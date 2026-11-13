@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 import subprocess
 import threading
 import time
@@ -45,10 +44,11 @@ from parser.git_ast.commit_relations import (  # noqa: F401 - re-exported
     normalize_mid,
     parse_relations,
 )
+from cache_engine import BYTES, INT, TEXT, CacheSpace, Eq, In, StoreSpec, get_cache_engine
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
-from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.services import disk_cache
+from db_engine.spec import Agg, Join, Value
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.jobs import jobs
 from webapp.backend.services.sync_service import register_refs_changed
 
@@ -80,17 +80,14 @@ def iter_records(stream: Iterable[str]) -> Iterator[list[str]]:
 
 # ----------------------------------------------------------------------------------- store
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS commits (sha BLOB PRIMARY KEY, at INTEGER, subject TEXT) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS rel (src BLOB NOT NULL, kind INTEGER NOT NULL, dst BLOB, prefix TEXT, p8 TEXT, note TEXT,
-                                UNIQUE (src, kind, dst, prefix, note));
-CREATE INDEX IF NOT EXISTS rel_src ON rel (src);
-CREATE INDEX IF NOT EXISTS rel_dst ON rel (dst);
-CREATE INDEX IF NOT EXISTS rel_p8 ON rel (p8);
-CREATE TABLE IF NOT EXISTS links (mid TEXT NOT NULL, sha BLOB NOT NULL, UNIQUE (mid, sha));
-CREATE INDEX IF NOT EXISTS links_sha ON links (sha);
-"""
+NAMESPACE = "commit-relations"
+STORES = (
+    StoreSpec("commits", (BYTES("sha"), INT("at", null=True), TEXT("subject", null=True)), key=("sha",), clustered=True),
+    StoreSpec("rel", (BYTES("src"), INT("kind"), BYTES("dst", null=True), TEXT("prefix", null=True),
+                      TEXT("p8", null=True), TEXT("note", null=True)),
+              unique=(("src", "kind", "dst", "prefix", "note"),), indexes=(("src",), ("dst",), ("p8",))),
+    StoreSpec("links", (TEXT("mid"), BYTES("sha")), unique=(("mid", "sha"),), indexes=(("sha",),)),
+)
 
 PASS_TRAILERS = [
     "log", "--all", "--no-color", "-E", "-i",
@@ -125,41 +122,30 @@ def git_subjects(keys: Iterable[bytes]) -> dict[bytes, tuple[int, str]]:
 
 
 class RelationIndex:
-    """SQLite store of the relations of one repository (path keyed by repository and code fingerprint)."""
+    """Cache store (cache_engine) of the relations of one repository (space keyed by repository and INDEX_FORMAT)."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._conns: dict[str, sqlite3.Connection] = {}
         self._resolved: RepoScopedCache = RepoScopedCache(maxsize=20_000)
 
-    def path(self):
+    @staticmethod
+    def space_name() -> str:
         # Versioned by INDEX_FORMAT (bump it when the stored rows change meaning), not by the module's
         # source: an unrelated edit must not throw away an index that took minutes to build
-        return disk_cache.sqlite_path("commit-relations", f"{get_active_repo_name()}-v{INDEX_FORMAT}")
+        return f"{get_active_repo_name()}-v{INDEX_FORMAT}"
 
-    def _conn(self) -> sqlite3.Connection:
-        path = str(self.path())
-        with self._lock:
-            conn = self._conns.get(path)
-            if conn is None:
-                conn = sqlite3.connect(path, check_same_thread=False, timeout=60)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.executescript(_SCHEMA)
-                self._conns[path] = conn
-            return conn
+    def space(self) -> CacheSpace:
+        """The relation space of the active repository (stores `commits`, `rel`, `links`; opened on demand)."""
+        return get_cache_engine().open(NAMESPACE, self.space_name(), STORES)
 
     def built(self) -> bool:
-        """The SQLite file exists and holds a finished build (checked without creating it)."""
+        """The cache holds a finished build (checked without creating it)."""
         try:
-            return self.path().exists() and bool(self.meta("built_at"))
+            return get_cache_engine().exists(NAMESPACE, self.space_name()) and bool(self.meta("built_at"))
         except Exception:  # noqa: BLE001
             return False
 
     def meta(self, key: str) -> str | None:
-        row = self._conn().execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
+        return self.space().get_meta(key)
 
     def covered_heads(self) -> set[str]:
         raw = self.meta("heads") or ""
@@ -182,13 +168,13 @@ class RelationIndex:
         return bool(heads) and self.current_heads() <= heads
 
     # ------------------------------------------------------------------ build
-    def _write(self, conn: sqlite3.Connection, commits: list, rels: list, links: list) -> None:
-        with self._write_lock, conn:
-            conn.executemany("INSERT OR IGNORE INTO commits (sha, at, subject) VALUES (?, ?, ?)", commits)
-            conn.executemany("INSERT OR IGNORE INTO rel (src, kind, dst, prefix, p8, note) VALUES (?, ?, ?, ?, ?, ?)", rels)
-            conn.executemany("INSERT OR IGNORE INTO links (mid, sha) VALUES (?, ?)", links)
+    def _write(self, space: CacheSpace, commits: list, rels: list, links: list) -> None:
+        with space.batch():
+            space.store("commits").put_many(commits, replace=False)
+            space.store("rel").put_many(rels, replace=False)
+            space.store("links").put_many(links, replace=False)
 
-    def _run_pass(self, args: list[str], revs: list[str] | None, conn: sqlite3.Connection,
+    def _run_pass(self, args: list[str], revs: list[str] | None, space: CacheSpace,
                   counter: list[int], cancelled: threading.Event | None) -> None:
         """Stream one `git log` pass into the store. `revs`: revisions for --stdin (incremental), else --all."""
         cmd = ["git", "-C", str(get_repo_dir()), *args]
@@ -235,10 +221,10 @@ class RelationIndex:
                     links.append((mid, src))
                 counter[0] += 1
                 if len(commits) >= BATCH:
-                    self._write(conn, commits, rels, links)
+                    self._write(space, commits, rels, links)
                     commits, rels, links = [], [], []
             if commits:
-                self._write(conn, commits, rels, links)
+                self._write(space, commits, rels, links)
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -249,7 +235,7 @@ class RelationIndex:
     def build(self, progress: Callable[..., None] | None = None) -> dict[str, Any]:
         """Full pass on first use; afterwards only the commits of new ref heads."""
         started = time.time()
-        conn = self._conn()
+        space = self.space()
         heads = self.current_heads()
         old = self.covered_heads()
         incremental = bool(old)
@@ -265,7 +251,7 @@ class RelationIndex:
 
         def run(args: list[str], slot: int) -> None:
             try:
-                self._run_pass(args, revs, conn, counters[slot], cancelled)
+                self._run_pass(args, revs, space, counters[slot], cancelled)
             except BaseException as exc:  # noqa: BLE001 - reported below
                 errors.append(exc)
 
@@ -280,9 +266,9 @@ class RelationIndex:
                 progress(None, None, f"{'new heads' if incremental else 'full pass'}: {counters[0][0] + counters[1][0]:,} commits read")
         if errors:
             raise RuntimeError(f"relation pass failed: {errors[0]}")
-        with self._write_lock, conn:
-            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('heads', ?)", (" ".join(sorted(heads | old)),))
-            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?)", (str(time.time()),))
+        with space.batch():
+            space.set_meta("heads", " ".join(sorted(heads | old)))
+            space.set_meta("built_at", str(time.time()))
         return {"incremental": incremental, "commits_scanned": counters[0][0] + counters[1][0],
                 "elapsed_s": round(time.time() - started, 1)}
 
@@ -290,12 +276,8 @@ class RelationIndex:
     def subjects(self, shas: Iterable[bytes]) -> dict[bytes, tuple[int, str]]:
         keys = list({s for s in shas if s})
         out: dict[bytes, tuple[int, str]] = {}
-        conn = self._conn()
-        for i in range(0, len(keys), 500):
-            part = keys[i:i + 500]
-            q = ",".join("?" * len(part))
-            for sha, at, subject in conn.execute(f"SELECT sha, at, subject FROM commits WHERE sha IN ({q})", part):
-                out[sha] = (at, subject)
+        for sha, (_, at, subject) in self.space().store("commits").get_many(keys).items():
+            out[sha] = (at, subject)
         missing = [k for k in keys if k not in out]
         if missing:
             # Commits outside both passes (no Fixes/Cc/Link/backport text): read their subjects from Git
@@ -319,12 +301,13 @@ class RelationIndex:
         return sha or None
 
     def relations(self, sha: str) -> dict[str, Any]:
-        conn = self._conn()
+        space = self.space()
+        rel, links = space.store("rel"), space.store("links")
         key = bytes.fromhex(sha)
         out: dict[str, Any] = {"sha": sha, "fixes": [], "fixed_by": [], "reverts": [], "reverted_by": [],
                                "upstream": [], "backports": [], "stable_cc": [], "links": []}
         related: list[bytes] = []
-        for kind, dst, prefix, note in conn.execute("SELECT kind, dst, prefix, note FROM rel WHERE src = ?", (key,)):
+        for kind, dst, prefix, note in rel.scan(Eq("src", key), columns=("kind", "dst", "prefix", "note")):
             if kind == KIND_FIXES:
                 full = dst.hex() if dst else self.resolve_prefix(prefix or "")
                 out["fixes"].append({"sha": full, "prefix": prefix, "subject": note or "", "resolved": bool(full)})
@@ -338,10 +321,10 @@ class RelationIndex:
             elif kind == KIND_STABLE_CC:
                 out["stable_cc"].append(note or "")
         prefixes = set(sha[:k] for k in range(8, 41))
-        by_prefix = [(src, kind) for src, kind, prefix in conn.execute(
-            "SELECT src, kind, prefix FROM rel WHERE p8 = ?", (sha[:8],)) if prefix in prefixes]
+        by_prefix = [(src, kind) for src, kind, prefix in rel.scan(
+            Eq("p8", sha[:8]), columns=("src", "kind", "prefix")) if prefix in prefixes]
         fixed_by = [src for src, kind in by_prefix if kind == KIND_FIXES]
-        incoming = conn.execute("SELECT src, kind FROM rel WHERE dst = ? AND kind IN (?, ?)", (key, KIND_REVERTS, KIND_UPSTREAM)).fetchall()
+        incoming = list(rel.scan([Eq("dst", key), In("kind", (KIND_REVERTS, KIND_UPSTREAM))], columns=("src", "kind")))
         incoming += [(src, kind) for src, kind in by_prefix if kind in (KIND_REVERTS, KIND_UPSTREAM)]
         lists = {"fixed_by": fixed_by,
                  "reverted_by": [src for src, kind in incoming if kind == KIND_REVERTS],
@@ -357,7 +340,7 @@ class RelationIndex:
             for src in srcs:
                 out[field].append({"sha": src.hex()})
                 related.append(src)
-        out["links"] = [m for (m,) in conn.execute("SELECT mid FROM links WHERE sha = ?", (key,))]
+        out["links"] = [m for (m,) in links.scan(Eq("sha", key), columns=("mid",))]
         subjects = self.subjects(related)
         for field in ("fixes", "fixed_by", "reverts", "reverted_by", "upstream", "backports"):
             for item in out[field]:
@@ -377,8 +360,8 @@ class RelationIndex:
     def fixes_of(self, sha: str) -> list[str]:
         """Full SHAs of the commits a commit names in its `Fixes:` tags (abbreviations resolved)."""
         out: list[str] = []
-        rows = self._conn().execute("SELECT dst, prefix FROM rel WHERE src = ? AND kind = ?", (bytes.fromhex(sha), KIND_FIXES))
-        for dst, prefix in rows.fetchall():
+        rows = self.space().store("rel").scan([Eq("src", bytes.fromhex(sha)), Eq("kind", KIND_FIXES)], columns=("dst", "prefix"))
+        for dst, prefix in list(rows):
             full = dst.hex() if dst else self.resolve_prefix(prefix or "")
             if full and full not in out:
                 out.append(full)
@@ -386,24 +369,21 @@ class RelationIndex:
 
     def backports_of(self, sha: str) -> list[str]:
         """Commits saying they are a backport of `sha` (`commit <sha> upstream.`, cherry picks)."""
-        conn = self._conn()
-        rows = conn.execute("SELECT src FROM rel WHERE dst = ? AND kind = ?", (bytes.fromhex(sha), KIND_UPSTREAM)).fetchall()
+        rel = self.space().store("rel")
+        rows = list(rel.scan([Eq("dst", bytes.fromhex(sha)), Eq("kind", KIND_UPSTREAM)], columns=("src",)))
         prefixes = set(sha[:k] for k in range(8, 40))
-        rows += [(src,) for src, prefix in conn.execute(
-            "SELECT src, prefix FROM rel WHERE p8 = ? AND kind = ?", (sha[:8], KIND_UPSTREAM)) if prefix in prefixes]
+        rows += [(src,) for src, prefix in rel.scan([Eq("p8", sha[:8]), Eq("kind", KIND_UPSTREAM)], columns=("src", "prefix"))
+                 if prefix in prefixes]
         return list(dict.fromkeys(src.hex() for (src,) in rows))
 
     def commits_for_mid(self, mid: str) -> list[str]:
-        rows = self._conn().execute("SELECT sha FROM links WHERE mid = ?", (normalize_mid(mid),)).fetchall()
+        rows = self.space().store("links").scan(Eq("mid", normalize_mid(mid)), columns=("sha",))
         return [r[0].hex() for r in rows]
 
     def counts(self) -> dict[str, int]:
-        conn = self._conn()
-        return {
-            "commits": conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
-            "relations": conn.execute("SELECT COUNT(*) FROM rel").fetchone()[0],
-            "links": conn.execute("SELECT COUNT(*) FROM links").fetchone()[0],
-        }
+        space = self.space()
+        return {"commits": space.store("commits").count(), "relations": space.store("rel").count(),
+                "links": space.store("links").count()}
 
 
 def _git(args: list[str], timeout: float = 60.0) -> str | None:
@@ -468,10 +448,6 @@ def _bytes(v: Any) -> bytes:
     return bytes(v) if v is not None else b""
 
 
-def _marks(n: int) -> str:
-    return ",".join(["%s"] * n)
-
-
 def db_ready() -> bool:
     """m_commit_relation covers every stored commit (backfill state "done:") and the active repository has
     a network: the database answers. A "not ready" answer is checked again after DB_READY_TTL."""
@@ -480,9 +456,8 @@ def db_ready() -> bool:
         return hit[0]
     ok = False
     try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT note FROM m_commit_relation WHERE commit_id = 0 AND kind = 0 AND idx = 0;")
-            row = cur.fetchone() or {}
+        with get_reader() as cur:
+            row = cur.select_one("m_commit_relation", ["note"], {"commit_id": 0, "kind": 0, "idx": 0}) or {}
             ok = _text(row.get("note")).startswith(BACKFILL_DONE) and get_active_network_id(cur) is not None
     except Exception as exc:  # noqa: BLE001 - an older database (no m_commit_relation)
         logger.debug("commit relation table unavailable: %s", exc)
@@ -494,12 +469,12 @@ def relations_token() -> str:
     """Changes whenever relation answers may change (part of report cache keys)."""
     if db_ready():
         try:
-            with get_db_cursor() as cur:
-                cur.execute("SELECT MAX(commit_id) AS m FROM m_commit_relation;")
-                return f"db:{(cur.fetchone() or {}).get('m')}"
+            with get_reader() as cur:
+                row = cur.select_one("m_commit_relation", {"m": Agg("MAX", "commit_id")}) or {}
+                return f"db:{row.get('m')}"
         except Exception:  # noqa: BLE001
             pass
-    return f"sqlite:{relation_index.meta('built_at') if relation_index.built() else ''}"
+    return f"index:{relation_index.meta('built_at') if relation_index.built() else ''}"
 
 
 def _db_commits(cur: Any, network_id: int, shas: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -508,12 +483,10 @@ def _db_commits(cur: Any, network_id: int, shas: Iterable[str]) -> dict[str, dic
     out: dict[str, dict[str, Any]] = {}
     for i in range(0, len(keys), DB_CHUNK):
         part = keys[i:i + DB_CHUNK]
-        cur.execute(
-            f"SELECT commit_id, commit_hash, author_date, subject FROM m_commit "
-            f"WHERE network_id = %s AND commit_hash IN ({_marks(len(part))});",
-            (network_id, *(bytes.fromhex(k) for k in part)),
-        )
-        for r in cur.fetchall():
+        for r in cur.select_rows(
+            "m_commit", ["commit_id", "commit_hash", "author_date", "subject"],
+            {"network_id": network_id, "commit_hash": [bytes.fromhex(k) for k in part]},
+        ):
             out[_bytes(r["commit_hash"]).hex()] = {"commit_id": int(r["commit_id"]), "date": int(r["author_date"] or 0),
                                                    "subject": _text(r["subject"])[:SUBJECT_MAX]}
     return out
@@ -523,12 +496,10 @@ def _forward(cur: Any, commit_ids: list[int], kinds: tuple[int, ...] = (KIND_FIX
     out: dict[int, list[dict[str, Any]]] = {}
     for i in range(0, len(commit_ids), DB_CHUNK):
         part = commit_ids[i:i + DB_CHUNK]
-        cur.execute(
-            f"SELECT commit_id, kind, idx, target_hash, target_prefix, note FROM m_commit_relation "
-            f"WHERE commit_id IN ({_marks(len(part))}) AND kind IN ({_marks(len(kinds))}) ORDER BY commit_id, kind, idx;",
-            (*part, *kinds),
-        )
-        for r in cur.fetchall():
+        for r in cur.select_rows(
+            "m_commit_relation", ["commit_id", "kind", "idx", "target_hash", "target_prefix", "note"],
+            {"commit_id": part, "kind": list(kinds)}, order_by=["commit_id", "kind", "idx"],
+        ):
             out.setdefault(int(r["commit_id"]), []).append(r)
     return out
 
@@ -544,23 +515,18 @@ def _target(row: dict[str, Any]) -> str | None:
 
 def _reverse(cur: Any, network_id: int, sha: str, kinds: tuple[int, ...]) -> list[dict[str, Any]]:
     """Ingested commits naming `sha` (stored target, or an unresolved prefix of it): [{kind, sha, date, subject}]."""
-    rows: list[dict[str, Any]] = []
-    cur.execute(
-        f"SELECT r.kind, c.commit_hash, c.author_date, c.subject FROM m_commit_relation r "
-        f"JOIN m_commit c ON c.commit_id = r.commit_id "
-        f"WHERE r.target_hash = %s AND r.kind IN ({_marks(len(kinds))}) AND c.network_id = %s;",
-        (bytes.fromhex(sha), *kinds, network_id),
+    columns = {"kind": "r.kind", "commit_hash": "c.commit_hash", "author_date": "c.author_date", "subject": "c.subject"}
+    joins = [Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"})]
+    rows: list[dict[str, Any]] = cur.select_rows(
+        ("m_commit_relation", "r"), columns,
+        {"r.target_hash": bytes.fromhex(sha), "r.kind": list(kinds), "c.network_id": network_id}, joins=joins,
     )
-    rows.extend(cur.fetchall())
     prefixes = [sha[:k] for k in range(8, 40)]
-    cur.execute(
-        f"SELECT r.kind, c.commit_hash, c.author_date, c.subject FROM m_commit_relation r "
-        f"JOIN m_commit c ON c.commit_id = r.commit_id "
-        f"WHERE r.target_hash = %s AND r.kind IN ({_marks(len(kinds))}) AND r.target_prefix IN ({_marks(len(prefixes))}) "
-        f"AND c.network_id = %s;",
-        (ZERO_HASH, *kinds, *prefixes, network_id),
-    )
-    rows.extend(cur.fetchall())
+    rows.extend(cur.select_rows(
+        ("m_commit_relation", "r"), columns,
+        {"r.target_hash": ZERO_HASH, "r.kind": list(kinds), "r.target_prefix": prefixes, "c.network_id": network_id},
+        joins=joins,
+    ))
     seen: set[tuple[int, str]] = set()
     out = []
     for r in rows:
@@ -578,7 +544,7 @@ def db_relations(sha: str) -> dict[str, Any] | None:
     if not _FULL_SHA.match(sha or "") or not db_ready():
         return None
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             network_id = get_active_network_id(cur)
             if network_id is None:
                 return None
@@ -604,8 +570,7 @@ def db_relations(sha: str) -> dict[str, Any] | None:
                     out[f"{field}_total"] = len(items)
                     items = items[:LIST_CAP]
                 out[field] = items
-            cur.execute("SELECT message_id FROM m_commit_link WHERE commit_id = %s;", (own["commit_id"],))
-            out["links"] = [_text(r["message_id"]) for r in cur.fetchall()]
+            out["links"] = [_text(r["message_id"]) for r in cur.select_rows("m_commit_link", ["message_id"], {"commit_id": own["commit_id"]})]
             targets = [it["sha"] for f in ("fixes", "reverts", "upstream") for it in out[f] if it.get("sha")]
             known = _db_commits(cur, network_id, targets)
     except Exception as exc:  # noqa: BLE001 - the relation index answers
@@ -636,7 +601,7 @@ def db_counts(hashes: list[str]) -> dict[str, dict[str, Any]]:
     if not keys or not db_ready():
         return out
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             network_id = get_active_network_id(cur)
             if network_id is None:
                 return out
@@ -665,7 +630,7 @@ def db_fixes_of(sha: str) -> list[str] | None:
     if not _FULL_SHA.match(sha or "") or not db_ready():
         return None
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             network_id = get_active_network_id(cur)
             own = _db_commits(cur, network_id, [sha]).get(sha) if network_id is not None else None
             if own is None:
@@ -682,7 +647,7 @@ def db_backports_of(sha: str) -> list[str] | None:
     if not _FULL_SHA.match(sha or "") or not db_ready():
         return None
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             network_id = get_active_network_id(cur)
             if network_id is None:
                 return None
@@ -700,18 +665,17 @@ def db_commits_for_mids(mids: list[str]) -> dict[str, list[str]] | None:
         return None
     out: dict[str, list[str]] = {m: [] for m in keys}
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             network_id = get_active_network_id(cur)
             if network_id is None:
                 return None
             for i in range(0, len(keys), DB_CHUNK):
                 part = keys[i:i + DB_CHUNK]
-                cur.execute(
-                    f"SELECT l.message_id, c.commit_hash FROM m_commit_link l JOIN m_commit c ON c.commit_id = l.commit_id "
-                    f"WHERE l.message_id IN ({_marks(len(part))}) AND c.network_id = %s;",
-                    (*part, network_id),
-                )
-                for r in cur.fetchall():
+                for r in cur.select_rows(
+                    ("m_commit_link", "l"), {"message_id": "l.message_id", "commit_hash": "c.commit_hash"},
+                    {"l.message_id": part, "c.network_id": network_id},
+                    joins=[Join(("m_commit", "c"), {"c.commit_id": "l.commit_id"})],
+                ):
                     out.setdefault(_text(r["message_id"]), []).append(_bytes(r["commit_hash"]).hex())
     except Exception as exc:  # noqa: BLE001
         logger.debug("database mail links failed: %s", exc)
@@ -733,28 +697,27 @@ def tags_ingested(tags: list[str]) -> bool:
     current = rs.tag_commits()
     ok = False
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
             network_id = get_active_network_id(cur)
             seg: dict[str, int] = {}
             for i in range(0, len(tags), DB_CHUNK):
                 part = tags[i:i + DB_CHUNK]
-                cur.execute(f"SELECT segment_id, tag, tag_hash FROM m_release_segment WHERE repo_id = %s AND tag IN ({_marks(len(part))});",
-                            (repo_id, *part))
-                for r in cur.fetchall():
+                for r in cur.select_rows(
+                    "m_release_segment", ["segment_id", "tag", "tag_hash"], {"repo_id": repo_id, "tag": part}
+                ):
                     if _bytes(r["tag_hash"]).hex() == current.get(_text(r["tag"])):
                         seg[_text(r["tag"])] = int(r["segment_id"])
             ok = network_id is not None and all(t in seg for t in tags)
             ids = sorted(seg.values())
             for i in range(0, len(ids), DB_CHUNK) if ok else ():
                 part = ids[i:i + DB_CHUNK]
-                cur.execute(
-                    f"SELECT COUNT(*) AS n, COUNT(c.commit_id) AS k FROM m_commit_release cr "
-                    f"LEFT JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash "
-                    f"WHERE cr.repo_id = %s AND cr.segment_id IN ({_marks(len(part))});",
-                    (network_id, repo_id, *part),
-                )
-                row = cur.fetchone() or {}
+                row = cur.select_one(
+                    ("m_commit_release", "cr"),
+                    {"n": Agg("COUNT", "*"), "k": Agg("COUNT", "c.commit_id")},
+                    {"cr.repo_id": repo_id, "cr.segment_id": part},
+                    joins=[Join(("m_commit", "c"), {"c.network_id": Value(network_id), "c.commit_hash": "cr.commit_hash"}, "left")],
+                ) or {}
                 if int(row.get("n") or 0) != int(row.get("k") or 0):
                     ok = False
                     break

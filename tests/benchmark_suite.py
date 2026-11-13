@@ -313,8 +313,7 @@ def benchmark_cast_stages(files: list[str] | None = None) -> None:
 
     for fp in target_files:
         stage_times.clear()
-        MockDB._global_store.clear()
-        MockDB._global_next_id.clear()
+        MockDB.store.clear()
         G.DB = MockDB
         G.TE = get_table_engine("cached")()
         gp = GreatProcessor()

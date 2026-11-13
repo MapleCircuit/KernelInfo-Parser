@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # def_id bit-packing constants (must remain unified across parser and views)
 DEF_ID_FLAG = 1 << 62
-KIND_DEFS = 0
+KIND_DEFS = 2  # m_symbol_own.kind values (core/SymbolRows.py)
 KIND_REFS = 1
 
 # Checkpoint tree view: resolves full trees through parent deltas

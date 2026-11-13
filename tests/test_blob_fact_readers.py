@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from db_engine import MockDB
 from parser import doc_labels, facts_ingest, include_facts
 from parser.kconfig_ast import kconfig_definitions as kd
 
@@ -93,7 +94,7 @@ class TestReaders(unittest.TestCase):
     def git_labels(self) -> dict:
         from webapp.backend.services import docs_service as ds
         svc = ds.DocsService()
-        with mock.patch.object(ds, "get_db_cursor"), mock.patch.object(ds, "get_version_info", return_value=(1, "v1")), \
+        with mock.patch.object(ds, "get_reader"), mock.patch.object(ds, "get_version_info", return_value=(1, "v1")), \
                 mock.patch.object(ds.DocsService, "_labels_from_facts", staticmethod(lambda sha: None)):
             return svc.get_label_index("v1")
 
@@ -167,26 +168,14 @@ class TestBackfill(unittest.TestCase):
 
     def test_fact_blob_paths_one_path_per_blob(self) -> None:
         from core import backfills
-        answers = {
-            "m_bridge_checkpoint": [[(1, 10), (2, 11), (3, 12)], [(1, 10), (4, 13)]],
-        }
-        cur = mock.MagicMock()
-        calls = {"cp": 0}
-
-        def execute(sql, params=()):
-            if "m_bridge_checkpoint" in sql:
-                cur.rows = answers["m_bridge_checkpoint"][calls["cp"]]
-                calls["cp"] += 1
-            elif "m_file_name" in sql:
-                names = {1: "kernel/a.c", 2: "Makefile", 3: "Documentation/x.rst", 4: "drivers/Kconfig"}
-                cur.rows = [(f, names[f]) for f in params]
-            else:
-                cur.rows = [(b, bytes([b]) * 20) for b in params]
-
-        cur.execute.side_effect = execute
-        cur.fetchall.side_effect = lambda: cur.rows
-        cur.query.side_effect = lambda sql, params=(), dictionary=False: (execute(sql, params), cur.rows)[1]
-        out = backfills.fact_blob_paths(cur, [("v1", 1, 0), ("v2", 2, 1)])
+        db = MockDB(use_global=False)
+        # Two versions (commits 1 and 2); the second is a delta that repeats blob 10 and adds blob 13 (path 4)
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"],
+                       [(1, 1, 10), (1, 2, 11), (1, 3, 12), (2, 4, 13), (2, 1, 10), (2, 5, 0)])
+        db.insert_rows("m_file_name", ["fnid", "fname"],
+                       [(1, "kernel/a.c"), (2, "Makefile"), (3, "Documentation/x.rst"), (4, "drivers/Kconfig"), (5, "gone.c")])
+        db.insert_rows("m_file_blob", ["blob_id", "blob_hash", "ftype"], [(b, bytes([b]) * 20, 1) for b in (10, 11, 12, 13)])
+        out = backfills.fact_blob_paths(db, [("v1", 1, 0), ("v2", 2, 1)])
         self.assertEqual(out, {bytes([10]) * 20: "kernel/a.c", bytes([12]) * 20: "Documentation/x.rst",
                                bytes([13]) * 20: "drivers/Kconfig"})
 

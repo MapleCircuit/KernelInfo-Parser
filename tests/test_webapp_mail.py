@@ -35,6 +35,8 @@ from webapp.backend.routers.mail import (
     search_mailing_list,
 )
 from webapp.backend.routers.commits import resolve_commit_mail as router_resolve_commit_mail
+from db_engine import MockDB
+from tests.db_fixtures import patch_reader
 from webapp.backend.services.git_service import GitService
 from parser.mailing_list.ml_patch_parser import parse_patch_from_body
 from parser.mailing_list.ml_types import (
@@ -405,7 +407,6 @@ class TestCommitMailIntegration(unittest.TestCase):
     def test_get_commit_detail_includes_linked_emails(self) -> None:
         git_svc = GitService()
 
-        mock_cursor = MagicMock()
         commit_row = {
             "commit_id": 5001,
             "commit_hash": b"\xab\xcd\xef\x12\x34\x56\x78\x90\xab\xcd\xef\x12\x34\x56\x78\x90\xab\xcd\xef\x12",
@@ -430,22 +431,12 @@ class TestCommitMailIntegration(unittest.TestCase):
             "patch_total": 1,
         }
 
-        with patch("webapp.backend.services.git_service.get_db_cursor") as mock_get_cursor:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__.return_value = mock_cursor
-            mock_get_cursor.return_value = mock_ctx
-
-            mock_cursor.fetchone.side_effect = [
-                commit_row,                                                    # commit detail
-                {"name": b"Dev", "email": b"dev@btrfs.org", "person_id": 1},   # author
-            ]
-            mock_cursor.fetchall.side_effect = [
-                [],                  # parents (m_commit_parent)
-                [],                  # trailers
-                [],                  # files
-                [mock_email_row],    # m_commit_email
-            ]
-
+        db = MockDB(use_global=False)
+        commit_cols = ["commit_id", "commit_hash", "subject", "message", "author_id", "author_date"]
+        db.insert_rows("m_commit", commit_cols, [tuple(commit_row[k] for k in commit_cols)])
+        db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(1, "Dev", "dev@btrfs.org")])
+        db.insert_rows("m_commit_email", ["commit_id", *mock_email_row], [(5001, *mock_email_row.values())])
+        with patch_reader(db):
             detail = git_svc.get_commit_detail("5001")
             self.assertEqual(detail["commit_id"], 5001)
             self.assertIn("linked_emails", detail)
@@ -459,6 +450,7 @@ class TestCommitMailIntegration(unittest.TestCase):
     def test_on_demand_resolve_commit_mail_read_only(self) -> None:
         git_svc = GitService()
 
+        db = MockDB(use_global=False)
         c_hash = "deadbeef1234567890abcdef1234567890abcdef"
         mock_detail = {
             "commit_id": 5002,
@@ -495,12 +487,7 @@ class TestCommitMailIntegration(unittest.TestCase):
 
         with patch.object(git_svc, "get_commit_detail", return_value=mock_detail), \
              patch("parser.mailing_list.ml_client.MailingListClient") as mock_client_cls, \
-             patch("webapp.backend.services.git_service.get_db_cursor") as mock_get_cursor:
-
-            mock_cursor = MagicMock()
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__.return_value = mock_cursor
-            mock_get_cursor.return_value = mock_ctx
+             patch_reader(db):
 
             mock_client_inst = MagicMock()
             mock_client_inst.resolve_commits.return_value = {c_hash: mock_resolved_ctx}
@@ -514,12 +501,8 @@ class TestCommitMailIntegration(unittest.TestCase):
             self.assertEqual(match["relation_type"], int(MLRelationType.Patch))
             self.assertEqual(match["match_tier"], int(MLMatchTier.MetadataFallback))
 
-            # CRITICAL READ-ONLY INVARIANT: Verify no INSERT, UPDATE, or DELETE executed on DB!
-            for call in mock_cursor.execute.call_args_list:
-                sql = call[0][0].strip().upper()
-                self.assertFalse(sql.startswith("INSERT"), f"Violation: execute called with {sql}")
-                self.assertFalse(sql.startswith("UPDATE"), f"Violation: execute called with {sql}")
-                self.assertFalse(sql.startswith("DELETE"), f"Violation: execute called with {sql}")
+            # CRITICAL READ-ONLY INVARIANT: resolving mail wrote nothing to the database
+            self.assertEqual(db.count_rows("m_commit_email"), 0)
 
 
 class TestFrontendMailAssets(unittest.TestCase):
@@ -600,44 +583,50 @@ if __name__ == "__main__":
 class TestMergedCommits(unittest.TestCase):
     """GET /api/mail/merged (P2): database path, trailer fallback, series aggregation, read-only SQL."""
 
+    def _mail_db(self):
+        from db_engine import MockDB
+        db = MockDB(use_global=False)
+        cols = ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"]
+        db.insert_rows("m_commit", cols, [
+            (1, 4, bytes.fromhex("aa" * 20), 0, 0, 0, 0, "one", ""),
+            (2, 4, bytes.fromhex("bb" * 20), 0, 0, 0, 0, "two", ""),
+            (3, 5, bytes.fromhex("dd" * 20), 0, 0, 0, 0, "other network", ""),
+        ])
+        email = ["commit_id", "message_id", "thread_id", "relation_type", "match_tier", "patch_version", "patch_idx", "patch_total"]
+        db.insert_rows("m_commit_email", email, [
+            (1, "p1@x", 9, 1, 1, 2, 1, 3), (2, "p2@x", 9, 1, 1, 2, 2, 3),
+            (3, "p3@x", 9, 1, 1, 2, 3, 3),   # another network's commit of the same thread
+            (2, "r@x", 9, 4, 1, 2, 0, 3),    # relation outside patch / cover / sibling
+        ])
+        return db
+
     def test_db_path_and_series(self) -> None:
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
+        from tests.db_fixtures import patch_reader
         from webapp.backend.services import merged_service as ms
-        rows = [
-            {"message_id": "p1@x", "thread_id": 9, "relation_type": 1, "match_tier": 1, "patch_version": 2, "patch_idx": 1,
-             "patch_total": 3, "commit_hash": bytes.fromhex("aa" * 20), "subject": "one"},
-            {"message_id": "p2@x", "thread_id": 9, "relation_type": 1, "match_tier": 1, "patch_version": 2, "patch_idx": 2,
-             "patch_total": 3, "commit_hash": bytes.fromhex("bb" * 20), "subject": "two"},
-        ]
-        cursor = MagicMock()
-        cursor.fetchone.return_value = {"n": 2}
-        cursor.fetchall.return_value = rows
-        ms._INDEXED.clear()
+        db = self._mail_db()
         badges = {"aa" * 20: {"released": True, "first_tag": "v3.1-rc1", "first_release": "v3.1"},
                   "bb" * 20: {"released": True, "first_tag": "v3.2-rc1", "first_release": "v3.2"}}
-        with patch.object(ms, "get_db_cursor") as gc, patch.object(ms, "get_active_network_id", return_value=4), \
+        with patch_reader(db), patch.object(ms, "get_active_network_id", return_value=4), \
                 patch("webapp.backend.services.commit_facts.release_badges", return_value=badges):
-            gc.return_value.__enter__.return_value = cursor
             out = ms.merged_commits(mid="<p1@x>", tid=9)
         self.assertEqual(out["source"], "db")
         self.assertEqual(out["mid"], "p1@x")
         self.assertEqual(out["series"], {"total": 3, "merged": 2, "first_release": "v3.1"})
         self.assertEqual([c["hash"] for c in out["commits"]], ["aa" * 20, "bb" * 20])
-        for call in cursor.execute.call_args_list:
-            self.assertTrue(call[0][0].strip().upper().startswith("SELECT"))
-        self.assertEqual(cursor.execute.call_args_list[-1][0][1][:2], (4, 9))
+        self.assertEqual([c["subject"] for c in out["commits"]], ["one", "two"])
 
     def test_trailer_fallback_without_indexes(self) -> None:
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
+        from db_engine import MockDB
+        from tests.db_fixtures import patch_reader
         from webapp.backend.services import merged_service as ms
-        cursor = MagicMock()
-        cursor.fetchone.return_value = {"n": 0}
-        ms._INDEXED.clear()
-        with patch.object(ms, "get_db_cursor") as gc, patch.object(ms, "get_active_network_id", return_value=4), \
+        db = MockDB(use_global=False)
+        with patch_reader(db), patch.object(ms, "get_active_network_id", return_value=4), \
+                patch.object(ms, "indexes_present", return_value=False), \
                 patch.object(ms, "_from_trailers", return_value=[{"hash": "cc" * 20, "subject": "s", "relation": "patch", "patch_idx": 0,
                                                                   "patch_total": 0, "message_id": "m@x"}]) as fb, \
                 patch("webapp.backend.services.commit_facts.release_badges", return_value={}):
-            gc.return_value.__enter__.return_value = cursor
             out = ms.merged_commits(mid="m@x")
         fb.assert_called_once_with("m@x", 0)
         self.assertEqual(out["source"], "trailers")
@@ -645,9 +634,22 @@ class TestMergedCommits(unittest.TestCase):
         with self.assertRaises(Exception):
             ms.merged_commits()
 
+    def test_indexes_present_needs_both_declared_indexes(self) -> None:
+        from core.DBLayout import m_commit_email
+        from db_engine import SQLiteDB
+        from webapp.backend.services import merged_service as ms
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([m_commit_email])
+        with db.reader() as reader:
+            self.assertTrue(ms.indexes_present(reader))
+        db.remove_index("commit_email_mid_idx", m_commit_email)
+        with db.reader() as reader:
+            self.assertFalse(ms.indexes_present(reader))
+        db.close()
+
     def test_parser_creates_missing_declared_indexes(self) -> None:
         from unittest.mock import MagicMock
-        from main import ensure_declared_indexes
+        from pipeline.db_setup import ensure_declared_indexes
         from core.DBLayout import m_commit_email
         db = MagicMock()
         db.index_exists.side_effect = lambda name, table: name == "commit_email_tid_idx"

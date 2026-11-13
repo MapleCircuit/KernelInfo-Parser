@@ -14,7 +14,6 @@ import fnmatch
 import logging
 import os
 import re
-import sqlite3
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -22,6 +21,7 @@ from typing import Any, Callable
 
 from fastapi import HTTPException
 
+from cache_engine import CacheError
 from parser import kapi_facts as kf
 from parser.kapi_facts import (  # noqa: F401 - re-exported: the catalogs' readers (tests, device_index_service)
     invocation,
@@ -89,7 +89,7 @@ def _load_records(sha: str, progress: Callable | None) -> list[tuple[str, dict[s
         records.update(kapi_store.get_many(missing))
         try:
             kapi_store.prune(settings["max_mb"] << 20)
-        except sqlite3.Error as exc:
+        except CacheError as exc:
             logger.debug("Kernel API store prune failed: %s", exc)
     out = [(path, records[b]) for path, b in files if records.get(b)]
     logger.info("Kernel API records of %s: %d of %d files (%d blobs from the database, %d extracted) in %.1f s",
@@ -460,36 +460,21 @@ def tracepoint_callsites(version: str, name: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Invalid tracepoint name")
     # For parsed versions, query m_symbol_ref first
     try:
-        from webapp.backend.database.pool import get_db_cursor
-        with get_db_cursor() as cursor:
+        from webapp.backend.database.pool import get_reader
+        with get_reader() as reader:
             from webapp.backend.services.symbol_service import SymbolService
             from webapp.backend.services.tree_resolver import best_path, definition_arch
-            from core.SymbolRows import rows_of_targets_sql
-            _, vname, blob_paths = SymbolService._scope(cursor, version)
+            _, vname, blob_paths = SymbolService._scope(reader, version)
             _, scope, bits = definition_arch(vname, None)
-            tp_names = (f"trace_{name}", f"trace_{name}_rcuidle", name)
-            cursor.execute(
-                f"""
-                SELECT s.ast_id, s.blob_id, s.line_s
-                FROM m_symbol_def s
-                WHERE s.name IN ({", ".join(["%s"] * len(tp_names))});
-                """,
-                tp_names,
-            )
-            defs = [r for r in cursor.fetchall() if r["blob_id"] in blob_paths and r["ast_id"]]
+            tp_names = [f"trace_{name}", f"trace_{name}_rcuidle", name]
+            def_rows = reader.select_rows("m_symbol_def", ["ast_id", "blob_id", "line_s"], {"name": tp_names})
+            defs = [r for r in def_rows if r["blob_id"] in blob_paths and r["ast_id"]]
             if defs:
                 targets = list(dict.fromkeys(r["ast_id"] for r in defs))
-                refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(targets))
-                cursor.execute(
-                    f"""
-                    SELECT r.blob_id, r.line AS line_no
-                    FROM ({refs_sql}) r
-                    WHERE r.role = 3
-                    LIMIT 500;
-                    """,
-                    tuple(targets) * repeat,
-                )
-                ref_rows = cursor.fetchall()
+                ref_rows = [
+                    {"blob_id": r["fid"], "line_no": r["line"]}
+                    for r in reader.symbol_refs_of_targets(targets, role=3, limit=500)
+                ]
                 if ref_rows:
                     sites = []
                     for r in ref_rows:

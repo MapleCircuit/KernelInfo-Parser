@@ -1,4 +1,4 @@
-"""parser/maintainer_ast/maintainer_store.py - Read the stored MAINTAINERS / CREDITS model (SELECT only).
+"""parser/maintainer_ast/maintainer_store.py - Read the stored MAINTAINERS / CREDITS model (read-only).
 
 Shared by the parser (Step 6.7 and `--backfill-maintainer-files`) and the webapp
 (`webapp/backend/services/maintainer_service.py`), so both resolve a blob's sections the same way
@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Sequence
 if TYPE_CHECKING:
     from db_engine.base import BaseDBEngine
 
+from db_engine.spec import Join, gt
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 from parser.maintainer_ast.maintainer_types import MaintainerSection
 
@@ -58,17 +59,19 @@ def blob_section_ids(db: BaseDBEngine, blob_id: int) -> dict[str, int]:
     """Section key (see `section_key`) -> sec_id of the section versions one MAINTAINERS blob holds."""
     if not blob_id:
         return {}
-    sql = """
-        SELECT s.sec_id, s.name, s.blob_id, (bt2.blob_id IS NOT NULL) AS exact_tag
-        FROM m_bridge_tag bt
-        JOIN m_tag t ON t.tag_id = bt.tag_id
-        JOIN m_maintainer_section s ON s.ast_id = t.ast_id
-        LEFT JOIN m_bridge_tag bt2 ON bt2.blob_id = s.blob_id AND bt2.tag_id = bt.tag_id
-        WHERE bt.blob_id = %s AND s.sec_id > 0
-        """
-    raw_rows = db.query(sql, (int(blob_id),), dictionary=False)
+    raw_rows = db.select_rows(
+        ("m_bridge_tag", "bt"),
+        ["s.sec_id", "s.name", "s.blob_id", "bt2.blob_id"],
+        {"bt.blob_id": int(blob_id), "s.sec_id": gt(0)},
+        joins=[
+            Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+            Join(("m_maintainer_section", "s"), {"s.ast_id": "t.ast_id"}),
+            Join(("m_bridge_tag", "bt2"), {"bt2.blob_id": "s.blob_id", "bt2.tag_id": "bt.tag_id"}, "left"),
+        ],
+        as_dict=False,
+    )
     rows = (
-        (section_key(_col(r, 1, "name")), int(_col(r, 0, "sec_id")), int(_col(r, 2, "blob_id")), bool(_col(r, 3, "exact_tag")))
+        (section_key(_col(r, 1, "name")), int(_col(r, 0, "sec_id")), int(_col(r, 2, "blob_id")), _col(r, 3, "exact_tag") is not None)
         for r in raw_rows
     )
     return pick_versions(rows, blob_id)
@@ -78,21 +81,23 @@ def blob_credit_ids(db: BaseDBEngine, blob_id: int) -> list[int]:
     """credit_ids of the entry versions one CREDITS blob holds (one per entry name and person), sorted."""
     if not blob_id:
         return []
-    sql = """
-        SELECT ce.credit_id, ce.ast_id, ce.person_id, ce.blob_id, (bt2.blob_id IS NOT NULL) AS exact_tag
-        FROM m_bridge_tag bt
-        JOIN m_tag t ON t.tag_id = bt.tag_id
-        JOIN m_credits_entry ce ON ce.ast_id = t.ast_id
-        LEFT JOIN m_bridge_tag bt2 ON bt2.blob_id = ce.blob_id AND bt2.tag_id = bt.tag_id
-        WHERE bt.blob_id = %s AND ce.credit_id > 0
-        """
-    raw_rows = db.query(sql, (int(blob_id),), dictionary=False)
+    raw_rows = db.select_rows(
+        ("m_bridge_tag", "bt"),
+        ["ce.credit_id", "ce.ast_id", "ce.person_id", "ce.blob_id", "bt2.blob_id"],
+        {"bt.blob_id": int(blob_id), "ce.credit_id": gt(0)},
+        joins=[
+            Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+            Join(("m_credits_entry", "ce"), {"ce.ast_id": "t.ast_id"}),
+            Join(("m_bridge_tag", "bt2"), {"bt2.blob_id": "ce.blob_id", "bt2.tag_id": "bt.tag_id"}, "left"),
+        ],
+        as_dict=False,
+    )
     rows = (
         (
             (int(_col(r, 1, "ast_id")), int(_col(r, 2, "person_id"))),
             int(_col(r, 0, "credit_id")),
             int(_col(r, 3, "blob_id")),
-            bool(_col(r, 4, "exact_tag")),
+            _col(r, 4, "exact_tag") is not None,
         )
         for r in raw_rows
     )
@@ -103,8 +108,13 @@ def version_blob(db: BaseDBEngine, commit_id: int, fname: str, tree: str = "m_ch
     """blob_id of `fname` (MAINTAINERS, CREDITS) in the checkpoint of commit_id, or None."""
     if not commit_id:
         return None
-    sql = f"SELECT t.blob_id FROM {tree} t JOIN m_file_name fn ON fn.fnid = t.fnid WHERE t.commit_id = %s AND fn.fname = %s"
-    row = db.query_one(sql, (int(commit_id), fname), dictionary=False)
+    row = db.select_one(
+        (tree, "t"),
+        ["t.blob_id"],
+        {"t.commit_id": int(commit_id), "fn.fname": fname},
+        joins=[Join(("m_file_name", "fn"), {"fn.fnid": "t.fnid"})],
+        as_dict=False,
+    )
     return int(_col(row, 0, "blob_id")) if row else None
 
 
@@ -114,8 +124,7 @@ def sections_with_rows(db: BaseDBEngine, sec_ids: Iterable[int]) -> set[int]:
     found: set[int] = set()
     for i in range(0, len(ids), 1000):
         chunk = ids[i : i + 1000]
-        sql = f"SELECT DISTINCT sec_id FROM m_maintainer_file WHERE sec_id IN ({','.join(['%s'] * len(chunk))})"
-        raw_rows = db.query(sql, tuple(chunk), dictionary=False)
+        raw_rows = db.select_rows("m_maintainer_file", ["sec_id"], {"sec_id": chunk}, distinct=True, as_dict=False)
         found.update(int(_col(r, 0, "sec_id")) for r in raw_rows)
     return found
 

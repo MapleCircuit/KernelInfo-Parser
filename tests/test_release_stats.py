@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -13,6 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import DBLayout as D
+from db_engine import SQLiteDB
+from db_engine.spec import Join
 from parser.git_ast import release_stats as rst
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.release_order import previous_in, release_ranges
@@ -189,8 +191,8 @@ class TestSummarizeLog(unittest.TestCase):
         from core import ingest_state as I
         from core.DBLayout import TABLES
         marks = {t.table_name: 10 for t, _ in I.marked_tables(TABLES)}
-        plan = {(d.table, d.where) for d in I.rollback_plan(TABLES, marks, 10, [])}
-        self.assertIn(("m_commit_release", "segment_id > %s"), plan)
+        plan = {(d.table, d.condition) for d in I.rollback_plan(TABLES, marks, 10, [])}
+        self.assertIn(("m_commit_release", "segment_id >"), plan)
 
     def test_shortstat(self) -> None:
         self.assertEqual(rst.parse_shortstat(" 7818 files changed, 496971 insertions(+), 383598 deletions(-)\n"), (7818, 496971, 383598))
@@ -198,82 +200,13 @@ class TestSummarizeLog(unittest.TestCase):
         self.assertEqual(rst.parse_shortstat(""), (0, 0, 0))
 
 
-class _Cursor:
-    """A DB-API cursor over sqlite3 taking the MariaDB `%s` placeholders."""
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._cur = conn.cursor()
-
-    def execute(self, sql: str, params=()) -> None:
-        self._cur.execute(sql.replace("%s", "?").replace("INSERT IGNORE", "INSERT OR IGNORE"), tuple(params))
-
-    def executemany(self, sql: str, rows) -> None:
-        self._cur.executemany(sql.replace("%s", "?"), list(rows))
-
-    def fetchall(self):
-        return self._cur.fetchall()
-
-    def fetchone(self):
-        return self._cur.fetchone()
-
-    @property
-    def lastrowid(self) -> int:
-        return self._cur.lastrowid
-
-    def close(self) -> None:
-        self._cur.close()
-
-
-class _Connection:
-    def __init__(self) -> None:
-        self.db = sqlite3.connect(":memory:")
-        self.db.executescript("""
-            CREATE TABLE m_maintainer_person (person_id INTEGER PRIMARY KEY, name TEXT, email TEXT);
-            INSERT INTO m_maintainer_person VALUES (0, '', ''), (7, 'Ann B', 'ann@x.org');
-            CREATE TABLE m_release_segment (segment_id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id INT, tag TEXT,
-                tag_hash BLOB, chain INT, base_tag TEXT, base_hash BLOB, commits INT, merges INT, diff_base_tag TEXT,
-                files_changed INT, lines_added INT, lines_removed INT, format INT, UNIQUE (repo_id, tag));
-            CREATE TABLE m_release_person (segment_id INT, person_id INT, role_type INT, commits INT,
-                PRIMARY KEY (segment_id, person_id, role_type));
-            CREATE TABLE m_person_first_release (repo_id INT, person_id INT, segment_id INT, PRIMARY KEY (repo_id, person_id));
-            CREATE TABLE m_commit_release (repo_id INT, commit_hash BLOB, chain INT, segment_id INT,
-                PRIMARY KEY (repo_id, commit_hash, chain));
-        """)
-
-    def query(self, sql: str, params=(), dictionary: bool = True):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.fetchall()
-
-    def query_one(self, sql: str, params=(), dictionary: bool = True):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.fetchone()
-
-    def execute(self, sql: str, params=()) -> int:
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur._cur.rowcount
-
-    def executemany(self, sql: str, params_seq) -> int:
-        cur = self.cursor()
-        cur.executemany(sql, params_seq)
-        return cur._cur.rowcount
-
-    def cursor(self) -> _Cursor:
-        return _Cursor(self.db)
-
-    def commit(self) -> None:
-        self.db.commit()
-
-    def rollback(self) -> None:
-        self.db.rollback()
-
-    def commit(self) -> None:
-        self.db.commit()
-
-    def rollback(self) -> None:
-        self.db.rollback()
+def _release_db() -> SQLiteDB:
+    """In-memory SQLite database holding the tables of the release statistics, with a known person (7)."""
+    db = SQLiteDB(":memory:", foreign_keys=False)
+    db.create_table([D.m_maintainer_person, D.m_release_segment, D.m_release_person, D.m_person_first_release,
+                     D.m_commit_release])
+    db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(7, "Ann B", "ann@x.org")], on_conflict="ignore")
+    return db
 
 
 class TestIngest(unittest.TestCase):
@@ -296,8 +229,7 @@ class TestIngest(unittest.TestCase):
         self.git("checkout", "-q", "-b", "stable", "v3.0")
         self.commit("Ann B", "ann@x.org", "fix (backport)", "a.c", "1\nB\n")
         self.git("tag", "v3.0.1")
-        self.db = _Connection()
-        self.cnx = self.db
+        self.db = _release_db()
 
     def tearDown(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -313,37 +245,41 @@ class TestIngest(unittest.TestCase):
         self.git("add", path)
         self.git("-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "--author", f"{name} <{email}>", "-m", message)
 
-    def rows(self, sql: str, params=()) -> list:
-        return self.db.db.execute(sql, params).fetchall()
+    def rows(self, source, columns, where=None, joins=()) -> list:
+        return [tuple(r) for r in self.db.select_rows(source, columns, where, joins=joins)]
+
+    def tag_join(self, table: str) -> tuple[Join, ...]:
+        """Join of a per-segment table to its segment row (alias s)."""
+        return (Join(("m_release_segment", "s"), {"s.segment_id": f"{table}.segment_id"}),)
 
     def test_ingest_and_incremental(self) -> None:
         summary = rst.ingest(self.db, self.dir, repo_id=1, workers=2)
         self.assertEqual((summary["state"], summary["tags"], summary["segments"]), ("updated", 4, 4))
         seg = {t: (c, m, b, d, f) for t, c, m, b, d, f in self.rows(
-            "SELECT tag, commits, merges, base_tag, diff_base_tag, files_changed FROM m_release_segment")}
+            "m_release_segment", ["tag", "commits", "merges", "base_tag", "diff_base_tag", "files_changed"])}
         self.assertEqual(seg["v3.0"], (1, 0, "", "", 0))
         self.assertEqual(seg["v3.1-rc1"], (2, 0, "v3.0", "v3.0", 2))
         self.assertEqual(seg["v3.1"], (2, 1, "v3.1-rc1", "v3.0", 3))   # segment rc1..v3.1, diff over the cycle
         self.assertEqual(seg["v3.0.1"], (1, 0, "v3.0", "v3.0", 1))
-        pid = {name: p for p, name in self.rows("SELECT person_id, name FROM m_maintainer_person")}
+        pid = {name: p for p, name in self.rows("m_maintainer_person", ["person_id", "name"])}
         self.assertEqual(pid["Ann B"], 7)  # the existing person row is reused
         people = {(t, n, r): c for t, n, r, c in self.rows(
-            "SELECT s.tag, p.name, r.role_type, r.commits FROM m_release_person r JOIN m_release_segment s USING (segment_id) "
-            "JOIN m_maintainer_person p USING (person_id)")}
+            ("m_release_person", "r"), ["s.tag", "p.name", "r.role_type", "r.commits"],
+            joins=[*self.tag_join("r"), Join(("m_maintainer_person", "p"), {"p.person_id": "r.person_id"})])}
         self.assertEqual(people[("v3.1-rc1", "Ann B", AUTHOR)], 1)
         self.assertEqual(people[("v3.1-rc1", "Ann B", SOB)], 1)          # Neo's commit, not her own
         self.assertNotIn(("v3.1-rc1", "Neo N", SOB), people)
         self.assertEqual(people[("v3.1-rc1", "Cy D", REVIEW)], 1)
         self.assertEqual(people[("v3.1", "q@q.org", REPORT)], 1)
         first = {n: t for n, t in self.rows(
-            "SELECT p.name, s.tag FROM m_person_first_release f JOIN m_release_segment s USING (segment_id) "
-            "JOIN m_maintainer_person p USING (person_id)")}
+            ("m_person_first_release", "f"), ["p.name", "s.tag"],
+            joins=[*self.tag_join("f"), Join(("m_maintainer_person", "p"), {"p.person_id": "f.person_id"})])}
         self.assertEqual(first, {"Ann B": "v3.0", "Neo N": "v3.1-rc1", "Cy D": "v3.1"})  # stable chain does not count
 
         # Every commit of each chain is held by the first segment containing it
         tag_of = {self.git("rev-parse", f"{t}^{{commit}}").strip(): t for t in ("v3.0", "v3.1-rc1", "v3.1", "v3.0.1")}
         held = {(h.hex(), c): t for h, c, t in self.rows(
-            "SELECT r.commit_hash, r.chain, s.tag FROM m_commit_release r JOIN m_release_segment s USING (segment_id)")}
+            ("m_commit_release", "r"), ["r.commit_hash", "r.chain", "s.tag"], joins=self.tag_join("r"))}
         all_mainline = self.git("rev-list", "v3.1").split()
         self.assertEqual({sha for sha, chain in held if chain == rst.CHAIN_MAINLINE}, set(all_mainline))
         for sha, tag in tag_of.items():
@@ -359,7 +295,7 @@ class TestIngest(unittest.TestCase):
         self.git("tag", "v3.0.2")
         again = rst.ingest(self.db, self.dir, repo_id=1)
         self.assertEqual((again["state"], again["segments"]), ("updated", 1))
-        self.assertEqual(self.rows("SELECT base_tag, commits FROM m_release_segment WHERE tag = 'v3.0.2'"), [("v3.0.1", 1)])
+        self.assertEqual(self.rows("m_release_segment", ["base_tag", "commits"], {"tag": "v3.0.2"}), [("v3.0.1", 1)])
 
     def test_prefixed_tags_and_kernel_tree_filter(self) -> None:
         """A repository tagged `man-pages-X.Y` is summarized like a kernel one; a kernel tree ignores prefixed tags."""
@@ -374,13 +310,14 @@ class TestIngest(unittest.TestCase):
         summary = rst.ingest(self.db, self.dir, repo_id=2, workers=2)
         self.assertEqual((summary["state"], summary["tags"], summary["segments"]), ("updated", 4, 4))
         seg = {t: (c, b, d) for t, c, b, d in self.rows(
-            "SELECT tag, commits, base_tag, diff_base_tag FROM m_release_segment WHERE repo_id = 2")}
+            "m_release_segment", ["tag", "commits", "base_tag", "diff_base_tag"], {"repo_id": 2})}
         self.assertEqual(seg["man-pages-6.00"], (1, "", ""))
         self.assertEqual(seg["man-pages-6.1-rc1"], (2, "man-pages-6.00", "man-pages-6.00"))
         self.assertEqual(seg["man-pages-6.01"], (2, "man-pages-6.1-rc1", "man-pages-6.00"))
         self.assertEqual(seg["man-pages-6.00.1"], (1, "man-pages-6.00", "man-pages-6.00"))
         first = {n for (n,) in self.rows(
-            "SELECT p.name FROM m_person_first_release f JOIN m_maintainer_person p USING (person_id) WHERE f.repo_id = 2")}
+            ("m_person_first_release", "f"), ["p.name"], {"f.repo_id": 2},
+            joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "f.person_id"})])}
         self.assertEqual(first, {"Ann B", "Neo N", "Cy D"})
 
     def test_moved_mainline_tag_rebuilds_first_releases(self) -> None:
@@ -388,15 +325,16 @@ class TestIngest(unittest.TestCase):
         self.git("tag", "-f", "v3.0", "v3.1-rc1")  # v3.0 now holds Neo's commit too
         self.assertEqual(rst.ingest(self.db, self.dir, repo_id=1)["state"], "updated")
         first = {n: t for n, t in self.rows(
-            "SELECT p.name, s.tag FROM m_person_first_release f JOIN m_release_segment s USING (segment_id) "
-            "JOIN m_maintainer_person p USING (person_id)")}
+            ("m_person_first_release", "f"), ["p.name", "s.tag"],
+            joins=[*self.tag_join("f"), Join(("m_maintainer_person", "p"), {"p.person_id": "f.person_id"})])}
         self.assertEqual(first["Neo N"], "v3.0")
-        self.assertEqual(self.rows("SELECT COUNT(*) FROM m_release_segment WHERE tag = 'v3.0'"), [(1,)])
+        self.assertEqual(self.db.count_rows("m_release_segment", {"tag": "v3.0"}), 1)
         # The replaced segments rewrote their commits: Neo's commit now belongs to v3.0, none is orphaned
         neo = self.git("log", "--format=%H", "--author=Neo", "-1", "v3.1").strip()
-        self.assertEqual(self.rows("SELECT s.tag FROM m_commit_release r JOIN m_release_segment s USING (segment_id) "
-                                   "WHERE r.commit_hash = ? AND r.chain = ?", (bytes.fromhex(neo), rst.CHAIN_MAINLINE)), [("v3.0",)])
-        held = {h for (h,) in self.rows("SELECT commit_hash FROM m_commit_release WHERE chain = ?", (rst.CHAIN_MAINLINE,))}
+        self.assertEqual(self.rows(("m_commit_release", "r"), ["s.tag"],
+                                   {"r.commit_hash": bytes.fromhex(neo), "r.chain": rst.CHAIN_MAINLINE},
+                                   joins=self.tag_join("r")), [("v3.0",)])
+        held = {h for (h,) in self.rows("m_commit_release", ["commit_hash"], {"chain": rst.CHAIN_MAINLINE})}
         self.assertEqual({bytes.fromhex(x) for x in self.git("rev-list", "v3.1").split()}, held)
 
 

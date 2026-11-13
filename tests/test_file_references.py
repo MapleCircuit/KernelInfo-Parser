@@ -250,6 +250,7 @@ class TestPathScopedReferences(unittest.TestCase):
         from unittest import mock
         import main
 
+        import pipeline.file_references
         staged: list[tuple] = []
 
         class FakeTE:
@@ -264,9 +265,9 @@ class TestPathScopedReferences(unittest.TestCase):
             def git_file_list(_self, version):
                 return "\n".join(self.FNIDS) + "\n"
 
-        with mock.patch.object(main, "MF", FakeMF()), mock.patch.object(main.G, "TE", FakeTE()), \
-                mock.patch.object(main, "get_fnid_for_path", self.FNIDS.get), \
-                mock.patch.object(main, "get_fid_for_path", self.BLOBS.get), \
+        with mock.patch.object(pipeline.file_references, "MF", FakeMF()), mock.patch.object(main.G, "TE", FakeTE()), \
+                mock.patch.object(pipeline.file_references, "get_fnid_for_path", self.FNIDS.get), \
+                mock.patch.object(pipeline.file_references, "get_fid_for_path", self.BLOBS.get), \
                 mock.patch.object(main.gp, "VID", 2, create=True), \
                 mock.patch.object(main.gp, "Version_Name", "v3.1", create=True):
             func("v3.1", new_pairs=new_pairs)
@@ -279,75 +280,63 @@ class TestPathScopedReferences(unittest.TestCase):
         return {(r[0], r[1], r[10], r[3], r[5]) for r in rows}
 
     def test_identical_makefiles_reference_their_own_directory(self) -> None:
-        from main import processing_kbuild
+        from pipeline.file_references import processing_kbuild
         rows = self._kbuild(self._run(processing_kbuild, None))
         self.assertEqual(rows, {(9, 1, 11, "y", 1), (9, 2, 12, "y", 1)})
 
     def test_only_new_pairs_are_recomputed(self) -> None:
-        from main import processing_kbuild
+        from pipeline.file_references import processing_kbuild
         # Blob 9 was already at fs/a/Makefile in the previous version: only its new path is parsed
         rows = self._kbuild(self._run(processing_kbuild, {(2, 9)}))
         self.assertEqual(rows, {(9, 2, 12, "y", 1)})
 
     def test_documentation_rows_per_path(self) -> None:
-        from main import processing_doc_references
+        from pipeline.file_references import processing_doc_references
         doc = int(FileRefType.Documentation)
         rows = {tuple(r[1:5]) for r in self._run(processing_doc_references, {(22, 40)})}
         self.assertEqual(rows, {(40, 22, 11, doc), (40, 22, 12, doc)})
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestNewPairsOnce(unittest.TestCase):
-    """Step 6.6 computes the new (path, blob) pairs once, in a temporary table of one connection (D09)."""
+    """Step 6.6 clears and recomputes the references of the (path, blob) pairs new in the version only."""
 
-    def test_one_anti_join_for_clearing_and_includes(self) -> None:
+    def _db(self):
+        from db_engine import SQLiteDB
+        from core.DBLayout import TABLES as ALL
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table(list(ALL))
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(1, 1, 9), (2, 1, 9), (2, 2, 9), (2, 3, 8)])
+        refs = [(1, 9, 1, 7, 1, 1, "kept"), (2, 9, 2, 7, 1, 1, "stale"), (3, 8, 3, 7, 1, 1, "stale")]
+        cols = ["ref_id", "source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"]
+        db.insert_rows("m_file_reference", cols, refs)
+        return db
+
+    def test_clears_only_new_pairs_and_hands_them_to_the_stagers(self) -> None:
         from contextlib import contextmanager
         from unittest import mock
         import main
 
-        log: list[str] = []
-
-        class FakeDB:
-            rowcount = 3
-
-            def execute(self, sql, params=()):
-                log.append(" ".join(sql.split()))
-                return 3
-
-            def query(self, sql, params=(), dictionary=False):
-                return [(1, 9), (2, 9)]
-
-            def commit(self):
-                pass
-
-            def rollback(self):
-                pass
-
-        db = FakeDB()
+        import pipeline.file_references
+        db = self._db()
 
         @contextmanager
         def fake_db():
             yield db
 
         with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", mock.MagicMock()), \
-                mock.patch.object(main, "processing_kbuild") as kbuild, mock.patch.object(main, "processing_doc_references"), \
+                mock.patch.object(pipeline.file_references, "processing_kbuild") as kbuild, mock.patch.object(pipeline.file_references, "processing_doc_references"), \
                 mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
-            main.processing_file_references("v3.1")
-        anti_joins = [s for s in log if "LEFT JOIN m_bridge_checkpoint old_v" in s]
-        self.assertEqual(len(anti_joins), 1)
-        self.assertTrue(anti_joins[0].startswith("INSERT INTO tmp_new_pairs"))
-        self.assertIn("DELETE r FROM tmp_new_pairs p JOIN m_file_reference r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid", log)
-        self.assertIn("DELETE r FROM tmp_new_pairs p JOIN m_kbuild_symbol r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid", log)
-        self.assertTrue(any(s.startswith("INSERT IGNORE INTO m_file_reference") and "FROM tmp_new_pairs p" in s for s in log))
-        self.assertEqual(kbuild.call_args.kwargs["new_pairs"], {(1, 9), (2, 9)})
-        self.assertEqual(log[-1], "DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+            pipeline.file_references.processing_file_references("v3.1")
+        self.assertEqual(kbuild.call_args.kwargs["new_pairs"], {(2, 9), (3, 8)})
+        left = db.select_values("m_file_reference", "details", order_by=["ref_id"])
+        self.assertEqual(left, ["kept"])
 
     def test_processing_file_references_invalidates_te_id_cursor(self) -> None:
         from unittest import mock
         from contextlib import contextmanager
         import main
+        import pipeline.file_references
         from core.DBLayout import m_file_reference
 
         te_mock = mock.MagicMock()
@@ -356,28 +345,22 @@ class TestNewPairsOnce(unittest.TestCase):
         te_mock._id_limit = {m_file_reference.table_id: 10000}
         te_mock.next_id = {m_file_reference.table_id: 1353}
         te_mock.queued_set = {}
+        db = self._db()
 
-        class DummyDB:
-            def execute(self, *args, **kwargs):
-                return 0
-            def query(self, *args, **kwargs):
-                return []
-            def commit(self):
-                pass
-            def get_next_id(self, tbl):
-                return 96696
-
-        db = DummyDB()
         @contextmanager
         def fake_db():
             yield db
 
         with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", te_mock), \
-                mock.patch.object(main, "processing_kbuild"), mock.patch.object(main, "processing_doc_references"), \
-                mock.patch.object(main, "processing_include_references"), \
+                mock.patch.object(pipeline.file_references, "processing_kbuild"), mock.patch.object(pipeline.file_references, "processing_doc_references"), \
+                mock.patch.object(pipeline.file_references, "processing_include_references"), \
                 mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
-            main.processing_file_references("v3.1")
+            pipeline.file_references.processing_file_references("v3.1")
 
         self.assertNotIn(m_file_reference.table_id, te_mock._id_cursor)
         self.assertNotIn(m_file_reference.table_id, te_mock._id_limit)
-        self.assertEqual(te_mock.next_id[m_file_reference.table_id], 96696)
+        self.assertEqual(te_mock.next_id[m_file_reference.table_id], db.get_next_id(m_file_reference))
+
+
+if __name__ == "__main__":
+    unittest.main()

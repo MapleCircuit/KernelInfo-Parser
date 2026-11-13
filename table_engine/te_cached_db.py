@@ -37,7 +37,7 @@ import time
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from core.globalstuff import JoinsType, SafeDataType
+from core.globalstuff import SafeDataType
 from table_engine.shared_buffer import (
     estimate_packed_bytes,
     SharedTableBuilder,
@@ -149,10 +149,10 @@ class TECachedDB(TEDirectDB):
         table only its working window, which is what `_load_preload_rows()` goes on to read.
         Run before preloading on each start, so a table that grew past the ceiling since the last version
         is dropped from the cache instead of preloaded, and one that is back under it is cached again.
-        A table whose size the driver cannot report (no `table_size()`, or it raised) is cached as configured.
+        A table whose size the driver cannot report (its `table_size()` reports 0, or it raised) is cached as configured.
         """
         self._oversized = {}
-        if not self.cache_max_bytes or self.db is None or not hasattr(self.db, "table_size"):
+        if not self.cache_max_bytes or self.db is None:
             return
         min_active_vid = self._get_min_active_vid()
         for table in self.tables.values():
@@ -214,33 +214,17 @@ class TECachedDB(TEDirectDB):
                 return tuple(bytes(x) if isinstance(x, (bytearray, memoryview)) else x for x in key)
         return key
 
-    @staticmethod
-    def _normalize_binary_val(val: Any) -> bytes:
-        """Coerce binary column value (bytearray, bytes, or latin1/utf-8 decoded string) to canonical bytes."""
-        if isinstance(val, (bytearray, memoryview)):
-            return bytes(val)
-        if isinstance(val, str):
-            try:
-                return val.encode("latin1")
-            except UnicodeEncodeError:
-                return val.encode("utf-8")
-        return bytes(val)
-
     @classmethod
     def _project_row(cls, table: Table, row: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]:
-        """Project row to only retain configured cached columns, substituting un-cached with None."""
+        """Project row to only retain configured cached columns, substituting un-cached with None.
+
+        Binary values arrive as `bytes` (the database engines normalize them); mutable buffers are frozen.
+        """
         cached_cols = getattr(table, "cached_columns", None)
-        cols_def = table.init_columns
         if cached_cols is None or len(cached_cols) == table.length:
-            return tuple(
-                (bytes(val) if isinstance(val, (bytearray, memoryview))
-                 else (cls._normalize_binary_val(val) if isinstance(val, str) and cols_def[i][1].upper().startswith("BINARY") else val))
-                for i, val in enumerate(row)
-            )
+            return tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row)
         return tuple(
-            (bytes(row[i]) if isinstance(row[i], (bytearray, memoryview))
-             else (cls._normalize_binary_val(row[i]) if isinstance(row[i], str) and cols_def[i][1].upper().startswith("BINARY") else row[i]))
-            if i in cached_cols else None
+            (bytes(row[i]) if isinstance(row[i], (bytearray, memoryview)) else row[i]) if i in cached_cols else None
             for i in range(table.length)
         )
 
@@ -253,14 +237,9 @@ class TECachedDB(TEDirectDB):
     ) -> tuple[SafeDataType, ...]:
         """Reconstruct full canonical row of length table.length from a column-projected query result."""
         full_row = [None] * table.length
-        cols_def = table.init_columns
         for idx, col_pos in enumerate(cached_cols):
             val = selected_row[idx]
-            if isinstance(val, (bytearray, memoryview)):
-                val = bytes(val)
-            elif isinstance(val, str) and cols_def[col_pos][1].upper().startswith("BINARY"):
-                val = cls._normalize_binary_val(val)
-            full_row[col_pos] = val
+            full_row[col_pos] = bytes(val) if isinstance(val, (bytearray, memoryview)) else val
         return tuple(full_row)
 
     @staticmethod
@@ -632,14 +611,9 @@ class TECachedDB(TEDirectDB):
         is_v_scoped = self._is_version_scoped(table)
         cached_cols = getattr(table, "cached_columns", None)
         min_vid = min_active_vid if (is_v_scoped and min_active_vid > 0) else None
-        has_preload = hasattr(self.db, "select_preload")
 
         try:
-            if has_preload:
-                raw_rows = self.db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)
-            else:
-                joins: JoinsType = (((table.table_id, 0),),)
-                raw_rows = self.db.view_select_multiple(self.tables, joins, (None,) * table.length)
+            raw_rows = self.db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)
         except Exception:
             return []
 
@@ -652,11 +626,7 @@ class TECachedDB(TEDirectDB):
         if not raw_rows:
             return []
 
-        is_partial_query = cached_cols is not None and len(cached_cols) < table.length and has_preload
-        # Fallback version check if the driver did not filter
-        fallback_vid_col = (
-            self._get_vid_col_idx(table) if (is_v_scoped and min_active_vid > 0 and not has_preload) else None
-        )
+        is_partial_query = cached_cols is not None and len(cached_cols) < table.length
         # Take the rows over one at a time, in order, so they are released as the projected ones are built
         # instead of a table being held twice over. The drained list is this engine's own copy of the
         # references (cheap: one pointer per row), never the list the driver returned, which it may still own.
@@ -668,8 +638,6 @@ class TECachedDB(TEDirectDB):
             row = pending_raw.pop()
             if is_partial_query:
                 rows.append(self._reconstruct_partial_row(table, row, cached_cols))
-                continue
-            if fallback_vid_col is not None and row[fallback_vid_col] is not None and row[fallback_vid_col] < min_active_vid:
                 continue
             rows.append(self._project_row(table, row))
         return rows

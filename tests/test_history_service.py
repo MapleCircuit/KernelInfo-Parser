@@ -18,6 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pathlib import Path
 from unittest import mock
 
+from core import DBLayout as D
+from db_engine import MockDB
+from db_engine.spec import gt
+from tests.db_fixtures import patch_reader, requires_live_db
 from fastapi import HTTPException
 from webapp.backend.services.history_service import (
     RC_RE,
@@ -153,6 +157,7 @@ class TestHistoryHelpers(unittest.TestCase):
             history_service.get_change_commits("../etc/passwd", "v2.6.15")
 
 
+@requires_live_db("indexed history of the live database")
 class TestHistoryIntegration(unittest.TestCase):
     """Indexed data: copy_process() (kernel/fork.c) changes in most early 2.6 releases."""
 
@@ -162,10 +167,10 @@ class TestHistoryIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         try:
-            from webapp.backend.database.pool import get_db_cursor
+            from webapp.backend.database.pool import get_reader
             from webapp.backend.services.history_service import indexed_versions
-            with get_db_cursor() as cursor:
-                cls.versions = indexed_versions(cursor, include_rc=True)
+            with get_reader() as reader:
+                cls.versions = indexed_versions(reader, include_rc=True)
         except Exception as e:  # no database
             raise unittest.SkipTest(f"database unavailable: {e}")
         if not cls.versions:
@@ -328,37 +333,33 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
         lines 8-11), their commit bridges (GitCommitParser.map_tags_to_commits), the commit files."""
         from parser.git_ast import GitCommitParser
         db = cls.store.db
-        db.executescript("""
-            DROP TABLE m_ingest_state;
-            CREATE TABLE m_ingest_state (network_id INT, commit_id INT, status INT, base_commit_id INT);
-            CREATE TABLE m_bridge_tag (blob_id INT, tag_id INT, line_s INT, line_e INT);
-            CREATE TABLE m_bridge_commit_tag (commit_id INT, blob_id INT, tag_id INT);
-            CREATE TABLE m_file_name (fnid INTEGER PRIMARY KEY, fname TEXT);
-            CREATE TABLE m_commit_file (commit_id INT, fnid INT, blob_id INT, old_fnid INT, old_blob_id INT, change_type TEXT);
-            INSERT INTO m_maintainer_person VALUES (1, 'Ann', 'ann@x.org');
-            INSERT INTO m_file_name VALUES (1, 'a.c'), (2, 'b.c');
-        """)
-        ids = {bytes(h).hex(): cid for cid, h in db.execute("SELECT commit_id, commit_hash FROM m_commit WHERE commit_id > 0")}
+        db.create_table([D.m_bridge_tag, D.m_bridge_commit_tag, D.m_file_name, D.m_commit_file])
+        db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(1, "Ann", "ann@x.org")], on_conflict="ignore")
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "a.c"), (2, "b.c")])
+        ids = {bytes(h).hex(): cid for cid, h in db.select_rows("m_commit", ["commit_id", "commit_hash"], {"commit_id": gt(0)})}
         cls.ids = ids
         tag = lambda t: cls.git("rev-parse", f"{t}^{{commit}}").strip()  # noqa: E731
-        db.executemany("INSERT INTO m_ingest_state VALUES (1, ?, 2, ?)",
-                       [(ids[tag("v1.0")], 0), (ids[tag("v1.1")], ids[tag("v1.0")]), (ids[tag("v1.2")], ids[tag("v1.1")])])
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at", "base_commit_id"],
+                       [(1, ids[tag("v1.0")], 2, 0, 0), (1, ids[tag("v1.1")], 2, 0, ids[tag("v1.0")]),
+                        (1, ids[tag("v1.2")], 2, 0, ids[tag("v1.1")])])
         cls.blob = 500
-        db.executemany("INSERT INTO m_bridge_tag VALUES (?, ?, ?, ?)", [(cls.blob, 1, 1, 6), (cls.blob, 2, 8, 11)])
+        db.insert_rows("m_bridge_tag", ["blob_id", "tag_id", "line_s", "line_e", "char_s", "char_e"],
+                       [(cls.blob, 1, 1, 6, 0, 0), (cls.blob, 2, 8, 11, 0, 0)])
         gp = GitCommitParser(repo_dir=str(cls.dir))
         _commits, hunks = gp.parse_version_commits_with_hunks("v1.0", "v1.1")
         bridges = gp.map_tags_to_commits([(1, cls.blob, 1, 6), (2, cls.blob, 8, 11)], "a.c", commit_hash_to_id=ids,
                                          file_hunks_map=hunks)
-        db.executemany("INSERT INTO m_bridge_commit_tag VALUES (?, ?, ?)", bridges)
+        db.insert_rows("m_bridge_commit_tag", ["commit_id", "blob_id", "tag_id"], bridges)
+        cf_cols = ["commit_id", "fnid", "blob_id", "old_fnid", "old_blob_id", "change_type"]
         for sha, cid in ids.items():
             out = cls.git("diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "--root", sha)
             for line in out.splitlines():
                 parts = line.split("\t")
                 fn = {"a.c": 1, "b.c": 2}
                 if parts[0].startswith("R"):
-                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 0, ?, 0, 'R')", (cid, fn[parts[2]], fn[parts[1]]))
+                    db.insert_rows("m_commit_file", cf_cols, [(cid, fn[parts[2]], 0, fn[parts[1]], 0, "R")])
                 else:
-                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 0, ?, 0, ?)", (cid, fn[parts[1]], fn[parts[1]], parts[0]))
+                    db.insert_rows("m_commit_file", cf_cols, [(cid, fn[parts[1]], 0, fn[parts[1]], 0, parts[0])])
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -371,7 +372,6 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
         sha_v2 = self.git("rev-parse", "v1.1:a.c").strip()
         self.patches = [
             *self.store.patches(),
-            mock.patch.object(hs, "get_db_cursor", return_value=self.store.dict_cursor()),
             mock.patch.object(hs, "get_active_network_id", return_value=1),
             mock.patch.object(hs, "get_active_repo_id", return_value=1),
             mock.patch.object(hs, "get_repo_dir", lambda: self.dir),
@@ -381,9 +381,9 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
         ]
         for p in self.patches:
             p.start()
+        self.enterContext(patch_reader(self.store.engine))
         rs._TAGS_CACHE.clear()
         hs._cached_change_commits.cache_clear()
-        self.store.statements.clear()
 
     def tearDown(self) -> None:
         for p in self.patches:
@@ -400,7 +400,6 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
             self.assertEqual([c["commit_hash"] for c in res["commits"]], self.git_answer("a.c", "v1.0", "v1.1", s, e))
             self.assertEqual({c["commit_hash"] for c in res["commits"]}, set(want))
         self.assertEqual(res["commits"][0]["author_name"], "Ann")
-        self.assertTrue(all(st.lstrip().upper().startswith("SELECT") for st in self.store.statements))
 
     def test_without_lines_lists_the_file_commits(self) -> None:
         res = self.hs.history_service.get_change_commits("a.c", "v1.2", "v1.1")
@@ -417,12 +416,12 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
     def test_reappeared_blob_does_not_leak_older_commits(self) -> None:
         db = self.store.db
         older = self.ids[self.git("rev-parse", "v1.0").strip()]
-        db.execute("INSERT INTO m_bridge_commit_tag VALUES (?, ?, 1)", (older, self.blob))
+        db.insert_rows("m_bridge_commit_tag", ["commit_id", "blob_id", "tag_id"], [(older, self.blob, 1)])
         try:
             res = self.hs.history_service.get_change_commits("a.c", "v1.1", "v1.0", 1, 6)
             self.assertNotIn(self.git("rev-parse", "v1.0").strip(), [c["commit_hash"] for c in res["commits"]])
         finally:
-            db.execute("DELETE FROM m_bridge_commit_tag WHERE commit_id = ?", (older,))
+            db.delete_rows("m_bridge_commit_tag", {"commit_id": older})
 
     def test_rename_is_followed(self) -> None:
         tag = lambda t: self.git("rev-parse", f"{t}^{{commit}}").strip()  # noqa: E731
@@ -431,23 +430,19 @@ class TestChangeCommitsFromDatabase(unittest.TestCase):
         self.assertIsNone(shas[2])
         sha_v2 = shas[1]
         new_sha = self.git("rev-parse", "v1.2:b.c").strip()
-        cur = mock.MagicMock()
-        answers = []
-
-        def execute(sql, params=()):
-            answers.append(sql)
-            cur.rows = [{"new_blob_id": 501}] if "m_blob_transition" in sql else [{"fname": "b.c"}]
-
-        cur.execute.side_effect = execute
-        cur.fetchall.side_effect = lambda: cur.rows
+        db = MockDB(use_global=False)
+        # v1.2 stores the new path in its checkpoint tree; the blob moved to 501 (a transition of the old blob)
+        db.insert_rows("m_blob_transition", ["old_blob_id", "new_blob_id"], [(self.blob, 501)])
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "a.c"), (2, "b.c")])
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(versions[2]["vid"], 2, 501)])
         meta = {sha_v2: (self.blob, 1)}
-        with mock.patch.object(self.hs.git_tree_resolver, "map_blob_hashes", side_effect=lambda c, s: {x: (501, 1) for x in s}):
-            paths, renamed = self.hs.HistoryService._follow_renames(cur, versions, "a.c", shas, meta)
+        with mock.patch.object(self.hs.git_tree_resolver, "map_blob_hashes", side_effect=lambda c, s: {x: (501, 1) for x in s}), \
+                patch_reader(db), self.hs.get_reader() as reader:
+            paths, renamed = self.hs.HistoryService._follow_renames(reader, versions, "a.c", shas, meta)
         self.assertEqual(paths, ["a.c", "a.c", "b.c"])
         self.assertEqual(renamed, {2: "a.c"})
         self.assertEqual(shas[2], new_sha)          # the timeline continues on the new path
         self.assertIn(new_sha, meta)                # a pure rename keeps the blob
-        self.assertIn("m_checkpoint_tree", answers[1])
 
 
 if __name__ == "__main__":

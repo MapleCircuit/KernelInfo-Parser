@@ -28,9 +28,9 @@ from parser.kconfig_ast.kconfig_definitions import (  # noqa: F401 - re-exported
 )
 from webapp.backend.services import kconfig_facts
 from webapp.backend.config import get_repo_dir
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import AnyOf, Const, Join, Order, finished_ref, ge, gt, le, sub
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    finished_ref_sql,
     get_active_network_id,
     get_active_repo_id,
     get_version_info,
@@ -97,28 +97,26 @@ def normalize_code(code: str, strip_c_comments: bool = True) -> str:
     return " ".join(code.split())
 
 
-def indexed_versions(cursor: Any, include_rc: bool = False, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def indexed_versions(reader: Any, include_rc: bool = False, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Indexed refs of the active repository, oldest first; release candidates only with include_rc.
 
     `scope` (history_scope()) keeps one branch: the tags reachable from it and the branch's own ref,
     so a timeline never interleaves releases of other branches (v2.6.16.62 is on stable/linux-2.6.16.y,
     not on master). Without it every indexed ref is listed.
     """
-    cursor.execute(
-        f"""
-        SELECT r.ref_name, r.commit_id, r.ref_type
-        FROM m_git_ref r
-        LEFT JOIN m_commit c ON c.commit_id = r.commit_id
-        WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()}
-        ORDER BY c.committer_date ASC, r.commit_id ASC;
-        """,
-        (get_active_repo_id(cursor),),
+    rows = reader.select_rows(
+        ("m_git_ref", "r"),
+        {"ref_name": "r.ref_name", "commit_id": "r.commit_id", "ref_type": "r.ref_type"},
+        [{"r.commit_id": gt(0), "r.repo_id": get_active_repo_id(reader)}, finished_ref("r")],
+        joins=[Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}, "left")],
+        order_by=["c.committer_date", "r.commit_id"],
+        as_dict=True,
     )
     tags = scope["tags"] if scope else None
     versions = []
     seen: set[str] = set()
     rc_count = 0
-    for r in cursor.fetchall():
+    for r in rows:
         name = safe_decode(r["ref_name"])
         if name in seen:
             continue
@@ -233,7 +231,7 @@ def _slice_extent(lines: list[str], s_l: int, e_l: int, s_c: int, e_c: int) -> s
     return "\n".join(slices)
 
 
-def tag_codes(cursor: Any, tag_ids: set[int]) -> dict[int, str]:
+def tag_codes(reader: Any, tag_ids: set[int]) -> dict[int, str]:
     """Code snippet of each tag reconstructed on-demand from Git blobs via m_bridge_tag coordinates."""
     codes: dict[int, str] = {}
     missing_ids: list[int] = []
@@ -256,17 +254,16 @@ def tag_codes(cursor: Any, tag_ids: set[int]) -> dict[int, str]:
     tag_spans: dict[int, tuple[str, int, int, int, int]] = {}
     for i in range(0, len(missing_ids), 1000):
         chunk = missing_ids[i:i + 1000]
-        fmt = ",".join(["%s"] * len(chunk))
-        cursor.execute(
-            f"""
-            SELECT bt.tag_id, fb.blob_hash, bt.line_s, bt.line_e, bt.char_s, bt.char_e
-            FROM m_bridge_tag bt
-            JOIN m_file_blob fb ON fb.blob_id = bt.blob_id
-            WHERE bt.tag_id IN ({fmt});
-            """,
-            chunk,
-        )
-        for r in cursor.fetchall():
+        for r in reader.select_rows(
+            ("m_bridge_tag", "bt"),
+            {
+                "tag_id": "bt.tag_id", "blob_hash": "fb.blob_hash", "line_s": "bt.line_s", "line_e": "bt.line_e",
+                "char_s": "bt.char_s", "char_e": "bt.char_e",
+            },
+            {"bt.tag_id": chunk},
+            joins=[Join(("m_file_blob", "fb"), {"fb.blob_id": "bt.blob_id"})],
+            as_dict=True,
+        ):
             tid = r["tag_id"]
             if tid not in tag_spans:
                 tag_spans[tid] = (
@@ -308,21 +305,14 @@ def tag_codes(cursor: Any, tag_ids: set[int]) -> dict[int, str]:
     return codes
 
 
-def tag_lineage(cursor: Any, tag_id: int) -> set[int]:
+def tag_lineage(reader: Any, tag_id: int) -> set[int]:
     """Transitive closure of m_moved_tag around tag_id, in both directions (bounded)."""
     seen = {tag_id}
     frontier = [tag_id]
     while frontier and len(seen) < LINEAGE_LIMIT:
-        fmt = ",".join(["%s"] * len(frontier))
-        cursor.execute(
-            f"""
-            SELECT e_tag_id AS t FROM m_moved_tag WHERE s_tag_id IN ({fmt})
-            UNION
-            SELECT s_tag_id AS t FROM m_moved_tag WHERE e_tag_id IN ({fmt});
-            """,
-            frontier + frontier,
-        )
-        frontier = [r["t"] for r in cursor.fetchall() if r["t"] not in seen]
+        reached = set(reader.select_values("m_moved_tag", "e_tag_id", {"s_tag_id": frontier}))
+        reached.update(reader.select_values("m_moved_tag", "s_tag_id", {"e_tag_id": frontier}))
+        frontier = [t for t in reached if t not in seen]
         seen.update(frontier)
     return seen
 
@@ -384,20 +374,27 @@ MAX_RENAMES = 5
 INGEST_CHAIN_LIMIT = 200
 
 
-def _ingest_chain(cursor: Any, network_id: int, from_sha: str, to_sha: str) -> list[int] | None:
+def _ingest_chain(reader: Any, network_id: int, from_sha: str, to_sha: str) -> list[int] | None:
     """commit_ids of the finished versions whose ingestion ranges lead from from_rev's commit to to_rev's
     (m_ingest_state.base_commit_id), to_rev's first; None when the bases do not reach from_rev (a version
     in between was never ingested, or an older database without base_commit_id)."""
-    cursor.execute(
-        "SELECT commit_id, commit_hash FROM m_commit WHERE network_id = %s AND commit_hash IN (%s, %s);",
-        (network_id, bytes.fromhex(from_sha), bytes.fromhex(to_sha)),
-    )
-    ids = {hash_hex(r["commit_hash"]): int(r["commit_id"]) for r in cursor.fetchall()}
+    ids = {
+        hash_hex(r["commit_hash"]): int(r["commit_id"])
+        for r in reader.select_rows(
+            "m_commit",
+            ["commit_id", "commit_hash"],
+            {"network_id": network_id, "commit_hash": [bytes.fromhex(from_sha), bytes.fromhex(to_sha)]},
+            as_dict=True,
+        )
+    }
     if from_sha not in ids or to_sha not in ids:
         return None
-    cursor.execute("SELECT commit_id, base_commit_id FROM m_ingest_state WHERE network_id = %s AND status = %s;",
-                   (network_id, INGEST_DONE))
-    base = {int(r["commit_id"]): int(r["base_commit_id"] or 0) for r in cursor.fetchall()}
+    base = {
+        int(r["commit_id"]): int(r["base_commit_id"] or 0)
+        for r in reader.select_rows(
+            "m_ingest_state", ["commit_id", "base_commit_id"], {"network_id": network_id, "status": INGEST_DONE}, as_dict=True
+        )
+    }
     chain, cid = [], ids[to_sha]
     while cid != ids[from_sha]:
         if cid not in base or len(chain) >= INGEST_CHAIN_LIMIT:
@@ -407,7 +404,13 @@ def _ingest_chain(cursor: Any, network_id: int, from_sha: str, to_sha: str) -> l
     return chain or None
 
 
-def _db_change_commits(cursor: Any, path: str, from_rev: str, to_rev: str, line_s: int, line_e: int,
+_CHANGE_COMMIT_COLUMNS = {
+    "commit_id": "c.commit_id", "commit_hash": "c.commit_hash", "author_date": "c.author_date",
+    "committer_date": "c.committer_date", "subject": "c.subject", "name": "p.name", "email": "p.email",
+}
+
+
+def _db_change_commits(reader: Any, path: str, from_rev: str, to_rev: str, line_s: int, line_e: int,
                        limit: int) -> list[dict[str, Any]] | None:
     """The commits of from_rev..to_rev behind a change, from what the parser stored; None when the
     database cannot answer (then `git log` does).
@@ -425,70 +428,73 @@ def _db_change_commits(cursor: Any, path: str, from_rev: str, to_rev: str, line_
     segments = rs.walk_segments(from_rev, to_rev)
     if not segments:
         return None
-    network_id = get_active_network_id(cursor)
-    repo_id = get_active_repo_id(cursor)
+    network_id = get_active_network_id(reader)
+    repo_id = get_active_repo_id(reader)
     if network_id is None:
         return None
-    chain = _ingest_chain(cursor, network_id, tags[from_rev], tags[to_rev])
+    chain = _ingest_chain(reader, network_id, tags[from_rev], tags[to_rev])
     if chain is None:
         return None
-    seg_sql = ",".join(["%s"] * len(segments))
     if line_s > 0 and line_e >= line_s:
         if len(chain) != 1:
             return None
         sha = batch_blob_shas([f"{to_rev}:{path}"])[0]
-        meta = git_tree_resolver.map_blob_hashes(cursor, [sha]) if sha else {}
+        meta = git_tree_resolver.map_blob_hashes(reader, [sha]) if sha else {}
         if not sha or sha not in meta:
             return None
         blob_id = meta[sha][0]
-        cursor.execute("SELECT tag_id FROM m_bridge_tag WHERE blob_id = %s AND line_s <= %s AND line_e >= %s;",
-                       (blob_id, line_e, line_s))
-        tag_ids = sorted({int(r["tag_id"]) for r in cursor.fetchall()})
+        tag_ids = sorted({
+            int(t)
+            for t in reader.select_values(
+                "m_bridge_tag", "tag_id", {"blob_id": blob_id, "line_s": le(line_e), "line_e": ge(line_s)}
+            )
+        })
         if not tag_ids:
             return []
         commit_ids: set[int] = set()
         for i in range(0, len(tag_ids), 500):
             part = tag_ids[i:i + 500]
-            cursor.execute(
-                f"SELECT DISTINCT commit_id FROM m_bridge_commit_tag WHERE blob_id = %s AND tag_id IN ({','.join(['%s'] * len(part))});",
-                (blob_id, *part),
+            commit_ids.update(
+                int(c)
+                for c in reader.select_values(
+                    "m_bridge_commit_tag", "commit_id", {"blob_id": blob_id, "tag_id": part}, distinct=True
+                )
             )
-            commit_ids.update(int(r["commit_id"]) for r in cursor.fetchall())
         if not commit_ids:
             return []
         ids = sorted(commit_ids)
         rows: list[dict[str, Any]] = []
         for i in range(0, len(ids), 1000):
             part = ids[i:i + 1000]
-            cursor.execute(
-                f"""
-                SELECT c.commit_id, c.commit_hash, c.author_date, c.committer_date, c.subject, p.name, p.email
-                FROM m_commit c
-                JOIN m_commit_release cr ON cr.repo_id = %s AND cr.commit_hash = c.commit_hash AND cr.segment_id IN ({seg_sql})
-                LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
-                WHERE c.commit_id IN ({','.join(['%s'] * len(part))});
-                """,
-                (repo_id, *segments, *part),
+            rows.extend(
+                reader.select_rows(
+                    ("m_commit", "c"),
+                    _CHANGE_COMMIT_COLUMNS,
+                    {"c.commit_id": part, "cr.segment_id": list(segments)},
+                    joins=[
+                        Join(("m_commit_release", "cr"), {"cr.repo_id": repo_id, "cr.commit_hash": "c.commit_hash"}),
+                        Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left"),
+                    ],
+                    as_dict=True,
+                )
             )
-            rows.extend(cursor.fetchall())
     else:
-        cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (path,))
-        row = cursor.fetchone()
-        if not row:
+        fnid = reader.select_value("m_file_name", "fnid", {"fname": path})
+        if fnid is None:
             return []
-        fnid = int(row["fnid"])
-        cursor.execute(
-            f"""
-            SELECT DISTINCT c.commit_id, c.commit_hash, c.author_date, c.committer_date, c.subject, p.name, p.email
-            FROM m_commit_release cr
-            JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash
-            JOIN m_commit_file f ON f.commit_id = c.commit_id AND (f.fnid = %s OR f.old_fnid = %s)
-            LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
-            WHERE cr.repo_id = %s AND cr.segment_id IN ({seg_sql});
-            """,
-            (network_id, fnid, fnid, repo_id, *segments),
+        fnid = int(fnid)
+        rows = reader.select_rows(
+            ("m_commit_release", "cr"),
+            _CHANGE_COMMIT_COLUMNS,
+            [{"cr.repo_id": repo_id, "cr.segment_id": list(segments)}, AnyOf({"f.fnid": fnid}, {"f.old_fnid": fnid})],
+            joins=[
+                Join(("m_commit", "c"), {"c.network_id": network_id, "c.commit_hash": "cr.commit_hash"}),
+                Join(("m_commit_file", "f"), {"f.commit_id": "c.commit_id"}),
+                Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left"),
+            ],
+            distinct=True,
+            as_dict=True,
         )
-        rows = cursor.fetchall()
     seen: set[str] = set()
     commits = []
     # Newest first like git log; same-second commits by commit_id (the parser registers parents first)
@@ -536,21 +542,20 @@ class HistoryService:
         """
         norm_path = (path or "").strip().strip("/")
         scope = history_scope(version_name, branch)
-        with get_db_cursor() as cursor:
-            anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, name, arch)
+        with get_reader() as reader:
+            anchor = self._resolve_anchor(reader, version_name, norm_path, line, ast_id, name, arch)
             if anchor["type_id"] in KCONFIG_TYPES:
                 return self.get_kconfig_history(anchor["name"], version_name, include_rc, scope=scope)
             norm_path = anchor["path"]
-            versions = indexed_versions(cursor, include_rc, scope)
+            versions = indexed_versions(reader, include_rc, scope)
             shas = batch_blob_shas([f"{v['vname']}:{norm_path}" for v in versions])
-            blob_meta = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s])
-            paths, renamed_from = self._follow_renames(cursor, versions, norm_path, shas, blob_meta)
+            blob_meta = git_tree_resolver.map_blob_hashes(reader, [s for s in shas if s])
+            paths, renamed_from = self._follow_renames(reader, versions, norm_path, shas, blob_meta)
             blob_ids = sorted({blob_meta[s][0] for s in shas if s and s in blob_meta})
-            lineage = tag_lineage(cursor, anchor["tag_id"])
-            cands = self._candidates(cursor, blob_ids, anchor, lineage)
-            codes = tag_codes(cursor, {c["tag_id"] for rows in cands.values() for c in rows} | {anchor["tag_id"]})
-            cursor.execute("SELECT name FROM m_type_descriptor WHERE type_id = %s;", (anchor["type_id"],))
-            type_row = cursor.fetchone()
+            lineage = tag_lineage(reader, anchor["tag_id"])
+            cands = self._candidates(reader, blob_ids, anchor, lineage)
+            codes = tag_codes(reader, {c["tag_id"] for rows in cands.values() for c in rows} | {anchor["tag_id"]})
+            type_row = reader.select_one("m_type_descriptor", ["name"], {"type_id": anchor["type_id"]}, as_dict=True)
 
         strip_comments = not norm_path.split("/")[-1].startswith("Kconfig")
         timeline: list[dict[str, Any]] = []
@@ -629,7 +634,7 @@ class HistoryService:
         }
 
     @staticmethod
-    def _follow_renames(cursor: Any, versions: list[dict[str, Any]], path: str, shas: list[str | None],
+    def _follow_renames(reader: Any, versions: list[dict[str, Any]], path: str, shas: list[str | None],
                         blob_meta: dict[str, Any]) -> tuple[list[str], dict[int, str]]:
         """Paths of the timeline's versions, following renames: when the path has no blob at a version
         but had an indexed one at the previous, m_blob_transition (old blob -> new blob, written by the
@@ -647,18 +652,17 @@ class HistoryService:
             start = k + 1
             old_blob = blob_meta[shas[k - 1]][0]
             try:
-                cursor.execute("SELECT new_blob_id FROM m_blob_transition WHERE old_blob_id = %s;", (old_blob,))
-                new_blobs = sorted({int(r["new_blob_id"]) for r in cursor.fetchall()})
+                new_blobs = sorted({int(b) for b in reader.select_values("m_blob_transition", "new_blob_id", {"old_blob_id": old_blob})})
                 if not new_blobs:
                     continue
-                cursor.execute(
-                    f"""
-                    SELECT DISTINCT f.fname FROM m_checkpoint_tree t JOIN m_file_name f ON f.fnid = t.fnid
-                    WHERE t.commit_id = %s AND t.blob_id IN ({",".join(["%s"] * len(new_blobs))});
-                    """,
-                    (versions[k]["vid"], *new_blobs),
+                names = reader.select_values(
+                    (reader.checkpoint_tree_source(), "t"),
+                    "f.fname",
+                    {"t.commit_id": versions[k]["vid"], "t.blob_id": new_blobs},
+                    joins=[Join(("m_file_name", "f"), {"f.fnid": "t.fnid"})],
+                    distinct=True,
                 )
-                found = sorted({safe_decode(r["fname"]) for r in cursor.fetchall()} - {paths[k - 1]})
+                found = sorted({safe_decode(n) for n in names} - {paths[k - 1]})
             except Exception as exc:  # noqa: BLE001 - the timeline stays on one path
                 logger.debug("rename lookup failed: %s", exc)
                 break
@@ -669,27 +673,24 @@ class HistoryService:
             if new_shas[0] is None:
                 continue
             shas[k:] = new_shas
-            blob_meta.update(git_tree_resolver.map_blob_hashes(cursor, [s for s in new_shas if s and s not in blob_meta]))
+            blob_meta.update(git_tree_resolver.map_blob_hashes(reader, [s for s in new_shas if s and s not in blob_meta]))
             renamed_from[k] = paths[k - 1]
             paths[k:] = [new_path] * (len(versions) - k)
         return paths, renamed_from
 
     @staticmethod
-    def _anchor_row(cursor: Any, tag_id: int, path: str, line_s: int | None = None) -> dict[str, Any]:
-        cursor.execute(
-            """
-            SELECT t.tag_id, t.ast_id, a.name, a.type_id
-            FROM m_tag t JOIN m_ast a ON a.ast_id = t.ast_id
-            WHERE t.tag_id = %s LIMIT 1;
-            """,
-            (tag_id,),
+    def _anchor_row(reader: Any, tag_id: int, path: str, line_s: int | None = None) -> dict[str, Any]:
+        row = reader.select_one(
+            ("m_tag", "t"),
+            {"tag_id": "t.tag_id", "ast_id": "t.ast_id", "name": "a.name", "type_id": "a.type_id"},
+            {"t.tag_id": tag_id},
+            joins=[Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"})],
+            as_dict=True,
         )
-        row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
         if line_s is None:
-            cursor.execute("SELECT line_s FROM m_bridge_tag WHERE tag_id = %s LIMIT 1;", (tag_id,))
-            r = cursor.fetchone()
+            r = reader.select_one("m_bridge_tag", ["line_s"], {"tag_id": tag_id}, as_dict=True)
             line_s = r["line_s"] if r else 0
         return {
             "tag_id": row["tag_id"], "ast_id": row["ast_id"], "name": safe_decode(row["name"]) or "",
@@ -698,7 +699,7 @@ class HistoryService:
 
     def _resolve_anchor(
         self,
-        cursor: Any,
+        reader: Any,
         version_name: str,
         path: str,
         line: int | None,
@@ -706,33 +707,30 @@ class HistoryService:
         name: str | None,
         arch: str = DEFAULT_DEFINITION_ARCH,
     ) -> dict[str, Any]:
-        vid, vname = get_version_info(cursor, version_name)
+        vid, vname = get_version_info(reader, version_name)
         rev = vname if vid is not None else version_name
         sha = batch_blob_shas([f"{rev}:{path}"])[0]
-        blob = git_tree_resolver.map_blob_hashes(cursor, [sha]).get(sha) if sha else None
+        blob = git_tree_resolver.map_blob_hashes(reader, [sha]).get(sha) if sha else None
         rows: list[dict[str, Any]] = []
         if blob:
-            conds = ["bt.blob_id = %s"]
-            params: list[Any] = [blob[0]]
+            where: dict[str, Any] = {"bt.blob_id": blob[0]}
             if line:
-                conds.append("bt.line_s <= %s AND bt.line_e >= %s")
-                params += [line, line]
-            cursor.execute(
-                f"""
-                SELECT bt.tag_id, bt.line_s, bt.line_e, t.ast_id, a.name, a.type_id
-                FROM m_bridge_tag bt
-                JOIN m_tag t ON t.tag_id = bt.tag_id
-                JOIN m_ast a ON a.ast_id = t.ast_id
-                WHERE {' AND '.join(conds)}
-                ORDER BY (bt.line_e - bt.line_s) ASC;
-                """,
-                params,
+                where.update({"bt.line_s": le(line), "bt.line_e": ge(line)})
+            rows = reader.select_rows(
+                ("m_bridge_tag", "bt"),
+                {"tag_id": "bt.tag_id", "line_s": "bt.line_s", "line_e": "bt.line_e", "ast_id": "t.ast_id",
+                 "name": "a.name", "type_id": "a.type_id"},
+                where,
+                joins=[
+                    Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                    Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                ],
+                order_by=[Order(sub("bt.line_e", "bt.line_s"))],
+                as_dict=True,
             )
-            rows = cursor.fetchall()
             # Tags of this blob holding a definition: one query filtered by blob (a correlated EXISTS on the
             # m_symbol_def view per tag took seconds)
-            cursor.execute("SELECT DISTINCT tag_id FROM m_symbol_def WHERE blob_id = %s;", (blob[0],))
-            def_tags = {r["tag_id"] for r in cursor.fetchall()}
+            def_tags = set(reader.select_values("m_symbol_def", "tag_id", {"blob_id": blob[0]}, distinct=True))
             for r in rows:
                 r["name"] = safe_decode(r["name"]) or ""
                 r["is_def"] = r["tag_id"] in def_tags
@@ -745,7 +743,7 @@ class HistoryService:
             pick = next((r for r in rows if r["ast_id"] == ast_id), None)
         if pick is None and name:
             # Cursor on a use of the symbol: follow it to its definition
-            located = self._locate_definition(cursor, rev, name, {path}, arch)
+            located = self._locate_definition(reader, rev, name, {path}, arch)
             if located:
                 return located
         if pick is None:
@@ -759,23 +757,26 @@ class HistoryService:
             "path": path, "line_s": pick["line_s"],
         }
 
-    def _locate_definition(self, cursor: Any, rev: str, name: str, prefer_paths: set[str],
+    def _locate_definition(self, reader: Any, rev: str, name: str, prefer_paths: set[str],
                            arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any] | None:
-        blob_paths = git_tree_resolver.blob_paths(cursor, rev) or {}
+        blob_paths = git_tree_resolver.blob_paths(reader, rev) or {}
         _, srcarch, bits = definition_arch(rev, arch)
         # The definition's own tag (EXPORT_SYMBOL(name) rows carry another tag)
-        cursor.execute(
-            """
-            SELECT d.blob_id, d.tag_id, d.line_s, d.line_e, d.linkage
-            FROM m_symbol_def d
-            JOIN m_tag t ON t.tag_id = d.tag_id
-            JOIN m_ast a ON a.ast_id = t.ast_id
-            WHERE d.name = %s AND a.name = %s
-            LIMIT 5000;
-            """,
-            (name, name),
-        )
-        defs = [r for r in cursor.fetchall() if r["blob_id"] in blob_paths]
+        defs = [
+            r
+            for r in reader.select_rows(
+                ("m_symbol_def", "d"),
+                {"blob_id": "d.blob_id", "tag_id": "d.tag_id", "line_s": "d.line_s", "line_e": "d.line_e", "linkage": "d.linkage"},
+                {"d.name": name, "a.name": name},
+                joins=[
+                    Join(("m_tag", "t"), {"t.tag_id": "d.tag_id"}),
+                    Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                ],
+                limit=5000,
+                as_dict=True,
+            )
+            if r["blob_id"] in blob_paths
+        ]
         if not defs:
             return None
         # Prefer the requested file, then the ARCH's definitions (definition_rank), then definitions with a
@@ -790,49 +791,48 @@ class HistoryService:
             return (0 if p in prefer_paths else 1, *definition_rank(p, r["linkage"], r["line_s"], srcarch, bits)[:4],
                     -(r["line_e"] - r["line_s"]), 0 if p.endswith(".c") else 1, p)
         best = min(defs, key=rank)
-        return self._anchor_row(cursor, best["tag_id"], path_of(best), best["line_s"])
+        return self._anchor_row(reader, best["tag_id"], path_of(best), best["line_s"])
 
     @staticmethod
-    def _candidates(cursor: Any, blob_ids: list[int], anchor: dict[str, Any], lineage: set[int]) -> dict[int, list[dict[str, Any]]]:
+    def _candidates(reader: Any, blob_ids: list[int], anchor: dict[str, Any], lineage: set[int]) -> dict[int, list[dict[str, Any]]]:
         """Tags of each blob carrying the anchor's identity (name + type), or belonging to its lineage."""
         out: dict[int, list[dict[str, Any]]] = {}
         if not blob_ids:
             return out
-        fmt = ",".join(["%s"] * len(blob_ids))
+        cols = {"blob_id": "bt.blob_id", "tag_id": "bt.tag_id", "line_s": "bt.line_s", "line_e": "bt.line_e", "same_name": Const(1)}
         if anchor["name"] and anchor["name"] != "{}":
-            cursor.execute(
-                f"""
-                SELECT bt.blob_id, bt.tag_id, bt.line_s, bt.line_e, 1 AS same_name
-                FROM m_bridge_tag bt
-                JOIN m_tag t ON t.tag_id = bt.tag_id
-                JOIN m_ast a ON a.ast_id = t.ast_id
-                WHERE bt.blob_id IN ({fmt}) AND a.name = %s AND a.type_id = %s;
-                """,
-                [*blob_ids, anchor["name"], anchor["type_id"]],
+            rows = reader.select_rows(
+                ("m_bridge_tag", "bt"),
+                cols,
+                {"bt.blob_id": blob_ids, "a.name": anchor["name"], "a.type_id": anchor["type_id"]},
+                joins=[
+                    Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                    Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                ],
+                as_dict=True,
             )
         else:
-            cursor.execute(
-                f"""
-                SELECT bt.blob_id, bt.tag_id, bt.line_s, bt.line_e, 1 AS same_name
-                FROM m_bridge_tag bt JOIN m_tag t ON t.tag_id = bt.tag_id
-                WHERE bt.blob_id IN ({fmt}) AND t.ast_id = %s;
-                """,
-                [*blob_ids, anchor["ast_id"]],
+            rows = reader.select_rows(
+                ("m_bridge_tag", "bt"),
+                cols,
+                {"bt.blob_id": blob_ids, "t.ast_id": anchor["ast_id"]},
+                joins=[Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"})],
+                as_dict=True,
             )
-        rows = cursor.fetchall()
         seen = {(r["blob_id"], r["tag_id"]) for r in rows}
         lin = sorted(lineage)
         for i in range(0, len(lin), 1000):
             chunk = lin[i:i + 1000]
-            cursor.execute(
-                f"""
-                SELECT blob_id, tag_id, line_s, line_e, 0 AS same_name
-                FROM m_bridge_tag
-                WHERE blob_id IN ({fmt}) AND tag_id IN ({",".join(["%s"] * len(chunk))});
-                """,
-                [*blob_ids, *chunk],
+            rows.extend(
+                r
+                for r in reader.select_rows(
+                    "m_bridge_tag",
+                    {"blob_id": "blob_id", "tag_id": "tag_id", "line_s": "line_s", "line_e": "line_e", "same_name": Const(0)},
+                    {"blob_id": blob_ids, "tag_id": chunk},
+                    as_dict=True,
+                )
+                if (r["blob_id"], r["tag_id"]) not in seen
             )
-            rows.extend(r for r in cursor.fetchall() if (r["blob_id"], r["tag_id"]) not in seen)
         for r in rows:
             out.setdefault(r["blob_id"], []).append(r)
         return out
@@ -872,44 +872,46 @@ class HistoryService:
             raise HTTPException(status_code=400, detail="Kconfig symbol name is required.")
         if scope is None:
             scope = history_scope(version_name, branch)
-        with get_db_cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT bt.blob_id, bt.tag_id, bt.line_s, bt.line_e
-                FROM m_ast a
-                JOIN m_tag t ON t.ast_id = a.ast_id
-                JOIN m_bridge_tag bt ON bt.tag_id = t.tag_id
-                WHERE a.name = %s AND a.type_id IN ({",".join(["%s"] * len(KCONFIG_TYPES))})
-                ORDER BY bt.line_s;
-                """,
-                (sym, *KCONFIG_TYPES),
+        with get_reader() as reader:
+            tag_rows = reader.select_rows(
+                ("m_ast", "a"),
+                {"blob_id": "bt.blob_id", "tag_id": "bt.tag_id", "line_s": "bt.line_s", "line_e": "bt.line_e"},
+                {"a.name": sym, "a.type_id": list(KCONFIG_TYPES)},
+                joins=[
+                    Join(("m_tag", "t"), {"t.ast_id": "a.ast_id"}),
+                    Join(("m_bridge_tag", "bt"), {"bt.tag_id": "t.tag_id"}),
+                ],
+                order_by=["bt.line_s"],
+                as_dict=True,
             )
-            tag_rows = cursor.fetchall()
             if not tag_rows:
                 raise HTTPException(status_code=404, detail=f"CONFIG_{sym} is not defined in any indexed Kconfig file.")
             by_blob: dict[int, list[dict[str, Any]]] = {}
             for r in tag_rows:
                 by_blob.setdefault(r["blob_id"], []).append(r)
             blob_ids = sorted(by_blob)
-            fmt = ",".join(["%s"] * len(blob_ids))
-            cursor.execute(f"SELECT blob_id, blob_hash FROM m_file_blob WHERE blob_id IN ({fmt});", blob_ids)
-            sha_to_blob = {hash_hex(r["blob_hash"]): r["blob_id"] for r in cursor.fetchall()}
-            cursor.execute(
-                f"""
-                SELECT DISTINCT fn.fname FROM m_bridge_checkpoint bc JOIN m_file_name fn ON fn.fnid = bc.fnid
-                WHERE bc.blob_id IN ({fmt})
-                UNION
-                SELECT DISTINCT fn.fname FROM m_commit_file cf JOIN m_file_name fn ON fn.fnid = cf.fnid
-                WHERE cf.blob_id IN ({fmt});
-                """,
-                blob_ids + blob_ids,
+            sha_to_blob = {
+                hash_hex(r["blob_hash"]): r["blob_id"]
+                for r in reader.select_rows("m_file_blob", ["blob_id", "blob_hash"], {"blob_id": blob_ids}, as_dict=True)
+            }
+            names = set(
+                reader.select_values(
+                    ("m_bridge_checkpoint", "bc"), "fn.fname", {"bc.blob_id": blob_ids},
+                    joins=[Join(("m_file_name", "fn"), {"fn.fnid": "bc.fnid"})], distinct=True,
+                )
             )
-            paths = sorted({safe_decode(r["fname"]) for r in cursor.fetchall()})
-            versions = indexed_versions(cursor, include_rc, scope)
+            names.update(
+                reader.select_values(
+                    ("m_commit_file", "cf"), "fn.fname", {"cf.blob_id": blob_ids},
+                    joins=[Join(("m_file_name", "fn"), {"fn.fnid": "cf.fnid"})], distinct=True,
+                )
+            )
+            paths = sorted({safe_decode(n) for n in names})
+            versions = indexed_versions(reader, include_rc, scope)
             specs = [f"{v['vname']}:{p}" for v in versions for p in paths]
             shas = batch_blob_shas(specs)
-            indexed = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s and s not in sha_to_blob])
-            codes = tag_codes(cursor, {r["tag_id"] for r in tag_rows})
+            indexed = git_tree_resolver.map_blob_hashes(reader, [s for s in shas if s and s not in sha_to_blob])
+            codes = tag_codes(reader, {r["tag_id"] for r in tag_rows})
         # The parser's stored definitions of every blob at once (m_blob_facts family 4); the rest parse from Git
         kconfig_facts.load_stored(s for s in shas if s)
 
@@ -1047,8 +1049,8 @@ class HistoryService:
         source = "git"
         if from_rev:
             try:
-                with get_db_cursor() as cursor:
-                    commits = _db_change_commits(cursor, norm_path, from_rev, to_rev, int(line_s or 0), int(line_e or 0), limit)
+                with get_reader() as reader:
+                    commits = _db_change_commits(reader, norm_path, from_rev, to_rev, int(line_s or 0), int(line_e or 0), limit)
             except Exception as exc:  # noqa: BLE001 - git answers
                 logger.debug("change commits of %s from the database failed: %s", norm_path, exc)
                 commits = None

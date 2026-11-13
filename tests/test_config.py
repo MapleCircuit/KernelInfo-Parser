@@ -57,7 +57,8 @@ class TestConfigManagement(unittest.TestCase):
         with patch("core.config.find_config_path", return_value=None):
             cfg = load_config(config_path=None)
             self.assertEqual(cfg["database"]["port"], 3306)
-            self.assertEqual(cfg["database"]["user"], "root")
+            # No default account: credentials come from the configuration or the connect fails with a clear error
+            self.assertEqual((cfg["database"]["user"], cfg["database"]["password"]), ("", ""))
             self.assertEqual(cfg["webapp"]["port"], 8000)
             self.assertEqual(cfg["parser"]["table_engine"], "cached")
 
@@ -87,7 +88,7 @@ class TestConfigManagement(unittest.TestCase):
             self.assertEqual(cfg["database"]["port"], 3307)
             self.assertEqual(cfg["database"]["database"], "custom_kernel")
             # Unspecified keys retain defaults
-            self.assertEqual(cfg["database"]["user"], "root")
+            self.assertEqual(cfg["database"]["user"], "")
             self.assertEqual(cfg["webapp"]["port"], 9090)
             self.assertFalse(cfg["webapp"]["reload"])
             self.assertEqual(cfg["parser"]["table_engine"], "direct")
@@ -190,6 +191,7 @@ class TestConfigManagement(unittest.TestCase):
     def test_main_cli_config_integration(self) -> None:
         """main.py arg_handling correctly parses -c and loads parser configuration."""
         import main
+        import pipeline.cli
         custom_data = {
             "parser": {
                 "table_engine": "direct",
@@ -205,7 +207,7 @@ class TestConfigManagement(unittest.TestCase):
 
         try:
             with mock.patch("sys.argv", ["main.py", "-c", temp_path]):
-                args = main.arg_handling()
+                args = pipeline.cli.arg_handling()
                 self.assertEqual(args.config, temp_path)
                 from core.globalstuff import G
                 self.assertEqual(G.MEMORY_MODE, "low")
@@ -230,46 +232,50 @@ class TestConfigManagement(unittest.TestCase):
             self.assertEqual(os.environ["CONFIG_FILE"], str(Path("custom.json").resolve()))
 
     def test_default_continuous_parsing_arguments(self) -> None:
-        """Verify main.arg_handling defaults single_version to False for continuous parsing."""
+        """Verify pipeline.cli.arg_handling defaults single_version to False for continuous parsing."""
         import main
+        import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertFalse(args.single_version)
 
     def test_cli_single_version_argument(self) -> None:
-        """Verify main.arg_handling recognizes --single-version and --single flags."""
+        """Verify pipeline.cli.arg_handling recognizes --single-version and --single flags."""
         import main
+        import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--single-version"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertTrue(args.single_version)
 
         with mock.patch("sys.argv", ["main.py", "--single"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertTrue(args.single_version)
 
     def test_cli_no_rc_argument(self) -> None:
         """--no-rc / --releases-only disables pre-release discovery; the default includes them."""
         import main
+        import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
-            self.assertTrue(main.arg_handling().include_pre_releases)
+            self.assertTrue(pipeline.cli.arg_handling().include_pre_releases)
         with mock.patch("sys.argv", ["main.py", "--no-rc"]):
-            self.assertFalse(main.arg_handling().include_pre_releases)
+            self.assertFalse(pipeline.cli.arg_handling().include_pre_releases)
         with mock.patch("sys.argv", ["main.py", "--releases-only"]):
-            self.assertFalse(main.arg_handling().include_pre_releases)
+            self.assertFalse(pipeline.cli.arg_handling().include_pre_releases)
 
     def test_cli_rc_arguments(self) -> None:
-        """Verify main.arg_handling recognizes --rc, --include-rc, and --include-pre-releases flags."""
+        """Verify pipeline.cli.arg_handling recognizes --rc, --include-rc, and --include-pre-releases flags."""
         import main
+        import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--rc"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertTrue(args.include_pre_releases)
 
         with mock.patch("sys.argv", ["main.py", "--include-rc"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertTrue(args.include_pre_releases)
 
         with mock.patch("sys.argv", ["main.py", "--include-pre-releases"]):
-            args = main.arg_handling()
+            args = pipeline.cli.arg_handling()
             self.assertTrue(args.include_pre_releases)
 
     def test_master_file_get_version_tags(self) -> None:

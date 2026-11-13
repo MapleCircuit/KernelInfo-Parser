@@ -32,8 +32,10 @@ _DEFAULT_TOTAL_MB = 1024
 
 
 def cache_root() -> Path:
-    """Directory holding every namespace (``KERNELINFO_CACHE_DIR`` or ``~/.cache/kernelinfo``)."""
-    return Path(os.environ.get("KERNELINFO_CACHE_DIR") or "~/.cache/kernelinfo").expanduser()
+    """Directory holding every namespace (``cache_engine.cache_root()``: ``KERNELINFO_CACHE_DIR``, config
+    ``cache.dir``, else ``~/.cache/kernelinfo``)."""
+    from cache_engine import cache_root as _root
+    return _root()
 
 
 def total_cap_bytes() -> int:
@@ -280,15 +282,3 @@ def usage() -> list[dict[str, Any]]:
                 continue
         out.append({"name": d.name, "entries": count, "bytes": size})
     return out
-
-
-def sqlite_path(namespace: str, name: str) -> Path:
-    """Path of a SQLite file of derived data under the cache root (indexes too large for gzip JSON:
-    the commit relation and release indexes). Like the JSON entries it lives outside the database the
-    webapp reads (section 2.5) and may be deleted at any time: it is rebuilt on demand."""
-    if not _NAMESPACE_RE.fullmatch(namespace):
-        raise ValueError(f"invalid disk cache namespace: {namespace!r}")
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120] or "index"
-    directory = cache_root() / namespace
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{safe}.sqlite3"

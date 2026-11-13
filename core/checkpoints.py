@@ -3,7 +3,7 @@
 `m_bridge_checkpoint` holds the tree of every ingested version: one `(commit_id, fnid, blob_id)` row per path.
 Consecutive versions share nearly all of them (a stable release changes well under 1% of the files), so a
 version's full rows are only kept while it is the newest one, which the next run reads as its previous version
-(TableEngine preload, `main.processing_unchanges()`, `_new_version_file_pairs()`...):
+(TableEngine preload, `main.processing_unchanges()`, `db.new_checkpoint_pairs()`...):
 
 - `compact()`, at the end of the next version's run, compares the version with the newest full checkpoint
   ingested before it (`choose_base()`). When they differ in at most `ratio` of the version's rows
@@ -13,7 +13,7 @@ version's full rows are only kept while it is the newest one, which the next run
 - `expand()` turns a delta back into the full tree. A run whose previous version is a delta (a backfill, a
   repair) expands it first; `expand_dependents()` does the same for the versions resting on a checkpoint that
   is about to be deleted.
-- The `m_checkpoint_tree` view (`TREE_VIEW_SQL`, created by `main.ensure_db_views()`) returns the full tree of
+- The `m_checkpoint_tree` view (defined in `db_engine/views.py`, created by `db.ensure_views()`) returns the full tree of
   every version, delta or not; filtered by `commit_id` the condition reaches both of its branches. Read through it
   wherever the version may be an older one.
 
@@ -25,22 +25,14 @@ import contextlib
 import logging
 from typing import Any
 
+from db_engine import DBError
+from db_engine.spec import Const, Join, Select, Value, in_select, is_null, lt, not_in
+
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_RATIO = 0.3
 INGEST_DONE = 2
-
-TREE_VIEW_SQL = (
-    "CREATE OR REPLACE VIEW m_checkpoint_tree AS "
-    "SELECT c.commit_id, c.fnid, c.blob_id FROM m_bridge_checkpoint c "
-    "WHERE c.blob_id <> 0 OR NOT EXISTS (SELECT 1 FROM m_checkpoint_base b0 WHERE b0.commit_id = c.commit_id) "
-    "UNION ALL "
-    "SELECT b.commit_id, k.fnid, k.blob_id FROM m_checkpoint_base b "
-    "JOIN m_bridge_checkpoint k ON k.commit_id = b.base_commit_id "
-    "WHERE NOT EXISTS (SELECT 1 FROM m_bridge_checkpoint d WHERE d.commit_id = b.commit_id AND d.fnid = k.fnid);"
-)
-
 
 def delta_ratio() -> float:
     """`parser.checkpoint_delta_ratio` (0 disables compaction)."""
@@ -54,13 +46,13 @@ def delta_ratio() -> float:
 
 def base_of(db: Any, commit_id: int) -> int | None:
     """The checkpoint `commit_id` is a delta of, or None when its rows are its full tree."""
-    row = db.query_one("SELECT base_commit_id FROM m_checkpoint_base WHERE commit_id = %s", (commit_id,), dictionary=False)
+    row = db.select_one("m_checkpoint_base", ["base_commit_id"], {"commit_id": commit_id}, as_dict=False)
     return int(row[0]) if row else None
 
 
 def dependents(db: Any, commit_id: int) -> list[int]:
     """Versions stored as a delta of `commit_id`."""
-    rows = db.query("SELECT commit_id FROM m_checkpoint_base WHERE base_commit_id = %s", (commit_id,), dictionary=False)
+    rows = db.select_rows("m_checkpoint_base", ["commit_id"], {"base_commit_id": commit_id}, as_dict=False)
     return [int(r[0]) for r in rows]
 
 
@@ -74,33 +66,22 @@ def is_checkpoint_pinned(db: Any, commit_id: int) -> bool:
     """Whether commit_id is pinned as an ancestor base for an active or pending task or parse run."""
     if not commit_id:
         return False
-    try:
-        if db.query_one(
-            "SELECT 1 FROM m_parse_task WHERE base_commit_id = %s AND status IN (0, 1, 2) LIMIT 1",
-            (commit_id,),
-            dictionary=False,
-        ):
-            return True
-    except Exception:
-        pass
-    try:
-        if db.query_one(
-            "SELECT 1 FROM m_parse_task t JOIN m_git_ref r ON t.base_ref_name = r.ref_name WHERE r.commit_id = %s AND t.status IN (0, 1, 2) LIMIT 1",
-            (commit_id,),
-            dictionary=False,
-        ):
-            return True
-    except Exception:
-        pass
-    try:
-        if db.query_one(
-            "SELECT 1 FROM m_ingest_state WHERE base_commit_id = %s AND status = 1 LIMIT 1",
-            (commit_id,),
-            dictionary=False,
-        ):
-            return True
-    except Exception:
-        pass
+    active = [0, 1, 2]
+    probes = (
+        lambda: db.row_exists("m_parse_task", {"base_commit_id": commit_id, "status": active}),
+        lambda: db.row_exists(
+            ("m_parse_task", "t"),
+            {"r.commit_id": commit_id, "t.status": active},
+            joins=[Join(("m_git_ref", "r"), {"r.ref_name": "t.base_ref_name"})],
+        ),
+        lambda: db.row_exists("m_ingest_state", {"base_commit_id": commit_id, "status": 1}),
+    )
+    for probe in probes:
+        try:
+            if probe():
+                return True
+        except DBError:
+            pass
     return False
 
 
@@ -112,46 +93,48 @@ def choose_base(
     preferred_base: int | None = None,
 ) -> int | None:
     """The newest finished version ingested before `commit_id` whose checkpoint is full (ids grow with ingestion)."""
-    skip = tuple(c for c in exclude if c) or (0,)
+    skip = [c for c in exclude if c] or [0]
+    base_join = [Join(("m_checkpoint_base", "b"), {"b.commit_id": "s.commit_id"}, "left")]
     if preferred_base and preferred_base not in skip:
-        row = db.query_one(
-            "SELECT s.commit_id FROM m_ingest_state s LEFT JOIN m_checkpoint_base b ON b.commit_id = s.commit_id "
-            "WHERE s.network_id = %s AND s.commit_id = %s AND s.status = %s AND b.commit_id IS NULL",
-            (network_id, preferred_base, INGEST_DONE),
-            dictionary=False,
+        row = db.select_one(
+            ("m_ingest_state", "s"),
+            ["s.commit_id"],
+            {"s.network_id": network_id, "s.commit_id": preferred_base, "s.status": INGEST_DONE, "b.commit_id": is_null()},
+            joins=base_join,
+            as_dict=False,
         )
         if row:
             return int(row[0])
 
-    placeholders = ",".join(["%s"] * len(skip))
-    row = db.query_one(
-        "SELECT s.commit_id FROM m_ingest_state s LEFT JOIN m_checkpoint_base b ON b.commit_id = s.commit_id "
-        f"WHERE s.network_id = %s AND s.status = %s AND s.commit_id < %s AND b.commit_id IS NULL "
-        f"AND s.commit_id NOT IN ({placeholders}) ORDER BY s.commit_id DESC LIMIT 1",
-        (network_id, INGEST_DONE, commit_id, *skip),
-        dictionary=False,
+    row = db.select_one(
+        ("m_ingest_state", "s"),
+        ["s.commit_id"],
+        [
+            {"s.network_id": network_id, "s.status": INGEST_DONE, "b.commit_id": is_null()},
+            {"s.commit_id": lt(commit_id)},
+            {"s.commit_id": not_in(skip)},
+        ],
+        joins=base_join,
+        order_by=["-s.commit_id"],
+        as_dict=False,
     )
     return int(row[0]) if row else None
 
 
 def delta_size(db: Any, commit_id: int, base: int) -> tuple[int, int, int]:
     """(rows of `commit_id` the base lacks or holds another blob for, base paths `commit_id` lacks, rows of `commit_id`)."""
-    c_row = db.query_one(
-        "SELECT COUNT(*) FROM m_bridge_checkpoint p LEFT JOIN m_bridge_checkpoint k "
-        "ON k.commit_id = %s AND k.fnid = p.fnid AND k.blob_id = p.blob_id WHERE p.commit_id = %s AND k.commit_id IS NULL",
-        (base, commit_id),
-        dictionary=False,
+    changed = db.count_rows(
+        ("m_bridge_checkpoint", "p"),
+        {"p.commit_id": commit_id, "k.commit_id": is_null()},
+        joins=[Join(("m_bridge_checkpoint", "k"),
+                    {"k.commit_id": Value(base), "k.fnid": "p.fnid", "k.blob_id": "p.blob_id"}, "left")],
     )
-    changed = int(c_row[0]) if c_row else 0
-    r_row = db.query_one(
-        "SELECT COUNT(*) FROM m_bridge_checkpoint k LEFT JOIN m_bridge_checkpoint p "
-        "ON p.commit_id = %s AND p.fnid = k.fnid WHERE k.commit_id = %s AND p.commit_id IS NULL",
-        (commit_id, base),
-        dictionary=False,
+    removed = db.count_rows(
+        ("m_bridge_checkpoint", "k"),
+        {"k.commit_id": base, "p.commit_id": is_null()},
+        joins=[Join(("m_bridge_checkpoint", "p"), {"p.commit_id": Value(commit_id), "p.fnid": "k.fnid"}, "left")],
     )
-    removed = int(r_row[0]) if r_row else 0
-    t_row = db.query_one("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (commit_id,), dictionary=False)
-    total = int(t_row[0]) if t_row else 0
+    total = db.count_rows("m_bridge_checkpoint", {"commit_id": commit_id})
     return changed, removed, total
 
 
@@ -179,29 +162,31 @@ def compact(
     changed, removed, total = delta_size(db, commit_id, base)
     if not should_compact(changed, removed, total, ratio):
         return None
-    try:
-        db.execute(
-            "INSERT IGNORE INTO m_bridge_checkpoint (commit_id, fnid, blob_id) "
-            "SELECT %s, k.fnid, 0 FROM m_bridge_checkpoint k LEFT JOIN m_bridge_checkpoint p "
-            "ON p.commit_id = %s AND p.fnid = k.fnid WHERE k.commit_id = %s AND p.commit_id IS NULL",
-            (commit_id, commit_id, base),
+    with db.transaction():
+        # Paths the base holds and this version lacks: a tombstone row (blob 0)
+        db.copy_rows(
+            "m_bridge_checkpoint",
+            ["commit_id", "fnid", "blob_id"],
+            Select(
+                ("m_bridge_checkpoint", "k"),
+                [Const(commit_id), "k.fnid", Const(0)],
+                {"k.commit_id": base, "p.commit_id": is_null()},
+                joins=[Join(("m_bridge_checkpoint", "p"), {"p.commit_id": Value(commit_id), "p.fnid": "k.fnid"}, "left")],
+            ),
+            on_conflict="ignore",
         )
-        # The rows the base holds identically (MariaDB 10.3+ reads a DELETE's own table in a subquery)
-        dropped = int(db.execute(
-            "DELETE FROM m_bridge_checkpoint WHERE commit_id = %s AND (fnid, blob_id) IN "
-            "(SELECT k.fnid, k.blob_id FROM m_bridge_checkpoint k WHERE k.commit_id = %s)",
-            (commit_id, base),
-        ) or 0)
-        db.execute("DELETE FROM m_checkpoint_base WHERE commit_id = %s", (commit_id,))
-        db.execute(
-            "INSERT INTO m_checkpoint_base (commit_id, base_commit_id, delta_rows) VALUES (%s, %s, %s)",
-            (commit_id, base, changed + removed),
+        # The rows the base holds identically
+        dropped = db.delete_rows(
+            "m_bridge_checkpoint",
+            [
+                {"commit_id": commit_id},
+                in_select(("fnid", "blob_id"),
+                          Select(("m_bridge_checkpoint", "k"), ["k.fnid", "k.blob_id"], {"k.commit_id": base})),
+            ],
         )
-        db.commit()
-    except Exception:
-        if hasattr(db, "rollback"):
-            db.rollback()
-        raise
+        db.delete_rows("m_checkpoint_base", {"commit_id": commit_id})
+        db.insert_rows("m_checkpoint_base", ["commit_id", "base_commit_id", "delta_rows"],
+                       [(commit_id, base, changed + removed)])
     return {"base": base, "changed": changed, "removed": removed, "total": total, "dropped": dropped}
 
 
@@ -213,20 +198,20 @@ def expand(db: Any, commit_id: int) -> int:
     base = base_of(db, commit_id)
     if base is None:
         return 0
-    try:
-        restored = int(db.execute(
-            "INSERT IGNORE INTO m_bridge_checkpoint (commit_id, fnid, blob_id) "
-            "SELECT %s, k.fnid, k.blob_id FROM m_bridge_checkpoint k LEFT JOIN m_bridge_checkpoint d "
-            "ON d.commit_id = %s AND d.fnid = k.fnid WHERE k.commit_id = %s AND d.commit_id IS NULL",
-            (commit_id, commit_id, base),
-        ) or 0)
-        db.execute("DELETE FROM m_bridge_checkpoint WHERE commit_id = %s AND blob_id = 0", (commit_id,))
-        db.execute("DELETE FROM m_checkpoint_base WHERE commit_id = %s", (commit_id,))
-        db.commit()
-    except Exception:
-        if hasattr(db, "rollback"):
-            db.rollback()
-        raise
+    with db.transaction():
+        restored = db.copy_rows(
+            "m_bridge_checkpoint",
+            ["commit_id", "fnid", "blob_id"],
+            Select(
+                ("m_bridge_checkpoint", "k"),
+                [Const(commit_id), "k.fnid", "k.blob_id"],
+                {"k.commit_id": base, "d.commit_id": is_null()},
+                joins=[Join(("m_bridge_checkpoint", "d"), {"d.commit_id": Value(commit_id), "d.fnid": "k.fnid"}, "left")],
+            ),
+            on_conflict="ignore",
+        )
+        db.delete_rows("m_bridge_checkpoint", {"commit_id": commit_id, "blob_id": 0})
+        db.delete_rows("m_checkpoint_base", {"commit_id": commit_id})
     return restored
 
 
@@ -245,11 +230,11 @@ def expand_dependents(db: Any, commit_id: int) -> list[int]:
 def tree_rows(db: Any, commit_id: int) -> list[tuple[int, int]]:
     """(fnid, blob_id) of a version's full tree, delta or not (what the view returns, without it)."""
     base = base_of(db, commit_id)
-    rows = db.query("SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (commit_id,), dictionary=False)
+    rows = db.select_rows("m_bridge_checkpoint", ["fnid", "blob_id"], {"commit_id": commit_id}, as_dict=False)
     own = {int(f): int(b) for f, b in rows}
     if base is None:
         return list(own.items())
-    base_rows = db.query("SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (base,), dictionary=False)
+    base_rows = db.select_rows("m_bridge_checkpoint", ["fnid", "blob_id"], {"commit_id": base}, as_dict=False)
     tree = {int(f): int(b) for f, b in base_rows if int(f) not in own}
     tree.update((f, b) for f, b in own.items() if b != 0)  # blob 0: a path of the base the version lacks
     return list(tree.items())

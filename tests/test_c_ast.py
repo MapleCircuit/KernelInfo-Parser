@@ -125,7 +125,7 @@ def default_processing(CS: ChangeSet, gp: GreatProcessor) -> None:
 
 def _symbol_store(view: str) -> dict[int, tuple]:
     """Rows of the m_symbol_def / m_symbol_ref view over the MockDB store, keyed like a table store."""
-    return dict(enumerate(symbol_view_rows(MockDB._global_store, view)))
+    return dict(enumerate(symbol_view_rows(MockDB.store, view)))
 
 
 def _slice_source(raw_lines: list[str], s_l: int, e_l: int, s_c: int, e_c: int) -> str:
@@ -166,7 +166,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
     temp_dir = None
     try:
         # Isolated in-memory DB per worker
-        MockDB._global_store.clear()
+        MockDB.store.clear()
         G.DEBUG_TYPECHECK = True
         G.DB = MockDB
         te_choice = item.get("table_engine", "cached")
@@ -212,8 +212,8 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         # Compute tag text fidelity and source code coverage metrics
         raw_lines = file_content.decode("latin-1").replace("\r\n", "\n").split("\n")
 
-        mock_tags = MockDB._global_store.get("m_tag", {})
-        mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
+        mock_tags = MockDB.store.get("m_tag", {})
+        mock_bridge = MockDB.store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
 
         mismatches_count = 0
@@ -310,15 +310,15 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             res_dict["store"] = {
                 "m_tag": dict(mock_tags),
                 "m_bridge_tag": dict(mock_bridge),
-                "m_ast": dict(MockDB._global_store.get("m_ast", {})),
-                "m_ast_container": dict(MockDB._global_store.get("m_ast_container", {})),
-                "m_map_ast": dict(MockDB._global_store.get("m_map_ast", {})),
-                "m_file_name": dict(MockDB._global_store.get("m_file_name", {})),
-                "m_file": dict(MockDB._global_store.get("m_file", {})),
-                "m_bridge_file": dict(MockDB._global_store.get("m_bridge_file", {})),
-                "m_moved_tag": dict(MockDB._global_store.get("m_moved_tag", {})),
-                "m_ast_include": dict(MockDB._global_store.get("m_ast_include", {})),
-                "m_ast_attribute": dict(MockDB._global_store.get("m_ast_attribute", {})),
+                "m_ast": dict(MockDB.store.get("m_ast", {})),
+                "m_ast_container": dict(MockDB.store.get("m_ast_container", {})),
+                "m_map_ast": dict(MockDB.store.get("m_map_ast", {})),
+                "m_file_name": dict(MockDB.store.get("m_file_name", {})),
+                "m_file": dict(MockDB.store.get("m_file", {})),
+                "m_bridge_file": dict(MockDB.store.get("m_bridge_file", {})),
+                "m_moved_tag": dict(MockDB.store.get("m_moved_tag", {})),
+                "m_ast_include": dict(MockDB.store.get("m_ast_include", {})),
+                "m_ast_attribute": dict(MockDB.store.get("m_ast_attribute", {})),
             }
         return res_dict
     except Exception as e:
@@ -420,7 +420,7 @@ class TestCASTParser(unittest.TestCase):
                 G.TE.close()
             except Exception:
                 pass
-        MockDB._global_store.clear()
+        MockDB.store.clear()
         clear_tu_caches()
         G.CURRENT_PARSING_FILE = None
         G.CURRENT_PARSING_DIR = None
@@ -454,9 +454,9 @@ class TestCASTParser(unittest.TestCase):
         self.assertTrue(res["execute_success"])
 
         # Check DB state
-        asts = MockDB._global_store.get("m_ast", {})
-        bridge_tags = MockDB._global_store.get("m_bridge_tag", {})
-        tags = MockDB._global_store.get("m_tag", {})
+        asts = MockDB.store.get("m_ast", {})
+        bridge_tags = MockDB.store.get("m_bridge_tag", {})
+        tags = MockDB.store.get("m_tag", {})
 
         # Find the tag spanning line 1220 to 1573
         task_struct_tags = []
@@ -514,7 +514,7 @@ class TestCASTParser(unittest.TestCase):
             "    int *buffer_ptr;\n"
             "};\n"
         )
-        MockDB._global_store.clear()
+        MockDB.store.clear()
         G.DEBUG_TYPECHECK = True
         G.DB = MockDB
         G.TE = TECachedDB()
@@ -549,8 +549,8 @@ class TestCASTParser(unittest.TestCase):
             cs.execute()
             G.TE.commit_all()
 
-            asts = MockDB._global_store.get("m_ast", {})
-            containers = MockDB._global_store.get("m_ast_container", {})
+            asts = MockDB.store.get("m_ast", {})
+            containers = MockDB.store.get("m_ast_container", {})
 
             # Map by name
             ast_by_name = {v[1]: (k, v) for k, v in asts.items() if v[1]}
@@ -695,7 +695,8 @@ class TestCASTParser(unittest.TestCase):
     def test_stage2_epoch_partitioning_and_regeneration(self) -> None:
         """Verify Stage 2 project-agnostic dynamic complexity batching, epoch partitioning, and reader lifecycle."""
         import tempfile
-        from main import is_heavy_source_path, is_heavy_source_file, partition_source_epochs, DependencyScheduler
+        from pipeline.source_order import is_heavy_source_path, is_heavy_source_file, partition_source_epochs
+        from pipeline.scheduler import DependencyScheduler
         from table_engine.shared_buffer import SharedSymbolBuilder
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1316,7 +1317,7 @@ int process_item(struct item *it) {
         """Verify struct definitions with intermediate and trailing #ifdef/#endif parse cleanly without leaking declarators."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1392,7 +1393,7 @@ struct task_struct {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1400,7 +1401,7 @@ struct task_struct {
         """Verify struct definitions with function pointers (e.g. struct nlmsvc_binding) produce exact member containers."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1437,8 +1438,8 @@ struct task_struct {
             G.TE.commit_all()
 
             from core.globalstuff import ASTT
-            mock_containers = MockDB._global_store.get("m_ast_container", {})
-            mock_asts = MockDB._global_store.get("m_ast", {})
+            mock_containers = MockDB.store.get("m_ast_container", {})
+            mock_asts = MockDB.store.get("m_ast", {})
 
             # Find nlmsvc_binding struct definition AST ID
             nlmsvc_ast_id = None
@@ -1484,7 +1485,7 @@ struct task_struct {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1492,7 +1493,7 @@ struct task_struct {
         """Verify struct definitions with multiple typedef members extract all fields into m_ast_container."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1536,8 +1537,8 @@ struct custom_data {
             G.TE.commit_all()
 
             from core.globalstuff import ASTT
-            mock_containers = MockDB._global_store.get("m_ast_container", {})
-            mock_asts = MockDB._global_store.get("m_ast", {})
+            mock_containers = MockDB.store.get("m_ast_container", {})
+            mock_asts = MockDB.store.get("m_ast", {})
 
             struct_ast_id = None
             for ast_row in mock_asts.values():
@@ -1557,7 +1558,7 @@ struct custom_data {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1565,7 +1566,7 @@ struct custom_data {
         """Verify typedef definitions link underlying types in m_ast_container and record TypeUsage in m_symbol_ref."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1605,8 +1606,8 @@ struct nlmsvc_binding {
             G.TE.commit_all()
 
             from core.globalstuff import ASTT, SymbolRole
-            mock_containers = MockDB._global_store.get("m_ast_container", {})
-            mock_asts = MockDB._global_store.get("m_ast", {})
+            mock_containers = MockDB.store.get("m_ast_container", {})
+            mock_asts = MockDB.store.get("m_ast", {})
             mock_sym_defs = _symbol_store("m_symbol_def")
             mock_sym_refs = _symbol_store("m_symbol_ref")
 
@@ -1644,7 +1645,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1681,7 +1682,7 @@ struct nlmsvc_binding {
         """Verify struct nlmsvc_binding and declarators contain zero type-0 or anonymous container rows."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1717,7 +1718,7 @@ struct nlmsvc_binding {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+            containers = list(MockDB.store.get("m_ast_container", {}).values())
             type_0_containers = [c for c in containers if c[2] == 0]
             self.assertEqual(
                 len(type_0_containers),
@@ -1725,7 +1726,7 @@ struct nlmsvc_binding {
                 f"Found {len(type_0_containers)} type-0 containers in bind.h: {type_0_containers}",
             )
 
-            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
+            asts = {r[0]: r for r in MockDB.store.get("m_ast", {}).values()}
             nlmsvc_ops_asts = [a for a in asts.values() if a[1] == "nlmsvc_ops"]
             self.assertTrue(bool(nlmsvc_ops_asts))
             nlmsvc_ops_containers = [c for c in containers if c[0] == nlmsvc_ops_asts[0][0]]
@@ -1739,7 +1740,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1748,7 +1749,7 @@ struct nlmsvc_binding {
         from collections import defaultdict
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1784,8 +1785,8 @@ struct nlmsvc_binding {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
-            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+            asts = {r[0]: r for r in MockDB.store.get("m_ast", {}).values()}
+            containers = list(MockDB.store.get("m_ast_container", {}).values())
 
             nlmclnt_proc_asts = [a for a in asts.values() if a[1] == "nlmclnt_proc"]
             self.assertTrue(bool(nlmclnt_proc_asts))
@@ -1846,7 +1847,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1855,7 +1856,7 @@ struct nlmsvc_binding {
         from collections import defaultdict
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1891,8 +1892,8 @@ struct nlmsvc_binding {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
-            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+            asts = {r[0]: r for r in MockDB.store.get("m_ast", {}).values()}
+            containers = list(MockDB.store.get("m_ast_container", {}).values())
 
             nlmclnt_init_asts = [a for a in asts.values() if a[1] == "nlmclnt_init"]
             self.assertTrue(bool(nlmclnt_init_asts), "nlmclnt_init AST node not found")
@@ -1944,7 +1945,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1952,7 +1953,7 @@ struct nlmsvc_binding {
         """Verify typedef function pointers correctly extract argument tags without phantom declarator tags."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1984,8 +1985,8 @@ struct nlmsvc_binding {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            db_tag = MockDB._global_store.get(m_tag.table_name, {})
-            db_bridge_tag = MockDB._global_store.get(m_bridge_tag.table_name, {})
+            db_tag = MockDB.store.get(m_tag.table_name, {})
+            db_bridge_tag = MockDB.store.get(m_bridge_tag.table_name, {})
 
             # Should have exactly 1 tag: the full typedef tag (argument is linked in m_ast_container, no phantom *nlm_host_match_fn_t tag)
             self.assertEqual(len(db_tag), 1)
@@ -2001,7 +2002,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -2039,7 +2040,7 @@ struct nlmsvc_binding {
         temp_dir_v2 = None
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -2078,7 +2079,7 @@ struct nlmsvc_binding {
             G.TE.commit_all()
 
             # Record tags created in v1
-            v1_tags = {row[0]: row for row in MockDB._global_store.get("m_tag", {}).values()}
+            v1_tags = {row[0]: row for row in MockDB.store.get("m_tag", {}).values()}
             self.assertGreaterEqual(len(v1_tags), 2, "Expected at least comment and struct tags in v1")
 
             # --- Version 2: Modified struct and comment ---
@@ -2124,7 +2125,7 @@ struct nlmsvc_binding {
             G.TE.commit_all()
 
             # Verify m_moved_tag entries exist linking v1 tags to v2 tags
-            moved_tags = MockDB._global_store.get("m_moved_tag", {})
+            moved_tags = MockDB.store.get("m_moved_tag", {})
             self.assertGreaterEqual(len(moved_tags), 2, f"Expected at least 2 m_moved_tag records, got {len(moved_tags)}")
 
             for (s_tag_id, e_tag_id), row in moved_tags.items():
@@ -2135,7 +2136,7 @@ struct nlmsvc_binding {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if mf:
                 mf.clear_all_version()
 
@@ -2145,7 +2146,7 @@ struct nlmsvc_binding {
         temp_dir_v2 = None
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -2187,7 +2188,7 @@ struct config_dynamic {
             G.TE.commit_all()
 
             # Record tags created in v1
-            v1_tags = list(MockDB._global_store.get("m_tag", {}).values())
+            v1_tags = list(MockDB.store.get("m_tag", {}).values())
             self.assertGreaterEqual(len(v1_tags), 3, "Expected at least 3 tags in v1")
             v1_comment_id = v1_tags[0][0]
             v1_static_id = v1_tags[1][0]
@@ -2240,7 +2241,7 @@ struct config_dynamic {
 
             # Verify m_moved_tag: unchanged field threshold is recycled cleanly without moving; only config_dynamic moved
             expected_moved = 1
-            moved_tags = MockDB._global_store.get("m_moved_tag", {})
+            moved_tags = MockDB.store.get("m_moved_tag", {})
             self.assertEqual(len(moved_tags), expected_moved, f"Expected exactly {expected_moved} moved tags, got {len(moved_tags)}")
             moved_s_ids = {s_id for (s_id, e_id) in moved_tags}
             # Unchanged comment and config_static should NOT be moved; config_dynamic moved
@@ -2253,7 +2254,7 @@ struct config_dynamic {
                     G.TE.close()
                 except Exception:
                     pass
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             if mf:
                 mf.clear_all_version()
 
@@ -2261,7 +2262,7 @@ struct config_dynamic {
         """Verify anonymous enums/structs strip /dev/shm full paths down to git relative paths."""
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
             gp = GreatProcessor()
@@ -2308,7 +2309,7 @@ struct anon_container {
             G.TE.commit_all()
 
             # Verify that none of the m_ast entries contain '/dev/shm'
-            ast_store = MockDB._global_store.get("m_ast", {})
+            ast_store = MockDB.store.get("m_ast", {})
             for ast_id, row in ast_store.items():
                 ast_name = row[1]
                 if ast_name:
@@ -2365,8 +2366,8 @@ int calculate_payload(struct payload *p, int factor) {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            ast_store = MockDB._global_store.get("m_ast", {})
-            container_store = MockDB._global_store.get("m_ast_container", {})
+            ast_store = MockDB.store.get("m_ast", {})
+            container_store = MockDB.store.get("m_ast_container", {})
 
             # Find function AST for calculate_payload
             fn_ast_id = None
@@ -2462,8 +2463,8 @@ void run_device(struct context *ctx) {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            ast_store = MockDB._global_store.get("m_ast", {})
-            container_store = MockDB._global_store.get("m_ast_container", {})
+            ast_store = MockDB.store.get("m_ast", {})
+            container_store = MockDB.store.get("m_ast_container", {})
 
             # Find run_device function
             fn_ast_id = None
@@ -2499,7 +2500,7 @@ void run_device(struct context *ctx) {
         """Verify multiple files defining identical function signatures (e.g. static void usage(void)) do not collide in m_ast_container."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -2544,8 +2545,8 @@ void run_device(struct context *ctx) {
 
             G.TE.commit_all()
 
-            ast_store = MockDB._global_store.get("m_ast", {})
-            container_store = MockDB._global_store.get("m_ast_container", {})
+            ast_store = MockDB.store.get("m_ast", {})
+            container_store = MockDB.store.get("m_ast_container", {})
 
             # Locate all AST nodes for 'usage' with functionprotodecl
             usage_nodes = [
@@ -2682,7 +2683,7 @@ err_out:
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            asts = MockDB._global_store.get("m_ast", {})
+            asts = MockDB.store.get("m_ast", {})
             label_asts = [v for v in asts.values() if len(v) >= 3 and v[2] == ASTT.C_LabelStmt]
             self.assertGreater(len(label_asts), 0, "Expected at least one C_LabelStmt")
             label_names = [v[1] for v in label_asts]
@@ -2747,8 +2748,8 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            asts = MockDB._global_store.get("m_ast", {})
-            containers = MockDB._global_store.get("m_ast_container", {})
+            asts = MockDB.store.get("m_ast", {})
+            containers = MockDB.store.get("m_ast_container", {})
 
             # 1. Verify btrfs_xattr_acl_access_handler exists
             handler_ast = None
@@ -2792,7 +2793,7 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
         """Verify struct variable declarations with designated initializers produce exactly 1 tag covering the complete statement."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
             gp = GreatProcessor()
@@ -2830,10 +2831,10 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            db_tag = MockDB._global_store.get(m_tag.table_name, {})
-            db_bridge_tag = MockDB._global_store.get(m_bridge_tag.table_name, {})
-            db_ast = MockDB._global_store.get(m_ast.table_name, {})
-            db_cont = MockDB._global_store.get(m_ast_container.table_name, {})
+            db_tag = MockDB.store.get(m_tag.table_name, {})
+            db_bridge_tag = MockDB.store.get(m_bridge_tag.table_name, {})
+            db_ast = MockDB.store.get(m_ast.table_name, {})
+            db_cont = MockDB.store.get(m_ast_container.table_name, {})
 
             # Exactly 1 tag produced for the complete struct declaration
             self.assertEqual(len(db_tag), 1, f"Expected 1 tag for struct declaration, got {len(db_tag)}")
@@ -2872,7 +2873,7 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
         """Verify CPPro_include normalizes included file paths to clean relative repo paths without /dev/shm/code-parser."""
         temp_dir = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -2911,7 +2912,7 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            db_fn = MockDB._global_store.get(m_file_name.table_name, {})
+            db_fn = MockDB.store.get(m_file_name.table_name, {})
             fnames = [row[1] for row in db_fn.values()]
 
             # Must contain the clean relative path
@@ -2933,7 +2934,7 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
         """Verify that named and anonymous enum constants are staged into m_symbol_def with type C_enumequal."""
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
             gp = GreatProcessor()
@@ -3010,7 +3011,7 @@ enum {
         """Verify that enum constant usages in statements are staged in m_symbol_ref as DeclRef."""
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
             gp = GreatProcessor()
@@ -3079,7 +3080,7 @@ int handle_state(enum my_state s) {
         """Verify cross-file enum constant reference resolution via REF_FILE."""
         mf = None
         try:
-            MockDB._global_store.clear()
+            MockDB.store.clear()
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
             gp = GreatProcessor()
@@ -3220,7 +3221,7 @@ my_local_handler:
             self.assertEqual(defs_by_name["entry_SYSCALL_64"][8], 6)  # line_e
 
             sym_refs = _symbol_store("m_symbol_ref")
-            ast_rows = MockDB._global_store.get("m_ast", {})
+            ast_rows = MockDB.store.get("m_ast", {})
             ast_by_id = {row[0]: row[1] for row in ast_rows.values()}
             ref_names = [ast_by_id.get(row[3], row[3]) for row in sym_refs.values()]
             self.assertIn("do_syscall_64", ref_names)
@@ -3311,7 +3312,7 @@ DEVICE_ATTR_RO(test_attr);
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            attrs = MockDB._global_store.get("m_ast_attribute", {})
+            attrs = MockDB.store.get("m_ast_attribute", {})
             type_attrs = [r for r in attrs.values() if r[2] == "type_str"]
             self.assertEqual(len(type_attrs), 2)
             self.assertEqual(type_attrs[0][3], "int")
@@ -3418,7 +3419,7 @@ END(my_jump_func)
             self.assertNotIn("2", defs_by_name)
 
             # Check that hash comment was staged as Ast_ASM_Comment (ASTT 87)
-            ast_rows = MockDB._global_store.get("m_ast", {})
+            ast_rows = MockDB.store.get("m_ast", {})
             comments = [r for r in ast_rows.values() if r[2] == int(ASTT.ASM_Comment)]
             self.assertTrue(len(comments) >= 1)
             self.assertIn("This is an assembly hash comment", comments[0][1])
@@ -3447,7 +3448,7 @@ def assert_file_tag_fidelity(
     Returns:
         Dictionary containing audit statistics and fidelity metrics.
     """
-    MockDB._global_store.clear()
+    MockDB.store.clear()
     G.DEBUG_TYPECHECK = True
     G.DB = MockDB
     G.TE = TECachedDB()
@@ -3488,8 +3489,8 @@ def assert_file_tag_fidelity(
         if not exec_ok:
             raise AssertionError(f"CS.execute() failed for {file_path}")
 
-        mock_tags = MockDB._global_store.get("m_tag", {})
-        mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
+        mock_tags = MockDB.store.get("m_tag", {})
+        mock_bridge = MockDB.store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
 
         mismatches: list[dict[str, Any]] = []

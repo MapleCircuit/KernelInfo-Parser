@@ -17,8 +17,8 @@ tags, changed or not. Here a parser records definitions and references against t
   placed twice), or a reused tag whose items differ from those stored. `m_symbol_own` marks such placements so the views skip their
   shared rows.
 
-The `m_symbol_def` / `m_symbol_ref` views (`SYMBOL_VIEW_SQL`, created by `main.ensure_db_views()`) return both
-layouts in the per-blob shape; `symbol_view_rows()` computes the same rows from in-memory tables (MockDB, tests).
+The `m_symbol_def` / `m_symbol_ref` views (defined in `db_engine/views.py`, created by `main.ensure_db_views()`) return both
+layouts in the per-blob shape; `symbol_view_rows()` computes the same rows from in-memory tables (in-memory test databases).
 `G.SYMBOL_LAYOUT = "blob"` writes every item per blob (no shared rows), e.g. to compare both layouts.
 """
 from __future__ import annotations
@@ -41,11 +41,11 @@ from core.DBLayout import (
 )
 from core.globalstuff import OP_REF, REF_POS, REF_ROOT, G
 
-KIND_REFS = 1
-KIND_DEFS = 2
+# The SQL of the views lives in `db_engine/views.py`; the key-first readers are `db_engine.symbol_rows`.
+from db_engine import DEF_ID_FLAG, KIND_DEFS, KIND_REFS  # noqa: F401
+
 # Synthetic def_id of a definition stored once per tag: bit 62 set, then blob id (25 bits), tag id (31 bits) and
 # the definition's index in the tag (6 bits); a tag with more definitions keeps them per blob
-DEF_ID_FLAG = 1 << 62
 MAX_TAG_DEFS = 64
 
 _BLOB_REF = ((m_file_blob.table_id, 0), OP_REF, (REF_ROOT,))
@@ -563,74 +563,13 @@ def _tag_row(kind: int, tag_ref: Any, idx: int, key: int, item: tuple[Any, ...],
 # ----------------------------------------------------------------------------------------------------------------
 # Reading: database views and their in-memory equivalent
 # ----------------------------------------------------------------------------------------------------------------
-_OWN = "NOT EXISTS (SELECT 1 FROM m_symbol_own o WHERE o.blob_id = bt.blob_id AND o.tag_id = bt.tag_id AND o.kind = {kind})"
-# Per view: (columns of its per-blob rows, columns of its shared rows, the tag table of the shared rows, its kind)
-_VIEW_PARTS: dict[str, tuple[str, str, str, int]] = {
-    "m_symbol_def": (
-        "d.def_id, d.blob_id, d.tag_id, d.ast_id, d.name, d.type_id, d.linkage, d.line_s, d.line_e FROM m_blob_symbol_def d",
-        f"CAST({DEF_ID_FLAG} | (bt.blob_id << 37) | (ti.tag_id << 6) | ti.def_idx AS SIGNED) AS def_id, "
-        "bt.blob_id, ti.tag_id, bs.target_ast_id AS ast_id, ti.name, ti.type_id, ti.linkage, "
-        "bt.line_s + ti.rel_line_s AS line_s, bt.line_s + ti.rel_line_e AS line_e",
-        "m_tag_def",
-        KIND_DEFS,
-    ),
-    "m_symbol_ref": (
-        "r.ref_id, r.blob_id, r.tag_id, r.ast_id, r.target_fnid, r.role, r.line, r.char_s FROM m_blob_symbol_ref r",
-        "NULL AS ref_id, bt.blob_id, ti.tag_id, bs.target_ast_id AS ast_id, COALESCE(bf.target_fnid, 0) AS target_fnid, "
-        "ti.role, bt.line_s + ti.rel_line AS line, ti.char_s",
-        "m_tag_ref",
-        KIND_REFS,
-    ),
-}
-
-# The target's file (m_symbol_ref only): set for the few keys of m_blob_symbol_file, else 0
-_FILE_JOIN = {
-    "m_symbol_def": "",
-    "m_symbol_ref": "LEFT JOIN m_blob_symbol_file bf ON bf.blob_id = bs.blob_id AND bf.sym_key = bs.sym_key ",
-}
-
-SYMBOL_VIEW_SQL: dict[str, str] = {
-    view: (
-        f"CREATE OR REPLACE VIEW {view} AS SELECT {blob_cols} UNION ALL SELECT {shared_cols} "
-        f"FROM m_bridge_tag bt JOIN {tag_table} ti ON ti.tag_id = bt.tag_id "
-        "JOIN m_blob_symbol bs ON bs.blob_id = bt.blob_id AND bs.sym_key = ti.sym_key "
-        f"{_FILE_JOIN[view]}"
-        f"WHERE {_OWN.format(kind=kind)};"
-    )
-    for view, (blob_cols, shared_cols, tag_table, kind) in _VIEW_PARTS.items()
-}
-
-
-def rows_of_targets_sql(view: str, n_targets: int) -> tuple[str, int]:
-    """A SELECT of the `view` rows whose `ast_id` is one of `n_targets` AST ids, and how often to pass them.
-
-    Filtering the view by `ast_id` makes the database join each blob that uses a target with every tag of every
-    blob holding the key (seconds to minutes for a common function). This query starts from the target's keys,
-    then their tag rows, their placements and the placements' blob resolution. Use it as a derived table:
-    `cursor.execute(f"SELECT ... FROM ({sql}) r", tuple(ids) * repeat)`.
-    """
-    blob_cols, shared_cols, tag_table, kind = _VIEW_PARTS[view]
-    ids = ", ".join(["%s"] * n_targets)
-    sql = (
-        f"SELECT {blob_cols} WHERE {'d' if view == 'm_symbol_def' else 'r'}.ast_id IN ({ids}) UNION ALL "
-        f"SELECT STRAIGHT_JOIN {shared_cols} "
-        f"FROM (SELECT DISTINCT sym_key FROM m_blob_symbol WHERE target_ast_id IN ({ids})) k "
-        f"JOIN {tag_table} ti ON ti.sym_key = k.sym_key "
-        "JOIN m_bridge_tag bt ON bt.tag_id = ti.tag_id "
-        "JOIN m_blob_symbol bs ON bs.blob_id = bt.blob_id AND bs.sym_key = ti.sym_key "
-        f"{_FILE_JOIN[view]}"
-        f"WHERE bs.target_ast_id IN ({ids}) AND {_OWN.format(kind=kind)}"
-    )
-    return sql, 3
-
-
 def synthetic_def_id(blob_id: int, tag_id: int, def_idx: int) -> int:
     """def_id the m_symbol_def view gives a definition stored once per tag."""
     return DEF_ID_FLAG | (blob_id << 37) | (tag_id << 6) | def_idx
 
 
 def symbol_view_rows(tables: Mapping[str, Iterable[tuple[Any, ...]]], view: str) -> list[tuple[Any, ...]]:
-    """Rows of the `m_symbol_def` / `m_symbol_ref` view computed from table rows (e.g. `MockDB._global_store`).
+    """Rows of the `m_symbol_def` / `m_symbol_ref` view computed from table rows (e.g. the rows of an in-memory test database).
 
     `tables` maps table names to their rows (dict values or lists of tuples). Per-blob rows come first, then the
     shared rows ordered by blob, tag placement and index.

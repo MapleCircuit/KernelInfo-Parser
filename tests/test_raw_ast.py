@@ -459,7 +459,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
     def setUp(self) -> None:
         from main import MF as main_MF
-        from main import file_fid_cache
+        from pipeline.changesets import file_fid_cache
         from main import gp as main_gp
         MockDB.reset()
         G.DB = MockDB
@@ -486,14 +486,15 @@ class TestSymlinkAliasing(unittest.TestCase):
         file_fid_cache.clear()
 
     def tearDown(self) -> None:
-        from main import file_fid_cache
+        from pipeline.changesets import file_fid_cache
         file_fid_cache.clear()
         if hasattr(self, "mf") and self.mf:
             self.mf.clear_all_version()
 
     def test_file_symlink_aliasing_zero_duplication(self) -> None:
         """Verify file symlink aliases to target fid in m_bridge_file with 0 duplicate m_file/tags."""
-        from main import file_fid_cache, processing_symlinks
+        from pipeline.changesets import file_fid_cache
+        from pipeline.unchanged import processing_symlinks
 
         # 1. Setup real target file on disk and in database
         target_rel = "arch/microblaze/platform/generic/system.dts"
@@ -515,8 +516,8 @@ class TestSymlinkAliasing(unittest.TestCase):
         G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
         G.TE.commit_all()
 
-        m_file_count_before = len(MockDB._global_store.get(m_file.table_name, {}))
-        m_tag_count_before = len(MockDB._global_store.get(m_tag.table_name, {}))
+        m_file_count_before = len(MockDB.store.get(m_file.table_name, {}))
+        m_tag_count_before = len(MockDB.store.get(m_tag.table_name, {}))
 
         # 2. Process symlink
         processing_symlinks([f"A\t{symlink_rel}"])
@@ -534,20 +535,21 @@ class TestSymlinkAliasing(unittest.TestCase):
         self.assertEqual(file_fid_cache.get(symlink_rel), target_fid)
 
         # Zero duplication: No new m_file or m_tag records created for the symlink
-        m_file_count_after = len(MockDB._global_store.get(m_file.table_name, {}))
-        m_tag_count_after = len(MockDB._global_store.get(m_tag.table_name, {}))
+        m_file_count_after = len(MockDB.store.get(m_file.table_name, {}))
+        m_tag_count_after = len(MockDB.store.get(m_tag.table_name, {}))
         self.assertEqual(m_file_count_after, m_file_count_before, "Symlink aliasing must not create duplicate m_file")
         self.assertEqual(m_tag_count_after, m_tag_count_before, "Symlink aliasing must not create duplicate m_tag")
 
         # Verify staged symlink records commit cleanly through unified commit_all()
         G.TE.commit_all()
-        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
-        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+        self.assertIn(sym_fnid, MockDB.store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB.store.get(m_bridge_file.table_name, {}))
 
     def test_directory_symlink_aliasing(self) -> None:
         """Verify directory symlink aliases directly to target directory fid without directory errors."""
         from core.globalstuff import T_DIR
-        from main import file_fid_cache, processing_symlinks
+        from pipeline.changesets import file_fid_cache
+        from pipeline.unchanged import processing_symlinks
 
         # 1. Setup real target dir and symlink on disk
         target_dir = os.path.join(self.temp_dir, "include", "dt-bindings")
@@ -567,7 +569,7 @@ class TestSymlinkAliasing(unittest.TestCase):
         G.TE.set(m_bridge_file.table_id, (1, dir_fn, dir_fid))
         G.TE.commit_all()
 
-        m_file_count_before = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_file_count_before = len(MockDB.store.get(m_file.table_name, {}))
 
         # 2. Process directory symlink
         processing_symlinks([f"A\t{symlink_rel}"])
@@ -582,17 +584,17 @@ class TestSymlinkAliasing(unittest.TestCase):
         self.assertEqual(bf_row[2][2], dir_fid)
         self.assertEqual(file_fid_cache.get(symlink_rel), dir_fid)
 
-        m_file_count_after = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_file_count_after = len(MockDB.store.get(m_file.table_name, {}))
         self.assertEqual(m_file_count_after, m_file_count_before, "Directory symlink aliasing must not create duplicate m_file")
 
         # Verify staged directory symlink records commit cleanly through unified commit_all()
         G.TE.commit_all()
-        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
-        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+        self.assertIn(sym_fnid, MockDB.store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB.store.get(m_bridge_file.table_name, {}))
 
     def test_broken_symlink_fallback(self) -> None:
         """Verify dangling/broken symlinks gracefully fall back to raw tracking."""
-        from main import processing_symlinks
+        from pipeline.unchanged import processing_symlinks
 
         broken_rel = "tools/broken_link.txt"
         broken_full = os.path.join(self.temp_dir, broken_rel)
@@ -613,13 +615,13 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # Verify fallback symlink records commit cleanly through unified commit_all()
         G.TE.commit_all()
-        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
-        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+        self.assertIn(sym_fnid, MockDB.store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB.store.get(m_bridge_file.table_name, {}))
 
     def test_symlink_deletion_does_not_close_target(self) -> None:
         """Verify deleting an aliased symlink does not close the target m_file record."""
         from main import MF as main_MF
-        from main import default_processing
+        from pipeline.file_processing import default_processing
         from main import gp as main_gp
 
         old_dir = self.mf.create_temp_dir()
@@ -666,7 +668,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
     def test_symlink_topological_commit_ordering(self) -> None:
         """Verify processing_symlinks does not flush m_bridge_file prematurely before commit_all."""
-        from main import processing_symlinks
+        from pipeline.unchanged import processing_symlinks
 
         # 1. Setup target file and symlink
         target_rel = "arch/x86/boot/compressed/misc.h"
@@ -688,15 +690,15 @@ class TestSymlinkAliasing(unittest.TestCase):
         G.TE.commit_all()
 
         # Count records in MockDB prior to symlink processing
-        bridge_count_before = len(MockDB._global_store.get(m_bridge_file.table_name, {}))
-        fn_count_before = len(MockDB._global_store.get(m_file_name.table_name, {}))
+        bridge_count_before = len(MockDB.store.get(m_bridge_file.table_name, {}))
+        fn_count_before = len(MockDB.store.get(m_file_name.table_name, {}))
 
         # 2. Process symlink
         processing_symlinks([f"A\t{symlink_rel}"])
 
         # 3. Assert processing_symlinks did NOT prematurely commit to DB
-        bridge_count_staged = len(MockDB._global_store.get(m_bridge_file.table_name, {}))
-        fn_count_staged = len(MockDB._global_store.get(m_file_name.table_name, {}))
+        bridge_count_staged = len(MockDB.store.get(m_bridge_file.table_name, {}))
+        fn_count_staged = len(MockDB.store.get(m_file_name.table_name, {}))
         self.assertEqual(
             bridge_count_staged,
             bridge_count_before,
@@ -710,8 +712,8 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # 4. Commit all and verify both are committed in proper topological order
         G.TE.commit_all()
-        bridge_store = MockDB._global_store.get(m_bridge_file.table_name, {})
-        fn_store = MockDB._global_store.get(m_file_name.table_name, {})
+        bridge_store = MockDB.store.get(m_bridge_file.table_name, {})
+        fn_store = MockDB.store.get(m_file_name.table_name, {})
 
         self.assertEqual(len(bridge_store), bridge_count_before + 1)
         self.assertEqual(len(fn_store), fn_count_before + 1)
@@ -723,7 +725,8 @@ class TestSymlinkAliasing(unittest.TestCase):
     def test_file_symlink_aliasing_multi_version_unchanged(self) -> None:
         """Verify unchanged symlinks in multi-version cycles resolve target fid from gp.Old_VID without duplicate m_file."""
         from main import MF as main_MF
-        from main import file_fid_cache, get_fid_for_path, processing_symlinks
+        from pipeline.changesets import file_fid_cache, get_fid_for_path
+        from pipeline.unchanged import processing_symlinks
         from main import gp as main_gp
 
         # 1. Setup real target file on disk and in database for VID 1
@@ -747,7 +750,7 @@ class TestSymlinkAliasing(unittest.TestCase):
         processing_symlinks([f"A\t{symlink_rel}"])
         G.TE.commit_all()
 
-        m_file_count_v1 = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_file_count_v1 = len(MockDB.store.get(m_file.table_name, {}))
 
         # 2. Advance to VID 2 (target and symlink are unchanged)
         main_gp.Old_VID = 1
@@ -784,7 +787,7 @@ class TestSymlinkAliasing(unittest.TestCase):
         self.assertEqual(file_fid_cache.get(symlink_rel), target_fid)
 
         # Zero new m_file records created in VID 2
-        m_file_count_v2 = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_file_count_v2 = len(MockDB.store.get(m_file.table_name, {}))
         self.assertEqual(m_file_count_v2, m_file_count_v1, "Unchanged symlink in VID 2 must not allocate new m_file")
 
     def test_raw_ast_operation_u_graceful(self) -> None:

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 import subprocess
 import threading
 import time
@@ -38,11 +37,12 @@ from parser.git_ast.release_order import (  # noqa: F401 - re-exported
     release_tag_names,
     series_name,
 )
+from cache_engine import BYTES, INT, TEXT, CacheError, CacheSpace, In, StoreSpec, get_cache_engine
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_repo_id
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Agg, Join
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import is_safe_rev
-from webapp.backend.services import disk_cache
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
 from webapp.backend.services.sync_service import register_refs_changed
@@ -137,45 +137,34 @@ def range_of(tag: str) -> tuple[str | None, str]:
 
 # --------------------------------------------------------------------------- first containing tag index
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS tags (idx INTEGER PRIMARY KEY, name TEXT UNIQUE, sha TEXT, chain TEXT);
-CREATE TABLE IF NOT EXISTS first_tag (sha BLOB, chain INTEGER, tag_idx INTEGER, PRIMARY KEY (sha, chain)) WITHOUT ROWID;
-"""
+NAMESPACE = "release-index"
+STORES = (
+    StoreSpec("tags", (INT("idx"), TEXT("name", null=True), TEXT("sha", null=True), TEXT("chain", null=True)),
+              key=("idx",), unique=(("name",),)),
+    StoreSpec("first_tag", (BYTES("sha"), INT("chain"), INT("tag_idx", null=True)), key=("sha", "chain"), clustered=True),
+)
 CHAIN_MAINLINE = 0
 CHAIN_STABLE = 1
 
 
 class ReleaseIndex:
-    """commit -> first mainline tag and first stable tag introducing it, in SQLite, per repository."""
+    """commit -> first mainline tag and first stable tag introducing it, per repository (cache_engine space)."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._conns: dict[str, sqlite3.Connection] = {}
-
-    def path(self):
+    @staticmethod
+    def space_name() -> str:
         # Versioned by INDEX_FORMAT (bump it when the stored rows change meaning), not by the module's
         # source: an unrelated edit must not throw away an index that took minutes to build
-        return disk_cache.sqlite_path("release-index", f"{get_active_repo_name()}-v{INDEX_FORMAT}")
+        return f"{get_active_repo_name()}-v{INDEX_FORMAT}"
 
-    def _conn(self) -> sqlite3.Connection:
-        path = str(self.path())
-        with self._lock:
-            conn = self._conns.get(path)
-            if conn is None:
-                conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.executescript(_SCHEMA)
-                self._conns[path] = conn
-            return conn
+    def space(self) -> CacheSpace:
+        """The release space of the active repository (stores `tags`, `first_tag`; opened on demand)."""
+        return get_cache_engine().open(NAMESPACE, self.space_name(), STORES)
 
     def _meta(self, key: str) -> str | None:
-        row = self._conn().execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
+        return self.space().get_meta(key)
 
     def built_tags(self) -> dict[str, str]:
-        return {name: sha for name, sha in self._conn().execute("SELECT name, sha FROM tags")}
+        return {name: sha for name, sha in self.space().store("tags").scan(columns=("name", "sha"))}
 
     def is_current(self) -> bool:
         tags = tag_commits()
@@ -186,48 +175,47 @@ class ReleaseIndex:
         """{mainline: tag, stable: tag} for a full SHA, or None when the index does not cover it yet."""
         if not _FULL_SHA.match(sha or ""):
             return None
-        conn = self._conn()
-        rows = conn.execute(
-            "SELECT f.chain, t.name FROM first_tag f JOIN tags t ON t.idx = f.tag_idx WHERE f.sha = ?",
-            (bytes.fromhex(sha),),
-        ).fetchall()
+        space = self.space()
+        key = bytes.fromhex(sha)
+        rows = space.store("first_tag").get_many([(key, CHAIN_MAINLINE), (key, CHAIN_STABLE)])
+        tags = space.store("tags")
         out: dict[str, str | None] = {"mainline": None, "stable": None}
-        for chain, name in rows:
-            out["mainline" if chain == CHAIN_MAINLINE else "stable"] = name
+        for (_sha, chain), (_s, _c, tag_idx) in rows.items():
+            hit = tags.get(tag_idx)
+            if hit:
+                out["mainline" if chain == CHAIN_MAINLINE else "stable"] = hit[1]
         return out
 
     def lookup_many(self, shas: list[str]) -> dict[str, dict[str, str | None]]:
         """`lookup()` of many full SHAs at once (500 per query); SHAs the index does not cover are omitted."""
         keys = list(dict.fromkeys(s for s in shas if _FULL_SHA.match(s or "")))
         out: dict[str, dict[str, str | None]] = {}
-        conn = self._conn()
-        names = {idx: name for idx, name in conn.execute("SELECT idx, name FROM tags")}
-        for i in range(0, len(keys), 500):
-            part = [bytes.fromhex(s) for s in keys[i:i + 500]]
-            q = ",".join("?" * len(part))
-            for sha, chain, tag_idx in conn.execute(f"SELECT sha, chain, tag_idx FROM first_tag WHERE sha IN ({q})", part):
-                hit = out.setdefault(sha.hex(), {"mainline": None, "stable": None})
-                hit["mainline" if chain == CHAIN_MAINLINE else "stable"] = names.get(tag_idx)
+        space = self.space()
+        names = {idx: name for idx, name in space.store("tags").scan(columns=("idx", "name"))}
+        part = [bytes.fromhex(s) for s in keys]
+        for sha, chain, tag_idx in space.store("first_tag").scan(In("sha", part)):
+            hit = out.setdefault(sha.hex(), {"mainline": None, "stable": None})
+            hit["mainline" if chain == CHAIN_MAINLINE else "stable"] = names.get(tag_idx)
         return out
 
     def stats(self) -> dict[str, Any]:
         try:
-            conn = self._conn()
             return {
-                "tags": conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0],
+                "tags": self.space().store("tags").count(),
                 "built_at": float(self._meta("built_at") or 0) or None,
             }
-        except sqlite3.Error:
+        except CacheError:
             return {"tags": 0, "built_at": None}
 
     def build(self, progress: Callable[..., None] | None = None) -> dict[str, Any]:
         """Index every release range not indexed yet (incremental: only new tags cost anything)."""
         tags = tag_commits(refresh=True)
         built = self.built_tags()
-        conn = self._conn()
+        space = self.space()
+        tags_store, first_tag = space.store("tags"), space.store("first_tag")
         # A tag that moved (re-tagged) invalidates the index: start over
         if any(name in tags and tags[name] != sha for name, sha in built.items()):
-            conn.executescript("DELETE FROM first_tag; DELETE FROM tags; DELETE FROM meta;")
+            space.clear()
             built = {}
         # Each range ends at a tag and starts at the tag before it on its chain (release_ranges: the previous
         # mainline tag of its family, the previous update of its stable series)
@@ -238,8 +226,8 @@ class ReleaseIndex:
         total = len(jobs_list)
         if progress:
             progress(0, total, "release ranges")
-        next_idx = (conn.execute("SELECT COALESCE(MAX(idx), 0) FROM tags").fetchone()[0] or 0) + 1
-        idx_of = {name: i for i, name in conn.execute("SELECT idx, name FROM tags")}
+        next_idx = (tags_store.max("idx") or 0) + 1
+        idx_of = {name: i for i, name in tags_store.scan(columns=("idx", "name"))}
         for t, _p, chain in jobs_list:
             if t not in idx_of:
                 idx_of[t] = next_idx
@@ -256,18 +244,14 @@ class ReleaseIndex:
             # Ranges are computed in parallel; rows are written in release order, so the first tag of
             # a commit reachable from two ranges (a stable chain starting below its parent) is the earliest
             for t, chain, shas in pool.map(run, jobs_list):
-                with conn:
-                    conn.execute("INSERT OR REPLACE INTO tags (idx, name, sha, chain) VALUES (?, ?, ?, ?)",
-                                 (idx_of[t], t, tags[t], "stable" if chain else "mainline"))
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO first_tag (sha, chain, tag_idx) VALUES (?, ?, ?)",
-                        ((bytes.fromhex(s), chain, idx_of[t]) for s in shas if _FULL_SHA.match(s)),
-                    )
+                with space.batch():
+                    tags_store.put((idx_of[t], t, tags[t], "stable" if chain else "mainline"))
+                    first_tag.put_many(
+                        ((bytes.fromhex(s), chain, idx_of[t]) for s in shas if _FULL_SHA.match(s)), replace=False)
                 done += 1
                 if progress:
                     progress(done, total, f"{t}: {len(shas)} commits")
-        with conn:
-            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('built_at', ?)", (str(time.time()),))
+        space.set_meta("built_at", str(time.time()))
         return {"tags": len(tags), "ranges_indexed": total}
 
 
@@ -286,12 +270,11 @@ _DB_COVERAGE: RepoScopedCache = RepoScopedCache(maxsize=4)
 _DB_COVERAGE_TTL = 60.0  # a "not covered" answer is checked again after this (release statistics run at parser start)
 
 
-def _segment_rows(cursor: Any) -> list[dict[str, Any]]:
-    cursor.execute(
-        "SELECT segment_id, tag, tag_hash, chain, base_tag, format FROM m_release_segment WHERE repo_id = %s;",
-        (get_active_repo_id(cursor),),
-    )
-    return list(cursor.fetchall())
+def _segment_rows(reader: Any) -> list[dict[str, Any]]:
+    return list(reader.select_rows(
+        "m_release_segment", ["segment_id", "tag", "tag_hash", "chain", "base_tag", "format"],
+        {"repo_id": get_active_repo_id(reader)},
+    ))
 
 
 def db_covers_all() -> bool:
@@ -304,7 +287,7 @@ def db_covers_all() -> bool:
     tags = tag_commits()
     ok = False
     try:
-        with get_db_cursor() as cursor:
+        with get_reader() as cursor:
             stored = {_text(r["tag"]): (_hex(r["tag_hash"]), int(r["format"])) for r in _segment_rows(cursor)}
         ok = bool(tags) and all(stored.get(t) == (sha, release_stats.FORMAT) for t, sha in tags.items())
     except Exception as exc:  # noqa: BLE001 - an older database (no m_release_segment): not covered
@@ -331,20 +314,16 @@ def db_lookup(shas: list[str]) -> dict[str, dict[str, str | None]]:
         return out
     tags = tag_commits()
     try:
-        with get_db_cursor() as cursor:
+        with get_reader() as cursor:
             repo_id = get_active_repo_id(cursor)
             for i in range(0, len(keys), 500):
                 part = keys[i:i + 500]
-                cursor.execute(
-                    f"""
-                    SELECT r.commit_hash, r.chain, s.tag, s.tag_hash
-                    FROM m_commit_release r
-                    JOIN m_release_segment s ON s.segment_id = r.segment_id
-                    WHERE r.repo_id = %s AND r.commit_hash IN ({",".join(["%s"] * len(part))});
-                    """,
-                    (repo_id, *[bytes.fromhex(x) for x in part]),
-                )
-                for r in cursor.fetchall():
+                for r in cursor.select_rows(
+                    ("m_commit_release", "r"),
+                    {"commit_hash": "r.commit_hash", "chain": "r.chain", "tag": "s.tag", "tag_hash": "s.tag_hash"},
+                    {"r.repo_id": repo_id, "r.commit_hash": [bytes.fromhex(x) for x in part]},
+                    joins=[Join(("m_release_segment", "s"), {"s.segment_id": "r.segment_id"})],
+                ):
                     tag = _text(r["tag"])
                     if tags.get(tag) != _hex(r["tag_hash"]):
                         continue
@@ -377,14 +356,15 @@ def release_token() -> str:
     """Changes whenever the release membership answers may change (part of report cache keys)."""
     if db_covers_all():
         try:
-            with get_db_cursor() as cursor:
-                cursor.execute("SELECT MAX(segment_id) AS m, COUNT(*) AS n FROM m_release_segment WHERE repo_id = %s;",
-                               (get_active_repo_id(cursor),))
-                row = cursor.fetchone() or {}
+            with get_reader() as cursor:
+                row = cursor.select_one(
+                    "m_release_segment", {"m": Agg("MAX", "segment_id"), "n": Agg("COUNT", "*")},
+                    {"repo_id": get_active_repo_id(cursor)},
+                ) or {}
             return f"db:{row.get('m')}:{row.get('n')}"
         except Exception:  # noqa: BLE001
             pass
-    return f"sqlite:{release_index.stats().get('built_at')}"
+    return f"index:{release_index.stats().get('built_at')}"
 
 
 def walk_segments(from_tag: str | None, to_tag: str, limit: int = 200) -> list[int] | None:
@@ -393,7 +373,7 @@ def walk_segments(from_tag: str | None, to_tag: str, limit: int = 200) -> list[i
     within `limit` segments, a segment is missing or stale, or the database has no segments."""
     tags = tag_commits()
     try:
-        with get_db_cursor() as cursor:
+        with get_reader() as cursor:
             rows = {_text(r["tag"]): r for r in _segment_rows(cursor)}
     except Exception:  # noqa: BLE001
         return None
@@ -415,14 +395,10 @@ def segment_commits(segment_ids: list[int]) -> list[str]:
     out: list[str] = []
     if not segment_ids:
         return out
-    with get_db_cursor() as cursor:
+    with get_reader() as reader:
         for i in range(0, len(segment_ids), 200):
             part = segment_ids[i:i + 200]
-            cursor.execute(
-                f"SELECT commit_hash FROM m_commit_release WHERE segment_id IN ({','.join(['%s'] * len(part))});",
-                tuple(part),
-            )
-            out.extend(_hex(r["commit_hash"]) for r in cursor.fetchall())
+            out.extend(_hex(r["commit_hash"]) for r in reader.select_rows("m_commit_release", ["commit_hash"], {"segment_id": part}))
     return out
 
 

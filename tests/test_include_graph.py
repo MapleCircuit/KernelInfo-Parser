@@ -103,11 +103,11 @@ class TestIncludeEndpoint(unittest.TestCase):
     def test_build_layout_answers_first(self) -> None:
         from webapp.backend.services import filesystem_service as fs
 
-        cursor = MagicMock()
+        reader = MagicMock()
         ctx = MagicMock()
-        ctx.__enter__.return_value = cursor
+        ctx.__enter__.return_value = reader
         svc = fs.FilesystemService()
-        with patch.object(fs, "get_db_cursor", return_value=ctx), \
+        with patch.object(fs, "get_reader", return_value=ctx), \
              patch.object(fs, "get_version_info", return_value=(1, "v2.6.12")), \
              patch("webapp.backend.services.tree_resolver.definition_arch", return_value=("x86_64", "x86_64", 64)), \
              patch("webapp.backend.services.arch_layout_service.arch_layout_service.resolve_include",
@@ -116,7 +116,8 @@ class TestIncludeEndpoint(unittest.TestCase):
             res = svc.resolve_include("v2.6.12", "<asm/atomic.h>", None, "include/linux/sched.h", "x86_64")
         self.assertEqual((res["path"], res["method"], res["arch"]), ("include/asm-x86_64/atomic.h", "build_layout", "x86_64"))
         resolve.assert_called_once_with("v2.6.12", "x86_64", "asm/atomic.h", "include/linux/sched.h", False)
-        cursor.execute.assert_not_called()
+        reader.select_rows.assert_not_called()
+        reader.select_one.assert_not_called()
 
 
 if __name__ == "__main__":

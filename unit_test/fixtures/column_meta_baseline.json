@@ -1,0 +1,1502 @@
+{
+ "m_arch_layout": {
+  "binary": [
+   1
+  ],
+  "est_bytes": [
+   4,
+   16
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_arch_layout_entry": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   1,
+   2,
+   257,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   3
+  ]
+ },
+ "m_arch_root": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   34,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_ast": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   257,
+   2
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_ast_attribute": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2,
+   66,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_ast_container": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2,
+   2,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_ast_debug": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2048
+  ],
+  "has_auto_increment": false,
+  "large": [
+   1
+  ],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_ast_hash": {
+  "binary": [
+   0
+  ],
+  "est_bytes": [
+   16,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_ast_include": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_blob_facts": {
+  "binary": [
+   0,
+   3
+  ],
+  "est_bytes": [
+   20,
+   1,
+   2,
+   2048
+  ],
+  "has_auto_increment": false,
+  "large": [
+   3
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_blob_symbol": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   8,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_blob_symbol_def": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4,
+   4,
+   257,
+   1,
+   1,
+   3,
+   3
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_blob_symbol_file": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   8,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_blob_symbol_ref": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4,
+   4,
+   4,
+   1,
+   3,
+   3
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_blob_transition": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_bridge_checkpoint": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_bridge_commit_person": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1,
+   2
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_bridge_commit_tag": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   2
+  ]
+ },
+ "m_bridge_map": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_bridge_tag": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   3,
+   3,
+   3,
+   3
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_checkpoint_base": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_commit": {
+  "binary": [
+   2
+  ],
+  "est_bytes": [
+   4,
+   4,
+   20,
+   4,
+   4,
+   4,
+   4,
+   502,
+   2048
+  ],
+  "has_auto_increment": true,
+  "large": [
+   8
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_commit_email": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   257,
+   8,
+   1,
+   1,
+   1,
+   2,
+   2
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0,
+   1,
+   3
+  ]
+ },
+ "m_commit_file": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4,
+   4,
+   4,
+   1
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_commit_link": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_commit_parent": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   2
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   2
+  ]
+ },
+ "m_commit_relation": {
+  "binary": [
+   3
+  ],
+  "est_bytes": [
+   4,
+   1,
+   2,
+   20,
+   42,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_commit_release": {
+  "binary": [
+   1
+  ],
+  "est_bytes": [
+   4,
+   20,
+   1,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_credits_entry": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4,
+   257,
+   257,
+   2048,
+   2048,
+   4
+  ],
+  "has_auto_increment": true,
+  "large": [
+   5,
+   6
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_cve": {
+  "binary": [
+   8
+  ],
+  "est_bytes": [
+   26,
+   1,
+   4,
+   4,
+   2,
+   1,
+   257,
+   514,
+   2048
+  ],
+  "has_auto_increment": false,
+  "large": [
+   8
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_cve_commit": {
+  "binary": [],
+  "est_bytes": [
+   42,
+   1,
+   26
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_cve_commit_hash": {
+  "binary": [
+   2
+  ],
+  "est_bytes": [
+   4,
+   42,
+   20
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_cve_file": {
+  "binary": [],
+  "est_bytes": [
+   26,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_cve_source": {
+  "binary": [
+   2
+  ],
+  "est_bytes": [
+   66,
+   18,
+   20,
+   2,
+   4,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_db_instance": {
+  "binary": [],
+  "est_bytes": [
+   66,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_file_blob": {
+  "binary": [
+   1
+  ],
+  "est_bytes": [
+   4,
+   20,
+   1
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_file_name": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   257
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_file_reference": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4,
+   4,
+   1,
+   3,
+   257
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_git_network": {
+  "binary": [
+   3
+  ],
+  "est_bytes": [
+   4,
+   4,
+   66,
+   20
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_git_ref": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1,
+   257,
+   4,
+   4,
+   4,
+   512
+  ],
+  "has_auto_increment": true,
+  "large": [
+   7
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_ingest_blob": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_ingest_id_range": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2,
+   8,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_ingest_state": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1,
+   8,
+   4,
+   130
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_ingest_watermark": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_kbuild_symbol": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   2,
+   66,
+   1,
+   3,
+   1,
+   1,
+   130,
+   257,
+   4,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11
+  ],
+  "primary": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ]
+ },
+ "m_maintainer_file": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_maintainer_member": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_maintainer_pattern": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   1,
+   257,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2,
+   3
+  ]
+ },
+ "m_maintainer_person": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   130,
+   130
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_maintainer_section": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   130,
+   34,
+   257,
+   257,
+   257,
+   4,
+   257,
+   257,
+   257,
+   257
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_map_ast": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   3,
+   3,
+   3,
+   3,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ]
+ },
+ "m_moved_tag": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_parse_node": {
+  "binary": [],
+  "est_bytes": [
+   130,
+   4,
+   34,
+   257,
+   4,
+   4,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_parse_task": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   130,
+   34,
+   4,
+   257,
+   4,
+   257,
+   4,
+   1,
+   130,
+   8,
+   2,
+   512
+  ],
+  "has_auto_increment": true,
+  "large": [
+   13
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_person_first_release": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_person_identity": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   257
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_project": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   66,
+   34
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_release_person": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1,
+   4
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_release_segment": {
+  "binary": [
+   3,
+   6
+  ],
+  "est_bytes": [
+   4,
+   4,
+   66,
+   20,
+   1,
+   66,
+   20,
+   4,
+   4,
+   66,
+   4,
+   4,
+   4,
+   2
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_repository": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   66,
+   257,
+   66
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_symbol_own": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   4,
+   1
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2
+  ],
+  "primary": [
+   0,
+   1,
+   2
+  ]
+ },
+ "m_table_sequence": {
+  "binary": [],
+  "est_bytes": [
+   2,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_tag": {
+  "binary": [
+   1
+  ],
+  "est_bytes": [
+   4,
+   32,
+   4,
+   4,
+   4
+  ],
+  "has_auto_increment": true,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "primary": [
+   0
+  ]
+ },
+ "m_tag_def": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   2,
+   8,
+   257,
+   1,
+   1,
+   3,
+   3
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_tag_ref": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   3,
+   8,
+   1,
+   3,
+   3
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_type_descriptor": {
+  "binary": [],
+  "est_bytes": [
+   2,
+   66
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1
+  ],
+  "primary": [
+   0
+  ]
+ }
+}

@@ -368,8 +368,9 @@ class TestDatabaseConnectionDiagnostic(unittest.TestCase):
         self.assertFalse(res.passed)
         self.assertIn("SSH host tunnel.unreachable.com:22 unreachable", res.message)
 
-    @patch.dict("sys.modules", {"mysql.connector": None})
-    def test_database_missing_mysql_connector(self) -> None:
+    def test_database_probe_failure_is_reported(self) -> None:
+        from db_engine import MariaDB, ProbeResult
+
         cfg = {
             "engine": "mariadb",
             "user": "root",
@@ -377,15 +378,45 @@ class TestDatabaseConnectionDiagnostic(unittest.TestCase):
             "database": "test",
             "host": "127.0.0.1",
         }
-        res = test_database_connection(cfg)
+        failed = ProbeResult(False, error="mysql-connector is not installed", target="127.0.0.1:3306")
+        with patch.object(MariaDB, "probe_connection", return_value=failed):
+            res = test_database_connection(cfg)
         self.assertFalse(res.passed)
         self.assertIn("mysql-connector is not installed", res.message)
+
+    def test_database_sqlite_file_probe(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = test_database_connection({"engine": "sqlite", "path": f"{tmp}/k.sqlite3"})
+            self.assertTrue(res.passed, res.message)
+            res = test_database_connection({"engine": "sqlite", "path": f"{tmp}/missing-dir/k.sqlite3"})
+            self.assertFalse(res.passed)
+            self.assertIn("SQLite connection failed", res.message)
+
+    def test_database_sqlite_bare_name_is_not_a_file(self) -> None:
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                res = test_database_connection({"engine": "sqlite", "database": "test"})
+                self.assertFalse(res.passed)
+                self.assertIn("database.path", res.message)
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                os.chdir(cwd)
+
+    def test_database_unknown_engine(self) -> None:
+        res = test_database_connection({"engine": "oracle"})
+        self.assertFalse(res.passed)
+        self.assertIn("Unknown database engine", res.message)
 
     @patch("mysql.connector.connect")
     def test_database_successful_mariadb_connection(self, mock_connect) -> None:
         mock_cnx = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cnx.cursor.return_value = mock_cursor
         mock_cnx.get_server_info.return_value = "10.11.6-MariaDB"
         mock_connect.return_value = mock_cnx
 
@@ -401,7 +432,6 @@ class TestDatabaseConnectionDiagnostic(unittest.TestCase):
         self.assertTrue(res.passed)
         self.assertIn("Connected to database successfully", res.message)
         self.assertIn("10.11.6-MariaDB", res.message)
-        mock_cursor.execute.assert_called_with("SELECT 1")
 
 
 class TestRepositoryDiagnostic(unittest.TestCase):

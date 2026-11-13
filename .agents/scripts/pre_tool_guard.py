@@ -4,6 +4,26 @@
 Invoked by Antigravity lifecycle hooks (`.agents/hooks.json`, tool `read_file`) and by
 Claude Code PreToolUse hooks (`.claude/settings.json`, tool `Read`).
 Receives hook payload JSON on stdin, outputs decision JSON on stdout.
+
+Scope: the hook guards the Read tool (`Read` / `read_file`) only. Shell access
+(`cat`, `sed -n`, `grep`) is not intercepted, so the guard is advisory for Bash.
+
+Rules (stable names, used in deny messages and overrides):
+    forbidden_files   exact forbidden basenames (Dockerfile, install.md, ...)
+    forbidden_dirs    `__pycache__/` and `tool/` directories
+    upstream_docs     AGENTS.md inside `repos/` (upstream kernel documentation)
+    deprecated_stub   `table_engine/API.md`, `db_engine/API.md` redirects
+    engine_boundary   `db_engine/` files other than the public-API allowlist
+    slice_limit       files >= 40 KB need a Read offset/limit span <= 350 lines
+
+Always allowed inside `db_engine/`: `API_SURFACE.md`, `base.py`, `DB_API.md`, `spec.py`, `errors.py`,
+`read_intents.py`, `__init__.py`.
+
+Overrides (explicit, user-approved tasks only; they apply solely to the named rules):
+    * untracked file `.agents/guard_overrides.local.json`, read on every call:
+      {"allow": ["engine_boundary"], "reason": "<who approved what>"}
+    * env var `KIP_GUARD_ALLOW=engine_boundary,slice_limit` (comma-separated)
+A missing or invalid override file grants nothing; the hook never crashes.
 """
 
 import json
@@ -24,24 +44,68 @@ FORBIDDEN_BASENAMES = {
     "ruff.toml",
 }
 
-# Allowed exceptions inside db_engine/
+# Always-allowed public-API files inside db_engine/ (lower-case basenames)
 ALLOWED_DB_ENGINE_FILES = {
     "__init__.py",
+    "api_surface.md",
     "base.py",
     "db_api.md",
-    "dbhandling.py",
-    "mock_db.py",
-    "pool.py",
+    "errors.py",
+    "read_intents.py",
     "spec.py",
-    "sql_render.py",
-    "views.py",
-    "sqlite_store.py",
 }
+
+RULE_NAMES = (
+    "forbidden_files",
+    "forbidden_dirs",
+    "upstream_docs",
+    "deprecated_stub",
+    "engine_boundary",
+    "slice_limit",
+)
+
+OVERRIDE_FILE = Path(__file__).resolve().parent.parent / "guard_overrides.local.json"
+OVERRIDE_ENV = "KIP_GUARD_ALLOW"
+OVERRIDE_HOWTO = (
+    "If the user approved this access for the task, enable it with "
+    "`.agents/guard_overrides.local.json` ({{\"allow\": [\"{rule}\"], \"reason\": \"...\"}}) "
+    "or env KIP_GUARD_ALLOW={rule}."
+)
+
+
+def load_overrides(override_file: Path | None = None, env: dict | None = None) -> set[str]:
+    """Return the set of rule names the user explicitly allowed (file + env). Fails closed."""
+    allowed: set[str] = set()
+    env = os.environ if env is None else env
+    try:
+        for name in str(env.get(OVERRIDE_ENV, "")).split(","):
+            name = name.strip()
+            if name in RULE_NAMES:
+                allowed.add(name)
+    except Exception:
+        pass
+    try:
+        path = override_file or OVERRIDE_FILE
+        data = json.loads(path.read_text(encoding="utf-8"))
+        names = data.get("allow") if isinstance(data, dict) else None
+        if isinstance(names, list):
+            allowed.update(n for n in names if isinstance(n, str) and n in RULE_NAMES)
+    except Exception:
+        pass
+    return allowed
+
+
+def _deny(rule: str, message: str) -> tuple[str, str]:
+    return "deny", f"[rule: {rule}] {message} {OVERRIDE_HOWTO.format(rule=rule)}"
 
 
 def evaluate_read_file(
-    args: dict, workspace_root: Path, range_hint: str = "StartLine and EndLine"
+    args: dict,
+    workspace_root: Path,
+    range_hint: str = "StartLine and EndLine",
+    overrides: set[str] | None = None,
 ) -> tuple[str, str | None]:
+    allow = load_overrides() if overrides is None else overrides
     raw_path = args.get("Path") or args.get("path")
     if not raw_path:
         return "allow", None
@@ -60,55 +124,62 @@ def evaluate_read_file(
     raw_parts = [part.lower() for part in raw_p.parts]
 
     # 1. Forbidden files guardrail
-    if filename_lower in FORBIDDEN_BASENAMES or raw_filename_lower in FORBIDDEN_BASENAMES:
-        return (
-            "deny",
-            f"Blocked by project guardrails: '{raw_p.name}' is a forbidden file (token-save.md §2)."
+    if "forbidden_files" not in allow and (
+        filename_lower in FORBIDDEN_BASENAMES or raw_filename_lower in FORBIDDEN_BASENAMES
+    ):
+        return _deny(
+            "forbidden_files",
+            f"Blocked by project guardrails: '{raw_p.name}' is a forbidden file (token-save.md §2).",
         )
 
     # 2. Forbidden directory guardrails
-    if "__pycache__" in parts or "__pycache__" in raw_parts:
-        return (
-            "deny",
-            f"Blocked by project guardrails: '__pycache__' directory is forbidden (token-save.md §2)."
+    if "forbidden_dirs" not in allow and ("__pycache__" in parts or "__pycache__" in raw_parts):
+        return _deny(
+            "forbidden_dirs",
+            "Blocked by project guardrails: '__pycache__' directory is forbidden (token-save.md §2).",
         )
 
     # Check if inside a directory named 'tool'
-    if "tool" in parts or "tool" in raw_parts:
-        return (
-            "deny",
-            f"Blocked by project guardrails: 'tool/' directory is forbidden (token-save.md §2)."
+    if "forbidden_dirs" not in allow and ("tool" in parts or "tool" in raw_parts):
+        return _deny(
+            "forbidden_dirs",
+            "Blocked by project guardrails: 'tool/' directory is forbidden (token-save.md §2).",
         )
 
     # 3. Upstream kernel repository documentation guardrail
-    if ("repos" in parts or "repos" in raw_parts) and (filename_lower == "agents.md" or raw_filename_lower == "agents.md"):
-        return (
-            "deny",
-            f"Blocked by project guardrails: '{raw_p.name}' inside repo directory is upstream documentation, not parser rules (token-save.md §2)."
+    if (
+        "upstream_docs" not in allow
+        and ("repos" in parts or "repos" in raw_parts)
+        and (filename_lower == "agents.md" or raw_filename_lower == "agents.md")
+    ):
+        return _deny(
+            "upstream_docs",
+            f"Blocked by project guardrails: '{raw_p.name}' inside repo directory is upstream documentation, not parser rules (token-save.md §2).",
         )
 
     # 4. Engine boundary guardrail & deprecated stub redirects
-    if filename_lower == "api.md":
+    if filename_lower == "api.md" and "deprecated_stub" not in allow:
         if "table_engine" in parts:
-            return (
-                "deny",
-                "Redirect: 'table_engine/API.md' is deprecated. Consult 'table_engine/TE_API.md' directly (token-save.md §1)."
+            return _deny(
+                "deprecated_stub",
+                "Redirect: 'table_engine/API.md' is deprecated. Consult 'table_engine/TE_API.md' directly (token-save.md §1).",
             )
         if "db_engine" in parts:
-            return (
-                "deny",
-                "Redirect: 'db_engine/API.md' is deprecated. Consult 'db_engine/DB_API.md' directly (token-save.md §1)."
+            return _deny(
+                "deprecated_stub",
+                "Redirect: 'db_engine/API.md' is deprecated. Consult 'db_engine/DB_API.md' directly (token-save.md §1).",
             )
 
-    if "db_engine" in parts:
+    if "db_engine" in parts and "engine_boundary" not in allow:
         if filename_lower not in ALLOWED_DB_ENGINE_FILES:
-            return (
-                "deny",
-                f"Blocked by engine boundary: '{p.name}' is inside 'db_engine/'. Only 'base.py' and 'DB_API.md' are allowed (token-save.md §2)."
+            return _deny(
+                "engine_boundary",
+                f"Blocked by engine boundary: '{p.name}' is inside 'db_engine/'. Allowed: API_SURFACE.md, base.py, DB_API.md, "
+                "spec.py, errors.py, read_intents.py, __init__.py (token-save.md §2).",
             )
 
     # 5. Large file slice-read guardrail
-    if p.is_file():
+    if p.is_file() and "slice_limit" not in allow:
         try:
             file_size = p.stat().st_size
         except OSError:
@@ -121,12 +192,13 @@ def evaluate_read_file(
             if start_line is None or end_line is None:
                 size_kb = file_size // 1024
                 rel_name = p.name
-                return (
-                    "deny",
+                return _deny(
+                    "slice_limit",
                     f"Blocked by token-saving guardrail: '{rel_name}' is {size_kb} KB (>40 KB). "
                     f"Full-file reads are prohibited to protect the context budget. "
-                    f"Please specify {range_hint} (span <= 300 lines), use grep -n, "
-                    f"or run 'python3 .agents/scripts/spec_section.py <file> <section>'."
+                    f"Please specify {range_hint} (span <= {MAX_SLICE_SPAN} lines), use grep -n, "
+                    f"or run 'python3 .agents/scripts/spec_section.py <file> <section>' / "
+                    f"'python3 .agents/scripts/code_symbol.py <file> <Symbol>'."
                 )
 
             try:
@@ -135,8 +207,8 @@ def evaluate_read_file(
                 span = 0
 
             if span > MAX_SLICE_SPAN:
-                return (
-                    "deny",
+                return _deny(
+                    "slice_limit",
                     f"Blocked by token-saving guardrail: Requested slice of '{p.name}' is {span} lines "
                     f"(maximum permitted for large files is {MAX_SLICE_SPAN} lines). "
                     f"Please request a narrower slice ({range_hint})."
@@ -209,10 +281,14 @@ def main():
         print(json.dumps({"decision": "allow"}))
         return
 
-    if "tool_name" in input_data and "toolCall" not in input_data:
-        handle_claude(input_data)
-    else:
-        handle_antigravity(input_data)
+    try:
+        if "tool_name" in input_data and "toolCall" not in input_data:
+            handle_claude(input_data)
+        else:
+            handle_antigravity(input_data)
+    except Exception:
+        # Failsafe: an internal error must never block or crash the agent
+        print(json.dumps({"decision": "allow"}))
 
 
 if __name__ == "__main__":

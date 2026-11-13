@@ -24,7 +24,7 @@ from parser.doc_labels import ADORNMENT_RE, LABEL_RE  # noqa: F401 - moved to pa
 
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.helpers import get_version_info
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import git_tree_resolver
@@ -58,8 +58,8 @@ class DocsService:
     # ------------------------------------------------------------------
     def get_label_index(self, version_name: str) -> dict[str, Any]:
         """Map every Documentation/ `.. _label:` target to {path, title} at the revision."""
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
         if vid is None:
             raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         sha = git_tree_resolver.resolve_commit_sha(vname)
@@ -150,8 +150,8 @@ class DocsService:
         norm_path = path.strip().strip("/")
         if not norm_path or not is_safe_rel_path(norm_path):
             raise HTTPException(status_code=400, detail="A valid relative file path must be specified.")
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
         if vid is None:
             raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         raw, is_dir, _ = git_reader.read_file(vname, norm_path)

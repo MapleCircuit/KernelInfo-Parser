@@ -9,16 +9,15 @@ from webapp.backend.config import RepoScopedCache, get_repo_dir
 from functools import lru_cache
 from typing import Any
 from fastapi import HTTPException
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join, NotExists, ge, gt, le, lt, hash_prefix
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    commit_prefix_range,
     get_active_network_id,
     hash_hex,
     safe_decode,
     get_version_info,
 )
 from webapp.backend.security.git import is_safe_rev, safe_rev
-from webapp.backend.security.sql import sanitize_like_query
 from webapp.backend.security.jail import resolve_and_verify_repo_path
 from webapp.backend.services.mailing_list_service import LORE_BASE_URL
 
@@ -187,13 +186,30 @@ def _cached_git_file_history(
     return last_changed, commits
 
 
-def _is_finished_version(cursor: Any, commit_id: int) -> bool:
+def _commit_entry(r: dict[str, Any]) -> dict[str, Any]:
+    """Response entry of a commit row (`list_network_commits` reads)."""
+    return {
+        "commit_id": r["commit_id"],
+        "commit_hash": format_commit_hash(r["commit_hash"]),
+        "author_date": r["author_date"],
+        "subject": safe_decode(r["subject"]),
+        "author": {
+            "person_id": r["author_id"],
+            "name": safe_decode(r["author_name"]),
+            "email": safe_decode(r["author_email"]),
+        },
+        "author_name": safe_decode(r["author_name"]),
+        "author_email": safe_decode(r["author_email"]),
+        "files_count": int(r.get("files_count", 0)),
+    }
+
+
+def _is_finished_version(reader: Any, commit_id: int) -> bool:
     """True when commit_id is the head of a finished version ingestion (m_ingest_state status 2)."""
     hit = _FINISHED_CACHE.get(commit_id)
     if hit:
         return True
-    cursor.execute("SELECT 1 AS ok FROM m_ingest_state WHERE commit_id = %s AND status = 2 LIMIT 1;", (commit_id,))
-    ok = cursor.fetchone() is not None
+    ok = reader.row_exists("m_ingest_state", {"commit_id": commit_id, "status": 2})
     if ok:  # a finished version stays finished; an unfinished one is asked again
         _FINISHED_CACHE[commit_id] = True
     return ok
@@ -352,8 +368,8 @@ class GitService:
         target_path = resolve_and_verify_repo_path(clean_file_path)
         rel_path = str(target_path.relative_to(get_repo_dir()))
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
         # An unresolved version falls back to the raw name, which git would read as an option
         rev = safe_rev(vname or str(version_name).strip(), "version")
         flags = self.blame_flags(move, copy, ignore_ws)
@@ -407,30 +423,32 @@ class GitService:
         writer = _LAST_WRITER_CACHE.get(key)
         if writer is None:
             writer = False
-            with get_db_cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT cf.commit_id
-                    FROM m_file_name fn
-                    JOIN m_commit_file cf ON cf.fnid = fn.fnid
-                    WHERE fn.fname = %s AND cf.blob_id = %s
-                      AND NOT EXISTS (SELECT 1 FROM m_ingest_state s WHERE s.commit_id = cf.commit_id)
-                    LIMIT 2;
-                    """,
-                    (path, blob_id),
+            with get_reader() as reader:
+                rows = reader.select_rows(
+                    ("m_file_name", "fn"),
+                    {"commit_id": "cf.commit_id"},
+                    [
+                        {"fn.fname": path, "cf.blob_id": blob_id},
+                        NotExists(("m_ingest_state", "s"), {"s.commit_id": "cf.commit_id"}),
+                    ],
+                    joins=[Join(("m_commit_file", "cf"), {"cf.fnid": "fn.fnid"})],
+                    limit=2,
+                    as_dict=True,
                 )
-                rows = cursor.fetchall()
                 if len(rows) == 1:
-                    cursor.execute(
-                        """
-                        SELECT c.commit_hash, c.author_date, c.subject, p.name AS author_name, p.email AS author_email
-                        FROM m_commit c
-                        LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
-                        WHERE c.commit_id = %s;
-                        """,
-                        (rows[0]["commit_id"],),
+                    c = reader.select_one(
+                        ("m_commit", "c"),
+                        {
+                            "commit_hash": "c.commit_hash",
+                            "author_date": "c.author_date",
+                            "subject": "c.subject",
+                            "author_name": "p.name",
+                            "author_email": "p.email",
+                        },
+                        {"c.commit_id": rows[0]["commit_id"]},
+                        joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left")],
+                        as_dict=True,
                     )
-                    c = cursor.fetchone()
                     if c:
                         chash = format_commit_hash(c["commit_hash"])
                         adate = int(c["author_date"] or 0)
@@ -452,9 +470,9 @@ class GitService:
         # The writer must be in the revision's history. A finished version's commits were ingested with it or
         # before it (every non-merge commit of its range has m_commit_file rows), so a writer with a higher
         # commit_id is not its ancestor; other revisions ask Git (merge-base costs as much as git log).
-        with get_db_cursor() as cursor:
-            vid, _vname = get_version_info(cursor, version_name)
-            if not vid or vid <= 0 or writer["commit_id"] > vid or not _is_finished_version(cursor, int(vid)):
+        with get_reader() as reader:
+            vid, _vname = get_version_info(reader, version_name)
+            if not vid or vid <= 0 or writer["commit_id"] > vid or not _is_finished_version(reader, int(vid)):
                 return None
         out = {k: v for k, v in writer.items() if k != "commit_id"}
         return out
@@ -468,8 +486,8 @@ class GitService:
         target_path = resolve_and_verify_repo_path(clean_file_path)
         rel_path = str(target_path.relative_to(get_repo_dir()))
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
         rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
@@ -559,11 +577,11 @@ class GitService:
         limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
         off = max(0, min((max(1, int(page)) - 1) * limit, MAX_COMMIT_OFFSET))
         now_ts = int(time.time())
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-            network_id = get_active_network_id(cursor)
+            network_id = get_active_network_id(reader)
             if network_id is None:
                 return {"version": vname, "page": page, "limit": limit, "offset": off, "total": 0, "commits": []}
 
@@ -572,47 +590,9 @@ class GitService:
 
             # Case 1: Query is a commit hash or prefix (4-40 hex characters) -> indexed binary lookup
             if q_clean and _HEX_REF.fullmatch(q_clean.lower()):
-                lo, hi = commit_prefix_range(q_clean)
-                if hi:
-                    sql = """
-                        SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                               p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                               (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                        FROM m_commit c
-                        JOIN m_maintainer_person p ON c.author_id = p.person_id
-                        WHERE c.commit_id > 0 AND c.network_id = %s
-                          AND c.commit_hash >= %s AND c.commit_hash < %s
-                        ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
-                    """
-                    cursor.execute(sql, (network_id, lo, hi, limit, off))
-                else:
-                    sql = """
-                        SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                               p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                               (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                        FROM m_commit c
-                        JOIN m_maintainer_person p ON c.author_id = p.person_id
-                        WHERE c.commit_id > 0 AND c.network_id = %s AND c.commit_hash = %s
-                        ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
-                    """
-                    cursor.execute(sql, (network_id, lo, limit, off))
-
                 commits = [
-                    {
-                        "commit_id": r["commit_id"],
-                        "commit_hash": format_commit_hash(r["commit_hash"]),
-                        "author_date": r["author_date"],
-                        "subject": safe_decode(r["subject"]),
-                        "author": {
-                            "person_id": r["author_id"],
-                            "name": safe_decode(r["author_name"]),
-                            "email": safe_decode(r["author_email"]),
-                        },
-                        "author_name": safe_decode(r["author_name"]),
-                        "author_email": safe_decode(r["author_email"]),
-                        "files_count": int(r.get("files_count", 0)),
-                    }
-                    for r in cursor.fetchall()
+                    _commit_entry(r)
+                    for r in reader.list_network_commits(network_id, hash_prefix=q_clean.lower(), limit=limit, offset=off)
                 ]
 
                 # If query is specified and we haven't reached the limit, search Git CLI for unparsed commits
@@ -643,63 +623,15 @@ class GitService:
 
             elif q_clean:
                 # Case 2: Text search by commit subject or author name
-                clean_q = sanitize_like_query(q_clean)
-                sql = """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > 0 AND c.network_id = %s
-                      AND (c.subject LIKE %s OR p.name LIKE %s)
-                    ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
-                """
-                cursor.execute(sql, (network_id, f"%{clean_q}%", f"%{clean_q}%", limit, off))
                 commits = [
-                    {
-                        "commit_id": r["commit_id"],
-                        "commit_hash": format_commit_hash(r["commit_hash"]),
-                        "author_date": r["author_date"],
-                        "subject": safe_decode(r["subject"]),
-                        "author": {
-                            "person_id": r["author_id"],
-                            "name": safe_decode(r["author_name"]),
-                            "email": safe_decode(r["author_email"]),
-                        },
-                        "author_name": safe_decode(r["author_name"]),
-                        "author_email": safe_decode(r["author_email"]),
-                        "files_count": int(r.get("files_count", 0)),
-                    }
-                    for r in cursor.fetchall()
+                    _commit_entry(r)
+                    for r in reader.list_network_commits(network_id, text=q_clean, limit=limit, offset=off)
                 ]
             else:
                 # Case 3: Empty query -> latest indexed commits (primary key walk, excluding future commits)
-                sql = """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > 0 AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
-                """
-                cursor.execute(sql, (network_id, now_ts, limit, off))
                 commits = [
-                    {
-                        "commit_id": r["commit_id"],
-                        "commit_hash": format_commit_hash(r["commit_hash"]),
-                        "author_date": r["author_date"],
-                        "subject": safe_decode(r["subject"]),
-                        "author": {
-                            "person_id": r["author_id"],
-                            "name": safe_decode(r["author_name"]),
-                            "email": safe_decode(r["author_email"]),
-                        },
-                        "author_name": safe_decode(r["author_name"]),
-                        "author_email": safe_decode(r["author_email"]),
-                        "files_count": int(r.get("files_count", 0)),
-                    }
-                    for r in cursor.fetchall()
+                    _commit_entry(r)
+                    for r in reader.list_network_commits(network_id, authored_before=now_ts + 1, limit=limit, offset=off)
                 ]
 
             return {
@@ -713,30 +645,23 @@ class GitService:
 
     def get_commit_detail(self, commit_id: int | str) -> dict[str, Any]:
         """Retrieve full commit metadata, modified files, and trailers."""
-        with get_db_cursor() as cursor:
+        with get_reader() as reader:
+            commit_cols = ["commit_id", "commit_hash", "author_id", "subject", "message", "author_date"]
             if str(commit_id).isdigit():
-                cursor.execute("SELECT * FROM m_commit WHERE commit_id = %s AND commit_id > 0 LIMIT 1;", (int(commit_id),))
-                c_row = cursor.fetchone()
+                c_row = reader.select_one(
+                    "m_commit", commit_cols, [{"commit_id": int(commit_id)}, {"commit_id": gt(0)}], as_dict=True
+                )
             else:
                 # commit_hash is BINARY(20); anything that is not hex cannot name a commit, and
                 # encoding it to latin-1 would raise on a non-latin-1 character
                 cid_str = str(commit_id).strip()
                 if not _HEX_REF.fullmatch(cid_str.lower()):
                     raise HTTPException(status_code=400, detail="A commit id or hash (4-40 hex digits) must be specified.")
-                if len(cid_str) == 40:
-                    cursor.execute("SELECT * FROM m_commit WHERE commit_hash = %s LIMIT 1;", (bytes.fromhex(cid_str),))
-                    c_row = cursor.fetchone()
-                else:
-                    # Short prefix: a range over the binary hash (every digit counts); two matches are ambiguous
-                    lo, hi = commit_prefix_range(cid_str)
-                    cursor.execute(
-                        f"SELECT * FROM m_commit WHERE commit_hash >= %s{' AND commit_hash < %s' if hi else ''} LIMIT 2;",
-                        (lo, hi) if hi else (lo,),
-                    )
-                    rows = cursor.fetchall()
-                    if len(rows) > 1:
-                        raise HTTPException(status_code=400, detail=f"Commit prefix '{cid_str}' is ambiguous; give more digits.")
-                    c_row = rows[0] if rows else None
+                # Prefix (full hash included): a range over the binary hash; two matches are ambiguous
+                rows = reader.select_rows("m_commit", commit_cols, {"commit_hash": hash_prefix(cid_str)}, limit=2, as_dict=True)
+                if len(rows) > 1:
+                    raise HTTPException(status_code=400, detail=f"Commit prefix '{cid_str}' is ambiguous; give more digits.")
+                c_row = rows[0] if rows else None
             if not c_row:
                 if not str(commit_id).isdigit():
                     return self._get_git_commit_detail(str(commit_id).strip())
@@ -746,29 +671,22 @@ class GitService:
 
             # Parents from the ingested DAG (a merge has several; a commit without rows is a root, or
             # its parents were not ingested: _fill_missing_commit_files then asks Git if it must)
-            cursor.execute(
-                """
-                SELECT c.commit_hash
-                FROM m_commit_parent p
-                JOIN m_commit c ON c.commit_id = p.parent_commit_id
-                WHERE p.commit_id = %s
-                ORDER BY p.parent_idx ASC;
-                """,
-                (cid,),
-            )
-            parents = [format_commit_hash(r["commit_hash"]) for r in cursor.fetchall()]
+            parents = [
+                format_commit_hash(r["commit_hash"])
+                for r in reader.select_rows(
+                    ("m_commit_parent", "p"),
+                    {"commit_hash": "c.commit_hash"},
+                    {"p.commit_id": cid},
+                    joins=[Join(("m_commit", "c"), {"c.commit_id": "p.parent_commit_id"})],
+                    order_by=["p.parent_idx"],
+                    as_dict=True,
+                )
+            ]
 
             # Author info
-            cursor.execute(
-                """
-                SELECT p.person_id, p.name, p.email
-                FROM m_maintainer_person p
-                WHERE p.person_id = %s
-                LIMIT 1;
-                """,
-                (c_row["author_id"],),
+            p_row = reader.select_one(
+                "m_maintainer_person", ["person_id", "name", "email"], {"person_id": c_row["author_id"]}, as_dict=True
             )
-            p_row = cursor.fetchone()
             author_dict = {
                 "person_id": c_row["author_id"],
                 "name": safe_decode(p_row["name"]) if p_row else "Unknown",
@@ -776,30 +694,27 @@ class GitService:
             }
 
             # Modified files
-            cursor.execute(
-                """
-                SELECT cf.change_type, fn.fname
-                FROM m_commit_file cf
-                JOIN m_file_name fn ON cf.fnid = fn.fnid
-                WHERE cf.commit_id = %s;
-                """,
-                (cid,),
-            )
-            files = [{"change_type": safe_decode(r["change_type"]), "file": safe_decode(r["fname"])} for r in cursor.fetchall()]
+            files = [
+                {"change_type": safe_decode(r["change_type"]), "file": safe_decode(r["fname"])}
+                for r in reader.select_rows(
+                    ("m_commit_file", "cf"),
+                    {"change_type": "cf.change_type", "fname": "fn.fname"},
+                    {"cf.commit_id": cid},
+                    joins=[Join(("m_file_name", "fn"), {"fn.fnid": "cf.fnid"})],
+                    as_dict=True,
+                )
+            ]
 
             # Contributor trailers (trailers have role_type >= 3, excluding author=1 and committer=2)
             role_names = ROLE_NAMES
-            cursor.execute(
-                """
-                SELECT p.person_id, p.name, p.email, bp.role_type
-                FROM m_bridge_commit_person bp
-                JOIN m_maintainer_person p ON bp.person_id = p.person_id
-                WHERE bp.commit_id = %s AND bp.role_type >= 3
-                ORDER BY bp.priority ASC;
-                """,
-                (cid,),
+            raw_trailers = reader.select_rows(
+                ("m_bridge_commit_person", "bp"),
+                {"person_id": "p.person_id", "name": "p.name", "email": "p.email", "role_type": "bp.role_type"},
+                {"bp.commit_id": cid, "bp.role_type": ge(3)},
+                joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "bp.person_id"})],
+                order_by=["bp.priority"],
+                as_dict=True,
             )
-            raw_trailers = cursor.fetchall()
             trailers = [
                 {
                     "person_id": r["person_id"],
@@ -824,17 +739,13 @@ class GitService:
             }
             linked_emails: list[dict[str, Any]] = []
             try:
-                cursor.execute(
-                    """
-                    SELECT message_id, thread_id, relation_type, match_tier,
-                           patch_version, patch_idx, patch_total
-                    FROM m_commit_email
-                    WHERE commit_id = %s
-                    ORDER BY relation_type ASC, patch_idx ASC;
-                    """,
-                    (cid,),
-                )
-                for erow in cursor.fetchall():
+                for erow in reader.select_rows(
+                    "m_commit_email",
+                    ["message_id", "thread_id", "relation_type", "match_tier", "patch_version", "patch_idx", "patch_total"],
+                    {"commit_id": cid},
+                    order_by=["relation_type", "patch_idx"],
+                    as_dict=True,
+                ):
                     rel_type = erow["relation_type"]
                     tier = erow["match_tier"]
                     mid = safe_decode(erow["message_id"]).strip("<> ")
@@ -1157,27 +1068,23 @@ class GitService:
 
         now_ts = int(time.time())
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
-                vid, vname = get_version_info(cursor, "v3.0")
+                vid, vname = get_version_info(reader, "v3.0")
             # Commit ids are global: every query below stays inside the repository's Git network
-            network_id = get_active_network_id(cursor)
+            network_id = get_active_network_id(reader)
             if network_id is None:
                 network_id = -1
 
             anchor_row = None
             if vid and vid > 0:
-                cursor.execute(
-                    """
-                    SELECT c.commit_id
-                    FROM m_commit c
-                    WHERE c.commit_id = %s AND c.network_id = %s AND c.author_date <= %s
-                    LIMIT 1;
-                    """,
-                    (vid, network_id, now_ts),
+                anchor_row = reader.select_one(
+                    "m_commit",
+                    ["commit_id"],
+                    {"commit_id": vid, "network_id": network_id, "author_date": le(now_ts)},
+                    as_dict=True,
                 )
-                anchor_row = cursor.fetchone()
 
             if not anchor_row:
                 # Check if version_name resolves directly in Git as an unparsed commit or branch
@@ -1225,17 +1132,13 @@ class GitService:
                         logger.debug("Failed to resolve unparsed git timeline for %s: %s", version_name, e)
 
                 # Find closest commit or latest tag commit (strictly not beyond current date)
-                cursor.execute(
-                    """
-                    SELECT c.commit_id
-                    FROM m_commit c
-                    WHERE c.commit_id > 0 AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id DESC
-                    LIMIT 1;
-                    """,
-                    (network_id, now_ts),
+                anchor_row = reader.select_one(
+                    "m_commit",
+                    ["commit_id"],
+                    {"commit_id": gt(0), "network_id": network_id, "author_date": le(now_ts)},
+                    order_by=["-commit_id"],
+                    as_dict=True,
                 )
-                anchor_row = cursor.fetchone()
 
             if not anchor_row:
                 return {
@@ -1251,68 +1154,25 @@ class GitService:
 
             if dir_mode == "future":
                 start_id = cursor_id if cursor_id is not None else anchor_id
-                cursor.execute(
-                    """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id >= %s AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id ASC
-                    LIMIT %s;
-                    """,
-                    (start_id, network_id, now_ts, limit),
+                raw_rows = reader.list_network_commits(
+                    network_id, authored_before=now_ts + 1, id_min=start_id, newest_first=False, limit=limit
                 )
-                raw_rows = cursor.fetchall()
             elif dir_mode == "around":
                 future_limit = max(5, limit // 4)
                 past_limit = max(1, limit - future_limit)
-                cursor.execute(
-                    """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > %s AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id ASC
-                    LIMIT %s;
-                    """,
-                    (anchor_id, network_id, now_ts, future_limit),
+                future_rows = list(reversed(reader.list_network_commits(
+                    network_id, authored_before=now_ts + 1, id_min=anchor_id, id_min_exclusive=True, newest_first=False,
+                    limit=future_limit,
+                )))
+                past_rows = reader.list_network_commits(
+                    network_id, authored_before=now_ts + 1, id_max=anchor_id, limit=past_limit
                 )
-                future_rows = list(reversed(cursor.fetchall()))
-                cursor.execute(
-                    """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id DESC
-                    LIMIT %s;
-                    """,
-                    (anchor_id, network_id, now_ts, past_limit),
-                )
-                past_rows = cursor.fetchall()
                 raw_rows = future_rows + past_rows
             else:  # default 'past'
                 start_id = cursor_id if cursor_id is not None else anchor_id
-                cursor.execute(
-                    """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                    FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s AND c.network_id = %s AND c.author_date <= %s
-                    ORDER BY c.commit_id DESC
-                    LIMIT %s;
-                    """,
-                    (start_id, network_id, now_ts, limit),
+                raw_rows = reader.list_network_commits(
+                    network_id, authored_before=now_ts + 1, id_max=start_id, limit=limit
                 )
-                raw_rows = cursor.fetchall()
 
             commits = []
             for r in raw_rows:
@@ -1337,10 +1197,12 @@ class GitService:
             min_id = min((c["commit_id"] for c in commits), default=anchor_id)
             max_id = max((c["commit_id"] for c in commits), default=anchor_id)
 
-            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id < %s AND commit_id > 0 AND network_id = %s LIMIT 1;", (min_id, network_id))
-            has_past = cursor.fetchone() is not None
-            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id > %s AND network_id = %s AND author_date <= %s LIMIT 1;", (max_id, network_id, now_ts))
-            has_future = cursor.fetchone() is not None
+            has_past = reader.row_exists(
+                "m_commit", [{"commit_id": lt(min_id)}, {"commit_id": gt(0)}, {"network_id": network_id}]
+            )
+            has_future = reader.row_exists(
+                "m_commit", {"commit_id": gt(max_id), "network_id": network_id, "author_date": le(now_ts)}
+            )
 
             return {
                 "version": vname,

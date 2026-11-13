@@ -43,8 +43,6 @@ class FakeDB:
     def __init__(self, stats: list[TableStats] | None = None) -> None:
         self.rows: dict[str, list[dict]] = {}
         self.stats = stats or []
-        self.commits = 0
-        self.rollbacks = 0
         self.fail: dict[str, Exception] = {}
 
     def add(self, table: str, **row: Any) -> None:
@@ -83,12 +81,6 @@ class FakeDB:
         kept = [r for r in before if not _match(r, where)]
         self.rows[table] = kept
         return len(before) - len(kept)
-
-    def commit(self):
-        self.commits += 1
-
-    def rollback(self):
-        self.rollbacks += 1
 
 
 def seeded() -> FakeDB:
@@ -278,7 +270,6 @@ class CleanVersionsTest(unittest.TestCase):
         self.assertEqual(results[0].method, "rollback")
         self.assertIn("parsed", results[1].error)
         self.assertIn("refs", results[2].error)
-        self.assertEqual(db.rollbacks, 1)
 
 
     def test_rechecks_state_before_cleaning(self) -> None:
@@ -320,7 +311,6 @@ class IngestStateCleanTest(unittest.TestCase):
         self.assertEqual(n, len(I.PARTIAL_VERSION_TABLES))
         for table in I.PARTIAL_VERSION_TABLES:
             self.assertEqual([r["commit_id"] for r in db.rows[table]], [6])
-        self.assertGreaterEqual(db.commits, 1)
         self.assertEqual(I.purge_partial_version(db, 0), 0)
         self.assertEqual(I.purge_partial_version(None, 5), 0)
 

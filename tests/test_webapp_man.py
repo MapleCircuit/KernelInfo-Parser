@@ -382,7 +382,7 @@ class TestVersionsOrder(unittest.TestCase):
         repos = [{"name": "linux", "path": "/nonexistent/linux", "project": "linux"},
                  {"name": "man-pages", "path": "/nonexistent/mp"}]
         with patch.object(versions, "list_repositories", lambda: repos), \
-                patch.object(versions, "get_db_cursor", side_effect=RuntimeError("no db")), \
+                patch.object(versions, "get_reader", side_effect=RuntimeError("no db")), \
                 patch.object(versions, "default_branch_of", lambda r: "master"):
             cat = {p["repo"]: p for p in versions.projects_catalog()}
         self.assertEqual(cat["man-pages"]["project"], "man-pages")

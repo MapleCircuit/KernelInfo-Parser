@@ -7,6 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import DBLayout as D
+from db_engine.spec import gt
 from webapp.backend.services import insights_service as ins
 from webapp.backend.services import release_service as rs
 
@@ -44,22 +46,7 @@ class TestInsightsHelpers(unittest.TestCase):
         self.assertEqual(ins.employer("nobody"), "(Individual / unknown)")
 
 
-class _DictCursor:
-    """The webapp's dictionary cursor over sqlite3 (`%s` placeholders)."""
-
-    def __init__(self, db) -> None:
-        self.c = db.cursor()
-
-    def execute(self, sql: str, params=()) -> None:
-        self.c.execute(sql.replace("%s", "?").rstrip().rstrip(";"), tuple(params))
-
-    def fetchall(self):
-        cols = [d[0] for d in self.c.description]
-        return [dict(zip(cols, r)) for r in self.c.fetchall()]
-
-    def fetchone(self):
-        r = self.c.fetchone()
-        return None if r is None else dict(zip([d[0] for d in self.c.description], r))
+CF_COLUMNS = ["commit_id", "fnid", "blob_id", "old_fnid", "old_blob_id", "change_type"]
 
 
 class _NoDisk:
@@ -78,16 +65,16 @@ class TestReleaseStatsSources(unittest.TestCase):
     git, commit, rows = _Repo.git, _Repo.commit, _Repo.rows
 
     def setUp(self) -> None:
-        import contextlib
         from unittest import mock
+        from tests.db_fixtures import patch_reader
         from parser.git_ast import release_stats as rst
         from webapp.backend.services import maintainer_service
         self._Repo.setUp(self)
-        rst.ingest(self.cnx, self.dir, repo_id=1)
+        rst.ingest(self.db, self.dir, repo_id=1)
         patches = [
             mock.patch.object(rs, "get_repo_dir", lambda: self.dir), mock.patch.object(ins, "get_repo_dir", lambda: self.dir),
             mock.patch.object(rs, "_PASS_DISK", _NoDisk()), mock.patch.object(ins, "_DISK", _NoDisk()),
-            mock.patch("webapp.backend.database.pool.get_db_cursor", contextlib.contextmanager(lambda: (yield _DictCursor(self.cnx.db)))),
+            patch_reader(self.db),
             mock.patch("webapp.backend.database.helpers.get_active_repo_id", lambda cur: 1),
         ]
         for p in patches:
@@ -116,7 +103,7 @@ class TestReleaseStatsSources(unittest.TestCase):
         self.assertEqual(ins.release_stats("v3.1")["result"]["source"], "database")
 
     def test_git_fallback(self) -> None:
-        self.cnx.db.execute("DELETE FROM m_release_segment WHERE tag = 'v3.1-rc1'")  # one segment of v3.0..v3.1 missing
+        self.db.delete_rows("m_release_segment", {"tag": "v3.1-rc1"})  # one segment of v3.0..v3.1 missing
         self.assertIsNone(ins.db_release_stats("v3.1"))
         self.assertIsNotNone(ins.db_release_stats("v3.0.1"))
         self.git("checkout", "-q", "stable")
@@ -138,8 +125,8 @@ class TestReleaseStatsSources(unittest.TestCase):
             self.git("tag", new_tag, f"{old_tag}^{{commit}}")
             self.git("tag", "-d", old_tag)
         for table in ("m_release_segment", "m_release_person", "m_person_first_release", "m_commit_release"):
-            self.cnx.db.execute(f"DELETE FROM {table}")
-        rst.ingest(self.cnx, self.dir, repo_id=1)
+            self.db.delete_rows(table, None, all_rows=True)
+        rst.ingest(self.db, self.dir, repo_id=1)
         rs._TAGS_CACHE.clear()
         ins._RANGES.clear()
         self.assertEqual(rs.releases("mainline"), ["man-pages-6.00", "man-pages-6.1-rc1", "man-pages-6.01"])
@@ -266,57 +253,51 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
         files (renames as new + old name, merges none), trailers, ingest states, and the v1.2 tree's
         m_maintainer_file rows."""
         import main
+        import pipeline.blob_reuse
         from parser.git_ast import GitCommitParser
         db = cls.store.db
-        db.executescript("""
-            DROP TABLE m_ingest_state;
-            CREATE TABLE m_ingest_state (network_id INT, commit_id INT, status INT, base_commit_id INT);
-            DELETE FROM m_maintainer_person;
-            CREATE TABLE m_commit_parent (commit_id INT, parent_commit_id INT, parent_idx INT);
-            CREATE TABLE m_commit_file (commit_id INT, fnid INT, blob_id INT, old_fnid INT, old_blob_id INT, change_type TEXT);
-            CREATE TABLE m_bridge_commit_person (commit_id INT, person_id INT, role_type INT, priority INT);
-            CREATE TABLE m_file_name (fnid INTEGER PRIMARY KEY, fname TEXT UNIQUE);
-            CREATE TABLE m_maintainer_file (sec_id INT, fnid INT);
-        """)
-        ids = {bytes(h).hex(): cid for cid, h in db.execute("SELECT commit_id, commit_hash FROM m_commit WHERE commit_id > 0")}
+        db.create_table([D.m_commit_parent, D.m_commit_file, D.m_bridge_commit_person, D.m_file_name, D.m_maintainer_file])
+        db.delete_rows("m_maintainer_person", None, all_rows=True)
+        ids = {bytes(h).hex(): cid for cid, h in db.select_rows("m_commit", ["commit_id", "commit_hash"], {"commit_id": gt(0)})}
         persons: dict[tuple[str, str], int] = {}
 
         def person(name: str, email: str) -> int:
-            key = main._person_key(name, email)
+            key = pipeline.blob_reuse._person_key(name, email)
             if key not in persons:
                 persons[key] = len(persons) + 1
-                db.execute("INSERT INTO m_maintainer_person VALUES (?, ?, ?)", (persons[key], *key))
+                db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(persons[key], *key)])
             return persons[key]
 
         def fnid(path: str) -> int:
-            db.execute("INSERT OR IGNORE INTO m_file_name (fname) VALUES (?)", (path,))
-            return db.execute("SELECT fnid FROM m_file_name WHERE fname = ?", (path,)).fetchone()[0]
+            return db.get_or_insert_id(D.m_file_name, {"fname": path})
 
         for c in GitCommitParser(repo_dir=str(cls.dir)).parse_version_commits(old_rev=None, new_rev="v1.2", with_files=False):
             cid = ids[c.commit_hash]
-            db.execute("UPDATE m_commit SET author_id = ? WHERE commit_id = ?", (person(c.author_name, c.author_email), cid))
+            db.update_rows("m_commit", {"author_id": person(c.author_name, c.author_email)}, {"commit_id": cid})
             for i, p in enumerate(c.parents or ()):
-                db.execute("INSERT INTO m_commit_parent VALUES (?, ?, ?)", (cid, ids[p], i))
+                db.insert_rows("m_commit_parent", ["commit_id", "parent_commit_id", "parent_idx"], [(cid, ids[p], i)])
             for k in c.contributors:
-                db.execute("INSERT INTO m_bridge_commit_person VALUES (?, ?, ?, ?)", (cid, person(k.name, k.email), int(k.role), int(k.priority)))
+                db.insert_rows("m_bridge_commit_person", ["commit_id", "person_id", "role_type", "priority"],
+                               [(cid, person(k.name, k.email), int(k.role), int(k.priority))], on_conflict="ignore")
             if len(c.parents or ()) > 1:
                 continue
             out = cls.g("diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "--root", c.commit_hash)
             for line in out.splitlines():
                 parts = line.split("\t")
                 if parts[0].startswith("R"):
-                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 1, ?, 1, 'R')", (cid, fnid(parts[2]), fnid(parts[1])))
+                    db.insert_rows("m_commit_file", CF_COLUMNS, [(cid, fnid(parts[2]), 1, fnid(parts[1]), 1, "R")])
                 else:
                     f = fnid(parts[1])
-                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 1, ?, 1, ?)", (cid, f, 0 if parts[0] == "A" else f, parts[0]))
+                    db.insert_rows("m_commit_file", CF_COLUMNS, [(cid, f, 1, 0 if parts[0] == "A" else f, 1, parts[0])])
         tag = lambda t: ids[cls.g("rev-parse", f"{t}^{{commit}}").strip()]  # noqa: E731
         chain = [("v1.0", None), ("v1.1-rc1", "v1.0"), ("v1.1", "v1.1-rc1"), ("v1.2", "v1.1")]
-        db.executemany("INSERT INTO m_ingest_state VALUES (1, ?, 2, ?)", [(tag(t), tag(b) if b else 0) for t, b in chain])
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at", "base_commit_id"],
+                       [(1, tag(t), 2, 0, tag(b) if b else 0) for t, b in chain])
         secs, matcher = cls.sections()
         for path in cls.g("ls-tree", "-r", "--name-only", "v1.2").split():
             for s in matcher.match_file(path):
                 if s.name != "THE REST":
-                    db.execute("INSERT INTO m_maintainer_file VALUES (?, ?)", (s.sec_id, fnid(path)))
+                    db.insert_rows("m_maintainer_file", ["sec_id", "fnid"], [(s.sec_id, fnid(path))], on_conflict="ignore")
 
     def setUp(self) -> None:
         from unittest import mock
@@ -332,7 +313,7 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
             p.start()
         rs._TAGS_CACHE.clear()
         rs._DB_COVERAGE.clear()
-        self.store.statements.clear()
+        self.before = self.store.counts()
 
     def tearDown(self) -> None:
         for p in self.patches:
@@ -352,24 +333,25 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
         self.assertEqual(rows["FOO DRIVER"]["commits"], 2)                 # the fix and the side commit; the merge is not counted
         self.assertEqual(rows["BAR LIB"]["commits"], 3)                    # change, rename (old name), deletion
         self.assertGreater(rows["FOO DRIVER"]["review_coverage"], 0)
-        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in self.store.statements))
+        self.assertEqual(self.store.counts(), self.before)   # the database report writes nothing
 
     def test_not_covered_falls_back_to_git(self) -> None:
         secs, matcher = self.sections()
         db = self.store.db
-        rc1 = db.execute("SELECT commit_id FROM m_ingest_state WHERE base_commit_id = (SELECT commit_id FROM m_ingest_state WHERE base_commit_id = 0)").fetchone()[0]
-        db.execute("UPDATE m_ingest_state SET status = 1 WHERE commit_id = ?", (rc1,))   # v1.1-rc1 interrupted
+        root = db.select_value("m_ingest_state", "commit_id", {"base_commit_id": 0})
+        rc1 = db.select_value("m_ingest_state", "commit_id", {"base_commit_id": root})
+        db.update_rows("m_ingest_state", {"status": 1}, {"commit_id": rc1})   # v1.1-rc1 interrupted
         try:
             self.assertIsNone(ins.health_from_db("v1.2", ["v1.1", "v1.2"], secs, matcher))
         finally:
-            db.execute("UPDATE m_ingest_state SET status = 2 WHERE commit_id = ?", (rc1,))
-        row = db.execute("SELECT commit_id FROM m_commit WHERE subject = 'kernel: x'").fetchone()
-        saved = db.execute("SELECT * FROM m_commit WHERE commit_id = ?", row).fetchone()
-        db.execute("DELETE FROM m_commit WHERE commit_id = ?", row)                       # a commit not ingested
+            db.update_rows("m_ingest_state", {"status": 2}, {"commit_id": rc1})
+        commit_cols = [c[0] for c in D.m_commit.init_columns]
+        saved = db.select_one("m_commit", commit_cols, {"subject": "kernel: x"})
+        db.delete_rows("m_commit", {"commit_id": saved[0]})                       # a commit not ingested
         try:
             self.assertIsNone(ins.health_from_db("v1.2", ["v1.1", "v1.2"], secs, matcher))
         finally:
-            db.execute("INSERT INTO m_commit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", saved)
+            db.insert_rows("m_commit", commit_cols, [tuple(saved)])
         with __import__("unittest").mock.patch.object(ins, "_maintainer_data", return_value=(secs, matcher)), \
                 __import__("unittest").mock.patch.object(ins, "health_from_db", return_value=None):
             self.assertEqual(ins.compute_subsystem_health("v1.2", 2)["source"], "git")

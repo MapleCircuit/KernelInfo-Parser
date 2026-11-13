@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 from fastapi import HTTPException
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Agg, Join, Value
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import safe_decode
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.symbol_service import SymbolService
@@ -93,29 +94,31 @@ class PaholeService:
         return field_types
 
     @staticmethod
-    def _definition(cursor: Any, version_name: str, name: str) -> tuple[str, dict[str, Any] | None]:
+    def _definition(reader: Any, version_name: str, name: str) -> tuple[str, dict[str, Any] | None]:
         """(revision, the struct/union definition of `name` in the revision's tree), preferring kernel
         headers, then the ranking of SymbolService (arch-aware), and definitions that have members."""
-        _, rev, blob_paths = SymbolService._scope(cursor, version_name)
+        _, rev, blob_paths = SymbolService._scope(reader, version_name)
         _, scope, bits = definition_arch(rev, None)
-        cursor.execute(
-            f"""
-            SELECT s.ast_id, s.blob_id, s.line_s, s.line_e, s.linkage
-            FROM m_symbol_def s
-            JOIN m_type_descriptor t ON t.type_id = s.type_id
-            WHERE s.name = %s AND t.name IN ({",".join(["%s"] * len(STRUCT_DECL_TYPES))});
-            """,
-            (name, *STRUCT_DECL_TYPES),
-        )
-        rows = [r for r in cursor.fetchall() if r["blob_id"] in blob_paths]
+        rows = [
+            r
+            for r in reader.select_rows(
+                ("m_symbol_def", "s"),
+                {"ast_id": "s.ast_id", "blob_id": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e", "linkage": "s.linkage"},
+                {"s.name": name, "t.name": list(STRUCT_DECL_TYPES)},
+                joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+                as_dict=True,
+            )
+            if r["blob_id"] in blob_paths
+        ]
         if not rows:
             return rev, None
         ast_ids = sorted({r["ast_id"] for r in rows})
-        cursor.execute(
-            f"SELECT ast_id, COUNT(*) AS n FROM m_ast_container WHERE ast_id IN ({','.join(['%s'] * len(ast_ids))}) GROUP BY ast_id;",
-            ast_ids,
-        )
-        members = {r["ast_id"]: int(r["n"]) for r in cursor.fetchall()}
+        members = {
+            r["ast_id"]: int(r["n"])
+            for r in reader.aggregate(
+                "m_ast_container", {"n": Agg("COUNT", "*")}, {"ast_id": ast_ids}, group_by=["ast_id"], as_dict=True
+            )
+        }
         for r in rows:
             r["fname"] = best_path(blob_paths[r["blob_id"]], scope, bits)
 
@@ -139,27 +142,34 @@ class PaholeService:
         if not clean_name:
             raise HTTPException(status_code=400, detail="A struct name must be specified.")
 
-        with get_db_cursor() as cursor:
-            vname, definition = self._definition(cursor, version_name, clean_name)
+        with get_reader() as reader:
+            vname, definition = self._definition(reader, version_name, clean_name)
             if definition is None:
                 raise HTTPException(status_code=404, detail=f"No struct or union '{clean_name}' is defined at '{version_name}'.")
-            cursor.execute(
-                """
-                SELECT c.priority, c.ref_ast_id, ref.name AS field_name, td.name AS type_name, rtd.name AS ref_type_name,
-                       a_size.val AS attr_size, a_offset.val AS attr_offset, a_bitfield.val AS attr_bitfield
-                FROM m_ast_container c
-                LEFT JOIN m_ast ref ON c.ref_ast_id = ref.ast_id
-                LEFT JOIN m_type_descriptor td ON c.type_id = td.type_id
-                LEFT JOIN m_type_descriptor rtd ON ref.type_id = rtd.type_id
-                LEFT JOIN m_ast_attribute a_size ON a_size.ast_id = c.ref_ast_id AND a_size.name = 'size_bytes'
-                LEFT JOIN m_ast_attribute a_offset ON a_offset.ast_id = c.ref_ast_id AND a_offset.name = 'offset_bits'
-                LEFT JOIN m_ast_attribute a_bitfield ON a_bitfield.ast_id = c.ref_ast_id AND a_bitfield.name = 'bitfield_width'
-                WHERE c.ast_id = %s
-                ORDER BY c.priority ASC;
-                """,
-                (definition["ast_id"],),
+            fields_raw = reader.select_rows(
+                ("m_ast_container", "c"),
+                {
+                    "priority": "c.priority",
+                    "ref_ast_id": "c.ref_ast_id",
+                    "field_name": "ref.name",
+                    "type_name": "td.name",
+                    "ref_type_name": "rtd.name",
+                    "attr_size": "a_size.val",
+                    "attr_offset": "a_offset.val",
+                    "attr_bitfield": "a_bitfield.val",
+                },
+                {"c.ast_id": definition["ast_id"]},
+                joins=[
+                    Join(("m_ast", "ref"), {"ref.ast_id": "c.ref_ast_id"}, "left"),
+                    Join(("m_type_descriptor", "td"), {"td.type_id": "c.type_id"}, "left"),
+                    Join(("m_type_descriptor", "rtd"), {"rtd.type_id": "ref.type_id"}, "left"),
+                    Join(("m_ast_attribute", "a_size"), {"a_size.ast_id": "c.ref_ast_id", "a_size.name": Value("size_bytes")}, "left"),
+                    Join(("m_ast_attribute", "a_offset"), {"a_offset.ast_id": "c.ref_ast_id", "a_offset.name": Value("offset_bits")}, "left"),
+                    Join(("m_ast_attribute", "a_bitfield"), {"a_bitfield.ast_id": "c.ref_ast_id", "a_bitfield.name": Value("bitfield_width")}, "left"),
+                ],
+                order_by=["c.priority"],
+                as_dict=True,
             )
-            fields_raw = cursor.fetchall()
 
         source_field_types = self._extract_source_field_types(
             vname, definition.get("fname"), definition.get("line_s") or 1, definition.get("line_e") or 1

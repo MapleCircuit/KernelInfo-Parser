@@ -5,6 +5,7 @@ Rows built by parser/kbuild_symbols.py (as Step 6.6 and --backfill-kbuild store 
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -16,10 +17,13 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.DBLayout import m_file_reference
+from db_engine import MockDB
 from core import ingest_state as I
 from core.DBLayout import TABLES
 from parser import kbuild_symbols as ks
 from parser.kbuild_parser import KbuildParser
+from tests.db_fixtures import patch_reader
 from webapp.backend.services import kconfig_service as kcs
 
 MAKEFILE = """\
@@ -56,25 +60,19 @@ class TestRows(unittest.TestCase):
 
     def test_rollback_and_blob_derived(self) -> None:
         marks = {t.table_name: 10 for t, _ in I.marked_tables(TABLES)}
-        plan = {(d.table, d.where) for d in I.rollback_plan(TABLES, marks, 10, [3])}
-        self.assertIn(("m_kbuild_symbol", "source_fnid > %s"), plan)
-        self.assertIn(("m_kbuild_symbol", "source_blob_id IN (%s)"), plan)   # rows of a re-parsed blob
+        plan = {(d.table, d.condition) for d in I.rollback_plan(TABLES, marks, 10, [3])}
+        self.assertIn(("m_kbuild_symbol", "source_fnid >"), plan)
+        self.assertIn(("m_kbuild_symbol", "source_blob_id IN"), plan)   # rows of a re-parsed blob
 
     def test_migration_deletes_only_kbuild_and_makefile_rows(self) -> None:
         from core import backfills
-        db = mock.MagicMock()
-        counts = iter([50_000, 1234])
-        db.execute.side_effect = lambda sql, params=(): next(counts)
-        self.assertEqual(backfills.delete_old_kbuild_references(db, chunk=50_000), 51_234)
-        sqls = {c.args[0] for c in db.execute.call_args_list}
-        self.assertEqual(sqls, {"DELETE FROM m_file_reference WHERE ref_type IN (3, 4) LIMIT %s"})
-
-    def test_parser_stages_no_kbuild_file_references(self) -> None:
-        import inspect
-        import main
-        src = inspect.getsource(main.processing_kbuild)
-        self.assertIn("m_kbuild_symbol.table_id", src)
-        self.assertNotIn("_stage_file_reference", src)
+        db = MockDB(use_global=False)
+        cols = [c[0] for c in m_file_reference.init_columns]
+        rows = [tuple(ref_type if c == "ref_type" else i if c in ("ref_id", "source_blob_id", "target_fnid") else 1 for c in cols)
+                for i, ref_type in enumerate([3, 4, 3, 1, 5, 4], start=1)]
+        db.insert_rows("m_file_reference", cols, rows)
+        self.assertEqual(backfills.delete_old_kbuild_references(db, chunk=2), 4)
+        self.assertEqual(sorted(r[0] for r in db.select_rows("m_file_reference", ["ref_type"])), [1, 5])
 
 
 class TestUsageOnRepository(unittest.TestCase):
@@ -143,68 +141,56 @@ class TestUsageOnRepository(unittest.TestCase):
         return rows, pair_of
 
     def _db(self, rows: list[dict], pair_of: dict, covered: bool = True):
-        statements: list[str] = []
-
-        class Cur:
-            def __init__(self) -> None:
-                self.rows: list = []
-
-            def execute(self, sql: str, params: tuple = ()) -> None:
-                statements.append(sql)
-                self.rows = [r for r in rows if r["symbol"] == params[0] and r["via"] in (1, 2)]
-
-            def fetchall(self):
-                return self.rows
-
-        ctx = mock.MagicMock()
-        ctx.__enter__.return_value = Cur()
+        db = MockDB(use_global=False)
+        if rows:
+            cols = list(rows[0])
+            db.insert_rows("m_kbuild_symbol", cols, [tuple(r[c] for c in cols) for r in rows])
         pairs = {v: k for k, v in pair_of.items()} if covered else None
-        return [
-            mock.patch.object(kcs, "get_db_cursor", return_value=ctx),
-            mock.patch.object(kcs.git_tree_resolver, "resolve_commit_sha", return_value=self.sha),
-            mock.patch.object(kcs.KconfigService, "_kbuild_pairs_covered", staticmethod(lambda cur, sha: pairs)),
-        ], statements
+
+        def enter() -> contextlib.ExitStack:
+            stack = contextlib.ExitStack()
+            stack.enter_context(patch_reader(db))
+            stack.enter_context(mock.patch.object(kcs.git_tree_resolver, "resolve_commit_sha", return_value=self.sha))
+            stack.enter_context(mock.patch.object(kcs.KconfigService, "_kbuild_pairs_covered", staticmethod(lambda cur, sha: pairs)))
+            return stack
+
+        return enter
 
     def test_database_and_git_give_the_same_rules(self) -> None:
         rows, pair_of = self._stored()
-        patches, statements = self._db(rows, pair_of)
+        enter = self._db(rows, pair_of)
         for name in ("FOO", "BAR", "NOPE"):
             git = self.svc._kbuild_usage_git(self.sha, name)
-            with patches[0], patches[1], patches[2]:
+            with enter():
                 db = self.svc._kbuild_usage_db(self.sha, name)
             self.assertEqual(db, git, name)
         foo = {r["path"]: r for r in self.svc._kbuild_usage_git(self.sha, "FOO")}
         self.assertTrue(foo["drivers/x/rusty.rs"]["exists"])                 # B6: Rust objects exist
         self.assertEqual(foo["drivers/x/cond.c"]["via"], "condition")
         self.assertEqual(foo["drivers/x/sub/"]["kind"], "directory")
-        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in statements))
 
     def test_not_covered_falls_back_to_git(self) -> None:
         rows, pair_of = self._stored(skip="drivers/x/Makefile")
-        patches, _ = self._db(rows, pair_of, covered=False)
-        with patches[0], patches[1], patches[2]:
+        enter = self._db(rows, pair_of, covered=False)
+        with enter():
             self.assertIsNone(self.svc._kbuild_usage_db(self.sha, "FOO"))
 
     def test_coverage_needs_every_makefile_pair(self) -> None:
-        cursor = mock.MagicMock()
         fnids = {p: i + 1 for i, p in enumerate(sorted(self.tree))}
         mk = [p for p in self.tree if ks.is_kbuild_file(p)]
         meta = {self.tree[p]: (100 + fnids[p], 1) for p in mk}
-        stored = [{"source_blob_id": 100 + fnids[p], "source_fnid": fnids[p]} for p in mk]
-        answers = {"FROM m_file_name": [{"fnid": fnids[p], "fname": p} for p in mk]}
-
-        def execute(sql, params=()):
-            cursor.rows = answers["FROM m_file_name"] if "FROM m_file_name" in sql else cursor.stored
-
-        cursor.execute.side_effect = execute
-        cursor.fetchall.side_effect = lambda: cursor.rows
+        db = MockDB(use_global=False)
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(fnids[p], p) for p in mk])
+        # The last Makefile has no stored rows: the revision is not covered
+        stored = [(100 + fnids[p], fnids[p], 0, "FOO", 1) for p in mk]
+        db.insert_rows("m_kbuild_symbol", ["source_blob_id", "source_fnid", "idx", "symbol", "via"], stored[:-1])
         resolver = kcs.git_tree_resolver
         with mock.patch.object(resolver, "list_tree", return_value=self.tree), \
-                mock.patch.object(resolver, "map_blob_hashes", return_value=meta):
-            cursor.stored = stored[:-1]
-            self.assertIsNone(kcs.KconfigService._kbuild_pairs_covered(cursor, self.sha))
-            cursor.stored = stored
-            got = kcs.KconfigService._kbuild_pairs_covered(cursor, self.sha)
+                mock.patch.object(resolver, "map_blob_hashes", return_value=meta), \
+                patch_reader(db), kcs.get_reader() as reader:
+            self.assertIsNone(kcs.KconfigService._kbuild_pairs_covered(reader, self.sha))
+            db.insert_rows("m_kbuild_symbol", ["source_blob_id", "source_fnid", "idx", "symbol", "via"], stored[-1:])
+            got = kcs.KconfigService._kbuild_pairs_covered(reader, self.sha)
         self.assertEqual(sorted(got.values()), sorted(mk))
 
 

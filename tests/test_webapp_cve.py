@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from db_engine import MockDB
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webapp.backend.services import cve_service as cs
@@ -191,36 +193,6 @@ class TestCveAffects(unittest.TestCase):
             cs.record("../etc")
 
 
-class FakeCursor:
-    """A dictionary cursor answering the CVE tables' SELECTs from rows given per table."""
-
-    def __init__(self, tables: dict) -> None:
-        self.tables = tables
-        self.rows: list = []
-        self.queries: list[str] = []
-
-    def execute(self, sql: str, params=()) -> None:
-        self.queries.append(sql)
-        if "FROM m_cve_source" in sql:
-            self.rows = list(self.tables.get("m_cve_source", []))
-        elif "FROM m_cve_commit" in sql:
-            wanted = set(params)
-            self.rows = sorted((r for r in self.tables.get("m_cve_commit", []) if r["commit_hash"] in wanted), key=lambda r: r["cve_id"])
-        elif "FROM m_cve_file" in sql:
-            wanted_path = params[0] if params else None
-            self.rows = [r for r in self.tables.get("m_cve_file", []) if not wanted_path or r.get("file_path") == wanted_path]
-        elif "FROM m_cve" in sql:
-            self.rows = list(self.tables.get("m_cve", []))
-        else:
-            self.rows = []
-
-    def fetchone(self):
-        return self.rows[0] if self.rows else None
-
-    def fetchall(self):
-        return list(self.rows)
-
-
 class TestCveFromDatabase(unittest.TestCase):
     """The webapp reads what the parser ingested (m_cve_source, m_cve, m_cve_commit)."""
 
@@ -229,23 +201,21 @@ class TestCveFromDatabase(unittest.TestCase):
         rec = cs.parse_record(cna_record("CVE-2024-0001"))
         other = cs.parse_record(other_record("CVE-2016-5195", "Race in the Linux kernel before 4.8.3",
                                              ["https://github.com/torvalds/linux/commit/" + FIX[:12]]))
-        self.tables = {
-            "m_cve_source": [{"name": "cvelistV5", "layout": "cvelist", "head": bytes.fromhex("e" * 40), "format": cs.RECORD_FORMAT,
-                              "records": 2, "built_at": 1700000000}],
-            "m_cve": [{"cve_id": r["id"], "data": zlib.compress(json.dumps(r).encode())} for r in (rec, other)],
-            "m_cve_commit": [{"commit_hash": FIX, "role": cs.ROLE_FIX, "cve_id": "CVE-2024-0001"},
-                             {"commit_hash": INTRO, "role": cs.ROLE_INTRODUCED, "cve_id": "CVE-2024-0001"},
-                             {"commit_hash": FIX[:12], "role": cs.ROLE_FIX, "cve_id": "CVE-2016-5195"},
-                             {"commit_hash": STABLE_FIX, "role": cs.ROLE_FIX, "cve_id": "CVE-2024-0001"}],
-        }
-        self.cursor = FakeCursor(self.tables)
-        from contextlib import contextmanager
+        self.db = MockDB(use_global=False)
+        self.db.insert_rows("m_cve_source", ["name", "layout", "head", "format", "records", "built_at"],
+                            [("cvelistV5", "cvelist", bytes.fromhex("e" * 40), cs.RECORD_FORMAT, 2, 1700000000)])
+        self.db.insert_rows("m_cve", ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
+                            [(r["id"], 0, 0, 0, 0, 0, "", "", zlib.compress(json.dumps(r).encode())) for r in (rec, other)])
+        self.db.insert_rows("m_cve_commit", ["commit_hash", "role", "cve_id"], [
+            (FIX, cs.ROLE_FIX, "CVE-2024-0001"), (INTRO, cs.ROLE_INTRODUCED, "CVE-2024-0001"),
+            (FIX[:12], cs.ROLE_FIX, "CVE-2016-5195"), (STABLE_FIX, cs.ROLE_FIX, "CVE-2024-0001")])
+        self.reads = 0
 
-        @contextmanager
-        def fake():
-            yield self.cursor
+        def reader():
+            self.reads += 1
+            return self.db.reader()
 
-        self.patch = patch.object(cs, "get_db_cursor", fake)
+        self.patch = patch.object(cs, "get_reader", reader)
         self.patch.start()
         cs._SOURCE.update(checked=0.0, row=None)
         cs._MEM.update(built_at=None, records={})
@@ -262,9 +232,9 @@ class TestCveFromDatabase(unittest.TestCase):
         self.assertEqual(sorted(recs), ["CVE-2016-5195", "CVE-2024-0001"])
         self.assertEqual(recs["CVE-2016-5195"]["kind"], "commit")
         self.assertEqual(cs.kinds(recs), {"cna": 1, "commit": 1, "text": 0})
-        n = len(self.cursor.queries)
+        n = self.reads
         cs.records()
-        self.assertEqual(len(self.cursor.queries), n, "loaded once per ingestion")
+        self.assertEqual(self.reads, n, "loaded once per ingestion")
 
     def test_for_commit(self) -> None:
         self.assertEqual(cs.for_commit(FIX), {"fixes": ["CVE-2016-5195", "CVE-2024-0001"], "introduced": [], "fixes_upstream": []})
@@ -273,7 +243,7 @@ class TestCveFromDatabase(unittest.TestCase):
         self.assertEqual(cs.for_commit("not a sha"), {"fixes": [], "introduced": [], "fixes_upstream": []})
 
     def test_cves_for_file(self) -> None:
-        self.tables["m_cve_file"] = [{"cve_id": "CVE-2024-0001", "file_path": "fs/ext4/super.c"}]
+        self.db.insert_rows("m_cve_file", ["cve_id", "file_path"], [("CVE-2024-0001", "fs/ext4/super.c")])
         res = cs.cves_for_file("v6.1.55", "fs/ext4/super.c")
         self.assertEqual(res["total"], 1)
         self.assertEqual(res["file_path"], "fs/ext4/super.c")
@@ -300,7 +270,7 @@ class TestCveFromDatabase(unittest.TestCase):
         self.assertEqual(state, "fixed")
 
     def test_not_ingested(self) -> None:
-        self.tables["m_cve_source"] = []
+        self.db.delete_rows("m_cve_source", None, all_rows=True)
         with patch("parser.cve.cve_ingest.repo_dir", lambda raw=None: None):
             self.assertEqual(cs.status(), {"configured": False, "ingested": False})
         with patch("parser.cve.cve_ingest.repo_dir", lambda raw=None: Path("/srv/cves")):

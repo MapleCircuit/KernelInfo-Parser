@@ -66,8 +66,7 @@ def ensure_golden_tree() -> str:
 
 def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], dict[str, str]]:
     """Execute parsing and return list of staged operation reprs and dict of table store hashes."""
-    MockDB._global_store.clear()
-    MockDB._global_next_id.clear()
+    MockDB.store.clear()
     saved_typecheck = G.DEBUG_TYPECHECK
     G.DEBUG_TYPECHECK = True
     G.DB = MockDB
@@ -107,14 +106,14 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
 
         ops_reprs = [repr(op) for op in cs.cs]
         table_hashes = {}
-        for tbl_name, rows_dict in MockDB._global_store.items():
+        for tbl_name, rows_dict in MockDB.store.items():
             if rows_dict and tbl_name not in _PHYSICAL_SYMBOL_TABLES:
                 sorted_rows = sorted(repr(r) for r in rows_dict.values())
                 table_hashes[tbl_name] = hashlib.sha256("\n".join(sorted_rows).encode("utf-8")).hexdigest()[:16]
         # Symbol rows as the m_symbol_def / m_symbol_ref views return them (either storage layout), without the
         # surrogate def_id / ref_id
         for view in ("m_symbol_def", "m_symbol_ref"):
-            rows = symbol_view_rows(MockDB._global_store, view)
+            rows = symbol_view_rows(MockDB.store, view)
             if rows:
                 sorted_rows = sorted(repr(r[1:]) for r in rows)
                 table_hashes[view] = hashlib.sha256("\n".join(sorted_rows).encode("utf-8")).hexdigest()[:16]

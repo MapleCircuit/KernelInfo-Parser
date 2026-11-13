@@ -91,7 +91,7 @@ class TestDurationProfiler(unittest.TestCase):
         """Verify main.py arg_handling recognizes --duration and configures G deadline."""
         import sys
         from unittest.mock import patch
-        from main import arg_handling
+        from pipeline.cli import arg_handling
 
         test_args = ["main.py", "--duration", "30m"]
         with patch.object(sys, "argv", test_args):

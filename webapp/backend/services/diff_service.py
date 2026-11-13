@@ -15,9 +15,9 @@ import subprocess
 from webapp.backend.config import get_repo_dir
 from typing import Any
 from fastapi import HTTPException
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    tree_source,
     safe_decode,
     get_version_info,
 )
@@ -75,47 +75,47 @@ def is_kconfig_path(path: str) -> bool:
 class DiffService:
     """Computes cross-version semantic deltas for files, symbols, and Kconfig options."""
 
-    def _resolve_pair(self, cursor: Any, v1: str, v2: str) -> tuple[int, str, int, str]:
-        vid1, vname1 = get_version_info(cursor, v1)
-        vid2, vname2 = get_version_info(cursor, v2)
+    def _resolve_pair(self, reader: Any, v1: str, v2: str) -> tuple[int, str, int, str]:
+        vid1, vname1 = get_version_info(reader, v1)
+        vid2, vname2 = get_version_info(reader, v2)
         if vid1 is None or vid2 is None:
             missing = v1 if vid1 is None else v2
             raise HTTPException(status_code=404, detail=f"Version or commit '{missing}' not found.")
         return vid1, vname1, vid2, vname2
 
-    def _fetch_tree(self, cursor: Any, vid: int, vname: str) -> tuple[dict[str, str], bool]:
+    def _fetch_tree(self, reader: Any, vid: int, vname: str) -> tuple[dict[str, str], bool]:
         """Return ({path: content_key}, is_git). Content keys are Git blob SHAs (Path C) or DB blob_ids."""
         git_tree = git_tree_resolver.list_tree(vname)
         if git_tree is not None:
             return git_tree, True
-        db_tree = self._fetch_commit_files(cursor, vid)
+        db_tree = self._fetch_commit_files(reader, vid)
         return {p: str(b) for p, b in db_tree.items()}, False
 
     def _fetch_trees(
-        self, cursor: Any, v1: str, v2: str,
+        self, reader: Any, v1: str, v2: str,
     ) -> tuple[str, str, dict[str, str], dict[str, str], bool]:
         """Level 1 inputs: (vname1, vname2, {path: content_key} of each side, both from Git)."""
-        vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
-        files_v1, git1 = self._fetch_tree(cursor, vid1, vname1)
-        files_v2, git2 = self._fetch_tree(cursor, vid2, vname2)
+        vid1, vname1, vid2, vname2 = self._resolve_pair(reader, v1, v2)
+        files_v1, git1 = self._fetch_tree(reader, vid1, vname1)
+        files_v2, git2 = self._fetch_tree(reader, vid2, vname2)
         use_git = git1 and git2
         if not use_git and (git1 or git2):
             # Mixed sources cannot be compared by key; fall back to DB on both sides
-            files_v1 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid1).items()}
-            files_v2 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid2).items()}
+            files_v1 = {p: str(b) for p, b in self._fetch_commit_files(reader, vid1).items()}
+            files_v2 = {p: str(b) for p, b in self._fetch_commit_files(reader, vid2).items()}
         return vname1, vname2, files_v1, files_v2, use_git
 
     def get_unchanged_files(self, v1: str, v2: str) -> dict[str, Any]:
         """Paths present at both revisions with the same content (the `unchanged_count` of the diff)."""
-        with get_db_cursor() as cursor:
-            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2)
+        with get_reader() as reader:
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(reader, v1, v2)
         files = sorted(p for p, key in files_v2.items() if files_v1.get(p) == key)
         return {"v1": vname1, "v2": vname2, "source": "git" if use_git else "db", "count": len(files), "files": files}
 
     def get_versions_diff(self, v1: str, v2: str) -> dict[str, Any]:
         """Compare file hierarchies between two revisions using 3-level blob-skip diffing."""
-        with get_db_cursor() as cursor:
-            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2)
+        with get_reader() as reader:
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(reader, v1, v2)
 
             added_paths = [p for p in files_v2 if p not in files_v1]
             deleted_paths = [p for p in files_v1 if p not in files_v2]
@@ -135,7 +135,7 @@ class DiffService:
             if use_git:
                 needed = [files_v2[p] for p in added_paths + modified_paths] + [files_v1[p] for p in deleted_paths + modified_paths]
                 needed += [files_v2[n] for _, n, _ in renamed_pairs]
-                blob_meta = git_tree_resolver.map_blob_hashes(cursor, needed)
+                blob_meta = git_tree_resolver.map_blob_hashes(reader, needed)
 
                 def blob_id_of(key: str) -> int:
                     return blob_meta.get(key, (0, 0))[0]
@@ -161,11 +161,7 @@ class DiffService:
             blob_ids = sorted({b for m in sym_files for b in (m["fid_old"], m["fid_new"])})
             syms_by_blob: dict[int, set[tuple[str, int]]] = {b: set() for b in blob_ids}
             if blob_ids:
-                cursor.execute(
-                    f"SELECT blob_id, name, type_id FROM m_symbol_def WHERE blob_id IN ({','.join(['%s'] * len(blob_ids))});",
-                    blob_ids,
-                )
-                for r in cursor.fetchall():
+                for r in reader.select_rows("m_symbol_def", ["blob_id", "name", "type_id"], {"blob_id": blob_ids}, as_dict=True):
                     syms_by_blob[r["blob_id"]].add((safe_decode(r["name"]), r["type_id"]))
             for m in sym_files:
                 old_syms, new_syms = syms_by_blob[m["fid_old"]], syms_by_blob[m["fid_new"]]
@@ -336,8 +332,8 @@ class DiffService:
             return result
         pairs, limit_needed = found
         added_set, deleted_set = set(added), set(deleted)
-        with get_db_cursor() as cursor:
-            meta = git_tree_resolver.map_blob_hashes(cursor, [files_v2[n] for _, n, _ in pairs if n in files_v2])
+        with get_reader() as reader:
+            meta = git_tree_resolver.map_blob_hashes(reader, [files_v2[n] for _, n, _ in pairs if n in files_v2])
         result["renames"] = [
             {"old_file": o, "file": n, "similarity": sim, "fid": meta.get(files_v2[n], (0, 0))[0]}
             for o, n, sim in pairs if o in deleted_set and n in added_set
@@ -357,8 +353,8 @@ class DiffService:
         from enclosing if/menu/choice blocks, selects, implies, ranges, choice, options, help); a
         definition that only moved lines is unchanged.
         """
-        with get_db_cursor() as cursor:
-            vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
+        with get_reader() as reader:
+            vid1, vname1, vid2, vname2 = self._resolve_pair(reader, v1, v2)
 
             empty = {
                 "v1": vname1,
@@ -377,7 +373,7 @@ class DiffService:
             tree1 = git_tree_resolver.list_tree(vname1)
             tree2 = git_tree_resolver.list_tree(vname2)
             if tree1 is None or tree2 is None:
-                return self._kconfig_diff_from_tags(cursor, empty, vid1, vid2)
+                return self._kconfig_diff_from_tags(reader, empty, vid1, vid2)
 
         k1 = {p: s for p, s in tree1.items() if is_kconfig_path(p)}
         k2 = {p: s for p, s in tree2.items() if is_kconfig_path(p)}
@@ -493,10 +489,10 @@ class DiffService:
         return found
 
     @staticmethod
-    def _kconfig_diff_from_tags(cursor: Any, result: dict[str, Any], vid1: int, vid2: int) -> dict[str, Any]:
+    def _kconfig_diff_from_tags(reader: Any, result: dict[str, Any], vid1: int, vid2: int) -> dict[str, Any]:
         """Without Git trees: compare the Kconfig tags (name -> set of code hashes) of two indexed versions."""
-        side1 = DiffService._fetch_kconfig_symbols(cursor, vid1)
-        side2 = DiffService._fetch_kconfig_symbols(cursor, vid2)
+        side1 = DiffService._fetch_kconfig_symbols(reader, vid1)
+        side2 = DiffService._fetch_kconfig_symbols(reader, vid2)
         added = sorted(k for k in side2 if k not in side1)
         removed = sorted(k for k in side1 if k not in side2)
         changed = sorted(k for k in side1 if k in side2 and side1[k] != side2[k])
@@ -650,21 +646,12 @@ class DiffService:
         return result
 
     @staticmethod
-    def _fetch_commit_files(cursor: Any, commit_id: int) -> dict[str, int]:
-        cursor.execute(
-            """
-            SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
-            FROM m_checkpoint_tree bc
-            LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
-            WHERE bc.commit_id = %s;
-            """.replace("m_checkpoint_tree", tree_source(cursor)),
-            (commit_id,),
-        )
-        rows = cursor.fetchall()
+    def _fetch_commit_files(reader: Any, commit_id: int) -> dict[str, int]:
+        rows = reader.checkpoint_tree_files(commit_id, include_unnamed=True)
         if rows:
-            return {safe_decode(r["fname"]): r["blob_id"] for r in rows}
+            return {(safe_decode(r["fname"]) or f"file_{r['fnid']}"): r["blob_id"] for r in rows}
 
-        fnid_map = tree_resolver.resolve_tree(commit_id, cursor)
+        fnid_map = tree_resolver.resolve_tree(commit_id, reader)
         if not fnid_map:
             return {}
 
@@ -673,47 +660,42 @@ class DiffService:
         chunk_size = 5000
         for i in range(0, len(fnids), chunk_size):
             chunk = fnids[i:i + chunk_size]
-            fmt = ",".join(["%s"] * len(chunk))
-            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt});", chunk)
-            for r in cursor.fetchall():
+            for r in reader.select_rows("m_file_name", ["fnid", "fname"], {"fnid": chunk}, as_dict=True):
                 fn = safe_decode(r["fname"]) or f"file_{r['fnid']}"
                 res[fn] = fnid_map[r["fnid"]]
         return res
 
     @staticmethod
-    def _fetch_kconfig_symbols(cursor: Any, commit_id: int) -> dict[str, frozenset[bytes]]:
+    def _fetch_kconfig_symbols(reader: Any, commit_id: int) -> dict[str, frozenset[bytes]]:
         """{symbol: code hashes of its Kconfig definition tags} of one indexed version.
 
         Kconfig entries are tags (m_ast name with type Kconfig_Config/Kconfig_Menuconfig): the tag
         hash identifies the definition text, so two versions differ exactly when the sets differ.
         """
         types = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
-        sql_tail = """
-            JOIN m_bridge_tag bt ON bt.blob_id = {blob}
-            JOIN m_tag t ON t.tag_id = bt.tag_id
-            JOIN m_ast a ON a.ast_id = t.ast_id
-            WHERE a.type_id IN (%s, %s)
-        """
-        cursor.execute(
-            "SELECT a.name, t.hash FROM m_checkpoint_tree bc".replace("m_checkpoint_tree", tree_source(cursor)) + sql_tail.format(blob="bc.blob_id") + " AND bc.commit_id = %s;",
-            (*types, commit_id),
+        tag_joins = [
+            Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+            Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+        ]
+        cols = {"name": "a.name", "hash": "t.hash"}
+        rows = reader.select_rows(
+            (reader.checkpoint_tree_source(), "bc"),
+            cols,
+            {"bc.commit_id": commit_id, "a.type_id": list(types)},
+            joins=[Join(("m_bridge_tag", "bt"), {"bt.blob_id": "bc.blob_id"}), *tag_joins],
+            as_dict=True,
         )
-        rows = cursor.fetchall()
         if not rows:
-            tree_map = tree_resolver.resolve_tree(commit_id, cursor)
+            tree_map = tree_resolver.resolve_tree(commit_id, reader)
             blob_ids = sorted(set(tree_map.values())) if tree_map else []
             rows = []
             for i in range(0, len(blob_ids), 5000):
                 chunk = blob_ids[i:i + 5000]
-                fmt = ",".join(["%s"] * len(chunk))
-                cursor.execute(
-                    f"""SELECT a.name, t.hash FROM m_bridge_tag bt
-                        JOIN m_tag t ON t.tag_id = bt.tag_id
-                        JOIN m_ast a ON a.ast_id = t.ast_id
-                        WHERE a.type_id IN (%s, %s) AND bt.blob_id IN ({fmt});""",
-                    (*types, *chunk),
+                rows.extend(
+                    reader.select_rows(
+                        ("m_bridge_tag", "bt"), cols, {"bt.blob_id": chunk, "a.type_id": list(types)}, joins=tag_joins, as_dict=True
+                    )
                 )
-                rows.extend(cursor.fetchall())
         out: dict[str, set[bytes]] = {}
         for r in rows:
             out.setdefault(safe_decode(r["name"]), set()).add(bytes(r["hash"]))

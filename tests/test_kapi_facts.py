@@ -2,6 +2,8 @@
 (webapp/backend/services/kapi_service.py, device_index_service.py; webapp/API.md section 4.9)."""
 from __future__ import annotations
 
+from cache_engine import get_cache_engine
+
 import os
 import shutil
 import subprocess
@@ -172,8 +174,7 @@ class TestCatalogsFromRecords(unittest.TestCase):
     def tearDown(self) -> None:
         for p in reversed(self.patches):
             p.stop()
-        for conn in self.store._conns.values():
-            conn.close()
+        get_cache_engine().close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_records_database_first_then_local_store(self) -> None:

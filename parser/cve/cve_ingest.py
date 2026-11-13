@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from db_engine.spec import Length, NotExists, Pred, lt
 from parser.cve.cve_records import (
     KINDS,
     RECORD_FORMAT,
@@ -241,7 +242,8 @@ def commit_rows(rec: dict[str, Any]) -> list[tuple[str, int, str]]:
 
 def source_state(db: Any) -> dict[str, Any] | None:
     """The list the database holds (one row), or None."""
-    row = db.query_one("SELECT name, layout, head, format, records, built_at FROM m_cve_source ORDER BY built_at DESC LIMIT 1", dictionary=False)
+    row = db.select_one("m_cve_source", ["name", "layout", "head", "format", "records", "built_at"],
+                        order_by=["-built_at"], as_dict=False)
     if not row:
         return None
     name, layout, head, fmt, records, built_at = row
@@ -258,10 +260,8 @@ def _ids_of(paths: Iterable[str]) -> list[str]:
 def _delete_ids(db: Any, ids: list[str]) -> None:
     for i in range(0, len(ids), _BATCH):
         part = ids[i:i + _BATCH]
-        marks = ",".join(["%s"] * len(part))
-        db.execute(f"DELETE FROM m_cve_file WHERE cve_id IN ({marks})", part)  # noqa: S608
-        db.execute(f"DELETE FROM m_cve_commit WHERE cve_id IN ({marks})", part)  # noqa: S608
-        db.execute(f"DELETE FROM m_cve WHERE cve_id IN ({marks})", part)  # noqa: S608
+        for table in ("m_cve_file", "m_cve_commit", "m_cve"):
+            db.delete_rows(table, {"cve_id": part})
 
 
 def _insert(db: Any, records: dict[str, tuple[str, dict[str, Any]]]) -> None:
@@ -274,23 +274,16 @@ def _insert(db: Any, records: dict[str, tuple[str, dict[str, Any]]]) -> None:
         if f_path
     ]
     for i in range(0, len(rows), _BATCH):
-        db.executemany(
-            "INSERT INTO m_cve (cve_id, kind, published, updated, score, kev, record_path, title, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE kind = VALUES(kind), "
-            "published = VALUES(published), updated = VALUES(updated), score = VALUES(score), kev = VALUES(kev), "
-            "record_path = VALUES(record_path), title = VALUES(title), data = VALUES(data)",
+        db.insert_rows(
+            "m_cve",
+            ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
             rows[i:i + _BATCH],
+            on_conflict="update",
         )
     for i in range(0, len(links), 2000):
-        db.executemany(
-            "INSERT IGNORE INTO m_cve_commit (commit_hash, role, cve_id) VALUES (%s, %s, %s)",
-            links[i:i + 2000],
-        )
+        db.insert_rows("m_cve_commit", ["commit_hash", "role", "cve_id"], links[i:i + 2000], on_conflict="ignore")
     for i in range(0, len(file_rows), 2000):
-        db.executemany(
-            "INSERT IGNORE INTO m_cve_file (cve_id, file_path) VALUES (%s, %s)",
-            file_rows[i:i + 2000],
-        )
+        db.insert_rows("m_cve_file", ["cve_id", "file_path"], file_rows[i:i + 2000], on_conflict="ignore")
 
 
 # ------------------------------------------------------------------------------------- ingestion
@@ -320,30 +313,21 @@ def prepare(repo: Path, prev: dict[str, Any] | None, force: bool = False, progre
 
 def write(db: Any, plan: dict[str, Any]) -> int:
     """Apply a `prepare()` plan in one transaction; returns the records the database then holds."""
-    try:
+    with db.transaction():
         if plan["state"] == "full":
-            db.execute("DELETE FROM m_cve_file")
-            db.execute("DELETE FROM m_cve_commit_hash")
-            db.execute("DELETE FROM m_cve_commit")
-            db.execute("DELETE FROM m_cve")
-            db.execute("DELETE FROM m_cve_source")
+            for table in ("m_cve_file", "m_cve_commit_hash", "m_cve_commit", "m_cve", "m_cve_source"):
+                db.delete_rows(table, None, all_rows=True)
         else:
             # A changed record is replaced; one no longer about the kernel (or deleted) goes away
             _delete_ids(db, _ids_of(plan["paths"]))
         _insert(db, plan["records"])
-        cnt_row = db.query_one("SELECT COUNT(*) FROM m_cve", dictionary=False)
-        total = int(cnt_row[0]) if cnt_row else 0
-        db.execute(
-            "INSERT INTO m_cve_source (name, layout, head, format, records, built_at) VALUES (%s, %s, %s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE layout = VALUES(layout), head = VALUES(head), format = VALUES(format), "
-            "records = VALUES(records), built_at = VALUES(built_at)",
-            (plan["name"], plan["layout"], bytes.fromhex(plan["head"]), RECORD_FORMAT, total, int(time.time())),
+        total = db.count_rows("m_cve")
+        db.insert_rows(
+            "m_cve_source",
+            ["name", "layout", "head", "format", "records", "built_at"],
+            [(plan["name"], plan["layout"], bytes.fromhex(plan["head"]), RECORD_FORMAT, total, int(time.time()))],
+            on_conflict="update",
         )
-        db.commit()
-    except Exception:
-        if hasattr(db, "rollback"):
-            db.rollback()
-        raise
     return total
 
 
@@ -352,18 +336,23 @@ def resolve_commit_prefixes(db: Any, kernel_repo: Path | str, repo_id: int) -> d
     (`commit_relations.resolve_prefixes`), for the prefixes without a row yet; a prefix naming no commit or
     several gets none and is tried again next time. Returns {pending, resolved}."""
     from parser.git_ast.commit_relations import resolve_prefixes
-    rows = db.query(
-        "SELECT DISTINCT c.commit_hash FROM m_cve_commit c WHERE CHAR_LENGTH(c.commit_hash) < 40 "
-        "AND NOT EXISTS (SELECT 1 FROM m_cve_commit_hash h WHERE h.repo_id = %s AND h.prefix = c.commit_hash)",
-        (repo_id,),
-        dictionary=False,
+    rows = db.select_rows(
+        ("m_cve_commit", "c"),
+        ["c.commit_hash"],
+        [
+            Pred(Length("c.commit_hash"), lt(40)),
+            NotExists(("m_cve_commit_hash", "h"), {"h.prefix": "c.commit_hash"}, {"h.repo_id": repo_id}),
+        ],
+        distinct=True,
+        as_dict=False,
     )
     pending = [r[0].decode() if isinstance(r[0], (bytes, bytearray)) else str(r[0]) for r in rows]
     found = resolve_prefixes(kernel_repo, pending) if pending else {}
     rows_to_ins = [(repo_id, p, bytes.fromhex(found[p.lower()])) for p in pending if p.lower() in found]
-    for i in range(0, len(rows_to_ins), 2000):
-        db.executemany("INSERT IGNORE INTO m_cve_commit_hash (repo_id, prefix, commit_hash) VALUES (%s, %s, %s)", rows_to_ins[i:i + 2000])
-    db.commit()
+    with db.transaction():
+        for i in range(0, len(rows_to_ins), 2000):
+            db.insert_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"], rows_to_ins[i:i + 2000],
+                           on_conflict="ignore")
     if pending:
         logger.info(f"[CVE] Resolved {len(rows_to_ins)} of {len(pending)} abbreviated commit hash(es) in {kernel_repo}.")
     return {"pending": len(pending), "resolved": len(rows_to_ins)}

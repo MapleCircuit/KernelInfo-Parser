@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
+import itertools
 from typing import Any, Callable
 
+from cache_engine import Eq, In, IsNull, Range
 from webapp.backend.config import get_active_repo_name
 from webapp.backend.services import commit_relations, release_service
 from webapp.backend.services.disk_cache import DiskCache
@@ -77,12 +78,6 @@ def annotation_applies(annotation: str, series: str) -> bool:
         if not plus and target == n:
             return True
     return False
-
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(commit_relations.relation_index.path()), timeout=60)
-    conn.execute("ATTACH DATABASE ? AS ri", (str(release_service.release_index.path()),))
-    return conn
 
 
 def _tag_dates(tags: dict[str, str], names: list[str]) -> dict[str, int]:
@@ -169,56 +164,78 @@ def build_report(series: str, progress=None, use_db: bool = False) -> dict[str, 
 
 def _report_sqlite(series: str, scope: dict[str, Any], progress=None) -> dict[str, Any]:
     key = scope["key"]
-    conn = _connect()
-    try:
-        tag_rows = conn.execute("SELECT idx, name, chain FROM ri.tags").fetchall()
-        later_mainline = {idx: name for idx, name, chain in tag_rows if chain == "mainline" and name in scope["later"]}
-        stable_set = set(scope["stable_tags"])
-        stable_idx = {idx for idx, name, chain in tag_rows if chain == "stable" and name in stable_set}
-        if progress:
-            progress(1, 4, "candidates")
-        rows = conn.execute(
-            """
-            SELECT r.src, r.kind, r.note, r.prefix, r.dst, f.tag_idx, c.at, c.subject
-            FROM rel r
-            JOIN ri.first_tag f ON f.sha = r.src AND f.chain = 0
-            LEFT JOIN commits c ON c.sha = r.src
-            WHERE r.kind IN (?, ?)
-            ORDER BY r.rowid
-            """,
-            (commit_relations.KIND_FIXES, commit_relations.KIND_STABLE_CC),
-        ).fetchall()
-        if progress:
-            progress(2, 4, f"{len(rows):,} marked commits")
-        cand: dict[bytes, dict[str, Any]] = {}
-        for src, kind, note, prefix, dst, tag_idx, at, subject in rows:
-            if tag_idx not in later_mainline:
-                continue
-            target = _contained_target(conn, dst, prefix, key) if kind == commit_relations.KIND_FIXES else None
-            _add(cand, src, kind, note, target, series, {"tag_idx": tag_idx, "at": at, "subject": subject})
-        if progress:
-            progress(3, 4, f"{len(cand):,} candidates: checking backports")
-        backported: set[bytes] = set()
-        for src in cand:
-            hexsha = src.hex()
-            rows = conn.execute(
-                "SELECT f.tag_idx FROM rel r JOIN ri.first_tag f ON f.sha = r.src AND f.chain = 1 WHERE r.dst = ? AND r.kind = ?",
-                (src, commit_relations.KIND_UPSTREAM)).fetchall()
-            # Backports naming the commit by an abbreviated hash (B12)
-            rows += [(t,) for t, pre in conn.execute(
-                "SELECT f.tag_idx, r.prefix FROM rel r JOIN ri.first_tag f ON f.sha = r.src AND f.chain = 1 "
-                "WHERE r.p8 = ? AND r.kind = ? AND r.dst IS NULL", (hexsha[:8], commit_relations.KIND_UPSTREAM)) if hexsha.startswith(pre or "~")]
-            if any(b[0] in stable_idx for b in rows):
-                backported.add(src)
-    finally:
-        conn.close()
+    relations = commit_relations.relation_index.space()
+    releases = release_service.release_index.space()
+    rel, commits = relations.store("rel"), relations.store("commits")
+    first_tag, tags = releases.store("first_tag"), releases.store("tags")
+    tag_rows = list(tags.scan(columns=("idx", "name", "chain")))
+    names = {idx: name for idx, name, _chain in tag_rows}
+    later_mainline = {idx: name for idx, name, chain in tag_rows if chain == "mainline" and name in scope["later"]}
+    stable_set = set(scope["stable_tags"])
+    stable_idx = {idx for idx, name, chain in tag_rows if chain == "stable" and name in stable_set}
+    if progress:
+        progress(1, 4, "candidates")
+    # Marked commits (Fixes: / Cc: stable) in insertion order, kept when their first mainline tag is a later release
+    marked = rel.scan(In("kind", (commit_relations.KIND_FIXES, commit_relations.KIND_STABLE_CC)),
+                      columns=("src", "kind", "note", "prefix", "dst"))
+    # Commits whose first mainline release is a later one (one scan of the release index instead of a lookup per marked row)
+    in_later = {sha: tag_idx for sha, tag_idx in first_tag.scan([Eq("chain", 0), In("tag_idx", sorted(later_mainline))],
+                                                                  columns=("sha", "tag_idx"))}
+    cand: dict[bytes, dict[str, Any]] = {}
+    release_keys: dict[str, tuple] = {}
+    targets_seen: dict[tuple, Any] = {}
+    total = 0
+    while True:
+        batch = list(itertools.islice(marked, 2000))
+        if not batch:
+            break
+        total += len(batch)
+        kept = [(r, in_later[r[0]]) for r in batch if r[0] in in_later]
+        info = commits.get_many({r[0] for r, _ in kept})
+        # first mainline release of every full-hash Fixes: target of the batch, in one lookup
+        dst_first = first_tag.get_many({(r[4], 0) for r, _ in kept if r[1] == commit_relations.KIND_FIXES and r[4]})
+        for (src, kind, note, prefix, dst), tag_idx in kept:
+            row = info.get(src)
+            target = None
+            if kind == commit_relations.KIND_FIXES:
+                memo_key = (dst, prefix)   # many commits fix the same target
+                if memo_key not in targets_seen:
+                    targets_seen[memo_key] = _contained_target(first_tag, names, dst, prefix, key, dst_first, release_keys)
+                target = targets_seen[memo_key]
+            _add(cand, src, kind, note, target, series, {"tag_idx": tag_idx, "at": row[1] if row else None,
+                                                         "subject": row[2] if row else None})
+    if progress:
+        progress(3, 4, f"{total:,} marked commits, {len(cand):,} candidates: checking backports")
+    backported: set[bytes] = set()
+    pending = list(cand)
+    for i in range(0, len(pending), 1000):
+        part = pending[i:i + 1000]
+        # Upstream relations naming a candidate by full hash, then by an abbreviated hash (B12): one scan each per batch
+        by_dst: dict[bytes, list[bytes]] = {}
+        for src, dst in rel.scan([In("dst", part), Eq("kind", commit_relations.KIND_UPSTREAM)], columns=("src", "dst")):
+            by_dst.setdefault(dst, []).append(src)
+        by_p8: dict[str, list[tuple[bytes, str | None]]] = {}
+        for b, pre, p8, dst in rel.scan(
+                [In("p8", sorted({c.hex()[:8] for c in part})), Eq("kind", commit_relations.KIND_UPSTREAM)],
+                columns=("src", "prefix", "p8", "dst")):
+            if dst is None:   # filtered here: `dst IS NULL` makes SQLite walk the dst index instead of p8's
+                by_p8.setdefault(p8, []).append((b, pre))
+        backports = {c: by_dst.get(c, []) + [b for b, pre in by_p8.get(c.hex()[:8], ()) if c.hex().startswith(pre or "~")]
+                     for c in part}
+        stable_firsts = first_tag.get_many({(b, 1) for bs in backports.values() for b in bs})
+        for c, bs in backports.items():
+            if any((b, 1) in stable_firsts and stable_firsts[(b, 1)][2] in stable_idx for b in bs):
+                backported.add(c)
     return _result(series, scope, cand, backported, lambda e: later_mainline.get(e["tag_idx"], ""), "index")
 
 
-def _contained_target(conn: sqlite3.Connection, dst: bytes | None, prefix: str | None, series_key: tuple) -> tuple[str, str] | None:
-    """(sha, first release) of a Fixes: target when the series contains it (first mainline tag <= series)."""
+def _contained_target(first_tag: Any, names: dict[int, str], dst: bytes | None, prefix: str | None,
+                      series_key: tuple, known: dict | None = None, release_keys: dict | None = None) -> tuple[str, str] | None:
+    """(sha, first release) of a Fixes: target when the series contains it (first mainline tag <= series).
+    `known` holds already fetched `first_tag` records by `(sha, chain)`; `release_keys` memoizes `release_key()`."""
     if dst:
-        rows = conn.execute("SELECT f.sha, t.name FROM ri.first_tag f JOIN ri.tags t ON t.idx = f.tag_idx WHERE f.sha = ? AND f.chain = 0", (dst,)).fetchall()
+        rec = known.get((dst, 0)) if known is not None else first_tag.get((dst, 0))
+        rows = [(dst, names[rec[2]])] if rec and rec[2] in names else []
     else:
         p = (prefix or "").lower()
         if len(p) < 8:
@@ -226,18 +243,20 @@ def _contained_target(conn: sqlite3.Connection, dst: bytes | None, prefix: str |
         even = p[: len(p) // 2 * 2]
         lo = bytes.fromhex(even)
         hi = (int.from_bytes(lo, "big") + 1).to_bytes(len(lo), "big") if lo != b"\xff" * len(lo) else None
-        q = "SELECT f.sha, t.name FROM ri.first_tag f JOIN ri.tags t ON t.idx = f.tag_idx WHERE f.chain = 0 AND f.sha >= ?"
-        args: list[Any] = [lo]
-        if hi is not None:
-            q += " AND f.sha < ?"
-            args.append(hi)
-        rows = [r for r in conn.execute(q + " LIMIT 50", args).fetchall() if r[0].hex().startswith(p)]
+        found = first_tag.scan([Range("sha", ge=lo, lt=hi), Eq("chain", 0)], order_by=("sha",), limit=50)
+        rows = [(sha, names[idx]) for sha, _chain, idx in found if sha.hex().startswith(p) and idx in names]
         if len(rows) != 1:
             return None  # unknown or ambiguous
     if not rows:
         return None
     sha, name = rows[0]
-    if release_service.release_key(name) > series_key:
+    if release_keys is not None:
+        if name not in release_keys:
+            release_keys[name] = release_service.release_key(name)
+        name_key = release_keys[name]
+    else:
+        name_key = release_service.release_key(name)
+    if name_key > series_key:
         return None
     return sha.hex(), name
 
@@ -262,25 +281,25 @@ def db_scope_covered(scope: dict[str, Any]) -> bool:
 
 
 def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, Any] | None:
-    """The report from m_commit_relation, m_commit_release, m_release_segment and m_commit (SELECT only);
+    """The report from m_commit_relation, m_commit_release, m_release_segment and m_commit (read only);
     None when a query fails (the SQLite path answers)."""
     from parser.git_ast.commit_relations import resolve_prefixes
     from webapp.backend.config import get_repo_dir
     from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
-    from webapp.backend.database.pool import get_db_cursor
+    from db_engine.spec import Join, Value
+    from webapp.backend.database.pool import get_reader
     k_fix, k_cc, k_up = commit_relations.KIND_FIXES, commit_relations.KIND_STABLE_CC, commit_relations.KIND_UPSTREAM
     tags = release_service.tag_commits()
     key = scope["key"]
     stable_set = set(scope["stable_tags"])
     try:
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
             network_id = get_active_network_id(cur)
             if network_id is None:
                 return None
-            cur.execute("SELECT segment_id, tag, tag_hash, chain FROM m_release_segment WHERE repo_id = %s;", (repo_id,))
             seg_tag: dict[int, str] = {}
-            for r in cur.fetchall():
+            for r in cur.select_rows("m_release_segment", ["segment_id", "tag", "tag_hash", "chain"], {"repo_id": repo_id}):
                 tag = _textv(r["tag"])
                 if tags.get(tag) == _hexv(r["tag_hash"]):
                     seg_tag[int(r["segment_id"])] = tag
@@ -291,18 +310,18 @@ def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, A
             rows: list[dict[str, Any]] = []
             for i in range(0, len(later_sids), 200):
                 part = later_sids[i:i + 200]
-                cur.execute(
-                    f"""
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject, r.kind, r.idx, r.note, r.target_hash,
-                           r.target_prefix, cr.segment_id
-                    FROM m_commit_release cr
-                    JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash
-                    JOIN m_commit_relation r ON r.commit_id = c.commit_id AND r.kind IN (%s, %s)
-                    WHERE cr.repo_id = %s AND cr.chain = %s AND cr.segment_id IN ({",".join(["%s"] * len(part))});
-                    """,
-                    (network_id, k_fix, k_cc, repo_id, release_service.DB_CHAIN_MAINLINE, *part),
-                )
-                rows.extend(cur.fetchall())
+                rows.extend(cur.select_rows(
+                    ("m_commit_release", "cr"),
+                    {"commit_id": "c.commit_id", "commit_hash": "c.commit_hash", "author_date": "c.author_date",
+                     "subject": "c.subject", "kind": "r.kind", "idx": "r.idx", "note": "r.note",
+                     "target_hash": "r.target_hash", "target_prefix": "r.target_prefix", "segment_id": "cr.segment_id"},
+                    {"cr.repo_id": repo_id, "cr.chain": release_service.DB_CHAIN_MAINLINE, "cr.segment_id": part,
+                     "r.kind": [k_fix, k_cc]},
+                    joins=[
+                        Join(("m_commit", "c"), {"c.network_id": Value(network_id), "c.commit_hash": "cr.commit_hash"}),
+                        Join(("m_commit_relation", "r"), {"r.commit_id": "c.commit_id"}),
+                    ],
+                ))
             rows.sort(key=lambda r: (int(r["commit_id"]), int(r["kind"]), int(r["idx"])))
             if progress:
                 progress(2, 4, f"{len(rows):,} marked commits")
@@ -320,12 +339,11 @@ def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, A
             first: dict[str, str] = {}
             for i in range(0, len(targets), 500):
                 part = targets[i:i + 500]
-                cur.execute(
-                    f"SELECT commit_hash, segment_id FROM m_commit_release WHERE repo_id = %s AND chain = %s "
-                    f"AND commit_hash IN ({','.join(['%s'] * len(part))});",
-                    (repo_id, release_service.DB_CHAIN_MAINLINE, *(bytes.fromhex(t) for t in part)),
-                )
-                for r in cur.fetchall():
+                for r in cur.select_rows(
+                    "m_commit_release", ["commit_hash", "segment_id"],
+                    {"repo_id": repo_id, "chain": release_service.DB_CHAIN_MAINLINE,
+                     "commit_hash": [bytes.fromhex(t) for t in part]},
+                ):
                     tag = seg_tag.get(int(r["segment_id"]))
                     if tag:
                         first[_hexv(r["commit_hash"])] = tag
@@ -347,17 +365,18 @@ def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, A
             srcs = list(cand)
             for i in range(0, len(srcs), 500):
                 part = srcs[i:i + 500]
-                cur.execute(
-                    f"""
-                    SELECT r.target_hash, cr.segment_id
-                    FROM m_commit_relation r
-                    JOIN m_commit c ON c.commit_id = r.commit_id
-                    JOIN m_commit_release cr ON cr.repo_id = %s AND cr.commit_hash = c.commit_hash AND cr.chain = %s
-                    WHERE r.kind = %s AND c.network_id = %s AND r.target_hash IN ({",".join(["%s"] * len(part))});
-                    """,
-                    (repo_id, release_service.DB_CHAIN_STABLE, k_up, network_id, *part),
-                )
-                for r in cur.fetchall():
+                for r in cur.select_rows(
+                    ("m_commit_relation", "r"),
+                    {"target_hash": "r.target_hash", "segment_id": "cr.segment_id"},
+                    {"r.kind": k_up, "c.network_id": network_id, "r.target_hash": part},
+                    joins=[
+                        Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}),
+                        Join(("m_commit_release", "cr"), {
+                            "cr.repo_id": Value(repo_id), "cr.commit_hash": "c.commit_hash",
+                            "cr.chain": Value(release_service.DB_CHAIN_STABLE),
+                        }),
+                    ],
+                ):
                     if int(r["segment_id"]) in stable_sids:
                         backported.add(bytes(r["target_hash"]))
     except Exception as exc:  # noqa: BLE001 - the SQLite path answers

@@ -20,6 +20,7 @@ from typing import Any, Iterator
 import urllib.error
 import urllib.request
 
+from db_engine import CAP_PERSISTENT, CAP_SERVER_TUNING, get_db_engine
 from core.config import (
     DEFAULT_BRANCH_FILTER,
     REPO_ROOT,
@@ -284,9 +285,19 @@ def test_database_connection(
             )
 
         engine = str(db_cfg.get("engine", "mariadb")).lower()
+        try:
+            engine_cls = get_db_engine(engine)
+        except ValueError as exc:
+            return DiagnosticResult(
+                name=test_name,
+                passed=False,
+                latency_ms=0.0,
+                message=f"Unknown database engine '{engine}'",
+                details=f"{exc}",
+            )
 
-        # In-memory mock engine support
-        if engine in ("mock", "mockdb", "inmemory"):
+        # Engines that keep data in process memory (the mock) have nothing to connect to
+        if CAP_PERSISTENT not in engine_cls.base_capabilities:
             return DiagnosticResult(
                 name=test_name,
                 passed=True,
@@ -295,38 +306,24 @@ def test_database_connection(
                 details=f"Engine '{engine}' does not require an external SQL server.",
             )
 
-        # SQLite database engine support
-        if engine in ("sqlite", "sqlite3"):
-            db_path = str(db_cfg.get("database", ":memory:"))
-            t0 = time.perf_counter()
-            import sqlite3
-
-            try:
-                conn = sqlite3.connect(db_path, timeout=float(db_cfg.get("timeout", 3.0)))
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.fetchall()
-                cur.execute("SELECT sqlite_version()")
-                ver_row = cur.fetchone()
-                ver_str = ver_row[0] if ver_row else "unknown"
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                conn.close()
-                return DiagnosticResult(
-                    name=test_name,
-                    passed=True,
-                    latency_ms=round(latency_ms, 2),
-                    message=f"Connected to SQLite ({ver_str}) successfully",
-                    details=f"Path: {db_path}\nSQLite Version: {ver_str}\nLatency: {latency_ms:.1f}ms",
-                )
-            except Exception as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+        # Embedded engines (SQLite) are probed by the engine itself; no host, credentials or tunnel involved
+        if CAP_SERVER_TUNING not in engine_cls.base_capabilities:
+            probe = engine_cls.probe_connection(db_cfg)
+            if not probe.ok:
                 return DiagnosticResult(
                     name=test_name,
                     passed=False,
-                    latency_ms=round(latency_ms, 2),
-                    message=f"SQLite connection failed: {exc}",
-                    details=traceback.format_exc(),
+                    latency_ms=probe.latency_ms,
+                    message=f"{engine_cls.display_name} connection failed: {probe.error}",
+                    details=f"Target: {probe.target}\n{probe.error}",
                 )
+            return DiagnosticResult(
+                name=test_name,
+                passed=True,
+                latency_ms=probe.latency_ms,
+                message=f"Connected to {engine_cls.display_name} ({probe.version}) successfully",
+                details=f"Path: {probe.target}\nVersion: {probe.version}\nLatency: {probe.latency_ms:.1f}ms",
+            )
 
         # MariaDB / MySQL validation
         user = db_cfg.get("user")
@@ -340,7 +337,6 @@ def test_database_connection(
                 details=f"Configured: user={user!r}, database={db_name!r}",
             )
 
-        password = db_cfg.get("password", "")
         host = db_cfg.get("host")
         raw_port = db_cfg.get("port", 3306)
         try:
@@ -348,8 +344,6 @@ def test_database_connection(
         except (ValueError, TypeError):
             port = 3306
 
-        unix_socket = db_cfg.get("unix_socket")
-        ssl_disabled = bool(db_cfg.get("ssl_disabled", False))
 
         # Check SSH Tunnel status if enabled
         ssh_cfg = ssh_tunnel_cfg if ssh_tunnel_cfg is not None else db_cfg.get("ssh_tunnel", {})
@@ -425,119 +419,44 @@ def test_database_connection(
             # configured database Host/Port, so a Port that does not reach the forward fails here.
             host = host or "127.0.0.1"
             forward_port = effective_local_port
-            unix_socket = None
         else:
             forward_port = 0
 
-        # Resolve Unix domain socket candidates when not tunneled
-        resolved_socket = None
-        if not tunnel_enabled and unix_socket:
-            if unix_socket == "auto":
-                if not host or host in ("127.0.0.1", "localhost"):
-                    for candidate in ("/run/mysqld/mysqld.sock", "/var/run/mysqld/mysqld.sock", "/tmp/mysql.sock"):
-                        if os.path.exists(candidate):
-                            resolved_socket = candidate
-                            break
-            elif unix_socket not in ("off", "disabled", "none", "false") and os.path.exists(unix_socket):
-                resolved_socket = unix_socket
-
-        try:
-            import mysql.connector
-        except ImportError:
-            return DiagnosticResult(
-                name=test_name,
-                passed=False,
-                latency_ms=0.0,
-                message="mysql-connector is not installed",
-                details="Please install mysql-connector-python: pip install mysql-connector-python",
-            )
-
-        conn_kwargs: dict[str, Any] = {
-            "user": user,
-            "password": password,
-            "database": db_name,
-            "connection_timeout": 3,
-            "autocommit": True,
-        }
-        if ssl_disabled:
-            conn_kwargs["ssl_disabled"] = True
-
-        if resolved_socket:
-            conn_kwargs["unix_socket"] = resolved_socket
-        else:
-            conn_kwargs["host"] = host or "127.0.0.1"
-            conn_kwargs["port"] = port
-
-        t0 = time.perf_counter()
-        try:
-            cnx = mysql.connector.connect(**conn_kwargs)
-        except Exception as exc:
-            # If Unix socket was attempted, attempt TCP fallback if host is present
-            if resolved_socket and host:
-                try:
-                    conn_kwargs.pop("unix_socket", None)
-                    conn_kwargs["host"] = host
-                    conn_kwargs["port"] = port
-                    cnx = mysql.connector.connect(**conn_kwargs)
-                except Exception as fallback_exc:
-                    latency_ms = (time.perf_counter() - t0) * 1000.0
-                    return DiagnosticResult(
-                        name=test_name,
-                        passed=False,
-                        latency_ms=round(latency_ms, 2),
-                        message=f"Database connection failed: {fallback_exc}",
-                        details=traceback.format_exc(),
-                    )
-            else:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                details = traceback.format_exc()
-                if forward_port and forward_port != port:
-                    details = (
-                        f"Target: {conn_kwargs['host']}:{port}\n"
-                        f"The SSH forward listens on 127.0.0.1:{forward_port}, not on Port {port}. "
-                        f"Set Local Port to {port} (or Port to the Local Port).\n{details}"
-                    )
-                return DiagnosticResult(
-                    name=test_name,
-                    passed=False,
-                    latency_ms=round(latency_ms, 2),
-                    message=f"Database connection failed: {exc}",
-                    details=details,
+        probe_cfg = dict(db_cfg)
+        probe_cfg["host"] = host or "127.0.0.1"
+        probe_cfg["port"] = port
+        probe_cfg["timeout"] = 3
+        if tunnel_enabled:
+            probe_cfg["unix_socket"] = "off"
+        probe = engine_cls.probe_connection(probe_cfg)
+        if not probe.ok:
+            details = probe.error
+            if forward_port and forward_port != port:
+                details = (
+                    f"Target: {probe_cfg['host']}:{port}\n"
+                    f"The SSH forward listens on 127.0.0.1:{forward_port}, not on Port {port}. "
+                    f"Set Local Port to {port} (or Port to the Local Port).\n{details}"
                 )
-
-        server_info = ""
-        try:
-            cur = cnx.cursor()
-            cur.execute("SELECT 1")
-            cur.fetchall()
-            server_info = cnx.get_server_info() or ""
-            cur.close()
-            cnx.close()
-        except Exception as exc:
-            latency_ms = (time.perf_counter() - t0) * 1000.0
             return DiagnosticResult(
                 name=test_name,
                 passed=False,
-                latency_ms=round(latency_ms, 2),
-                message=f"Query failed on connected database: {exc}",
-                details=traceback.format_exc(),
+                latency_ms=probe.latency_ms,
+                message=f"Database connection failed: {probe.error}",
+                details=details,
             )
 
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        server_str = f" ({server_info})" if server_info else ""
-        target_str = resolved_socket if resolved_socket else f"{conn_kwargs.get('host')}:{conn_kwargs.get('port')}"
-
+        server_str = f" ({probe.version})" if probe.version else ""
         return DiagnosticResult(
             name=test_name,
             passed=True,
-            latency_ms=round(latency_ms, 2),
-            message=f"Connected to database successfully{server_str}",
+            latency_ms=probe.latency_ms,
+            message=f"Connected to {engine_cls.display_name} successfully{server_str}",
             details=(
-                f"Target: {target_str}\n"
+                f"Target: {probe.target}\n"
                 f"Database: {db_name}\n"
                 f"User: {user}\n"
-                f"Server: {server_info or 'Unknown'}\n"
-                f"Latency: {latency_ms:.1f}ms"
+                f"Server: {probe.version or 'Unknown'}\n"
+                f"Latency: {probe.latency_ms:.1f}ms"
             ),
         )
     except Exception as exc:

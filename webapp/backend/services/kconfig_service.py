@@ -42,7 +42,8 @@ from parser.kconfig_ast.kconfig_model import (
 )
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_version_info
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.tree_resolver import git_tree_resolver
 from webapp.backend.security.sql import is_valid_identifier
@@ -163,8 +164,8 @@ class KconfigService:
         ver = str(version_name or "v3.0").strip()
         if ver.isdigit():
             try:
-                with get_db_cursor() as cursor:
-                    _, vname = get_version_info(cursor, ver)
+                with get_reader() as reader:
+                    _, vname = get_version_info(reader, ver)
                     return safe_rev(vname or ver, "version")
             except HTTPException:
                 raise
@@ -594,10 +595,10 @@ class KconfigService:
         sha = git_tree_resolver.resolve_commit_sha(rev)
         if sha is None or not is_valid_identifier(name):
             return None
-        with get_db_cursor() as cursor:
-            if not git_tree_resolver._is_finished_version(cursor, sha):
+        with get_reader() as reader:
+            if not git_tree_resolver._is_finished_version(reader, sha):
                 return None
-            blob_paths = git_tree_resolver.blob_paths(cursor, sha)
+            blob_paths = git_tree_resolver.blob_paths(reader, sha)
             if blob_paths is None:
                 return None
             # The revision's Kconfig blobs only (the name alone would also walk every older definition)
@@ -605,18 +606,18 @@ class KconfigService:
             rows = []
             for i in range(0, len(kconfig_blobs), 2000):
                 chunk = kconfig_blobs[i : i + 2000]
-                cursor.execute(
-                    f"""
-                    SELECT bt.blob_id, bt.line_s, bt.line_e
-                    FROM m_bridge_tag bt
-                    JOIN m_tag t ON t.tag_id = bt.tag_id
-                    JOIN m_ast a ON a.ast_id = t.ast_id
-                    WHERE bt.blob_id IN ({",".join(["%s"] * len(chunk))})
-                      AND a.name = %s AND a.type_id IN ({",".join(["%s"] * len(KCONFIG_TYPES))});
-                    """,
-                    (*chunk, name, *KCONFIG_TYPES),
+                rows.extend(
+                    reader.select_rows(
+                        ("m_bridge_tag", "bt"),
+                        {"blob_id": "bt.blob_id", "line_s": "bt.line_s", "line_e": "bt.line_e"},
+                        {"bt.blob_id": chunk, "a.name": name, "a.type_id": list(KCONFIG_TYPES)},
+                        joins=[
+                            Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                            Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                        ],
+                        as_dict=True,
+                    )
                 )
-                rows.extend(cursor.fetchall())
         found = {
             (path, int(r["line_s"]), int(r["line_e"]))
             for r in rows
@@ -731,20 +732,21 @@ class KconfigService:
         sha = git_tree_resolver.resolve_commit_sha(rev)
         if sha is None:
             return None
-        with get_db_cursor() as cursor:
-            pairs = self._kbuild_pairs_covered(cursor, sha)
+        with get_reader() as reader:
+            pairs = self._kbuild_pairs_covered(reader, sha)
             if pairs is None:
                 return None
-            cursor.execute(
-                """
-                SELECT r.source_blob_id, r.source_fnid, r.idx, r.via, r.line_no, r.compile_mode, r.kind,
-                       r.target_obj, r.target_path, r.rule
-                FROM m_kbuild_symbol r
-                WHERE r.symbol = %s AND r.via IN (1, 2);
-                """,
-                (name,),
-            )
-            rows = [r for r in cursor.fetchall() if (int(r["source_blob_id"]), int(r["source_fnid"])) in pairs]
+            rows = [
+                r
+                for r in reader.select_rows(
+                    "m_kbuild_symbol",
+                    ["source_blob_id", "source_fnid", "idx", "via", "line_no", "compile_mode", "kind",
+                     "target_obj", "target_path", "rule"],
+                    {"symbol": name, "via": [1, 2]},
+                    as_dict=True,
+                )
+                if (int(r["source_blob_id"]), int(r["source_fnid"])) in pairs
+            ]
         paths = self._all_paths(rev)
         # One entry per binding (a binding naming the symbol in its rule and a condition is a rule)
         best: dict[tuple[str, int], dict[str, Any]] = {}
@@ -762,7 +764,7 @@ class KconfigService:
         ]
 
     @staticmethod
-    def _kbuild_pairs_covered(cursor: Any, sha: str) -> dict[tuple[int, int], str] | None:
+    def _kbuild_pairs_covered(reader: Any, sha: str) -> dict[tuple[int, int], str] | None:
         """(blob_id, fnid) -> path of the revision's Makefile/Kbuild files when every one of them has
         m_kbuild_symbol rows (marker rows included), else None. Cached per commit."""
         hit = _KBUILD_COVERAGE.get(sha)
@@ -772,15 +774,16 @@ class KconfigService:
         if tree is None:
             return None
         files = [p for p in tree if kbuild_symbols.is_kbuild_file(p)]
-        meta = git_tree_resolver.map_blob_hashes(cursor, [tree[p] for p in files])
+        meta = git_tree_resolver.map_blob_hashes(reader, [tree[p] for p in files])
         if any(tree[p] not in meta for p in files):
             _KBUILD_COVERAGE[sha] = {}
             return None
         fnid_of: dict[str, int] = {}
         for i in range(0, len(files), 1000):
             chunk = files[i:i + 1000]
-            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fname IN ({','.join(['%s'] * len(chunk))});", tuple(chunk))
-            fnid_of.update({_text(r["fname"]): int(r["fnid"]) for r in cursor.fetchall()})
+            fnid_of.update(
+                {_text(r["fname"]): int(r["fnid"]) for r in reader.select_rows("m_file_name", ["fnid", "fname"], {"fname": chunk}, as_dict=True)}
+            )
         pairs: dict[tuple[int, int], str] = {}
         for p in files:
             if p not in fnid_of:
@@ -791,11 +794,12 @@ class KconfigService:
         stored: set[tuple[int, int]] = set()
         for i in range(0, len(blobs), 1000):
             chunk = blobs[i:i + 1000]
-            cursor.execute(
-                f"SELECT DISTINCT source_blob_id, source_fnid FROM m_kbuild_symbol WHERE source_blob_id IN ({','.join(['%s'] * len(chunk))});",
-                tuple(chunk),
+            stored.update(
+                (int(r["source_blob_id"]), int(r["source_fnid"]))
+                for r in reader.select_rows(
+                    "m_kbuild_symbol", ["source_blob_id", "source_fnid"], {"source_blob_id": chunk}, distinct=True, as_dict=True
+                )
             )
-            stored.update((int(r["source_blob_id"]), int(r["source_fnid"])) for r in cursor.fetchall())
         if any(pair not in stored for pair in pairs):
             # Not cached as final: a running backfill or parse fills the rest
             return None

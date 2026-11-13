@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import MagicMock
 
 from core.globalstuff import SymbolLinkage
+from db_engine import MockDB
+from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.services.tree_resolver import (
     ArchScope,
     GitTreeResolver,
@@ -21,52 +23,36 @@ class TestTreeResolverService(unittest.TestCase):
 
     def setUp(self) -> None:
         self.resolver = TreeResolverService(max_cache_size=4)
-        self.mock_cursor = MagicMock()
-        # tree_source() remembers what a real database answered (an earlier test may have read one without the
-        # m_checkpoint_tree view): this test's cursor is a double, which tree_source() never remembers
-        from webapp.backend.database import helpers
-        saved = dict(helpers._TREE_SOURCE)
-        helpers._TREE_SOURCE.clear()
-        self.addCleanup(lambda: (helpers._TREE_SOURCE.clear(), helpers._TREE_SOURCE.update(saved)))
+        self.db = MockDB(use_global=False)
 
     def test_path_b_full_tree_assembly_and_lru_caching(self) -> None:
         """Verify Path B constructs full tree by applying deltas to checkpoint and caches result."""
         # Checkpoint 10: {1: 101, 2: 102, 3: 103}
         # Commit 11 (parent 10): modifies 2 -> 202, deletes 3, adds 4 -> 404
-        parents = {11: 10}
+        db = self.db
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(10, 1, 101), (10, 2, 102), (10, 3, 103)])
+        db.insert_rows("m_commit_parent", ["commit_id", "parent_commit_id", "parent_idx"], [(11, 10, 0)])
+        db.insert_rows(
+            "m_commit_file",
+            ["commit_id", "fnid", "blob_id", "old_fnid", "old_blob_id", "change_type"],
+            [(11, 2, 202, 2, 102, "M"), (11, 3, 0, 3, 103, "D"), (11, 4, 404, 0, 0, "A")],
+        )
 
-        def execute_side_effect(sql: str, params: tuple | list) -> None:
-            if "FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1" in sql:
-                cid = params[0]
-                self.mock_cursor.fetchone.return_value = {"1": 1} if cid == 10 else None
-            elif "FROM m_commit_parent" in sql:
-                self.mock_cursor.fetchone.return_value = {"parent_commit_id": 10}
-            elif "SELECT fnid, blob_id FROM m_checkpoint_tree" in sql:
-                self.mock_cursor.fetchall.return_value = [
-                    {"fnid": 1, "blob_id": 101},
-                    {"fnid": 2, "blob_id": 102},
-                    {"fnid": 3, "blob_id": 103},
-                ]
-            elif "FROM m_commit_file" in sql:
-                self.mock_cursor.fetchall.return_value = [
-                    {"commit_id": 11, "fnid": 2, "blob_id": 202, "change_type": "M"},
-                    {"commit_id": 11, "fnid": 3, "blob_id": 0, "change_type": "D"},
-                    {"commit_id": 11, "fnid": 4, "blob_id": 404, "change_type": "A"},
-                ]
-            else:
-                self.mock_cursor.fetchone.return_value = None
+        with db.reader() as reader:
+            tree = self.resolver.resolve_tree(commit_id=11, reader=reader)
+            self.assertEqual(tree, {1: 101, 2: 202, 4: 404})
+            self.assertNotIn(3, tree)
 
-        self.mock_cursor.execute.side_effect = execute_side_effect
+            # LRU cache verification: subsequent call hits the cache without reading the database
+            db.delete_rows("m_commit_file", None, all_rows=True)
+            db.delete_rows("m_bridge_checkpoint", None, all_rows=True)
+            self.assertEqual(self.resolver.resolve_tree(commit_id=11, reader=reader), {1: 101, 2: 202, 4: 404})
 
-        tree = self.resolver.resolve_tree(commit_id=11, cursor=self.mock_cursor)
-        self.assertEqual(tree, {1: 101, 2: 202, 4: 404})
-        self.assertNotIn(3, tree)
-
-        # LRU cache verification: subsequent call should hit cache without querying DB
-        self.mock_cursor.execute.reset_mock()
-        cached_tree = self.resolver.resolve_tree(commit_id=11, cursor=self.mock_cursor)
-        self.assertEqual(cached_tree, {1: 101, 2: 202, 4: 404})
-        self.mock_cursor.execute.assert_not_called()
+    def test_checkpoint_itself_and_unindexed_commit(self) -> None:
+        self.db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(10, 1, 101), (10, 2, 0)])
+        with self.db.reader() as reader:
+            self.assertEqual(self.resolver.resolve_tree(10, reader), {1: 101})
+            self.assertEqual(self.resolver.resolve_tree(99, reader), {})
 
 
 class TestGitTreeBlobPaths(unittest.TestCase):
@@ -99,26 +85,17 @@ class TestGitTreeBlobPaths(unittest.TestCase):
         from unittest.mock import patch
         from webapp.backend.services import symbol_service as ss
 
-        cursor = MagicMock()
-        state: dict = {}
+        # blob 99 belongs to another version and must be dropped
+        db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": 1, "name": "C_function"}],
+            "m_blob_symbol_def": [
+                {"def_id": d, "blob_id": b, "tag_id": 1, "ast_id": 7, "name": "start_kernel", "type_id": 1, "linkage": 1,
+                 "line_s": 5, "line_e": 9}
+                for d, b in ((1, 99), (2, 10), (3, 20))
+            ],
+        })
 
-        def execute(sql: str, params=None) -> None:
-            state["sql"] = sql
-
-        def fetchall() -> list:
-            if "SELECT s.def_id, s.blob_id" in state["sql"]:
-                # blob 99 belongs to another version and must be dropped
-                return [{"def_id": 1, "blob_id": 99}, {"def_id": 2, "blob_id": 10}, {"def_id": 3, "blob_id": 20}]
-            return [
-                {"def_id": d, "name": "start_kernel", "type_id": 1, "type_name": "C_function", "fid": b, "line_s": 5, "line_e": 9, "ast_id": 7}
-                for d, b in ((2, 10), (3, 20))
-            ]
-
-        cursor.execute.side_effect = execute
-        cursor.fetchall.side_effect = fetchall
-        ctx = MagicMock()
-        ctx.__enter__.return_value = cursor
-        with patch.object(ss, "get_db_cursor", return_value=ctx), \
+        with patch_reader(db), \
              patch.object(ss, "get_version_info", return_value=(None, "")), \
              patch.object(ss.git_tree_resolver, "blob_paths", return_value={10: ["init/main.c"], 20: ["mm/slab.c"]}):
             results = ss.SymbolService().search_symbols("0123abcd", "start_kernel", limit=10)
@@ -204,12 +181,12 @@ class TestDefinitionRanking(unittest.TestCase):
              "line_s": 10 * d, "line_e": 10 * d + 5, "tag_id": d, "linkage": 0}
             for d, b in ((1, 10), (2, 20), (3, 30))
         ]
-        cursor = MagicMock()
-        cursor.fetchall.return_value = rows
+        reader = MagicMock()
+        reader.select_rows.return_value = rows
         ctx = MagicMock()
-        ctx.__enter__.return_value = cursor
+        ctx.__enter__.return_value = reader
         blob_paths = {10: ["arch/alpha/kernel/setup.c"], 20: ["arch/x86/kernel/setup.c"], 30: ["arch/arm/kernel/setup.c"]}
-        with patch.object(ss, "get_db_cursor", return_value=ctx), \
+        with patch.object(ss, "get_reader", return_value=ctx), \
              patch.object(ss.SymbolService, "_scope", return_value=(1, "v3.0", blob_paths)), \
              patch.object(ss, "definition_arch", side_effect=lambda v, a: (a, {"x86_64": "x86"}.get(a, a), 64)), \
              patch.object(ss.SymbolService, "get_symbol_xref", return_value={}):

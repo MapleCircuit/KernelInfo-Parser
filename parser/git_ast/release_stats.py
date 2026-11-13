@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from db_engine.spec import Join
 from parser.git_ast.git_commit_parser import iter_trailers
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.identity import identity_key, person_key
@@ -183,7 +184,7 @@ class _Persons:
     """(name, email) -> person_id over m_maintainer_person, inserting the ones not registered yet."""
 
     def __init__(self, db: Any) -> None:
-        rows_raw = db.query("SELECT person_id, name, email FROM m_maintainer_person", dictionary=False)
+        rows_raw = db.select_rows("m_maintainer_person", ["person_id", "name", "email"])
         rows = [(int(pid), _text(name), _text(email)) for pid, name, email in rows_raw]
         # A row stored in its normalized form wins over older unnormalized duplicates (main._ingest_commit_range)
         rows.sort(key=lambda r: ((r[1], r[2]) != stored_person_key(r[1], r[2]), r[0]))
@@ -200,7 +201,7 @@ class _Persons:
                 new.append((self.next_id, key[0], key[1]))
                 self.next_id += 1
         if new:
-            db.executemany("INSERT INTO m_maintainer_person (person_id, name, email) VALUES (%s, %s, %s)", new)
+            db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], new)
         return self.ids
 
 
@@ -210,11 +211,10 @@ def _text(value: Any) -> str:
 
 def stored_segments(db: Any, repo_id: int) -> dict[str, tuple]:
     """tag -> (segment_id, tag_hash, base_tag, base_hash, diff_base_tag, format, chain) of a repository."""
-    rows = db.query(
-        "SELECT segment_id, tag, tag_hash, base_tag, base_hash, diff_base_tag, format, chain "
-        "FROM m_release_segment WHERE repo_id = %s",
-        (repo_id,),
-        dictionary=False,
+    rows = db.select_rows(
+        "m_release_segment",
+        ["segment_id", "tag", "tag_hash", "base_tag", "base_hash", "diff_base_tag", "format", "chain"],
+        {"repo_id": repo_id},
     )
     return {_text(tag): (int(sid), bytes(th), _text(bt), bytes(bh), _text(dbt), int(fmt), int(chain))
             for sid, tag, th, bt, bh, dbt, fmt, chain in rows}
@@ -222,32 +222,27 @@ def stored_segments(db: Any, repo_id: int) -> dict[str, tuple]:
 
 def _first_releases(db: Any, repo_id: int, tag_of: dict[int, str]) -> dict[int, tuple[tuple, int]]:
     """person_id -> (release_key of its first segment, segment_id)."""
-    rows = db.query(
-        "SELECT person_id, segment_id FROM m_person_first_release WHERE repo_id = %s",
-        (repo_id,),
-        dictionary=False,
-    )
+    rows = db.select_rows("m_person_first_release", ["person_id", "segment_id"], {"repo_id": repo_id})
     return {int(pid): (release_key(tag_of[int(sid)]), int(sid)) for pid, sid in rows if int(sid) in tag_of}
 
 
 def _rebuild_first_releases(db: Any, repo_id: int, mainline: dict[int, str]) -> dict[int, tuple[tuple, int]]:
     """Recompute m_person_first_release from the stored author rows (after a mainline segment was replaced)."""
     first: dict[int, tuple[tuple, int]] = {}
-    rows = db.query(
-        "SELECT r.segment_id, r.person_id FROM m_release_person r JOIN m_release_segment s "
-        "ON s.segment_id = r.segment_id WHERE s.repo_id = %s AND s.chain = %s AND r.role_type = %s",
-        (repo_id, CHAIN_MAINLINE, int(CommitRole.AUTHOR)),
-        dictionary=False,
+    rows = db.select_rows(
+        ("m_release_person", "r"),
+        ["r.segment_id", "r.person_id"],
+        {"s.repo_id": repo_id, "s.chain": CHAIN_MAINLINE, "r.role_type": int(CommitRole.AUTHOR)},
+        joins=[Join(("m_release_segment", "s"), {"s.segment_id": "r.segment_id"})],
     )
     for sid, pid in rows:
         key = (release_key(mainline[int(sid)]), int(sid))
         if int(pid) not in first or key < first[int(pid)]:
             first[int(pid)] = key
-    db.execute("DELETE FROM m_person_first_release WHERE repo_id = %s", (repo_id,))
+    db.delete_rows("m_person_first_release", {"repo_id": repo_id})
     out_rows = [(repo_id, pid, sid) for pid, (_k, sid) in first.items()]
     for i in range(0, len(out_rows), 5000):
-        db.executemany("INSERT INTO m_person_first_release (repo_id, person_id, segment_id) VALUES (%s, %s, %s)",
-                       out_rows[i:i + 5000])
+        db.insert_rows("m_person_first_release", ["repo_id", "person_id", "segment_id"], out_rows[i:i + 5000])
     return first
 
 
@@ -256,39 +251,31 @@ def write_segment(db: Any, repo_id: int, rng: dict[str, Any], result: dict[str, 
     """Store one summarized range (replacing its previous row); returns its segment_id. `first` (the
     in-memory m_person_first_release) is updated for a mainline segment, None skips that."""
     if old_id is not None:
-        db.execute("DELETE FROM m_commit_release WHERE segment_id = %s", (old_id,))
-        db.execute("DELETE FROM m_release_person WHERE segment_id = %s", (old_id,))
-        db.execute("DELETE FROM m_person_first_release WHERE segment_id = %s", (old_id,))
-        db.execute("DELETE FROM m_release_segment WHERE segment_id = %s", (old_id,))
-    db.execute(
-        "INSERT INTO m_release_segment (repo_id, tag, tag_hash, chain, base_tag, base_hash, commits, merges, "
-        "diff_base_tag, files_changed, lines_added, lines_removed, format) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (repo_id, rng["tag"], bytes.fromhex(rng["sha"]), rng["chain"], rng["segment_base"] or "",
-         bytes.fromhex(rng["base_sha"]) if rng["base_sha"] else _NO_HASH, result["commits"], result["merges"],
-         rng["range_base"] or "", result["files_changed"], result["lines_added"], result["lines_removed"], FORMAT),
+        for table in ("m_commit_release", "m_release_person", "m_person_first_release", "m_release_segment"):
+            db.delete_rows(table, {"segment_id": old_id})
+    db.insert_rows(
+        "m_release_segment",
+        ["repo_id", "tag", "tag_hash", "chain", "base_tag", "base_hash", "commits", "merges", "diff_base_tag",
+         "files_changed", "lines_added", "lines_removed", "format"],
+        [(repo_id, rng["tag"], bytes.fromhex(rng["sha"]), rng["chain"], rng["segment_base"] or "",
+          bytes.fromhex(rng["base_sha"]) if rng["base_sha"] else _NO_HASH, result["commits"], result["merges"],
+          rng["range_base"] or "", result["files_changed"], result["lines_added"], result["lines_removed"], FORMAT)],
     )
-    seg_row = db.query_one(
-        "SELECT segment_id FROM m_release_segment WHERE repo_id = %s AND tag = %s",
-        (repo_id, rng["tag"]),
-        dictionary=False,
-    )
+    seg_row = db.select_one("m_release_segment", ["segment_id"], {"repo_id": repo_id, "tag": rng["tag"]})
     segment_id = int(seg_row[0]) if seg_row else 0
     ids = persons.resolve(db, (key for key, _role in result["people"]))
     rows: dict[tuple[int, int], int] = Counter()
     for (key, role), n in result["people"].items():
         rows[(ids[key], role)] += n  # two raw spellings of one stored person add up
-    db.executemany("INSERT INTO m_release_person (segment_id, person_id, role_type, commits) VALUES (%s, %s, %s, %s)",
+    db.insert_rows("m_release_person", ["segment_id", "person_id", "role_type", "commits"],
                    [(segment_id, pid, role, n) for (pid, role), n in rows.items()])
     # Every commit of the segment; a commit another segment of the chain already holds keeps it (segments
     # are written in release order, so the earliest wins, as in the webapp's release index)
     shas = [bytes.fromhex(sha) for sha in result.get("shas", ()) if _FULL_SHA.match(sha)]
     for i in range(0, len(shas), INSERT_CHUNK):
         chunk = shas[i:i + INSERT_CHUNK]
-        db.execute(
-            "INSERT IGNORE INTO m_commit_release (repo_id, commit_hash, chain, segment_id) VALUES "
-            + ",".join(["(%s, %s, %s, %s)"] * len(chunk)),
-            tuple(v for sha in chunk for v in (repo_id, sha, rng["chain"], segment_id)),
-        )
+        db.insert_rows("m_commit_release", ["repo_id", "commit_hash", "chain", "segment_id"],
+                       [(repo_id, sha, rng["chain"], segment_id) for sha in chunk], on_conflict="ignore")
     if first is not None and rng["chain"] == CHAIN_MAINLINE:
         key = release_key(rng["tag"])
         for (pid, role) in rows:
@@ -296,11 +283,11 @@ def write_segment(db: Any, repo_id: int, rng: dict[str, Any], result: dict[str, 
                 continue
             have = first.get(pid)
             if have is None:
-                db.execute("INSERT INTO m_person_first_release (repo_id, person_id, segment_id) VALUES (%s, %s, %s)",
-                           (repo_id, pid, segment_id))
+                db.insert_rows("m_person_first_release", ["repo_id", "person_id", "segment_id"],
+                               [(repo_id, pid, segment_id)])
             elif key < have[0]:
-                db.execute("UPDATE m_person_first_release SET segment_id = %s WHERE repo_id = %s AND person_id = %s",
-                           (segment_id, repo_id, pid))
+                db.update_rows("m_person_first_release", {"segment_id": segment_id},
+                               {"repo_id": repo_id, "person_id": pid})
             else:
                 continue
             first[pid] = (key, segment_id)
@@ -332,34 +319,26 @@ def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str]
     # to an earlier segment of the run, which must not find them held by the old row
     old_ids = [stored[r["tag"]][0] for r in todo if r["tag"] in stored]
     if old_ids:
-        for i in range(0, len(old_ids), 500):
-            chunk = old_ids[i:i + 500]
-            placeholders = ",".join(["%s"] * len(chunk))
-            db.execute(f"DELETE FROM m_commit_release WHERE segment_id IN ({placeholders})", tuple(chunk))
-        db.commit()
+        with db.transaction():
+            db.delete_rows("m_commit_release", {"segment_id": old_ids})
     done = 0
     last_log = time.time()
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            # Computed in parallel, written in release order (pool.map keeps it): a person's first
-            # release is decided by the earliest mainline segment, and an interrupted run resumes cleanly
-            for rng, result in zip(todo, pool.map(lambda r: compute(repo, r), todo)):
-                old = stored.get(rng["tag"])
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        # Computed in parallel, written in release order (pool.map keeps it): a person's first
+        # release is decided by the earliest mainline segment, and an interrupted run resumes cleanly
+        for rng, result in zip(todo, pool.map(lambda r: compute(repo, r), todo)):
+            old = stored.get(rng["tag"])
+            with db.transaction():
                 write_segment(db, repo_id, rng, result, persons, old[0] if old else None, first)
-                db.commit()
-                done += 1
-                if progress:
-                    progress(done, len(todo), rng["tag"])
-                if time.time() - last_log > 20:
-                    logger.info(f"[Release stats] {done}/{len(todo)} ({rng['tag']}: {result['commits']} commits)")
-                    last_log = time.time()
-        if replaced_mainline:
-            mainline = {row[0]: t for t, row in stored_segments(db, repo_id).items() if row[6] == CHAIN_MAINLINE}
+            done += 1
+            if progress:
+                progress(done, len(todo), rng["tag"])
+            if time.time() - last_log > 20:
+                logger.info(f"[Release stats] {done}/{len(todo)} ({rng['tag']}: {result['commits']} commits)")
+                last_log = time.time()
+    if replaced_mainline:
+        mainline = {row[0]: t for t, row in stored_segments(db, repo_id).items() if row[6] == CHAIN_MAINLINE}
+        with db.transaction():
             _rebuild_first_releases(db, repo_id, mainline)
-            db.commit()
-    except BaseException:
-        if hasattr(db, "rollback"):
-            db.rollback()
-        raise
     return {"state": "updated", "tags": len(tags), "segments": done, "persons_added": persons.next_id - first_persons,
             "seconds": round(time.time() - started, 1)}

@@ -268,68 +268,47 @@ class TestLayoutReuse(unittest.TestCase):
 
 class TestStoredLayouts(unittest.TestCase):
     def test_step_6_8_replaces_the_version_rows(self) -> None:
-        """main.processing_arch_layouts(): one m_arch_root row per ARCH of the head commit, pointing at a layout
+        """pipeline.arch_layouts.processing_arch_layouts(): one m_arch_root row per ARCH of the head commit, pointing at a layout
         stored once (m_arch_layout by digest, its rows in m_arch_layout_entry); previous rows replaced."""
         from contextlib import contextmanager
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         import main
+        import pipeline.arch_layouts
+        from core.DBLayout import m_arch_layout, m_arch_layout_entry, m_arch_root
+        from db_engine import SQLiteDB
         from parser.arch_layout import layout_digest
 
-        known: dict[bytes, int] = {}
-        log: list = []
-
-        class FakeDB:
-            lastrowid = 0
-
-            def __init__(self):
-                self.commit = MagicMock()
-
-            def execute(self, sql, params=()):
-                log.append((sql.split()[0] + " " + sql.split()[2], params))
-                if sql.startswith("INSERT INTO m_arch_layout "):
-                    FakeDB.lastrowid = len(known) + 1
-                    known[params[0]] = FakeDB.lastrowid
-
-            def executemany(self, sql, rows):
-                log.append(("INSERT entries", list(rows)))
-
-            def query(self, sql, params=(), dictionary=False):
-                return []
-
-            def query_one(self, sql, params=(), dictionary=False):
-                if sql.startswith("SELECT layout_id FROM m_arch_layout"):
-                    return (known[params[0]],) if params[0] in known else None
-                return None
-
-        db = FakeDB()
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([m_arch_root, m_arch_layout, m_arch_layout_entry])
 
         @contextmanager
         def fake_db():
             yield db
 
         def run():
-            log.clear()
             with patch.object(main.gp, "VID", 7), patch.object(main.gp, "Version_Name", "v2.6.12"), \
                  patch.object(main.gp, "file_blob_hashes", dict.fromkeys(OLD_TREE, b"\0" * 20), create=True), \
                  patch.object(main.MF, "get_file", side_effect=lambda path, version: OLD_TREE[path]), \
                  patch.object(main.G, "DB", fake_db):
-                return main.processing_arch_layouts("v2.6.12")
+                return pipeline.arch_layouts.processing_arch_layouts("v2.6.12")
 
+        db.insert_rows("m_arch_root", ["commit_id", "arch", "layout_id"], [(7, "stale", 99), (6, "keep", 1)])
         stored = run()
-        self.assertEqual(log[0], ("DELETE m_arch_root", (7,)))
-        entries = [r for kind, rows in log if kind == "INSERT entries" for r in rows]
+        entries = db.select_rows("m_arch_layout_entry", ["layout_id", "role", "priority", "path", "target"], as_dict=False)
         self.assertEqual(stored, len(entries))
-        roots = [params for kind, params in log if kind == "INSERT m_arch_root"]
-        self.assertEqual({r[1] for r in roots}, {"i386", "um", "x86_64"})
+        roots = db.select_rows("m_arch_root", ["commit_id", "arch", "layout_id"], {"commit_id": 7}, as_dict=False)
+        self.assertEqual({r[1] for r in roots}, {"i386", "um", "x86_64"}, "the stale row of the version is replaced")
+        self.assertEqual(db.count_rows("m_arch_root", {"commit_id": 6}), 1)
         x86 = next(r[2] for r in roots if r[1] == "x86_64")
-        self.assertIn((x86, ROLE_LINK, 0, "include/asm/", "include/asm-x86_64/"), entries)
-        self.assertEqual(len(known), 3, "one layout per ARCH")
+        self.assertIn((x86, ROLE_LINK, 0, "include/asm/", "include/asm-x86_64/"), [tuple(e) for e in entries])
+        self.assertEqual(db.count_rows("m_arch_layout"), 3, "one layout per ARCH")
         self.assertEqual(layout_digest([(1, 0, "a/", "")]), layout_digest([(1, 0, "a/", ""), (1, 0, "a/", "")]))
         # The next version with the same Makefiles: the layouts exist, only m_arch_root is written
         self.assertEqual(run(), 0)
-        self.assertEqual([kind for kind, _ in log if kind.startswith("INSERT")], ["INSERT m_arch_root"] * 3)
-        self.assertEqual(db.commit.call_count, 2)
+        self.assertEqual(db.count_rows("m_arch_layout"), 3)
+        self.assertEqual(db.count_rows("m_arch_layout_entry"), len(entries))
+        self.assertEqual(db.count_rows("m_arch_root", {"commit_id": 7}), 3)
 
 
 REPO = Path(__file__).resolve().parent.parent / "repos" / "linux"

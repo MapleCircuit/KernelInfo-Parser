@@ -14,6 +14,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from db_engine import MockDB
 from core.globalstuff import G, OP_REF, REF_POS, REF_ROOT, compute_code_hash
 from core.GreatProcessor import GreatProcessor
 from core.FileHandler import MasterFile
@@ -145,14 +146,18 @@ class TestTagMaps(unittest.TestCase):
         self.assertEqual(len(bridge_map_ops), 0, "No new m_bridge_map should be created for recycled tag")
         self.assertEqual(len(bridge_tag_ops), 1, "Exactly one m_bridge_tag must be emitted for recycled tag")
 
-    def test_dbhandling_uses_strict_insert(self) -> None:
-        """Verify that DBHandling.py uses strict INSERT INTO and not INSERT IGNORE."""
-        import inspect
-        from db_engine.DBHandling import MariaDB
+    def test_insert_is_strict_not_ignoring_duplicates(self) -> None:
+        """`insert()` reports a duplicate primary key (it must not silently ignore the row)."""
+        from core.DBLayout import m_file_name
+        from db_engine import DuplicateKeyError, SQLiteDB
 
-        source = inspect.getsource(MariaDB.insert)
-        self.assertIn("INSERT INTO", source)
-        self.assertNotIn("INSERT IGNORE", source)
+        for db in (SQLiteDB(":memory:"), MockDB(use_global=False)):
+            with self.subTest(backend=type(db).__name__):
+                db.create_table([m_file_name])
+                db.insert(m_file_name, ((5, "kernel/a.c"),))
+                with self.assertRaises(DuplicateKeyError):
+                    db.insert(m_file_name, ((5, "kernel/b.c"),))
+                self.assertEqual(db.select_values("m_file_name", "fname", {"fnid": 5}), ["kernel/a.c"])
 
 
 if __name__ == "__main__":

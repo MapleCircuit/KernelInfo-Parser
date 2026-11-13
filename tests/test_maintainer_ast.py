@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -369,22 +370,24 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         G.TE.commit_all()
 
         # Validate Maintainer Section rows committed to DB
-        sec_rows = MockDB._global_store.get(m_maintainer_section.table_name, {})
+        sec_rows = MockDB.store.get(m_maintainer_section.table_name, {})
         self.assertEqual(len(sec_rows), 4)
 
         # Validate Credits Entry rows committed to DB
-        cred_rows = MockDB._global_store.get(m_credits_entry.table_name, {})
+        cred_rows = MockDB.store.get(m_credits_entry.table_name, {})
         self.assertEqual(len(cred_rows), 3)
 
         # Validate Person Deduplication
         # Theodore Ts'o is in both MAINTAINERS and CREDITS with email tytso@mit.edu
-        person_rows = list(MockDB._global_store.get(m_maintainer_person.table_name, {}).values())
+        person_rows = list(MockDB.store.get(m_maintainer_person.table_name, {}).values())
         tytso_entries = [r for r in person_rows if r[2] == "tytso@mit.edu"]
         self.assertEqual(len(tytso_entries), 1, "Theodore Ts'o must be deduplicated to a single person row")
 
     def test_moved_file_r100_and_r_modify(self) -> None:
         """Test default_processing() for R100 exact rename and R modify rename."""
-        from main import default_processing, gp as main_gp, file_fid_cache
+        from main import gp as main_gp
+        from pipeline.file_processing import default_processing
+        from pipeline.changesets import file_fid_cache
 
         G.DB = MockDB
         G.TE = TECachedDB()
@@ -447,7 +450,9 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
 
     def test_r100_c_ast_pipeline_no_unresolved_refs(self) -> None:
         """Verify R100 exact rename (e.g. linux/fs/xfs/kmem.c) completes parse() and execute() without unresolved references."""
-        from main import default_processing, gp as main_gp, file_fid_cache
+        from main import gp as main_gp
+        from pipeline.file_processing import default_processing
+        from pipeline.changesets import file_fid_cache
 
         G.DB = MockDB
         G.TE = TECachedDB()
@@ -493,7 +498,10 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
 
     def test_processing_maintainer_files_and_kbuild(self) -> None:
         """Test processing_maintainer_files and processing_kbuild helper routines."""
-        from main import processing_maintainer_files, processing_kbuild, gp as main_gp, file_fid_cache
+        from main import gp as main_gp
+        from pipeline.maintainers import processing_maintainer_files
+        from pipeline.file_references import processing_kbuild
+        from pipeline.changesets import file_fid_cache
 
         G.DB = MockDB
         G.TE = TECachedDB()
@@ -517,10 +525,14 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
                 return "MAINTAINERS\nfs/ext4/Makefile\nfs/ext4/balloc.c\nfs/ext4/inode.c\nfs/ext4/core.c\nnet/ipv6/ip6_output.c\n"
 
         import main
-        orig_mf = getattr(main, "MF", None)
+        import pipeline.file_references
+        import pipeline.maintainers
+        steps = (pipeline.maintainers, pipeline.file_references)  # the modules that look `MF` up
+        orig_mf = pipeline.maintainers.MF
         orig_g_mf = getattr(main.G, "MF", None)
         try:
-            main.MF = FakeMF()
+            for step in steps:
+                step.MF = FakeMF()
             main.G.MF = FakeMF()
 
             # Seed section and symbol
@@ -547,8 +559,10 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             maintainers_fnid = G.TE.set(m_file_name.table_id, (None, "MAINTAINERS"))[0]
             G.TE.set(m_bridge_file.table_id, (1, maintainers_fnid, 1))
 
-            # 1. Run processing_maintainer_files
-            processing_maintainer_files("v3.0")
+            # 1. Run processing_maintainer_files; the sections are only staged in the TableEngine, so the database
+            # read yields nothing usable and the step falls back to the TableEngine lookup
+            with mock.patch("parser.maintainer_ast.maintainer_store.blob_section_ids", side_effect=RuntimeError("unreadable")):
+                processing_maintainer_files("v3.0")
 
             # Verify m_maintainer_file staging:
             # balloc.c and inode.c and core.c matched EXT4 FILE SYSTEM
@@ -580,8 +594,8 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             kbuild_refs = [row for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values() if row[4] in (3, 4)]
             self.assertEqual(kbuild_refs, [])
         finally:
-            if orig_mf is not None:
-                main.MF = orig_mf
+            for step in steps:
+                step.MF = orig_mf
             if orig_g_mf is not None:
                 main.G.MF = orig_g_mf
 

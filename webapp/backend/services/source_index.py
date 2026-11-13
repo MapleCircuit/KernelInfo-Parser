@@ -27,7 +27,6 @@ from __future__ import annotations
 import bisect
 import json
 import logging
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -51,8 +50,9 @@ from parser.source_facts import (
     extract_many,
     init_worker,
 )
+from cache_engine import BYTES, INT, CacheError, CacheSpace, In, Range, StoreSpec, get_cache_engine
 from webapp.backend.config import get_active_repo_name, get_repo_dir
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services import disk_cache
 from webapp.backend.services.jobs import jobs
 
@@ -64,10 +64,10 @@ MAX_REVISIONS = 2
 CHUNK = 48
 MAX_BLOB = 4 << 20
 _MACRO = F_MACRO_FN | F_MACRO_OBJ
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS facts (sha BLOB PRIMARY KEY, used INTEGER NOT NULL, size INTEGER NOT NULL, data BLOB NOT NULL);
-CREATE INDEX IF NOT EXISTS facts_used ON facts (used);
-"""
+NAMESPACE = "source-index"
+STORES = (
+    StoreSpec("facts", (BYTES("sha"), INT("used"), INT("size"), BYTES("data")), key=("sha",), indexes=(("used",),)),
+)
 
 
 def _settings() -> dict[str, Any]:
@@ -94,58 +94,42 @@ def _settings() -> dict[str, Any]:
 # ------------------------------------------------------------------------------------- facts store
 
 class FactStore:
-    """blob SHA -> facts of one family, in SQLite (one file per family and format, for every repository: blob SHAs
-    are content addresses). The default is the call facts (`parser/source_facts.py`); the Kernel API catalogs keep
+    """blob SHA -> facts of one family, in a cache_engine space (one per family and format, for every repository: blob
+    SHAs are content addresses). The default is the call facts (`parser/source_facts.py`); the Kernel API catalogs keep
     their records (`parser/kapi_facts.py`) in a store of their own (`kapi_service.kapi_store`)."""
 
     def __init__(self, name: str = "facts", fmt: int = FACTS_FORMAT, encoder: Callable[[Any], bytes] = encode,
                  decoder: Callable[[Any], Any] = decode) -> None:
-        self._lock = threading.Lock()
-        self._conns: dict[str, sqlite3.Connection] = {}
         self.name, self.fmt, self.encoder, self.decoder = name, fmt, encoder, decoder
 
-    def path(self):
-        return disk_cache.sqlite_path("source-index", f"{self.name}-v{self.fmt}")
+    def space(self) -> CacheSpace:
+        return get_cache_engine().open(NAMESPACE, f"{self.name}-v{self.fmt}", STORES)
 
-    def _conn(self) -> sqlite3.Connection:
-        path = str(self.path())
-        with self._lock:
-            conn = self._conns.get(path)
-            if conn is None:
-                conn = sqlite3.connect(path, check_same_thread=False, timeout=60)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.executescript(_SCHEMA)
-                self._conns[path] = conn
-            return conn
+    def _facts(self):
+        return self.space().store("facts")
 
     def get_many(self, shas: list[str]) -> dict[str, dict[str, Any]]:
         """Facts of the blobs already extracted (and marks them used now)."""
         out: dict[str, dict[str, Any]] = {}
-        conn = self._conn()
+        facts_store = self._facts()
         now = int(time.time() // 3600)
         for i in range(0, len(shas), 500):
             part = [bytes.fromhex(s) for s in shas[i:i + 500]]
-            q = ",".join("?" * len(part))
-            rows = conn.execute(f"SELECT sha, data FROM facts WHERE sha IN ({q})", part).fetchall()
-            for sha, data in rows:
+            rows = facts_store.get_many(part)
+            for sha, (_s, _used, _size, data) in rows.items():
                 facts = self.decoder(data)
                 if facts is not None:
                     out[sha.hex()] = facts
             if rows:
-                with self._lock:
-                    conn.execute(f"UPDATE facts SET used = ? WHERE used < ? AND sha IN ({q})", (now, now, *part))
-                    conn.commit()
+                facts_store.update_where([In("sha", part), Range("used", lt=now)], {"used": now})
         return out
 
     def missing(self, shas: list[str]) -> list[str]:
         """The blobs of `shas` not in the store."""
         have: set[bytes] = set()
-        conn = self._conn()
+        facts_store = self._facts()
         for i in range(0, len(shas), 500):
-            part = [bytes.fromhex(s) for s in shas[i:i + 500]]
-            q = ",".join("?" * len(part))
-            have.update(r[0] for r in conn.execute(f"SELECT sha FROM facts WHERE sha IN ({q})", part))
+            have.update(r[0] for r in facts_store.scan(In("sha", [bytes.fromhex(s) for s in shas[i:i + 500]]), columns=("sha",)))
         return [s for s in shas if bytes.fromhex(s) not in have]
 
     def put_many(self, items: list[tuple[str, dict[str, Any]]]) -> None:
@@ -156,35 +140,29 @@ class FactStore:
         for sha, facts in items:
             data = self.encoder(facts)
             rows.append((bytes.fromhex(sha), now, len(data), data))
-        conn = self._conn()
-        with self._lock:
-            conn.executemany("INSERT OR REPLACE INTO facts (sha, used, size, data) VALUES (?, ?, ?, ?)", rows)
-            conn.commit()
+        self._facts().put_many(rows)
 
     def size(self) -> int:
-        return int(self._conn().execute("SELECT COALESCE(SUM(size), 0) FROM facts").fetchone()[0])
+        return int(self._facts().sum("size"))
 
     def prune(self, max_bytes: int) -> int:
         """Drop the least recently used blobs until the store holds at most 3/4 of `max_bytes`; returns rows dropped."""
-        conn = self._conn()
+        facts_store = self._facts()
         total = self.size()
         dropped = 0
         while total > max_bytes * 3 // 4:
-            rows = conn.execute("SELECT sha, size FROM facts ORDER BY used LIMIT 2000").fetchall()
+            rows = list(facts_store.scan(columns=("sha", "size"), order_by=("used",), limit=2000))
             if not rows:
                 break
-            with self._lock:
-                conn.executemany("DELETE FROM facts WHERE sha = ?", [(r[0],) for r in rows])
-                conn.commit()
+            facts_store.delete_many(r[0] for r in rows)
             total -= sum(r[1] for r in rows)
             dropped += len(rows)
         if dropped:
-            with self._lock:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.space().compact()
         return dropped
 
     def count(self) -> int:
-        return int(self._conn().execute("SELECT COUNT(*) FROM facts").fetchone()[0])
+        return self._facts().count()
 
 
 fact_store = FactStore()
@@ -193,16 +171,11 @@ fact_store = FactStore()
 # ------------------------------------------------------------------------------------- the parser's facts
 
 def _db_rows(shas: list[str], with_data: bool, family: int = FAMILY, fmt: int = FACTS_FORMAT) -> Iterator[dict[str, Any]]:
-    cols = "blob_hash, data" if with_data else "blob_hash"
-    with get_db_cursor() as cur:
+    cols = ["blob_hash", "data"] if with_data else ["blob_hash"]
+    with get_reader() as reader:
         for i in range(0, len(shas), 500):
             part = [bytes.fromhex(s) for s in shas[i:i + 500]]
-            cur.execute(
-                f"SELECT {cols} FROM m_blob_facts WHERE family = %s AND format = %s "  # noqa: S608
-                f"AND blob_hash IN ({','.join(['%s'] * len(part))})",
-                (family, fmt, *part),
-            )
-            yield from cur.fetchall()
+            yield from reader.select_rows("m_blob_facts", cols, {"family": family, "format": fmt, "blob_hash": part})
 
 
 def db_has(shas: list[str], family: int = FAMILY, fmt: int = FACTS_FORMAT) -> set[str]:
@@ -792,7 +765,7 @@ def build_revision(sha: str, progress: Callable | None = None, workers: int | No
         extract_blobs(missing, progress, workers or settings["workers"])
         try:
             fact_store.prune(settings["max_mb"] << 20)
-        except sqlite3.Error as exc:
+        except CacheError as exc:
             logger.debug("source index prune failed: %s", exc)
     idx = RevisionIndex(sha, files, load_facts, progress)
     if progress:
@@ -841,12 +814,10 @@ def revision_state(sha: str, wait: float = 0.0) -> dict[str, Any]:
 
 def _db_blob_estimate() -> int | None:
     try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "
-                        "AND TABLE_NAME = 'm_blob_facts'")
-            row = cur.fetchone()
+        with get_reader() as reader:
+            stats = reader.table_stats(["m_blob_facts"])
         # An estimate of the rows of both families (calls for .c/.h, Kernel API for .c/.h/.S): about two per blob
-        return int(row["TABLE_ROWS"]) // 2 if row and row.get("TABLE_ROWS") is not None else None
+        return int(stats[0].rows) // 2 if stats else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -856,6 +827,6 @@ def status() -> dict[str, Any]:
         return {"db_blobs": _db_blob_estimate(), "blobs": fact_store.count(), "bytes": fact_store.size(),
                 "saved_revisions": len(_SAVED.entries()), "saved_bytes": _SAVED.size_bytes(),
                 "revisions": [i.summary() for i in list(_REVISIONS.values())], **_settings()}
-    except sqlite3.Error as exc:
+    except CacheError as exc:
         return {"error": str(exc)}
 

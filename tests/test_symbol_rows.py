@@ -15,6 +15,8 @@ import types
 import unittest
 
 import main
+import pipeline.db_setup
+import pipeline.file_processing
 from core.config import get_default_repo_path
 from core.DBLayout import init_db_layout, m_v_main
 from core.FileHandler import MasterFile
@@ -86,10 +88,10 @@ def _parse_two_versions(path: str, versions: tuple[str, str], layout: str, eager
             cs.gp, cs.mf, cs.current_vid = gp, mf, vid
             cs.blob_hash = hashlib.sha1(content).digest()
             G.CURRENT_PARSING_FILE = path
-            # The file's m_file_name operation first, as in main.default_processing() (target_fnid routes point at it)
+            # The file's m_file_name operation first, as in pipeline.file_processing.default_processing() (target_fnid routes point at it)
             stage_file_prelude(cs, gp)
             cs.store(m_v_main.set(None, 0, 4, version, vid, None, None, None))
-            before = {t: len(MockDB._global_store.get(t, {})) for t in SYMBOL_TABLES}
+            before = {t: len(MockDB.store.get(t, {})) for t in SYMBOL_TABLES}
             if eager_second and op == "M":
                 orig_ref = ChangeSet.ref
                 ChangeSet.ref = _eager_ref(orig_ref)
@@ -102,8 +104,8 @@ def _parse_two_versions(path: str, versions: tuple[str, str], layout: str, eager
             if not cs.execute():
                 raise AssertionError(f"{path} at {version} did not execute")
             te.commit_all()
-            second_version_rows = {t: len(MockDB._global_store.get(t, {})) - before[t] for t in SYMBOL_TABLES}
-        store = MockDB._global_store
+            second_version_rows = {t: len(MockDB.store.get(t, {})) - before[t] for t in SYMBOL_TABLES}
+        store = MockDB.store
         return {
             "views": {v: collections.Counter(r[1:] for r in symbol_view_rows(store, v)) for v in ("m_symbol_def", "m_symbol_ref")},
             "second": second_version_rows,
@@ -189,9 +191,15 @@ class TestViewRows(unittest.TestCase):
 
 class TestOldLayoutGuard(unittest.TestCase):
     def test_database_with_per_blob_tables_is_refused(self) -> None:
-        db = types.SimpleNamespace(query=lambda sql, params=None, dictionary=False: [("m_symbol_def",), ("m_symbol_ref",)])
+        from db_engine import SQLiteDB
+        from core.DBLayout import INT
+        from core.TableHandling import Table
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([Table(table_id=900 + i, table_name=name, columns=(("k", INT()),), primary=("k",))
+                         for i, name in enumerate(("m_symbol_def", "m_symbol_ref"))])
         with self.assertRaises(RuntimeError) as ctx:
-            main.ensure_db_views(db)
+            pipeline.db_setup.ensure_db_views(db)
         self.assertIn("--reset", str(ctx.exception))
 
 

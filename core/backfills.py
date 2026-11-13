@@ -13,12 +13,13 @@ Each backfill takes a database driver (`db`) and returns a summary dict with a `
 """
 from __future__ import annotations
 
-import contextlib
 import logging
 import time
 from typing import Any, Callable, Iterable
 
 from core import ingest_state
+from db_engine import DBError
+from db_engine.spec import Agg, AnyOf, Col, Const, Join, Select, Value, exists_select, gt, is_null, le, lt
 
 logger = logging.getLogger(__name__)
 
@@ -49,53 +50,22 @@ class Progress:
         return round(time.monotonic() - self.started, 1)
 
 
-def _query_rows(db: Any, sql: str, params: tuple = ()) -> list[tuple]:
-    if hasattr(db, "query") and callable(db.query):
-        res = db.query(sql, params, dictionary=False)
-        if isinstance(res, list):
-            return res
-    if hasattr(db, "execute") and callable(db.execute):
-        res = db.execute(sql, params)
-        if isinstance(res, list):
-            return res
-    return []
-
-
-def _query_one_row(db: Any, sql: str, params: tuple = ()) -> tuple | None:
-    if hasattr(db, "query_one") and callable(db.query_one):
-        res = db.query_one(sql, params, dictionary=False)
-        if isinstance(res, (tuple, list)):
-            return tuple(res)
-        if res is None:
-            return None
-    if hasattr(db, "execute") and callable(db.execute):
-        res = db.execute(sql, params)
-        if isinstance(res, (tuple, list)):
-            return tuple(res)
-    return None
-
-
 def interrupted_ingests(db: Any) -> int:
     """Number of versions whose ingestion is interrupted (m_ingest_state INGEST_PARSING).
     In distributed mode, versions actively being parsed by a heartbeating node are in progress, not interrupted.
     """
     now = int(time.time())
     try:
-        row = _query_one_row(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM m_ingest_state s
-            LEFT JOIN m_parse_node n ON n.node_id = s.worker_id
-            WHERE s.status = %s
-            AND (s.worker_id = '' OR n.node_id IS NULL OR n.heartbeat_at < %s)
-            """,
-            (ingest_state.INGEST_PARSING, now - 180),
+        return db.count_rows(
+            ("m_ingest_state", "s"),
+            [
+                {"s.status": ingest_state.INGEST_PARSING},
+                AnyOf({"s.worker_id": ""}, {"n.node_id": is_null()}, {"n.heartbeat_at": lt(now - 180)}),
+            ],
+            joins=[Join(("m_parse_node", "n"), {"n.node_id": "s.worker_id"}, "left")],
         )
-        return int((row or (0,))[0] or 0)
-    except Exception:
-        row = _query_one_row(db, "SELECT COUNT(*) FROM m_ingest_state WHERE status = %s", (ingest_state.INGEST_PARSING,))
-        return int((row or (0,))[0] or 0)
+    except DBError:
+        return db.count_rows("m_ingest_state", {"status": ingest_state.INGEST_PARSING})
 
 
 def guarded(label: str, db: Any, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -110,24 +80,18 @@ def guarded(label: str, db: Any, run: Callable[[], dict[str, Any]]) -> dict[str,
         return run()
     except Exception as exc:  # noqa: BLE001 - a backfill never blocks parsing
         logger.warning(f"[{label}] Failed: {exc}", exc_info=True)
-        if hasattr(db, "rollback") and callable(db.rollback):
-            with contextlib.suppress(Exception):
-                db.rollback()
         return {"state": "error", "error": str(exc)}
 
 
 def finished_versions(db: Any, network_id: int, repo_id: int) -> list[tuple[str, int, int]]:
     """(ref_name, commit_id, base_commit_id) of the repository's finished versions, in ingestion order."""
-    rows = _query_rows(
-        db,
-        """
-        SELECT r.ref_name, s.commit_id, s.base_commit_id
-        FROM m_ingest_state s
-        JOIN m_git_ref r ON r.commit_id = s.commit_id AND r.repo_id = %s
-        WHERE s.network_id = %s AND s.status = %s
-        ORDER BY s.updated_at, s.commit_id
-        """,
-        (repo_id, network_id, ingest_state.INGEST_DONE),
+    rows = db.select_rows(
+        ("m_ingest_state", "s"),
+        ["r.ref_name", "s.commit_id", "s.base_commit_id"],
+        {"s.network_id": network_id, "s.status": ingest_state.INGEST_DONE},
+        joins=[Join(("m_git_ref", "r"), {"r.commit_id": "s.commit_id", "r.repo_id": Value(repo_id)})],
+        order_by=["s.updated_at", "s.commit_id"],
+        as_dict=False,
     )
     out: list[tuple[str, int, int]] = []
     seen: set[int] = set()
@@ -146,8 +110,7 @@ def fnids_of(db: Any, paths: Iterable[str], cache: dict[str, int]) -> dict[str, 
     missing = sorted({p for p in paths if p not in cache})
     for i in range(0, len(missing), 1000):
         chunk = missing[i : i + 1000]
-        sql = f"SELECT fnid, fname FROM m_file_name WHERE fname IN ({','.join(['%s'] * len(chunk))})"
-        rows = _query_rows(db, sql, tuple(chunk))
+        rows = db.select_rows("m_file_name", ["fnid", "fname"], {"fname": chunk}, as_dict=False)
         for fnid, fname in rows:
             if isinstance(fname, (bytes, bytearray)):
                 fname = fname.decode("utf-8", "replace")
@@ -156,16 +119,11 @@ def fnids_of(db: Any, paths: Iterable[str], cache: dict[str, int]) -> dict[str, 
 
 
 def insert_ignore(db: Any, table: str, columns: tuple[str, ...], rows: list[tuple[Any, ...]]) -> int:
-    """INSERT IGNORE rows into table in chunks; returns the number of rows sent."""
-    if not rows:
-        return 0
-    one = "(" + ",".join(["%s"] * len(columns)) + ")"
+    """Insert rows into table in chunks, skipping rows that exist; returns the number of rows sent.
+
+    The caller groups the writes of a batch with `with db.transaction():`."""
     for i in range(0, len(rows), INSERT_CHUNK):
-        chunk = rows[i : i + INSERT_CHUNK]
-        db.execute(
-            f"INSERT IGNORE INTO {table} ({','.join(columns)}) VALUES {','.join([one] * len(chunk))}",
-            tuple(v for row in chunk for v in row),
-        )
+        db.insert_rows(table, list(columns), rows[i : i + INSERT_CHUNK], on_conflict="ignore")
     return len(rows)
 
 
@@ -217,9 +175,8 @@ def backfill_maintainer_files(db: Any, mf: Any, network_id: int, repo_id: int, f
             pairs = maintainer_store.map_files(sections, cur_ids, changed, all_paths, new_paths)
             fnids = fnids_of(db, {p for _s, p in pairs}, fnid_cache)
             rows = sorted({(sid, fnids[p]) for sid, p in pairs if p in fnids})
-            rows_total += insert_ignore(db, "m_maintainer_file", ("sec_id", "fnid"), rows)
-            if hasattr(db, "commit") and callable(db.commit):
-                db.commit()
+            with db.transaction():
+                rows_total += insert_ignore(db, "m_maintainer_file", ("sec_id", "fnid"), rows)
             progress.step(note=f"{ref} ({len(rows)} rows)")
         logger.info(f"[Backfill maintainer files] {len(versions)} version(s), {rows_total} row(s) sent in {progress.seconds}s.")
         return {"state": "done", "versions": len(versions), "rows": rows_total, "skipped": skipped, "seconds": progress.seconds}
@@ -259,51 +216,50 @@ def repair_head_commit_files(db: Any, repo_dir: str, network_id: int) -> dict[st
     commit really has (Step 6.5) are kept. A merge head keeps none (merges have no m_commit_file rows)."""
 
     def run() -> dict[str, Any]:
-        rows = _query_rows(
-            db,
-            """
-            SELECT s.commit_id, c.commit_hash,
-                   (SELECT COUNT(*) FROM m_commit_parent p WHERE p.commit_id = s.commit_id) AS parents
-            FROM m_ingest_state s
-            JOIN m_commit c ON c.commit_id = s.commit_id
-            WHERE s.network_id = %s AND s.status = %s
-              AND EXISTS (SELECT 1 FROM m_commit_file cf WHERE cf.commit_id = s.commit_id)
-            ORDER BY s.commit_id
-            """,
-            (network_id, ingest_state.INGEST_DONE),
+        rows = db.select_rows(
+            ("m_ingest_state", "s"),
+            ["s.commit_id", "c.commit_hash"],
+            [
+                {"s.network_id": network_id, "s.status": ingest_state.INGEST_DONE},
+                exists_select(Select(("m_commit_file", "cf"), [Const(1)], {"cf.commit_id": Col("s.commit_id")})),
+            ],
+            joins=[Join(("m_commit", "c"), {"c.commit_id": "s.commit_id"})],
+            order_by=["s.commit_id"],
+            as_dict=False,
         )
         heads = []
-        for cid, chash, parents in rows:
+        for cid, chash in rows:
             sha = bytes(chash).hex() if isinstance(chash, (bytes, bytearray, memoryview)) else str(chash)
-            heads.append((int(cid), sha, int(parents or 0)))
+            heads.append((int(cid), sha))
         progress = Progress("Repair head commit files", len(heads))
         deleted = 0
         for i in range(0, len(heads), 200):
-            batch = heads[i : i + 200]
-            touched = _diff_tree_files(repo_dir, [sha for _cid, sha, parents in batch if parents < 2])
-            for cid, sha, parents in batch:
-                cf_rows = _query_rows(
-                    db,
-                    "SELECT cf.fnid, fn.fname FROM m_commit_file cf JOIN m_file_name fn ON fn.fnid = cf.fnid WHERE cf.commit_id = %s",
-                    (cid,),
+            batch = [(cid, sha) for cid, sha in heads[i : i + 200]]
+            parent_counts = {
+                int(cid): int(n)
+                for cid, n in db.aggregate(
+                    "m_commit_parent", {"n": Agg("COUNT")}, {"commit_id": [cid for cid, _sha in batch]},
+                    group_by=["commit_id"], as_dict=False,
                 )
-                real = touched.get(sha, set()) if parents < 2 else set()
-                stale = []
-                for fnid, fname in cf_rows:
-                    if isinstance(fname, (bytes, bytearray)):
-                        fname = fname.decode("utf-8", "replace")
-                    if fname not in real:
-                        stale.append(int(fnid))
-                for j in range(0, len(stale), 1000):
-                    chunk = stale[j : j + 1000]
-                    db.execute(
-                        f"DELETE FROM m_commit_file WHERE commit_id = %s AND fnid IN ({','.join(['%s'] * len(chunk))})",
-                        (cid, *chunk),
+            }
+            touched = _diff_tree_files(repo_dir, [sha for cid, sha in batch if parent_counts.get(cid, 0) < 2])
+            with db.transaction():
+                for cid, sha in batch:
+                    cf_rows = db.select_rows(
+                        ("m_commit_file", "cf"), ["cf.fnid", "fn.fname"], {"cf.commit_id": cid},
+                        joins=[Join(("m_file_name", "fn"), {"fn.fnid": "cf.fnid"})], as_dict=False,
                     )
-                deleted += len(stale)
-                progress.step()
-            if hasattr(db, "commit") and callable(db.commit):
-                db.commit()
+                    real = touched.get(sha, set()) if parent_counts.get(cid, 0) < 2 else set()
+                    stale = []
+                    for fnid, fname in cf_rows:
+                        if isinstance(fname, (bytes, bytearray)):
+                            fname = fname.decode("utf-8", "replace")
+                        if fname not in real:
+                            stale.append(int(fnid))
+                    if stale:
+                        db.delete_rows("m_commit_file", {"commit_id": cid, "fnid": stale})
+                    deleted += len(stale)
+                    progress.step()
         logger.info(f"[Repair head commit files] {len(heads)} head commit(s), {deleted} row(s) deleted in {progress.seconds}s.")
         return {"state": "done", "heads": len(heads), "deleted": deleted, "seconds": progress.seconds}
 
@@ -319,10 +275,8 @@ def delete_old_kbuild_references(db: Any, chunk: int = 50_000) -> int:
     returns the number deleted."""
     deleted = 0
     while True:
-        n = db.execute("DELETE FROM m_file_reference WHERE ref_type IN (3, 4) LIMIT %s", (chunk,))
-        n = int(n or 0)
-        if hasattr(db, "commit") and callable(db.commit):
-            db.commit()
+        with db.transaction():
+            n = int(db.delete_rows("m_file_reference", {"ref_type": [3, 4]}, limit=chunk) or 0)
         deleted += n
         if n < chunk:
             break
@@ -339,7 +293,7 @@ def _kbuild_pairs(db: Any) -> tuple[list[tuple[int, int]], dict[int, str], dict[
     checkpoint stored as a delta holds the pairs new since its base, its base the others, so the union
     over every version is every pair."""
     from parser.kbuild_symbols import is_kbuild_file
-    fn_rows = _query_rows(db, "SELECT fnid, fname FROM m_file_name WHERE fnid > 0")
+    fn_rows = db.select_rows("m_file_name", ["fnid", "fname"], {"fnid": gt(0)}, as_dict=False)
     path_of: dict[int, str] = {}
     fnid_of: dict[str, int] = {}
     for fnid, fname in fn_rows:
@@ -349,14 +303,15 @@ def _kbuild_pairs(db: Any) -> tuple[list[tuple[int, int]], dict[int, str], dict[
         if is_kbuild_file(fname):
             path_of[int(fnid)] = fname
     fnids = sorted(path_of)
-    v_rows = _query_rows(db, "SELECT DISTINCT commit_id FROM m_ingest_state WHERE status = %s", (ingest_state.INGEST_DONE,))
+    v_rows = db.select_rows("m_ingest_state", ["commit_id"], {"status": ingest_state.INGEST_DONE}, distinct=True, as_dict=False)
     versions = sorted(int(r[0]) for r in v_rows)
     pairs: set[tuple[int, int]] = set()
     for cid in versions:
         for i in range(0, len(fnids), 2000):
             chunk = fnids[i:i + 2000]
-            sql_bp = f"SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s AND fnid IN ({','.join(['%s'] * len(chunk))}) AND blob_id > 0"
-            bp_rows = _query_rows(db, sql_bp, (cid, *chunk))
+            bp_rows = db.select_rows(
+                "m_bridge_checkpoint", ["fnid", "blob_id"], {"commit_id": cid, "fnid": chunk, "blob_id": gt(0)}, as_dict=False
+            )
             pairs.update((int(f), int(b)) for f, b in bp_rows)
     return sorted(pairs), path_of, fnid_of
 
@@ -375,10 +330,8 @@ def backfill_kbuild(db: Any, mf: Any) -> dict[str, Any]:
         for i in range(0, len(pairs), 1000):
             chunk = pairs[i:i + 1000]
             blobs = sorted({b for _f, b in chunk})
-            rows_done = _query_rows(
-                db,
-                f"SELECT DISTINCT source_fnid, source_blob_id FROM m_kbuild_symbol WHERE source_blob_id IN ({','.join(['%s'] * len(blobs))})",
-                tuple(blobs),
+            rows_done = db.select_rows(
+                "m_kbuild_symbol", ["source_fnid", "source_blob_id"], {"source_blob_id": blobs}, distinct=True, as_dict=False
             )
             done = {(int(f), int(b)) for f, b in rows_done}
             todo.extend(p for p in chunk if p not in done)
@@ -386,11 +339,7 @@ def backfill_kbuild(db: Any, mf: Any) -> dict[str, Any]:
         sha_of: dict[int, str] = {}
         for i in range(0, len(blob_ids), 1000):
             chunk = blob_ids[i:i + 1000]
-            rows_hash = _query_rows(
-                db,
-                f"SELECT blob_id, blob_hash FROM m_file_blob WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",
-                tuple(chunk),
-            )
+            rows_hash = db.select_rows("m_file_blob", ["blob_id", "blob_hash"], {"blob_id": chunk}, as_dict=False)
             for bid, bhash in rows_hash:
                 sha_of[int(bid)] = bytes(bhash).hex()
         progress = Progress("Backfill Kbuild", len(todo))
@@ -408,14 +357,12 @@ def backfill_kbuild(db: Any, mf: Any) -> dict[str, Any]:
                 # binding_rows: (idx, line_no, symbol, via, ...) -> the table's (idx, symbol, via, line_no, ...)
                 rows.extend((blob_id, fnid, r[0], r[2], r[3], r[1], *r[4:]) for r in binding_rows(bindings, fnid_of.get))
             if len(rows) >= INSERT_CHUNK:
-                sent += insert_ignore(db, "m_kbuild_symbol", columns, rows)
-                if hasattr(db, "commit") and callable(db.commit):
-                    db.commit()
+                with db.transaction():
+                    sent += insert_ignore(db, "m_kbuild_symbol", columns, rows)
                 rows = []
             progress.step()
-        sent += insert_ignore(db, "m_kbuild_symbol", columns, rows)
-        if hasattr(db, "commit") and callable(db.commit):
-            db.commit()
+        with db.transaction():
+            sent += insert_ignore(db, "m_kbuild_symbol", columns, rows)
         logger.info(f"[Backfill Kbuild] {len(todo)} Makefile (path, blob) pair(s), {sent} row(s) in {progress.seconds}s.")
         return {"state": "done", "pairs": len(todo), "rows": sent, "seconds": progress.seconds}
 
@@ -433,18 +380,19 @@ def commit_relations_state(db: Any) -> str:
     """The backfill state note of m_commit_relation (row commit_id 0, kind 0, idx 0): "" (never ran),
     "next:<id>" (interrupted after <id>) or "done:<id>" (every commit up to <id> covered; later ones are
     written by Step 6.5)."""
-    sql = "SELECT note FROM m_commit_relation WHERE commit_id = 0 AND kind = 0 AND idx = 0"
-    row = _query_one_row(db, sql)
+    row = db.select_one("m_commit_relation", ["note"], {"commit_id": 0, "kind": 0, "idx": 0}, as_dict=False)
     note = (row or ("",))[0] or ""
     return note.decode("utf-8", "replace") if isinstance(note, (bytes, bytearray)) else str(note)
 
 
 def _set_relations_state(db: Any, note: str) -> None:
     from parser.git_ast.commit_relations import KIND_BACKFILL_STATE, ZERO_HASH
-    db.execute(
-        "INSERT INTO m_commit_relation (commit_id, kind, idx, target_hash, target_prefix, note) VALUES (0, %s, 0, %s, '', %s) "
-        "ON DUPLICATE KEY UPDATE note = VALUES(note)",
-        (KIND_BACKFILL_STATE, ZERO_HASH, note),
+    db.insert_rows(
+        "m_commit_relation",
+        ["commit_id", "kind", "idx", "target_hash", "target_prefix", "note"],
+        [(0, KIND_BACKFILL_STATE, 0, ZERO_HASH, "", note)],
+        on_conflict="update",
+        update_columns=["note"],
     )
 
 
@@ -463,17 +411,18 @@ def backfill_commit_relations(db: Any, repo_dir: str | None, from_commit_id: int
             start = int(state[len(BACKFILL_RUNNING):] or 0)
         else:
             start = 0
-        upper_row = db.query_one("SELECT COALESCE(MAX(commit_id), 0) FROM m_commit", dictionary=False)
-        upper = int((upper_row or (0,))[0] or 0)
+        upper = int(db.max_value("m_commit", "commit_id", default=0) or 0)
         progress = Progress("Backfill commit relations", max(0, upper - start))
         n_commits = n_rel = n_link = n_resolved = 0
         last = start
         while last < upper:
-            batch = db.query(
-                "SELECT commit_id, commit_hash, message FROM m_commit WHERE commit_id > %s AND commit_id <= %s "
-                "ORDER BY commit_id LIMIT %s",
-                (last, upper, RELATION_CHUNK),
-                dictionary=False,
+            batch = db.select_rows(
+                "m_commit",
+                ["commit_id", "commit_hash", "message"],
+                [{"commit_id": gt(last)}, {"commit_id": le(upper)}],
+                order_by=["commit_id"],
+                limit=RELATION_CHUNK,
+                as_dict=False,
             )
             if not batch:
                 break
@@ -490,19 +439,17 @@ def backfill_commit_relations(db: Any, repo_dir: str | None, from_commit_id: int
                 r, lk = cr.table_rows(cid, rels, links, resolved)
                 rel_rows.extend(r)
                 link_rows.extend(lk)
-            n_rel += insert_ignore(db, "m_commit_relation",
-                                   ("commit_id", "kind", "idx", "target_hash", "target_prefix", "note"), rel_rows)
-            n_link += insert_ignore(db, "m_commit_link", ("commit_id", "message_id"), link_rows)
-            n_resolved += len(resolved)
             last = int(batch[-1][0])
-            _set_relations_state(db, f"{BACKFILL_RUNNING}{last}")
-            if hasattr(db, "commit") and callable(db.commit):
-                db.commit()
+            with db.transaction():
+                n_rel += insert_ignore(db, "m_commit_relation",
+                                       ("commit_id", "kind", "idx", "target_hash", "target_prefix", "note"), rel_rows)
+                n_link += insert_ignore(db, "m_commit_link", ("commit_id", "message_id"), link_rows)
+                _set_relations_state(db, f"{BACKFILL_RUNNING}{last}")
+            n_resolved += len(resolved)
             n_commits += len(batch)
             progress.step(int(batch[-1][0]) - (progress.done + start), f"commits ({n_rel} relations, {n_link} links)")
-        _set_relations_state(db, f"{BACKFILL_DONE}{upper}")
-        if hasattr(db, "commit") and callable(db.commit):
-            db.commit()
+        with db.transaction():
+            _set_relations_state(db, f"{BACKFILL_DONE}{upper}")
         logger.info(f"[Backfill commit relations] {n_commits} commit(s), {n_rel} relation(s), {n_link} link(s), "
                     f"{n_resolved} abbreviated target(s) resolved, in {progress.seconds}s.")
         return {"state": "done", "commits": n_commits, "relations": n_rel, "links": n_link, "through": upper,
@@ -522,24 +469,21 @@ def fact_blob_paths(db: Any, versions: list[tuple[str, int, int]]) -> dict[bytes
     from parser.facts_ingest import families_of
     fnid_of_blob: dict[int, int] = {}
     for _name, cid, _base in versions:
-        sql_bc = "SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s AND blob_id > 0"
-        bc_rows = _query_rows(db, sql_bc, (cid,))
+        bc_rows = db.select_rows("m_bridge_checkpoint", ["fnid", "blob_id"], {"commit_id": cid, "blob_id": gt(0)}, as_dict=False)
         for fnid, bid in bc_rows:
             fnid_of_blob.setdefault(int(bid), int(fnid))
     path_of: dict[int, str] = {}
     fnids = sorted(set(fnid_of_blob.values()))
     for i in range(0, len(fnids), 1000):
         chunk = fnids[i:i + 1000]
-        sql_fn = f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({','.join(['%s'] * len(chunk))})"
-        fn_rows = _query_rows(db, sql_fn, tuple(chunk))
+        fn_rows = db.select_rows("m_file_name", ["fnid", "fname"], {"fnid": chunk}, as_dict=False)
         for fnid, fname in fn_rows:
             path_of[int(fnid)] = fname.decode("utf-8", "replace") if isinstance(fname, (bytes, bytearray)) else str(fname)
     wanted = sorted(b for b, f in fnid_of_blob.items() if families_of(path_of.get(f, "")))
     out: dict[bytes, str] = {}
     for i in range(0, len(wanted), 1000):
         chunk = wanted[i:i + 1000]
-        sql_fb = f"SELECT blob_id, blob_hash FROM m_file_blob WHERE blob_id IN ({','.join(['%s'] * len(chunk))})"
-        fb_rows = _query_rows(db, sql_fb, tuple(chunk))
+        fb_rows = db.select_rows("m_file_blob", ["blob_id", "blob_hash"], {"blob_id": chunk}, as_dict=False)
         for bid, bhash in fb_rows:
             out.setdefault(bytes(bhash), path_of[fnid_of_blob[int(bid)]])
     return out
@@ -581,7 +525,7 @@ def backfill_doc_references(db: Any, mf: Any, network_id: int, repo_id: int, wor
     from parser.doc_parser import DocReferenceScanner
 
     def run() -> dict[str, Any]:
-        rows_fn = _query_rows(db, "SELECT fnid, fname FROM m_file_name WHERE fnid > 0")
+        rows_fn = db.select_rows("m_file_name", ["fnid", "fname"], {"fnid": gt(0)}, as_dict=False)
         path_of: dict[int, str] = {}
         fnid_of: dict[str, int] = {}
         scanner = DocReferenceScanner()
@@ -600,11 +544,8 @@ def backfill_doc_references(db: Any, mf: Any, network_id: int, repo_id: int, wor
         for cid in commit_ids:
             for i in range(0, len(fnids), 2000):
                 chunk = fnids[i:i + 2000]
-                rows_bp = _query_rows(
-                    db,
-                    f"SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s "
-                    f"AND fnid IN ({','.join(['%s'] * len(chunk))}) AND blob_id > 0",
-                    (cid, *chunk),
+                rows_bp = db.select_rows(
+                    "m_bridge_checkpoint", ["fnid", "blob_id"], {"commit_id": cid, "fnid": chunk, "blob_id": gt(0)}, as_dict=False
                 )
                 pairs.update((int(f), int(b)) for f, b in rows_bp)
 
@@ -614,11 +555,9 @@ def backfill_doc_references(db: Any, mf: Any, network_id: int, repo_id: int, wor
         for i in range(0, len(sorted_pairs), 1000):
             chunk = sorted_pairs[i:i + 1000]
             blob_ids = sorted({b for _f, b in chunk})
-            rows_ref = _query_rows(
-                db,
-                f"SELECT DISTINCT source_fnid, source_blob_id FROM m_file_reference "
-                f"WHERE ref_type = %s AND source_blob_id IN ({','.join(['%s'] * len(blob_ids))})",
-                (doc_type, *blob_ids),
+            rows_ref = db.select_rows(
+                "m_file_reference", ["source_fnid", "source_blob_id"], {"ref_type": doc_type, "source_blob_id": blob_ids},
+                distinct=True, as_dict=False,
             )
             done = {(int(f), int(b)) for f, b in rows_ref}
             todo.extend(p for p in chunk if p not in done)
@@ -627,11 +566,7 @@ def backfill_doc_references(db: Any, mf: Any, network_id: int, repo_id: int, wor
         sha_of: dict[int, str] = {}
         for i in range(0, len(blob_ids), 1000):
             chunk = blob_ids[i:i + 1000]
-            rows_blob = _query_rows(
-                db,
-                f"SELECT blob_id, blob_hash FROM m_file_blob WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",
-                tuple(chunk),
-            )
+            rows_blob = db.select_rows("m_file_blob", ["blob_id", "blob_hash"], {"blob_id": chunk}, as_dict=False)
             for bid, bhash in rows_blob:
                 sha_of[int(bid)] = bytes(bhash).hex()
 
@@ -653,15 +588,13 @@ def backfill_doc_references(db: Any, mf: Any, network_id: int, repo_id: int, wor
                     rows.append((blob_id, fnid, r.target_fnid, doc_type, int(r.line_no), r.details[:255]))
 
             if len(rows) >= INSERT_CHUNK:
-                sent += insert_ignore(db, "m_file_reference", columns, rows)
-                if hasattr(db, "commit") and callable(db.commit):
-                    db.commit()
+                with db.transaction():
+                    sent += insert_ignore(db, "m_file_reference", columns, rows)
                 rows = []
             progress.step()
 
-        sent += insert_ignore(db, "m_file_reference", columns, rows)
-        if hasattr(db, "commit") and callable(db.commit):
-            db.commit()
+        with db.transaction():
+            sent += insert_ignore(db, "m_file_reference", columns, rows)
 
         logger.info(f"[Backfill doc references] {len(todo)} doc (path, blob) pair(s), {sent} row(s) in {progress.seconds}s.")
         return {"state": "done", "pairs": len(todo), "rows": sent, "seconds": progress.seconds}
@@ -679,11 +612,10 @@ def backfill_cve_files(db: Any, mf: Any = None, network_id: int = 1, repo_id: in
     import zlib
 
     def run() -> dict[str, Any]:
-        count_row = _query_one_row(db, "SELECT COUNT(*) FROM m_cve")
-        total = int((count_row or (0,))[0] or 0)
+        total = db.count_rows("m_cve")
         progress = Progress("Backfill CVE files", total)
 
-        cve_batch = _query_rows(db, "SELECT cve_id, data FROM m_cve")
+        cve_batch = db.select_rows("m_cve", ["cve_id", "data"], as_dict=False)
 
         rows: list[tuple[str, str]] = []
         sent = 0
@@ -711,15 +643,13 @@ def backfill_cve_files(db: Any, mf: Any = None, network_id: int = 1, repo_id: in
                             rows.append((str(cve_id), f_clean))
 
             if len(rows) >= INSERT_CHUNK:
-                sent += insert_ignore(db, "m_cve_file", columns, rows)
-                if hasattr(db, "commit") and callable(db.commit):
-                    db.commit()
+                with db.transaction():
+                    sent += insert_ignore(db, "m_cve_file", columns, rows)
                 rows = []
             progress.step()
 
-        sent += insert_ignore(db, "m_cve_file", columns, rows)
-        if hasattr(db, "commit") and callable(db.commit):
-            db.commit()
+        with db.transaction():
+            sent += insert_ignore(db, "m_cve_file", columns, rows)
 
         logger.info(f"[Backfill CVE files] {total} CVE record(s), {sent} row(s) in {progress.seconds}s.")
         return {"state": "done", "cves": total, "rows": sent, "seconds": progress.seconds}
@@ -760,10 +690,8 @@ def backfill_mailing_list(
         commit_hash_to_id: dict[str, int] = {}
         for i in range(0, len(commit_hashes), 1000):
             chunk = commit_hashes[i:i + 1000]
-            rows_c = _query_rows(
-                db,
-                f"SELECT commit_hash, commit_id FROM m_commit WHERE commit_hash IN ({','.join(['%s'] * len(chunk))})",
-                tuple(bytes.fromhex(h) for h in chunk),
+            rows_c = db.select_rows(
+                "m_commit", ["commit_hash", "commit_id"], {"commit_hash": [bytes.fromhex(h) for h in chunk]}, as_dict=False
             )
             for chash, cid in rows_c:
                 commit_hash_to_id[bytes(chash).hex()] = int(cid)
@@ -821,9 +749,8 @@ def backfill_mailing_list(
                         rows.append((cid, mid[:255], ctx.pull_request.tid, int(MLRelationType.PullRequest),
                                      int(ctx.matched_tier), 1, 0, 0))
 
-            sent += insert_ignore(db, "m_commit_email", columns, rows)
-            if hasattr(db, "commit") and callable(db.commit):
-                db.commit()
+            with db.transaction():
+                sent += insert_ignore(db, "m_commit_email", columns, rows)
             progress.step(len(chunk))
 
         logger.info(f"[Backfill mailing list] {len(target_commits)} commit(s), {sent} row(s) in {progress.seconds}s.")

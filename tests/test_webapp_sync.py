@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from db_engine import MockDB
 from webapp.backend import app as app_module
+from tests.db_fixtures import patch_reader
 from webapp.backend.routers import versions as versions_router
 from webapp.backend.routers.versions import _stamp
 from webapp.backend.services import catalog_cache as cc
@@ -83,22 +85,21 @@ class TestBuildBoundAssets(unittest.TestCase):
 
 class TestTokens(unittest.TestCase):
     def test_parsed_token_ignores_versions_still_being_parsed_and_clears_caches_on_change(self) -> None:
-        rows = [{"ref_name": "v3.0", "commit_id": 5, "status": 2, "updated_at": 100}]
-        cursor = MagicMock()
-        cursor.fetchall.side_effect = lambda: list(rows)
-        ctx = MagicMock()
-        ctx.__enter__.return_value = cursor
+        db = MockDB(use_global=False)
+        db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(1, 1, 1, "v3.0", 5)])
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 5, 2, 100)])
         svc = ss.SyncService()
-        with patch.object(ss, "get_db_cursor", return_value=ctx), \
+        with patch_reader(db), \
              patch.object(ss, "get_active_repo_id", return_value=1), \
              patch.object(ss, "get_active_repo_name", return_value="linux"), \
              patch.object(ss, "clear_parse_dependent_caches") as cleared:
             first = svc.parsed_token()
-            rows.append({"ref_name": "v3.1", "commit_id": 9, "status": ss.INGEST_PARSING, "updated_at": 200})
+            db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(2, 1, 1, "v3.1", 9)])
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 9, ss.INGEST_PARSING, 200)])
             svc._parsed = ss._Ttl(0)
             self.assertEqual(svc.parsed_token(), first)  # an unfinished version changes nothing
             cleared.assert_not_called()
-            rows[1]["status"] = 2
+            db.update_rows("m_ingest_state", {"status": 2}, {"commit_id": 9})
             self.assertNotEqual(svc.parsed_token(), first)
             cleared.assert_called_once()
 
@@ -135,7 +136,7 @@ class TestTokens(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             svc = ss.SyncService(Path(tmp))
             counter = iter(range(100))
-            with patch.object(ss, "get_db_cursor", side_effect=lambda: (_ for _ in ()).throw(RuntimeError("no db"))), \
+            with patch.object(ss, "get_reader", side_effect=lambda: (_ for _ in ()).throw(RuntimeError("no db"))), \
                  patch.object(ss, "get_active_repo_name", return_value="linux"), \
                  patch.object(ss, "get_repo_dir", return_value=tmp), \
                  patch.object(ss.subprocess, "run", side_effect=lambda *a, **k: MagicMock(stdout=f"{next(counter)} refs/tags/v3.0")), \

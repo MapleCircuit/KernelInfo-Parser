@@ -1,7 +1,7 @@
 """tests/test_maintainer_files.py - Files of each MAINTAINERS section version (m_maintainer_file, D01).
 
 Covers parser/maintainer_ast/maintainer_store.py (section versions of a blob, the incremental mapping),
-Step 6.7 (`main.processing_maintainer_files`), the migration of the old layout, the backfill guard, and the
+Step 6.7 (`pipeline.maintainers.processing_maintainer_files`), the migration of the old layout, the backfill guard, and the
 webapp readers (`MaintainerService.sections_for_paths`, section detail, in_credits).
 """
 from __future__ import annotations
@@ -14,7 +14,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import ingest_state as I
-from core.DBLayout import TABLES, m_maintainer_file
+from core.DBLayout import TABLES, m_credits_entry, m_maintainer_file, m_maintainer_section
+from db_engine import MockDB
+from db_engine.spec import INT
 from parser.maintainer_ast import maintainer_store as store
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 from parser.maintainer_ast.maintainer_parser import MaintainerParser
@@ -44,38 +46,28 @@ PATHS_V1 = ["drivers/alpha/a.c", "drivers/beta/b.c", "include/linux/beta.h", "in
 PATHS_V2 = PATHS_V1 + ["drivers/alpha/new.c"]
 
 
-class FakeCursor:
-    """Answers the queries of maintainer_store from canned rows; records every statement."""
+def maintainer_db() -> MockDB:
+    """An isolated MockDB with the tables `maintainer_store` joins (rows added through `place`, `section`, `credit`)."""
+    return MockDB(use_global=False)
 
-    def __init__(self, answers: dict[str, list]) -> None:
-        self.answers = answers
-        self.statements: list[str] = []
-        self._rows: list = []
 
-    def execute(self, sql: str, params: tuple = ()) -> None:
-        self.statements.append(sql)
-        for needle, rows in self.answers.items():
-            if needle in sql:
-                self._rows = list(rows(params) if callable(rows) else rows)
-                return
-        self._rows = []
+def place(db: MockDB, blob: int, tag: int, ast: int) -> None:
+    """The blob holds a tag naming `ast` (m_bridge_tag + m_tag)."""
+    db.insert_rows("m_bridge_tag", ["blob_id", "tag_id", "line_s", "line_e", "char_s", "char_e"], [(blob, tag, 1, 2, 0, 0)],
+                   on_conflict="ignore")
+    db.insert_rows("m_tag", ["tag_id", "hash", "ast_id", "hl_s", "hl_l"], [(tag, bytes([tag]) * 32, ast, 0, 0)], on_conflict="ignore")
 
-    def fetchall(self) -> list:
-        return self._rows
 
-    def fetchone(self):
-        return self._rows[0] if self._rows else None
+def section(db: MockDB, sec_id: int, name: str, blob: int, ast: int) -> None:
+    cols = [c[0] for c in m_maintainer_section.init_columns]
+    row = {"sec_id": sec_id, "blob_id": blob, "name": name, "ast_id": ast}
+    db.insert_rows("m_maintainer_section", cols, [tuple(row.get(c, "") if c not in ("sec_id", "blob_id", "ast_id") else row[c] for c in cols)])
 
-    def query(self, sql: str, params: tuple = (), dictionary: bool = True) -> list:
-        self.execute(sql, params)
-        return self._rows
 
-    def query_one(self, sql: str, params: tuple = (), dictionary: bool = True):
-        self.execute(sql, params)
-        return self.fetchone()
-
-    def close(self) -> None:
-        pass
+def credit(db: MockDB, credit_id: int, ast: int, person: int, blob: int) -> None:
+    cols = [c[0] for c in m_credits_entry.init_columns]
+    row = {"credit_id": credit_id, "blob_id": blob, "person_id": person, "ast_id": ast}
+    db.insert_rows("m_credits_entry", cols, [tuple(row.get(c, "") if c not in row else row[c] for c in cols)])
 
 
 class TestSectionVersions(unittest.TestCase):
@@ -88,22 +80,37 @@ class TestSectionVersions(unittest.TestCase):
         self.assertEqual(store.pick_versions(rows, 200), {"a": 10, "b": 11, "c": 40})
 
     def test_blob_section_ids_keys_by_lower_case_name(self) -> None:
-        cur = FakeCursor({"m_maintainer_section": [(5, "Alpha Driver", 1, True), (9, "ALPHA DRIVER", 7, False)]})
-        self.assertEqual(store.blob_section_ids(cur, 3), {"alpha driver": 5})
-        self.assertEqual(store.blob_section_ids(cur, 0), {})
+        db = maintainer_db()
+        place(db, 3, 100, 20)       # MAINTAINERS blob 3 holds the tag of the section named by ast 20
+        place(db, 1, 100, 20)       # blob 1 (an older MAINTAINERS) places the same tag: its row has the identical text
+        section(db, 5, "Alpha Driver", 1, 20)
+        section(db, 9, "ALPHA DRIVER", 7, 20)   # a later version with other text
+        self.assertEqual(store.blob_section_ids(db, 3), {"alpha driver": 5})
+        self.assertEqual(store.blob_section_ids(db, 0), {})
+        self.assertEqual(store.blob_section_ids(db, 99), {}, "a blob without tags holds no section")
 
     def test_blob_credit_ids_one_per_entry_and_person(self) -> None:
-        cur = FakeCursor({"m_credits_entry": [(1, 70, 4, 1, True), (2, 70, 4, 5, False), (3, 71, 6, 1, True)]})
-        self.assertEqual(store.blob_credit_ids(cur, 2), [1, 3])
+        db = maintainer_db()
+        place(db, 2, 100, 70)
+        place(db, 1, 100, 70)       # entry 1 was stored with a blob that places the same tag
+        place(db, 2, 101, 71)
+        place(db, 1, 101, 71)
+        credit(db, 1, 70, 4, 1)
+        credit(db, 2, 70, 4, 5)     # a later row of the same entry and person: not the identical text
+        credit(db, 3, 71, 6, 1)
+        self.assertEqual(store.blob_credit_ids(db, 2), [1, 3])
 
-    def test_queries_are_select_only(self) -> None:
-        cur = FakeCursor({})
-        store.blob_section_ids(cur, 1)
-        store.blob_credit_ids(cur, 1)
-        store.version_blob(cur, 1, "MAINTAINERS")
-        store.sections_with_rows(cur, [1, 2])
-        self.assertTrue(cur.statements)
-        self.assertTrue(all(s.strip().upper().startswith("SELECT") for s in cur.statements))
+    def test_version_blob_and_sections_with_rows(self) -> None:
+        db = maintainer_db()
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "MAINTAINERS"), (2, "CREDITS")])
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(7, 1, 30), (7, 2, 31), (8, 1, 32)])
+        self.assertEqual(store.version_blob(db, 7, "MAINTAINERS", tree="m_bridge_checkpoint"), 30)
+        self.assertEqual(store.version_blob(db, 7, "CREDITS", tree="m_bridge_checkpoint"), 31)
+        self.assertIsNone(store.version_blob(db, 9, "CREDITS", tree="m_bridge_checkpoint"))
+        self.assertIsNone(store.version_blob(db, 0, "CREDITS"))
+        db.insert_rows("m_maintainer_file", ["sec_id", "fnid"], [(1, 1), (1, 2), (3, 1)])
+        self.assertEqual(store.sections_with_rows(db, [1, 2, 3]), {1, 3})
+        self.assertEqual(store.sections_with_rows(db, []), set())
 
 
 class TestMapFiles(unittest.TestCase):
@@ -137,10 +144,12 @@ class TestMapFiles(unittest.TestCase):
 
 
 class TestStep67(unittest.TestCase):
-    """main.processing_maintainer_files with the database answers patched in."""
+    """pipeline.maintainers.processing_maintainer_files with the database answers patched in."""
 
     def _run(self, scope, base_files=PATHS_V1, files=PATHS_V2, text=V2):
         import main
+        import pipeline.db_setup
+        import pipeline.maintainers
         mf = mock.MagicMock()
         mf.git_file_list.side_effect = lambda rev: "\n".join(base_files if rev == "v1" else files)
         mf.get_file.return_value = text
@@ -148,15 +157,15 @@ class TestStep67(unittest.TestCase):
         te = mock.MagicMock()
         te.set.side_effect = lambda tid, row: staged.append((tid, row))
         fnids = {p: i + 100 for i, p in enumerate(files)}
-        with mock.patch.object(main, "MF", mf), mock.patch.object(main.G, "TE", te), \
-                mock.patch.object(main, "_maintainer_scope", return_value=scope), \
-                mock.patch.object(main, "get_fid_for_path", return_value=77), \
-                mock.patch.object(main, "get_fnid_for_path", side_effect=fnids.get), \
+        with mock.patch.object(pipeline.maintainers, "MF", mf), mock.patch.object(main.G, "TE", te), \
+                mock.patch.object(pipeline.maintainers, "_maintainer_scope", return_value=scope), \
+                mock.patch.object(pipeline.maintainers, "get_fid_for_path", return_value=77), \
+                mock.patch.object(pipeline.maintainers, "get_fnid_for_path", side_effect=fnids.get), \
                 mock.patch.object(main.gp, "VID", 2), mock.patch.object(main.gp, "Old_VID", 1, create=True), \
                 mock.patch.object(main.gp, "Version_Name", "v2", create=True), \
                 mock.patch.object(main.gp, "Old_Version_Name", "v1", create=True), \
                 mock.patch.object(MaintainerParser, "parse", autospec=True, side_effect=MaintainerParser.parse) as parse:
-            main.processing_maintainer_files("v2")
+            pipeline.maintainers.processing_maintainer_files("v2")
         return staged, parse, fnids
 
     def test_unchanged_sections_and_paths_do_not_parse(self) -> None:
@@ -184,50 +193,55 @@ class TestStep67(unittest.TestCase):
 
 class TestMigrationAndRollback(unittest.TestCase):
     def _db(self, has_table: bool, has_old_column: bool):
-        cur = FakeCursor({
-            "information_schema.TABLES": [(1 if has_table else 0,)],
-            "information_schema.COLUMNS": [(1 if has_old_column else 0,)],
-        })
-        db = mock.MagicMock(spec=[])
-        db.cursor = lambda: cur
-        db.execute = cur.execute
-        db.query_one = lambda sql, params=(), dictionary=False: cur.execute(sql, params) or cur.fetchone()
-        return db, cur
+        from db_engine import SQLiteDB
+        from core.DBLayout import INT
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        if has_table:
+            db.create_table([m_maintainer_file])
+            if has_old_column:
+                db.add_column("m_maintainer_file", "maintainers_blob_id", INT())
+        return db
 
     def test_old_layout_is_dropped(self) -> None:
         import main
-        db, cur = self._db(True, True)
-        self.assertEqual(main.drop_outdated_derived_tables(db), ["m_maintainer_file"])
-        self.assertIn("DROP TABLE m_maintainer_file", cur.statements)
+        import pipeline.db_setup
+        import pipeline.maintainers
+        db = self._db(True, True)
+        self.assertEqual(pipeline.db_setup.drop_outdated_derived_tables(db), ["m_maintainer_file"])
+        self.assertFalse(db.table_exists("m_maintainer_file"))
 
     def test_current_layout_is_kept(self) -> None:
         import main
+        import pipeline.db_setup
+        import pipeline.maintainers
         for has_table, old in ((True, False), (False, False)):
-            db, cur = self._db(has_table, old)
-            self.assertEqual(main.drop_outdated_derived_tables(db), [])
-            self.assertFalse(any(s.startswith("DROP") for s in cur.statements))
+            db = self._db(has_table, old)
+            self.assertEqual(pipeline.db_setup.drop_outdated_derived_tables(db), [])
+            self.assertEqual(db.table_exists("m_maintainer_file"), has_table)
 
     def test_rows_go_with_their_section_and_file_name(self) -> None:
         marks = {t.table_name: 10 for t, _ in I.marked_tables(TABLES)}
         plan = I.rollback_plan(TABLES, marks, 10, [3])
-        wheres = {d.where for d in plan if d.table == "m_maintainer_file"}
-        self.assertIn("fnid > %s", wheres)
-        self.assertIn("sec_id > %s", wheres)
+        wheres = {d.condition for d in plan if d.table == "m_maintainer_file"}
+        self.assertIn("fnid >", wheres)
+        self.assertIn("sec_id >", wheres)
         # Sections of a re-parsed MAINTAINERS blob take their file rows with them
-        self.assertTrue(any(w.startswith("sec_id IN (SELECT sec_id FROM m_maintainer_section WHERE blob_id IN") for w in wheres))
+        self.assertTrue(any(w.startswith("sec_id IN m_maintainer_section.sec_id WHERE blob_id IN") for w in wheres))
 
     def test_backfill_is_deferred_while_an_ingestion_is_interrupted(self) -> None:
         from core import backfills
-        cur = FakeCursor({"m_ingest_state": [(1,)]})
-        db = mock.MagicMock()
-        db.query_one = lambda sql, params=(), dictionary=False: cur.execute(sql, params) or cur.fetchone()
+        db = MockDB(use_global=False)
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 5, I.INGEST_PARSING, 0)])
         out = backfills.backfill_maintainer_files(db, mock.MagicMock(), 1, 1)
         self.assertEqual(out["state"], "deferred")
+        db.update_rows("m_ingest_state", {"status": I.INGEST_DONE}, {"commit_id": 5})
+        self.assertEqual(backfills.backfill_maintainer_files(db, mock.MagicMock(), 1, 1)["state"], "done", "no version to fill")
         self.assertEqual(backfills.backfill_maintainer_files(None, None, 1, 1)["state"], "unavailable")
 
 
 class TestWebappReaders(unittest.TestCase):
-    """MaintainerService database paths, without a database (cursor and caches patched)."""
+    """MaintainerService database paths over a MockDB read session (caches patched)."""
 
     def setUp(self) -> None:
         from webapp.backend.services import maintainer_service as ms
@@ -237,16 +251,14 @@ class TestWebappReaders(unittest.TestCase):
             sec.sec_id = sid
         self.matcher = MaintainerMatcher(self.sections)
         ms._FILE_SUBSYSTEMS_CACHE.clear()
-        ms._MAINT_FILE_LAYOUT.clear()
+        self.db = MockDB(use_global=False)
 
     def _service(self, rows: dict[str, set[int]]):
+        from tests.db_fixtures import patch_reader
         svc = self.ms.MaintainerService()
         svc.get_maintainer_data = lambda version: (self.sections, self.matcher)
-        cursor = mock.MagicMock()
-        ctx = mock.MagicMock()
-        ctx.__enter__.return_value = cursor
         patches = [
-            mock.patch.object(self.ms, "get_db_cursor", return_value=ctx),
+            patch_reader(self.db),
             mock.patch.object(self.ms.MaintainerService, "_stored_sections_for_paths",
                               staticmethod(lambda cur, paths, ids: {p: rows[p] for p in paths if p in rows})),
         ]
@@ -266,32 +278,49 @@ class TestWebappReaders(unittest.TestCase):
             got = svc.sections_for_paths("v3.0", ["drivers/beta/b.c"])
         self.assertEqual([s.name for s in got["drivers/beta/b.c"]], ["BETA DRIVER", "THE REST"])
 
+    def test_stored_rows_are_read_per_path_and_section_version(self) -> None:
+        self.db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "a.c"), (2, "b.c")])
+        self.db.insert_rows("m_maintainer_file", ["sec_id", "fnid"], [(1, 1), (2, 1), (3, 2)])
+        with self.db.reader() as reader:
+            got = self.ms.MaintainerService._stored_sections_for_paths(reader, ["a.c", "b.c", "c.c"], [1, 3])
+        self.assertEqual(got, {"a.c": {1}, "b.c": {3}}, "other section versions and unknown paths are left out")
+
     def test_old_layout_is_not_read(self) -> None:
-        cursor = mock.MagicMock()
-        cursor.fetchone.return_value = {"n": 1}
-        self.assertFalse(self.ms.MaintainerService._section_file_rows_readable(cursor))
-        self.assertEqual(self.ms.MaintainerService._stored_sections_for_paths(cursor, ["a"], [1]), {})
+        with self.db.reader() as reader:
+            self.assertTrue(self.ms.MaintainerService._section_file_rows_readable(reader))
+        self.db.add_column("m_maintainer_file", "maintainers_blob_id", INT())
+        with self.db.reader() as reader:
+            self.assertFalse(self.ms.MaintainerService._section_file_rows_readable(reader))
+            self.assertEqual(self.ms.MaintainerService._stored_sections_for_paths(reader, ["a"], [1]), {})
 
     def test_section_files_are_limited_to_the_version_tree(self) -> None:
         svc = self.ms.MaintainerService()
-        cursor = mock.MagicMock()
-        cursor.fetchall.return_value = [{"fname": "drivers/alpha/a.c"}, {"fname": "drivers/alpha/gone.c"}]
-        with mock.patch("webapp.backend.services.tree_resolver.git_tree_resolver.list_tree",
-                        return_value={"drivers/alpha/a.c": "0" * 40}):
-            self.assertEqual(svc._section_files(cursor, 1, 5, "v3.0"), ["drivers/alpha/a.c"])
-        sql = " ".join(c.args[0] for c in cursor.execute.call_args_list)
-        self.assertNotIn("LIMIT", sql)  # the count is the real one; the page is cut afterwards
+        self.db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "drivers/alpha/a.c"), (2, "drivers/alpha/gone.c")])
+        self.db.insert_rows("m_maintainer_file", ["sec_id", "fnid"], [(1, 1), (1, 2), (2, 1)])
+        with self.db.reader() as reader, mock.patch(
+            "webapp.backend.services.tree_resolver.git_tree_resolver.list_tree", return_value={"drivers/alpha/a.c": "0" * 40}
+        ):
+            # the count is the real one; the page is cut afterwards
+            self.assertEqual(svc._section_files(reader, 1, 5, "v3.0"), ["drivers/alpha/a.c"])
+        with self.db.reader() as reader, mock.patch(
+            "webapp.backend.services.tree_resolver.git_tree_resolver.list_tree", return_value=None
+        ):
+            self.db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(5, 2, 9)])
+            self.assertEqual(svc._section_files(reader, 1, 5, "v3.0"), ["drivers/alpha/gone.c"], "the version's checkpoint tree decides")
 
     def test_in_credits_uses_the_version_entries_and_aliases(self) -> None:
         svc = self.ms.MaintainerService()
-        cursor = mock.MagicMock()
-        cursor.fetchall.return_value = [{"person_id": 8}]
-        with mock.patch.object(self.ms.MaintainerService, "_identity_index",
-                               staticmethod(lambda cur: ({8: "n:alice", 9: "n:alice"}, {"n:alice": [8, 9]}))):
-            self.assertEqual(svc._credited_identities(cursor, [41, 42]), {"n:alice"})
-            self.assertEqual(svc._credited_identities(cursor, []), set())
-        sql = cursor.execute.call_args_list[0].args[0]
-        self.assertIn("credit_id IN (%s,%s)", sql)
+        self.db.insert_rows(
+            "m_credits_entry",
+            ["credit_id", "blob_id", "person_id", "web_page", "pgp_key", "description", "snail_mail", "ast_id"],
+            [(41, 1, 8, "", "", "", "", 0), (43, 1, 9, "", "", "", "", 0)],
+        )
+        with self.db.reader() as reader, mock.patch.object(
+            self.ms.MaintainerService, "_identity_index",
+            staticmethod(lambda cur: ({8: "n:alice", 9: "n:bob"}, {"n:alice": [8], "n:bob": [9]})),
+        ):
+            self.assertEqual(svc._credited_identities(reader, [41, 42]), {"n:alice"}, "only the version's entries count")
+            self.assertEqual(svc._credited_identities(reader, []), set())
 
 
 if __name__ == "__main__":

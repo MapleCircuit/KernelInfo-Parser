@@ -38,11 +38,6 @@ DEFAULT_SSH_TUNNEL_CONFIG: dict[str, Any] = {
     "connect_timeout": 10,
 }
 
-STANDARD_UNIX_SOCKETS: tuple[str, ...] = (
-    "/run/mysqld/mysqld.sock",
-    "/var/run/mysqld/mysqld.sock",
-    "/tmp/mysql.sock",
-)
 
 
 def resolve_unix_socket(socket_path: str | None = None, host: str | None = None) -> str | None:
@@ -70,7 +65,9 @@ def resolve_unix_socket(socket_path: str | None = None, host: str | None = None)
 
     normalized_host = (host or "").strip().lower()
     if normalized_host in ("localhost", "127.0.0.1", ""):
-        for candidate_str in STANDARD_UNIX_SOCKETS:
+        from db_engine import default_socket_paths
+
+        for candidate_str in default_socket_paths():
             candidate = Path(candidate_str)
             try:
                 if candidate.exists() and stat.S_ISSOCK(candidate.stat().st_mode):
@@ -84,9 +81,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "database": {
         "host": "127.0.0.1",
         "port": 3306,
-        "user": "root",
-        "password": "Passe123",
+        # No default account: a missing user or password is reported when the connection is made
+        "user": "",
+        "password": "",
         "database": "test",
+        # SQLite engine only: database file (":memory:" for a private in-memory database); required for a file database (a bare "database" name is not a path)
+        "path": "",
         "timeout": 10,
         "engine": "mariadb",
         "unix_socket": "auto",
@@ -114,6 +114,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "connect_timeout": 10,
         },
     },
+    # Local caches of derived data (cache_engine/CACHE_API.md): engine name and base directory (empty: the
+    # KERNELINFO_CACHE_DIR environment variable, else ~/.cache/kernelinfo)
+    "cache": {"engine": "sqlite", "dir": ""},
     "webapp": {
         "host": "0.0.0.0",
         "port": 8000,
@@ -321,7 +324,7 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
 
     host = str(db_cfg.get("host") or "127.0.0.1")
     port = str(db_cfg.get("port") or 3306)
-    user = str(db_cfg.get("user") or "root")
+    user = str(db_cfg.get("user") or "")
     password = str(db_cfg.get("password") or "")
     database = str(db_cfg.get("database") or "test")
     timeout = str(db_cfg.get("timeout") or 10)
@@ -347,6 +350,7 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
         "MYSQL_PASSWORD": password,
         "DB_NAME": database,
         "MYSQL_DATABASE": database,
+        "DB_PATH": str(db_cfg.get("path") or ""),
         "DB_TIMEOUT": timeout,
         "MYSQL_TIMEOUT": timeout,
         "DB_SOCKET": resolved_socket,

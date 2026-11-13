@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from core import config, distributed
 from parser.git_ast import release_order
+from tests.test_distributed_parsing import DistDB
 
 
 class TestLinuxBranchesAndDistributed(unittest.TestCase):
@@ -127,8 +128,7 @@ class TestLinuxBranchesAndDistributed(unittest.TestCase):
 
     def test_publish_delegable_chains_with_branches(self):
         """Verify publish_delegable_chains populates tasks with merge-base dependencies."""
-        mock_db = MagicMock()
-        mock_db.execute.return_value = 1
+        db = DistDB()
 
         version_states = {
             "v3.0": (100, "done"),
@@ -136,7 +136,7 @@ class TestLinuxBranchesAndDistributed(unittest.TestCase):
         }
 
         enqueued = distributed.publish_delegable_chains(
-            mock_db,
+            db,
             network_id=1,
             repo_id=1,
             all_tags=["v3.0", "v3.0.1", "next-20260810"],
@@ -146,42 +146,36 @@ class TestLinuxBranchesAndDistributed(unittest.TestCase):
         )
         self.assertTrue(enqueued >= 2)
 
-        # Verify insert statements
-        inserted_refs = [call[0][1][4] for call in mock_db.execute.call_args_list]
-        self.assertIn("v3.0.1", inserted_refs)
-        self.assertIn("next-20260810", inserted_refs)
-        self.assertIn("linux-next/master", inserted_refs)
-        self.assertIn("stable/linux-3.0.y", inserted_refs)
+        tasks = {t["ref_name"]: t for t in db.tasks}
+        self.assertIn("v3.0.1", tasks)
+        self.assertIn("next-20260810", tasks)
+        self.assertIn("linux-next/master", tasks)
+        self.assertIn("stable/linux-3.0.y", tasks)
 
-        # Verify status of linux-next/master: base is master (commit_id 500, state done) -> TASK_ELIGIBLE (1)
-        for call in mock_db.execute.call_args_list:
-            args = call[0][1]
-            ref_name = args[4]
-            status = args[8]
-            base_ref = args[6]
-            if ref_name == "linux-next/master":
-                self.assertEqual(base_ref, "master")
-                self.assertEqual(status, distributed.TASK_ELIGIBLE)
-            elif ref_name == "stable/linux-3.0.y":
-                self.assertEqual(base_ref, "v3.0")
-                self.assertEqual(status, distributed.TASK_ELIGIBLE)
+        # Status of linux-next/master: base is master (commit_id 500, state done) -> TASK_ELIGIBLE (1)
+        self.assertEqual(tasks["linux-next/master"]["base_ref_name"], "master")
+        self.assertEqual(tasks["linux-next/master"]["status"], distributed.TASK_ELIGIBLE)
+        self.assertEqual(tasks["stable/linux-3.0.y"]["base_ref_name"], "v3.0")
+        self.assertEqual(tasks["stable/linux-3.0.y"]["status"], distributed.TASK_ELIGIBLE)
 
     def test_claim_next_task_priority(self):
-        """Verify claim_next_task orders candidate queries prioritizing history -> stable -> next."""
-        mock_db = MagicMock()
-        mock_db.query.return_value = [
-            (1, "branch:history/2.4-stable", "history", "history/2.4-stable", 0, "2.4.15", 10),
-        ]
-        mock_db.execute.return_value = 1
+        """Verify claim_next_task hands out chains in the order history -> stable -> next -> other branches."""
+        elig = distributed.TASK_ELIGIBLE
+        db = DistDB().add_tasks(
+            {"task_id": 1, "chain_name": "branch:topic/x", "chain_kind": "branch", "ref_name": "topic/x", "status": elig},
+            {"task_id": 2, "chain_name": "next:next-20260810", "chain_kind": "next", "ref_name": "next-20260810", "status": elig},
+            {"task_id": 3, "chain_name": "stable:v3.0", "chain_kind": "stable", "ref_name": "v3.0.1", "status": elig},
+            {"task_id": 4, "chain_name": "branch:history/2.4-stable", "chain_kind": "history", "ref_name": "history/2.4-stable",
+             "base_ref_name": "2.4.15", "base_commit_id": 10, "status": elig},
+        )
 
-        task = distributed.claim_next_task(mock_db, network_id=1, worker_id="test-worker")
+        task = distributed.claim_next_task(db, network_id=1, worker_id="test-worker")
         self.assertIsNotNone(task)
         self.assertEqual(task["ref_name"], "history/2.4-stable")
-
-        query_sql = mock_db.query.call_args[0][0]
-        self.assertIn("WHEN chain_name LIKE 'history%' OR chain_kind = 'history' THEN 1", query_sql)
-        self.assertIn("WHEN chain_kind = 'stable' THEN 2", query_sql)
-        self.assertIn("WHEN chain_name LIKE '%next%' OR chain_kind = 'next' THEN 3", query_sql)
+        order = [task["ref_name"]]
+        while (task := distributed.claim_next_task(db, network_id=1, worker_id="test-worker")) is not None:
+            order.append(task["ref_name"])
+        self.assertEqual(order, ["history/2.4-stable", "v3.0.1", "next-20260810", "topic/x"])
 
 
 if __name__ == "__main__":

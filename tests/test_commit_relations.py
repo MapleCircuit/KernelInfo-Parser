@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import backfills
 from core import ingest_state as I
+from core import DBLayout as D
 from core.DBLayout import TABLES
+from db_engine import SQLiteDB
+from db_engine.spec import gt
 from parser.git_ast import commit_relations as pcr
 
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "Ann", "GIT_AUTHOR_EMAIL": "ann@x.org", "GIT_COMMITTER_NAME": "Ann",
@@ -104,9 +106,9 @@ class TestRows(unittest.TestCase):
 
     def test_rollback_plan_has_both_tables(self) -> None:
         marks = {t.table_name: 10 for t, _ in I.marked_tables(TABLES)}
-        plan = {(d.table, d.where) for d in I.rollback_plan(TABLES, marks, 10, [])}
-        self.assertIn(("m_commit_relation", "commit_id > %s"), plan)
-        self.assertIn(("m_commit_link", "commit_id > %s"), plan)
+        plan = {(d.table, d.condition) for d in I.rollback_plan(TABLES, marks, 10, [])}
+        self.assertIn(("m_commit_relation", "commit_id >"), plan)
+        self.assertIn(("m_commit_link", "commit_id >"), plan)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
@@ -136,86 +138,45 @@ class TestResolvePrefixes(unittest.TestCase):
                 self.assertNotIn(shared, got)
 
 
-def _cursor_class():
-    from tests.test_release_stats import _Cursor
-
-    class _Cur(_Cursor):
-        """The release statistics' sqlite cursor, plus the backfill state upsert."""
-
-        def execute(self, sql: str, params=()) -> None:
-            super().execute(sql.replace("ON DUPLICATE KEY UPDATE note = VALUES(note)",
-                                        "ON CONFLICT (commit_id, kind, idx) DO UPDATE SET note = excluded.note"), params)
-
-    return _Cur
-
-
 class Store:
     """In-memory database with what the parser writes for a repository: m_commit (every commit, ids in
     topological order), relation rows through --backfill-commit-relations, release membership through
     the release statistics."""
 
+    COMMIT_COLUMNS = [c[0] for c in D.m_commit.init_columns]
+
     def __init__(self, repo: Path, with_relations: bool = True) -> None:
-        from tests.test_release_stats import _Connection
-        self.engine = _Connection()
-        cur_class = _cursor_class()
-        self.engine.cursor = lambda: cur_class(self.engine.db)
-        self.cnx = self.engine
-        self.db = self.engine.db
-        self.db.executescript("""
-            CREATE TABLE m_ingest_state (network_id INT, commit_id INT, status INT);
-            CREATE TABLE m_commit (commit_id INTEGER PRIMARY KEY, network_id INT, commit_hash BLOB, author_id INT,
-                author_date INT, committer_id INT, committer_date INT, subject TEXT, message TEXT);
-            CREATE TABLE m_commit_relation (commit_id INT, kind INT, idx INT, target_hash BLOB, target_prefix TEXT,
-                note TEXT, PRIMARY KEY (commit_id, kind, idx));
-            CREATE TABLE m_commit_link (commit_id INT, message_id TEXT, PRIMARY KEY (commit_id, message_id));
-            INSERT INTO m_commit VALUES (0, 0, zeroblob(20), 0, 0, 0, 0, '', '');
-        """)
+        self.engine = SQLiteDB(":memory:", foreign_keys=False)
+        self.db = self.engine
+        self.engine.create_table([D.m_maintainer_person, D.m_release_segment, D.m_release_person, D.m_person_first_release,
+                                  D.m_commit_release, D.m_ingest_state, D.m_commit, D.m_commit_relation, D.m_commit_link])
+        self.engine.insert_rows("m_commit", self.COMMIT_COLUMNS, [(0, 0, b"\0" * 20, 0, 0, 0, 0, "", "")], on_conflict="ignore")
         out = git(repo, "log", "--all", "--topo-order", "--reverse", "--format=%x1e%H%x1f%at%x1f%s%x1f%B")
         for i, rec in enumerate(r for r in out.split("\x1e") if r.strip()):
             sha, at, subject, body = rec.split("\x1f", 3)
-            self.db.execute("INSERT INTO m_commit VALUES (?, 1, ?, 1, ?, 1, ?, ?, ?)",
-                            (i + 1, bytes.fromhex(sha), int(at), int(at), subject, body.rstrip("\n")))
+            self.engine.insert_rows("m_commit", self.COMMIT_COLUMNS,
+                                    [(i + 1, 1, bytes.fromhex(sha), 1, int(at), 1, int(at), subject, body.rstrip("\n"))])
         if with_relations:
             self.summary = backfills.backfill_commit_relations(self.engine, str(repo))
         from parser.git_ast import release_stats
         release_stats.ingest(self.engine, repo, repo_id=1, workers=2)
-        self.statements: list[str] = []
 
-    def dict_cursor(self):
-        store = self
+    TABLES = ("m_commit", "m_commit_relation", "m_commit_link", "m_commit_release", "m_release_segment", "m_release_person")
 
-        class DictCur:
-            def __init__(self) -> None:
-                self.rows: list = []
-
-            def execute(self, sql: str, params=()) -> None:
-                store.statements.append(sql)
-                cur = store.db.execute(sql.replace("%s", "?"), tuple(params))
-                cols = [d[0] for d in cur.description or ()]
-                self.rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-
-            def fetchall(self):
-                return self.rows
-
-            def fetchone(self):
-                return self.rows[0] if self.rows else None
-
-        ctx = mock.MagicMock()
-        ctx.__enter__.side_effect = lambda: DictCur()
-        return ctx
+    def counts(self) -> dict[str, int]:
+        """Row count of every table the readers touch (a read path must leave them as they are)."""
+        return {t: self.engine.count_rows(t) for t in self.TABLES}
 
     def patches(self) -> list:
-        from webapp.backend.database import helpers, pool
+        from tests.db_fixtures import patch_reader
+        from webapp.backend.database import helpers
         from webapp.backend.services import commit_relations as wcr
         from webapp.backend.services import release_service as rs
-        ctx = self.dict_cursor()
         return [
-            mock.patch.object(wcr, "get_db_cursor", return_value=ctx),
+            patch_reader(self.engine),
             mock.patch.object(wcr, "get_active_network_id", return_value=1),
             mock.patch.object(wcr, "get_active_repo_id", return_value=1),
-            mock.patch.object(rs, "get_db_cursor", return_value=ctx),
             mock.patch.object(rs, "get_active_repo_id", return_value=1),
-            mock.patch.object(pool, "get_db_cursor", return_value=ctx),
             mock.patch.object(helpers, "get_active_network_id", return_value=1),
             mock.patch.object(helpers, "get_active_repo_id", return_value=1),
         ]
@@ -257,7 +218,7 @@ class TestOnRepository(unittest.TestCase):
         rs._DB_COVERAGE.clear()
         wcr._DB_READY.clear()
         wcr._STALE.clear()
-        self.store.statements.clear()
+        self.before = self.store.counts()
 
     def tearDown(self) -> None:
         for p in self.patches:
@@ -269,17 +230,17 @@ class TestOnRepository(unittest.TestCase):
 
     def test_backfill_is_idempotent_and_resumable(self) -> None:
         db = self.store.db
-        rows = db.execute("SELECT COUNT(*) FROM m_commit_relation").fetchone()[0]
-        state = db.execute("SELECT note FROM m_commit_relation WHERE commit_id = 0").fetchone()[0]
+        rows = db.count_rows("m_commit_relation")
+        state = db.select_value("m_commit_relation", "note", {"commit_id": 0})
         self.assertTrue(state.startswith(pcr.BACKFILL_DONE))
         again = backfills.backfill_commit_relations(self.store.engine, str(self.repo), from_commit_id=0)
         self.assertEqual(again["state"], "done")
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM m_commit_relation").fetchone()[0], rows)
+        self.assertEqual(db.count_rows("m_commit_relation"), rows)
         # Interrupted after commit 2: the next run starts there
-        db.execute("UPDATE m_commit_relation SET note = 'next:2' WHERE commit_id = 0")
+        db.update_rows("m_commit_relation", {"note": "next:2"}, {"commit_id": 0})
         resumed = backfills.backfill_commit_relations(self.store.engine, str(self.repo))
-        self.assertEqual(resumed["commits"], db.execute("SELECT COUNT(*) FROM m_commit WHERE commit_id > 2").fetchone()[0])
-        fixed = db.execute("SELECT target_hash FROM m_commit_relation WHERE kind = 1").fetchone()[0]
+        self.assertEqual(resumed["commits"], db.count_rows("m_commit", {"commit_id": gt(2)}))
+        fixed = db.select_value("m_commit_relation", "target_hash", {"kind": 1})
         self.assertEqual(bytes(fixed).hex(), self.T.bug)                   # Fixes: <12 digits> resolved
 
     def test_database_answers_like_the_relation_index(self) -> None:
@@ -301,7 +262,7 @@ class TestOnRepository(unittest.TestCase):
         counts = self.wcr.db_counts([self.T.bug, self.T.fix])
         self.assertEqual(counts[self.T.bug]["fixed_by"], 1)
         self.assertEqual((counts[self.T.fix]["fixes"], counts[self.T.fix]["backports"], counts[self.T.fix]["stable_cc"]), (1, 1, True))
-        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in self.store.statements))
+        self.assertEqual(self.store.counts(), self.before)   # the readers write nothing
 
     def test_relations_need_no_sqlite_index(self) -> None:
         with mock.patch.object(self.wcr.relation_index, "build") as build, \
@@ -313,13 +274,13 @@ class TestOnRepository(unittest.TestCase):
 
     def test_not_ready_or_not_ingested_falls_back(self) -> None:
         db = self.store.db
-        db.execute("UPDATE m_commit_relation SET note = 'next:1' WHERE commit_id = 0")
+        db.update_rows("m_commit_relation", {"note": "next:1"}, {"commit_id": 0})
         try:
             self.assertFalse(self.wcr.db_ready())
             self.assertIsNone(self.wcr.db_relations(self.T.fix))
             self.assertIsNone(self.wcr.db_commits_for_mids(["fix-1@x.org"]))
         finally:
-            db.execute("UPDATE m_commit_relation SET note = 'done:9' WHERE commit_id = 0")
+            db.update_rows("m_commit_relation", {"note": "done:9"}, {"commit_id": 0})
         self.wcr._DB_READY.clear()
         self.assertIsNone(self.wcr.db_relations("f" * 40))                   # not in m_commit
         state = self.wcr.relations(self.T.fix)
@@ -328,13 +289,13 @@ class TestOnRepository(unittest.TestCase):
     def test_backports_complete_only_when_releases_are_ingested(self) -> None:
         self.assertTrue(self.wcr.tags_ingested(["v1.0", "v1.0.1"]))
         key = bytes.fromhex(self.T.backport)
-        row = self.store.db.execute("SELECT * FROM m_commit WHERE commit_hash = ?", (key,)).fetchone()
-        self.store.db.execute("DELETE FROM m_commit WHERE commit_hash = ?", (key,))
+        row = self.store.db.select_one("m_commit", Store.COMMIT_COLUMNS, {"commit_hash": key})
+        self.store.db.delete_rows("m_commit", {"commit_hash": key})
         try:
             self.wcr._DB_READY.clear()
             self.assertFalse(self.wcr.tags_ingested(["v1.0", "v1.0.1"]))
         finally:
-            self.store.db.execute("INSERT INTO m_commit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+            self.store.db.insert_rows("m_commit", Store.COMMIT_COLUMNS, [tuple(row)])
 
     def test_merged_trailers_from_the_database(self) -> None:
         from webapp.backend.services import merged_service
@@ -387,7 +348,6 @@ class TestStableReport(unittest.TestCase):
                 db = ss.build_report("v1.0", use_db=True)
             build.assert_not_called()
             self.assertEqual(db["source"], "db")
-            self.store.statements.clear()
             rs.release_index.build()
             wcr.relation_index.build()
             sq = ss._report_sqlite("v1.0", scope)
@@ -403,29 +363,35 @@ class TestStableReport(unittest.TestCase):
 class TestWriters(unittest.TestCase):
     def test_step1_inserts_relation_rows_with_the_commits(self) -> None:
         import main
-        from tests.test_pipeline_steps import _commit, _reset_mock_db
-        from db_engine.mock_db import MockDB
+        import pipeline.backfill_steps
+        import pipeline.commits
+        import pipeline.git_ingest
+        from tests.test_pipeline_steps import _commit
+        from db_engine import MockDB
         from core.DBLayout import m_commit_link, m_commit_relation
-        _reset_mock_db()
+        MockDB.reset()
         try:
             c1, c2 = "1" * 40, "2" * 40
             fix = _commit(c2, "A", "a@x", [c1])
             fix.message = f"fix\n\nFixes: {c1} (\"x\")\nLink: https://lore.kernel.org/r/m@x"
             with MockDB() as db, mock.patch.object(main.MF, "repo_dir", None, create=True):
-                ids = main._ingest_commit_range(db, [fix, _commit(c1, "A", "a@x", [])], network_id=1)
-                rel = list(MockDB._global_store[m_commit_relation.table_name].values())
-                links = list(MockDB._global_store[m_commit_link.table_name].values())
+                ids = pipeline.git_ingest._ingest_commit_range(db, [fix, _commit(c1, "A", "a@x", [])], network_id=1)
+                rel = list(MockDB.store[m_commit_relation.table_name].values())
+                links = list(MockDB.store[m_commit_link.table_name].values())
             flat = [r if isinstance(r, tuple) else tuple(r) for r in rel]
             self.assertTrue(any(ids[c2] in r and bytes.fromhex(c1) in r for r in flat), flat)
             self.assertTrue(any("m@x" in (r if isinstance(r, tuple) else tuple(r)) for r in links), links)
         finally:
-            _reset_mock_db()
+            MockDB.reset()
 
     def test_step65_stages_rows_of_commits_it_inserts(self) -> None:
         import main
+        import pipeline.backfill_steps
+        import pipeline.commits
+        import pipeline.git_ingest
         te = mock.MagicMock()
         with mock.patch.object(main.G, "TE", te):
-            n_rel, n_link = main.stage_commit_relations([(7, "b" * 40, "x\n\nCc: stable@vger.kernel.org\nMessage-Id: <a@b>")], None)
+            n_rel, n_link = pipeline.commits.stage_commit_relations([(7, "b" * 40, "x\n\nCc: stable@vger.kernel.org\nMessage-Id: <a@b>")], None)
         self.assertEqual((n_rel, n_link), (1, 1))
         tables = [c.args[0] for c in te.set.call_args_list]
         from core.DBLayout import m_commit_link, m_commit_relation
@@ -433,23 +399,25 @@ class TestWriters(unittest.TestCase):
 
     def test_automatic_backfill_runs_until_done(self) -> None:
         import main
-        mock_db = mock.MagicMock(spec=[])
-        mock_db.query_one = mock.MagicMock(side_effect=[("next:5",), None])
-        mock_db.execute = mock.MagicMock()
-        mock_db.fetchone = mock.MagicMock(side_effect=[("next:5",), None])
-        db = mock.MagicMock()
-        db.__enter__.return_value = mock_db
+        import pipeline.backfill_steps
+        import pipeline.commits
+        import pipeline.git_ingest
+        from contextlib import contextmanager
+        from db_engine import MockDB
+
+        mock_db = MockDB(use_global=False)
+
+        @contextmanager
+        def fake_db():
+            yield mock_db
+
         args = mock.MagicMock(no_backfill=False)
-        with mock.patch.object(main.G, "DB", return_value=db), \
-                mock.patch.object(backfills, "backfill_commit_relations") as run:
-            main.run_automatic_backfills(args)
-        run.assert_called_once()
-        mock_db.query_one.side_effect = [("done:5",), None]
-        mock_db.fetchone.side_effect = [("done:5",), None]
-        with mock.patch.object(main.G, "DB", return_value=db), \
-                mock.patch.object(backfills, "backfill_commit_relations") as run:
-            main.run_automatic_backfills(args)
-        run.assert_not_called()
+        for state, expected_calls in (("next:5", 1), ("done:5", 0)):
+            with mock.patch.object(main.G, "DB", fake_db), \
+                    mock.patch.object(backfills, "commit_relations_state", return_value=state), \
+                    mock.patch.object(backfills, "backfill_commit_relations") as run:
+                pipeline.backfill_steps.run_automatic_backfills(args)
+            self.assertEqual(run.call_count, expected_calls)
 
 
 if __name__ == "__main__":

@@ -13,79 +13,26 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import DBLayout as D
+from db_engine import SQLiteDB
 from parser.cve import cve_ingest as ci
 from parser.cve import cve_records as cr
 from tests.test_webapp_cve import FIX, INTRO, STABLE_FIX, cna_record, other_record
 
 
-class RecordingCursor:
-    """Executes nothing: records the statements and answers COUNT(*) / the m_cve_source SELECT."""
-
-    def __init__(self, conn: "RecordingConnection") -> None:
-        self.conn = conn
-        self._row = None
-
-    def execute(self, sql: str, params=()) -> None:
-        self.conn.statements.append((sql, tuple(params)))
-        if sql.startswith("SELECT COUNT(*) FROM m_cve"):
-            self._row = (self.conn.count,)
-        elif "FROM m_cve_source" in sql:
-            self._row = self.conn.source
-        else:
-            self._row = None
-
-    def executemany(self, sql: str, rows) -> None:
-        rows = list(rows)
-        self.conn.statements.append((sql, rows))
-        if sql.startswith("INSERT INTO m_cve "):
-            self.conn.count += len(rows)
-
-    def fetchone(self):
-        return self._row
-
-    def close(self) -> None:
-        pass
+CVE_TABLES = (D.m_cve_source, D.m_cve, D.m_cve_commit, D.m_cve_commit_hash, D.m_cve_file)
 
 
-class RecordingConnection:
-    def __init__(self, source=None, count: int = 0) -> None:
-        self.statements: list = []
-        self.source = source
-        self.count = count
-        self.commits = self.rollbacks = 0
+def cve_db() -> SQLiteDB:
+    """An in-memory SQLite database with the CVE tables."""
+    db = SQLiteDB(":memory:", foreign_keys=False)
+    db.create_table(list(CVE_TABLES))
+    return db
 
-    def query(self, sql: str, params=(), dictionary: bool = True):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        res = cur.fetchall()
-        return res if res is not None else []
 
-    def query_one(self, sql: str, params=(), dictionary: bool = True):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.fetchone()
-
-    def execute(self, sql: str, params=()) -> int:
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return 1
-
-    def executemany(self, sql: str, params_seq) -> int:
-        cur = self.cursor()
-        cur.executemany(sql, params_seq)
-        return len(params_seq)
-
-    def cursor(self):
-        return RecordingCursor(self)
-
-    def commit(self) -> None:
-        self.commits += 1
-
-    def rollback(self) -> None:
-        self.rollbacks += 1
-
-    def sql(self, prefix: str) -> list:
-        return [params for sql, params in self.statements if sql.startswith(prefix)]
+def ids(db: SQLiteDB) -> list[str]:
+    """The cve_id of every stored m_cve row, sorted."""
+    return sorted(str(r[0]) for r in db.select_rows("m_cve", ["cve_id"]))
 
 
 class TestRows(unittest.TestCase):
@@ -166,21 +113,22 @@ class TestIngest(unittest.TestCase):
             (repo / "cves" / "delta.json").write_text("{}")
             head1 = self.commit(tmp)
 
-            conn = RecordingConnection()
-            res = ci.ingest(conn, repo)
+            db = cve_db()
+            db.insert_rows("m_cve", ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
+                           [("CVE-1999-0001", 1, 0, 0, 0, 0, "old.json", "stale", b"")])
+            db.insert_rows("m_cve_commit", ["commit_hash", "role", "cve_id"], [("a" * 40, 1, "CVE-1999-0001")])
+            res = ci.ingest(db, repo)
             self.assertEqual((res["state"], res["layout"], res["records"]), ("full", "cvelist", 2))
-            self.assertEqual([p for s, p in conn.statements if s == "DELETE FROM m_cve_commit"], [()], "a full ingestion replaces everything")
-            inserted = [r[0] for rows in conn.sql("INSERT INTO m_cve ") for r in rows]
-            self.assertEqual(sorted(inserted), ["CVE-2024-0001", "CVE-2024-0002"])
-            links = {(r[0], r[1], r[2]) for rows in conn.sql("INSERT IGNORE INTO m_cve_commit") for r in rows}
+            self.assertEqual(ids(db), ["CVE-2024-0001", "CVE-2024-0002"], "a full ingestion replaces everything")
+            links = {(str(r[0]), int(r[1]), str(r[2])) for r in db.select_rows("m_cve_commit", ["commit_hash", "role", "cve_id"])}
             self.assertIn((FIX, cr.ROLE_FIX, "CVE-2024-0002"), links)
-            source = conn.sql("INSERT INTO m_cve_source")[0]
-            self.assertEqual(source[:5], (repo.name, "cvelist", bytes.fromhex(head1), cr.RECORD_FORMAT, 2))
-            self.assertEqual((conn.commits, conn.rollbacks), (1, 0))
+            self.assertNotIn(("a" * 40, 1, "CVE-1999-0001"), links)
+            source = ci.source_state(db)
+            self.assertEqual((source["name"], source["layout"], source["head"], source["format"], source["records"]),
+                             (repo.name, "cvelist", head1, cr.RECORD_FORMAT, 2))
 
             # Same HEAD: nothing to do
-            state = (repo.name, "cvelist", bytes.fromhex(head1), cr.RECORD_FORMAT, 2, 1)
-            self.assertEqual(ci.ingest(RecordingConnection(source=state), repo)["state"], "current")
+            self.assertEqual(ci.ingest(db, repo)["state"], "current")
 
             # A new HEAD: one record removed, one added, one rejected
             (d / "CVE-2024-0001.json").unlink()
@@ -189,17 +137,14 @@ class TestIngest(unittest.TestCase):
             rejected["cveMetadata"]["state"] = "REJECTED"
             (d / "CVE-2024-0002.json").write_text(json.dumps(rejected))
             self.commit(tmp)
-            conn2 = RecordingConnection(source=state, count=2)
-            res2 = ci.ingest(conn2, repo)
+            res2 = ci.ingest(db, repo)
             self.assertEqual((res2["state"], res2["changed"], res2["paths"]), ("incremental", 1, 3))
-            deleted = sorted(p for params in conn2.sql("DELETE FROM m_cve WHERE") for p in params)
-            self.assertEqual(deleted, ["CVE-2024-0001", "CVE-2024-0002", "CVE-2024-0004"])
-            self.assertEqual([r[0] for rows in conn2.sql("INSERT INTO m_cve ") for r in rows], ["CVE-2024-0004"])
-            self.assertEqual([sql for sql, _p in conn2.statements if sql in ("DELETE FROM m_cve_commit", "DELETE FROM m_cve_source")], [])
+            self.assertEqual(ids(db), ["CVE-2024-0004"])
+            self.assertEqual(ci.source_state(db)["records"], 1, "the source row follows the stored record count")
 
             # Another record format: everything again
-            old_format = (*state[:3], cr.RECORD_FORMAT - 1, *state[4:])
-            self.assertEqual(ci.ingest(RecordingConnection(source=old_format), repo)["state"], "full")
+            db.update_rows("m_cve_source", {"format": cr.RECORD_FORMAT - 1}, {"name": repo.name})
+            self.assertEqual(ci.ingest(db, repo)["state"], "full")
 
     def test_vulns_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,7 +163,7 @@ class TestIngest(unittest.TestCase):
             subprocess.run(["git", "-C", tmp, "init", "-q"], check=True, env=self.env)
             (Path(tmp) / "README").write_text("x")
             self.commit(tmp)
-            self.assertEqual(ci.ingest(RecordingConnection(), Path(tmp)), {"state": "missing"})
+            self.assertEqual(ci.ingest(cve_db(), Path(tmp)), {"state": "missing"})
         self.assertIsNone(ci.repo_dir(""), "an empty cve.repo_dir turns the CVE list off")
 
 
@@ -237,19 +182,23 @@ class TestCommitPrefixes(unittest.TestCase):
             subprocess.run(["git", "-C", tmp, "init", "-q"], check=True, env=self.env)
             (Path(tmp) / "a").write_text("1")
             sha = TestIngest.commit(self, tmp)
-            db = mock.MagicMock()
-            db.query.return_value = [(sha[:12],), ("deadbeef0000",)]
+            db = cve_db()
+            db.insert_rows("m_cve_commit", ["commit_hash", "role", "cve_id"],
+                           [(sha[:12], 1, "CVE-2024-0001"), ("deadbeef0000", 1, "CVE-2024-0001"),
+                            (sha, 1, "CVE-2024-0002"), ("abcdef012345", 1, "CVE-2024-0003")])
+            db.insert_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"], [(7, "abcdef012345", b"\x01" * 20)])
             out = ci.resolve_commit_prefixes(db, tmp, 7)
-            self.assertEqual(out, {"pending": 2, "resolved": 1})
-            select = db.query.call_args_list[0].args
-            self.assertIn("NOT EXISTS (SELECT 1 FROM m_cve_commit_hash h", select[0])   # only prefixes without a row
-            self.assertEqual(select[1], (7,))
-            rows = db.executemany.call_args.args[1]
-            self.assertEqual(rows, [(7, sha[:12], bytes.fromhex(sha))])               # the unknown one gets no row
-        conn = RecordingConnection()
-        ci.write(conn, {"state": "full", "records": {}, "name": "x", "layout": "cvelist", "head": "ab" * 20})
-        self.assertIn("DELETE FROM m_cve_commit_hash", [sql for sql, _ in conn.statements])
-        self.assertIn("DELETE FROM m_cve_file", [sql for sql, _ in conn.statements])
+            self.assertEqual(out, {"pending": 2, "resolved": 1}, "a full hash and a prefix with a row are not pending")
+            stored = {(int(r[0]), str(r[1])): bytes(r[2]) for r in db.select_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"])}
+            self.assertEqual(stored[(7, sha[:12])], bytes.fromhex(sha))               # the unknown one gets no row
+            self.assertNotIn((7, "deadbeef0000"), stored)
+            self.assertEqual(ci.resolve_commit_prefixes(db, tmp, 7), {"pending": 1, "resolved": 0}, "an unresolved prefix is tried again")
+        db = cve_db()
+        db.insert_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"], [(7, "abcdef012345", b"\x01" * 20)])
+        db.insert_rows("m_cve_file", ["cve_id", "file_path"], [("CVE-1", "a.c")])
+        ci.write(db, {"state": "full", "records": {}, "name": "x", "layout": "cvelist", "head": "ab" * 20})
+        self.assertEqual(db.count_rows("m_cve_commit_hash"), 0)
+        self.assertEqual(db.count_rows("m_cve_file"), 0)
 
     def test_m_cve_file_insertion_and_deletion(self) -> None:
         """m_cve_file table is populated on insert and cleaned up on delete."""
@@ -266,23 +215,14 @@ class TestCommitPrefixes(unittest.TestCase):
             "ranges": [],
             "entries": [],
         }
-        conn = RecordingConnection()
-        cur = conn.cursor()
-        ci._insert(cur, {"path.json": ("path.json", rec)})
-        file_inserts = [
-            (sql, rows)
-            for sql, rows in conn.statements
-            if "INSERT IGNORE INTO m_cve_file" in sql
-        ]
-        self.assertEqual(len(file_inserts), 1)
-        self.assertEqual(
-            file_inserts[0][1],
-            [("CVE-2024-99999", "fs/ext4/inode.c"), ("CVE-2024-99999", "fs/ext4/super.c")],
-        )
+        db = cve_db()
+        ci._insert(db, {"path.json": ("path.json", rec)})
+        files = sorted((str(r[0]), str(r[1])) for r in db.select_rows("m_cve_file", ["cve_id", "file_path"]))
+        self.assertEqual(files, [("CVE-2024-99999", "fs/ext4/inode.c"), ("CVE-2024-99999", "fs/ext4/super.c")])
 
-        ci._delete_ids(cur, ["CVE-2024-99999"])
-        delete_stmts = [sql for sql, _ in conn.statements if "DELETE FROM m_cve_file" in sql]
-        self.assertEqual(len(delete_stmts), 1)
+        ci._delete_ids(db, ["CVE-2024-99999"])
+        self.assertEqual(db.count_rows("m_cve_file"), 0)
+        self.assertEqual(ids(db), [])
 
     def test_root_commit_12_char_filtered(self) -> None:
         """Abbreviated 12-char root commit 1da177e4c3f4 is filtered out as introducing commit."""

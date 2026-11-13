@@ -11,10 +11,8 @@ Usage:
     # Search section by name/heading:
     python3 .agents/scripts/spec_section.py core/API.md "Release Statistics"
 
-    # Scan and update TOC line ranges [Lxxx-Lyyy] in lines 1-120 of the file:
+    # Regenerate the line-indexed TOC of one spec / of every spec (same as `toc.py --write`):
     python3 .agents/scripts/spec_section.py webapp/API_ENDPOINTS.md --update-toc
-
-    # Scan and update TOC line ranges across all subsystem spec files:
     python3 .agents/scripts/spec_section.py --update-all
 """
 
@@ -91,90 +89,11 @@ def find_section(headings: list[dict], total_lines: int, query: str) -> tuple[in
     return start_line, end_line, target["text"]
 
 
-def update_toc(filepath: Path) -> bool:
-    content = filepath.read_text(encoding="utf-8")
-    lines = content.splitlines(keepends=True)
-    headings = parse_headings([l.rstrip("\r\n") for l in lines])
-
-    changed = False
-    new_lines = []
-
-    # Process TOC in first 120 lines
-    for idx, raw_line in enumerate(lines, 1):
-        if idx > 120:
-            new_lines.append(raw_line)
-            continue
-
-        # Check if line contains any [L...]
-        if not re.search(r"\[L\d+(?:-L\d+)?\]", raw_line):
-            new_lines.append(raw_line)
-            continue
-
-        # Split line by '|' to support multiple entries on one line
-        segments = raw_line.split("|")
-        new_segments = []
-        line_changed = False
-
-        for seg in segments:
-            range_match = re.search(r"\[L(\d+)(?:-L(\d+))?\]", seg)
-            if range_match:
-                before = seg[:range_match.start()]
-                sec_m = re.search(r"(?:§\s*|`|\*\*)(\d+[A-Za-z]?(?:\.\d+)*)", before)
-                if not sec_m:
-                    sec_m = re.search(r"^\s*-\s*(\d+[A-Za-z]?(?:\.\d+)*)", before)
-
-                if sec_m:
-                    sec_key = sec_m.group(1)
-                    sec_res = find_section(headings, len(lines), sec_key)
-                    if sec_res:
-                        s, e, _ = sec_res
-                        if range_match.group(2):
-                            new_tag = f"[L{s}-L{e}]"
-                        else:
-                            new_tag = f"[L{s}]"
-
-                        if new_tag != range_match.group(0):
-                            seg = seg[:range_match.start()] + new_tag + seg[range_match.end():]
-                            line_changed = True
-
-            new_segments.append(seg)
-
-        if line_changed:
-            updated_line = "|".join(new_segments)
-            changed = True
-        else:
-            updated_line = raw_line
-
-        new_lines.append(updated_line)
-
-    if changed:
-        filepath.write_text("".join(new_lines), encoding="utf-8")
-        print(f"Updated TOC line indices in {filepath}")
-    else:
-        print(f"TOC line indices in {filepath} are already up to date.")
-    return changed
-
-
-SPEC_FILES = [
-    "core/API.md",
-    "webapp/API.md",
-    "webapp/API_ENDPOINTS.md",
-    "webapp/API_FRONTEND.md",
-    "parser/c_ast/CAST_API.md",
-    "parser/kconfig_ast/KCONFIG_API.md",
-    "parser/rust_ast/RUST_API.md",
-    "parser/git_ast/GIT_API.md",
-    "parser/maintainer_ast/MAINTAINER_API.md",
-    "table_engine/TE_API.md",
-    "db_engine/DB_API.md",
-]
-
-
 def update_all() -> None:
-    for spec_rel in SPEC_FILES:
-        p = Path(spec_rel)
-        if p.is_file():
-            update_toc(p)
+    """Regenerate every spec TOC (delegates to toc.py, which owns the TOC block format)."""
+    import toc
+
+    toc.main(["--write", "all"])
 
 
 def main():
@@ -192,8 +111,9 @@ def main():
         sys.exit(1)
 
     if "--update-toc" in sys.argv:
-        update_toc(path)
-        sys.exit(0)
+        import toc
+
+        sys.exit(toc.main(["--write", str(path)]))
 
     if len(sys.argv) < 3:
         print("Error: query required (e.g. section number '4.8' or title)", file=sys.stderr)

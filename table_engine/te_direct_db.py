@@ -37,7 +37,6 @@ KEY RESPONSIBILITIES:
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import threading
 import time
@@ -178,11 +177,10 @@ class TEDirectDB:
         """Wait for a pending background commit (raising its error), then safely close the database handle."""
         self.wait_for_commit()
         if getattr(self, "db", None) is not None:
-            if hasattr(self.db, "close") and callable(self.db.close):
-                try:
-                    self.db.close()
-                except Exception:
-                    pass
+            try:
+                self.db.close()
+            except Exception:
+                pass
             self.db = None
 
     def __enter__(self) -> Self:
@@ -491,7 +489,7 @@ class TEDirectDB:
             return assigned_id
 
         table = self.tables.get(table_id)
-        if self.distributed and self.db is not None and hasattr(self.db, "reserve_id_block") and table is not None:
+        if self.distributed and self.db is not None and table is not None:
             block_size = self._id_block_sizes.get(table.table_name, self.DEFAULT_ID_BLOCK_SIZE)
             start_id, end_id = self.db.reserve_id_block(table, block_size, commit_id=self.current_commit_id)
             self._id_cursor[table_id] = start_id + 1
@@ -989,23 +987,22 @@ class TEDirectDB:
         """Write a batch with `db`; per-table stats land in `batch.stats`.
 
         `parallel` uses `db.commit_tables_parallel()` when available; otherwise each table is written with
-        `db.insert()` / `db.update()`, as one transaction when the driver offers `transaction()`. A failure carries
+        `db.insert()` / `db.update()`, as one transaction (`db.transaction()`). A failure carries
         `failed_table_ids` (the tables not committed) when that can be told.
         """
         if not batch.tables_data:
             return
-        if parallel and hasattr(db, "commit_tables_parallel"):
+        if parallel:
             if dedicated:
                 stats = db.commit_tables_parallel(batch.tables_data, max_workers=max_workers, dedicated=True)
             else:
                 stats = db.commit_tables_parallel(batch.tables_data, max_workers=max_workers)
             batch.stats = [tuple(st) for st in (stats or ())]
             return
-        transaction = getattr(db, "transaction", None)
         for pos, (table, ins_p, upd_p) in enumerate(batch.tables_data):
             t_start = time.perf_counter()
             try:
-                with transaction() if callable(transaction) else contextlib.nullcontext():
+                with db.transaction():
                     if ins_p:
                         db.insert(table, ins_p)
                     if upd_p:

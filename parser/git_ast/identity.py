@@ -16,6 +16,7 @@ Shared by the parser's release statistics step (parser/git_ast/release_stats.py)
 import contextlib
 from typing import Any, Iterable
 
+from db_engine.spec import gt
 from parser.maintainer_ast.maintainer_types import clean_identity_text
 
 
@@ -107,22 +108,20 @@ def refresh_person_identities(db: Any) -> int:
     def _dec(v: Any) -> str:
         return v.decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else ("" if v is None else str(v))
 
-    rows = db.query("SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > 0", dictionary=False)
+    rows = db.select_rows("m_maintainer_person", ["person_id", "name", "email"], {"person_id": gt(0)})
     index = build_identity_index((int(pid), _dec(name), _dec(email)) for pid, name, email in rows)
-    stored_rows = db.query("SELECT person_id, identity_key FROM m_person_identity", dictionary=False)
+    stored_rows = db.select_rows("m_person_identity", ["person_id", "identity_key"])
     stored = {int(pid): _dec(key) for pid, key in stored_rows}
     changed = [(pid, key[:IDENTITY_KEY_LEN]) for pid, key in index.items() if stored.get(pid) != key[:IDENTITY_KEY_LEN]]
     gone = sorted(pid for pid in stored if pid not in index)
-    for i in range(0, len(changed), 5000):
-        chunk = changed[i : i + 5000]
-        db.executemany(
-            "INSERT INTO m_person_identity (person_id, identity_key) VALUES (%s, %s) "
-            "ON DUPLICATE KEY UPDATE identity_key = VALUES(identity_key)",
-            chunk,
-        )
-    for i in range(0, len(gone), 1000):
-        chunk = gone[i : i + 1000]
-        placeholders = ",".join(["%s"] * len(chunk))
-        db.execute(f"DELETE FROM m_person_identity WHERE person_id IN ({placeholders})", tuple(chunk))
-    db.commit()
+    with db.transaction():
+        for i in range(0, len(changed), 5000):
+            db.insert_rows(
+                "m_person_identity",
+                ["person_id", "identity_key"],
+                changed[i : i + 5000],
+                on_conflict="update",
+            )
+        if gone:
+            db.delete_rows("m_person_identity", {"person_id": gone})
     return len(changed) + len(gone)

@@ -28,8 +28,9 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import require_indexed_ref
+from tests.db_fixtures import requires_live_db
 from fastapi import HTTPException
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 from webapp.backend.models import FormatPatchRequest
 from webapp.backend.services.callgraph_service import CallgraphService
 from webapp.backend.services.diff_service import DiffService
@@ -99,40 +100,51 @@ _FIXTURE_REFS: list[dict] = [
 _FIXTURE_REV = "fixture-rev"
 
 
-class _FixtureCursor:
-    """DB cursor answering the symbol queries of the webapp services from the fixture lists above."""
+class _FixtureReader:
+    """Read session double answering the symbol reads of the webapp services from the fixture lists above (the
+    symbol read intents they exercise are stubbed: seeding the AST / tag graph behind them is not what is tested)."""
 
-    def __init__(self) -> None:
-        self._rows: list[dict] = []
+    def __enter__(self) -> "_FixtureReader":
+        return self
 
-    def execute(self, sql: str, args: tuple | list = ()) -> None:
-        args = list(args or ())
-        rows: list[dict] = []
-        if "FROM m_tag_def WHERE name LIKE" in sql:
-            prefix = str(args[0]).rstrip("%")
-            rows = [{"name": n} for n in sorted({d["name"] for d in _FIXTURE_DEFS}) if n.startswith(prefix)]
-        elif "FROM m_symbol_def s" in sql and "s.name IN" in sql:
-            names = set(args[:-1])
-            rows = [{**d, "fid": d["blob_id"]} for d in _FIXTURE_DEFS if d["name"] in names]
-        elif "FROM m_symbol_def s" in sql and "s.name = %s" in sql:
-            rows = [{**d, "fid": d["blob_id"]} for d in _FIXTURE_DEFS if d["name"] == args[0]]
-            if "t.name IN" in sql:
-                rows = [r for r in rows if r["type_name"] in args[1:]]
-        elif "r.role, r.line" in sql:
-            targets = set(args)
-            rows = [{k: v for k, v in r.items() if k != "target"} for r in _FIXTURE_REFS if r["target"] in targets]
-        self._rows = [dict(r) for r in rows]
+    def __exit__(self, *exc) -> None:
+        return None
 
-    def fetchall(self) -> list[dict]:
-        return self._rows
+    def select_rows(self, source, columns, where=None, **kw) -> list[dict]:
+        if source != ("m_symbol_def", "s"):
+            return []
+        names = where["s.name"]
+        names = {names} if isinstance(names, str) else set(names)
+        rows = [{**d, "fid": d["blob_id"]} for d in _FIXTURE_DEFS if d["name"] in names]
+        if "t.name" in where:
+            rows = [r for r in rows if r["type_name"] in where["t.name"]]
+        return [dict(r) for r in rows]
 
-    def fetchone(self) -> dict | None:
-        return self._rows[0] if self._rows else None
+    def select_one(self, *args, **kw):
+        return None
+
+    def aggregate(self, *args, **kw) -> list[dict]:
+        return []
+
+    def symbol_name_page(self, prefix: str, *, after=None, limit: int = 400) -> list[str]:
+        names = sorted({d["name"] for d in _FIXTURE_DEFS if d["name"].startswith(prefix)}, key=lambda n: (len(n), n))
+        return [n for n in names if after is None or (len(n), n) > tuple(after)][:limit]
+
+    def symbol_refs_of_targets(self, ast_ids, *, role=None, with_caller: bool = False, limit=None) -> list[dict]:
+        targets = set(ast_ids)
+        keep = ("role", "line", "char_s", "fid", "tag_id", "ast_id") + (("caller",) if with_caller else ())
+        rows = [
+            {**{k: v for k, v in r.items() if k in keep}, "ast_id": r["target"]}
+            for r in _FIXTURE_REFS if r["target"] in targets and role in (None, r["role"])
+        ]
+        return rows[:limit] if limit else rows
+
+    def symbol_def_blobs_of_targets(self, ast_ids) -> set:
+        return set()
 
 
-@contextmanager
-def _fixture_db_cursor():
-    yield _FixtureCursor()
+def _fixture_reader() -> _FixtureReader:
+    return _FixtureReader()
 
 
 def _fixture_scope(cursor, version_name):
@@ -178,8 +190,9 @@ def _fixture_services():
     """Point the symbol, struct-layout, callgraph, filesystem and Kconfig services at the fixtures above
     (no database rows, Git tree or parsed version needed)."""
     with ExitStack() as stack:
-        for mod in (symbol_mod, pahole_mod, callgraph_mod, filesystem_mod):
-            stack.enter_context(patch.object(mod, "get_db_cursor", _fixture_db_cursor))
+        for mod in (symbol_mod, callgraph_mod):
+            stack.enter_context(patch.object(mod, "get_reader", _fixture_reader))
+        stack.enter_context(patch.object(filesystem_mod, "get_reader", _fixture_reader))
         for mod in (symbol_mod, pahole_mod, callgraph_mod):
             stack.enter_context(patch.object(mod, "definition_arch", _fixture_arch))
         stack.enter_context(patch.object(SymbolService, "_scope", staticmethod(_fixture_scope)))
@@ -199,6 +212,7 @@ def _fixture_services():
 class TestWebappAdvancedFeatures(unittest.TestCase):
     """Test suite for advanced web application systems."""
 
+    @requires_live_db("reads the live database")
     def test_version_diff_and_kconfig_diff(self) -> None:
         # File Tree Diff (same version self-diff should be 100% unchanged)
         res = get_versions_diff("v3.0", "v3.0")
@@ -257,6 +271,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertTrue(res["solution_found"])
         self.assertIn("toggles_needed", res)
 
+    @requires_live_db("reads the live database")
     def test_patch_reviewer_maintainers_matcher(self) -> None:
         sample_patch = """diff --git a/fs/ext4/super.c b/fs/ext4/super.c
 --- a/fs/ext4/super.c
@@ -296,6 +311,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn('data-act="rc"', content)
         self.assertIn("api.getHistoryCommits", content)
 
+    @requires_live_db("reads the live database")
     def test_clang_compile_commands_exporter(self) -> None:
         cmds = export_compile_commands("v3.0", arch="x86")
         self.assertIsInstance(cmds, list)
@@ -338,6 +354,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
 
 
+    @requires_live_db("reads the live database")
     def test_codebase_treemap(self) -> None:
         tree = get_codebase_treemap("v3.0", max_depth=3)
         self.assertIn("name", tree)
@@ -369,6 +386,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("From:", res["formatted_patch"])
         self.assertIn("Subject: [PATCH] ext4: update b value", res["formatted_patch"])
 
+    @requires_live_db("reads the live database")
     def test_edge_cases_empty_and_fallback(self) -> None:
         with _fixture_services():
             self._check_edge_cases()
@@ -443,6 +461,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIsInstance(results, list)
         self.assertEqual([r["name"] for r in results], ["task_nice", "task_struct"])
 
+    @requires_live_db("reads m_ast_include of the live database")
     def test_include_symbols_endpoint_and_dom(self) -> None:
         """Verify get_include_symbols endpoint and includeSymbolsPopover UI structure."""
         # 1. 404 on non-existent AST ID
@@ -451,9 +470,8 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
         # 2. Existing AST ID query if any include exists in DB
-        with get_db_cursor() as cursor:
-            cursor.execute("SELECT ast_id FROM m_ast_include LIMIT 1;")
-            row = cursor.fetchone()
+        with get_reader() as reader:
+            row = reader.select_one("m_ast_include", ["ast_id"])
         if row:
             res = get_include_symbols("v3.0", row["ast_id"])
             self.assertIn("ast_id", res)
@@ -609,6 +627,7 @@ int get_foo(void) {
         # Nothing listens for a loading event: the spinner element is the only consumer
         self.assertNotIn("app:loading", api_js)
 
+    @requires_live_db("reads the live database")
     def test_kconfig_declaration_coordinates(self) -> None:
         """Verify Kconfig symbol detail retrieves declaration file_path and line range with fallback."""
         from webapp.backend.services.kconfig_service import KconfigService
@@ -634,6 +653,7 @@ int get_foo(void) {
         self.assertTrue(sym_res["file_path"].endswith("Kconfig") or sym_res["file_path"].endswith(".c"))
         self.assertIn("line_s", sym_res)
 
+    @requires_live_db("reads the live database")
     def test_projects_and_branches_endpoints(self) -> None:
         """Verify /api/projects, /api/branches, and /api/versions include_rc functionality."""
         from webapp.backend.routers.versions import get_projects, get_branches, get_versions
@@ -692,11 +712,10 @@ int get_foo(void) {
 
     def test_commit_level_version_info_resolution(self) -> None:
         """Verify get_version_info resolves tags, -rc tags, and arbitrary commit SHAs via git rev-parse."""
-        from webapp.backend.database.pool import get_db_cursor
         from webapp.backend.database.helpers import get_version_info
 
         v30 = require_indexed_ref("v3.0")
-        with get_db_cursor() as cursor:
+        with get_reader() as cursor:
             # 1. Standard indexed tag
             cid, vname = get_version_info(cursor, "v3.0")
             self.assertEqual(cid, v30)
@@ -713,6 +732,7 @@ int get_foo(void) {
             self.assertEqual(sha_cid, v30)
             self.assertEqual(sha_vname.lower(), sha.lower())
 
+    @requires_live_db("reads the live database")
     def test_file_history_and_last_changed(self) -> None:
         """Verify file history and last changed metadata retrieval via git_service and filesystem_service."""
         from webapp.backend.services.git_service import GitService
@@ -746,39 +766,39 @@ int get_foo(void) {
         self.assertEqual(file_res["file_info"]["last_changed"]["commit_hash"], history["last_changed"]["commit_hash"])
 
 
-class _LadderCursor:
-    """Cursor over an in-memory AST where node k holds node k + 1 twice (content-addressed sharing):
+class _LadderReader:
+    """Read session double over an in-memory AST where node k holds node k + 1 twice (content-addressed sharing):
     expanded to depth d it serializes to 2^(d+1) - 1 positions from only d + 1 distinct nodes."""
 
     def __init__(self, levels: int) -> None:
         self.levels = levels
         self.queries = 0
-        self._rows: list[dict] = []
 
-    def execute(self, sql: str, args: tuple | list = ()) -> None:
+    def __enter__(self) -> "_LadderReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def select_rows(self, source, columns, where=None, **kw) -> list[dict]:
         self.queries += 1
-        ids = [int(a) for a in args]
-        if "m_ast_container" in sql:
-            self._rows = [{"ast_id": i, "ref_ast_id": i + 1, "priority": p}
-                          for i in ids if i < self.levels for p in (0, 1)]
-        else:
-            self._rows = [{"ast_id": i, "name": f"n{i}", "type_id": 1, "type_name": "Block", "tag_id": None}
-                          for i in ids if i <= self.levels]
-
-    def fetchall(self) -> list[dict]:
-        return self._rows
+        if source == "m_ast_container":
+            return [{"ast_id": i, "ref_ast_id": i + 1, "priority": p}
+                    for i in where["ast_id"] if i < self.levels for p in (0, 1)]
+        if isinstance(source, tuple) and source[0] == "m_ast":
+            return [{"ast_id": i, "name": f"n{i}", "type_id": 1, "type_name": "Block"}
+                    for i in where["a.ast_id"] if i <= self.levels]
+        return []  # m_tag: the nodes carry no tag
 
 
 class TestAstTreeBudget(unittest.TestCase):
     """GET /api/symbols/{v}/ast/{id}: the answer never serializes more than MAX_AST_TREE_NODES nodes."""
 
-    def _tree(self, depth: int, levels: int = 12) -> tuple[dict, _LadderCursor]:
-        from unittest.mock import MagicMock, patch
-        cursor = _LadderCursor(levels)
-        ctx = MagicMock()
-        ctx.__enter__.return_value = cursor
-        with patch("webapp.backend.services.symbol_service.get_db_cursor", return_value=ctx):
-            return SymbolService().get_ast_tree(0, depth), cursor
+    def _tree(self, depth: int, levels: int = 12) -> tuple[dict, _LadderReader]:
+        from unittest.mock import patch
+        reader = _LadderReader(levels)
+        with patch("webapp.backend.services.symbol_service.get_reader", return_value=reader):
+            return SymbolService().get_ast_tree(0, depth), reader
 
     @staticmethod
     def _positions(node: dict) -> int:
@@ -793,8 +813,8 @@ class TestAstTreeBudget(unittest.TestCase):
         self.assertEqual(self._positions(tree), 2 ** 11 - 1)
         self.assertFalse(self._truncated(tree))
         self.assertNotIn("containers", tree)
-        # One container query and one node query per level, not one per node
-        self.assertLessEqual(cursor.queries, 2 * 10 + 1)
+        # One container read, one node read and one tag read per level, not one per node
+        self.assertLessEqual(cursor.queries, 3 * 10 + 2)
 
     def test_budget_bounds_positions_at_any_depth(self) -> None:
         from unittest.mock import patch

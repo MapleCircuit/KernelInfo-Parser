@@ -7,11 +7,11 @@ Always enforce these invariants when modifying `core/`:
 
 1. **Canonical Database Schema Authority (`core/DBLayout.py`)**:
    - `core/DBLayout.py` is the single authoritative source of truth for all 65 tables (`Table_Array` / `TABLES`).
-   - Lines 1–93 contain the complete relational entity-relationship graph across git DAG, content-addressable blobs, code tags, symbols, Kconfig, maintainers, and distributed tasks.
-   - When adding or altering a table, update the docstring graph (lines 1–93), the `Table(...)` definition, and the table's registration in `Table_Array` / `TABLES`.
-2. **Database View & Migration Lifecycle (`main.py`)**:
+   - The module docstring contains the complete relational entity-relationship graph across git DAG, content-addressable blobs, code tags, symbols, Kconfig, maintainers, and distributed tasks.
+   - When adding or altering a table, update the docstring graph, the `Table(...)` definition, and the table's registration in `Table_Array` / `TABLES`.
+2. **Database View & Migration Lifecycle (`pipeline/db_setup.py`)**:
    - Tables in `Table_Array` are auto-created by the engine.
-   - Joined database views (e.g., `m_symbol_def`, `m_symbol_ref`) are defined and maintained in `main.py` (`ensure_db_views`). Never issue manual ad-hoc DDL in feature code.
+   - Joined database views (e.g., `m_symbol_def`, `m_symbol_ref`) are registered in `db_engine/views.py` and created by `db.ensure_views()` (called from `pipeline/db_setup.py` `ensure_db_views`). Never issue manual ad-hoc DDL or SQL text in feature code (`tests/test_db_boundary.py`).
 3. **Derived Table Backfills (`core/backfills.py`)**:
    - Derived facts computed across commits or blobs belong in `core/backfills.py` registered in `BACKFILL_HANDLERS`.
    - Handlers must support restartability, idempotence, and progress logging.

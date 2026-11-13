@@ -9,6 +9,7 @@ size in bytes.
 """
 import copy
 import gc
+from collections import Counter
 import os
 import pickle
 import re
@@ -18,18 +19,16 @@ import threading
 import unittest
 
 import main
+import pipeline.source_order
+import pipeline.worker_protocol
+import pipeline.worker_stage
 from core.DBLayout import m_ast, m_blob_symbol_def, m_bridge_checkpoint, m_bridge_tag, m_file_name, m_tag
 from core.GreatProcessor import GreatProcessor
+from core.SymbolRows import STATS as SYMBOL_STATS
 from core.globalstuff import G
 from core.Profiler import PipelineProfiler, PipelineStageProfiler, _format_pct
 from db_engine import MockDB
-from db_engine.DBHandling import MariaDB, parse_server_setting
 from table_engine import TECachedDB, TEDirectDB
-
-
-def _reset_mock_db() -> None:
-    MockDB._global_store.clear()
-    MockDB._global_next_id.clear()
 
 
 class _GatedDB(MockDB):
@@ -56,7 +55,7 @@ class _GatedDB(MockDB):
 
 
 def _stored(table) -> dict:
-    return MockDB._global_store.get(table.table_name, {})
+    return MockDB.store.get(table.table_name, {})
 
 
 class _EngineCase(unittest.TestCase):
@@ -64,7 +63,7 @@ class _EngineCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self.saved = (G.DB, G.TE)
-        _reset_mock_db()
+        MockDB.reset()
         _GatedDB.gate.set()
         _GatedDB.fail_tables = set()
         _GatedDB.dedicated_calls = 0
@@ -81,7 +80,7 @@ class _EngineCase(unittest.TestCase):
         except Exception:
             pass
         G.DB, G.TE = self.saved
-        _reset_mock_db()
+        MockDB.reset()
 
     def _stage_symbol(self, name: str) -> tuple:
         return self.te.set(m_blob_symbol_def.table_id, (None, 7, 8, 9, name, 1, 0, 1, 2))
@@ -142,7 +141,7 @@ class TestBackgroundCommits(_EngineCase):
         _GatedDB.fail_tables = {"m_file_name"}
         self.te.commit_all()
         _GatedDB.fail_tables = set()
-        main._end_background_commits("[test]")
+        pipeline.worker_stage._end_background_commits("[test]")
         self.assertFalse(self.te.async_commits)
         self.assertEqual([r[1] for r in _stored(m_file_name).values() if r[1] == "fs/ext2/inode.c"], ["fs/ext2/inode.c"])
 
@@ -175,28 +174,28 @@ class TestIdleCommit(_EngineCase):
     def test_waiting_parent_commits_in_the_background(self) -> None:
         self.te.async_commits = True
         self._stage_symbol("idle")
-        saved = main._IDLE_COMMIT_MIN_ROWS
+        saved = pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS
         try:
-            main._IDLE_COMMIT_MIN_ROWS = 2
-            main._maybe_idle_commit()
+            pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS = 2
+            pipeline.worker_stage._maybe_idle_commit()
             self.assertEqual(self.te.staged_rows, 1, "below the threshold nothing is committed")
-            main._IDLE_COMMIT_MIN_ROWS = 1
-            main._maybe_idle_commit()
+            pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS = 1
+            pipeline.worker_stage._maybe_idle_commit()
             self.assertEqual(self.te.staged_rows, 0)
             self.te.wait_for_commit()
             self.assertEqual(self.te.commit_stats["background"], 1)
         finally:
-            main._IDLE_COMMIT_MIN_ROWS = saved
+            pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS = saved
 
     def test_no_commit_outside_a_stage(self) -> None:
         self._stage_symbol("idle")
-        saved = main._IDLE_COMMIT_MIN_ROWS
+        saved = pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS
         try:
-            main._IDLE_COMMIT_MIN_ROWS = 1
-            main._maybe_idle_commit()
+            pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS = 1
+            pipeline.worker_stage._maybe_idle_commit()
             self.assertEqual(self.te.staged_rows, 1)
         finally:
-            main._IDLE_COMMIT_MIN_ROWS = saved
+            pipeline.worker_stage._IDLE_COMMIT_MIN_ROWS = saved
 
 
 class TestBlobSymbolCache(_EngineCase):
@@ -304,21 +303,21 @@ class TestStageCounts(unittest.TestCase):
 def _reporting_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     """Fake worker that answers every task and reports a fixed time split with its done frame."""
     while True:
-        task = main._recv_task(conn)
+        task = pipeline.worker_protocol._recv_task(conn)
         if task is None:
             break
         batch_id, files = task
-        conn.send_bytes(main._encode_batch_result(batch_id, {f: 1 for f in files}, [], compress=False))
-    split = dict.fromkeys(main._WORKER_SPLIT_KEYS, 0.0)
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {f: 1 for f in files}, [], compress=False))
+    split = dict.fromkeys(pipeline.worker_protocol._WORKER_SPLIT_KEYS, 0.0)
     split.update(busy_s=3.0, task_wait_s=1.0, db_reads=5, symbol_stats={"refs reused": 2})
-    conn.send_bytes(main._FRAME_DONE + pickle.dumps(split))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE + pickle.dumps(split))
     conn.close()
 
 
 class TestStageTimeSplit(unittest.TestCase):
     def setUp(self) -> None:
         self.saved = (G.DB, G.TE)
-        _reset_mock_db()
+        MockDB.reset()
         G.DB = MockDB
         G.TE = TECachedDB(hugepages="off")
         G.TE.start(main.gp.Table_Array, MockDB)
@@ -330,7 +329,7 @@ class TestStageTimeSplit(unittest.TestCase):
         G.TE.close()
         G.DB, G.TE = self.saved
         gc.unfreeze()
-        _reset_mock_db()
+        MockDB.reset()
 
     @staticmethod
     def _timeout(signum, frame) -> None:
@@ -338,7 +337,7 @@ class TestStageTimeSplit(unittest.TestCase):
 
     def test_workers_report_their_time_split(self) -> None:
         ingested: dict = {}
-        result = main._run_worker_stage(
+        result = pipeline.worker_stage._run_worker_stage(
             "[test]", [(0, ["a.c"]), (1, ["b.c"]), (2, ["c.c"])], ingested.update, 2, [], worker_target=_reporting_worker
         )
         self.assertEqual(set(ingested), {"a.c", "b.c", "c.c"})
@@ -347,14 +346,14 @@ class TestStageTimeSplit(unittest.TestCase):
         self.assertEqual(result.split["worker_db_reads"], 10)
         self.assertGreaterEqual(result.split["ingest_s"], 0.0)
         self.assertFalse(G.TE.async_commits, "background commits end with the stage")
-        text = main._format_time_split(result.split)
+        text = pipeline.worker_stage._format_time_split(result.split)
         self.assertIn("workers 75% parsing", text)
         self.assertIn("25% without a task", text)
-        self.assertEqual(main.WORKER_SYMBOL_STATS["refs reused"], 4)
+        self.assertEqual(pipeline.worker_stage.WORKER_SYMBOL_STATS["refs reused"], 4)
         with self.assertLogs(main.logger, "INFO") as logs:
-            main._log_symbol_stats("v-test", main.Counter(main.SYMBOL_STATS))
+            pipeline.worker_stage._log_symbol_stats("v-test", Counter(SYMBOL_STATS))
         self.assertIn("4 items stored in tags (4 of them in reused tags", logs.output[0])
-        self.assertFalse(main.WORKER_SYMBOL_STATS)
+        self.assertFalse(pipeline.worker_stage.WORKER_SYMBOL_STATS)
 
 
 class TestBatchBytes(unittest.TestCase):
@@ -365,7 +364,7 @@ class TestBatchBytes(unittest.TestCase):
                 with open(os.path.join(d, f"f{i}.c"), "wb") as f:
                     f.write(b"x" * size)
                 files.append(f"M\tf{i}.c")
-            epochs = main.partition_source_epochs(files, working_dir=d, normal_batch_size=50, num_workers=2)
+            epochs = pipeline.source_order.partition_source_epochs(files, working_dir=d, normal_batch_size=50, num_workers=2)
         self.assertEqual(len(epochs), 1)
         batches = epochs[0]
         self.assertEqual(batches[0][1], ["M\tf0.c"], "the large file is its own batch, dispatched first")

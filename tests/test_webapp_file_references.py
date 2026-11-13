@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import HTTPException
 
+from db_engine import MockDB
+from tests.db_fixtures import patch_reader
 from webapp.backend.services import filesystem_service as fss
 
 REFS = [
@@ -29,48 +31,37 @@ BLOB_PATHS = {10: ["kernel/fork.c"], 11: ["kernel/a.c"], 12: ["arch/x/Kconfig"],
               14: ["kernel/Makefile"], 20: ["include/linux/sched.h"]}
 
 
-class Cur:
-    def __init__(self, known: bool = True) -> None:
-        self.rows: list = []
-        self.statements: list[str] = []
-        self.known = known
+TARGET = "include/linux/sched.h"
 
-    def execute(self, sql: str, params=()) -> None:
-        self.statements.append(sql)
-        names = {p: 100 + i for i, p in enumerate(sorted({r[4] for r in REFS}))}
-        if "FROM m_file_name WHERE fname" in sql:
-            self.rows = [{"fnid": 5}] if self.known else []
-        elif "FROM m_file_name WHERE fnid IN" in sql:
-            self.rows = [{"fnid": f, "fname": p} for p, f in names.items() if f in params]
-        elif "SELECT ref_id, details FROM m_file_reference" in sql:
-            self.rows = [{"ref_id": i, "details": REFS[i][2]} for i in params]
-        elif "FROM m_file_reference" in sql:
-            self.rows = [{"ref_id": i, "ref_type": t, "line_no": ln, "source_blob_id": b, "source_fnid": names[p]}
-                         for i, (t, ln, d, b, p) in enumerate(REFS)]
-        elif "FROM m_kbuild_symbol" in sql:
-            self.rows = [{"source_blob_id": b, "line_no": ln, "symbol": s, "rule": r, "fname": p} for b, ln, s, r, p in KBUILD]
-        else:
-            raise AssertionError(sql)
 
-    def fetchone(self):
-        return self.rows[0] if self.rows else None
-
-    def fetchall(self):
-        return self.rows
+def make_db(known: bool = True) -> MockDB:
+    """A database holding the references and Kbuild rules of `TARGET` (nothing when `known` is false)."""
+    db = MockDB(use_global=False)
+    paths = sorted({r[4] for r in REFS} | {r[4] for r in KBUILD})
+    fnid = {p: 100 + i for i, p in enumerate(paths)}
+    db.insert_rows("m_file_name", ["fnid", "fname"], [(f, p) for p, f in fnid.items()] + ([(5, TARGET)] if known else []))
+    db.insert_rows(
+        "m_file_reference",
+        ["ref_id", "target_fnid", "ref_type", "line_no", "source_blob_id", "source_fnid", "details"],
+        [(i + 1, 5, t, ln, b, fnid[p], d) for i, (t, ln, d, b, p) in enumerate(REFS)],
+    )
+    db.insert_rows(
+        "m_kbuild_symbol",
+        ["source_blob_id", "source_fnid", "idx", "via", "line_no", "symbol", "rule", "target_fnid"],
+        [(b, fnid[p], i, 1, ln, s, r, 5) for i, (b, ln, s, r, p) in enumerate(KBUILD)],
+    )
+    return db
 
 
 class TestFileReferences(unittest.TestCase):
-    def call(self, cur: Cur, path: str = "include/linux/sched.h", limit: int = 200) -> dict:
-        ctx = mock.MagicMock()
-        ctx.__enter__.return_value = cur
-        with mock.patch.object(fss, "get_db_cursor", return_value=ctx), \
+    def call(self, db: MockDB, path: str = TARGET, limit: int = 200) -> dict:
+        with patch_reader(db), \
                 mock.patch.object(fss, "get_version_info", return_value=(1, "v3.0")), \
                 mock.patch.object(fss.git_tree_resolver, "blob_paths", return_value=BLOB_PATHS):
             return fss.FilesystemService().get_file_references("v3.0", path, limit)
 
     def test_kinds_and_tree_filter(self) -> None:
-        cur = Cur()
-        res = self.call(cur)
+        res = self.call(make_db())
         self.assertTrue(res["indexed"])
         self.assertEqual(res["included_by"], [{"path": "kernel/a.c", "line": 1}, {"path": "kernel/fork.c", "line": 3}])
         self.assertEqual(res["sourced_by"], [{"path": "arch/x/Kconfig", "line": 4}])
@@ -79,19 +70,18 @@ class TestFileReferences(unittest.TestCase):
         self.assertEqual(res["totals"], {"included_by": 2, "sourced_by": 1, "documented_in": 1, "built_by": 1})
         self.assertFalse(res["truncated"])
         self.assertEqual(res["includes_source"], "parser")
-        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in cur.statements))
 
     def test_cap_and_truncated(self) -> None:
-        res = self.call(Cur(), limit=1)
+        res = self.call(make_db(), limit=1)
         self.assertEqual(len(res["included_by"]), 1)
         self.assertEqual(res["totals"]["included_by"], 2)
         self.assertTrue(res["truncated"])
 
     def test_unknown_path_and_validation(self) -> None:
-        res = self.call(Cur(known=False), path="no/such.h")
+        res = self.call(make_db(known=False), path="no/such.h")
         self.assertEqual((res["included_by"], res["built_by"], res["indexed"]), ([], [], False))
         with self.assertRaises(HTTPException):
-            self.call(Cur(), path="../etc/passwd")
+            self.call(make_db(), path="../etc/passwd")
 
 
 if __name__ == "__main__":

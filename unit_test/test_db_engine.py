@@ -39,6 +39,7 @@ if PROJECT_ROOT not in sys.path:
 import core
 from core.globalstuff import JoinsType
 from core.TableHandling import Table
+from core.DBLayout import m_ast
 from db_engine import DB_ENGINES, BaseDBEngine
 from db_engine import (
     Agg,
@@ -68,7 +69,9 @@ from db_engine import (
     not_in,
     not_null,
 )
-from db_engine.DBHandling import MariaDB, parse_server_setting
+from db_engine.DBHandling import MariaDB
+from db_engine.mariadb_support import parse_server_setting
+from db_engine.errors import PacketTooLargeError
 from unit_test.harness import (
     TestTableCollection,
     test_feature,
@@ -103,7 +106,7 @@ class GenericDBEngineTestCase:
         cls.feature_registry = FeatureRegistry()
 
         # Introspect engine capabilities
-        cls.has_network_socket = hasattr(cls.engine_class, "check_if_connected")
+        cls.has_network_socket = "concurrent_connections" in getattr(cls.engine_class, "base_capabilities", ())
         cls.has_packet_bisection = (cls.engine_name == "MariaDB")
         cls.supports_index_tracking = (cls.engine_name != "MockDB")
 
@@ -542,7 +545,7 @@ class GenericDBEngineTestCase:
         t_debug = self.test_tables.t_ast_debug
         self.db.insert(t_ast, tuple((10 + i, f"node_{i}", 1) for i in range(6)))
 
-        original_executemany = self.db.cursor.executemany
+        original_executemany = self.db._cur.executemany
         call_count = 0
 
         def simulated_executemany(sql: str, chunk: list[tuple]) -> None:
@@ -554,7 +557,7 @@ class GenericDBEngineTestCase:
                 )
             original_executemany(sql, chunk)
 
-        self.db.cursor.executemany = simulated_executemany
+        self.db._cur.executemany = simulated_executemany
         try:
             with test_step(
                 "Executing insert() with 6 rows triggering simulated packet error 1153",
@@ -571,7 +574,7 @@ class GenericDBEngineTestCase:
                 row = self.db.select(t_debug, (10, None))
                 self.assertIsNotNone(row)
         finally:
-            self.db.cursor.executemany = original_executemany
+            self.db._cur.executemany = original_executemany
 
     @test_feature("payload_unhandled_oversized", depends_on=["create_table"])
     def test_15_payload_unhandled_oversized(self) -> None:
@@ -590,18 +593,19 @@ class GenericDBEngineTestCase:
         ):
             mock_driver = object.__new__(self.engine_class)
             mock_driver.cnx = MagicMock()
-            mock_driver.cursor = MagicMock()
+            mock_driver._cur = MagicMock()
             mock_driver.check_if_connected = MagicMock()
             mock_driver.close = MagicMock()
-            mock_driver.cursor.executemany.side_effect = mysql.connector.errors.OperationalError(
+            mock_driver._cur.executemany.side_effect = mysql.connector.errors.OperationalError(
                 errno=1153, msg="Got a packet bigger than 'max_allowed_packet' bytes"
             )
 
             single_oversized = ((99, "UNHANDLED_OVERSIZED_PAYLOAD"),)
-            with self.assertRaises(mysql.connector.Error) as ctx:
+            with self.assertRaises(PacketTooLargeError) as ctx:
                 mock_driver.insert(t_debug, single_oversized)
             self.assertIn("1153", str(ctx.exception))
-            self.assertEqual(mock_driver.cursor.executemany.call_count, 3, "Expected 3 retry attempts before raising")
+            self.assertIsInstance(ctx.exception.__cause__, mysql.connector.Error)
+            self.assertEqual(mock_driver._cur.executemany.call_count, 3, "Expected 3 retry attempts before raising")
 
     @test_feature("payload_byte_bounded_chunking", depends_on=["create_table"])
     def test_16_payload_byte_bounded_chunking(self) -> None:
@@ -636,18 +640,40 @@ class GenericDBEngineTestCase:
             self.db.commit()
             self.db.rollback()
 
+        if self.engine_name == "MockDB":
+            from db_engine import UnsupportedOperation
+
+            with test_step("MockDB raw SQL raises UnsupportedOperation"):
+                for call in (
+                    lambda: self.db._raw_query("SELECT 1 AS val"),
+                    lambda: self.db._raw_query_one("SELECT 1 AS val"),
+                    lambda: list(self.db._raw_query_iter("SELECT 1")),
+                    lambda: self.db._raw_execute("SELECT 1"),
+                    lambda: self.db._raw_executemany("SELECT %s", [(1,)]),
+                    lambda: self.db._raw_cursor(),
+                ):
+                    with self.assertRaises(UnsupportedOperation):
+                        call()
+            with test_step("MockDB schema helpers answer from the in-memory schema"):
+                self.assertFalse(self.db.table_exists("t_no_such_table_xyz"))
+                self.db.create_view("v_t_demo", "SELECT 1")
+                self.assertTrue(self.db.table_exists("v_t_demo"))
+                self.db.drop_view("v_t_demo")
+                self.assertFalse(self.db.table_exists("v_t_demo"))
+            return
+
         with test_step("Executing driver query and query_one"):
-            rows = self.db.query("SELECT 1 AS val")
+            rows = self.db._raw_query("SELECT 1 AS val")
             self.assertIsInstance(rows, list)
-            row = self.db.query_one("SELECT 1 AS val")
+            row = self.db._raw_query_one("SELECT 1 AS val")
             if row is not None:
                 val = row.get("val") if isinstance(row, dict) else row[0]
                 self.assertEqual(val, 1)
 
         with test_step("Executing driver execute and executemany"):
-            res = self.db.execute("SELECT 1")
+            res = self.db._raw_execute("SELECT 1")
             self.assertGreaterEqual(res, 0)
-            many_res = self.db.executemany("SELECT %s", [(1,), (2,)])
+            many_res = self.db._raw_executemany("SELECT %s", [(1,), (2,)])
             self.assertGreaterEqual(many_res, 0)
 
     @test_feature("spec_reads_and_conditions", depends_on=["create_table"])
@@ -794,8 +820,7 @@ class GenericDBEngineTestCase:
                 [(1, "A_Updated", "a@test.com")],
                 on_conflict="update",
             )
-            # MariaDB returns 2 for updated row, MockDB returns 2
-            self.assertIn(rc_up, (1, 2))
+            self.assertEqual(rc_up, 1, "upsert counts every offered row once on every backend")
             val = self.db.select_value(t_person, "name", where={"person_id": 1})
             self.assertEqual(val, "A_Updated")
 
@@ -954,7 +979,7 @@ class _FakeCnx:
 def _offline_mariadb() -> MariaDB:
     db = MariaDB.__new__(MariaDB)
     db.cnx = _FakeCnx()
-    db.cursor = _FakeCursor()
+    db._cur = _FakeCursor()
     db.sessions = 0
 
     def _init_session() -> None:
@@ -1016,7 +1041,7 @@ class _TuningCursor:
 class TestServerTuning(unittest.TestCase):
     def _db(self, values: dict, caps: dict | None = None) -> MariaDB:
         db = _offline_mariadb()
-        db.cursor = _TuningCursor(values, caps or {})
+        db._cur = _TuningCursor(values, caps or {})
         return db
 
     def test_sizes_parse_and_only_grow(self) -> None:
@@ -1025,7 +1050,7 @@ class TestServerTuning(unittest.TestCase):
         db = self._db({"innodb_log_file_size": 4 * 1024**3, "innodb_flush_log_at_trx_commit": 1})
         notes = db.apply_server_tuning({"innodb_log_file_size": "2G", "innodb_flush_log_at_trx_commit": 2})
         self.assertEqual(notes, ["innodb_flush_log_at_trx_commit: 1 -> 2"])
-        self.assertEqual(db.cursor.values["innodb_log_file_size"], 4 * 1024**3)
+        self.assertEqual(db._cur.values["innodb_log_file_size"], 4 * 1024**3)
 
     def test_capped_and_unknown_variables_are_reported(self) -> None:
         db = self._db({"innodb_buffer_pool_size": 128 * 1024**2}, caps={"innodb_buffer_pool_size": 128 * 1024**2})
@@ -1052,7 +1077,7 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
     def test_adaptive_bisection_on_error_1153(self) -> None:
         """When executemany raises OperationalError 1153, insert() bisects chunks and succeeds."""
         maria = object.__new__(MariaDB)
-        maria.cursor = MagicMock()
+        maria._cur = MagicMock()
         maria.cnx = MagicMock()
         maria.check_if_connected = MagicMock()
         maria.close = MagicMock()
@@ -1064,16 +1089,16 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
                 )
                 raise err
 
-        maria.cursor.executemany.side_effect = mock_executemany
+        maria._cur.executemany.side_effect = mock_executemany
         sample_data = tuple((b"\x01" * 32, f"int func_{i}() {{ return {i}; }}") for i in range(6))
         maria.insert(self.t_code, sample_data)
-        self.assertGreater(maria.cursor.executemany.call_count, 1)
+        self.assertGreater(maria._cur.executemany.call_count, 1)
         maria.cnx.commit.assert_called_once()
 
     def test_byte_bounded_chunking_large_payloads(self) -> None:
         """Tables with large text columns are chunked into smaller batches based on size."""
         maria = object.__new__(MariaDB)
-        maria.cursor = MagicMock()
+        maria._cur = MagicMock()
         maria.cnx = MagicMock()
         maria.check_if_connected = MagicMock()
         maria.close = MagicMock()
@@ -1081,8 +1106,52 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
         large_code = "A" * (500 * 1024)
         sample_data = tuple((b"\x02" * 32, large_code) for _ in range(10))
         maria.insert(self.t_code, sample_data)
-        self.assertGreaterEqual(maria.cursor.executemany.call_count, 2)
+        self.assertGreaterEqual(maria._cur.executemany.call_count, 2)
 
+
+
+class TestMariaDBCursorMethodAndPoolConfig(unittest.TestCase):
+    """`MariaDB._raw_cursor()` stays callable (the shared cursor lives in `_cur`); the pool never invents credentials."""
+
+    def test_cursor_method_not_shadowed(self) -> None:
+        from db_engine.DBHandling import MariaDB
+
+        db = object.__new__(MariaDB)
+        db.cnx = MagicMock()
+        db._cur = MagicMock()
+        db._in_txn = False
+        db.check_if_connected = MagicMock()
+        handle = db._raw_cursor(dictionary=True)
+        db.cnx.cursor.assert_called_once_with(dictionary=True)
+        self.assertIs(handle, db.cnx.cursor.return_value)
+
+    def test_connect_without_credentials_is_a_clear_error(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from db_engine import ConfigurationError
+        from db_engine.DBHandling import MariaDB
+
+        env = {k: v for k, v in os.environ.items() if k not in ("DB_USER", "DB_PASSWORD")}
+        with patch.dict(os.environ, env, clear=True), patch("mysql.connector.connect") as connect:
+            with self.assertRaises(ConfigurationError) as ctx:
+                MariaDB()
+        self.assertIn("database.user", str(ctx.exception))
+        connect.assert_not_called()
+
+    def test_pool_requires_injected_credentials(self) -> None:
+        import db_engine.pool as pool
+
+        saved = pool._CONFIG_PROVIDER
+        try:
+            pool._CONFIG_PROVIDER = None
+            with self.assertRaises(pool.PoolConfigError):
+                pool._create_pool()
+            pool.configure_pool({"host": "127.0.0.1"})
+            with self.assertRaises(pool.PoolConfigError):
+                pool._create_pool()
+        finally:
+            pool._CONFIG_PROVIDER = saved
 
 
 # =============================================================================
@@ -1110,6 +1179,92 @@ def _generate_engine_test_classes() -> None:
 
 
 # Execute auto-generation upon module load
+class TestMariaDBReserveIdBlockSql(unittest.TestCase):
+    """The MariaDB sequence allocator's statements (driver internals, moved from the distributed tests)."""
+
+    def test_reserve_id_block_upsert_initialization(self):
+        """Verify reserve_id_block executes sequence upsert before SELECT FOR UPDATE."""
+        mock_cnx = MagicMock()
+        mock_cur = MagicMock()
+        mock_cnx.cursor.return_value = mock_cur
+        mock_cur.fetchone.return_value = (500,)
+
+        class MockBaseEngine:
+            def __init__(self, cnx):
+                self.cnx = cnx
+
+        engine = MockBaseEngine(mock_cnx)
+        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=1000, commit_id=12)
+
+        self.assertEqual(start, 500)
+        self.assertEqual(end, 1499)
+
+        exec_calls = mock_cur.execute.call_args_list
+        self.assertIn("INSERT INTO m_table_sequence", exec_calls[0][0][0])
+        # The upsert seeds a missing sequence row from MAX(pk) + 1 and never moves an existing one backwards
+        self.assertIn("COALESCE(MAX(ast_id), 0) + 1 FROM m_ast", exec_calls[0][0][0])
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", exec_calls[0][0][0])
+        self.assertIn("SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE", exec_calls[1][0][0])
+        self.assertIn("UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s", exec_calls[2][0][0])
+        self.assertEqual(exec_calls[2][0][1], (1500, m_ast.table_id))
+
+    def test_reserve_id_block_disables_autocommit_during_lock(self):
+        """Verify reserve_id_block sets autocommit=False during the lock and restores original autocommit."""
+        mock_cnx = MagicMock()
+        mock_cnx.autocommit = True
+        mock_cur = MagicMock()
+        mock_cnx.cursor.return_value = mock_cur
+        mock_cur.fetchone.return_value = (100,)
+
+        autocommit_during_execute = []
+
+        def track_execute(sql, params=()):
+            autocommit_during_execute.append(mock_cnx.autocommit)
+
+        mock_cur.execute.side_effect = track_execute
+
+        class MockBaseEngine:
+            def __init__(self, cnx):
+                self.cnx = cnx
+
+        engine = MockBaseEngine(mock_cnx)
+        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=100, commit_id=5)
+
+        self.assertEqual(start, 100)
+        self.assertEqual(end, 199)
+        self.assertTrue(len(autocommit_during_execute) >= 3)
+        self.assertTrue(all(val is False for val in autocommit_during_execute))
+        self.assertTrue(mock_cnx.autocommit)
+        mock_cnx.commit.assert_called_once()
+
+    def test_reserve_id_block_sql_advances_sequence_beyond_existing_max(self) -> None:
+        from core.DBLayout import m_file_reference
+
+        db = MariaDB.__new__(MariaDB)
+        mock_cnx = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cnx.cursor.return_value = mock_cursor
+        db.cnx = mock_cnx
+
+        executed = []
+        mock_cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        mock_cursor.fetchone.return_value = (50000,)
+
+        start_id, end_id = db.reserve_id_block(m_file_reference, 1000)
+        self.assertEqual(start_id, 50000)
+        self.assertEqual(end_id, 50999)
+
+        upsert_sql = executed[0][0]
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", upsert_sql)
+
+    def test_insert_sql_idempotent_tables_skip_only_existing_rows(self) -> None:
+        from core.DBLayout import m_commit, m_commit_file
+        sql = MariaDB._insert_sql(m_commit_file)
+        self.assertTrue(sql.startswith("INSERT INTO `m_commit_file` VALUES"))
+        self.assertTrue(sql.endswith("ON DUPLICATE KEY UPDATE `commit_id` = `commit_id`"))
+        self.assertNotIn("ON DUPLICATE", MariaDB._insert_sql(m_commit))
+
+
 _generate_engine_test_classes()
 
 

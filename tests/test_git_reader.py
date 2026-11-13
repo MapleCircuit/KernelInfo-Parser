@@ -1,5 +1,7 @@
 """tests/test_git_reader.py - Unit Tests for GitReader and FilesystemService Version Reading."""
 import unittest
+
+from tests.db_fixtures import requires_live_db
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
 from webapp.backend.services.git_reader import READERS_PER_REPO, GitReader, git_reader
@@ -95,6 +97,7 @@ class TestFilesystemServiceGetFile(unittest.TestCase):
     def setUp(self) -> None:
         self.svc = FilesystemService()
 
+    @requires_live_db("reads the live database")
     def test_get_file_small_and_big(self) -> None:
         """Verify get_file retrieves version-specific source for small and large files."""
         res_small = self.svc.get_file("v3.0", "include/linux/lockd/bind.h")
@@ -107,18 +110,21 @@ class TestFilesystemServiceGetFile(unittest.TestCase):
         self.assertEqual(res_big["version"], "v3.0")
         self.assertIn("struct task_struct", res_big["content"])
 
+    @requires_live_db("reads the live database")
     def test_get_file_directory(self) -> None:
         """Verify get_file on directory returns directory structure."""
         res = self.svc.get_file("v3.0", "include/linux/lockd")
         self.assertEqual(res["type"], "dir")
         self.assertTrue(res["is_directory"])
 
+    @requires_live_db("reads the live database")
     def test_get_file_unindexed(self) -> None:
         """Verify get_file on unindexed file (e.g. Makefile) gracefully serves source code."""
         res = self.svc.get_file("v3.0", "Makefile")
         self.assertEqual(res["type"], "file")
         self.assertIn("VERSION = 3", res["content"])
 
+    @requires_live_db("reads the live database")
     def test_get_file_missing_404(self) -> None:
         """Verify nonexistent file raises 404."""
         with self.assertRaises(HTTPException) as ctx:
@@ -139,6 +145,7 @@ class TestGitBlameService(unittest.TestCase):
         from webapp.backend.services.git_service import GitService
         self.svc = GitService()
 
+    @requires_live_db("reads the live database")
     def test_get_blame_success_and_schema(self) -> None:
         """Verify git blame produces the keys the webapp frontend reads, on every line."""
         res = self.svc.get_blame("v3.0", "include/linux/lockd/bind.h")
@@ -156,6 +163,7 @@ class TestGitBlameService(unittest.TestCase):
             self.assertGreater(entry["date"], 0)
         self.assertEqual([e["line"] for e in res["lines"]], list(range(1, len(res["lines"]) + 1)))
 
+    @requires_live_db("reads the live database")
     def test_get_blame_router_scoped(self) -> None:
         """Verify the commits router's blame route proxies blame retrieval."""
         from webapp.backend.routers.commits import get_blame
@@ -169,6 +177,7 @@ class TestGitBlameService(unittest.TestCase):
             self.svc.get_blame("v3.0", "../../../etc/passwd")
         self.assertEqual(ctx.exception.status_code, 400)
 
+    @requires_live_db("reads the live database")
     def test_get_blame_file_with_form_feeds(self) -> None:
         """Verify files with form feed characters (e.g. COPYING:75) blame every line without missing entries."""
         res = self.svc.get_blame("v3.10", "COPYING")

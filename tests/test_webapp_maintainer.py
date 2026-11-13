@@ -11,7 +11,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import require_indexed_ref
-from webapp.backend.database.pool import get_db_cursor
+from tests.db_fixtures import requires_live_db
+from db_engine.spec import gt
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.maintainer_service import (
     _address_in_domain,
     _build_identity_index,
@@ -27,16 +29,15 @@ get_person_profile = maintainer_service.get_person_profile
 get_credits_overview = maintainer_service.get_credits
 
 
+@requires_live_db("maintainer endpoints read the live database")
 class TestWebAppMaintainerEndpoints(unittest.TestCase):
     """Test web application backend endpoints for Maintainer and Credits subsystems."""
 
     @classmethod
     def setUpClass(cls) -> None:
         try:
-            with get_db_cursor() as cur:
-                cur.execute("SELECT COUNT(*) as c FROM m_maintainer_section WHERE sec_id > 0;")
-                row = cur.fetchone()
-                count = row.get("c", 0) if isinstance(row, dict) else (row[0] if row else 0)
+            with get_reader() as reader:
+                count = reader.count_rows("m_maintainer_section", {"sec_id": gt(0)})
                 if count == 0:
                     raise unittest.SkipTest("m_maintainer_section is not populated in active database.")
         except unittest.SkipTest:

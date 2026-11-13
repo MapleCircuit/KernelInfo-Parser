@@ -1,6 +1,8 @@
 """tests/test_webapp_source_index.py - Source index: per-blob facts, revision assembly and its saved form (webapp/API.md section 2.19)."""
 from __future__ import annotations
 
+from cache_engine import get_cache_engine
+
 import os
 import shutil
 import subprocess
@@ -172,8 +174,7 @@ class TestFactStore(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.env.stop()
-        for conn in self.store._conns.values():
-            conn.close()
+        get_cache_engine().close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_round_trip_missing_and_prune(self) -> None:
@@ -301,8 +302,7 @@ class TestBuildFromGit(unittest.TestCase):
                 again = si.build_revision(second, workers=1)
                 self.assertEqual(len(extracted), len(SOURCES) + 1, "a saved revision is read back, not assembled")
                 self.assertEqual(again.summary(), two.summary())
-                for conn in store._conns.values():
-                    conn.close()
+                get_cache_engine().close()
             self.assertEqual(len(one.paths), len(SOURCES))
             shared = two.nodes_named("shared")[0]
             self.assertIn("extra", [two.name_of(n) for n, _p, _l, _v in two.callees(shared)])
@@ -332,8 +332,7 @@ class TestBuildFromGit(unittest.TestCase):
                     patch.object(si, "db_has", lambda shas: {s for s in shas if s in stored}), \
                     patch.object(si, "db_facts", lambda shas: {s: stored[s] for s in shas if s in stored}):
                 idx = si.build_revision(head, workers=1)
-                for conn in store._conns.values():
-                    conn.close()
+                get_cache_engine().close()
             self.assertEqual(len(extracted), 1, "only the blob the database lacks is extracted")
             self.assertEqual(idx.struct_report("file_operations")["tables"], 3)
             self.assertEqual(len(idx.nodes_named("helper")), 2)

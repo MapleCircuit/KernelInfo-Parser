@@ -2,9 +2,10 @@
   "database": {
     "host": "127.0.0.1",
     "port": 3306,
-    "user": "root",
-    "password": "Passe123",
-    "database": "test",
+    "user": "",
+    "password": "",
+    "database": "kernelinfo",
+    "path": "",
     "timeout": 10,
     "engine": "mariadb",
     "unix_socket": "auto",
@@ -21,6 +22,10 @@
       "strict_host_key_checking": "accept-new",
       "connect_timeout": 10
     }
+  },
+  "cache": {
+    "engine": "sqlite",
+    "dir": ""
   },
   "webapp": {
     "host": "0.0.0.0",

@@ -2,7 +2,7 @@
 import unittest
 from core.globalstuff import G
 from core.TableHandling import Table
-from db_engine.mock_db import MockDB
+from db_engine import MockDB
 from table_engine.te_direct_db import TEDirectDB
 from table_engine.te_cached_db import TECachedDB
 
@@ -59,7 +59,7 @@ class TestTableEngineChunkDedup(unittest.TestCase):
         te.commit(self.t_nodup.table_id)
 
         # Verify DB store contains exactly 1 row
-        db_rows = MockDB._global_store["test_nodup"]
+        db_rows = MockDB.store["test_nodup"]
         self.assertEqual(len(db_rows), 1)
 
     def test_te_direct_db_cross_chunk_hash(self) -> None:
@@ -77,7 +77,7 @@ class TestTableEngineChunkDedup(unittest.TestCase):
         te.commit(self.t_hash.table_id)
 
         # Verify DB store contains exactly 1 row
-        db_rows = MockDB._global_store["test_hash"]
+        db_rows = MockDB.store["test_hash"]
         self.assertEqual(len(db_rows), 1)
 
     def test_te_cached_db_cross_chunk_nodup_and_hash(self) -> None:
@@ -97,8 +97,8 @@ class TestTableEngineChunkDedup(unittest.TestCase):
         te.set(self.t_hash.table_id, (h1, "int bar();"))
         te.commit_all()
 
-        self.assertEqual(len(MockDB._global_store["test_nodup"]), 1)
-        self.assertEqual(len(MockDB._global_store["test_hash"]), 1)
+        self.assertEqual(len(MockDB.store["test_nodup"]), 1)
+        self.assertEqual(len(MockDB.store["test_hash"]), 1)
 
 
 if __name__ == "__main__":

@@ -34,12 +34,12 @@ from webapp.backend.config import (
     set_active_repository,
 )
 from webapp.backend.database.helpers import (
-    finished_ref_sql,
     get_active_repo_id,
     hash_hex,
     safe_decode,
 )
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
+from db_engine.spec import Join, finished_ref, gt
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.catalog_cache import (
     JsonBody,
@@ -138,17 +138,19 @@ def projects_catalog() -> list[dict[str, Any]]:
     """
     indexed: dict[str, dict[str, Any]] = {}
     try:
-        with get_db_cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.repo_id, r.name, r.git_url, p.project_id, p.name AS project_name, p.slug
-                FROM m_repository r
-                LEFT JOIN m_git_network n ON n.network_id = r.network_id
-                LEFT JOIN m_project p ON p.project_id = n.project_id
-                WHERE r.repo_id > 0;
-                """
-            )
-            for row in cursor.fetchall():
+        with get_reader() as reader:
+            for row in reader.select_rows(
+                ("m_repository", "r"),
+                {
+                    "repo_id": "r.repo_id", "name": "r.name", "git_url": "r.git_url", "project_id": "p.project_id",
+                    "project_name": "p.name", "slug": "p.slug",
+                },
+                {"r.repo_id": gt(0)},
+                joins=[
+                    Join(("m_git_network", "n"), {"n.network_id": "r.network_id"}, "left"),
+                    Join(("m_project", "p"), {"p.project_id": "n.project_id"}, "left"),
+                ],
+            ):
                 indexed[safe_decode(row["name"])] = row
     except Exception as e:  # noqa: BLE001 - catalog still lists configured repositories without the DB
         logger.warning("Could not read m_repository: %s", e)
@@ -240,19 +242,17 @@ def _build_branches() -> dict[str, Any]:
         if short_name and matches_branch_filter(short_name, branch_filter):
             git_heads[short_name] = obj
 
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            f"""
-            SELECT r.ref_name, r.commit_id, c.commit_hash, s.updated_at AS parsed_at
-            FROM m_git_ref r
-            LEFT JOIN m_commit c ON r.commit_id = c.commit_id
-            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id
-            WHERE r.ref_type = 2 AND r.repo_id = %s AND {finished_ref_sql()}
-            ORDER BY r.ref_name ASC;
-            """,
-            (get_active_repo_id(cursor),),
-        )
-        for row in cursor.fetchall():
+    with get_reader() as reader:
+        for row in reader.select_rows(
+            ("m_git_ref", "r"),
+            {"ref_name": "r.ref_name", "commit_id": "r.commit_id", "commit_hash": "c.commit_hash", "parsed_at": "s.updated_at"},
+            [{"r.ref_type": 2, "r.repo_id": get_active_repo_id(reader)}, finished_ref("r")],
+            joins=[
+                Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}, "left"),
+                Join(("m_ingest_state", "s"), {"s.commit_id": "r.commit_id"}, "left"),
+            ],
+            order_by=["r.ref_name"],
+        ):
             bname = safe_decode(row["ref_name"])
             if bname and bname.startswith("origin/") and bname[7:] in local_branches:
                 continue
@@ -462,25 +462,20 @@ def _version_rows(include_rc: bool) -> list[tuple[int, str, str, int, int | None
     rows: list[tuple[int, str, str, int, int | None]] = []
     seen_vnames: set[str] = set()
 
-    with get_db_cursor() as cursor:
-        cursor.execute(
-            f"""
-            SELECT
-                r.commit_id AS vid,
-                r.ref_name AS vname,
-                r.ref_type,
-                c.commit_hash,
-                c.author_date,
-                s.updated_at AS parsed_at
-            FROM m_git_ref r
-            LEFT JOIN m_commit c ON r.commit_id = c.commit_id
-            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id
-            WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()}
-            ORDER BY c.author_date ASC, r.commit_id ASC;
-            """,
-            (get_active_repo_id(cursor),),
-        )
-        for r in cursor.fetchall():
+    with get_reader() as reader:
+        for r in reader.select_rows(
+            ("m_git_ref", "r"),
+            {
+                "vid": "r.commit_id", "vname": "r.ref_name", "ref_type": "r.ref_type", "commit_hash": "c.commit_hash",
+                "author_date": "c.author_date", "parsed_at": "s.updated_at",
+            },
+            [{"r.commit_id": gt(0), "r.repo_id": get_active_repo_id(reader)}, finished_ref("r")],
+            joins=[
+                Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}, "left"),
+                Join(("m_ingest_state", "s"), {"s.commit_id": "r.commit_id"}, "left"),
+            ],
+            order_by=["c.author_date", "r.commit_id"],
+        ):
             vname = safe_decode(r["vname"]) or ""
             if vname and vname not in seen_vnames:
                 seen_vnames.add(vname)

@@ -1188,9 +1188,9 @@ class TestTECachedDBIntegrity(unittest.TestCase):
 
         class MockDBWithData(MockDB):
             def select_preload(self, table, cached_columns=None, min_vid=None):
-                # Return string for h1 (like MariaDB null bytes) and bytearray for h2
+                # Drivers hand binary values over as bytes; a mutable buffer is frozen by the engine
                 return [
-                    (h1.decode("latin1"),),
+                    (h1,),
                     (bytearray(h2),),
                 ]
 
@@ -1223,38 +1223,6 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         self.te.update_in_mem_indexes = False
         self.te.close()
         self.assertTrue(self.te.update_in_mem_indexes)
-
-    def test_binary_preload_utf8_decoded_strings(self) -> None:
-        """Verify binary column preloading seamlessly handles valid UTF-8 decoded strings with code points > 255."""
-        fake_bin_tbl = Table(
-            table_id=893,
-            table_name="m_fake_bin_utf8",
-            columns=(
-                ("hash", "BINARY(32)", "NOT NULL"),
-                ("ast_id", "INT", "NOT NULL"),
-            ),
-            primary=("hash",),
-            te_cached=True,
-        )
-
-        # 34-byte hex whose raw bytes decode to valid UTF-8 with Greek/Cyrillic characters > 255
-        raw_hash_bytes = bytes.fromhex("51CFBB47C79907C6A90A267A3C6C6E053C483227624F7A496458D48B7CC586042F00")[:32]
-        utf8_str = raw_hash_bytes.decode("utf-8")
-
-        class MockDBWithUtf8Data(MockDB):
-            def select_preload(self, table, cached_columns=None, min_vid=None):
-                # Return UTF-8 decoded string for column 0 (mirroring MariaDB charset utf8mb4 behavior)
-                return [
-                    (utf8_str, 42),
-                ]
-
-        self.te.start([fake_bin_tbl], MockDBWithUtf8Data)
-        self.assertIn(raw_hash_bytes, self.te._pk_index[fake_bin_tbl.table_id])
-        res = self.te.get(fake_bin_tbl.table_id, (raw_hash_bytes, None))
-        self.assertIsNotNone(res)
-        self.assertEqual(res[0], raw_hash_bytes)
-        self.assertEqual(res[1], 42)
-        self.te.close()
 
     def test_version_scoped_table_schema_configuration(self) -> None:
         """Verify Table supports version_scoped across bool, dict, and tuple te_cached configurations."""
@@ -1747,7 +1715,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
 
     def test_order_changed_files_dag(self) -> None:
         """Verify order_changed_files prioritizes headers and resolves include dependencies."""
-        from main import order_changed_files
+        from pipeline.source_order import order_changed_files
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1901,7 +1869,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
         from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
         from core.globalstuff import ASTT, REF_FILE
         from core.GreatProcessor import GreatProcessor
-        from main import DependencyScheduler
+        from pipeline.scheduler import DependencyScheduler
 
         old_te = G.TE
         G.TE = self.te
@@ -1956,7 +1924,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
         from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
         from core.globalstuff import ASTT, REF_FILE
         from core.GreatProcessor import GreatProcessor
-        from main import DependencyScheduler
+        from pipeline.scheduler import DependencyScheduler
 
         old_te = G.TE
         G.TE = self.te
@@ -2006,7 +1974,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
         from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
         from core.globalstuff import ASTT, REF_FILE
         from core.GreatProcessor import GreatProcessor
-        from main import execute_phase2_parallel_waves
+        from pipeline.scheduler import execute_phase2_parallel_waves
 
         old_te = G.TE
         G.TE = self.te
@@ -2076,7 +2044,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
         from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
         from core.globalstuff import ASTT, REF_FILE
         from core.GreatProcessor import GreatProcessor
-        from main import execute_phase2_parallel_waves
+        from pipeline.scheduler import execute_phase2_parallel_waves
 
         old_te = G.TE
         G.TE = self.te

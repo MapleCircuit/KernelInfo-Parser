@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from core import ingest_state
-from main import orchestrate_repair_pipeline
+from pipeline.repair import orchestrate_repair_pipeline
 
 
 class TestResumePipeline(unittest.TestCase):
@@ -81,7 +81,7 @@ class TestResumePipeline(unittest.TestCase):
         )
         self.assertFalse(repaired)
 
-    @patch("main.update")
+    @patch("pipeline.repair.update")
     @patch("core.ingest_state.purge_version_differential_rows")
     @patch("core.globalstuff.G.DB")
     def test_repair_execution_backfills_and_realigns(

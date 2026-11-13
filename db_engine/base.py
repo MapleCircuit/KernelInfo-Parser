@@ -15,8 +15,11 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, ContextManager, Literal, Mapping, NamedTuple, Self
 
 from core.globalstuff import JoinsType, PointerType, SafeDataType
+from db_engine.errors import UnsupportedOperation
 from db_engine.spec import (
+    as_column_spec,
     Agg,
+    ColumnSpec,
     AnyOf,
     Col,
     Cond,
@@ -30,11 +33,48 @@ from db_engine.spec import (
     Value,
     Where,
 )
+from db_engine.spec import Case, Incoming, Length, Order, Pred, Substr, add, ge, gt, in_select, is_null, ne
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
 
 logger = logging.getLogger("kernelinfo.db_engine")
+
+
+# Capability flags (`BaseDBEngine.capabilities`). Callers branch on these instead of `isinstance(db, MockDB)`.
+CAP_PERSISTENT = "persistent"  # data outlives the process (false for the in-memory mock)
+CAP_SERVER_TUNING = "server_tuning"  # `apply_server_tuning()` can change server variables
+CAP_BACKGROUND_COMMIT = "background_commit"  # `commit_tables_parallel(dedicated=True)` may run on a writer thread
+CAP_CONCURRENT_CONNECTIONS = "concurrent_connections"  # independent connections see one database (workers, reader pool)
+
+_TUNING_WARNING_MARKERS = (" capped at ", ": kept ", "not available", "memory guard")
+
+
+def tuning_note_is_warning(note: str) -> bool:
+    """True for an `apply_server_tuning()` note that a caller should log as a warning (cap, refusal, memory guard)."""
+    return any(marker in note for marker in _TUNING_WARNING_MARKERS)
+
+
+class ProbeResult(NamedTuple):
+    """Outcome of `BaseDBEngine.probe_connection()`."""
+
+    ok: bool
+    version: str = ""
+    latency_ms: float = 0.0
+    error: str = ""
+    target: str = ""
+
+
+class _hybridmethod:
+    """Descriptor: the wrapped function receives the instance when called on one, else the class."""
+
+    def __init__(self, func: Any) -> None:
+        self.func = func
+        self.__doc__ = func.__doc__
+
+    def __get__(self, obj: Any, cls: type | None = None) -> Any:
+        target = obj if obj is not None else cls
+        return lambda *a, **k: self.func(target, *a, **k)
 
 
 class ColumnInfo(NamedTuple):
@@ -74,6 +114,82 @@ class NewPairs(ABC):
         """Insert include and Kconfig references from new pairs into m_file_reference."""
 
 
+class SpecNewPairs(NewPairs):
+    """`NewPairs` built from query specs alone: no connection-local state, so every backend can use it.
+
+    `pairs` is read once; the deletes and the include copy re-run the anti-join of the two checkpoints in the
+    database (`in_select` / `copy_rows`).
+    """
+
+    def __init__(self, db: BaseDBEngine, commit_id: int, prev_commit_id: int) -> None:
+        self.db = db
+        self.commit_id = commit_id
+        self.prev_commit_id = prev_commit_id
+        rows = db.select_spec(self._anti_join(["cur_v.fnid", "cur_v.blob_id"]), as_dict=False)
+        self.pairs = {(int(f), int(b)) for f, b in rows}
+
+    def _anti_join(self, columns: Sequence[Any], *, hint: Literal["straight_join"] | None = None) -> Select:
+        """`(fnid, blob_id)` rows of `commit_id`'s checkpoint that `prev_commit_id`'s lacks."""
+        return Select(
+            ("m_bridge_checkpoint", "cur_v"),
+            columns,
+            {"cur_v.commit_id": self.commit_id, "old_v.blob_id": is_null()},
+            joins=[Join(
+                ("m_bridge_checkpoint", "old_v"),
+                {"old_v.commit_id": Value(self.prev_commit_id), "old_v.fnid": "cur_v.fnid", "old_v.blob_id": "cur_v.blob_id"},
+                "left",
+            )],
+            hint=hint,
+        )
+
+    def delete_rows_of(self, table: Table | str) -> int:
+        name = table.table_name if hasattr(table, "table_name") else str(table)
+        return self.db.delete_rows(
+            name,
+            [in_select(("source_blob_id", "source_fnid"), self._anti_join(["cur_v.blob_id", "cur_v.fnid"]))],
+        )
+
+    def insert_include_references(
+        self,
+        kconfig_type_ids: Sequence[int] | str,
+        kconfig_ref_type: int,
+        include_ref_type: int,
+    ) -> int:
+        if isinstance(kconfig_type_ids, str):
+            kconfig_type_ids = [int(x) for x in kconfig_type_ids.split(",") if x.strip()]
+        kconfig_types = [int(x) for x in kconfig_type_ids]
+        return self.db.copy_rows(
+            "m_file_reference",
+            ["source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"],
+            Select(
+                ("m_bridge_checkpoint", "bf"),
+                [
+                    "bt.blob_id",
+                    "bf.fnid",
+                    "inc.fnid",
+                    Case([({"a.type_id": kconfig_types}, kconfig_ref_type)], include_ref_type),
+                    "bt.line_s",
+                    Substr("a.name", 1, 255),
+                ],
+                {"bf.commit_id": self.commit_id, "old_v.blob_id": is_null()},
+                joins=[
+                    Join(
+                        ("m_bridge_checkpoint", "old_v"),
+                        {"old_v.commit_id": Value(self.prev_commit_id), "old_v.fnid": "bf.fnid", "old_v.blob_id": "bf.blob_id"},
+                        "left",
+                    ),
+                    Join(("m_bridge_tag", "bt"), {"bt.blob_id": "bf.blob_id"}),
+                    Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                    Join(("m_ast_include", "inc"), {"inc.ast_id": "t.ast_id"}),
+                    Join(("m_ast", "a"), {"a.ast_id": "inc.ast_id"}),
+                ],
+                distinct=True,
+                hint="straight_join",
+            ),
+            on_conflict="ignore",
+        )
+
+
 class TableCommitStat(NamedTuple):
     """Rows one `commit_tables_parallel()` call wrote to one table, and the seconds that table took."""
 
@@ -83,13 +199,15 @@ class TableCommitStat(NamedTuple):
     seconds: float
 
 
-def estimate_column_bytes(col_def: Sequence[str]) -> int:
-    """Stored width in bytes of one column, from its DDL definition (`("hash", "BINARY(32)", "NOT NULL")`).
+def estimate_column_bytes(col_def: Sequence[Any]) -> int:
+    """Stored width in bytes of one column, from its definition (`("hash", BIN(32))`, a name + `ColumnSpec`).
 
     Fixed-width types are exact; a `CHAR`/`BINARY` column is taken at its declared length and a
     `TEXT`/`BLOB` column at a nominal average, which is what makes a projected table size an estimate.
     """
-    sql_type = str(col_def[1]).upper()
+    from db_engine.sql_render import render_column_type
+
+    sql_type = render_column_type(as_column_spec(tuple(col_def[1:]))).upper()
     declared_match = re.search(r"\((\d+)", sql_type)
     declared = int(declared_match.group(1)) if declared_match else 0
     if "TINYINT" in sql_type or "BOOL" in sql_type:
@@ -126,6 +244,49 @@ class BaseDBEngine(ABC):
     """
 
     supports_background_commit = False
+
+    #: Human-readable engine name used in diagnostics ("Connected to <display_name> successfully").
+    display_name: str = "database"
+
+    #: SQL dialect that `sql_render` uses for this engine ("mariadb" or "sqlite").
+    dialect: Literal["mariadb", "sqlite"] = "mariadb"
+    #: Capability flags every instance of the engine has (see the `CAP_*` constants); `capabilities` adds derived ones.
+    base_capabilities: frozenset[str] = frozenset()
+    #: Candidate local server socket paths an engine of this family listens on (empty for socketless engines).
+    default_socket_paths: tuple[str, ...] = ()
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Capability flags of this engine (`CAP_*`): persistent, server_tuning, background_commit, ..."""
+        caps = set(self.base_capabilities)
+        if self.supports_background_commit:
+            caps.add(CAP_BACKGROUND_COMMIT)
+        return frozenset(caps)
+
+    def has_capability(self, name: str) -> bool:
+        """True when `name` is in `capabilities`."""
+        return name in self.capabilities
+
+    @classmethod
+    def probe_connection(cls, cfg: Mapping[str, Any]) -> ProbeResult:
+        """Try to connect with the `database` config section `cfg`; never raises. Engines override."""
+        return ProbeResult(False, error=f"{cls.__name__} does not implement probe_connection")
+
+    @_hybridmethod
+    def reader(self) -> ContextManager[Any]:
+        """Context manager yielding a read-only `ReadSession` (callable on the class or an instance)."""
+        raise UnsupportedOperation(
+            f"{getattr(self, '__name__', type(self).__name__)} does not provide a reader; use an engine with read sessions "
+            "(MariaDB, SQLiteDB, MockDB) - see DB_API.md 'Webapp Read Session & Query Primitives'"
+        )
+
+    @classmethod
+    def warm_up(cls) -> None:
+        """Pre-connect the shared reader pool (and any SSH tunnel) at process start; no-op by default."""
+
+    @classmethod
+    def shutdown(cls) -> None:
+        """Release the shared reader pool at process exit; no-op by default."""
 
     @abstractmethod
     def __init__(self) -> None:
@@ -508,39 +669,47 @@ class BaseDBEngine(ABC):
             dict[str, int]: Dictionary mapping constraint names to orphan record counts (empty if all valid).
         """
 
+    def check_if_connected(self) -> None:
+        """Verify the connection and re-establish it when dropped (no-op for engines without a remote connection)."""
+
     def commit(self) -> None:
         """Commit pending transaction if driver is in transactional mode."""
 
     def rollback(self) -> None:
         """Roll back pending transaction if driver is in transactional mode."""
 
-    def cursor(self, dictionary: bool = False) -> Any:
+    def _raw_cursor(self, dictionary: bool = False) -> Any:
         """Lease a cursor handle on the underlying database connection."""
         if hasattr(self, "cnx") and getattr(self, "cnx", None):
             return self.cnx.cursor(dictionary=dictionary)
-        raise NotImplementedError("Driver does not provide raw cursor handle")
+        raise UnsupportedOperation(
+            "Driver does not provide a raw cursor; use spec reads (select_rows) / writes (insert_rows, update_rows) "
+            "- see DB_API.md 'Encapsulation & Query Authority Contract'"
+        )
 
 
-    def query(
+    def _raw_query(
         self,
         sql: str,
         params: Sequence[Any] | None = None,
         dictionary: bool = True,
     ) -> list[dict[str, Any] | tuple[SafeDataType, ...]]:
         """Execute a SQL SELECT/query and return all result rows."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement query")
+        raise UnsupportedOperation(
+            f"{type(self).__name__} does not run raw queries; use select_rows / select_spec - see DB_API.md 'Spec Read Primitives'"
+        )
 
-    def query_one(
+    def _raw_query_one(
         self,
         sql: str,
         params: Sequence[Any] | None = None,
         dictionary: bool = True,
     ) -> dict[str, Any] | tuple[SafeDataType, ...] | None:
         """Execute a SQL SELECT/query and return the first result row, or None if no match."""
-        rows = self.query(sql, params, dictionary=dictionary)
+        rows = self._raw_query(sql, params, dictionary=dictionary)
         return rows[0] if rows else None
 
-    def query_iter(
+    def _raw_query_iter(
         self,
         sql: str,
         params: Sequence[Any] | None = None,
@@ -548,20 +717,22 @@ class BaseDBEngine(ABC):
         chunk_size: int = 2000,
     ) -> Iterator[dict[str, Any] | tuple[SafeDataType, ...]]:
         """Stream query result rows in batches of chunk_size."""
-        yield from self.query(sql, params, dictionary=dictionary)
+        yield from self._raw_query(sql, params, dictionary=dictionary)
 
-    def execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
+    def _raw_execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
         """Execute an arbitrary SQL DML/DDL statement."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement execute")
+        raise UnsupportedOperation(
+            f"{type(self).__name__} does not run raw statements; use insert_rows / update_rows / delete_rows - see DB_API.md 'Spec Write Primitives'"
+        )
 
-    def executemany(self, sql: str, params_seq: Sequence[Sequence[Any]]) -> int:
+    def _raw_executemany(self, sql: str, params_seq: Sequence[Sequence[Any]]) -> int:
         """Execute a parameterized SQL statement repeatedly across a sequence of parameter tuples."""
         count = 0
         for p in params_seq:
-            count += self.execute(sql, p)
+            count += self._raw_execute(sql, p)
         return count
 
-    def delete(
+    def _raw_delete(
         self,
         table: Table | str,
         where: str,
@@ -570,39 +741,57 @@ class BaseDBEngine(ABC):
         """Delete records matching parameterized WHERE condition."""
         tbl_name = table.table_name if hasattr(table, "table_name") else str(table)
         sql = f"DELETE FROM {tbl_name} WHERE {where}"
-        return self.execute(sql, params)
+        return self._raw_execute(sql, params)
 
     def table_exists(self, table_name: str) -> bool:
         """Check whether a table or view exists in the current catalog."""
-        rows = self.query(
+        rows = self._raw_query(
             "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s LIMIT 1",
             (table_name,),
             dictionary=False,
         )
         return bool(rows)
 
-    def create_view(self, view_name: str, select_sql: str, replace: bool = True) -> None:
-        """Create or replace a database view safely."""
-        stmt = f"CREATE {'OR REPLACE ' if replace else ''}VIEW {view_name} AS {select_sql}"
-        self.execute(stmt)
+    def create_view(self, view_name: str, select: Select | str, replace: bool = True) -> None:
+        """Create or replace a database view from a `Select` spec (a SQL string is accepted for legacy callers)."""
+        from db_engine.sql_render import render_select_literal, validate_ident
+
+        body = render_select_literal(select, self.dialect) if isinstance(select, Select) else str(select)
+        validate_ident(view_name)
+        if replace and self.dialect == "sqlite":
+            self._raw_execute(f"DROP VIEW IF EXISTS {view_name}")
+            self._raw_execute(f"CREATE VIEW {view_name} AS {body}")
+            return
+        self._raw_execute(f"CREATE {'OR REPLACE ' if replace else ''}VIEW {view_name} AS {body}")
 
     def drop_view(self, view_name: str, if_exists: bool = True) -> None:
         """Drop a database view."""
         stmt = f"DROP VIEW {'IF EXISTS ' if if_exists else ''}{view_name}"
-        self.execute(stmt)
+        self._raw_execute(stmt)
 
     def add_column_if_missing(self, table_name: str, column_name: str, column_def: str) -> bool:
         """Add column to table if not already present."""
-        rows = self.query(
+        rows = self._raw_query(
             "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s LIMIT 1",
             (table_name, column_name),
             dictionary=False,
         )
         if not rows:
             col_spec = column_def if column_def.strip().startswith(column_name) else f"{column_name} {column_def}"
-            self.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_spec}")
+            self._raw_execute(f"ALTER TABLE {table_name} ADD COLUMN {col_spec}")
             return True
         return False
+
+    def add_column(self, table_name: str, column_name: str, spec: ColumnSpec) -> bool:
+        """Add a neutrally described column (`ColumnSpec`) when the table lacks it. Returns True when added."""
+        from db_engine.sql_render import render_column_ddl, validate_ident
+
+        validate_ident(table_name)
+        if self.column_exists(table_name, column_name):
+            return False
+        self._raw_execute(f"ALTER TABLE {table_name} ADD COLUMN {render_column_ddl(column_name, spec, self.dialect)}")
+        self.commit()
+        return True
 
     # -------------------------------------------------------------------------
     # Transaction Management (§3.6)
@@ -627,9 +816,32 @@ class BaseDBEngine(ABC):
         limit: int | None = None,
         offset: int | None = None,
         as_dict: bool | None = None,
+        group_by: Sequence[Any] = (),
+        having: Where | None = None,
+        hint: Literal["straight_join"] | None = None,
     ) -> list[tuple | dict]:
-        """Execute parameterized SELECT query from spec and return rows."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement select_rows")
+        """Execute parameterized SELECT query from spec and return rows.
+
+        Columns / order_by / group_by items may be column names, `Agg`, `Const` or expressions (`Concat`, `Case`, ...).
+        """
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement select_rows - see DB_API.md 'Spec Read Primitives'")
+
+    def select_spec(self, select: Select, *, as_dict: bool | None = None) -> list[tuple | dict]:
+        """Run a complete `Select` specification (every clause) through `select_rows()`."""
+        return self.select_rows(
+            select.source,
+            select.columns,
+            select.where,
+            joins=select.joins,
+            distinct=select.distinct,
+            order_by=select.order_by,
+            limit=select.limit,
+            offset=select.offset,
+            as_dict=as_dict,
+            group_by=select.group_by,
+            having=select.having,
+            hint=select.hint,
+        )
 
     def iter_rows(
         self,
@@ -643,6 +855,9 @@ class BaseDBEngine(ABC):
         limit: int | None = None,
         offset: int | None = None,
         as_dict: bool | None = None,
+        group_by: Sequence[Any] = (),
+        having: Where | None = None,
+        hint: Literal["straight_join"] | None = None,
     ) -> Iterator[tuple | dict]:
         """Stream query result rows."""
         rows = self.select_rows(
@@ -655,6 +870,9 @@ class BaseDBEngine(ABC):
             limit=limit,
             offset=offset,
             as_dict=as_dict,
+            group_by=group_by,
+            having=having,
+            hint=hint,
         )
         yield from rows
 
@@ -774,11 +992,12 @@ class BaseDBEngine(ABC):
         *,
         joins: Sequence[Join] = (),
         group_by: Sequence[str] = (),
-        order_by: Sequence[str] = (),
+        order_by: Sequence[Any] = (),
         as_dict: bool | None = None,
+        having: Where | None = None,
     ) -> list:
-        """Compute aggregate calculations, optionally grouped by columns."""
-        cols: dict[str, str | Agg | Const] = {col: col for col in group_by}
+        """Compute aggregate calculations, optionally grouped (`GROUP BY group_by [HAVING having]`)."""
+        cols: dict[str, Any] = {col.rsplit(".", 1)[-1]: col for col in group_by if isinstance(col, str)}
         cols.update(aggregates)
         return self.select_rows(
             source,
@@ -787,6 +1006,8 @@ class BaseDBEngine(ABC):
             joins=joins,
             order_by=order_by,
             as_dict=as_dict,
+            group_by=group_by,
+            having=having,
         )
 
     def max_value(
@@ -831,9 +1052,21 @@ class BaseDBEngine(ABC):
         on_conflict: Literal["error", "ignore", "update", "replace"] = "error",
         update_columns: Sequence[str] | None = None,
         chunk_size: int | None = None,
+        update_exprs: Mapping[str, Any] | None = None,
     ) -> int:
-        """Insert row(s) matching columns. Returns total affected rows."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement insert_rows")
+        """Insert row(s) matching columns. Returns the number of rows written.
+
+        Count (identical on every backend): `error` / `ignore` count the rows inserted (an ignored duplicate counts 0);
+        `update` / `replace` count every offered row (inserted, or overwriting / updating an existing one, even when
+        the stored values do not change).
+
+        `on_conflict="update"` assigns the incoming value to `update_columns` (default: every inserted column,
+        or none when `update_exprs` is given) and evaluates `update_exprs` (`{column: Expr}`) for the rest:
+        `Incoming("col")` is the offered value, a bare column name the STORED (pre-update) value on every backend
+        (MariaDB renders the assignments in an order that guarantees it; a read cycle raises `SpecError`),
+        `Case(...)` makes the update conditional.
+        """
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement insert_rows - see DB_API.md 'Spec Write Primitives'")
 
     def get_or_insert_id(
         self,
@@ -868,8 +1101,11 @@ class BaseDBEngine(ABC):
         *,
         limit: int | None = None,
     ) -> int:
-        """Update rows matching where filter. Returns affected row count."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement update_rows")
+        """Update rows matching where filter. Returns the rows matched (also those whose values do not change).
+
+        Expressions (`Col`, `Case`, ...) read the stored row on every backend.
+        """
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement update_rows - see DB_API.md 'Spec Write Primitives'")
 
     def delete_rows(
         self,
@@ -879,8 +1115,8 @@ class BaseDBEngine(ABC):
         limit: int | None = None,
         all_rows: bool = False,
     ) -> int:
-        """Delete rows matching where filter. Returns affected row count."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement delete_rows")
+        """Delete rows matching where filter. Returns the rows deleted."""
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement delete_rows - see DB_API.md 'Spec Write Primitives'")
 
     def copy_rows(
         self,
@@ -890,8 +1126,8 @@ class BaseDBEngine(ABC):
         *,
         on_conflict: Literal["error", "ignore"] = "error",
     ) -> int:
-        """Insert rows selected by select query into table. Returns affected rows."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement copy_rows")
+        """Insert rows selected by select query into table. Returns the rows inserted (ignored duplicates count 0)."""
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement copy_rows - see DB_API.md 'Spec Write Primitives'")
 
     # -------------------------------------------------------------------------
     # Catalog and Server Introspection (§4)
@@ -912,7 +1148,7 @@ class BaseDBEngine(ABC):
             f"SELECT TABLE_NAME FROM information_schema.TABLES "
             f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({placeholders}){type_filter}"
         )
-        rows = self.query(sql, list(names), dictionary=False)
+        rows = self._raw_query(sql, list(names), dictionary=False)
         return {str(r[0]) for r in rows if r and r[0]}
 
     def column_info(self, table: Table | str, column: str) -> ColumnInfo | None:
@@ -923,7 +1159,7 @@ class BaseDBEngine(ABC):
             "FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s LIMIT 1"
         )
-        rows = self.query(sql, (tbl_name, column), dictionary=False)
+        rows = self._raw_query(sql, (tbl_name, column), dictionary=False)
         if not rows or not rows[0]:
             return None
         r = rows[0]
@@ -940,7 +1176,7 @@ class BaseDBEngine(ABC):
             "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s"
         )
-        rows = self.query(sql, (tbl_name,), dictionary=False)
+        rows = self._raw_query(sql, (tbl_name,), dictionary=False)
         return {str(r[0]) for r in rows if r and r[0]}
 
     def table_stats(self, names: Sequence[str] | None = None) -> list[TableStats]:
@@ -956,7 +1192,7 @@ class BaseDBEngine(ABC):
             f"SELECT TABLE_NAME, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM information_schema.TABLES "
             f"WHERE TABLE_SCHEMA = DATABASE(){where} ORDER BY DATA_LENGTH + INDEX_LENGTH DESC"
         )
-        rows = self.query(sql, params, dictionary=False)
+        rows = self._raw_query(sql, params, dictionary=False)
         stats = []
         for r in rows:
             name = str(r[0])
@@ -972,15 +1208,26 @@ class BaseDBEngine(ABC):
         if not re.match(r"^[A-Za-z0-9_]+$", clean):
             raise ValueError(f"Invalid server variable name: {name}")
         try:
-            rows = self.query(f"SELECT @@GLOBAL.{clean}", dictionary=False)
+            rows = self._raw_query(f"SELECT @@GLOBAL.{clean}", dictionary=False)
             if rows and rows[0] and rows[0][0] is not None:
                 return str(rows[0][0])
         except Exception:
             pass
         return None
 
-    def apply_server_tuning(self, settings: dict[str, Any] | None = None) -> list[str]:
-        """Apply server-level engine tuning. Base implementation returns empty list."""
+    def apply_server_tuning(
+        self,
+        settings: dict[str, Any] | None = None,
+        *,
+        tunnel_active: bool | None = None,
+        mem_max_gb: float = 0.0,
+    ) -> list[str]:
+        """Apply server-level engine tuning and return one note per change or problem. Base: no tuning, no notes.
+
+        `tunnel_active` (None = unknown, skip the local-RAM logic) tells whether the server is reached through an
+        SSH tunnel; `mem_max_gb` is the parser memory guard used for the RAM-fit warning
+        (`tuning_note_is_warning()` classifies the notes).
+        """
         return []
 
     # -------------------------------------------------------------------------
@@ -990,11 +1237,11 @@ class BaseDBEngine(ABC):
         self,
         names: Sequence[str],
         *,
+        ignore_fk: bool = False,
         if_exists: bool = True,
-        disable_fk_checks: bool = True,
     ) -> None:
-        """Drop tables by name safely."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement drop_tables")
+        """Drop tables by name; `ignore_fk=True` drops them although other tables reference them."""
+        raise UnsupportedOperation(f"{type(self).__name__} does not implement drop_tables - see DB_API.md 'Schema Maintenance & View Registry'")
 
     def ensure_columns(self, table: Table, columns: Sequence[str] | None = None) -> list[str]:
         """Add any init_columns missing from the live table and return their names."""
@@ -1005,8 +1252,7 @@ class BaseDBEngine(ABC):
             if wanted is not None and col_name not in wanted:
                 continue
             if not self.column_exists(table.table_name, col_name):
-                col_spec = " ".join(col_def)
-                self.execute(f"ALTER TABLE {table.table_name} ADD COLUMN {col_spec}")
+                self.add_column(table.table_name, col_name, col_def[1])
                 added.append(col_name)
         if added:
             self.commit()
@@ -1063,12 +1309,52 @@ class BaseDBEngine(ABC):
         prev_commit_id: int,
     ) -> Iterator[NewPairs]:
         """Context manager yielding NewPairs for (fnid, blob_id) diff between commits."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement new_checkpoint_pairs")
-        yield
+        yield SpecNewPairs(self, commit_id, prev_commit_id)
 
     def enqueue_parse_tasks(self, rows: Sequence[Sequence[Any]]) -> int:
-        """Insert or update tasks in m_parse_task. Returns count of modified/inserted rows."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement enqueue_parse_tasks")
+        """Publish tasks to `m_parse_task`; returns how many tasks were written (inserted or updated).
+
+        Each row is `(network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name,
+        base_commit_id, status)`; `(network_id, ref_name)` identifies a task. An existing task keeps its progress: a
+        FAILED task, or a DONE one that is published as not done, starts over (status as published, `retry_count`
+        0, `error_msg` cleared); a LEASED or RECLAIMING task keeps its state unless it is published as DONE; any
+        other task takes the published status. A known `commit_id` / `base_commit_id` is never replaced by 0. One
+        transaction; every row is its own statement.
+        """
+        if not rows:
+            return 0
+        failed, done, leased, reclaiming = 4, 3, 2, 5  # core.distributed TASK_* values
+        reopened = AnyOf({"status": failed}, [{"status": done}, Pred(Incoming("status"), ne(done))])
+        update_exprs = {
+            "commit_id": Case([(Pred(Incoming("commit_id"), gt(0)), Incoming("commit_id"))], "commit_id"),
+            "base_commit_id": Case([(Pred(Incoming("base_commit_id"), gt(0)), Incoming("base_commit_id"))], "base_commit_id"),
+            # retry_count / error_msg read the stored status (every expression reads the stored row)
+            "retry_count": Case([([reopened], 0)], "retry_count"),
+            "error_msg": Case([([reopened], Value(""))], "error_msg"),
+            "status": Case(
+                [
+                    ({"status": failed}, Incoming("status")),
+                    ([{"status": done}, Pred(Incoming("status"), ne(done))], Incoming("status")),
+                    (
+                        {"status": [leased, reclaiming]},
+                        Case([(Pred(Incoming("status"), done), done)], "status"),
+                    ),
+                ],
+                Incoming("status"),
+            ),
+        }
+        columns = ["network_id", "chain_name", "chain_kind", "seq_order", "ref_name", "commit_id", "base_ref_name",
+                   "base_commit_id", "status"]
+        enqueued = 0
+        with self.transaction():
+            for row in rows:
+                changed = self.insert_rows(
+                    "m_parse_task", columns, [tuple(row)], on_conflict="update",
+                    update_columns=["chain_name", "chain_kind", "seq_order", "base_ref_name"], update_exprs=update_exprs,
+                )
+                if changed > 0:
+                    enqueued += 1
+        return enqueued
 
     def record_task_failure(
         self,
@@ -1078,8 +1364,24 @@ class BaseDBEngine(ABC):
         worker_id: str | None = None,
         max_attempts: int = 3,
     ) -> int:
-        """Record task failure, incrementing retry_count and updating status to FAILED or ELIGIBLE."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement record_task_failure")
+        """Record a failed attempt of a LEASED / RECLAIMING task (of `worker_id` when given); returns the rows updated.
+
+        `retry_count` grows by one; the task becomes FAILED once that reaches `max_attempts`, else ELIGIBLE again,
+        and loses its worker. Every expression reads the stored row.
+        """
+        where: dict[str, Any] = {"task_id": task_id, "status": [2, 5]}
+        if worker_id:
+            where["worker_id"] = worker_id
+        return self.update_rows(
+            "m_parse_task",
+            {
+                "status": Case([(Pred(add("retry_count", 1), ge(max_attempts)), 4)], 1),
+                "retry_count": add("retry_count", 1),
+                "error_msg": error_msg[:1000],
+                "worker_id": "",
+            },
+            where,
+        )
 
     def next_eligible_parse_tasks(
         self,
@@ -1088,6 +1390,39 @@ class BaseDBEngine(ABC):
         *,
         limit: int = 10,
     ) -> list[tuple]:
-        """Fetch next batch of eligible parse tasks ordered by chain preference."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement next_eligible_parse_tasks")
+        """Next `limit` tasks of `status`: stable chains first, then shorter then alphabetical chain names, by `seq_order`.
 
+        Rows are `(task_id, chain_name, chain_kind, ref_name, commit_id, base_ref_name, base_commit_id)`.
+        """
+        rows = self.select_rows(
+            "m_parse_task",
+            ["task_id", "chain_name", "chain_kind", "ref_name", "commit_id", "base_ref_name", "base_commit_id"],
+            {"network_id": network_id, "status": status},
+            order_by=[Order(Case([({"chain_kind": "stable"}, 1)], 0), desc=True), Order(Length("chain_name")),
+                      "chain_name", "seq_order"],
+            limit=int(limit),
+            as_dict=False,
+        )
+        return [tuple(r) for r in rows]
+
+    def symbol_refs_of_targets(
+        self,
+        ast_ids: Sequence[int],
+        *,
+        role: int | None = None,
+        with_caller: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """References of the target ASTs: dicts `role, line, char_s, fid, tag_id, ast_id` (+ `caller`).
+
+        Read key first through query specs (`db_engine/symbol_rows.py`) instead of filtering the `m_symbol_ref` view.
+        """
+        from db_engine import symbol_rows
+
+        return symbol_rows.symbol_refs_of_targets(self, ast_ids, role=role, with_caller=with_caller, limit=limit)
+
+    def symbol_def_blobs_of_targets(self, ast_ids: Sequence[int]) -> set[tuple[int, int]]:
+        """Distinct `(ast_id, blob_id)` definitions of the target ASTs (`db_engine/symbol_rows.py`)."""
+        from db_engine import symbol_rows
+
+        return symbol_rows.symbol_def_blobs_of_targets(self, ast_ids)

@@ -233,27 +233,6 @@ class TestIndexesOnRepository(unittest.TestCase):
         self.assertEqual(sorted(f["sha"] for f in cr.relation_index.relations(self.bug)["fixed_by"]), sorted([self.fix, fix2]))
 
 
-class _DictCursor:
-    """sqlite3 cursor answering with dict rows and the MariaDB placeholders (the webapp's cursor shape)."""
-
-    def __init__(self, db) -> None:
-        self.db = db
-        self.rows: list = []
-        self.statements: list[str] = []
-
-    def execute(self, sql: str, params=()) -> None:
-        self.statements.append(sql)
-        cur = self.db.execute(sql.replace("%s", "?"), tuple(params))
-        cols = [d[0] for d in cur.description or ()]
-        self.rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    def fetchall(self):
-        return self.rows
-
-    def fetchone(self):
-        return self.rows[0] if self.rows else None
-
-
 class TestDatabaseMembership(TestIndexesOnRepository):
     """m_commit_release (written by the parser's release statistics) answers like the SQLite index."""
 
@@ -262,14 +241,13 @@ class TestDatabaseMembership(TestIndexesOnRepository):
         for p in self.patches[-2:]:
             p.stop()
         self.patches = self.patches[:-2]
-        from tests.test_release_stats import _Connection
+        from tests.test_release_stats import _release_db
         from parser.git_ast import release_stats
-        self.cnx = _Connection()
-        release_stats.ingest(self.cnx, self.repo, repo_id=1, workers=2)
-        self.cursor = _DictCursor(self.cnx.db)
-        ctx = unittest.mock.MagicMock()
-        ctx.__enter__.return_value = self.cursor
-        for p in (patch.object(rs, "get_db_cursor", return_value=ctx), patch.object(rs, "get_active_repo_id", return_value=1)):
+        self.engine = _release_db()
+        release_stats.ingest(self.engine, self.repo, repo_id=1, workers=2)
+        self.before = self.engine.count_rows("m_commit_release"), self.engine.count_rows("m_release_segment")
+        from tests.db_fixtures import patch_reader
+        for p in (patch_reader(self.engine), patch.object(rs, "get_active_repo_id", return_value=1)):
             p.start()
             self.patches.append(p)
         rs._DB_COVERAGE.clear()
@@ -286,7 +264,7 @@ class TestDatabaseMembership(TestIndexesOnRepository):
         for sha in shas:
             self.assertEqual(db[sha], sqlite.get(sha) or {"mainline": None, "stable": None}, sha)
         self.assertEqual(db[self.revert], {"mainline": None, "stable": None})   # on no release chain
-        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") for s in self.cursor.statements))
+        self.assertEqual((self.engine.count_rows("m_commit_release"), self.engine.count_rows("m_release_segment")), self.before)
 
     def test_no_sqlite_build_when_the_database_covers_every_tag(self) -> None:
         with patch.object(rs.release_index, "build") as build:

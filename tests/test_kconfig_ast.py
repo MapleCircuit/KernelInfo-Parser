@@ -192,7 +192,7 @@ class TestKconfigParser(unittest.TestCase):
 
 class TestKconfigAstIntegration(unittest.TestCase):
     def setUp(self) -> None:
-        MockDB._global_store.clear()
+        MockDB.store.clear()
         self.gp = GreatProcessor()
         init_db_layout(self.gp)
         G.DB = MockDB
@@ -533,78 +533,41 @@ if __name__ == "__main__":
 class TestObsoleteKconfigTables(unittest.TestCase):
     """Startup migration dropping m_kconfig_* (table ids 16-19) and renumbering interrupted runs' watermarks."""
 
-    class FakeCursor:
-        def __init__(self, store: dict) -> None:
-            self.store = store
-            self._result: list = []
+    @staticmethod
+    def _database(marks: list) -> Any:
+        from core.DBLayout import INT, m_ingest_watermark
+        from core.TableHandling import Table
+        from db_engine import SQLiteDB
+        import main
 
-        def execute(self, sql: str, params: tuple = ()) -> None:
-            s = " ".join(sql.split())
-            marks = self.store["marks"]
-            if s.startswith("SELECT table_name FROM information_schema.tables"):
-                self._result = [(n,) for n in params if n in self.store["tables"]]
-            elif s.startswith("SELECT DISTINCT commit_id FROM m_ingest_watermark WHERE marked_table_id"):
-                self._result = sorted({(c,) for c, t, _ in marks if t == params[0]})
-            elif s.startswith("SELECT marked_table_id, max_id FROM m_ingest_watermark"):
-                self._result = [(t, v) for c, t, v in marks if c == params[0]]
-            elif s.startswith("DELETE FROM m_ingest_watermark"):
-                self.store["marks"] = [m for m in marks if m[0] != params[0]]
-            elif s.startswith("INSERT INTO m_ingest_watermark"):
-                assert not any(c == params[0] and t == params[1] for c, t, _ in marks), "primary key collision"
-                self.store["marks"].append(tuple(params))
-            elif s.startswith("DROP TABLE"):
-                for name in list(self.store["tables"]):
-                    if f"`{name}`" in s:
-                        self.store["tables"].discard(name)
-            self.store["log"].append(s)
-
-        def fetchall(self) -> list:
-            return self._result
-
-        def close(self) -> None:
-            pass
-
-    class FakeDB:
-        def __init__(self, store: dict) -> None:
-            self.store = store
-            self._cur = TestObsoleteKconfigTables.FakeCursor(store)
-
-        def cursor(self):
-            return self._cur
-
-        def execute(self, sql: str, params: tuple = ()) -> None:
-            self._cur.execute(sql, params)
-
-        def query(self, sql: str, params: tuple = (), dictionary: bool = False) -> list:
-            self._cur.execute(sql, params)
-            return self._cur.fetchall()
-
-        def drop_table(self, tables) -> None:
-            tbl_list = tables if isinstance(tables, (list, tuple)) else [tables]
-            for t in tbl_list:
-                name = getattr(t, "table_name", str(t))
-                self.store["tables"].discard(name)
-
-        def fetchall(self) -> list:
-            return self._cur.fetchall()
-
-        def commit(self) -> None:
-            pass
+        import pipeline.db_setup
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        obsolete = [
+            Table(table_id=100 + i, table_name=name, columns=(("k", INT()),), primary=("k",))
+            for i, name in enumerate(pipeline.db_setup.OBSOLETE_KCONFIG_TABLES)
+        ]
+        db.create_table([m_ingest_watermark, *obsolete])
+        db.insert_rows("m_ingest_watermark", ["commit_id", "marked_table_id", "max_id"], marks)
+        return db
 
     def test_drop_and_renumber_is_idempotent(self) -> None:
         import main
+        import pipeline.db_setup
         from core import ingest_state
         from core.DBLayout import TABLES, m_maintainer_member, m_maintainer_person
         # Old numbering: m_kconfig_symbol/relation/tree (16-18) were watermarked, later tables were 20+
         old_marks = [(7, 3, 9), (7, 16, 100), (7, 17, 200), (7, 18, 300), (7, 20, 40), (7, 26, 50), (7, 35, 6), (7, 38, 7), (7, 45, 1)]
         new_marks = [(9, 15, 11), (9, 21, 12)]  # a run already recorded with the current ids
-        store = {"tables": set(main.OBSOLETE_KCONFIG_TABLES) | {"m_ingest_watermark"}, "marks": old_marks + new_marks, "log": []}
-        db = self.FakeDB(store)
-        main.drop_obsolete_kconfig_tables(db)
-        self.assertEqual(store["tables"], {"m_ingest_watermark"})
+        db = self._database(old_marks + new_marks)
+
+        def marks() -> list:
+            return sorted(tuple(r) for r in db.select_rows("m_ingest_watermark", ["commit_id", "marked_table_id", "max_id"], as_dict=False))
+
+        pipeline.db_setup.drop_obsolete_kconfig_tables(db)
+        self.assertEqual(db.existing_tables(pipeline.db_setup.OBSOLETE_KCONFIG_TABLES + ("m_ingest_watermark",)), {"m_ingest_watermark"})
         # m_maintainer_person (old 20 -> 15), m_commit (26 -> 21), m_ast_attribute (35 -> 34),
         # m_git_ref (38 -> 32), m_ingest_watermark (45 -> 40)
-        self.assertEqual(sorted(store["marks"]), sorted([(7, 3, 9), (7, 15, 40), (7, 21, 50), (7, 34, 6), (7, 32, 7), (7, 40, 1)] + new_marks))
+        self.assertEqual(marks(), sorted([(7, 3, 9), (7, 15, 40), (7, 21, 50), (7, 34, 6), (7, 32, 7), (7, 40, 1)] + new_marks))
         names = {t.table_id: t.table_name for t in TABLES}
         self.assertEqual((names[15], names[21], names[32], names[34], names[40]),
                          ("m_maintainer_person", "m_commit", "m_git_ref", "m_ast_attribute", "m_ingest_watermark"))
@@ -612,9 +575,9 @@ class TestObsoleteKconfigTables(unittest.TestCase):
         marked = {t.table_id for t, _ in ingest_state.marked_tables(TABLES)}
         self.assertNotIn(m_maintainer_member.table_id, marked)
         self.assertIn(m_maintainer_person.table_id, marked)
-        before = list(store["marks"])
-        main.drop_obsolete_kconfig_tables(db)
-        self.assertEqual(store["marks"], before)
+        before = marks()
+        pipeline.db_setup.drop_obsolete_kconfig_tables(db)
+        self.assertEqual(marks(), before)
 
 
 class TestKconfigDiffDefinitions(unittest.TestCase):

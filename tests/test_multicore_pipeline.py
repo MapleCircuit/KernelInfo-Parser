@@ -1,4 +1,4 @@
-"""tests/test_multicore_pipeline.py - Regression tests for main.trigger_multicore and its worker pool.
+"""tests/test_multicore_pipeline.py - Regression tests for pipeline.multicore.trigger_multicore and its worker pool.
 
 Covers worker change selection after blob deduplication, memory-mode budgets, ChangeSet evacuation
 bookkeeping, the shared symbol segment lifecycle and file scoping, in-flight reference blocking,
@@ -14,7 +14,18 @@ import types
 import unittest
 
 import main
+import pipeline.changesets
+import pipeline.file_processing
+import pipeline.git_commit_worker
+import pipeline.multicore
+import pipeline.scheduler
+import pipeline.source_order
+import pipeline.systemic
+import pipeline.unchanged
+import pipeline.worker_protocol
+import pipeline.worker_stage
 from core.DBLayout import m_ast
+from core.GreatProcessor import GreatProcessor
 from core.globalstuff import G, REF_FILE
 from core.TableHandling import ChangeSet
 from db_engine import MockDB
@@ -62,27 +73,27 @@ def _crashing_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     Each result maps a file to the size of the batch it arrived in, so tests can see how files were batched.
     """
     while True:
-        task = main._recv_task(conn)
+        task = pipeline.worker_protocol._recv_task(conn)
         if task is None:
             break
         batch_id, files = task
         if any("crash" in f for f in files):
             os.kill(os.getpid(), signal.SIGKILL)
-        conn.send_bytes(main._encode_batch_result(batch_id, {f: len(files) for f in files}, [], compress=False))
-    conn.send_bytes(main._FRAME_DONE)
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {f: len(files) for f in files}, [], compress=False))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
     conn.close()
 
 
 def _failing_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     """Fake parsing worker that reports the same error for every file, like broken libclang bindings."""
     while True:
-        task = main._recv_task(conn)
+        task = pipeline.worker_protocol._recv_task(conn)
         if task is None:
             break
         batch_id, files = task
         errors = [(f"M\t{f}", "Tried calling method on a null-cursor.", _NULL_CURSOR_TB) for f in files]
-        conn.send_bytes(main._encode_batch_result(batch_id, {}, errors, compress=False))
-    conn.send_bytes(main._FRAME_DONE)
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {}, errors, compress=False))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
     conn.close()
 
 
@@ -101,7 +112,7 @@ _NULL_CURSOR_TB = (
 
 def _unstartable_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     """Fake worker that cannot reach the database."""
-    conn.send_bytes(main._FRAME_INIT_FAILED + pickle.dumps((f"Worker {worker_id}", "DB connection failed: refused", "")))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_INIT_FAILED + pickle.dumps((f"Worker {worker_id}", "DB connection failed: refused", "")))
     conn.close()
 
 
@@ -115,12 +126,12 @@ class TestWorkerChangeSelection(unittest.TestCase):
     def test_fully_deduplicated_version_parses_nothing(self) -> None:
         main.gp.Change_List = ["M\tinclude/a.h", "M\tkernel/b.c"]
         main.gp.worker_change_list = []
-        self.assertEqual(main._select_worker_changes(), [])
+        self.assertEqual(pipeline.worker_stage._select_worker_changes(), [])
 
     def test_without_dedup_uses_change_list(self) -> None:
         main.gp.Change_List = ["M\tkernel/b.c"]
         main.gp.worker_change_list = None
-        self.assertEqual(main._select_worker_changes(), ["M\tkernel/b.c"])
+        self.assertEqual(pipeline.worker_stage._select_worker_changes(), ["M\tkernel/b.c"])
 
 
 class TestMemoryProfile(unittest.TestCase):
@@ -134,17 +145,17 @@ class TestMemoryProfile(unittest.TestCase):
     def test_budgets_per_mode(self) -> None:
         G.MEMORY_MODE = "very_low"
         self.assertEqual(
-            main._memory_profile(),
+            pipeline.worker_stage._memory_profile(),
             {"workers": 2, "header_batch": 25, "normal_batch": 25, "heavy_batch": 10, "max_batch_bytes": 350_000, "epoch_files": 2000},
         )
         G.MEMORY_MODE = "low"
         self.assertEqual(
-            main._memory_profile(),
+            pipeline.worker_stage._memory_profile(),
             {"workers": 8, "header_batch": 50, "normal_batch": 50, "heavy_batch": 25, "max_batch_bytes": 750_000, "epoch_files": 4500},
         )
         G.MEMORY_MODE = "normal"
         self.assertEqual(
-            main._memory_profile(),
+            pipeline.worker_stage._memory_profile(),
             {"workers": 15, "header_batch": 200, "normal_batch": 200, "heavy_batch": 50, "max_batch_bytes": 1_500_000, "epoch_files": 4500},
         )
 
@@ -160,7 +171,7 @@ class TestEvacuationBookkeeping(unittest.TestCase):
         cs.pre_extracted_tags = [(11, 5, 1, 3)]
         cs.cs_processed = True
         try:
-            main.extract_tags_and_evacuate_cs(cs)
+            pipeline.changesets.extract_tags_and_evacuate_cs(cs)
             self.assertEqual(main.gp.file_blob_ids.get("Documentation/foo.txt"), 5)
             self.assertEqual(main.gp.file_pre_extracted_tags.get("Documentation/foo.txt"), [(11, 5, 1, 3)])
         finally:
@@ -211,7 +222,7 @@ class TestSharedSymbols(unittest.TestCase):
             reader.close()
 
     def test_segments_released_between_versions(self) -> None:
-        gp = main.GreatProcessor()
+        gp = GreatProcessor()
         for release in (gp.init_cs_dict, gp.reset_cs):
             chain = self._chain({"a.h": {("foo", 1): 1}})
             gp._shared_symbols = chain
@@ -220,12 +231,12 @@ class TestSharedSymbols(unittest.TestCase):
             self.assertEqual(chain.segments, [])
 
     def test_finalize_releases_segments(self) -> None:
-        gp = main.GreatProcessor()
+        gp = GreatProcessor()
         gp._shared_symbols = self._chain({"a.h": {("foo", 1): 1}})
         old_te = G.TE
         G.TE = _RecordingTE()
         try:
-            main.DependencyScheduler(gp).finalize()
+            pipeline.scheduler.DependencyScheduler(gp).finalize()
         finally:
             G.TE = old_te
         self.assertIsNone(gp._shared_symbols)
@@ -311,7 +322,7 @@ class TestWorkerStage(unittest.TestCase):
         ingested: dict[str, int] = {}
         errors: list = []
         batches = [(0, ["a.c", "b.c"]), (1, ["c.c", "crash.c", "d.c"]), (2, ["e.c"])]
-        result = main._run_worker_stage(
+        result = pipeline.worker_stage._run_worker_stage(
             "[test]", batches, ingested.update, 2, errors, worker_target=_crashing_worker
         )
         self.assertEqual(set(ingested), {"a.c", "b.c", "c.c", "d.c", "e.c"})
@@ -324,14 +335,14 @@ class TestWorkerStage(unittest.TestCase):
         ingested: dict[str, int] = {}
         errors: list = []
         batches = [(0, ["a.c", "b.c"]), (1, ["c.c", "crash.c", "d.c"]), (2, ["e.c", "f.c"]), (3, ["g.c", "h.c"])]
-        result = main._run_worker_stage("[test]", batches, ingested.update, 1, errors, worker_target=_crashing_worker)
+        result = pipeline.worker_stage._run_worker_stage("[test]", batches, ingested.update, 1, errors, worker_target=_crashing_worker)
         self.assertEqual(result.lost_files, ["crash.c"])
         self.assertEqual(ingested, {"a.c": 2, "b.c": 2, "c.c": 1, "d.c": 1, "e.c": 2, "f.c": 2, "g.c": 2, "h.c": 2})
 
     def test_stage_aborts_when_no_worker_can_start(self) -> None:
         errors: list = []
         with self.assertRaises(RuntimeError):
-            main._run_worker_stage("[test]", [(0, ["a.c"]), (1, ["b.c"])], lambda batch: None, 2, errors,
+            pipeline.worker_stage._run_worker_stage("[test]", [(0, ["a.c"]), (1, ["b.c"])], lambda batch: None, 2, errors,
                                    worker_target=_unstartable_worker)
         self.assertTrue(any("DB connection failed" in e[1] for e in errors))
 
@@ -345,14 +356,14 @@ class TestWorkerStage(unittest.TestCase):
             ingested.update(batch)
 
         batches = [(0, ["a.c"]), (1, ["bad.c"]), (2, ["c.c"])]
-        result = main._run_worker_stage("[test]", batches, _ingest, 2, errors, worker_target=_crashing_worker)
+        result = pipeline.worker_stage._run_worker_stage("[test]", batches, _ingest, 2, errors, worker_target=_crashing_worker)
         self.assertEqual(set(ingested), {"a.c", "c.c"})
         self.assertEqual(result.failed_workers, 0)
         self.assertTrue(any("commit failed" in e[1] for e in errors))
 
     def test_on_started_runs_with_db_connection(self) -> None:
         seen: list = []
-        main._run_worker_stage(
+        pipeline.worker_stage._run_worker_stage(
             "[test]", [(0, ["a.c"])], lambda batch: None, 1, [],
             on_started=lambda: seen.append(G.TE.db), worker_target=_crashing_worker,
         )
@@ -364,8 +375,8 @@ class TestWorkerStage(unittest.TestCase):
         errors: list = []
         ingested: list = []
         batches = [(i, [f"f{i}_{j}.c" for j in range(2)]) for i in range(20)]
-        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(main.SystemicParseError) as ctx:
-            main._run_worker_stage("[test]", batches, ingested.append, 2, errors, worker_target=_failing_worker)
+        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(pipeline.systemic.SystemicParseError) as ctx:
+            pipeline.worker_stage._run_worker_stage("[test]", batches, ingested.append, 2, errors, worker_target=_failing_worker)
         message = str(ctx.exception)
         self.assertIn("'Tried calling method on a null-cursor.'", message)
         self.assertIn("clang/cindex.py:1629 in inner, called from parser/c_ast/cursor_tree.py:2607 in exec_punctuation", message)
@@ -373,7 +384,7 @@ class TestWorkerStage(unittest.TestCase):
 
 
 class TestSystemicFailure(unittest.TestCase):
-    """main._raise_if_systemic(): one error across most files stops the version."""
+    """pipeline.systemic._raise_if_systemic(): one error across most files stops the version."""
 
     @staticmethod
     def _errors(n: int, message: str = "boom") -> list:
@@ -381,46 +392,50 @@ class TestSystemicFailure(unittest.TestCase):
 
     def test_scattered_file_errors_do_not_stop(self) -> None:
         errors = [(f"M\tf{i}.c", f"error {i}", "") for i in range(30)]
-        main._raise_if_systemic("[test]", errors, 40)
+        pipeline.systemic._raise_if_systemic("[test]", errors, 40)
 
     def test_few_files_do_not_stop(self) -> None:
-        main._raise_if_systemic("[test]", self._errors(main.SYSTEMIC_ERROR_MIN_FILES - 1), main.SYSTEMIC_ERROR_MIN_FILES - 1)
+        pipeline.systemic._raise_if_systemic("[test]", self._errors(pipeline.systemic.SYSTEMIC_ERROR_MIN_FILES - 1), pipeline.systemic.SYSTEMIC_ERROR_MIN_FILES - 1)
 
     def test_same_error_on_a_minority_of_files_does_not_stop(self) -> None:
-        main._raise_if_systemic("[test]", self._errors(10), 100)
+        pipeline.systemic._raise_if_systemic("[test]", self._errors(10), 100)
 
     def test_same_error_on_most_files_stops(self) -> None:
-        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(main.SystemicParseError) as ctx:
-            main._raise_if_systemic("Version 'v3.0.1'", self._errors(63), 82)
+        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(pipeline.systemic.SystemicParseError) as ctx:
+            pipeline.systemic._raise_if_systemic("Version 'v3.0.1'", self._errors(63), 82)
         self.assertIn("63 of 82 files", str(ctx.exception))
         self.assertIn("dir/f0.c", str(ctx.exception))
 
     def test_error_origin_names_the_raising_and_the_calling_frame(self) -> None:
         self.assertEqual(
-            main._error_origin(_NULL_CURSOR_TB),
+            pipeline.systemic._error_origin(_NULL_CURSOR_TB),
             "/usr/lib/python3.14/site-packages/clang/cindex.py:1629 in inner, "
             "called from parser/c_ast/cursor_tree.py:2607 in exec_punctuation",
         )
-        self.assertEqual(main._error_origin(""), "")
+        self.assertEqual(pipeline.systemic._error_origin(""), "")
 
 
 class TestTriggerMulticore(unittest.TestCase):
     """Drive both stages of trigger_multicore with the fake worker and no scheduler."""
 
     def setUp(self) -> None:
-        self.saved = {
-            name: getattr(main, name)
-            for name in ("file_processing_worker", "processing_dirs", "processing_unchanges", "_register_file_names")
+        # Each name is replaced on the module that looks it up
+        self.patched = {
+            "file_processing_worker": pipeline.worker_stage,
+            "processing_dirs": pipeline.multicore,
+            "processing_unchanges": pipeline.multicore,
+            "_register_file_names": pipeline.multicore,
         }
+        self.saved = {name: getattr(module, name) for name, module in self.patched.items()}
         self.saved_gp = (main.gp.worker_change_list, main.gp.Change_List, main.gp.Version_Name)
         self.old_db, self.old_te = G.DB, G.TE
         G.DB = MockDB
         G.TE = _RecordingTE()
         self.registered: list[list[str]] = []
-        main.file_processing_worker = _crashing_worker
-        main.processing_dirs = lambda: {}
-        main.processing_unchanges = lambda: ["A\tdrivers/missing.c"]
-        main._register_file_names = lambda items: self.registered.append(list(items))
+        pipeline.worker_stage.file_processing_worker = _crashing_worker
+        pipeline.multicore.processing_dirs = lambda: {}
+        pipeline.multicore.processing_unchanges = lambda: ["A\tdrivers/missing.c"]
+        pipeline.multicore._register_file_names = lambda items: self.registered.append(list(items))
         main.gp.Version_Name = "test-version-not-checked-out"
         main.gp.init_cs_dict()
         signal.signal(signal.SIGALRM, TestWorkerStage._timeout)
@@ -429,7 +444,7 @@ class TestTriggerMulticore(unittest.TestCase):
     def tearDown(self) -> None:
         signal.alarm(0)
         for name, value in self.saved.items():
-            setattr(main, name, value)
+            setattr(self.patched[name], name, value)
         main.gp.worker_change_list, main.gp.Change_List, main.gp.Version_Name = self.saved_gp
         G.DB, G.TE = self.old_db, self.old_te
         main.gp.init_cs_dict()
@@ -438,7 +453,7 @@ class TestTriggerMulticore(unittest.TestCase):
         main.gp.Change_List = ["M\tinclude/linux/a.h", "M\tkernel/b.c", "M\tDocumentation/c.txt"]
         main.gp.worker_change_list = None
         frozen_before = gc.get_freeze_count()
-        main.trigger_multicore()
+        pipeline.multicore.trigger_multicore()
         # The fake worker keys each result by its change line
         self.assertEqual(
             set(main.gp.ChangeSet_Dict.keys()),
@@ -474,17 +489,17 @@ class TestGitCommitWorker(unittest.TestCase):
 
     def test_result_handed_over_through_file(self) -> None:
         self._install_parser((["c1", "c2"], {"kernel/fork.c": [1, 2]}))
-        main._start_git_commit_worker()
+        pipeline.git_commit_worker._start_git_commit_worker()
         result_dir = main.gp._commit_result_dir
-        self.assertEqual(main._collect_git_commit_result(), (["c1", "c2"], {"kernel/fork.c": [1, 2]}))
+        self.assertEqual(pipeline.git_commit_worker._collect_git_commit_result(), (["c1", "c2"], {"kernel/fork.c": [1, 2]}))
         self.assertIsNone(main.gp._commit_proc)
         self.assertFalse(os.path.exists(result_dir))
         self.assertNotIn(result_dir, main.gp.PURGE_LIST)
 
     def test_failed_worker_falls_back(self) -> None:
         self._install_parser(RuntimeError("git log failed"))
-        main._start_git_commit_worker()
-        self.assertIsNone(main._collect_git_commit_result())
+        pipeline.git_commit_worker._start_git_commit_worker()
+        self.assertIsNone(pipeline.git_commit_worker._collect_git_commit_result())
 
 
 class TestEpochOrdering(unittest.TestCase):
@@ -497,12 +512,12 @@ class TestEpochOrdering(unittest.TestCase):
                 with open(os.path.join(tmpdir, rel), "wb") as f:
                     f.write(b"x" * size)
                 items.append(f"M\t{rel}")
-            epochs = main.partition_source_epochs(
+            epochs = pipeline.source_order.partition_source_epochs(
                 items, working_dir=tmpdir, normal_batch_size=1, heavy_batch_size=1, max_batch_bytes=10**9
             )
             sizes = [os.path.getsize(os.path.join(tmpdir, b[1][0].split("\t")[-1])) for b in epochs[0]]
             self.assertEqual(sizes, sorted(sizes, reverse=True))
-            in_order = main.partition_source_epochs(
+            in_order = pipeline.source_order.partition_source_epochs(
                 items, working_dir=tmpdir, normal_batch_size=1, heavy_batch_size=1, max_batch_bytes=10**9, largest_first=False
             )
             self.assertEqual([b[0] for b in in_order[0]], [0, 1, 2, 3, 4])

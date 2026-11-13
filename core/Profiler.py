@@ -377,7 +377,7 @@ class PipelineStageProfiler:
                     lines.append("  -> TableEngine cache preload (carried hash tables are reused or rebuilt from memory).")
                     lines.append("  -> A long preload means a cold first load or a carried-table rebuild; see the [TECachedDB] lines.")
                 elif "file references" in low_name:
-                    lines.append("  -> Mostly the include/Kconfig reference INSERT...SELECT for new blobs; Kbuild and docs are a small share.")
+                    lines.append("  -> Mostly the include/Kconfig reference copy for new blobs; Kbuild and docs are a small share.")
                     lines.append("  -> Optimization: database-side (InnoDB buffer pool size, indexes on m_file_reference).")
                 elif "header" in low_name and "wave" in low_name:
                     lines.append("  -> Topological sort and cycle-breaking deadlock resolution.")

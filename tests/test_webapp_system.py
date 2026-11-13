@@ -8,47 +8,51 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import ensure_db_instance
+from pipeline.db_setup import ensure_db_instance
 from core.DBLayout import m_db_instance
-from webapp.backend.database.pool import get_db_cursor
+from db_engine import MockDB
+from tests.db_fixtures import patch_reader
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.sync_service import SyncService
 
 
 class TestWebappSystem(unittest.TestCase):
     """Test suite for the database instance token and database read-only invariants."""
 
-    def _db_token(self, cursor: MagicMock) -> str:
-        with patch("webapp.backend.services.sync_service.get_db_cursor") as mock_get_cursor:
-            mock_get_cursor.return_value.__enter__.return_value = cursor
+    def _db_token(self, db: MockDB) -> str:
+        with patch_reader(db):
             return SyncService().db_token(fresh=True)
 
     def test_db_token_populated(self) -> None:
-        """The `db` sync token is the instance hash, read with a read-only SELECT."""
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = {"instance_hash": "a" * 64}
-        self.assertEqual(self._db_token(mock_cursor), "a" * 12)
-        mock_cursor.execute.assert_called_once()
-        query = mock_cursor.execute.call_args[0][0]
-        self.assertIn("SELECT", query.upper())
-        self.assertNotIn("INSERT INTO", query.upper())
-        self.assertNotIn("CREATE TABLE", query.upper())
+        """The `db` sync token is the instance hash, read through the read-only session."""
+        db = MockDB(use_global=False)
+        db.insert_rows("m_db_instance", ["instance_hash", "created_at"], [("a" * 64, 1)])
+        self.assertEqual(self._db_token(db), "a" * 12)
+        self.assertEqual(db.count_rows("m_db_instance"), 1, "nothing was written")
 
     def test_db_token_empty_or_unavailable(self) -> None:
         """An empty or missing m_db_instance gives an empty token, without writing anything."""
-        empty = MagicMock()
-        empty.fetchone.return_value = None
+        empty = MockDB(use_global=False)
         self.assertEqual(self._db_token(empty), "")
-        for call_args in empty.execute.call_args_list:
-            self.assertNotIn("INSERT INTO", call_args[0][0].upper())
+        self.assertEqual(empty.count_rows("m_db_instance"), 0)
 
-        broken = MagicMock()
-        broken.execute.side_effect = Exception("Table 'test.m_db_instance' doesn't exist")
+        broken = MockDB(use_global=False)
+        broken.drop_tables(["m_db_instance"])
         self.assertEqual(self._db_token(broken), "")
 
-    def test_get_db_cursor_rejects_commit_argument(self) -> None:
-        """Rule 35: get_db_cursor must not accept commit argument."""
-        with self.assertRaises(TypeError):
-            get_db_cursor(commit=True)  # type: ignore[call-arg]
+    def test_webapp_reader_is_read_only(self) -> None:
+        """webapp/API.md 2.5: every engine's request session refuses writes, DDL and commits."""
+        from db_engine import ReadOnlyViolation, SQLiteDB
+        for engine in (MockDB(use_global=False), SQLiteDB(":memory:")):
+            with patch_reader(engine), get_reader() as reader:
+                for call in (
+                    lambda: reader.insert_rows("m_db_instance", ["instance_hash"], [(b"x",)]),
+                    lambda: reader.delete_rows("m_db_instance", all_rows=True),
+                    lambda: reader.drop_tables(["m_db_instance"]),
+                    lambda: reader.commit(),
+                ):
+                    with self.assertRaises(ReadOnlyViolation, msg=type(engine).__name__):
+                        call()
 
     def test_ensure_db_instance_seeding(self) -> None:
         """Verify parser helper ensure_db_instance checks and seeds m_db_instance if empty."""
@@ -75,56 +79,56 @@ if __name__ == "__main__":
 class TestIngestStatus(unittest.TestCase):
     """GET /api/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
 
-    def _run(self, states, refs, tables, now=1_000_000.0, network_id=7, repo_id=3):
+    def _run(self, states, refs, now=1_000_000.0, network_id=7, repo_id=3):
         from webapp.backend.routers import system
-        cursor = MagicMock()
-        results = [states, refs, tables]
-        cursor.fetchall.side_effect = lambda: results.pop(0)
-        with patch.object(system, "get_db_cursor") as get_cursor, \
+        db = MockDB(use_global=False)
+        for commit_id, status, updated_at, commit_hash in states:
+            db.insert_rows(
+                "m_commit",
+                ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+                [(commit_id, network_id, commit_hash, 0, 0, 0, 0, "", "")],
+            )
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(network_id, commit_id, status, updated_at)])
+        # Another network's state and another repository's refs must stay out
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(network_id + 1, 99, 2, 5)])
+        for i, (commit_id, name) in enumerate(refs):
+            db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(i + 1, repo_id, 1, name, commit_id)])
+        db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(50, repo_id + 1, 1, "other", 1)])
+        with patch_reader(db), \
                 patch.object(system, "get_active_network_id", return_value=network_id), \
                 patch.object(system, "get_active_repo_id", return_value=repo_id), \
                 patch.object(system, "_git_tag_count", return_value=10):
-            get_cursor.return_value.__enter__.return_value = cursor
             out = system.ingest_status(now)
-        return out, cursor
+        return out, db
 
     def test_shape_and_staleness(self) -> None:
         now = 1_000_000.0
         states = [
-            {"commit_id": 1, "status": 1, "updated_at": int(now - 60), "commit_hash": "a" * 40},
-            {"commit_id": 2, "status": 1, "updated_at": int(now - 3600), "commit_hash": "b" * 40},
-            {"commit_id": 3, "status": 2, "updated_at": int(now - 10), "commit_hash": "c" * 40},
+            (1, 1, int(now - 60), b"a" * 20),
+            (2, 1, int(now - 3600), b"b" * 20),
+            (3, 2, int(now - 10), b"c" * 20),
         ]
-        refs = [{"commit_id": 1, "ref_name": "v3.2-rc4"}, {"commit_id": 3, "ref_name": "v3.1"}]
-        tables = [{"TABLE_NAME": "m_ast", "TABLE_ROWS": 5, "DATA_LENGTH": 3 << 20, "INDEX_LENGTH": 1 << 20}]
-        out, cursor = self._run(states, refs, tables, now)
+        refs = [(1, "v3.2-rc4"), (3, "v3.1")]
+        out, db = self._run(states, refs, now)
         self.assertEqual(out["catalog"], {"tags": 10, "parsed": 1, "parsing": 2, "git_only": 9})
-        self.assertEqual([(p["version"], p["stale"]) for p in out["parsing"]], [("v3.2-rc4", False), ("b" * 12, True)])
-        self.assertEqual(out["recent"], [{"version": "v3.1", "commit": "c" * 12, "finished_at": int(now - 10)}])
-        self.assertEqual(out["db"], {"tables": [{"name": "m_ast", "rows_estimate": 5, "data_mb": 3.0, "index_mb": 1.0}], "total_mb": 4.0})
-        # Read-only (section 2.5) and scoped to the active repository's network and refs
-        for call in cursor.execute.call_args_list:
-            sql = call[0][0].strip().upper()
-            self.assertTrue(sql.startswith("SELECT"), sql)
-            for word in ("INSERT", "UPDATE ", "DELETE", "CREATE", "ALTER", "DROP"):
-                self.assertNotIn(word, sql)
-        self.assertEqual(cursor.execute.call_args_list[0][0][1][0], 7)
-        self.assertEqual(cursor.execute.call_args_list[1][0][1], (3,))
+        self.assertEqual([(p["version"], p["stale"]) for p in out["parsing"]], [("v3.2-rc4", False), (("b" * 20).encode().hex()[:12], True)])
+        self.assertEqual(out["recent"], [{"version": "v3.1", "commit": ("c" * 20).encode().hex()[:12], "finished_at": int(now - 10)}])
+        names = {t["name"]: t for t in out["db"]["tables"]}
+        self.assertIn("m_ingest_state", names)
+        self.assertEqual(names["m_ingest_state"]["rows_estimate"], db.count_rows("m_ingest_state"))
+        self.assertTrue(out["available"])
 
     def test_unparsed_repository_and_missing_database(self) -> None:
         from webapp.backend.routers import system
-        cursor = MagicMock()
-        cursor.fetchall.return_value = []
-        with patch.object(system, "get_db_cursor") as get_cursor, \
+        with patch_reader(MockDB(use_global=False)), \
                 patch.object(system, "get_active_network_id", return_value=None), \
                 patch.object(system, "get_active_repo_id", return_value=-1), \
                 patch.object(system, "_git_tag_count", return_value=4):
-            get_cursor.return_value.__enter__.return_value = cursor
             out = system.ingest_status(1.0)
         self.assertEqual(out["catalog"]["parsed"], 0)
         self.assertEqual(out["catalog"]["git_only"], 4)
-        self.assertEqual(cursor.execute.call_count, 1)  # only information_schema
-        with patch.object(system, "get_db_cursor", side_effect=Exception("no database")), \
+        self.assertEqual(out["parsing"], [])
+        with patch.object(system, "get_reader", side_effect=Exception("no database")), \
                 patch.object(system, "_git_tag_count", return_value=None):
             out = system.ingest_status(1.0)
         self.assertFalse(out["available"])

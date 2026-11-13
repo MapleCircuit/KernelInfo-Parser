@@ -3,7 +3,7 @@
 Did a patch (series) land, as which commits, in which release?
 1. `m_commit_email` (the parser's commit <-> mail links, core/API.md section 8.2) by message-id, or by
    thread for the whole series, relation Patch / CoverLetter / SiblingPatch, joined to `m_commit` of the
-   active repository's network (SELECT only, section 2.5). Used when the table has its message-id and
+   active repository's network (read-only, section 2.5). Used when the table has its message-id and
    thread indexes (created by the parser at start); without them a lookup would scan the table.
 2. Fallback: commits whose `Link:` / `Message-Id:` trailer names the message (`source: "trailers"`):
    `m_commit_link` (core/API.md section 4, row 64), else the commit relation index (section 2.16).
@@ -12,21 +12,18 @@ Each commit gets its first release (section 2.17).
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any
 
 from fastapi import HTTPException
 
-from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.helpers import get_active_network_id, safe_decode
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
+from db_engine.spec import AnyOf, Join
 
 logger = logging.getLogger(__name__)
 
 RELATIONS = {1: "patch", 2: "cover", 3: "sibling", 4: "pull"}
 MAX_THREAD_MIDS = 300
-_INDEXED: RepoScopedCache = RepoScopedCache()
-_LOCK = threading.Lock()
 
 
 def clean_mid(mid: str) -> str:
@@ -35,22 +32,12 @@ def clean_mid(mid: str) -> str:
     return unquote(str(mid or "")).strip().strip("<>").strip()[:255]
 
 
-def indexes_present(cursor: Any) -> bool:
-    hit = _INDEXED.get("mail_idx")
-    if hit is not None:
-        return hit
+def indexes_present(reader: Any) -> bool:
+    """True when m_commit_email has its message-id and thread indexes (the engine remembers the catalog answer)."""
     try:
-        cursor.execute(
-            "SELECT COUNT(DISTINCT INDEX_NAME) AS n FROM information_schema.STATISTICS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'm_commit_email' "
-            "AND INDEX_NAME IN ('commit_email_mid_idx', 'commit_email_tid_idx');"
-        )
-        row = cursor.fetchone() or {}
-        ok = int(row.get("n") or 0) == 2
+        return {"commit_email_mid_idx", "commit_email_tid_idx"} <= set(reader.index_names("m_commit_email"))
     except Exception:  # noqa: BLE001
-        ok = False
-    _INDEXED["mail_idx"] = ok
-    return ok
+        return False
 
 
 def _hex(h: Any) -> str:
@@ -78,29 +65,25 @@ def merged_commits(mid: str = "", tid: int = 0) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="mid or tid is required.")
     commits: list[dict[str, Any]] = []
     source = "db"
-    with get_db_cursor() as cursor:
-        network_id = get_active_network_id(cursor)
-        use_db = network_id is not None and indexes_present(cursor)
+    with get_reader() as reader:
+        network_id = get_active_network_id(reader)
+        use_db = network_id is not None and indexes_present(reader)
         if use_db:
-            where, params = [], []
+            branches: list[dict[str, Any]] = []
             if tid:
-                where.append("e.thread_id = %s")
-                params.append(tid)
+                branches.append({"e.thread_id": tid})
             if mid:
-                where.append("e.message_id = %s")
-                params.append(mid)
-            cursor.execute(
-                f"""
-                SELECT e.message_id, e.thread_id, e.relation_type, e.match_tier, e.patch_version, e.patch_idx,
-                       e.patch_total, c.commit_hash, c.subject
-                FROM m_commit_email e
-                JOIN m_commit c ON c.commit_id = e.commit_id
-                WHERE c.network_id = %s AND e.relation_type IN (1, 2, 3) AND ({" OR ".join(where)})
-                LIMIT 1000;
-                """,
-                (network_id, *params),
-            )
-            for r in cursor.fetchall():
+                branches.append({"e.message_id": mid})
+            for r in reader.select_rows(
+                ("m_commit_email", "e"),
+                [
+                    "e.message_id", "e.thread_id", "e.relation_type", "e.match_tier", "e.patch_version", "e.patch_idx",
+                    "e.patch_total", "c.commit_hash", "c.subject",
+                ],
+                [{"c.network_id": network_id, "e.relation_type": [1, 2, 3]}, AnyOf(*branches)],
+                joins=[Join(("m_commit", "c"), {"c.commit_id": "e.commit_id"})],
+                limit=1000,
+            ):
                 commits.append({
                     "hash": _hex(r["commit_hash"]), "subject": safe_decode(r["subject"]),
                     "relation": RELATIONS.get(int(r["relation_type"]), "patch"), "match_tier": int(r["match_tier"]),

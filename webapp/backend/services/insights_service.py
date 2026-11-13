@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from fastapi import HTTPException
 
+from db_engine.spec import Agg, Join, NotExists, Value, gt
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.release_order import release_ranges
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
@@ -243,12 +244,21 @@ def _release_range(tag: str) -> dict[str, Any] | None:
     return {"range_base": r["range_base"], "kind": r["kind"], "tags": members}
 
 
-def _in_list(n: int) -> str:
-    return ",".join(["%s"] * n)
+def _release_commit_source(network_id: int | None, repo_id: int | None, segs: list[int]) -> tuple[Any, list[Join], list[Any]]:
+    """(source, joins, where) of the non-merge commits of release segments `segs` in `m_commit` (`git log
+    --no-merges`): `m_commit_release` rows joined to their commit, without a second parent."""
+    return (
+        ("m_commit_release", "cr"),
+        [Join(("m_commit", "c"), {"c.network_id": Value(network_id), "c.commit_hash": "cr.commit_hash"})],
+        [
+            {"cr.repo_id": repo_id, "cr.segment_id": segs},
+            NotExists(("m_commit_parent", "mp"), {"mp.commit_id": "c.commit_id"}, {"mp.parent_idx": gt(0)}),
+        ],
+    )
 
 
 def db_release_stats(tag: str) -> dict[str, Any] | None:
-    """Release stats from the parser's release statistics (SELECT only), or None when they do not cover
+    """Release stats from the parser's release statistics (read only), or None when they do not cover
     the release: tables missing, repository never parsed, a tag of the range not summarized, or summarized
     against other commits, bases or another format than Git and the parser agree on now."""
     from parser.git_ast.release_stats import FORMAT
@@ -258,18 +268,22 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
     tags = rs.tag_commits()
     try:
         from webapp.backend.database.helpers import get_active_repo_id
-        from webapp.backend.database.pool import get_db_cursor
+        from webapp.backend.database.pool import get_reader
         from webapp.backend.services.maintainer_service import MaintainerService
-        with get_db_cursor() as cur:
+        with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
             if repo_id is None or repo_id <= 0:
                 return None
             members = list(rng["tags"])
-            cur.execute(
-                "SELECT segment_id, tag, tag_hash, base_tag, base_hash, diff_base_tag, format, commits, merges, "
-                f"files_changed, lines_added, lines_removed FROM m_release_segment WHERE repo_id = %s AND tag IN ({_in_list(len(members))});",
-                (repo_id, *members))
-            seg = {_text(r["tag"]): r for r in cur.fetchall()}
+            seg = {
+                _text(r["tag"]): r
+                for r in cur.select_rows(
+                    "m_release_segment",
+                    ["segment_id", "tag", "tag_hash", "base_tag", "base_hash", "diff_base_tag", "format", "commits",
+                     "merges", "files_changed", "lines_added", "lines_removed"],
+                    {"repo_id": repo_id, "tag": members},
+                )
+            }
             for t, base in rng["tags"].items():
                 r = seg.get(t)
                 if (r is None or bytes(r["tag_hash"]).hex() != tags[t] or _text(r["base_tag"]) != (base or "")
@@ -279,15 +293,23 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
             if _text(own["diff_base_tag"]) != (rng["range_base"] or ""):
                 return None
             ids = [int(r["segment_id"]) for r in seg.values()]
-            cur.execute(f"SELECT person_id, role_type, SUM(commits) AS n FROM m_release_person WHERE segment_id IN ({_in_list(len(ids))}) "
-                        "GROUP BY person_id, role_type;", tuple(ids))
-            counts = [(int(r["person_id"]), int(r["role_type"]), int(r["n"])) for r in cur.fetchall()]
+            counts = [
+                (int(r["person_id"]), int(r["role_type"]), int(r["n"]))
+                for r in cur.select_rows(
+                    "m_release_person",
+                    {"person_id": "person_id", "role_type": "role_type", "n": Agg("SUM", "commits")},
+                    {"segment_id": ids},
+                    group_by=["person_id", "role_type"],
+                )
+            ]
             pids = sorted({p for p, _, _ in counts})
             persons: dict[int, tuple[str, str]] = {}
             for i in range(0, len(pids), 1000):
                 part = pids[i:i + 1000]
-                cur.execute(f"SELECT person_id, name, email FROM m_maintainer_person WHERE person_id IN ({_in_list(len(part))});", tuple(part))
-                persons.update({int(r["person_id"]): (_text(r["name"]), _text(r["email"])) for r in cur.fetchall()})
+                persons.update({
+                    int(r["person_id"]): (_text(r["name"]), _text(r["email"]))
+                    for r in cur.select_rows("m_maintainer_person", ["person_id", "name", "email"], {"person_id": part})
+                })
             pid_to_key, members_of = MaintainerService._identity_index(cur)
             key_of = {p: pid_to_key.get(p) or identity(*persons.get(p, ("", ""))) for p in pids}
             first_of: dict[str, tuple] = {}
@@ -297,15 +319,20 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
                 firsts: list[tuple[int, int]] = []
                 for i in range(0, len(aliases), 1000):
                     part = aliases[i:i + 1000]
-                    cur.execute("SELECT person_id, segment_id FROM m_person_first_release WHERE repo_id = %s AND "
-                                f"person_id IN ({_in_list(len(part))});", (repo_id, *part))
-                    firsts += [(int(r["person_id"]), int(r["segment_id"])) for r in cur.fetchall()]
+                    firsts += [
+                        (int(r["person_id"]), int(r["segment_id"]))
+                        for r in cur.select_rows(
+                            "m_person_first_release", ["person_id", "segment_id"], {"repo_id": repo_id, "person_id": part}
+                        )
+                    ]
                 sids = sorted({s for _, s in firsts})
                 seg_tag: dict[int, str] = {}
                 for i in range(0, len(sids), 1000):
                     part = sids[i:i + 1000]
-                    cur.execute(f"SELECT segment_id, tag FROM m_release_segment WHERE segment_id IN ({_in_list(len(part))});", tuple(part))
-                    seg_tag.update({int(r["segment_id"]): _text(r["tag"]) for r in cur.fetchall()})
+                    seg_tag.update({
+                        int(r["segment_id"]): _text(r["tag"])
+                        for r in cur.select_rows("m_release_segment", ["segment_id", "tag"], {"segment_id": part})
+                    })
                 for p, s in firsts:
                     if s not in seg_tag:
                         continue
@@ -527,19 +554,18 @@ def _sender(body: str) -> str:
 
 
 def _pull_threads(commit_ids: list[int]) -> dict[int, dict[str, Any]]:
-    """commit_id -> {message_id, thread_id} of its [GIT PULL] mail (m_commit_email relation 4, SELECT only)."""
+    """commit_id -> {message_id, thread_id} of its [GIT PULL] mail (m_commit_email relation 4, read only)."""
     if not commit_ids:
         return {}
     try:
-        from webapp.backend.database.pool import get_db_cursor
-        with get_db_cursor() as cursor:
+        from webapp.backend.database.pool import get_reader
+        with get_reader() as reader:
             out = {}
             for i in range(0, len(commit_ids), 500):
                 part = commit_ids[i:i + 500]
-                cursor.execute(
-                    f"SELECT commit_id, message_id, thread_id FROM m_commit_email WHERE relation_type = 4 AND commit_id IN ({','.join(['%s'] * len(part))});",
-                    tuple(part))
-                for r in cursor.fetchall():
+                for r in reader.select_rows(
+                    "m_commit_email", ["commit_id", "message_id", "thread_id"], {"relation_type": 4, "commit_id": part}
+                ):
                     out.setdefault(int(r["commit_id"]), {"message_id": r["message_id"], "thread_id": int(r["thread_id"])})
             return out
     except Exception as exc:  # noqa: BLE001
@@ -704,22 +730,15 @@ def health_coverage(cur: Any, tags: list[str]) -> dict[str, list[int]] | None:
         segs = rs.walk_segments(prev, t) if prev else None
         if not segs or _ingest_chain(cur, network_id, tc[prev], tc[t]) is None:
             return None
-        marks = ",".join(["%s"] * len(segs))
-        cur.execute(f"SELECT COALESCE(SUM(commits), 0) AS n, MIN(format) AS lo, MAX(format) AS hi, COUNT(*) AS k "
-                    f"FROM m_release_segment WHERE segment_id IN ({marks});", tuple(segs))
-        row = cur.fetchone() or {}
+        row = cur.select_one(
+            "m_release_segment",
+            {"n": Agg("SUM", "commits"), "lo": Agg("MIN", "format"), "hi": Agg("MAX", "format"), "k": Agg("COUNT", "*")},
+            {"segment_id": segs},
+        ) or {}
         if int(row.get("k") or 0) != len(segs) or int(row.get("lo") or 0) != release_stats.FORMAT or int(row.get("hi") or 0) != release_stats.FORMAT:
             return None
-        cur.execute(
-            f"""
-            SELECT COUNT(*) AS n FROM m_commit_release cr
-            JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash
-            WHERE cr.repo_id = %s AND cr.segment_id IN ({marks})
-              AND NOT EXISTS (SELECT 1 FROM m_commit_parent mp WHERE mp.commit_id = c.commit_id AND mp.parent_idx > 0);
-            """,
-            (network_id, repo_id, *segs),
-        )
-        if int((cur.fetchone() or {}).get("n") or 0) != int(row.get("n") or 0):
+        source, joins, where = _release_commit_source(network_id, repo_id, segs)
+        if cur.count_rows(source, where, joins=joins) != int(row.get("n") or 0):
             return None
         out[t] = segs
     return out
@@ -727,7 +746,7 @@ def health_coverage(cur: Any, tags: list[str]) -> dict[str, list[int]] | None:
 
 def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                    progress: Callable | None = None) -> dict[str, Any] | None:
-    """The report from the database (SELECT only), or None when it does not cover the window (health_coverage()).
+    """The report from the database (read only), or None when it does not cover the window (health_coverage()).
 
     Commits of each release's segments without a second parent (`git log --no-merges`), their authors, their
     m_commit_file paths, new and old name (`--no-renames` lists both sides of a rename) and their trailers
@@ -735,8 +754,8 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
     sections come from m_maintainer_file for the tag's sections when it has rows there (files of the tag's
     tree), else from MAINTAINERS like the Git path (files no longer in the tree)."""
     from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
-    from webapp.backend.database.pool import get_db_cursor
-    with get_db_cursor() as cur:
+    from webapp.backend.database.pool import get_reader
+    with get_reader() as cur:
         cov = health_coverage(cur, tags)
         if cov is None:
             return None
@@ -747,41 +766,35 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
         fnids_seen: set[int] = set()
         for t in tags:
             segs = cov[t]
-            cur.execute(
-                f"""
-                SELECT c.commit_id, c.author_date, c.committer_date, p.name, p.email
-                FROM m_commit_release cr
-                JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash
-                LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
-                WHERE cr.repo_id = %s AND cr.segment_id IN ({",".join(["%s"] * len(segs))})
-                  AND NOT EXISTS (SELECT 1 FROM m_commit_parent mp WHERE mp.commit_id = c.commit_id AND mp.parent_idx > 0);
-                """,
-                (network_id, repo_id, *segs),
+            source, joins, where = _release_commit_source(network_id, repo_id, segs)
+            fetched_rows = cur.select_rows(
+                source,
+                {"commit_id": "c.commit_id", "author_date": "c.author_date", "committer_date": "c.committer_date",
+                 "name": "p.name", "email": "p.email"},
+                where,
+                joins=[*joins, Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left")],
             )
             # In `git log` order (newest commit first; the parser registers parents before children), so ties
             # among top authors break the same way as on the Git path
-            fetched = sorted(cur.fetchall(), key=lambda r: (int(r["committer_date"] or 0), int(r["commit_id"])), reverse=True)
+            fetched = sorted(fetched_rows, key=lambda r: (int(r["committer_date"] or 0), int(r["commit_id"])), reverse=True)
             commits = {int(r["commit_id"]): {"date": int(r["author_date"] or 0), "author": safe_decode(r["name"]) or "",
                                              "email": (safe_decode(r["email"]) or "").lower(), "trailers": {}, "fnids": set()}
                        for r in fetched}
             ids = sorted(commits)
             for i in range(0, len(ids), HEALTH_CHUNK):
                 part = ids[i:i + HEALTH_CHUNK]
-                marks = ",".join(["%s"] * len(part))
-                cur.execute(f"SELECT commit_id, fnid, old_fnid FROM m_commit_file WHERE commit_id IN ({marks});", tuple(part))
-                for r in cur.fetchall():
+                for r in cur.select_rows("m_commit_file", ["commit_id", "fnid", "old_fnid"], {"commit_id": part}):
                     c = commits[int(r["commit_id"])]
                     for f in (int(r["fnid"] or 0), int(r["old_fnid"] or 0)):
                         if f > 0:
                             c["fnids"].add(f)
                 roles = [int(x) for x in HEALTH_ROLES]
-                cur.execute(
-                    f"SELECT b.commit_id, b.role_type, p.name, p.email FROM m_bridge_commit_person b "
-                    f"JOIN m_maintainer_person p ON p.person_id = b.person_id "
-                    f"WHERE b.commit_id IN ({marks}) AND b.role_type IN ({','.join(['%s'] * len(roles))});",
-                    (*part, *roles),
-                )
-                for r in cur.fetchall():
+                for r in cur.select_rows(
+                    ("m_bridge_commit_person", "b"),
+                    {"commit_id": "b.commit_id", "role_type": "b.role_type", "name": "p.name", "email": "p.email"},
+                    {"b.commit_id": part, "b.role_type": roles},
+                    joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "b.person_id"})],
+                ):
                     role = HEALTH_ROLES[CommitRole(int(r["role_type"]))]
                     commits[int(r["commit_id"])]["trailers"].setdefault(role, []).append(
                         [safe_decode(r["name"]) or "", (safe_decode(r["email"]) or "").lower()])
@@ -793,8 +806,10 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
         missing = sorted(fnids_seen)
         for i in range(0, len(missing), HEALTH_CHUNK):
             part = missing[i:i + HEALTH_CHUNK]
-            cur.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({','.join(['%s'] * len(part))});", tuple(part))
-            names.update({int(r["fnid"]): safe_decode(r["fname"]) for r in cur.fetchall()})
+            names.update({
+                int(r["fnid"]): safe_decode(r["fname"])
+                for r in cur.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part})
+            })
         # Sections of the tag's tree files from D01's mapping (THE REST left out)
         sec_name = {s.sec_id: s.name for s in sections if s.name != "THE REST" and isinstance(s.sec_id, int)}
         file_secs: dict[str, list[str]] = {}
@@ -803,12 +818,7 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
             try:
                 for i in range(0, len(missing), HEALTH_CHUNK):
                     part = missing[i:i + HEALTH_CHUNK]
-                    cur.execute(
-                        f"SELECT fnid, sec_id FROM m_maintainer_file WHERE fnid IN ({','.join(['%s'] * len(part))}) "
-                        f"AND sec_id IN ({','.join(['%s'] * len(sec_ids))});",
-                        (*part, *sec_ids),
-                    )
-                    for r in cur.fetchall():
+                    for r in cur.select_rows("m_maintainer_file", ["fnid", "sec_id"], {"fnid": part, "sec_id": sec_ids}):
                         path = names.get(int(r["fnid"]))
                         if path is not None:
                             file_secs.setdefault(path, []).append(sec_name[int(r["sec_id"])])

@@ -1,4 +1,4 @@
-"""tests/test_webapp_rust_refs.py - Rust uses of C symbols in xref and the callgraph (no database).
+"""tests/test_webapp_rust_refs.py - Rust uses of C symbols in xref and the callgraph (read session double).
 
 A Rust use through bindgen (`bindings::kfree(p)`) references the `Rust_BindingRef` AST named by the symbol
 (parser/rust_ast/RUST_API.md §7): `get_symbol_xref()` and `get_function_callgraph()` add that AST to their
@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from contextlib import contextmanager
 from typing import Any
 from unittest.mock import patch
 
@@ -24,50 +23,51 @@ BLOB_C, BLOB_RS = 1, 2
 PATHS = {BLOB_C: ["mm/slab_common.c"], BLOB_RS: ["rust/kernel/alloc.rs"]}
 
 
-class _Cursor:
-    """Answers the services' queries by their shape; records each one."""
+C_DEF = {"ast_id": C_DEF_AST, "type_id": int(ASTT.C_functionproto), "type_name": "C_functionproto",
+         "line_s": 10, "line_e": 20, "blob_id": BLOB_C, "linkage": 0, "ast_name": "kfree"}
+
+
+class _Reader:
+    """A read session double answering by the source and conditions of each spec read and stubbing the symbol read
+    intents (their reference/caller joins would need a seeded AST and tag graph); `defs` are the definitions `kfree` has."""
 
     def __init__(self) -> None:
-        self.queries: list[tuple[str, Any]] = []
-        self._rows: list[dict[str, Any]] = []
+        self.defs: list[dict[str, Any]] = [dict(C_DEF)]
+        self.ref_targets: list[list[int]] = []
 
-    def execute(self, sql: str, params: Any = None) -> None:
-        self.queries.append((sql, params))
-        flat = " ".join(sql.split())
-        if "FROM m_ast WHERE name = %s AND type_id = %s" in flat:
-            self._rows = [{"ast_id": BINDING_AST}] if params == ("kfree", int(ASTT.Rust_BindingRef)) else []
-        elif "FROM m_symbol_def s" in flat and "WHERE s.name = %s" in flat:
-            self._rows = [{
-                "ast_id": C_DEF_AST, "type_id": int(ASTT.C_functionproto), "type_name": "C_functionproto",
-                "line_s": 10, "line_e": 20, "blob_id": BLOB_C, "linkage": 0, "ast_name": "kfree",
-            }] if params == ("kfree",) else []
-        elif "r.role = 3" in flat and "caller_name" in flat:
-            # Callers: only the binding AST has a reference (the Rust call)
-            self._rows = [{"caller_name": "free", "blob_id": BLOB_RS, "line_no": 5}] if BINDING_AST in params else []
-        elif "caller" in flat:
-            self._rows = [{"role": 3, "line": 5, "char_s": 9, "fid": BLOB_RS, "tag_id": 3, "caller": "free"}] if BINDING_AST in params else []
-        else:
-            self._rows = []
+    def __enter__(self) -> "_Reader":
+        return self
 
-    def fetchall(self) -> list[dict[str, Any]]:
-        return self._rows
+    def __exit__(self, *exc: Any) -> None:
+        return None
 
-    def fetchone(self) -> dict[str, Any] | None:
-        return self._rows[0] if self._rows else None
+    def select_rows(self, source: Any, columns: Any, where: Any = None, **kw: Any) -> list[dict[str, Any]]:
+        if source == "m_ast":
+            hit = where == {"name": "kfree", "type_id": int(ASTT.Rust_BindingRef)}
+            return [{"ast_id": BINDING_AST}] if hit else []
+        if source == ("m_symbol_def", "s") and where == {"s.name": "kfree"}:
+            return [dict(r) for r in self.defs]
+        return []  # callees of the function: none
+
+    def symbol_refs_of_targets(self, ast_ids: Any, *, role: int | None = None, with_caller: bool = False,
+                               limit: int | None = None) -> list[dict[str, Any]]:
+        self.ref_targets.append(list(ast_ids))
+        # Only the binding AST has a reference (the Rust call)
+        if BINDING_AST not in ast_ids or role not in (None, 3):
+            return []
+        return [{"role": 3, "line": 5, "char_s": 9, "fid": BLOB_RS, "tag_id": 3, "ast_id": BINDING_AST, "caller": "free"}]
+
+    def symbol_def_blobs_of_targets(self, ast_ids: Any) -> set[tuple[int, int]]:
+        return set()
 
 
 class TestRustReferencesInWebapp(unittest.TestCase):
     def setUp(self) -> None:
-        self.cursor = _Cursor()
-
-        @contextmanager
-        def cursor_cm():
-            yield self.cursor
-
+        self.reader = _Reader()
         arch = ("x86_64", None, 64)
         self.patches = [
-            patch.object(ss, "get_db_cursor", cursor_cm),
-            patch.object(cgs, "get_db_cursor", cursor_cm),
+            patch.object(ss, "get_reader", lambda: self.reader),
+            patch.object(cgs, "get_reader", lambda: self.reader),
             patch.object(ss.SymbolService, "_scope", staticmethod(lambda cur, v: (1, "v7.3", PATHS))),
             patch.object(ss, "definition_arch", lambda v, a: arch),
             patch.object(cgs, "definition_arch", lambda v, a: arch),
@@ -84,8 +84,8 @@ class TestRustReferencesInWebapp(unittest.TestCase):
             p.stop()
 
     def test_binding_ref_asts(self) -> None:
-        self.assertEqual(ss.binding_ref_asts(self.cursor, "kfree"), [BINDING_AST])
-        self.assertEqual(ss.binding_ref_asts(self.cursor, "nothing"), [])
+        self.assertEqual(ss.binding_ref_asts(self.reader, "kfree"), [BINDING_AST])
+        self.assertEqual(ss.binding_ref_asts(self.reader, "nothing"), [])
 
     def test_xref_lists_rust_uses(self) -> None:
         res = ss.SymbolService().get_symbol_xref("v7.3", "kfree")
@@ -107,14 +107,7 @@ class TestRustReferencesInWebapp(unittest.TestCase):
             {"ast_id": C_DEF_AST, "blob_id": BLOB_C, "line_s": 10, "line_e": 20, "type_id": int(ASTT.C_functionproto),
              "linkage": int(SymbolLinkage.ExternalDef), "ast_name": "kfree"},
         ]
-        original = self.cursor.execute
-
-        def execute(sql: str, params: Any = None) -> None:
-            original(sql, params)
-            if "FROM m_symbol_def s" in sql and "WHERE s.name = %s" in sql:
-                self.cursor._rows = [dict(r) for r in rows]
-
-        self.cursor.execute = execute
+        self.reader.defs = rows
         res = cgs.CallgraphService().get_function_callgraph("v7.3", "kfree")
         self.assertEqual(res["file_path"], "mm/slab_common.c")
 

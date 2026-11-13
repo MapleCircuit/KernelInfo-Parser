@@ -133,6 +133,7 @@ from core.globalstuff import (
     compute_code_hash,
 )
 from core.Profiler import PipelineProfiler
+from db_engine.spec import as_column_spec
 
 logger = logging.getLogger(__name__)
 
@@ -1411,7 +1412,7 @@ class Table:
         *,
         table_id: int,
         table_name: str,
-        columns: tuple[tuple[str, ...], ...],
+        columns: tuple[tuple[Any, ...], ...],
         primary: tuple[str, ...],
         foreign: tuple[tuple[str, str, str], ...] | None = None,
         initial_insert: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...] | None = None,
@@ -1429,7 +1430,8 @@ class Table:
         Args:
             table_id: Integer index identifying the table in `gp.Table_Array` (e.g., 0, 1, 2...).
             table_name: Database table name string (e.g., `"m_file_name"`).
-            columns: Tuple of column definition tuples: `(("col_name", "DATA_TYPE", "CONSTRAINTS"), ...)`.
+            columns: Tuple of `(col_name, ColumnSpec)` pairs (neutral types from `db_engine.spec`). Legacy
+                `("col_name", "DATA_TYPE", "CONSTRAINT", ...)` DDL fragment tuples are converted to a `ColumnSpec`.
             primary: Tuple of column name strings forming the Primary Key: `("fnid",)` or `("vid", "fnid")`.
             foreign: Optional tuple of Foreign Key constraints: `(("local_col", "foreign_table", "foreign_col"), ...)`.
             initial_insert: Optional tuple of default rows inserted when table is created.
@@ -1450,8 +1452,8 @@ class Table:
         """
         self.table_id = table_id
         self.table_name = table_name
-        self.init_columns = columns
-        self.length = len(columns)
+        self.init_columns = tuple((col[0], as_column_spec(col[1:])) for col in columns)
+        self.length = len(self.init_columns)
         self.init_primary = primary
 
         # Convert primary key column names into 0-indexed column position integers
@@ -1502,7 +1504,7 @@ class Table:
             self.te_cached = self.cached_columns
 
         self.hashing_table = hashing_table
-        self.has_auto_increment = any(any("AUTO_INCREMENT" in str(elem) for elem in col) for col in self.init_columns)
+        self.has_auto_increment = any(col[1].auto_increment for col in self.init_columns)
 
         # Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
         for x, column in enumerate(self.init_columns):

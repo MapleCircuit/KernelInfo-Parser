@@ -31,8 +31,9 @@ from core.globalstuff import SymbolLinkage, is_safe_git_rev
 from parser.arch_layout import ArchLayout, path_arch
 from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
-from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import finished_ref_sql, hash_hex, safe_decode, tree_source
+from db_engine.spec import Join, finished_ref
+from webapp.backend.database.pool import get_reader
+from webapp.backend.database.helpers import hash_hex, safe_decode
 
 logger = logging.getLogger(__name__)
 
@@ -54,29 +55,20 @@ class TreeResolverService:
             self._checkpoint_cache.clear()
             self._parent_cache.clear()
 
-    def _get_first_parent(self, commit_id: int, cursor: Any) -> int | None:
+    def _get_first_parent(self, commit_id: int, reader: Any) -> int | None:
         """Resolve the primary (first-parent, parent_idx=0) commit_id."""
         if commit_id in self._parent_cache:
             return self._parent_cache[commit_id]
 
-        cursor.execute(
-            """
-            SELECT parent_commit_id
-            FROM m_commit_parent
-            WHERE commit_id = %s AND parent_idx = 0
-            LIMIT 1;
-            """,
-            (commit_id,),
-        )
-        row = cursor.fetchone()
+        row = reader.select_one("m_commit_parent", ["parent_commit_id"], {"commit_id": commit_id, "parent_idx": 0})
         if row:
-            parent_id = row["parent_commit_id"] if isinstance(row, dict) else row[0]
+            parent_id = row["parent_commit_id"]
             self._parent_cache[commit_id] = parent_id
             return parent_id
         return None
 
     def _find_nearest_checkpoint_and_path(
-        self, commit_id: int, cursor: Any, max_depth: int = 500
+        self, commit_id: int, reader: Any, max_depth: int = 500
     ) -> tuple[int | None, list[int]]:
         """Walk parent_idx=0 backwards from commit_id to locate nearest m_bridge_checkpoint.
         
@@ -91,7 +83,7 @@ class TreeResolverService:
             path_rev: list[int] = []
             while curr != chk_id and curr is not None and len(path_rev) <= max_depth:
                 path_rev.append(curr)
-                curr = self._get_first_parent(curr, cursor)
+                curr = self._get_first_parent(curr, reader)
             if curr == chk_id:
                 return chk_id, list(reversed(path_rev))
 
@@ -101,21 +93,17 @@ class TreeResolverService:
 
         while curr is not None and curr > 0 and len(path_rev) <= max_depth:
             # Check if curr is a checkpoint commit
-            cursor.execute(
-                "SELECT 1 FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1;".replace("m_checkpoint_tree", tree_source(cursor)),
-                (curr,),
-            )
-            if cursor.fetchone():
+            if reader.checkpoint_tree_exists(curr):
                 chk_id = curr
                 break
             path_rev.append(curr)
-            curr = self._get_first_parent(curr, cursor)
+            curr = self._get_first_parent(curr, reader)
 
         if chk_id is not None:
             self._checkpoint_cache[commit_id] = chk_id
         return chk_id, list(reversed(path_rev))
 
-    def resolve_tree(self, commit_id: int, cursor: Any = None) -> dict[int, int]:
+    def resolve_tree(self, commit_id: int, reader: Any = None) -> dict[int, int]:
         """Path B: Full-tree resolution (<15ms, LRU cached) applying m_commit_file deltas to checkpoint."""
         if commit_id <= 0:
             return {}
@@ -124,49 +112,32 @@ class TreeResolverService:
             self._tree_cache.move_to_end(commit_id)
             return dict(self._tree_cache[commit_id])
 
-        if cursor is not None:
-            return self._resolve_tree_with_cursor(commit_id, cursor)
+        if reader is not None:
+            return self._resolve_tree_with_reader(commit_id, reader)
 
-        with get_db_cursor() as cur:
-            return self._resolve_tree_with_cursor(commit_id, cur)
+        with get_reader() as session:
+            return self._resolve_tree_with_reader(commit_id, session)
 
-    def _resolve_tree_with_cursor(self, commit_id: int, cursor: Any) -> dict[int, int]:
-        chk_id, forward_path = self._find_nearest_checkpoint_and_path(commit_id, cursor)
+    def _resolve_tree_with_reader(self, commit_id: int, reader: Any) -> dict[int, int]:
+        chk_id, forward_path = self._find_nearest_checkpoint_and_path(commit_id, reader)
 
         # 1. Load baseline tree from checkpoint
         if chk_id is not None and chk_id in self._tree_cache:
             tree_map = dict(self._tree_cache[chk_id])
         elif chk_id is not None:
-            cursor.execute(
-                "SELECT fnid, blob_id FROM m_checkpoint_tree WHERE commit_id = %s;".replace("m_checkpoint_tree", tree_source(cursor)),
-                (chk_id,),
-            )
-            rows = cursor.fetchall()
-            tree_map = {
-                (r["fnid"] if isinstance(r, dict) else r[0]): (r["blob_id"] if isinstance(r, dict) else r[1])
-                for r in rows
-                if (r["blob_id"] if isinstance(r, dict) else r[1]) != 0
-            }
+            rows = reader.select_rows(reader.checkpoint_tree_source(), ["fnid", "blob_id"], {"commit_id": chk_id})
+            tree_map = {r["fnid"]: r["blob_id"] for r in rows if r["blob_id"] != 0}
             self._cache_tree(chk_id, dict(tree_map))
         else:
             tree_map = {}
 
         # 2. Apply forward deltas along first-parent path
         if forward_path:
-            format_strings = ",".join(["%s"] * len(forward_path))
-            sql = f"""
-                SELECT commit_id, fnid, blob_id, change_type
-                FROM m_commit_file
-                WHERE commit_id IN ({format_strings});
-            """
-            cursor.execute(sql, forward_path)
-            rows = cursor.fetchall()
+            rows = reader.select_rows("m_commit_file", ["commit_id", "fnid", "blob_id", "change_type"], {"commit_id": forward_path})
             deltas_by_commit: dict[int, list[tuple[int, int, str]]] = {cid: [] for cid in forward_path}
             for r in rows:
-                cid = r["commit_id"] if isinstance(r, dict) else r[0]
-                fnid = r["fnid"] if isinstance(r, dict) else r[1]
-                blob_id = r["blob_id"] if isinstance(r, dict) else r[2]
-                change_type = safe_decode(r["change_type"] if isinstance(r, dict) else r[3])
+                cid, fnid, blob_id = r["commit_id"], r["fnid"], r["blob_id"]
+                change_type = safe_decode(r["change_type"])
                 if cid in deltas_by_commit:
                     deltas_by_commit[cid].append((fnid, blob_id, change_type))
 
@@ -399,7 +370,7 @@ class GitTreeResolver:
                 self._size_cache.popitem(last=False)
         return sizes
 
-    def blob_paths(self, cursor: Any, rev: str) -> dict[int, list[str]] | None:
+    def blob_paths(self, reader: Any, rev: str) -> dict[int, list[str]] | None:
         """Return {blob_id: [paths]} for the indexed blobs in the tree of rev, or None if rev is unresolvable.
 
         Symbols are content-addressed (m_symbol_def.blob_id), so this scopes symbol queries to any
@@ -419,7 +390,7 @@ class GitTreeResolver:
         tree = self.list_tree(sha)
         if tree is None:
             return None
-        meta = self.map_blob_hashes(cursor, tree.values())
+        meta = self.map_blob_hashes(reader, tree.values())
         paths: dict[int, list[str]] = {}
         for path, blob_sha in tree.items():
             m = meta.get(blob_sha)
@@ -430,7 +401,7 @@ class GitTreeResolver:
 
         # A finished version's blobs are all indexed: its map only changes when the parse state does,
         # which clears this cache (clear_revision_caches). Other revisions gain blobs as parses run.
-        stamp = None if self._is_finished_version(cursor, sha) else now
+        stamp = None if self._is_finished_version(reader, sha) else now
         with self._lock:
             self._blob_path_cache[sha] = (stamp, paths)
             self._blob_path_cache.move_to_end(sha)
@@ -439,38 +410,28 @@ class GitTreeResolver:
         return paths
 
     @staticmethod
-    def _is_finished_version(cursor: Any, sha: str) -> bool:
+    def _is_finished_version(reader: Any, sha: str) -> bool:
         """Whether the commit is the head of a ref whose ingestion finished."""
         try:
-            cursor.execute(
-                f"""
-                SELECT 1 FROM m_commit c JOIN m_git_ref r ON r.commit_id = c.commit_id
-                WHERE c.commit_hash = %s AND {finished_ref_sql('r')} LIMIT 1;
-                """,
-                (bytes.fromhex(sha),),
+            return reader.row_exists(
+                ("m_commit", "c"),
+                [{"c.commit_hash": bytes.fromhex(sha)}, finished_ref("r")],
+                joins=[Join(("m_git_ref", "r"), {"r.commit_id": "c.commit_id"})],
             )
-            return cursor.fetchone() is not None
         except Exception as exc:  # noqa: BLE001 - unknown: keep the TTL
             logger.debug("finished-version check for %s failed: %s", sha, exc)
             return False
 
     @staticmethod
-    def map_blob_hashes(cursor: Any, blob_shas: Iterable[str]) -> dict[str, tuple[int, int]]:
+    def map_blob_hashes(reader: Any, blob_shas: Iterable[str]) -> dict[str, tuple[int, int]]:
         """Map Git blob SHA hex strings to (blob_id, ftype) indexed in m_file_blob."""
         unique = sorted({s for s in blob_shas if s and len(s) == 40})
         result: dict[str, tuple[int, int]] = {}
         chunk_size = 2000
         for i in range(0, len(unique), chunk_size):
             chunk = [bytes.fromhex(s) for s in unique[i:i + chunk_size]]
-            fmt = ",".join(["%s"] * len(chunk))
-            cursor.execute(
-                f"SELECT blob_hash, blob_id, ftype FROM m_file_blob WHERE blob_hash IN ({fmt});",
-                chunk,
-            )
-            for r in cursor.fetchall():
-                h = r["blob_hash"] if isinstance(r, dict) else r[0]
-                b_id = r["blob_id"] if isinstance(r, dict) else r[1]
-                ftype = r["ftype"] if isinstance(r, dict) else r[2]
+            for r in reader.select_rows("m_file_blob", ["blob_hash", "blob_id", "ftype"], {"blob_hash": chunk}):
+                h, b_id, ftype = r["blob_hash"], r["blob_id"], r["ftype"]
                 key = hash_hex(h)
                 # The same content may be indexed under several ftypes; prefer a typed (non-directory) row
                 if key not in result or (result[key][1] == 0 and ftype != 0):

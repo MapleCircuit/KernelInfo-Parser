@@ -2,7 +2,6 @@
 
 import json
 import os
-import sqlite3
 import tempfile
 import threading
 import time
@@ -12,6 +11,8 @@ import zlib
 from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 
+from db_engine import create_foreign_sqlite
+from db_engine.spec import INT, MEDIUMBLOB, TEXT
 from parser.mailing_list.ml_types import (
     CommitFeatures,
     MLMatchTier,
@@ -26,6 +27,19 @@ from parser.mailing_list.ml_resolver import (
 )
 from parser.mailing_list.ml_server import MLServerRequestHandler
 from parser.mailing_list.ml_client import MailingListClient
+
+
+
+def over_writer(path: Path):
+    """A writer on a public-inbox lookalike `over.sqlite3` (tables `over` and `id2num`)."""
+    w = create_foreign_sqlite(path)
+    w.create_table("over", {"num": INT(), "tid": INT(null=True), "sid": INT(null=True), "ts": INT(null=True),
+                           "ds": INT(null=True), "ddd": MEDIUMBLOB(null=True)}, primary=("num",))
+    w.create_table("id2num", {"id": TEXT(), "num": INT(null=True)}, primary=("id",))
+    return w
+
+
+OVER_COLUMNS = ["num", "tid", "sid", "ts", "ds", "ddd"]
 
 
 class TestPatchMetadataExtraction(unittest.TestCase):
@@ -149,21 +163,7 @@ class TestPublicInboxLocalStore(unittest.TestCase):
         self.storage_dir = Path(self.test_dir.name)
 
         # 1. Create over.sqlite3
-        over_path = self.storage_dir / "over.sqlite3"
-        conn = sqlite3.connect(str(over_path))
-        conn.execute(
-            """
-            CREATE TABLE over (
-                num INTEGER PRIMARY KEY,
-                tid INTEGER,
-                sid INTEGER,
-                ts INTEGER,
-                ds INTEGER,
-                ddd BLOB
-            )
-            """
-        )
-        conn.execute("CREATE TABLE id2num (id TEXT PRIMARY KEY, num INTEGER)")
+        conn = over_writer(self.storage_dir / "over.sqlite3")
 
         # Create compressed ddd blob
         # Format: subject\nfrom\nrefs\nmessage_id\nkv\n
@@ -175,39 +175,22 @@ class TestPublicInboxLocalStore(unittest.TestCase):
         raw_ddd = f"{subj}\n{from_hdr}\n{refs}\n{mid}\n{blob_sha}\n".encode("utf-8")
         compressed_ddd = zlib.compress(raw_ddd)
 
-        conn.execute(
-            "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
-            (10, 10, 1, 1621000000, 1621000000, compressed_ddd),
-        )
-        conn.execute(
-            "INSERT INTO id2num (id, num) VALUES (?, ?)",
-            (mid, 10),
-        )
+        conn.insert_rows("over", OVER_COLUMNS, [(10, 10, 1, 1621000000, 1621000000, compressed_ddd)])
+        conn.insert_rows("id2num", ["id", "num"], [(mid, 10)])
 
         # Cover letter
         c_subj = "[PATCH 0/2] driver: core: bus series"
         c_mid = "20210515.cover@example.org"
         c_blob = ":feedface0123456789abcdef0123456789abcdef"
         c_raw = f"{c_subj}\n{from_hdr}\n{refs}\n{c_mid}\n{c_blob}\n".encode("utf-8")
-        conn.execute(
-            "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
-            (9, 10, 1, 1620999900, 1620999900, zlib.compress(c_raw)),
-        )
-        conn.execute(
-            "INSERT INTO id2num (id, num) VALUES (?, ?)",
-            (c_mid, 9),
-        )
-
-        conn.commit()
+        conn.insert_rows("over", OVER_COLUMNS, [(9, 10, 1, 1620999900, 1620999900, zlib.compress(c_raw))])
+        conn.insert_rows("id2num", ["id", "num"], [(c_mid, 9)])
         conn.close()
 
         # 2. Create msgmap.sqlite3
-        msgmap_path = self.storage_dir / "msgmap.sqlite3"
-        conn2 = sqlite3.connect(str(msgmap_path))
-        conn2.execute("CREATE TABLE msg_map (num INTEGER PRIMARY KEY, mid TEXT)")
-        conn2.execute("INSERT INTO msg_map (num, mid) VALUES (10, ?)", (mid,))
-        conn2.execute("INSERT INTO msg_map (num, mid) VALUES (9, ?)", (c_mid,))
-        conn2.commit()
+        conn2 = create_foreign_sqlite(self.storage_dir / "msgmap.sqlite3")
+        conn2.create_table("msg_map", {"num": INT(), "mid": TEXT(null=True)}, primary=("num",))
+        conn2.insert_rows("msg_map", ["num", "mid"], [(10, mid), (9, c_mid)])
         conn2.close()
 
         self.store = PublicInboxLocalStore(self.storage_dir)
@@ -244,13 +227,9 @@ class TestPublicInboxLocalStore(unittest.TestCase):
             ":abcdef010123456789abcdef0123456789abcdef\n"
         ).encode("utf-8")
         ahead = int(time.time()) + 86400 * 365
-        conn = sqlite3.connect(str(self.storage_dir / "over.sqlite3"))
-        conn.execute(
-            "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
-            (11, 11, 2, ahead, ahead, zlib.compress(raw)),
-        )
-        conn.execute("INSERT INTO id2num (id, num) VALUES (?, ?)", (mid, 11))
-        conn.commit()
+        conn = create_foreign_sqlite(self.storage_dir / "over.sqlite3")
+        conn.insert_rows("over", OVER_COLUMNS, [(11, 11, 2, ahead, ahead, zlib.compress(raw))])
+        conn.insert_rows("id2num", ["id", "num"], [(mid, 11)])
         conn.close()
         return mid
 
@@ -748,24 +727,15 @@ class TestMemoryBounds(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.storage_dir = Path(self.test_dir.name)
-        conn = sqlite3.connect(str(self.storage_dir / "over.sqlite3"))
-        conn.execute(
-            "CREATE TABLE over (num INTEGER PRIMARY KEY, tid INTEGER, sid INTEGER, "
-            "ts INTEGER, ds INTEGER, ddd BLOB)"
-        )
-        conn.execute("CREATE TABLE id2num (id TEXT PRIMARY KEY, num INTEGER)")
+        conn = over_writer(self.storage_dir / "over.sqlite3")
         # One thread of 40 messages, newest last.
         for i in range(40):
             subj = f"[PATCH {i}/40] subsystem: change number {i}"
             ddd = zlib.compress(
                 f"{subj}\nDev <dev@example.org>\n\nTo\nCc\n{'a' * 40}\nmid{i}@example.org\n100\n5\n".encode()
             )
-            conn.execute(
-                "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
-                (i + 1, 7, 1, 1600000000 + i, 1600000000 + i, ddd),
-            )
-            conn.execute("INSERT INTO id2num (id, num) VALUES (?, ?)", (f"mid{i}@example.org", i + 1))
-        conn.commit()
+            conn.insert_rows("over", OVER_COLUMNS, [(i + 1, 7, 1, 1600000000 + i, 1600000000 + i, ddd)])
+            conn.insert_rows("id2num", ["id", "num"], [(f"mid{i}@example.org", i + 1)])
         conn.close()
         self.store = PublicInboxLocalStore(self.storage_dir)
 

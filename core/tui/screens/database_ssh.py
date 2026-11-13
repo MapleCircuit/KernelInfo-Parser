@@ -7,6 +7,7 @@ import curses
 from typing import Any, Optional
 
 from core.config import _coerce_bool
+from db_engine import CAP_PERSISTENT, available_engines, get_db_engine
 from core.tui.screens.base import BaseScreen
 from core.tui.theme import (
     PAIR_ACTIVE,
@@ -61,9 +62,14 @@ class DatabaseSSHScreen(BaseScreen):
         self._orig_ssh_cfg = copy.deepcopy(self.ssh_cfg)
 
         # 2. Section 1: Database Credentials & Connection
-        engine_opts = ["mariadb", "sqlite"]
+        engine_opts = [e for e in available_engines() if CAP_PERSISTENT in get_db_engine(e).base_capabilities]
         curr_engine = str(self.db_cfg.get("engine", "mariadb")).lower()
-        sel_engine_idx = 1 if curr_engine == "sqlite" else 0
+        try:
+            curr_cls = get_db_engine(curr_engine)
+        except ValueError:
+            curr_cls = None
+        curr_canonical = next((e for e in engine_opts if get_db_engine(e) is curr_cls), engine_opts[0])
+        sel_engine_idx = engine_opts.index(curr_canonical)
 
         self.engine = SelectList(
             y=2,
@@ -95,7 +101,7 @@ class DatabaseSSHScreen(BaseScreen):
             x=2,
             width=30,
             label="User",
-            value=str(self.db_cfg.get("user", "root")),
+            value=str(self.db_cfg.get("user", "")),
             label_width=14,
         )
         self.password = TextInput(

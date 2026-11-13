@@ -9,11 +9,13 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webapp.backend.services import git_service as gs_mod
+from db_engine import MockDB
+from tests.db_fixtures import patch_reader
 from webapp.backend.services.git_service import GitService
 
 PORCELAIN = """\
@@ -94,12 +96,10 @@ class TestBlameRepository(unittest.TestCase):
 
     @contextmanager
     def service(self):
-        cursor = MagicMock()
         with patch.object(gs_mod, "get_repo_dir", lambda: self.repo), \
                 patch("webapp.backend.security.jail.get_repo_dir", lambda: self.repo), \
-                patch.object(gs_mod, "get_db_cursor") as get_cursor, \
-                patch.object(gs_mod, "get_version_info", lambda cur, v: (0, v)):
-            get_cursor.return_value.__enter__.return_value = cursor
+                patch_reader(MockDB(use_global=False)), \
+                patch.object(gs_mod, "get_version_info", lambda reader, v: (0, v)):
             yield GitService()
 
     def test_copy_follows_the_moved_function(self) -> None:

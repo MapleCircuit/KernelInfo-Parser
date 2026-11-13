@@ -13,37 +13,12 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.DBLayout import m_commit
+from db_engine import MockDB
+from tests.db_fixtures import patch_reader
+from webapp.backend.services.history_service import KCONFIG_TYPES
 from webapp.backend.services import git_service as gs
 from webapp.backend.services.kconfig_service import KconfigService
-
-
-class RecordingCursor:
-    """Answers queries by substring; records the statements."""
-
-    def __init__(self, answers: list[tuple[str, list]]) -> None:
-        self.answers = answers
-        self.statements: list[str] = []
-        self._rows: list = []
-
-    def execute(self, sql: str, params: tuple = ()) -> None:
-        self.statements.append(sql)
-        for needle, rows in self.answers:
-            if needle in sql:
-                self._rows = list(rows)
-                return
-        self._rows = []
-
-    def fetchall(self) -> list:
-        return self._rows
-
-    def fetchone(self):
-        return self._rows[0] if self._rows else None
-
-
-def _ctx(cursor: RecordingCursor):
-    ctx = mock.MagicMock()
-    ctx.__enter__.return_value = cursor
-    return ctx
 
 
 COMMIT = {"commit_hash": bytes.fromhex("ab" * 20), "author_date": 1300000000, "subject": "fix it",
@@ -55,37 +30,47 @@ class TestLastChanged(unittest.TestCase):
         gs._LAST_WRITER_CACHE.clear()
         gs._FINISHED_CACHE.clear()
 
-    def _run(self, writers: list, version_vid: int = 500, finished: bool = True):
+    def _run(self, writers: list, version_vid: int = 500, finished: bool = True, staged: tuple = ()):
+        """`writers`: commits writing blob 77 at kernel/sched.c; `staged`: commits that are version heads."""
         self.setUp()
-        cursor = RecordingCursor([
-            ("FROM m_file_name fn", writers),
-            ("FROM m_commit c", [COMMIT]),
-            ("FROM m_ingest_state", [{"ok": 1}] if finished else []),
-        ])
-        with mock.patch.object(gs, "get_db_cursor", return_value=_ctx(cursor)), \
-                mock.patch.object(gs, "get_version_info", return_value=(version_vid, "v3.0")):
-            return gs.GitService._db_last_changed("v3.0", "kernel/sched.c", 77), cursor
+        db = MockDB(use_global=False)
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "kernel/sched.c")])
+        db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(5, COMMIT["author_name"], COMMIT["author_email"])])
+        for w in writers:
+            db.insert_rows("m_commit_file", ["commit_id", "fnid", "blob_id"], [(w["commit_id"], 1, 77)])
+            db.insert_rows(
+                "m_commit",
+                ["commit_id", "commit_hash", "author_id", "author_date", "subject"],
+                [(w["commit_id"], COMMIT["commit_hash"], 5, COMMIT["author_date"], COMMIT["subject"])],
+            )
+        states = [(c, 1) for c in staged] + ([(version_vid, 2)] if finished else [])
+        if states:
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status"], [(1, c, s) for c, s in states])
+        with patch_reader(db), mock.patch.object(gs, "get_version_info", return_value=(version_vid, "v3.0")):
+            return gs.GitService._db_last_changed("v3.0", "kernel/sched.c", 77)
 
     def test_one_writer_answers_with_the_git_shape(self) -> None:
-        hit, cursor = self._run([{"commit_id": 120}])
+        hit = self._run([{"commit_id": 120}])
         self.assertEqual(hit["commit_hash"], "ab" * 20)
         self.assertEqual(hit["commit_hash_short"], "ab" * 5)
         self.assertEqual(hit["source"], "db")
         self.assertEqual(set(hit) - {"source"}, {"commit_hash", "commit_hash_short", "author_name", "author_email",
                                                  "author_date", "author_date_iso", "subject"})
-        self.assertTrue(all(s.strip().upper().startswith("SELECT") for s in cursor.statements))
+
+    def test_version_head_commits_are_not_writers(self) -> None:
         # Version head commits are left out (version-diff rows of older databases)
-        self.assertIn("NOT EXISTS (SELECT 1 FROM m_ingest_state", cursor.statements[0])
+        self.assertIsNone(self._run([{"commit_id": 120}], staged=(120,)))
+        self.assertEqual(self._run([{"commit_id": 120}, {"commit_id": 130}], staged=(130,))["commit_hash"], "ab" * 20)
 
     def test_zero_or_two_writers_ask_git(self) -> None:
-        self.assertIsNone(self._run([])[0])
+        self.assertIsNone(self._run([]))
         gs._LAST_WRITER_CACHE.clear()
-        self.assertIsNone(self._run([{"commit_id": 1}, {"commit_id": 2}])[0])
+        self.assertIsNone(self._run([{"commit_id": 1}, {"commit_id": 2}]))
 
     def test_unfinished_or_older_revision_asks_git(self) -> None:
-        self.assertIsNone(self._run([{"commit_id": 120}], finished=False)[0])
-        self.assertIsNone(self._run([{"commit_id": 900}], version_vid=500)[0])   # writer ingested after it
-        self.assertIsNone(self._run([{"commit_id": 120}], version_vid=-1)[0])    # git-only revision
+        self.assertIsNone(self._run([{"commit_id": 120}], finished=False))
+        self.assertIsNone(self._run([{"commit_id": 900}], version_vid=500))   # writer ingested after it
+        self.assertIsNone(self._run([{"commit_id": 120}], version_vid=-1))    # git-only revision
 
     def test_get_file_last_changed_falls_back_to_git(self) -> None:
         svc = gs.GitService()
@@ -101,25 +86,29 @@ class TestLastChanged(unittest.TestCase):
 
 class TestOtherArchDefinitions(unittest.TestCase):
     def _run(self, finished: bool):
-        cursor = RecordingCursor([("FROM m_bridge_tag bt", [
-            {"blob_id": 3, "line_s": 40, "line_e": 52},
-            {"blob_id": 9, "line_s": 7, "line_e": 9},
-        ])])
+        db = MockDB(use_global=False)
+        kconfig_type = KCONFIG_TYPES[0]
+        db.insert_rows("m_ast", ["ast_id", "name", "type_id"], [(1, "ARM_THUMB", kconfig_type), (2, "ARM_THUMB", 999), (3, "OTHER", kconfig_type)])
+        db.insert_rows("m_tag", ["tag_id", "ast_id"], [(10, 1), (11, 1), (12, 2), (13, 3), (14, 1)])
+        db.insert_rows(
+            "m_bridge_tag",
+            ["blob_id", "tag_id", "line_s", "line_e"],
+            [(3, 10, 40, 52), (9, 11, 7, 9), (3, 12, 1, 2), (3, 13, 60, 70), (4, 14, 5, 6), (77, 14, 5, 6)],
+        )
         resolver = "webapp.backend.services.kconfig_service.git_tree_resolver"
         with mock.patch(f"{resolver}.resolve_commit_sha", return_value="c" * 40), \
                 mock.patch(f"{resolver}._is_finished_version", return_value=finished), \
                 mock.patch(f"{resolver}.blob_paths", return_value={3: ["arch/arm/mm/Kconfig"], 9: ["arch/arm/Kconfig"], 4: ["x.c"]}), \
-                mock.patch("webapp.backend.services.kconfig_service.get_db_cursor", return_value=_ctx(cursor)):
-            return KconfigService._other_arch_definitions_db("v3.0", "ARM_THUMB"), cursor
+                patch_reader(db):
+            return KconfigService._other_arch_definitions_db("v3.0", "ARM_THUMB"), db
 
     def test_tags_of_a_finished_version(self) -> None:
-        defs, cursor = self._run(True)
+        defs, _db = self._run(True)
+        # Only the revision's Kconfig blobs and the Kconfig-typed entries named like the symbol count
         self.assertEqual(defs, [
             {"file_path": "arch/arm/Kconfig", "line_s": 7, "line_e": 9},
             {"file_path": "arch/arm/mm/Kconfig", "line_s": 40, "line_e": 52},
         ])
-        # Only the revision's Kconfig blobs are searched
-        self.assertIn("bt.blob_id IN (%s,%s)", cursor.statements[0])
 
     def test_other_revisions_use_git_grep(self) -> None:
         self.assertIsNone(self._run(False)[0])
@@ -172,48 +161,51 @@ class TestRepairHeadCommitFiles(unittest.TestCase):
         from core import backfills
         head = "ab" * 20
 
-        class Cur(RecordingCursor):
-            def __init__(self) -> None:
-                super().__init__([
-                    ("AND EXISTS", [(10, bytes.fromhex(head), 1), (20, bytes.fromhex("cd" * 20), 2)]),
-                    ("WHERE s.status = %s", [(0,)]),
-                ])
-                self.deletes: list[tuple] = []
+        from core import ingest_state
+        db = MockDB(use_global=False)
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"],
+                       [(1, 10, ingest_state.INGEST_DONE, 0), (1, 20, ingest_state.INGEST_DONE, 0)])
+        commit_cols = [c[0] for c in m_commit.init_columns]
 
-            def execute(self, sql: str, params: tuple = ()) -> None:
-                if sql.startswith("SELECT cf.fnid"):
-                    self.statements.append(sql)
-                    self._rows = [(1, "Makefile"), (2, "kernel/sched.c")] if params[0] == 10 else [(3, "mm/slab.c")]
-                    return
-                if sql.startswith("DELETE"):
-                    self.deletes.append(params)
-                    return
-                super().execute(sql, params)
+        def commit_row(cid: int, sha: bytes) -> tuple:
+            return tuple(cid if c[0] == "commit_id" else sha if c[0] == "commit_hash" else 0 if c[1].is_integer else ""
+                         for c in m_commit.init_columns)
 
-            def query(self, sql: str, params: tuple = (), dictionary: bool = False) -> list:
-                self.execute(sql, params)
-                return self.fetchall()
-
-            def commit(self) -> None:
-                pass
-
-            def rollback(self) -> None:
-                pass
-
-            def close(self) -> None:
-                pass
-
-        cur = Cur()
+        db.insert_rows("m_commit", commit_cols, [commit_row(10, bytes.fromhex(head)), commit_row(20, bytes.fromhex("cd" * 20))])
+        db.insert_rows("m_commit_parent", ["commit_id", "parent_commit_id", "parent_idx"], [(10, 1, 0), (20, 1, 0), (20, 2, 1)])
+        db.insert_rows("m_file_name", ["fnid", "fname"], [(1, "Makefile"), (2, "kernel/sched.c"), (3, "mm/slab.c")])
+        cf = ["commit_id", "fnid", "blob_id", "old_fnid", "old_blob_id", "change_type"]
+        db.insert_rows("m_commit_file", cf, [(10, 1, 0, 0, 0, "M"), (10, 2, 0, 0, 0, "M"), (20, 3, 0, 0, 0, "M")])
         with mock.patch.object(backfills, "_diff_tree_files", return_value={head: {"Makefile"}}) as diff:
-            out = backfills.repair_head_commit_files(cur, "/repo", 1)
+            out = backfills.repair_head_commit_files(db, "/repo", 1)
         diff.assert_called_once_with("/repo", [head])   # the merge head is not asked: it keeps no rows
         self.assertEqual(out["deleted"], 2)
-        self.assertEqual(sorted(cur.deletes), [(10, 2), (20, 3)])
+        self.assertEqual(sorted(db.select_rows("m_commit_file", ["commit_id", "fnid"])), [(10, 1)])
 
     def test_reuse_step_writes_no_head_commit_rows(self) -> None:
-        import inspect
+        from contextlib import contextmanager
         import main
-        self.assertNotIn("m_commit_file.table_id", inspect.getsource(main._reuse_parsed_blobs))
+        import pipeline.blob_reuse
+        from core.DBLayout import m_commit_file
+
+        db = MockDB(use_global=False)
+        db.insert_rows("m_bridge_tag", ["blob_id", "tag_id", "line_s", "line_e", "char_s", "char_e"], [(5, 1, 1, 1, 0, 0)])
+
+        @contextmanager
+        def fake_db():
+            yield db
+
+        te = mock.MagicMock()
+        te.get.return_value = (5,)
+        te.set.return_value = (11,)
+        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", te), \
+                mock.patch.object(main.gp, "Change_List", ["M\tdrivers/a.c"], create=True), \
+                mock.patch.object(main.gp, "VID", 3, create=True), \
+                mock.patch.object(main.gp, "file_blob_ids", {}, create=True):
+            remaining = pipeline.blob_reuse._reuse_parsed_blobs({"drivers/a.c": b"\x01" * 20})
+        self.assertEqual(remaining, [], "the tagged blob is reused")
+        written = {c.args[0] for c in te.set.call_args_list}
+        self.assertNotIn(m_commit_file.table_id, written)
 
 
 if __name__ == "__main__":

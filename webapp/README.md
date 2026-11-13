@@ -17,8 +17,8 @@ The web application is built on a decoupled, zero-trust layered architecture:
 
 - **Backend (`webapp/backend/`)**:
   - Built with **FastAPI** and Python 3.10+.
-  - **Database Connection Pool**: Thread-safe MySQL pool (`webapp/backend/database/pool.py`) with automatic backoff and reconnection.
-  - **Zero-Trust Security**: Canonical repository jailing (`webapp/backend/security/jail.py`), parameterized SQL wildcard escaping (`webapp/backend/security/sql.py`), strict Content-Security-Policy headers, and sliding-window rate limiting.
+  - **Database Access**: `get_reader()` (`webapp/backend/database/pool.py`) hands out read-only sessions of the configured `database.engine` (MariaDB pool with backoff and reconnection, SQLite, or the mock); services hold no SQL and no driver handle.
+  - **Zero-Trust Security**: Canonical repository jailing (`webapp/backend/security/jail.py`), engine-side SQL wildcard escaping (spec `like()`) and identifier validation (`webapp/backend/security/sql.py`), strict Content-Security-Policy headers, and sliding-window rate limiting.
   - **Domain Services**: Encapsulated service layer (`webapp/backend/services/`) for Filesystem, Symbols & AST, Kconfig, Maintainers, Git Blame/Commits, Memory Layout (Pahole), Callgraphs, and Semantic Diffs.
   - **Modular Routers**: Version-scoped REST controllers (`webapp/backend/routers/`).
 - **Frontend (`webapp/frontend/`)**:

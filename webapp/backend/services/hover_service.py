@@ -209,11 +209,11 @@ class HoverService:
             ast_id = detail.get("ast_id") or detail.get("definition", {}).get("ast_id")
             if not attr_dict and ast_id:
                 try:
-                    from webapp.backend.database.pool import get_db_cursor
+                    from webapp.backend.database.pool import get_reader
                     from webapp.backend.database.helpers import safe_decode
-                    with get_db_cursor() as cursor:
-                        cursor.execute("SELECT name, val FROM m_ast_attribute WHERE ast_id = %s;", (ast_id,))
-                        attr_dict = {safe_decode(r.get("name")): safe_decode(r.get("val")) for r in cursor.fetchall()}
+                    with get_reader() as reader:
+                        rows = reader.select_rows("m_ast_attribute", ["name", "val"], {"ast_id": ast_id})
+                        attr_dict = {safe_decode(r.get("name")): safe_decode(r.get("val")) for r in rows}
                 except Exception:
                     pass
             if "offset_bits" in attr_dict or "offset_bytes" in attr_dict:

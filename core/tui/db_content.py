@@ -475,11 +475,7 @@ def clean_versions(db: Any, versions: Sequence[VersionRow]) -> list[CleanResult]
         try:
             method = clean_interrupted_version(db, v.network_id, v.commit_id, TABLES)
             results.append(CleanResult(v, True, method=method))
-        except Exception as exc:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+        except Exception as exc:  # each delete of the clean is atomic and repeatable: a failed one is simply tried again
             results.append(CleanResult(v, False, error=str(exc)))
     return results
 

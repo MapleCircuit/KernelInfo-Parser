@@ -3,14 +3,12 @@ from __future__ import annotations
 from typing import Any
 from fastapi import HTTPException
 from core.globalstuff import ASTT
-from core.SymbolRows import rows_of_targets_sql
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Agg, Join, ge, le, like
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    tree_source,
     safe_decode,
     get_version_info,
 )
-from webapp.backend.security.sql import escape_like, sanitize_like_query
 from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
@@ -55,17 +53,14 @@ def format_symbol_type(type_name: str) -> str:
     return type_name
 
 
-def binding_ref_asts(cursor: Any, symbol_name: str) -> list[int]:
+def binding_ref_asts(reader: Any, symbol_name: str) -> list[int]:
     """The `Rust_BindingRef` AST of a C symbol: what Rust uses of it through bindgen (`bindings::foo`) reference.
 
     The AST is a leaf named by the symbol (parser/rust_ast/RUST_API.md §7), one row whatever the file or version,
     found through `m_ast`'s (name, type_id) index.
     """
-    cursor.execute(
-        "SELECT ast_id FROM m_ast WHERE name = %s AND type_id = %s;",
-        (symbol_name, int(ASTT.Rust_BindingRef)),
-    )
-    return [r["ast_id"] for r in cursor.fetchall() if r["ast_id"]]
+    rows = reader.select_rows("m_ast", ["ast_id"], {"name": symbol_name, "type_id": int(ASTT.Rust_BindingRef)})
+    return [r["ast_id"] for r in rows if r["ast_id"]]
 
 
 def _symbol_asts(def_rows: list[dict[str, Any]], symbol_name: str) -> list[int]:
@@ -86,49 +81,40 @@ class SymbolService:
     """Service providing symbol searching, definitions, cross-reference index (XRef), and AST container trees."""
 
     @staticmethod
-    def _scope(cursor: Any, version_name: str) -> tuple[int | None, str, dict[int, list[str]]]:
+    def _scope(reader: Any, version_name: str) -> tuple[int | None, str, dict[int, list[str]]]:
         """Resolve (vid, vname, {blob_id: [paths]}) for any revision: tag, branch or arbitrary commit.
 
         The Git tree is authoritative (works for commits without a checkpoint snapshot, even commits
         that were never ingested); m_bridge_checkpoint is the fallback when Git is unavailable.
         """
-        vid, vname = get_version_info(cursor, version_name)
+        vid, vname = get_version_info(reader, version_name)
         rev = vname if vid is not None else version_name
-        blob_paths = git_tree_resolver.blob_paths(cursor, rev)
+        blob_paths = git_tree_resolver.blob_paths(reader, rev)
         if blob_paths is None:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-            cursor.execute(
-                """
-                SELECT bc.blob_id, fn.fname
-                FROM m_checkpoint_tree bc
-                JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE bc.commit_id = %s;
-                """.replace("m_checkpoint_tree", tree_source(cursor)),
-                (vid,),
-            )
             blob_paths = {}
-            for r in cursor.fetchall():
+            for r in reader.checkpoint_tree_files(vid):
                 blob_paths.setdefault(r["blob_id"], []).append(safe_decode(r["fname"]))
         return vid, rev, blob_paths
 
     def search_symbols(self, version_name: str, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
         """Symbol definitions of the revision whose name starts with `query`: the exact name first, then
         shorter names, then by name."""
-        clean_q = sanitize_like_query(query)
+        clean_q = (query or "").strip()[:100]
         if not clean_q:
             return []
 
-        with get_db_cursor() as cursor:
-            _, _, blob_paths = self._scope(cursor, version_name)
+        with get_reader() as reader:
+            _, _, blob_paths = self._scope(reader, version_name)
             cap = max(1, min(limit, 200))
             picked: list[dict[str, Any]] = []
             batch_size = FIRST_NAME_BATCH
             after: tuple[int, str] | None = None
             for _ in range(MAX_NAME_PAGES):
-                names = self._name_page(cursor, f"{clean_q}%", after)
+                names = reader.symbol_name_page(clean_q, after=after, limit=NAME_PAGE)
                 for i in range(0, len(names), batch_size):
-                    picked.extend(self._definitions_in_tree(cursor, names[i:i + batch_size], blob_paths))
+                    picked.extend(self._definitions_in_tree(reader, names[i:i + batch_size], blob_paths))
                     batch_size = min(batch_size * 2, MAX_NAME_BATCH)
                     if len(picked) >= cap:
                         break
@@ -155,44 +141,21 @@ class SymbolService:
             return results
 
     @staticmethod
-    def _name_page(cursor: Any, like: str, after: tuple[int, str] | None) -> list[str]:
-        """Next NAME_PAGE distinct definition names matching `like`, by (byte length, name), after `after`.
-
-        Each table holding definition names (shared per tag, or per blob) is read through its name index
-        and only its distinct names are sorted; the two lists merge in Python. Being ordered by the same
-        key, the union's first NAME_PAGE names are among the first NAME_PAGE of each table.
-        """
-        cond, args = "", [like]
-        if after is not None:
-            cond = " AND (LENGTH(name) > %s OR (LENGTH(name) = %s AND name > %s))"
-            args += [after[0], after[0], after[1]]
-        names: set[str] = set()
-        for table in ("m_tag_def", "m_blob_symbol_def"):
-            cursor.execute(
-                f"SELECT name FROM {table} WHERE name LIKE %s{cond} GROUP BY name ORDER BY LENGTH(name), name LIMIT %s;",
-                (*args, NAME_PAGE),
-            )
-            names.update(safe_decode(r["name"]) for r in cursor.fetchall())
-        return sorted(names, key=lambda n: (len(n.encode()), n))[:NAME_PAGE]
-
-    @staticmethod
-    def _definitions_in_tree(cursor: Any, names: list[str], blob_paths: dict[int, list[str]]) -> list[dict[str, Any]]:
+    def _definitions_in_tree(reader: Any, names: list[str], blob_paths: dict[int, list[str]]) -> list[dict[str, Any]]:
         """Definitions of `names` whose blob is in the revision's tree, in the order of `names`, then by path and line."""
         if not names:
             return []
         rank = {n: i for i, n in enumerate(names)}
-        cursor.execute(
-            f"""
-            SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
-            FROM m_symbol_def s
-            JOIN m_type_descriptor t ON s.type_id = t.type_id
-            WHERE s.name IN ({", ".join(["%s"] * len(names))})
-            LIMIT %s;
-            """,
-            (*names, SEARCH_CANDIDATES),
+        found = reader.select_rows(
+            ("m_symbol_def", "s"),
+            {"def_id": "s.def_id", "name": "s.name", "type_id": "s.type_id", "type_name": "t.name",
+             "fid": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e", "ast_id": "s.ast_id"},
+            {"s.name": list(names)},
+            joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+            limit=SEARCH_CANDIDATES,
         )
         rows = []
-        for r in cursor.fetchall():
+        for r in found:
             paths = blob_paths.get(r["fid"])
             if not paths:
                 continue
@@ -271,8 +234,8 @@ class SymbolService:
         every in-tree definition in rank order. References are not part of the answer: get_symbol_xref()
         computes them, only for the views that show them.
         """
-        with get_db_cursor() as cursor:
-            _, vname, blob_paths = self._scope(cursor, version_name)
+        with get_reader() as reader:
+            _, vname, blob_paths = self._scope(reader, version_name)
             arch_id, srcarch, bits = definition_arch(vname, arch)
 
             # A Kconfig configuration symbol (CONFIG_NET, CONFIG_SMP)
@@ -282,17 +245,15 @@ class SymbolService:
                     return k_res
 
             # Authoritative definition: one whose blob is in this revision's tree, ranked for the ARCH
-            cursor.execute(
-                """
-                SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.tag_id, s.linkage
-                FROM m_symbol_def s
-                JOIN m_type_descriptor t ON s.type_id = t.type_id
-                WHERE s.name = %s
-                ORDER BY s.def_id ASC;
-                """,
-                (name,),
+            def_rows = reader.select_rows(
+                ("m_symbol_def", "s"),
+                {"def_id": "s.def_id", "ast_id": "s.ast_id", "name": "s.name", "type_id": "s.type_id",
+                 "type_name": "t.name", "fid": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e",
+                 "tag_id": "s.tag_id", "linkage": "s.linkage"},
+                {"s.name": name},
+                joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+                order_by=["s.def_id"],
             )
-            def_rows = cursor.fetchall()
             in_tree = [r for r in def_rows if r["fid"] in blob_paths]
             for r in in_tree:
                 r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
@@ -311,11 +272,9 @@ class SymbolService:
 
             attrs = []
             if s_row.get("ast_id"):
-                cursor.execute(
-                    "SELECT name, val FROM m_ast_attribute WHERE ast_id = %s ORDER BY priority ASC;",
-                    (s_row["ast_id"],),
+                raw_attrs = reader.select_rows(
+                    "m_ast_attribute", ["name", "val"], {"ast_id": s_row["ast_id"]}, order_by=["priority"]
                 )
-                raw_attrs = cursor.fetchall() or []
                 attrs = [
                     {"name": safe_decode(r.get("name")), "val": safe_decode(r.get("val", ""))}
                     for r in raw_attrs
@@ -367,25 +326,23 @@ class SymbolService:
         `definition` is the first one. References are looked up for every AST that *is* the symbol, in the
         tree or not, so a revision whose copy of the defining file was never parsed still resolves them.
         """
-        with get_db_cursor() as cursor:
-            _, vname, blob_paths = self._scope(cursor, version_name)
+        with get_reader() as reader:
+            _, vname, blob_paths = self._scope(reader, version_name)
             arch_id, srcarch, bits = definition_arch(vname, arch)
 
             # Resolve symbol definition to ast_id. a.name tells the symbol's own AST from the AST of a marker
             # definition (EXPORT_SYMBOL(sym), an initcall): that one is the macro's content-addressed node,
             # shared by every symbol it marks, so it is shown but never a reference target (see ref_targets)
-            cursor.execute(
-                """
-                SELECT s.ast_id, s.type_id, t.name AS type_name, s.line_s, s.line_e, s.blob_id, s.linkage,
-                       a.name AS ast_name
-                FROM m_symbol_def s
-                JOIN m_type_descriptor t ON s.type_id = t.type_id
-                LEFT JOIN m_ast a ON a.ast_id = s.ast_id
-                WHERE s.name = %s;
-                """,
-                (symbol_name,),
+            def_rows = reader.select_rows(
+                ("m_symbol_def", "s"),
+                {"ast_id": "s.ast_id", "type_id": "s.type_id", "type_name": "t.name", "line_s": "s.line_s",
+                 "line_e": "s.line_e", "blob_id": "s.blob_id", "linkage": "s.linkage", "ast_name": "a.name"},
+                {"s.name": symbol_name},
+                joins=[
+                    Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"}),
+                    Join(("m_ast", "a"), {"a.ast_id": "s.ast_id"}, "left"),
+                ],
             )
-            def_rows = cursor.fetchall()
             in_tree = [d for d in def_rows if d["blob_id"] in blob_paths]
             # Only definitions of this tree are definitions of this revision: an out-of-tree blob sits at no
             # path here, so it has nothing to show and nothing to jump to
@@ -409,19 +366,18 @@ class SymbolService:
 
             # Fallback to m_ast lookup if no explicit m_symbol_def record exists
             if not def_rows:
-                cursor.execute(
-                    """
-                    SELECT a.ast_id, a.type_id, t.name AS type_name, bt.blob_id, bt.line_s, bt.line_e
-                    FROM m_ast a
-                    JOIN m_type_descriptor t ON a.type_id = t.type_id
-                    JOIN m_tag tg ON a.ast_id = tg.ast_id
-                    JOIN m_bridge_tag bt ON tg.tag_id = bt.tag_id
-                    WHERE a.name = %s
-                    LIMIT 200;
-                    """,
-                    (symbol_name,),
+                tag_rows = reader.select_rows(
+                    ("m_ast", "a"),
+                    {"ast_id": "a.ast_id", "type_id": "a.type_id", "type_name": "t.name",
+                     "blob_id": "bt.blob_id", "line_s": "bt.line_s", "line_e": "bt.line_e"},
+                    {"a.name": symbol_name},
+                    joins=[
+                        Join(("m_type_descriptor", "t"), {"t.type_id": "a.type_id"}),
+                        Join(("m_tag", "tg"), {"tg.ast_id": "a.ast_id"}),
+                        Join(("m_bridge_tag", "bt"), {"bt.tag_id": "tg.tag_id"}),
+                    ],
+                    limit=200,
                 )
-                tag_rows = cursor.fetchall()
                 ref_targets = list(dict.fromkeys(r["ast_id"] for r in tag_rows if r["ast_id"]))[:MAX_XREF_TARGETS]
                 tag_rows = [r for r in tag_rows if r["blob_id"] in blob_paths]
                 tag_rows.sort(key=lambda r: (path_rank(best_path(blob_paths.get(r["blob_id"]), srcarch, bits), srcarch, bits), r["line_s"] or 0))
@@ -435,28 +391,18 @@ class SymbolService:
                     })
 
             # Rust uses of a C symbol (`bindings::foo`) reference the symbol's name, not one of its ASTs
-            ast_ids = list(dict.fromkeys(ref_targets + binding_ref_asts(cursor, symbol_name)))
+            ast_ids = list(dict.fromkeys(ref_targets + binding_ref_asts(reader, symbol_name)))
             targets = set(ast_ids)
             primary_ast_id = next((d["ast_id"] for d in defs if d["ast_id"] in targets), ast_ids[0] if ast_ids else 0)
 
             ref_rows = []
             if ast_ids:
-                # Key-first form of `m_symbol_ref WHERE ast_id IN (...)` (the view itself takes seconds per target)
-                refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(ast_ids))
                 # The referencing file is the path of r.blob_id in this revision (target_fnid is the target's file);
                 # the caller is the AST of the tag the reference sits in
-                cursor.execute(
-                    f"""
-                    SELECT r.role, r.line, r.char_s, r.blob_id AS fid, r.tag_id, a.name AS caller
-                    FROM ({refs_sql}) r
-                    LEFT JOIN m_tag t ON r.tag_id = t.tag_id
-                    LEFT JOIN m_ast a ON a.ast_id = t.ast_id;
-                    """,
-                    list(ast_ids) * repeat,
-                )
+                refs = reader.symbol_refs_of_targets(ast_ids, with_caller=True)
                 ref_rows = [
-                    {**r, "fname": best_path(blob_paths[r["fid"]], srcarch, bits)}
-                    for r in cursor.fetchall()
+                    {**r, "fid": r["fid"], "fname": best_path(blob_paths[r["fid"]], srcarch, bits)}
+                    for r in refs
                     if r["fid"] in blob_paths
                 ]
                 ref_rows.sort(key=lambda r: (r["fname"], r["line"] or 0, r["char_s"] or 0))
@@ -500,7 +446,7 @@ class SymbolService:
         # bound and without memoizing subtrees, a deep request re-expands every shared subtree once
         # per path through it: queries and response size grow exponentially in the depth.
         depth = max(0, min(int(depth), MAX_AST_TREE_DEPTH))
-        with get_db_cursor() as cursor:
+        with get_reader() as reader:
             node_cache: dict[int, dict[str, Any]] = {}
             # ast_id -> [(child ast_id, priority)] of every node expanded so far
             children_of: dict[int, list[tuple[int, int]]] = {}
@@ -513,19 +459,19 @@ class SymbolService:
                 missing = list(dict.fromkeys(aid for aid in ast_ids if aid not in node_cache))
                 for i in range(0, len(missing), AST_TREE_CHUNK):
                     chunk = missing[i:i + AST_TREE_CHUNK]
-                    placeholders = ",".join(["%s"] * len(chunk))
-                    cursor.execute(
-                        f"""
-                        SELECT a.ast_id, a.name, a.type_id, t.name AS type_name,
-                               (SELECT tag_id FROM m_tag WHERE ast_id = a.ast_id LIMIT 1) AS tag_id
-                        FROM m_ast a
-                        JOIN m_type_descriptor t ON a.type_id = t.type_id
-                        WHERE a.ast_id IN ({placeholders});
-                        """,
-                        chunk,
+                    nodes = reader.select_rows(
+                        ("m_ast", "a"),
+                        {"ast_id": "a.ast_id", "name": "a.name", "type_id": "a.type_id", "type_name": "t.name"},
+                        {"a.ast_id": chunk},
+                        joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "a.type_id"})],
                     )
-                    for r in cursor.fetchall():
-                        node_cache[r["ast_id"]] = r
+                    tags = reader.select_rows(
+                        "m_tag", {"ast_id": "ast_id", "tag_id": Agg("MIN", "tag_id")}, {"ast_id": chunk},
+                        group_by=["ast_id"],
+                    )
+                    tag_of = {t["ast_id"]: t["tag_id"] for t in tags}
+                    for r in nodes:
+                        node_cache[r["ast_id"]] = {**r, "tag_id": tag_of.get(r["ast_id"])}
 
             def expand(roots: list[int], levels: int) -> None:
                 """Fetch the containers of `roots` and of their descendants `levels` levels down: one query
@@ -539,16 +485,11 @@ class SymbolService:
                         return
                     for i in range(0, len(frontier), AST_TREE_CHUNK):
                         chunk = frontier[i:i + AST_TREE_CHUNK]
-                        cursor.execute(
-                            f"""
-                            SELECT c.ast_id, c.ref_ast_id, c.priority
-                            FROM m_ast_container c
-                            WHERE c.ast_id IN ({",".join(["%s"] * len(chunk))})
-                            ORDER BY c.ast_id, c.priority ASC;
-                            """,
-                            chunk,
+                        containers = reader.select_rows(
+                            "m_ast_container", ["ast_id", "ref_ast_id", "priority"], {"ast_id": chunk},
+                            order_by=["ast_id", "priority"],
                         )
-                        for r in cursor.fetchall():
+                        for r in containers:
                             children_of.setdefault(r["ast_id"], []).append((r["ref_ast_id"], r["priority"]))
                     for aid in frontier:
                         children_of.setdefault(aid, [])
@@ -616,12 +557,12 @@ class SymbolService:
             return build_tree(ast_id, depth)[0]
 
     @staticmethod
-    def _blob_of(cursor: Any, rev: str, path: str | None) -> int | None:
+    def _blob_of(reader: Any, rev: str, path: str | None) -> int | None:
         """Indexed blob_id of `path` in the tree of `rev` (None when absent or never parsed)."""
         clean = (path or "").strip().strip("/")
         tree = git_tree_resolver.list_tree(rev) if clean else None
         sha = tree.get(clean) if tree else None
-        meta = git_tree_resolver.map_blob_hashes(cursor, [sha]).get(sha) if sha else None
+        meta = git_tree_resolver.map_blob_hashes(reader, [sha]).get(sha) if sha else None
         return meta[0] if meta else None
 
     def get_include_symbols(
@@ -637,64 +578,52 @@ class SymbolService:
         import os
         from core.globalstuff import normalize_repo_path
 
-        with get_db_cursor() as cursor:
-            _, version_name, blob_paths = self._scope(cursor, version_name)
+        with get_reader() as reader:
+            _, version_name, blob_paths = self._scope(reader, version_name)
 
             target_ast_id = ast_id or 0
             if target_ast_id <= 0 and tag_id:
-                cursor.execute("SELECT ast_id FROM m_tag WHERE tag_id = %s LIMIT 1;", (tag_id,))
-                t_row = cursor.fetchone()
+                t_row = reader.select_one("m_tag", ["ast_id"], {"tag_id": tag_id})
                 if t_row and t_row["ast_id"]:
                     target_ast_id = t_row["ast_id"]
 
             # The include directive of the referring file, looked up in that file's blob at this revision
-            file_blob = self._blob_of(cursor, version_name, file_path) if target_ast_id <= 0 and file_path else None
+            file_blob = self._blob_of(reader, version_name, file_path) if target_ast_id <= 0 and file_path else None
             if target_ast_id <= 0 and file_blob and line:
-                cursor.execute(
-                    """
-                    SELECT a.ast_id
-                    FROM m_bridge_tag bt
-                    JOIN m_tag t ON bt.tag_id = t.tag_id
-                    JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bt.blob_id = %s AND a.type_id = 78 AND bt.line_s <= %s AND bt.line_e >= %s
-                    LIMIT 1;
-                    """,
-                    (file_blob, line, line),
+                f_row = reader.select_one(
+                    ("m_bridge_tag", "bt"),
+                    {"ast_id": "a.ast_id"},
+                    {"bt.blob_id": file_blob, "a.type_id": 78, "bt.line_s": le(line), "bt.line_e": ge(line)},
+                    joins=[
+                        Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                        Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                    ],
                 )
-                f_row = cursor.fetchone()
                 if f_row and f_row["ast_id"]:
                     target_ast_id = f_row["ast_id"]
 
             if target_ast_id <= 0 and file_blob and header:
-                clean_hdr = escape_like(header.strip().strip("<>\"' ;"))
-                cursor.execute(
-                    """
-                    SELECT a.ast_id
-                    FROM m_bridge_tag bt
-                    JOIN m_tag t ON bt.tag_id = t.tag_id
-                    JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bt.blob_id = %s AND a.type_id = 78 AND a.name LIKE %s
-                    LIMIT 1;
-                    """,
-                    (file_blob, f"%{clean_hdr}%"),
+                clean_hdr = header.strip().strip("<>\"' ;")
+                h_row = reader.select_one(
+                    ("m_bridge_tag", "bt"),
+                    {"ast_id": "a.ast_id"},
+                    {"bt.blob_id": file_blob, "a.type_id": 78, "a.name": like(clean_hdr, "contains")},
+                    joins=[
+                        Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}),
+                        Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+                    ],
                 )
-                h_row = cursor.fetchone()
                 if h_row and h_row["ast_id"]:
                     target_ast_id = h_row["ast_id"]
 
             ast_row = None
             if target_ast_id and target_ast_id > 0:
-                cursor.execute(
-                    """
-                    SELECT a.ast_id, a.name, a.type_id, td.name AS type_name
-                    FROM m_ast a
-                    LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
-                    WHERE a.ast_id = %s
-                    LIMIT 1;
-                    """,
-                    (target_ast_id,),
+                ast_row = reader.select_one(
+                    ("m_ast", "a"),
+                    {"ast_id": "a.ast_id", "name": "a.name", "type_id": "a.type_id", "type_name": "td.name"},
+                    {"a.ast_id": target_ast_id},
+                    joins=[Join(("m_type_descriptor", "td"), {"td.type_id": "a.type_id"}, "left")],
                 )
-                ast_row = cursor.fetchone()
 
             if not ast_row:
                 if (target_ast_id and target_ast_id > 0) and not header and not file_path:
@@ -719,50 +648,37 @@ class SymbolService:
 
             raw_include_text = safe_decode(ast_row["name"])
 
-            cursor.execute(
-                """
-                SELECT fn.fnid, fn.fname
-                FROM m_ast_include ai
-                JOIN m_file_name fn ON ai.fnid = fn.fnid
-                WHERE ai.ast_id = %s
-                LIMIT 1;
-                """,
-                (target_ast_id,),
+            inc_row = reader.select_one(
+                ("m_ast_include", "ai"),
+                {"fnid": "fn.fnid", "fname": "fn.fname"},
+                {"ai.ast_id": target_ast_id},
+                joins=[Join(("m_file_name", "fn"), {"fn.fnid": "ai.fnid"})],
             )
-            inc_row = cursor.fetchone()
             raw_header = safe_decode(inc_row["fname"]) if inc_row else ""
             header_file = normalize_repo_path(raw_header)
 
-            cursor.execute(
-                """
-                SELECT c.priority, c.type_id, td.name AS type_name, ra.ast_id AS sym_ast_id, ra.name AS sym_name
-                FROM m_ast_container c
-                LEFT JOIN m_type_descriptor td ON c.type_id = td.type_id
-                LEFT JOIN m_ast ra ON c.ref_ast_id = ra.ast_id
-                WHERE c.ast_id = %s
-                ORDER BY c.priority ASC;
-                """,
-                (target_ast_id,),
+            cont_rows = reader.select_rows(
+                ("m_ast_container", "c"),
+                {"priority": "c.priority", "type_id": "c.type_id", "type_name": "td.name",
+                 "sym_ast_id": "ra.ast_id", "sym_name": "ra.name"},
+                {"c.ast_id": target_ast_id},
+                joins=[
+                    Join(("m_type_descriptor", "td"), {"td.type_id": "c.type_id"}, "left"),
+                    Join(("m_ast", "ra"), {"ra.ast_id": "c.ref_ast_id"}, "left"),
+                ],
+                order_by=["c.priority"],
             )
-            cont_rows = cursor.fetchall()
 
             symbol_names = [safe_decode(r["sym_name"]) for r in cont_rows if r["sym_name"]]
 
             # Each symbol's definition in this revision's tree: in the header itself, then in its directory
             def_map = {}
             if symbol_names:
-                format_strings = ",".join(["%s"] * len(symbol_names))
                 header_dir = (os.path.dirname(header_file) + "/") if header_file else ""
-                cursor.execute(
-                    f"""
-                    SELECT d.name, d.blob_id AS fid, d.line_s
-                    FROM m_symbol_def d
-                    WHERE d.name IN ({format_strings});
-                    """,
-                    tuple(symbol_names),
-                )
                 ranked: dict[str, tuple] = {}
-                for d_row in cursor.fetchall():
+                for d_row in reader.select_rows(
+                    "m_symbol_def", {"name": "name", "fid": "blob_id", "line_s": "line_s"}, {"name": symbol_names},
+                ):
                     paths = blob_paths.get(d_row["fid"])
                     if not paths:
                         continue

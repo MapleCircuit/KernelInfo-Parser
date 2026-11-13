@@ -1,7 +1,7 @@
 """webapp/backend/services/commit_facts.py - Commit enrichment shared by the history features (H1-H4).
 
 `git_facts(shas)` reads subject, author and date of commits from Git in one call; `commit_ids(shas)`
-maps the ones the parser ingested to their `m_commit.commit_id` (SELECT only, section 2.5);
+maps the ones the parser ingested to their `m_commit.commit_id` (read-only, section 2.5);
 `release_badges(shas)` adds the first tags containing them (release membership, section 2.17).
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.helpers import get_active_network_id
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_BATCH = 200
@@ -45,15 +45,15 @@ def commit_ids(shas: Iterable[str]) -> dict[str, int]:
     if not keys:
         return {}
     try:
-        with get_db_cursor() as cursor:
-            network_id = get_active_network_id(cursor)
+        with get_reader() as reader:
+            network_id = get_active_network_id(reader)
             if network_id is None:
                 return {}
-            cursor.execute(
-                f"SELECT commit_id, commit_hash FROM m_commit WHERE network_id = %s AND commit_hash IN ({','.join(['%s'] * len(keys))});",
-                (network_id, *(bytes.fromhex(k) for k in keys)),
+            rows = reader.select_rows(
+                "m_commit",
+                ["commit_id", "commit_hash"],
+                {"network_id": network_id, "commit_hash": [bytes.fromhex(k) for k in keys]},
             )
-            rows = cursor.fetchall()
     except Exception:  # noqa: BLE001 - enrichment is optional
         return {}
     out = {}

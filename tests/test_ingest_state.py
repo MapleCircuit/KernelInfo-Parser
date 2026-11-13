@@ -1,11 +1,12 @@
 """tests/test_ingest_state.py - Recovery of interrupted version runs (core/ingest_state.py)."""
 from __future__ import annotations
 
-import re
 import unittest
 
 from core import ingest_state as I
 from core.DBLayout import TABLES
+from db_engine import MockDB, SQLiteDB
+from db_engine.spec import CURRENT_TIMESTAMP, NO_DEFAULT, gt, le
 
 BY_NAME = {t.table_name: t for t in TABLES}
 
@@ -14,45 +15,68 @@ def _cols(name: str) -> list[str]:
     return [c[0] for c in BY_NAME[name].init_columns]
 
 
-class MemoryDB:
-    """Rows as dicts per table; executes the DELETE forms rollback_plan() generates."""
-
-    def __init__(self) -> None:
-        self.rows: dict[str, list[dict]] = {t.table_name: [] for t in TABLES}
+class _RowHelpers:
+    """Row helpers for the rollback scenarios, shared by the MockDB and the SQLiteDB test databases."""
 
     def add(self, table: str, *values) -> None:
-        self.rows[table].append(dict(zip(_cols(table), values)))
+        """Insert a row; columns past `values` take a neutral filler (0, b"" or "" by type) when they have no default."""
+        specs = BY_NAME[table].init_columns
+        row = list(values)
+        for _name, spec in specs[len(values):]:
+            if spec.default is not NO_DEFAULT and spec.default is not CURRENT_TIMESTAMP:
+                row.append(spec.default)
+            else:
+                row.append(b"" if spec.is_binary else "" if spec.type.name in ("CHAR", "VARCHAR", "TEXT", "MEDIUMTEXT", "LONGTEXT") else 0)
+        self.insert_rows(table, _cols(table), [tuple(row)])
 
-    def _match(self, row: dict, where: str, params: tuple) -> bool:
-        m = re.fullmatch(r"(\w+) (=|>) %s", where)
-        if m:
-            v = row[m.group(1)]
-            return v == params[0] if m.group(2) == "=" else v > params[0]
-        m = re.fullmatch(r"(\w+) IN \(SELECT (\w+) FROM (\w+) WHERE (\w+) IN \(([%s,]+)\)\)", where)
-        if m:
-            ids = {r[m.group(2)] for r in self.rows[m.group(3)] if r[m.group(4)] in params}
-            return row[m.group(1)] in ids
-        m = re.fullmatch(r"(\w+) IN \(([%s,]+)\)", where)
-        if m:
-            return row[m.group(1)] in params
-        raise AssertionError(f"unsupported WHERE: {where}")
+    def table_rows(self, table: str) -> list[dict]:
+        return self.select_rows(table, _cols(table), as_dict=True)
+
+    @property
+    def rows(self) -> dict[str, list[dict]]:
+        return {t.table_name: self.table_rows(t.table_name) for t in TABLES}
 
     def run(self, plan: list[I.Delete]) -> None:
         for d in plan:
-            self.rows[d.table] = [r for r in self.rows[d.table] if not self._match(r, d.where, d.params)]
+            d.run(self)
 
     def dangling(self) -> list[str]:
         out = []
         for t in TABLES:
             for col, parent, pcol in (t.init_foreign or ()):
-                keys = {r[pcol] for r in self.rows[parent]}
-                out += [f"{t.table_name}.{col}={r[col]}" for r in self.rows[t.table_name] if r[col] not in keys]
+                keys = {r[pcol] for r in self.table_rows(parent)}
+                out += [f"{t.table_name}.{col}={r[col]}" for r in self.table_rows(t.table_name) if r[col] not in keys]
         return out
+
+
+class MemoryDB(_RowHelpers, MockDB):
+    """An isolated MockDB over the whole schema."""
+
+    def __init__(self) -> None:
+        MockDB.__init__(self, use_global=False)
+
+
+class SQLiteMemoryDB(_RowHelpers, SQLiteDB):
+    """An in-memory SQLiteDB with every table of the schema, empty."""
+
+    def __init__(self) -> None:
+        SQLiteDB.__init__(self, ":memory:", foreign_keys=False)
+        self.create_table(list(TABLES))
+        for t in TABLES:
+            self.delete_rows(t.table_name, None, all_rows=True)
+
+
+BACKEND: list[type] = [MemoryDB]
+
+
+def new_db() -> MemoryDB:
+    """A fresh empty database of the backend under test."""
+    return BACKEND[0]()
 
 
 def seeded() -> MemoryDB:
     """Rows before the run (ids <= 10) plus rows an interrupted run wrote (ids > 10, and blob 3's rows)."""
-    db = MemoryDB()
+    db = new_db()
     db.add("m_type_descriptor", 1, "C_function")
     db.add("m_project", 1, "Linux", "linux")
     db.add("m_git_network", 1, 1, "linux", b"root")
@@ -113,10 +137,10 @@ class TestRollbackPlan(unittest.TestCase):
         for t in TABLES:
             for _, parent, _ in (t.init_foreign or ()):
                 if parent != t.table_name and t.table_name in last_delete and parent in MARKS:
-                    first_parent = min(i for i, d in enumerate(plan) if d.table == parent and "> %s" in d.where)
+                    first_parent = min(i for i, d in enumerate(plan) if d.table == parent and d.condition.endswith(" >"))
                     self.assertLess(
-                        min(i for i, d in enumerate(plan) if d.table == t.table_name and "> %s" in d.where)
-                        if any(d.table == t.table_name and "> %s" in d.where for d in plan) else -1,
+                        min(i for i, d in enumerate(plan) if d.table == t.table_name and d.condition.endswith(" >"))
+                        if any(d.table == t.table_name and d.condition.endswith(" >") for d in plan) else -1,
                         first_parent, f"{t.table_name} must be cleared before {parent}",
                     )
 
@@ -150,138 +174,153 @@ class TestRollbackPlan(unittest.TestCase):
         db = seeded()
         plan = I.rollback_plan(TABLES, MARKS, 10, [3])
         db.run(plan)
-        snapshot = {k: list(v) for k, v in db.rows.items()}
+        snapshot = db.rows
         db.run(plan)
         self.assertEqual(db.rows, snapshot)
 
     def test_precheck_flags_older_rows_pointing_at_new_ones(self) -> None:
-        queries = I.precheck_queries(TABLES, MARKS)
-        self.assertIn("m_tag.ast_id -> m_ast", [q[0] for q in queries])
-        sql = dict((q[0], q[1]) for q in queries)["m_tag.ast_id -> m_ast"]
-        self.assertEqual(sql, "SELECT tag_id FROM m_tag WHERE tag_id <= %s AND ast_id > %s LIMIT 1")
+        queries = dict(I.precheck_queries(TABLES, MARKS))
+        select = queries["m_tag.ast_id -> m_ast"]
+        self.assertEqual((select.source, list(select.columns), select.limit), ("m_tag", ["tag_id"], 1))
+        self.assertEqual(select.where, {"tag_id": le(10), "ast_id": gt(10)})
 
 
-class FakeCursor:
-    def __init__(self, log: list, results: dict) -> None:
-        self.log, self.results, self.rowcount, self._last = log, results, 0, None
-
-    def execute(self, sql: str, params=()) -> None:
-        self.log.append((sql, tuple(params or ())))
-        self._last = next((v for k, v in self.results.items() if sql.startswith(k) or sql.strip().startswith(k)), None)
-        self.rowcount = len(self._last) if self._last and isinstance(self._last, list) else 1
-
-    def executemany(self, sql: str, rows) -> None:
-        self.log.extend((sql, tuple(r)) for r in rows)
-
-    def fetchone(self):
-        return self._last[0] if self._last else None
-
-    def fetchall(self):
-        return list(self._last or [])
-
-    def close(self) -> None:
-        pass
-
-
-class FakeCnx:
-    def __init__(self, results: dict | None = None) -> None:
-        self.log: list = []
-        self.results = results or {}
-        self.commits = 0
-
-    def query(self, sql: str, params=(), dictionary: bool = True) -> list:
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.fetchall()
-
-    def query_one(self, sql: str, params=(), dictionary: bool = True):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.fetchone()
-
-    def execute(self, sql: str, params=()) -> int:
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur.rowcount
-
-    def executemany(self, sql: str, rows) -> int:
-        cur = self.cursor()
-        cur.executemany(sql, rows)
-        return len(rows)
-
-    def cursor(self) -> FakeCursor:
-        return FakeCursor(self.log, self.results)
-
-    def commit(self) -> None:
-        self.commits += 1
+def _watermarks(db: MemoryDB, commit_id: int = 10) -> None:
+    """The watermark rows `begin()` stored for a run whose marks are MARKS."""
+    for t, _col in I.marked_tables(TABLES):
+        db.add("m_ingest_watermark", commit_id, t.table_id, MARKS[t.table_name])
 
 
 class TestIngestStateDatabase(unittest.TestCase):
     def test_begin_records_watermarks_and_parsing_status(self) -> None:
-        cnx = FakeCnx({"SELECT COALESCE(MAX(": [(42,)]})
-        marks = I.begin(cnx, 1, 10, TABLES)
-        self.assertEqual(set(marks.values()), {42})
-        inserted = [p for sql, p in cnx.log if sql.startswith("INSERT INTO m_ingest_watermark")]
-        self.assertEqual(len(inserted), len(I.marked_tables(TABLES)))
-        status = [p for sql, p in cnx.log if sql.startswith("INSERT INTO m_ingest_state")]
-        self.assertEqual(status[0][:3], (1, 10, I.INGEST_PARSING))
+        db = seeded()
+        marks = I.begin(db, 1, 10, TABLES, base_commit_id=5, worker_id="w1")
+        self.assertEqual(marks["m_commit"], 11, "the highest commit id of the seeded rows")
+        self.assertEqual(marks["m_file_name"], 11)
+        stored = {int(r["marked_table_id"]): int(r["max_id"]) for r in db.table_rows("m_ingest_watermark")}
+        self.assertEqual(stored, {t.table_id: marks[t.table_name] for t, _ in I.marked_tables(TABLES)})
+        state = db.table_rows("m_ingest_state")[0]
+        self.assertEqual((state["network_id"], state["commit_id"], state["status"]), (1, 10, I.INGEST_PARSING))
+        self.assertEqual((state["base_commit_id"], state["worker_id"]), (5, "w1"))
+        self.assertEqual(I.get_status(db, 1, 10), I.INGEST_PARSING)
+        self.assertIsNone(I.get_status(db, 1, 99))
+
+    def test_begin_replaces_the_marks_of_an_earlier_attempt(self) -> None:
+        db = seeded()
+        I.begin(db, 1, 10, TABLES)
+        db.add("m_ingest_blob", 10, 3)
+        I.begin(db, 1, 10, TABLES)
+        self.assertEqual(db.count_rows("m_ingest_blob"), 0)
+        self.assertEqual(db.count_rows("m_ingest_watermark"), len(I.marked_tables(TABLES)))
 
     def test_done_clears_the_bookkeeping(self) -> None:
-        cnx = FakeCnx()
-        I.set_status(cnx, 1, 10, I.INGEST_DONE)
-        sqls = [sql for sql, _ in cnx.log]
-        self.assertTrue(any(s.startswith("DELETE FROM m_ingest_watermark") for s in sqls))
-        self.assertTrue(any(s.startswith("DELETE FROM m_ingest_blob") for s in sqls))
+        db = seeded()
+        _watermarks(db)
+        db.add("m_ingest_blob", 10, 3)
+        I.set_status(db, 1, 10, I.INGEST_DONE)
+        self.assertEqual((db.count_rows("m_ingest_watermark"), db.count_rows("m_ingest_blob")), (0, 0))
+        self.assertEqual(I.get_status(db, 1, 10), I.INGEST_DONE)
+
+    def test_a_commit_zero_status_is_ignored(self) -> None:
+        db = new_db()
+        I.set_status(db, 1, 0, I.INGEST_DONE)
+        self.assertEqual(db.count_rows("m_ingest_state"), 0)
+
+    def test_record_blobs_ignores_repeats(self) -> None:
+        db = new_db()
+        I.record_blobs(db, 10, [3, 3, 4])
+        I.record_blobs(db, 10, [4, 5])
+        self.assertEqual(sorted(r[0] for r in db.select_rows("m_ingest_blob", ["blob_id"], {"commit_id": 10})), [3, 4, 5])
 
     def test_rollback_without_watermarks_reports_it(self) -> None:
-        self.assertFalse(I.rollback_version(FakeCnx({"SELECT marked_table_id": []}), 1, 10, TABLES))
+        self.assertFalse(I.rollback_version(new_db(), 1, 10, TABLES))
 
     def test_rollback_refuses_when_older_rows_reference_the_run(self) -> None:
-        cnx = FakeCnx({"SELECT marked_table_id": [(BY_NAME["m_tag"].table_id, 10), (BY_NAME["m_ast"].table_id, 10)],
-                       "SELECT tag_id FROM m_tag": [(4,)]})
+        db = new_db()
+        db.add("m_ingest_watermark", 10, BY_NAME["m_tag"].table_id, 10)
+        db.add("m_ingest_watermark", 10, BY_NAME["m_ast"].table_id, 10)
+        db.add("m_tag", 4, b"c4", 99, 0, 0)  # older than the run (tag 4 <= 10) but pointing at an ast of the run
         with self.assertRaises(I.RecoveryError):
-            I.rollback_version(cnx, 1, 10, TABLES)
+            I.rollback_version(db, 1, 10, TABLES)
+
+    def test_rollback_version_undoes_the_run_and_forgets_its_marks(self) -> None:
+        db = seeded()
+        _watermarks(db)
+        db.add("m_ingest_blob", 10, 3)
+        self.assertTrue(I.rollback_version(db, 1, 10, TABLES))
+        self.assertEqual(db.dangling(), [])
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_commit")], [5, 10])
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_bridge_checkpoint")], [5])
+        self.assertEqual([r["blob_id"] for r in db.table_rows("m_bridge_tag")], [1])
+        self.assertEqual((db.count_rows("m_ingest_watermark"), db.count_rows("m_ingest_blob")), (0, 0))
+
+    def test_rollback_version_with_stale_marks_discards_them(self) -> None:
+        db = seeded()
+        _watermarks(db)
+        db.add("m_ingest_state", 1, 11, I.INGEST_DONE, 0)  # a version finished on top of the marks
+        self.assertFalse(I.rollback_version(db, 1, 10, TABLES))
+        self.assertEqual(db.count_rows("m_ingest_watermark"), 0)
+        self.assertEqual(len(db.table_rows("m_commit")), 3, "nothing of the finished version is deleted")
+
+    def test_rollback_by_leased_id_ranges(self) -> None:
+        db = seeded()
+        db.add("m_ingest_id_range", 10, BY_NAME["m_ast"].table_id, 11, 20)
+        db.add("m_ingest_blob", 10, 3)
+        self.assertTrue(I.rollback_version(db, 1, 10, TABLES))
+        self.assertEqual({r["ast_id"] for r in db.table_rows("m_ast")}, {1}, "the leased range goes")
+        self.assertEqual({r["ast_id"] for r in db.table_rows("m_ast_container")}, {1})
+        self.assertEqual(db.table_rows("m_ast_hash"), [])
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_bridge_checkpoint")], [5])
+        self.assertEqual(db.count_rows("m_ingest_state"), 0, "the run's state row goes with it")
+        self.assertEqual(db.count_rows("m_ingest_id_range"), 0)
+        self.assertEqual({r["blob_id"] for r in db.table_rows("m_file_blob")}, {1, 2, 3, 11}, "registries stay")
 
     def test_fetch_repo_version_states_classifies_correctly(self) -> None:
-        fake_rows = [
-            ("v1.0", 101, I.INGEST_DONE),
-            ("v1.1", 102, I.INGEST_PARSING),
-            ("v1.2", 103, None),
-            ("v1.3", 104, None),
-        ]
-        cnx = FakeCnx({
-            "SELECT r.ref_name": fake_rows,
-            "SELECT DISTINCT commit_id FROM m_bridge_checkpoint": [(103,)],
-        })
-        states = I.fetch_repo_version_states(cnx, repo_id=1, network_id=1)
+        db = new_db()
+        refs = (("v1.0", 101), ("v1.1", 102), ("v1.2", 103), ("v1.3", 104), ("unresolved", 0))
+        db.insert_rows("m_git_ref", ["repo_id", "ref_type", "ref_name", "commit_id"], [(1, 1, n, c) for n, c in refs])
+        db.insert_rows("m_git_ref", ["repo_id", "ref_type", "ref_name", "commit_id"], [(2, 1, "other-repo", 105)])
+        db.add("m_ingest_state", 1, 101, I.INGEST_DONE, 0)
+        db.add("m_ingest_state", 1, 102, I.INGEST_PARSING, 0)
+        db.add("m_ingest_state", 2, 104, I.INGEST_DONE, 0)   # another network's state does not count
+        db.add("m_bridge_checkpoint", 103, 1, 1)
+        states = I.fetch_repo_version_states(db, repo_id=1, network_id=1)
         self.assertEqual(states["v1.0"], (101, "done"))
         self.assertEqual(states["v1.1"], (102, "interrupted"))
         # Checkpoint rows without a state row: completeness is decided by main._previous_ingest() (90% rule)
         self.assertEqual(states["v1.2"], (103, "legacy"))
         self.assertEqual(states["v1.3"], (104, "new"))
-        # One batched existence query for all legacy candidates, not one COUNT(*) per ref
-        self.assertEqual(sum(1 for sql, _ in cnx.log if "m_bridge_checkpoint" in sql), 1)
+        self.assertNotIn("unresolved", states)
+        self.assertNotIn("other-repo", states)
+
+    def _purge_fixture(self) -> MemoryDB:
+        db = new_db()
+        for cid, blob in ((40, 1), (50, 1), (50, 2)):
+            db.add("m_bridge_checkpoint", cid, blob, blob)
+        for blob, tag in ((1, 100), (2, 100), (2, 200)):
+            db.add("m_bridge_tag", blob, tag, 1, 5, 0, 0)
+        db.add("m_moved_tag", 7, 100)
+        db.add("m_moved_tag", 7, 200)
+        db.add("m_commit_file", 50, 2, 2, 0, 0, "A")
+        db.add("m_commit_file", 40, 1, 1, 0, 0, "A")
+        db.add("m_ingest_state", 1, 50, I.INGEST_DONE, 0)
+        return db
 
     def test_purge_version_differential_rows_cleans_version_records(self) -> None:
-        cnx = FakeCnx({
-            "SELECT DISTINCT bt.tag_id": [(10,), (20,)],
-        })
-        deleted = I.purge_version_differential_rows(cnx, commit_id=50, pred_commit_id=40)
+        db = self._purge_fixture()
+        deleted = I.purge_version_differential_rows(db, commit_id=50, pred_commit_id=40)
         self.assertGreater(deleted, 0)
-        sqls = [sql.strip() for sql, _ in cnx.log]
-        self.assertTrue(any("DELETE FROM m_bridge_checkpoint" in s for s in sqls))
-        self.assertTrue(any("DELETE FROM m_commit_file" in s for s in sqls))
-        self.assertTrue(any("DELETE FROM m_moved_tag" in s for s in sqls))
-        self.assertTrue(any("UPDATE m_ingest_state SET status" in s for s in sqls))
-        self.assertGreater(cnx.commits, 0)
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_bridge_checkpoint")], [40])
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_commit_file")], [40])
+        self.assertEqual(I.get_status(db, 1, 50), I.INGEST_PARSING)
         # Only tags absent from the predecessor's tree lose their inbound transitions
-        tag_query = next(p for sql, p in cnx.log if "SELECT DISTINCT bt.tag_id" in sql)
-        self.assertEqual(tag_query, (40, 50, 40))
+        self.assertEqual([r["e_tag_id"] for r in db.table_rows("m_moved_tag")], [100])
 
     def test_purge_without_predecessor_keeps_moved_tags(self) -> None:
-        cnx = FakeCnx({"SELECT DISTINCT bt.tag_id": [(10,)]})
-        I.purge_version_differential_rows(cnx, commit_id=50)
-        self.assertFalse(any("m_moved_tag" in sql for sql, _ in cnx.log))
+        db = self._purge_fixture()
+        I.purge_version_differential_rows(db, commit_id=50)
+        self.assertEqual(sorted(r["e_tag_id"] for r in db.table_rows("m_moved_tag")), [100, 200])
+        self.assertEqual([r["commit_id"] for r in db.table_rows("m_bridge_checkpoint")], [40])
 
     def test_cleanup_keeps_directories_of_running_instances(self) -> None:
         import tempfile
@@ -307,6 +346,24 @@ class TestIngestStateDatabase(unittest.TestCase):
             removed = I.cleanup_ramdisk_artifacts(ramdisk_dir=tmp_dir, search_system_temps=False)
             self.assertEqual(removed, 1)
             self.assertFalse(os.path.isdir(test_target))
+
+
+class _OnSQLite:
+    """Runs the scenarios of the base class against an in-memory SQLiteDB instead of the MockDB."""
+
+    def setUp(self) -> None:
+        BACKEND[0] = SQLiteMemoryDB
+
+    def tearDown(self) -> None:
+        BACKEND[0] = MemoryDB
+
+
+class TestRollbackPlanSQLite(_OnSQLite, TestRollbackPlan):
+    pass
+
+
+class TestIngestStateDatabaseSQLite(_OnSQLite, TestIngestStateDatabase):
+    pass
 
 
 if __name__ == "__main__":

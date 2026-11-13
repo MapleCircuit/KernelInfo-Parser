@@ -19,7 +19,8 @@ from collections import OrderedDict
 
 from parser.arch_layout import ArchLayout, compute_layouts
 from parser.include_graph import IncludeResolver, include_directives
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import git_tree_resolver
 
@@ -140,18 +141,16 @@ class ArchLayoutService:
     @staticmethod
     def _from_db(sha: str, arch: str) -> ArchLayout | None:
         try:
-            with get_db_cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT e.role, e.priority, e.path, e.target
-                    FROM m_commit c
-                    JOIN m_arch_root r ON r.commit_id = c.commit_id
-                    JOIN m_arch_layout_entry e ON e.layout_id = r.layout_id
-                    WHERE c.commit_hash = %s AND r.arch = %s;
-                    """,
-                    (bytes.fromhex(sha), arch),
+            with get_reader() as reader:
+                rows = reader.select_rows(
+                    ("m_commit", "c"),
+                    ["e.role", "e.priority", "e.path", "e.target"],
+                    {"c.commit_hash": bytes.fromhex(sha), "r.arch": arch},
+                    joins=[
+                        Join(("m_arch_root", "r"), {"r.commit_id": "c.commit_id"}),
+                        Join(("m_arch_layout_entry", "e"), {"e.layout_id": "r.layout_id"}),
+                    ],
                 )
-                rows = cursor.fetchall()
         except Exception as exc:  # table missing (older database) or no database
             logger.debug("m_arch_root unavailable: %s", exc)
             return None

@@ -10,6 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import HTTPException
 
+from core import DBLayout as D
+from core.globalstuff import ASTT
+from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.services import outline_service as osvc
 from webapp.backend.services.outline_service import OutlineService, build_outline, flatten, outline_kind
 
@@ -66,30 +69,36 @@ class TestOutlineModel(unittest.TestCase):
 
 class TestOutlineService(unittest.TestCase):
     def _svc(self, tree, blob_ids, rows):
-        cursor = MagicMock()
-        cursor.fetchall.return_value = rows
+        """Service over a database whose blob 42 defines `rows`; `reader` counts the `get_reader()` calls."""
+        db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+            "m_blob_symbol_def": [
+                {"def_id": i + 1, "blob_id": 42, "tag_id": 1, "ast_id": 1, "name": r["name"], "type_id": ASTT[r["type_name"]].value,
+                 "linkage": r["linkage"], "line_s": r["line_s"], "line_e": r["line_e"]}
+                for i, r in enumerate(rows)
+            ],
+        })
+        reader = patch.object(osvc, "get_reader", wraps=osvc.get_reader)
         patches = [
+            patch_reader(db),
             patch.object(osvc.git_tree_resolver, "list_tree", return_value=tree),
             patch.object(osvc.GitTreeResolver, "map_blob_hashes", return_value=blob_ids),
-            patch.object(osvc, "get_db_cursor"),
+            reader,
         ]
-        started = [p.start() for p in patches]
-        started[2].return_value.__enter__.return_value = cursor
-        self.addCleanup(lambda: [p.stop() for p in patches])
-        return OutlineService(), cursor
+        mocks = [p.start() for p in patches]
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+        return OutlineService(), mocks[-1]
 
     def test_indexed_blob_read_only_and_cached(self) -> None:
         sha = "a" * 40
-        svc, cursor = self._svc({"kernel/fork.c": sha}, {sha: (42, 1)}, [row("copy_process", "C_functionprotodecl", 10, 20)])
+        svc, reader = self._svc({"kernel/fork.c": sha}, {sha: (42, 1)}, [row("copy_process", "C_functionprotodecl", 10, 20)])
         out = svc.get_outline("v3.0", "kernel/fork.c")
         self.assertTrue(out["indexed"])
         self.assertEqual(out["count"], 1)
-        sql = cursor.execute.call_args[0][0].strip().upper()
-        self.assertTrue(sql.startswith("SELECT"))
-        self.assertEqual(cursor.execute.call_args[0][1][0], 42)
-        calls = cursor.execute.call_count
+        self.assertEqual([i["name"] for i in out["items"]], ["copy_process"])
+        self.assertEqual(reader.call_count, 1)
         self.assertEqual(svc.get_outline("v3.1", "kernel/fork.c")["count"], 1)  # same blob: cached
-        self.assertEqual(cursor.execute.call_count, calls)
+        self.assertEqual(reader.call_count, 1)
 
     def test_unindexed_blob_and_errors(self) -> None:
         sha = "b" * 40

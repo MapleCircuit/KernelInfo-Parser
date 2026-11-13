@@ -38,7 +38,7 @@ from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and
     parse_record,
     version_status,
 )
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services import release_service as rs
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
@@ -68,9 +68,10 @@ def source(fresh: bool = False) -> dict[str, Any] | None:
         return _SOURCE["row"]
     row = None
     try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT name, layout, head, format, records, built_at FROM m_cve_source ORDER BY built_at DESC LIMIT 1")
-            r = cur.fetchone()
+        with get_reader() as reader:
+            r = reader.select_one(
+                "m_cve_source", ["name", "layout", "head", "format", "records", "built_at"], order_by=["-built_at"]
+            )
         if r:
             row = {"name": _text(r["name"]), "layout": _text(r["layout"]), "head": bytes(r["head"]).hex(),
                    "format": int(r["format"]), "records": int(r["records"]), "built_at": int(r["built_at"])}
@@ -100,9 +101,8 @@ def records() -> dict[str, dict[str, Any]]:
             return _MEM["records"]
     out: dict[str, dict[str, Any]] = {}
     started = time.time()
-    with get_db_cursor() as cur:
-        cur.execute("SELECT cve_id, data FROM m_cve")
-        for r in cur.fetchall():
+    with get_reader() as reader:
+        for r in reader.select_rows("m_cve", ["cve_id", "data"]):
             rec = _decode(r["data"])
             if rec is not None:
                 out[_text(r["cve_id"])] = rec
@@ -140,14 +140,10 @@ def for_commit(sha: str, upstream: Iterable[str] = ()) -> dict[str, list[str]]:
     wanted = {k: full for full in [sha, *ups] for k in keys(full)}
     hits: dict[str, dict[int, list[str]]] = {}
     try:
-        with get_db_cursor() as cur:
-            keys_list = sorted(wanted)
-            cur.execute(
-                f"SELECT commit_hash, role, cve_id FROM m_cve_commit WHERE commit_hash IN ({','.join(['%s'] * len(keys_list))}) "  # noqa: S608
-                "ORDER BY cve_id",
-                keys_list,
-            )
-            for r in cur.fetchall():
+        with get_reader() as reader:
+            for r in reader.select_rows(
+                "m_cve_commit", ["commit_hash", "role", "cve_id"], {"commit_hash": sorted(wanted)}, order_by=["cve_id"]
+            ):
                 full = wanted.get(_text(r["commit_hash"]))
                 if full is None:
                     continue
@@ -169,19 +165,17 @@ def for_commit(sha: str, upstream: Iterable[str] = ()) -> dict[str, list[str]]:
 
 def stored_prefixes(prefixes: list[str]) -> dict[str, str]:
     """{prefix: full SHA} of the abbreviated hashes m_cve_commit_hash resolved for the active repository
-    (SELECT only; an older database without the table answers {})."""
+    (read only; an older database without the table answers {})."""
     out: dict[str, str] = {}
     try:
         from webapp.backend.database.helpers import get_active_repo_id
-        with get_db_cursor() as cursor:
-            repo_id = get_active_repo_id(cursor)
+        with get_reader() as reader:
+            repo_id = get_active_repo_id(reader)
             for i in range(0, len(prefixes), 1000):
                 part = prefixes[i:i + 1000]
-                cursor.execute(
-                    f"SELECT prefix, commit_hash FROM m_cve_commit_hash WHERE repo_id = %s AND prefix IN ({','.join(['%s'] * len(part))});",
-                    (repo_id, *part),
-                )
-                for r in cursor.fetchall():
+                for r in reader.select_rows(
+                    "m_cve_commit_hash", ["prefix", "commit_hash"], {"repo_id": repo_id, "prefix": part}
+                ):
                     prefix = r["prefix"].decode() if isinstance(r["prefix"], (bytes, bytearray)) else r["prefix"]
                     out[prefix] = bytes(r["commit_hash"]).hex()
     except Exception as exc:  # noqa: BLE001 - git resolves them
@@ -488,9 +482,8 @@ def cves_for_file(version: str, file_path: str) -> dict[str, Any]:
     if not clean_path or not is_safe_rel_path(clean_path):
         raise HTTPException(status_code=400, detail="Invalid file path")
     from webapp.backend.database.helpers import safe_decode
-    with get_db_cursor() as cursor:
-        cursor.execute("SELECT cve_id FROM m_cve_file WHERE file_path = %s;", (clean_path,))
-        cve_ids = [safe_decode(r["cve_id"]) for r in cursor.fetchall() if r.get("cve_id")]
+    with get_reader() as reader:
+        cve_ids = [safe_decode(r["cve_id"]) for r in reader.select_rows("m_cve_file", ["cve_id"], {"file_path": clean_path}) if r.get("cve_id")]
     all_recs = records()
     ctx = Context(version) if version else None
     results = []

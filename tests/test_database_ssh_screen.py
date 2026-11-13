@@ -92,7 +92,7 @@ class TestDatabaseSSHScreen(unittest.TestCase):
         self.assertEqual(screen.engine.get_selected(), "mariadb")
         self.assertEqual(screen.host.get_value(), "127.0.0.1")
         self.assertEqual(screen.port.get_value(), "3306")
-        self.assertEqual(screen.user.get_value(), "root")
+        self.assertEqual(screen.user.get_value(), "")
         self.assertEqual(screen.password.get_value(), "")
         self.assertEqual(screen.database.get_value(), "test")
         self.assertEqual(screen.unix_socket.get_value(), "auto")

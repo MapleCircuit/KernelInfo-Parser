@@ -8,9 +8,11 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from db_engine.spec import Join, gt
+
 from webapp.backend.config import get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
-from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.sync_service import sync_service
 
 sync_router = APIRouter(prefix="/api", tags=["system"])
@@ -68,23 +70,25 @@ def ingest_status(now: float | None = None) -> dict[str, Any]:
         "available": True,
     }
     try:
-        with get_db_cursor() as cursor:
-            network_id = get_active_network_id(cursor)
-            repo_id = get_active_repo_id(cursor)
+        with get_reader() as reader:
+            network_id = get_active_network_id(reader)
+            repo_id = get_active_repo_id(reader)
             if network_id is not None:
-                cursor.execute(
-                    "SELECT s.commit_id, s.status, s.updated_at, c.commit_hash FROM m_ingest_state s "
-                    "JOIN m_commit c ON c.commit_id = s.commit_id "
-                    "WHERE s.network_id = %s AND (s.status = %s OR s.status = %s) "
-                    "ORDER BY s.updated_at DESC;",
-                    (network_id, INGEST_PARSING, INGEST_DONE),
+                states = reader.select_rows(
+                    ("m_ingest_state", "s"),
+                    ["s.commit_id", "s.status", "s.updated_at", "c.commit_hash"],
+                    {"s.network_id": network_id, "s.status": [INGEST_PARSING, INGEST_DONE]},
+                    joins=[Join(("m_commit", "c"), {"c.commit_id": "s.commit_id"})],
+                    order_by=["-s.updated_at"],
                 )
-                states = cursor.fetchall()
-                cursor.execute(
-                    "SELECT r.commit_id, r.ref_name FROM m_git_ref r WHERE r.repo_id = %s AND r.commit_id > 0 ORDER BY r.ref_id;",
-                    (repo_id,),
+                names = _ref_names(
+                    reader.select_rows(
+                        ("m_git_ref", "r"),
+                        ["r.commit_id", "r.ref_name"],
+                        {"r.repo_id": repo_id, "r.commit_id": gt(0)},
+                        order_by=["r.ref_id"],
+                    )
                 )
-                names = _ref_names(cursor.fetchall())
                 parsing = [r for r in states if int(r["status"]) == INGEST_PARSING]
                 done = [r for r in states if int(r["status"]) == INGEST_DONE]
                 out["catalog"]["parsing"] = len(parsing)
@@ -103,20 +107,14 @@ def ingest_status(now: float | None = None) -> dict[str, Any]:
                         "commit": _short(r["commit_hash"]),
                         "finished_at": int(r["updated_at"] or 0),
                     })
-            cursor.execute(
-                "SELECT TABLE_NAME, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA = DATABASE() ORDER BY DATA_LENGTH + INDEX_LENGTH DESC;"
-            )
             total = 0
-            for r in cursor.fetchall():
-                data = int(r.get("DATA_LENGTH") or 0)
-                index = int(r.get("INDEX_LENGTH") or 0)
-                total += data + index
+            for stat in reader.table_stats():
+                total += stat.data_bytes + stat.index_bytes
                 out["db"]["tables"].append({
-                    "name": safe_decode(r.get("TABLE_NAME")),
-                    "rows_estimate": int(r.get("TABLE_ROWS") or 0),
-                    "data_mb": round(data / 1048576, 1),
-                    "index_mb": round(index / 1048576, 1),
+                    "name": safe_decode(stat.name),
+                    "rows_estimate": int(stat.rows or 0),
+                    "data_mb": round(stat.data_bytes / 1048576, 1),
+                    "index_mb": round(stat.index_bytes / 1048576, 1),
                 })
             out["db"]["total_mb"] = round(total / 1048576, 1)
     except Exception as exc:  # noqa: BLE001 - the status page also reports a missing database

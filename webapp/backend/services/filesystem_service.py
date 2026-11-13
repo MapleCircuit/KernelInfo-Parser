@@ -7,15 +7,14 @@ import os
 from webapp.backend.config import RepoScopedCache, get_repo_dir
 from typing import Any
 from fastapi import HTTPException
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import AnyOf, Join, like, ne
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    tree_source,
     safe_decode,
     format_stat_label,
     get_version_info,
 )
 from webapp.backend.security.jail import is_safe_rel_path
-from webapp.backend.security.sql import escape_like
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 logger = logging.getLogger(__name__)
@@ -32,46 +31,39 @@ RAW_MEDIA_TYPES = {"svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpe
 class FilesystemService:
     """Service handling directory tree traversal, file content extraction, and AST coordinate mapping."""
 
-    def get_tree(self, version_name: str, path: str = "", cursor: Any = None) -> dict[str, Any]:
-        """Retrieve directory hierarchy and file entries for the given version (on `cursor` when given)."""
-        if cursor is None:
-            with get_db_cursor() as cur:
-                return self._get_tree(cur, version_name, path)
-        return self._get_tree(cursor, version_name, path)
+    def get_tree(self, version_name: str, path: str = "", reader: Any = None) -> dict[str, Any]:
+        """Retrieve directory hierarchy and file entries for the given version (on `reader` when given)."""
+        if reader is None:
+            with get_reader() as rd:
+                return self._get_tree(rd, version_name, path)
+        return self._get_tree(reader, version_name, path)
 
-    def _get_tree(self, cursor: Any, version_name: str, path: str) -> dict[str, Any]:
+    def _get_tree(self, reader: Any, version_name: str, path: str) -> dict[str, Any]:
         norm_path = path.strip().strip("/")
-        vid, vname = get_version_info(cursor, version_name)
+        vid, vname = get_version_info(reader, version_name)
         if vid is None:
             raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
         prefix = f"{norm_path}/" if norm_path else ""
-        # Wildcards in the requested path are escaped: only the trailing % is a wildcard
-        like_pattern = f"{escape_like(prefix)}%" if prefix else "%"
+        # Wildcards in the requested path are escaped by like(): only the trailing % is a wildcard
+        name_filter = like(prefix, "prefix") if prefix else None
 
         # Path C: the Git tree is authoritative for every revision (tags, branches, arbitrary commits)
         git_dir = git_tree_resolver.list_dir(vname, norm_path)
         is_checkpoint = False
         if git_dir is None:
             # Git unavailable: fall back to milestone checkpoint in m_bridge_checkpoint
-            cursor.execute("SELECT 1 FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1;".replace("m_checkpoint_tree", tree_source(cursor)), (vid,))
-            is_checkpoint = cursor.fetchone() is not None
+            is_checkpoint = reader.checkpoint_tree_exists(vid)
 
         if git_dir is not None:
-            rows = self._git_tree_rows(cursor, git_dir, prefix)
+            rows = self._git_tree_rows(reader, git_dir, prefix)
         elif is_checkpoint:
-            sql = """
-                SELECT fn.fname, bc.blob_id AS fid, fb.ftype, '0' AS s_stat, '0' AS e_stat
-                FROM m_checkpoint_tree bc
-                JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
-                JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR %s = '')
-                ORDER BY fn.fname ASC;
-            """.replace("m_checkpoint_tree", tree_source(cursor))
-            cursor.execute(sql, (vid, like_pattern, prefix))
-            rows = cursor.fetchall()
+            rows = [
+                {"fname": r["fname"], "fid": r["blob_id"], "ftype": r["ftype"], "s_stat": "0", "e_stat": "0"}
+                for r in reader.checkpoint_tree_files(vid, name=name_filter, with_ftype=True, order_by_name=True)
+            ]
         else:
-            tree_map = tree_resolver.resolve_tree(vid, cursor)
+            tree_map = tree_resolver.resolve_tree(vid, reader)
             if not tree_map:
                 rows = []
             else:
@@ -80,24 +72,17 @@ class FilesystemService:
                 chunk_size = 5000
                 for i in range(0, len(fnids), chunk_size):
                     chunk = fnids[i:i + chunk_size]
-                    fmt = ",".join(["%s"] * len(chunk))
-                    if prefix:
-                        cursor.execute(
-                            f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) AND fname LIKE %s ORDER BY fname ASC;",
-                            [*chunk, like_pattern],
-                        )
-                    else:
-                        cursor.execute(
-                            f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) ORDER BY fname ASC;",
-                            chunk,
-                        )
-                    c_rows = cursor.fetchall()
+                    name_where: dict[str, Any] = {"fnid": chunk}
+                    if name_filter is not None:
+                        name_where["fname"] = name_filter
+                    c_rows = reader.select_rows("m_file_name", ["fnid", "fname"], name_where, order_by=["fname"], as_dict=True)
                     blob_ids = list({tree_map[r["fnid"]] for r in c_rows})
                     b_types: dict[int, int] = {}
                     if blob_ids:
-                        b_fmt = ",".join(["%s"] * len(blob_ids))
-                        cursor.execute(f"SELECT blob_id, ftype FROM m_file_blob WHERE blob_id IN ({b_fmt});", blob_ids)
-                        b_types = {br["blob_id"]: br["ftype"] for br in cursor.fetchall()}
+                        b_types = {
+                            br["blob_id"]: br["ftype"]
+                            for br in reader.select_rows("m_file_blob", ["blob_id", "ftype"], {"blob_id": blob_ids}, as_dict=True)
+                        }
                     for r in c_rows:
                         b_id = tree_map[r["fnid"]]
                         rows.append({
@@ -164,10 +149,10 @@ class FilesystemService:
         }
 
     @staticmethod
-    def _git_tree_rows(cursor: Any, git_dir: tuple[set[str], dict[str, str]], prefix: str) -> list[dict[str, Any]]:
+    def _git_tree_rows(reader: Any, git_dir: tuple[set[str], dict[str, str]], prefix: str) -> list[dict[str, Any]]:
         """Direct-child rows of prefix from a Git directory listing (list_dir), annotating files via m_file_blob blob_hash."""
         subdirs, direct_files = git_dir
-        blob_meta = git_tree_resolver.map_blob_hashes(cursor, direct_files.values())
+        blob_meta = git_tree_resolver.map_blob_hashes(reader, direct_files.values())
         rows: list[dict[str, Any]] = [
             {"fname": f"{prefix}{d}", "fid": None, "ftype": 0, "s_stat": "0", "e_stat": "0"}
             for d in subdirs
@@ -197,14 +182,14 @@ class FilesystemService:
         if not is_safe_rel_path(norm_path):
             raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
             raw_bytes, is_dir, sha1 = git_reader.read_file(vname, norm_path)
             if is_dir:
-                tree_data = self.get_tree(version_name, norm_path, cursor=cursor)
+                tree_data = self.get_tree(version_name, norm_path, reader=reader)
                 return {
                     "type": "dir",
                     "is_directory": True,
@@ -221,7 +206,7 @@ class FilesystemService:
             if raw_bytes is None:
                 raise HTTPException(status_code=404, detail=f"File '{norm_path}' not found in version '{vname}'.")
 
-            blob_meta = git_tree_resolver.map_blob_hashes(cursor, [sha1]).get(sha1) if sha1 else None
+            blob_meta = git_tree_resolver.map_blob_hashes(reader, [sha1]).get(sha1) if sha1 else None
             fid, ftype = (blob_meta[0], blob_meta[1]) if blob_meta else (None, None)
             file_size = len(raw_bytes)
 
@@ -255,7 +240,7 @@ class FilesystemService:
                 if cached_tokens is not None:
                     compact_tokens = cached_tokens
                 else:
-                    compact_tokens = self._blob_tokens(cursor, fid)
+                    compact_tokens = self._blob_tokens(reader, fid)
                     _FILE_TOKENS_CACHE[fid] = compact_tokens
 
         last_changed = None
@@ -283,23 +268,25 @@ class FilesystemService:
         }
 
     @staticmethod
-    def _blob_tokens(cursor: Any, blob_id: int) -> list[list[int]]:
+    def _blob_tokens(reader: Any, blob_id: int) -> list[list[int]]:
         """Absolute [line_s, char_s, line_e, char_e, ast_id, type_id] of every AST map of one blob."""
-        cursor.execute(
-            """
-            SELECT bt.line_s, bt.char_s, bt.line_e, bt.char_e,
-                   m.line_s AS m_line_s, m.char_s AS m_char_s, m.line_e AS m_line_e, m.char_e AS m_char_e,
-                   m.ast_id, a.type_id
-            FROM m_bridge_tag bt
-            JOIN m_map_ast m ON m.map_id = bt.tag_id
-            JOIN m_ast a ON m.ast_id = a.ast_id
-            WHERE bt.blob_id = %s
-            ORDER BY bt.line_s ASC, bt.char_s ASC;
-            """,
-            (blob_id,),
+        rows = reader.select_rows(
+            ("m_bridge_tag", "bt"),
+            {
+                "line_s": "bt.line_s", "char_s": "bt.char_s", "line_e": "bt.line_e", "char_e": "bt.char_e",
+                "m_line_s": "m.line_s", "m_char_s": "m.char_s", "m_line_e": "m.line_e", "m_char_e": "m.char_e",
+                "ast_id": "m.ast_id", "type_id": "a.type_id",
+            },
+            {"bt.blob_id": blob_id},
+            joins=[
+                Join(("m_map_ast", "m"), {"m.map_id": "bt.tag_id"}),
+                Join(("m_ast", "a"), {"a.ast_id": "m.ast_id"}),
+            ],
+            order_by=["bt.line_s", "bt.char_s"],
+            as_dict=True,
         )
         tokens = []
-        for r in cursor.fetchall():
+        for r in rows:
             # Absolute line and 0-indexed column coordinates from the 1-indexed snippet-relative map
             abs_ls = r["line_s"] + r["m_line_s"] - 1
             abs_le = r["line_s"] + r["m_line_e"] - 1
@@ -316,8 +303,8 @@ class FilesystemService:
         Sources come from the Git tree (Path C) so every revision is complete; files under other
         architectures' arch/<name>/ subtrees are excluded.
         """
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         tree = git_tree_resolver.list_tree(vname)
@@ -354,8 +341,8 @@ class FilesystemService:
         """Directory hierarchy of the revision weighted by bytes and file counts (for treemap rendering)."""
         norm_path = path.strip().strip("/")
         max_depth = max(1, min(int(max_depth or 3), 8))
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         treemap_key = (vname, max_depth, norm_path)
@@ -409,8 +396,8 @@ class FilesystemService:
         matches (heapq), instead of lowercasing and sorting every match on each keystroke.
         """
         q = (query or "").strip().lower()
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         if not q:
@@ -461,8 +448,8 @@ class FilesystemService:
         norm_path = path.strip().strip("/")
         if not norm_path or not is_safe_rel_path(norm_path.replace(".*", ".x")):
             raise HTTPException(status_code=400, detail="A valid relative file path must be specified.")
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         candidates = [norm_path[:-2] + ext for ext in (".svg", ".png", ".jpg", ".jpeg", ".gif")] if norm_path.endswith(".*") else [norm_path]
@@ -485,7 +472,7 @@ class FilesystemService:
         """What refers to a file at a revision (webapp/API.md section 4.2): the files including it, the Kconfig
         files `source`-ing it and the documents naming it (m_file_reference, the parser's Step 6.6 rows), and
         the Kbuild rules building it (m_kbuild_symbol). Rows are stored per (source path, blob); only those
-        whose source blob is the revision's blob of that path are kept. SELECT only."""
+        whose source blob is the revision's blob of that path are kept."""
         import time
         started = time.perf_counter()
         norm = (path or "").strip().strip("/")
@@ -494,39 +481,43 @@ class FilesystemService:
         limit = max(1, min(int(limit or 200), 1000))
         lists: dict[str, list[dict[str, Any]]] = {"included_by": [], "sourced_by": [], "documented_in": [], "built_by": []}
         out: dict[str, Any] = {"version": version_name, "path": norm, "includes_source": "parser", "indexed": False}
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             rev = vname or version_name
-            blob_paths = git_tree_resolver.blob_paths(cursor, rev)
+            blob_paths = git_tree_resolver.blob_paths(reader, rev)
             if blob_paths is None:
                 raise HTTPException(status_code=404, detail=f"Revision '{version_name}' is not available in Git.")
             in_tree = {(bid, p) for bid, paths in blob_paths.items() for p in paths}
             out["indexed"] = any(p == norm for _bid, p in in_tree)
-            cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (norm,))
-            row = cursor.fetchone()
-            if row:
-                fnid = int(row["fnid"])
+            row = reader.select_value("m_file_name", "fnid", {"fname": norm})
+            if row is not None:
+                fnid = int(row)
                 kind_of = {self.REF_INCLUDE: "included_by", self.REF_KCONFIG_SOURCE: "sourced_by", self.REF_DOC: "documented_in"}
                 # Read from the covering index fref_tgt_src_idx alone (ref_id is its primary key part); the
                 # paths and the documents' details are fetched for the rows of the revision only
-                cursor.execute(
-                    """
-                    SELECT ref_id, ref_type, line_no, source_blob_id, source_fnid
-                    FROM m_file_reference
-                    WHERE target_fnid = %s AND ref_type IN (%s, %s, %s);
-                    """,
-                    (fnid, self.REF_INCLUDE, self.REF_KCONFIG_SOURCE, self.REF_DOC),
-                )
-                rows = [r for r in cursor.fetchall() if int(r["source_blob_id"]) in blob_paths]
-                names = self._fnames(cursor, {int(r["source_fnid"]) for r in rows})
+                rows = [
+                    r
+                    for r in reader.select_rows(
+                        "m_file_reference",
+                        ["ref_id", "ref_type", "line_no", "source_blob_id", "source_fnid"],
+                        {"target_fnid": fnid, "ref_type": [self.REF_INCLUDE, self.REF_KCONFIG_SOURCE, self.REF_DOC]},
+                        as_dict=True,
+                    )
+                    if int(r["source_blob_id"]) in blob_paths
+                ]
+                names = self._fnames(reader, {int(r["source_fnid"]) for r in rows})
                 kept = [(r, names.get(int(r["source_fnid"]), "")) for r in rows]
                 kept = [(r, src) for r, src in kept if (int(r["source_blob_id"]), src) in in_tree]
                 details: dict[int, str] = {}
                 doc_ids = sorted(int(r["ref_id"]) for r, _src in kept if int(r["ref_type"]) == self.REF_DOC)
                 for i in range(0, len(doc_ids), 1000):
                     part = doc_ids[i:i + 1000]
-                    cursor.execute(f"SELECT ref_id, details FROM m_file_reference WHERE ref_id IN ({','.join(['%s'] * len(part))});", tuple(part))
-                    details.update({int(d["ref_id"]): safe_decode(d["details"]) or "" for d in cursor.fetchall()})
+                    details.update(
+                        {
+                            int(d["ref_id"]): safe_decode(d["details"]) or ""
+                            for d in reader.select_rows("m_file_reference", ["ref_id", "details"], {"ref_id": part}, as_dict=True)
+                        }
+                    )
                 seen: set[tuple] = set()
                 for r, src in kept:
                     kind = kind_of[int(r["ref_type"])]
@@ -538,17 +529,18 @@ class FilesystemService:
                         seen.add(key)
                         lists[kind].append(item)
                 try:
-                    cursor.execute(
-                        """
-                        SELECT k.source_blob_id, k.line_no, k.symbol, k.rule, fn.fname
-                        FROM m_kbuild_symbol k
-                        JOIN m_file_name fn ON fn.fnid = k.source_fnid
-                        WHERE k.target_fnid = %s AND k.via IN (1, 2);
-                        """,
-                        (fnid,),
+                    kbuild_rows = reader.select_rows(
+                        ("m_kbuild_symbol", "k"),
+                        {
+                            "source_blob_id": "k.source_blob_id", "line_no": "k.line_no", "symbol": "k.symbol",
+                            "rule": "k.rule", "fname": "fn.fname",
+                        },
+                        {"k.target_fnid": fnid, "k.via": [1, 2]},
+                        joins=[Join(("m_file_name", "fn"), {"fn.fnid": "k.source_fnid"})],
+                        as_dict=True,
                     )
                     rules: dict[tuple[str, int], dict[str, Any]] = {}
-                    for r in cursor.fetchall():
+                    for r in kbuild_rows:
                         src = safe_decode(r["fname"])
                         if (int(r["source_blob_id"]), src) not in in_tree:
                             continue
@@ -575,13 +567,17 @@ class FilesystemService:
         return out
 
     @staticmethod
-    def _fnames(cursor: Any, fnids: set[int]) -> dict[int, str]:
+    def _fnames(reader: Any, fnids: set[int]) -> dict[int, str]:
         out: dict[int, str] = {}
         ids = sorted(fnids)
         for i in range(0, len(ids), 1000):
             part = ids[i:i + 1000]
-            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({','.join(['%s'] * len(part))});", tuple(part))
-            out.update({int(r["fnid"]): safe_decode(r["fname"]) for r in cursor.fetchall()})
+            out.update(
+                {
+                    int(r["fnid"]): safe_decode(r["fname"])
+                    for r in reader.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part}, as_dict=True)
+                }
+            )
         return out
 
     def resolve_include(
@@ -624,8 +620,8 @@ class FilesystemService:
         if cached is not None:
             return cached
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
@@ -642,20 +638,20 @@ class FilesystemService:
 
             # 1. Check compiler-verified m_file_reference if current_file is provided
             if current_file:
-                cursor.execute(
-                    """
-                    SELECT fn_target.fname
-                    FROM m_checkpoint_tree bc_src
-                    JOIN m_file_name fn_src ON bc_src.fnid = fn_src.fnid
-                    JOIN m_file_reference fr ON fr.source_blob_id = bc_src.blob_id AND fr.source_fnid = bc_src.fnid
-                    JOIN m_file_name fn_target ON fr.target_fnid = fn_target.fnid
-                    WHERE bc_src.commit_id = %s AND fn_src.fname = %s AND fr.ref_type = 1
-                      AND (fn_target.fname = %s OR fn_target.fname LIKE %s)
-                    LIMIT 1;
-                    """.replace("m_checkpoint_tree", tree_source(cursor)),
-                    (vid, current_file, clean_header, f"%/{clean_header}"),
+                fr_row = reader.select_one(
+                    (reader.checkpoint_tree_source(), "bc_src"),
+                    {"fname": "fn_target.fname"},
+                    [
+                        {"bc_src.commit_id": vid, "fn_src.fname": current_file, "fr.ref_type": 1},
+                        AnyOf({"fn_target.fname": clean_header}, {"fn_target.fname": like(f"/{clean_header}", "suffix")}),
+                    ],
+                    joins=[
+                        Join(("m_file_name", "fn_src"), {"fn_src.fnid": "bc_src.fnid"}),
+                        Join(("m_file_reference", "fr"), {"fr.source_blob_id": "bc_src.blob_id", "fr.source_fnid": "bc_src.fnid"}),
+                        Join(("m_file_name", "fn_target"), {"fn_target.fnid": "fr.target_fnid"}),
+                    ],
+                    as_dict=True,
                 )
-                fr_row = cursor.fetchone()
                 if fr_row and fr_row["fname"]:
                     res = {
                         "header": clean_header,
@@ -668,34 +664,31 @@ class FilesystemService:
 
             # 2. If AST ID provided, check m_ast_include
             if ast_id and int(ast_id) > 0:
-                cursor.execute(
-                    """
-                    SELECT fn.fname
-                    FROM m_ast_include ai
-                    JOIN m_file_name fn ON ai.fnid = fn.fnid
-                    WHERE ai.ast_id = %s
-                    LIMIT 1;
-                    """,
-                    (int(ast_id),),
+                ai_row = reader.select_one(
+                    ("m_ast_include", "ai"),
+                    {"fname": "fn.fname"},
+                    {"ai.ast_id": int(ast_id)},
+                    joins=[Join(("m_file_name", "fn"), {"fn.fnid": "ai.fnid"})],
+                    as_dict=True,
                 )
-                ai_row = cursor.fetchone()
                 if ai_row and ai_row["fname"]:
                     raw_path = safe_decode(ai_row["fname"]).strip("<>\"' ")
                     # Normalize away ../../ components
                     normalized = os.path.normpath(raw_path).lstrip("./")
                     # Check if normalized or raw path exists in DB for this version (must be file, not dir)
-                    cursor.execute(
-                        """
-                        SELECT fn.fname
-                        FROM m_file_name fn
-                        JOIN m_checkpoint_tree bc ON fn.fnid = bc.fnid
-                        JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
-                        WHERE bc.commit_id = %s AND fb.ftype != 0 AND (fn.fname = %s OR fn.fname = %s OR fn.fname LIKE %s)
-                        LIMIT 1;
-                        """.replace("m_checkpoint_tree", tree_source(cursor)),
-                        (vid, normalized, raw_path, f"%/{clean_header}"),
+                    found = reader.select_one(
+                        ("m_file_name", "fn"),
+                        {"fname": "fn.fname"},
+                        [
+                            {"bc.commit_id": vid, "fb.ftype": ne(0)},
+                            AnyOf({"fn.fname": [normalized, raw_path]}, {"fn.fname": like(f"/{clean_header}", "suffix")}),
+                        ],
+                        joins=[
+                            Join((reader.checkpoint_tree_source(), "bc"), {"bc.fnid": "fn.fnid"}),
+                            Join(("m_file_blob", "fb"), {"fb.blob_id": "bc.blob_id"}),
+                        ],
+                        as_dict=True,
                     )
-                    found = cursor.fetchone()
                     if found:
                         res = {
                             "header": clean_header,
@@ -727,30 +720,10 @@ class FilesystemService:
             candidates.append(f"arch/x86/include/{clean_header}")
             candidates.append(f"arch/x86/include/uapi/{clean_header}")
 
-            # Query database for candidate match (excluding directories ftype != 0)
-            placeholders = ", ".join(["%s"] * len(candidates))
-            cursor.execute(
-                f"""
-                SELECT fn.fname
-                FROM m_file_name fn
-                JOIN m_checkpoint_tree bc ON fn.fnid = bc.fnid
-                JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
-                WHERE bc.commit_id = %s AND fb.ftype != 0 AND (fn.fname IN ({placeholders}) OR fn.fname LIKE %s)
-                ORDER BY
-                    CASE
-                        WHEN fn.fname = %s THEN 0
-                        WHEN fn.fname = %s THEN 1
-                        WHEN fn.fname = %s THEN 2
-                        WHEN fn.fname LIKE %s THEN 3
-                        ELSE 4
-                    END,
-                    LENGTH(fn.fname) ASC
-                LIMIT 1;
-                """.replace("m_checkpoint_tree", tree_source(cursor)),
-                (vid, *candidates, f"%/{clean_header}", candidates[0], f"include/{clean_header}", f"include/uapi/{clean_header}", f"%/{clean_header}"),
-            )
-
-            match_row = cursor.fetchone()
+            # Query database for candidate match (directories excluded): the earlier candidate wins, then a
+            # path ending with the header, then the shortest path
+            match_path = reader.checkpoint_find_file(vid, candidates, suffix=f"/{clean_header}")
+            match_row = {"fname": match_path} if match_path else None
             if match_row:
                 res = {
                     "header": clean_header,

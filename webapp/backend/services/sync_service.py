@@ -27,7 +27,8 @@ from typing import Any, Callable
 
 from webapp.backend.config import get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_repo_id, safe_decode
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Coalesce, Join, gt
+from webapp.backend.database.pool import get_reader
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +153,8 @@ class SyncService:
     def db_token(self, fresh: bool = False) -> str:
         def compute() -> str:
             try:
-                with get_db_cursor() as cursor:
-                    cursor.execute("SELECT instance_hash FROM m_db_instance LIMIT 1;")
-                    row = cursor.fetchone()
+                with get_reader() as reader:
+                    row = reader.select_one("m_db_instance", ["instance_hash"])
                     return safe_decode(row["instance_hash"])[:12] if row else ""
             except Exception as exc:
                 logger.debug("db token unavailable: %s", exc)
@@ -167,20 +167,20 @@ class SyncService:
 
         def compute() -> str:
             try:
-                with get_db_cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT r.ref_name, r.commit_id, COALESCE(s.status, 0) AS status, COALESCE(s.updated_at, 0) AS updated_at
-                        FROM m_git_ref r
-                        LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id
-                        WHERE r.repo_id = %s AND r.commit_id > 0
-                        ORDER BY r.ref_id;
-                        """,
-                        (get_active_repo_id(cursor),),
+                with get_reader() as reader:
+                    rows = reader.select_rows(
+                        ("m_git_ref", "r"),
+                        {
+                            "ref_name": "r.ref_name", "commit_id": "r.commit_id",
+                            "status": Coalesce("s.status", 0), "updated_at": Coalesce("s.updated_at", 0),
+                        },
+                        {"r.repo_id": get_active_repo_id(reader), "r.commit_id": gt(0)},
+                        joins=[Join(("m_ingest_state", "s"), {"s.commit_id": "r.commit_id"}, "left")],
+                        order_by=["r.ref_id"],
                     )
                     parts = [
                         f"{safe_decode(r['ref_name'])}:{r['commit_id']}:{r['updated_at']}"
-                        for r in cursor.fetchall() if int(r["status"]) != INGEST_PARSING
+                        for r in rows if int(r["status"]) != INGEST_PARSING
                     ]
             except Exception as exc:
                 logger.debug("parsed token unavailable: %s", exc)

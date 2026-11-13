@@ -16,7 +16,8 @@ from fastapi import HTTPException
 from core.globalstuff import SymbolLinkage
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.helpers import safe_decode
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.tree_resolver import GitTreeResolver, git_tree_resolver
@@ -132,8 +133,8 @@ class OutlineService:
         if cached is not None:
             return {**base, **cached}
         try:
-            with get_db_cursor() as cursor:
-                mapped = GitTreeResolver.map_blob_hashes(cursor, [blob_sha])
+            with get_reader() as reader:
+                mapped = GitTreeResolver.map_blob_hashes(reader, [blob_sha])
                 blob_id = mapped.get(blob_sha, (0, 0))[0]
                 if not blob_id:
                     from webapp.backend.services.git_reader import git_reader
@@ -164,17 +165,13 @@ class OutlineService:
                             return {**base, **body}
                     body = {"indexed": False, "items": [], "count": 0}
                     return {**base, **body}
-                cursor.execute(
-                    """
-                    SELECT s.name, t.name AS type_name, s.line_s, s.line_e, s.linkage
-                    FROM m_symbol_def s
-                    JOIN m_type_descriptor t ON s.type_id = t.type_id
-                    WHERE s.blob_id = %s
-                    LIMIT %s;
-                    """,
-                    (blob_id, MAX_ITEMS),
+                rows = reader.select_rows(
+                    ("m_symbol_def", "s"),
+                    {"name": "s.name", "type_name": "t.name", "line_s": "s.line_s", "line_e": "s.line_e", "linkage": "s.linkage"},
+                    {"s.blob_id": blob_id},
+                    joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+                    limit=MAX_ITEMS,
                 )
-                rows = cursor.fetchall()
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - an unreachable database leaves the outline empty

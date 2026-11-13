@@ -12,6 +12,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ContextManager, Iterator, Literal, Mapping, NamedTuple, Sequence, Self
 
+from db_engine.errors import MissingTableError as _NeutralMissingTableError
 from db_engine.spec import (
     Agg,
     AnyOf,
@@ -55,8 +56,8 @@ class StoreError(Exception):
     """Base exception for SQLiteStore errors."""
 
 
-class MissingTableError(StoreError):
-    """Raised when an operation targets a table that does not exist."""
+class MissingTableError(StoreError, _NeutralMissingTableError):
+    """Raised when an operation targets a table that does not exist (also the neutral `db_engine.errors.MissingTableError`)."""
 
 
 class SQLiteStore:

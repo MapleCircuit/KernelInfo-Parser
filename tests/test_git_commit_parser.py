@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+
+from tests.db_fixtures import requires_live_db
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -330,6 +332,7 @@ COMMIT_DELIM_END
         self.assertEqual(commits[0].file_blobs["f.c"], ("f.c", "1" * 40, "2" * 40))
 
 
+@requires_live_db("git endpoints read the live database")
 class TestWebAppGitEndpoints(unittest.TestCase):
     """Test suite for FastAPI Git Blame, Timeline, Commit, and Contributor Endpoints."""
 
@@ -416,7 +419,7 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         db = MockDB(use_global=False)
         db.insert(m_bridge_commit_person, ((10, 20, 1, 0), (11, 21, 2, 0)))
         db.insert(m_bridge_commit_person, ((10, 20, 1, 0), (12, 22, 3, 0)))
-        self.assertEqual(len(db.tables_data[m_bridge_commit_person.table_name]), 3)
+        self.assertEqual(len(db.store[m_bridge_commit_person.table_name]), 3)
 
         # 1. Test TECachedDB in-batch and preloaded deduplication
         te_cached = TECachedDB()

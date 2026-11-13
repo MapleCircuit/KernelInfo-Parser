@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import re
-import sqlite3
 import subprocess
 import threading
 import time
@@ -16,6 +15,8 @@ from typing import Any
 import urllib.parse
 import zlib
 
+from db_engine import DBError, ForeignReader, MissingTableError, open_foreign_sqlite
+from db_engine.spec import AnyOf, Hex, Join, gt, is_null, le
 from parser.mailing_list.ml_types import SmsgRecord
 
 try:
@@ -26,6 +27,9 @@ except ImportError:
     HAS_XAPIAN = False
 
 logger = logging.getLogger(__name__)
+
+# Columns of an `over` row unpacked by `_unpack_row`
+_OVER_COLS = ["num", "tid", "sid", "ts", "ds", "ddd"]
 
 # A Date: header set in the future (a skewed sender clock or a forged header) sorts
 # ahead of every real message, so the chronological browse listing (an empty query)
@@ -92,9 +96,11 @@ class PublicInboxLocalStore:
             msgmap_file = self.idx_dir / "msgmap.sqlite3"
         self._msgmap_path = msgmap_file if msgmap_file.exists() else None
 
-        self._local = threading.local()
-        self._over_db_override: Any = None
-        self._msgmap_db_override: Any = None
+        # Read-only foreign SQLite readers (one lazily opened connection per thread, PRAGMAs set by db_engine)
+        self.over_db: ForeignReader = open_foreign_sqlite(self._over_path, cache_kib=SQLITE_CACHE_KIB)
+        self.msgmap_db: ForeignReader | None = (
+            open_foreign_sqlite(self._msgmap_path, cache_kib=SQLITE_CACHE_KIB) if self._msgmap_path else None
+        )
         self._cat_lock = threading.Lock()
         self._qp_lock = threading.Lock()
 
@@ -185,88 +191,6 @@ class PublicInboxLocalStore:
             self._cat_proc = None
             return None
 
-    @staticmethod
-    def _open_sqlite(path: Path) -> sqlite3.Connection:
-        """Open a read-only SQLite handle configured for resilient concurrent access."""
-        conn = sqlite3.connect(
-            f"file:{path}?mode=ro&immutable=1",
-            uri=True,
-            check_same_thread=False,
-            timeout=60.0,
-            isolation_level=None,
-        )
-        try:
-            conn.execute("PRAGMA busy_timeout = 60000;")
-            conn.execute("PRAGMA query_only = ON;")
-            # Bound per-connection memory: handles are thread-local, so an unbounded
-            # page cache would multiply by the number of daemon request threads.
-            conn.execute(f"PRAGMA cache_size = -{SQLITE_CACHE_KIB};")
-            # Spill ORDER BY sorters to disk instead of growing the heap.
-            conn.execute("PRAGMA temp_store = FILE;")
-        except Exception:
-            pass
-        return conn
-
-    @property
-    def over_db(self) -> sqlite3.Connection:
-        if self._over_db_override is not None:
-            return self._over_db_override
-        db = getattr(self._local, "over_db", None)
-        if db is None:
-            db = self._open_sqlite(self._over_path)
-            self._local.over_db = db
-        return db
-
-    @over_db.setter
-    def over_db(self, val: Any) -> None:
-        self._over_db_override = val
-
-    @property
-    def msgmap_db(self) -> sqlite3.Connection | None:
-        if self._msgmap_db_override is not None:
-            return self._msgmap_db_override
-        if not self._msgmap_path:
-            return None
-        db = getattr(self._local, "msgmap_db", None)
-        if db is None:
-            db = self._open_sqlite(self._msgmap_path)
-            self._local.msgmap_db = db
-        return db
-
-    @msgmap_db.setter
-    def msgmap_db(self, val: Any) -> None:
-        self._msgmap_db_override = val
-
-    def _execute_query(
-        self,
-        db: sqlite3.Connection | None,
-        sql: str,
-        params: tuple[Any, ...] = (),
-        retries: int = 5,
-        base_delay: float = 0.2,
-    ) -> sqlite3.Cursor:
-        """Execute a query with exponential backoff on concurrent SQLite locks."""
-        if db is None:
-            raise sqlite3.OperationalError("Database connection is None")
-        for attempt in range(retries):
-            try:
-                return db.execute(sql, params)
-            except sqlite3.OperationalError as exc:
-                err_msg = str(exc).lower()
-                if ("locked" in err_msg or "busy" in err_msg) and attempt < retries - 1:
-                    sleep_time = base_delay * (2 ** attempt)
-                    logger.warning(
-                        "SQLite lock contention (attempt %d/%d), retrying in %.2fs: %s",
-                        attempt + 1,
-                        retries,
-                        sleep_time,
-                        exc,
-                    )
-                    time.sleep(sleep_time)
-                else:
-                    raise
-        return db.execute(sql, params)
-
     def close_thread_handles(self) -> None:
         """Close this thread's SQLite handles.
 
@@ -274,32 +198,15 @@ class PublicInboxLocalStore:
         without this every request would leave two open connections (and their page
         caches) behind for the life of the process.
         """
-        for attr in ("over_db", "msgmap_db"):
-            db = getattr(self._local, attr, None)
-            if db is not None:
-                try:
-                    db.close()
-                except Exception as exc:
-                    logger.debug("Error closing thread-local %s: %s", attr, exc)
-                setattr(self._local, attr, None)
+        self.over_db.close_thread()
+        if self.msgmap_db is not None:
+            self.msgmap_db.close_thread()
 
     def close(self) -> None:
         """Safely close open databases and processes."""
-        db = getattr(self._local, "over_db", None)
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
-            self._local.over_db = None
-
-        msg_db = getattr(self._local, "msgmap_db", None)
-        if msg_db is not None:
-            try:
-                msg_db.close()
-            except Exception:
-                pass
-            self._local.msgmap_db = None
+        self.over_db.close()
+        if self.msgmap_db is not None:
+            self.msgmap_db.close()
 
         with self._cat_lock:
             if self._cat_proc:
@@ -368,12 +275,7 @@ class PublicInboxLocalStore:
         """Fetch article by sequential article number (> 0)."""
         if num <= 0:
             return None
-        cursor = self._execute_query(
-            self.over_db,
-            "SELECT num, tid, sid, ts, ds, ddd FROM over WHERE num = ? AND num > 0 LIMIT 1",
-            (num,),
-        )
-        row = cursor.fetchone()
+        row = self.over_db.select_one("over", _OVER_COLS, {"num": num})
         return self._unpack_row(row) if row else None
 
     def get_by_mid(self, mid: str) -> SmsgRecord | None:
@@ -388,34 +290,23 @@ class PublicInboxLocalStore:
             if cand and cand not in candidates:
                 candidates.append(cand)
 
-        placeholders = ",".join("?" for _ in candidates)
-
         # Check msgmap.sqlite3 if present
         if self.msgmap_db is not None:
-            cursor = self._execute_query(
-                self.msgmap_db,
-                f"SELECT num FROM msg_map WHERE mid IN ({placeholders}) LIMIT 1",
-                tuple(candidates),
-            )
-            row = cursor.fetchone()
+            row = self.msgmap_db.select_one("msg_map", ["num"], {"mid": candidates})
             if row and row[0] > 0:
                 return self.get_by_num(row[0])
 
         # Fallback for extindex schema (msgid + id2num inside over.sqlite3)
         try:
-            cursor = self._execute_query(
-                self.over_db,
-                f"""
-                SELECT i2n.num FROM msgid m
-                JOIN id2num i2n ON m.id = i2n.id
-                WHERE m.mid IN ({placeholders}) AND i2n.num > 0 LIMIT 1
-                """,
-                tuple(candidates),
+            row = self.over_db.select_one(
+                ("msgid", "m"),
+                ["i2n.num"],
+                {"m.mid": candidates, "i2n.num": gt(0)},
+                joins=[Join(("id2num", "i2n"), {"i2n.id": "m.id"})],
             )
-            row = cursor.fetchone()
             if row and row[0] > 0:
                 return self.get_by_num(row[0])
-        except sqlite3.OperationalError:
+        except DBError:
             pass
         return None
 
@@ -424,13 +315,7 @@ class PublicInboxLocalStore:
         if tid <= 0:
             return 0
         try:
-            cursor = self._execute_query(
-                self.over_db,
-                "SELECT count(*) FROM over WHERE tid = ? AND num > 0",
-                (tid,),
-            )
-            row = cursor.fetchone()
-            return int(row[0]) if row else 0
+            return int(self.over_db.count_rows("over", {"tid": tid, "num": gt(0)}))
         except Exception as exc:
             logger.debug("Thread count failed for tid %d: %s", tid, exc)
             return 0
@@ -448,18 +333,10 @@ class PublicInboxLocalStore:
         if tid <= 0:
             return []
         capped = max(1, min(int(limit), MAX_THREAD_MESSAGES))
-        cursor = self._execute_query(
-            self.over_db,
-            """
-            SELECT num, tid, sid, ts, ds, ddd
-            FROM over
-            WHERE tid = ? AND num > 0
-            ORDER BY ds ASC, num ASC
-            LIMIT ? OFFSET ?
-            """,
-            (tid, capped, max(0, int(offset))),
+        rows = self.over_db.select_rows(
+            "over", _OVER_COLS, {"tid": tid, "num": gt(0)}, order_by=["ds", "num"],
+            limit=capped, offset=max(0, int(offset)),
         )
-        rows = cursor.fetchall()
         if len(rows) >= capped:
             logger.debug("Thread %d truncated at %d messages", tid, capped)
         return [self._unpack_row(r) for r in rows]
@@ -474,16 +351,9 @@ class PublicInboxLocalStore:
         Rows are consumed one at a time and only matches inside the requested page are
         retained, so memory stays proportional to `limit` rather than to the scan.
         """
-        cursor = self._execute_query(
-            self.over_db,
-            """
-            SELECT num, tid, sid, ts, ds, ddd
-            FROM over
-            WHERE num > 0
-            ORDER BY ds DESC
-            LIMIT ?
-            """,
-            (max(500, min(int(scan_limit), MAX_SEARCH_SCAN)),),
+        cursor = self.over_db.iter_rows(
+            "over", _OVER_COLS, {"num": gt(0)}, order_by=["-ds"],
+            limit=max(500, min(int(scan_limit), MAX_SEARCH_SCAN)),
         )
         matches: list[SmsgRecord] = []
         pattern_lower = pattern.lower()
@@ -606,12 +476,8 @@ class PublicInboxLocalStore:
         if len(clean_sha) == 40:
             try:
                 raw_bin = bytes.fromhex(clean_sha)
-                cursor = self._execute_query(
-                    self.over_db,
-                    "SELECT docid FROM xref3 WHERE oidbin = ? LIMIT 10",
-                    (raw_bin,),
-                )
-                docids = [row[0] for row in cursor.fetchall() if row[0] > 0]
+                rows = self.over_db.select_rows("xref3", ["docid"], {"oidbin": raw_bin}, limit=10)
+                docids = [row[0] for row in rows if row[0] > 0]
                 if docids:
                     matches: list[SmsgRecord] = []
                     for docid in docids:
@@ -619,7 +485,7 @@ class PublicInboxLocalStore:
                         if rec:
                             matches.append(rec)
                     return matches
-            except sqlite3.OperationalError:
+            except MissingTableError:
                 pass
             except Exception as exc:
                 logger.debug("xref3 lookup error for blob %s: %s", clean_sha, exc)
@@ -631,10 +497,7 @@ class PublicInboxLocalStore:
         if HAS_XAPIAN and self.xap_db is not None:
             return []
 
-        cursor = self._execute_query(
-            self.over_db,
-            "SELECT num, tid, sid, ts, ds, ddd FROM over WHERE num > 0 ORDER BY ds DESC LIMIT 1000",
-        )
+        cursor = self.over_db.iter_rows("over", _OVER_COLS, {"num": gt(0)}, order_by=["-ds"], limit=1000)
         matches: list[SmsgRecord] = []
         for r in cursor:
             rec = self._unpack_row(r)
@@ -694,12 +557,7 @@ class PublicInboxLocalStore:
         blob_sha = rec.git_blob
         if not blob_sha:
             try:
-                cur = self._execute_query(
-                    self.over_db,
-                    "SELECT hex(oidbin) FROM xref3 WHERE docid = ? LIMIT 1",
-                    (rec.num,),
-                )
-                row = cur.fetchone()
+                row = self.over_db.select_one("xref3", {"h": Hex("oidbin")}, {"docid": rec.num})
                 if row and row[0]:
                     blob_sha = str(row[0]).lower()
             except Exception:
@@ -893,18 +751,12 @@ class PublicInboxLocalStore:
             else:
                 # Empty query: recent messages ordered chronologically, future dates excluded
                 try:
-                    cursor = self._execute_query(
-                        self.over_db,
-                        """
-                        SELECT num, tid, sid, ts, ds, ddd
-                        FROM over
-                        WHERE num > 0 AND (ds IS NULL OR ds <= ?)
-                        ORDER BY ds DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (int(time.time()) + FUTURE_DATE_SKEW_SECONDS, fetch, offset),
+                    rows = self.over_db.select_rows(
+                        "over", _OVER_COLS,
+                        [{"num": gt(0)}, AnyOf({"ds": is_null()}, {"ds": le(int(time.time()) + FUTURE_DATE_SKEW_SECONDS)})],
+                        order_by=["-ds"], limit=fetch, offset=offset,
                     )
-                    matched_records = [self._unpack_row(r) for r in cursor]
+                    matched_records = [self._unpack_row(r) for r in rows]
                 except Exception as exc:
                     logger.warning("Empty search query failed: %s", exc)
                     matched_records = []

@@ -2,8 +2,8 @@
 from __future__ import annotations
 from typing import Any
 from core.globalstuff import ASTT, SymbolLinkage
-from core.SymbolRows import rows_of_targets_sql
-from webapp.backend.database.pool import get_db_cursor
+from db_engine.spec import Join, between
+from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import safe_decode
 from webapp.backend.services.symbol_service import SymbolService, binding_ref_asts
 from webapp.backend.services.tree_resolver import best_path, definition_arch, definition_rank
@@ -37,8 +37,8 @@ class CallgraphService:
 
     def get_function_callgraph(self, version_name: str, function_name: str) -> dict[str, Any]:
         """Incoming callers and outgoing callees of a function, within the revision's tree."""
-        with get_db_cursor() as cursor:
-            _, vname, blob_paths = SymbolService._scope(cursor, version_name)
+        with get_reader() as reader:
+            _, vname, blob_paths = SymbolService._scope(reader, version_name)
             _, scope, bits = definition_arch(vname, None)
             empty = {
                 "function": function_name,
@@ -51,17 +51,15 @@ class CallgraphService:
                 "truncated": False,
             }
 
-            cursor.execute(
-                """
-                SELECT s.ast_id, s.blob_id, s.line_s, s.line_e, s.type_id, s.linkage, a.name AS ast_name
-                FROM m_symbol_def s
-                LEFT JOIN m_ast a ON a.ast_id = s.ast_id
-                WHERE s.name = %s;
-                """,
-                (function_name,),
+            def_rows = reader.select_rows(
+                ("m_symbol_def", "s"),
+                {"ast_id": "s.ast_id", "blob_id": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e",
+                 "type_id": "s.type_id", "linkage": "s.linkage", "ast_name": "a.name"},
+                {"s.name": function_name},
+                joins=[Join(("m_ast", "a"), {"a.ast_id": "s.ast_id"}, "left")],
             )
             defs = [
-                r for r in cursor.fetchall()
+                r for r in def_rows
                 if r["blob_id"] in blob_paths and r["ast_id"] and r["type_id"] in FUNCTION_TYPES
                 and int(r["linkage"] or 0) != SymbolLinkage.MacroOrKernelDef
             ]
@@ -86,28 +84,18 @@ class CallgraphService:
             ]
             targets = list(dict.fromkeys(targets))[:MAX_TARGETS]
             # Rust calls through bindgen (`bindings::foo(..)`) reference the function's name
-            targets = list(dict.fromkeys(targets + binding_ref_asts(cursor, function_name)))
+            targets = list(dict.fromkeys(targets + binding_ref_asts(reader, function_name)))
 
             # 1. Callers: calls in this revision's blobs, named by the AST of the tag they are in. The
-            # references come key first (rows_of_targets_sql); filtering the m_symbol_ref view by ast_id is slow.
-            refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(targets))
-            cursor.execute(
-                f"""
-                SELECT a.name AS caller_name, r.blob_id, r.line AS line_no, r.tag_id
-                FROM ({refs_sql}) r
-                LEFT JOIN m_tag t ON r.tag_id = t.tag_id
-                LEFT JOIN m_ast a ON a.ast_id = t.ast_id
-                WHERE r.role = 3;
-                """,
-                tuple(targets) * repeat,
-            )
+            # references come key first (symbol_refs_of_targets); filtering the m_symbol_ref view by ast_id is slow.
+            caller_refs = reader.symbol_refs_of_targets(targets, role=3, with_caller=True)
             caller_sites = []
-            for r in cursor.fetchall():
-                if r["blob_id"] not in blob_paths:
+            for r in caller_refs:
+                if r["fid"] not in blob_paths:
                     continue
-                path = best_path(blob_paths[r["blob_id"]], scope, bits)
-                caller_name = safe_decode(r.get("caller_name")).strip()
-                line_no = r["line_no"]
+                path = best_path(blob_paths[r["fid"]], scope, bits)
+                caller_name = (safe_decode(r.get("caller")) or "").strip()
+                line_no = r["line"]
 
                 # For Rust method callers inside impl Trait for Type, resolve the actual method name
                 if caller_name.startswith("impl ") or " for " in caller_name or path.endswith(".rs"):
@@ -153,25 +141,19 @@ class CallgraphService:
 
             # 2. Callees: calls inside the function's lines, with the files defining each callee in this
             # revision (joining the m_symbol_def view by ast_id would materialize it)
-            cursor.execute(
-                """
-                SELECT r.ast_id, a.name AS callee_name, a.type_id AS callee_type, r.line AS line_no
-                FROM m_symbol_ref r
-                JOIN m_ast a ON a.ast_id = r.ast_id
-                WHERE r.blob_id = %s AND r.line BETWEEN %s AND %s AND r.role = 3;
-                """,
-                (fn_def["blob_id"], fn_def["line_s"], fn_def["line_e"]),
+            call_rows = reader.select_rows(
+                ("m_symbol_ref", "r"),
+                {"ast_id": "r.ast_id", "callee_name": "a.name", "callee_type": "a.type_id", "line_no": "r.line"},
+                {"r.blob_id": fn_def["blob_id"], "r.line": between(fn_def["line_s"], fn_def["line_e"]), "r.role": 3},
+                joins=[Join(("m_ast", "a"), {"a.ast_id": "r.ast_id"})],
             )
-            call_rows = cursor.fetchall()
             callee_ids = sorted({r["ast_id"] for r in call_rows})
             callee_files: dict[int, list[str]] = {}
             if callee_ids:
-                defs_sql, repeat = rows_of_targets_sql("m_symbol_def", len(callee_ids))
-                cursor.execute(f"SELECT DISTINCT d.ast_id, d.blob_id FROM ({defs_sql}) d;", tuple(callee_ids) * repeat)
-                for d_row in cursor.fetchall():
-                    if d_row["blob_id"] in blob_paths:
-                        path = best_path(blob_paths[d_row["blob_id"]], scope, bits)
-                        files = callee_files.setdefault(d_row["ast_id"], [])
+                for def_ast, def_blob in sorted(reader.symbol_def_blobs_of_targets(callee_ids)):
+                    if def_blob in blob_paths:
+                        path = best_path(blob_paths[def_blob], scope, bits)
+                        files = callee_files.setdefault(def_ast, [])
                         if path not in files:
                             files.append(path)
             # A Rust function's calls of C functions (`bindings::foo(..)`) name the callee only: its files are
@@ -182,15 +164,12 @@ class CallgraphService:
             }
             if binding_callees:
                 names = sorted(set(binding_callees.values()))
-                cursor.execute(
-                    f"""
-                    SELECT DISTINCT s.name, s.blob_id FROM m_symbol_def s
-                    WHERE s.name IN ({", ".join(["%s"] * len(names))}) AND s.type_id IN ({", ".join(["%s"] * len(FUNCTION_TYPES))});
-                    """,
-                    (*names, *FUNCTION_TYPES),
+                named_defs = reader.select_rows(
+                    "m_symbol_def", ["name", "blob_id"], {"name": names, "type_id": list(FUNCTION_TYPES)},
+                    distinct=True,
                 )
                 by_name: dict[str, list[str]] = {}
-                for d_row in cursor.fetchall():
+                for d_row in named_defs:
                     if d_row["blob_id"] in blob_paths:
                         path = best_path(blob_paths[d_row["blob_id"]], scope, bits)
                         files = by_name.setdefault(safe_decode(d_row["name"]), [])

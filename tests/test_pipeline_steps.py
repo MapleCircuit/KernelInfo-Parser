@@ -15,8 +15,20 @@ import tempfile
 import unittest
 
 import main
+import pipeline.arch_layouts
+import pipeline.blob_reuse
+import pipeline.changesets
+import pipeline.commits
+import pipeline.file_processing
+import pipeline.file_references
+import pipeline.git_ingest
+import pipeline.git_network
+import pipeline.maintainers
+import pipeline.scheduler
+import pipeline.worker_stage
 from core.DBLayout import (
     m_ast,
+    m_file_name,
     m_ast_container,
     m_ast_hash,
     m_bridge_checkpoint,
@@ -35,7 +47,6 @@ from core.GreatProcessor import CompressedChangeSetDict, GreatProcessor
 from core.TableHandling import ChangeSet
 from core.globalstuff import ASTT, G, OP_VIEW_DONE, OP_VIEW_SET, REF_FILE, type_check
 from db_engine import MockDB
-from db_engine.DBHandling import MariaDB
 from parser.git_ast.git_commit_parser import _HunkIndex
 from parser.git_ast.git_types import CommitRole, GitCommit, GitContributor
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
@@ -45,72 +56,50 @@ from table_engine.shared_buffer import SharedSymbolBuilder, SharedTablePKView
 from tests.test_maintainer_ast import SAMPLE_MAINTAINERS
 
 
-def _reset_mock_db() -> None:
-    MockDB._global_store.clear()
-    MockDB._global_next_id.clear()
-
-
 class _TableEngineTestCase(unittest.TestCase):
     """Runs each test with a fresh MockDB-backed TableEngine and restores the module state afterwards."""
 
     def setUp(self) -> None:
         self.saved = (G.DB, G.TE, main.gp.VID, main.gp.Old_VID, main.gp.Change_List, main.gp.file_blob_ids)
-        _reset_mock_db()
+        MockDB.reset()
         G.DB = MockDB
         G.TE = TECachedDB()
         G.TE.start(main.gp.Table_Array, MockDB)
         main.gp.file_blob_ids = {}
-        main.file_fid_cache.clear()
+        pipeline.changesets.file_fid_cache.clear()
 
     def tearDown(self) -> None:
         G.DB, G.TE, main.gp.VID, main.gp.Old_VID, main.gp.Change_List, main.gp.file_blob_ids = self.saved
         main.gp.deduped_paths = set()
-        main.file_fid_cache.clear()
-        _reset_mock_db()
+        pipeline.changesets.file_fid_cache.clear()
+        MockDB.reset()
 
 
 class TestInsertSemantics(unittest.TestCase):
     def test_idempotent_tables_skip_only_existing_rows(self) -> None:
-        sql = MariaDB._insert_sql(m_commit_file)
-        self.assertTrue(sql.startswith("INSERT INTO `m_commit_file` VALUES"))
-        self.assertTrue(sql.endswith("ON DUPLICATE KEY UPDATE `commit_id` = `commit_id`"))
-        self.assertNotIn("ON DUPLICATE", MariaDB._insert_sql(m_commit))
+        """Re-inserting an identical row of an idempotent table is a no-op; a plain table refuses duplicates."""
+        from db_engine import SQLiteDB
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([m_commit_file, m_commit])
+        row = (1, 2, 3, 0, 0, 0)
+        db.insert(m_commit_file, (row,))
+        db.insert(m_commit_file, (row,))
+        self.assertEqual(db.count_rows("m_commit_file"), 1)
 
     def test_symbol_definitions_are_not_cached(self) -> None:
         self.assertFalse(m_blob_symbol_def.te_cached)
-
-    def test_reserve_id_block_sql_advances_sequence_beyond_existing_max(self) -> None:
-        from unittest import mock
-        from core.DBLayout import m_file_reference
-
-        db = MariaDB.__new__(MariaDB)
-        mock_cnx = mock.MagicMock()
-        mock_cursor = mock.MagicMock()
-        mock_cnx.cursor.return_value = mock_cursor
-        db.cnx = mock_cnx
-
-        executed = []
-        mock_cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
-        mock_cursor.fetchone.return_value = (50000,)
-
-        start_id, end_id = db.reserve_id_block(m_file_reference, 1000)
-        self.assertEqual(start_id, 50000)
-        self.assertEqual(end_id, 50999)
-
-        upsert_sql = executed[0][0]
-        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", upsert_sql)
 
 
 class TestBlobHashGuard(unittest.TestCase):
     def test_files_needing_a_hash_without_one_are_refused(self) -> None:
         hashes = {"kernel/fork.c": b"\x01" * 20}
         cs = ChangeSet("M\tkernel/fork.c")
-        self.assertTrue(main._attach_blob_hash(cs, hashes))
+        self.assertTrue(pipeline.file_processing._attach_blob_hash(cs, hashes))
         self.assertEqual(cs.blob_hash, b"\x01" * 20)
-        self.assertFalse(main._attach_blob_hash(ChangeSet("M\tlib/submodule"), hashes))
-        self.assertTrue(main._attach_blob_hash(ChangeSet("D\tlib/gone.c"), hashes))
-        self.assertTrue(main._attach_blob_hash(ChangeSet("R100\told.c\tnew.c"), hashes))
-        self.assertTrue(main._attach_blob_hash(ChangeSet("M\tlib/any.c"), {}))
+        self.assertFalse(pipeline.file_processing._attach_blob_hash(ChangeSet("M\tlib/submodule"), hashes))
+        self.assertTrue(pipeline.file_processing._attach_blob_hash(ChangeSet("D\tlib/gone.c"), hashes))
+        self.assertTrue(pipeline.file_processing._attach_blob_hash(ChangeSet("R100\told.c\tnew.c"), hashes))
+        self.assertTrue(pipeline.file_processing._attach_blob_hash(ChangeSet("M\tlib/any.c"), {}))
 
 
 def _commit(c_hash: str, name: str, email: str, parents: list[str], contributors: list[tuple[str, str]] = ()) -> GitCommit:
@@ -131,10 +120,10 @@ def _commit(c_hash: str, name: str, email: str, parents: list[str], contributors
 
 class TestCommitRangeIngestion(unittest.TestCase):
     def setUp(self) -> None:
-        _reset_mock_db()
+        MockDB.reset()
 
     def tearDown(self) -> None:
-        _reset_mock_db()
+        MockDB.reset()
 
     def test_range_is_ingested_in_bulk_with_parents_and_people(self) -> None:
         c1, c2, c3, outside = ("1" * 40), ("2" * 40), ("3" * 40), ("9" * 40)
@@ -145,33 +134,33 @@ class TestCommitRangeIngestion(unittest.TestCase):
         ]
         with MockDB() as db:
             db.insert(m_commit, (100, 1, bytes.fromhex(outside), 1, 0, 1, 0, "outside", ""))
-            ids = main._ingest_commit_range(db, commits, network_id=1)
+            ids = pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
             self.assertEqual(ids[outside], 100)
             self.assertLess(ids[c1], ids[c2])
             self.assertLess(ids[c2], ids[c3])
 
-            parents = set(MockDB._global_store[m_commit_parent.table_name])
+            parents = set(MockDB.store[m_commit_parent.table_name])
             self.assertEqual(parents, {(ids[c2], 0), (ids[c3], 0), (ids[c3], 1)})
-            people = {(row[1], row[2]) for row in MockDB._global_store[m_maintainer_person.table_name].values()}
+            people = {(row[1], row[2]) for row in MockDB.store[m_maintainer_person.table_name].values()}
             self.assertEqual(people, {("A Dev", "a@x"), ("B Dev", "b@x"), ("A. Dev", "a@x")})
-            self.assertEqual(len(MockDB._global_store[m_bridge_commit_person.table_name]), 2)
+            self.assertEqual(len(MockDB.store[m_bridge_commit_person.table_name]), 2)
 
             # Re-ingesting the same range adds nothing and returns the same ids
-            rows_before = {name: len(rows) for name, rows in MockDB._global_store.items()}
-            self.assertEqual(main._ingest_commit_range(db, commits, network_id=1), ids)
-            self.assertEqual({name: len(rows) for name, rows in MockDB._global_store.items()}, rows_before)
-            self.assertEqual(main._lookup_commit_ids(db, 1, [c1, "f" * 40]), {c1: ids[c1]})
+            rows_before = {name: len(rows) for name, rows in MockDB.store.items()}
+            self.assertEqual(pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1), ids)
+            self.assertEqual({name: len(rows) for name, rows in MockDB.store.items()}, rows_before)
+            self.assertEqual(pipeline.git_network._lookup_commit_ids(db, 1, [c1, "f" * 40]), {c1: ids[c1]})
 
     def test_person_identity_is_name_and_email(self) -> None:
-        self.assertEqual(main._person_key("A", "a@x"), ("A", "a@x"))
-        self.assertEqual(main._person_key("", "a@x"), ("a@x", "a@x"))
-        self.assertEqual(main._person_key(None, None), ("Unknown", ""))
+        self.assertEqual(pipeline.blob_reuse._person_key("A", "a@x"), ("A", "a@x"))
+        self.assertEqual(pipeline.blob_reuse._person_key("", "a@x"), ("a@x", "a@x"))
+        self.assertEqual(pipeline.blob_reuse._person_key(None, None), ("Unknown", ""))
 
 
 class TestPreloadSummary(_TableEngineTestCase):
     def test_preload_summary_logs_cached_tables(self) -> None:
         with self.assertLogs("main", level="INFO") as cm:
-            main._log_preload_summary(0.42)
+            pipeline.blob_reuse._log_preload_summary(0.42)
         self.assertTrue(any("Preloaded cached tables in 0.4s" in output for output in cm.output))
 
 
@@ -185,16 +174,16 @@ class TestReuseParsedBlobs(_TableEngineTestCase):
         main.gp.Change_List = ["M\tdrivers/a.c", "A\tdrivers/b.c", "D\tdrivers/c.c"]
         hashes = {"drivers/a.c": known, "drivers/b.c": b"\x08" * 20}
 
-        remaining = main._reuse_parsed_blobs(hashes)
+        remaining = pipeline.blob_reuse._reuse_parsed_blobs(hashes)
 
         self.assertEqual(remaining, ["A\tdrivers/b.c", "D\tdrivers/c.c"])
         self.assertEqual(main.gp.deduped_paths, {"drivers/a.c"})
         self.assertEqual(main.gp.file_blob_ids["drivers/a.c"], 7)
-        fnid = G.TE.get(main.m_file_name.table_id, (None, "drivers/a.c"))[0]
+        fnid = G.TE.get(m_file_name.table_id, (None, "drivers/a.c"))[0]
         self.assertIsNotNone(G.TE.get(m_bridge_checkpoint.table_id, (5, fnid, None)))
         # The head commit gets no version-diff m_commit_file row (only Step 6.5 writes what commits touched)
         self.assertNotIn((5, fnid), G.TE.queued_set.get(m_commit_file.table_id, {}))
-        self.assertEqual(main._load_blob_tags([7]), {7: [(70, 7, 1, 3)]})
+        self.assertEqual(pipeline.commits._load_blob_tags([7]), {7: [(70, 7, 1, 3)]})
 
     def test_untagged_blobs_are_parsed_again(self) -> None:
         known = b"\x07" * 20
@@ -202,7 +191,7 @@ class TestReuseParsedBlobs(_TableEngineTestCase):
         G.TE.commit_all()
         main.gp.VID = 5
         main.gp.Change_List = ["M\tdrivers/a.c"]
-        self.assertEqual(main._reuse_parsed_blobs({"drivers/a.c": known}), ["M\tdrivers/a.c"])
+        self.assertEqual(pipeline.blob_reuse._reuse_parsed_blobs({"drivers/a.c": known}), ["M\tdrivers/a.c"])
         self.assertEqual(main.gp.deduped_paths, set())
 
 
@@ -224,11 +213,11 @@ def _consumer(path: str, target: str) -> ChangeSet:
 
 
 class TestSchedulerWakeups(_TableEngineTestCase):
-    def _scheduler(self, changed: set[str]) -> tuple[GreatProcessor, main.DependencyScheduler]:
+    def _scheduler(self, changed: set[str]) -> tuple[GreatProcessor, pipeline.scheduler.DependencyScheduler]:
         gp = GreatProcessor()
         gp.init_cs_dict()
         gp._changed_paths_set = set(changed)
-        return gp, main.DependencyScheduler(gp)
+        return gp, pipeline.scheduler.DependencyScheduler(gp)
 
     def test_waiting_header_runs_as_soon_as_its_dependency_completes(self) -> None:
         gp, scheduler = self._scheduler({"include/a.h", "include/b.h"})
@@ -267,10 +256,10 @@ class TestStoredChangesetState(unittest.TestCase):
 
         store.get = _no_decompress
         store.__class__ = type("NoDecompress", (CompressedChangeSetDict,), {"__getitem__": _no_decompress})
-        self.assertIs(main._stored_changeset_executed(store, "done.c"), True)
-        self.assertIs(main._stored_changeset_executed(store, "pending_old.c"), False)
-        self.assertIs(main._stored_changeset_executed(store, "pending_new.c"), False)
-        self.assertIsNone(main._stored_changeset_executed(store, "absent.c"))
+        self.assertIs(pipeline.scheduler._stored_changeset_executed(store, "done.c"), True)
+        self.assertIs(pipeline.scheduler._stored_changeset_executed(store, "pending_old.c"), False)
+        self.assertIs(pipeline.scheduler._stored_changeset_executed(store, "pending_new.c"), False)
+        self.assertIsNone(pipeline.scheduler._stored_changeset_executed(store, "absent.c"))
 
 
 class TestDefaultProcessing(_TableEngineTestCase):
@@ -278,7 +267,7 @@ class TestDefaultProcessing(_TableEngineTestCase):
         main.gp.VID, main.gp.Old_VID = 2, 1
         cs = ChangeSet("M\tkernel/fork.c")
         cs.blob_hash = b"\x02" * 20
-        main.default_processing(cs)
+        pipeline.file_processing.default_processing(cs)
         bridge_views = [
             op for op in cs.cs
             if op[1] in (OP_VIEW_SET, OP_VIEW_DONE) and isinstance(op[0], tuple) and op[0][0][0][0] == m_bridge_file.table_id
@@ -361,7 +350,7 @@ class TestCarriedHashTables(unittest.TestCase):
 
     def setUp(self) -> None:
         self.saved = (G.DB, G.TE, main.gp.Old_VID)
-        _reset_mock_db()
+        MockDB.reset()
         _CountingDB.preloaded = []
         _CountingDB.fail_inserts = False
         G.DB = _CountingDB
@@ -376,7 +365,7 @@ class TestCarriedHashTables(unittest.TestCase):
         except Exception:
             pass
         G.DB, G.TE, main.gp.Old_VID = self.saved
-        _reset_mock_db()
+        MockDB.reset()
 
     def _start(self) -> None:
         _CountingDB.preloaded = []
@@ -449,10 +438,10 @@ class TestCarriedHashTables(unittest.TestCase):
 
 class TestPreloadWindow(unittest.TestCase):
     def setUp(self) -> None:
-        _reset_mock_db()
+        MockDB.reset()
 
     def tearDown(self) -> None:
-        _reset_mock_db()
+        MockDB.reset()
 
     def test_checkpoints_are_filtered_by_commit_id_not_blob_id(self) -> None:
         with MockDB() as db:
@@ -484,10 +473,10 @@ class TestCommitEviction(_TableEngineTestCase):
 
 class TestBatchSizing(unittest.TestCase):
     def test_small_stages_give_every_worker_several_batches(self) -> None:
-        self.assertEqual(main._balanced_batch_size(164, 7, 200), 6)
-        self.assertEqual(main._balanced_batch_size(17000, 7, 200), 200)
-        self.assertEqual(main._balanced_batch_size(10, 7, 200), 4)
-        self.assertEqual(main._balanced_batch_size(500, 7, 50), 18)
+        self.assertEqual(pipeline.worker_stage._balanced_batch_size(164, 7, 200), 6)
+        self.assertEqual(pipeline.worker_stage._balanced_batch_size(17000, 7, 200), 200)
+        self.assertEqual(pipeline.worker_stage._balanced_batch_size(10, 7, 200), 4)
+        self.assertEqual(pipeline.worker_stage._balanced_batch_size(500, 7, 50), 18)
 
 
 class TestSymbolTableAllocation(unittest.TestCase):
@@ -506,10 +495,10 @@ class TestNonKernelProjects(unittest.TestCase):
         from unittest import mock
         self.mock = mock
         self.saved = (G.DB, main.gp.VID, getattr(main.gp, "project_slug", None), getattr(main.gp, "file_blob_hashes", None))
-        _reset_mock_db()
+        MockDB.reset()
         G.DB = MockDB
-        main._network_repo_cache.clear()
-        main._repo_project_cache.clear()
+        pipeline.git_network._network_repo_cache.clear()
+        pipeline.git_network._repo_project_cache.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = os.path.join(self.tmp.name, "pages")
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -519,68 +508,69 @@ class TestNonKernelProjects(unittest.TestCase):
 
     def tearDown(self) -> None:
         G.DB, main.gp.VID, main.gp.project_slug, main.gp.file_blob_hashes = self.saved
-        main._network_repo_cache.clear()
-        main._repo_project_cache.clear()
-        _reset_mock_db()
+        pipeline.git_network._network_repo_cache.clear()
+        pipeline.git_network._repo_project_cache.clear()
+        MockDB.reset()
         self.tmp.cleanup()
 
     def _resolve(self, entry):
-        with self.mock.patch.object(main, "get_repository", return_value=entry):
-            return main.resolve_git_network_and_repo(self.repo)
+        with self.mock.patch.object(pipeline.git_network, "get_repository", return_value=entry):
+            return pipeline.git_network.resolve_git_network_and_repo(self.repo)
 
     def test_manpages_entry_gets_its_own_project_and_network(self) -> None:
         from core.DBLayout import m_git_network, m_project, m_repository
         net_id, repo_id = self._resolve({"name": "man-pages", "path": self.repo, "project": "man-pages"})
         self.assertEqual(main.gp.project_slug, "man-pages")
-        self.assertFalse(main.kernel_steps_apply())
-        projects = list(MockDB._global_store[m_project.table_name].values())
+        self.assertFalse(pipeline.git_network.kernel_steps_apply())
+        projects = list(MockDB.store[m_project.table_name].values())
         self.assertEqual([(p[1], p[2]) for p in projects], [("Linux man-pages", "man-pages")])
-        networks = list(MockDB._global_store[m_git_network.table_name].values())
+        networks = list(MockDB.store[m_git_network.table_name].values())
         self.assertEqual([(n[0], n[1], n[2]) for n in networks], [(net_id, projects[0][0], "man-pages-network")])
-        self.assertIn(repo_id, [r[0] for r in MockDB._global_store[m_repository.table_name].values()])
+        self.assertIn(repo_id, [r[0] for r in MockDB.store[m_repository.table_name].values()])
         # Cached: a second call answers without the configuration
-        with self.mock.patch.object(main, "get_repository", side_effect=AssertionError("looked up again")):
-            self.assertEqual(main.resolve_git_network_and_repo(self.repo), (net_id, repo_id))
+        with self.mock.patch.object(pipeline.git_network, "get_repository", side_effect=AssertionError("looked up again")):
+            self.assertEqual(pipeline.git_network.resolve_git_network_and_repo(self.repo), (net_id, repo_id))
 
     def test_unconfigured_tree_stays_linux(self) -> None:
         from core.DBLayout import m_git_network, m_project
         self._resolve(None)
         self.assertEqual(main.gp.project_slug, "linux")
-        self.assertTrue(main.kernel_steps_apply())
-        projects = list(MockDB._global_store[m_project.table_name].values())
+        self.assertTrue(pipeline.git_network.kernel_steps_apply())
+        projects = list(MockDB.store[m_project.table_name].values())
         self.assertEqual([(p[1], p[2]) for p in projects], [("Linux Kernel", "linux")])
-        self.assertEqual([n[2] for n in MockDB._global_store[m_git_network.table_name].values()], ["linux-network"])
+        self.assertEqual([n[2] for n in MockDB.store[m_git_network.table_name].values()], ["linux-network"])
 
     def test_project_slug_from_root_commit_and_explicit_arguments(self) -> None:
         from core.config import MANPAGES_ROOT_COMMIT
-        with self.mock.patch.object(main, "get_repository", return_value=None):
-            self.assertEqual(main.repo_project_slug(self.repo, [MANPAGES_ROOT_COMMIT]), "man-pages")
-            main._repo_project_cache.clear()
-            self.assertEqual(main.repo_project_slug(self.repo, ["0" * 40]), "linux")
-        with self.mock.patch.object(main, "get_repository", return_value={"project": "linux-stable"}):
-            main._repo_project_cache.clear()
-            self.assertEqual(main.repo_project_slug(self.repo, []), "linux-stable")
-        main._repo_project_cache.clear()
-        main.resolve_git_network_and_repo(self.repo, project_slug="rt")
+        with self.mock.patch.object(pipeline.git_network, "get_repository", return_value=None):
+            self.assertEqual(pipeline.git_network.repo_project_slug(self.repo, [MANPAGES_ROOT_COMMIT]), "man-pages")
+            pipeline.git_network._repo_project_cache.clear()
+            self.assertEqual(pipeline.git_network.repo_project_slug(self.repo, ["0" * 40]), "linux")
+        with self.mock.patch.object(pipeline.git_network, "get_repository", return_value={"project": "linux-stable"}):
+            pipeline.git_network._repo_project_cache.clear()
+            self.assertEqual(pipeline.git_network.repo_project_slug(self.repo, []), "linux-stable")
+        pipeline.git_network._repo_project_cache.clear()
+        pipeline.git_network.resolve_git_network_and_repo(self.repo, project_slug="rt")
         self.assertEqual(main.gp.project_slug, "rt")
         from core.DBLayout import m_project
-        self.assertIn(("rt", "rt"), [(p[1], p[2]) for p in MockDB._global_store[m_project.table_name].values()])
+        self.assertIn(("rt", "rt"), [(p[1], p[2]) for p in MockDB.store[m_project.table_name].values()])
 
     def test_kernel_only_steps_skip_manpages(self) -> None:
         main.gp.VID = 5
         main.gp.project_slug = "man-pages"
         main.gp.file_blob_hashes = {"GNUmakefile": b"\1" * 20, "man/man2/read.2": b"\2" * 20}
         boom = AssertionError("kernel-only step ran")
-        with self.mock.patch.object(main, "_version_file_list", side_effect=boom), \
-                self.mock.patch.object(main, "get_fid_for_path", side_effect=boom), \
-                self.mock.patch.object(main, "compute_layout_rows", side_effect=boom):
-            main.processing_kbuild("man-pages-6.9")
-            main.processing_maintainer_files("man-pages-6.9")
-            self.assertEqual(main.processing_arch_layouts("man-pages-6.9"), 0)
+        with self.mock.patch.object(pipeline.file_references, "_version_file_list", side_effect=boom), \
+                self.mock.patch.object(pipeline.file_references, "get_fid_for_path", side_effect=boom), \
+                self.mock.patch.object(pipeline.maintainers, "get_fid_for_path", side_effect=boom), \
+                self.mock.patch.object(pipeline.arch_layouts, "compute_layout_rows", side_effect=boom):
+            pipeline.file_references.processing_kbuild("man-pages-6.9")
+            pipeline.maintainers.processing_maintainer_files("man-pages-6.9")
+            self.assertEqual(pipeline.arch_layouts.processing_arch_layouts("man-pages-6.9"), 0)
         # A kernel project without any kernel build input skips the ARCH layouts too
         main.gp.project_slug = "linux"
-        with self.mock.patch.object(main, "compute_layout_rows", side_effect=boom):
-            self.assertEqual(main.processing_arch_layouts("v0"), 0)
+        with self.mock.patch.object(pipeline.arch_layouts, "compute_layout_rows", side_effect=boom):
+            self.assertEqual(pipeline.arch_layouts.processing_arch_layouts("v0"), 0)
 
 
 if __name__ == "__main__":

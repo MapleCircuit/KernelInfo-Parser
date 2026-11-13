@@ -216,12 +216,8 @@ def missing(db: Any, shas: Iterable[bytes], family: int) -> list[bytes]:
     have: set[bytes] = set()
     for i in range(0, len(todo), _IN):
         part = todo[i:i + _IN]
-        placeholders = ",".join(["%s"] * len(part))
-        rows = db.query(
-            "SELECT blob_hash FROM m_blob_facts WHERE family = %s AND format = %s "  # noqa: S608
-            f"AND blob_hash IN ({placeholders})",
-            (family, FAMILIES[family], *part),
-            dictionary=False,
+        rows = db.select_rows(
+            "m_blob_facts", ["blob_hash"], {"family": family, "format": FAMILIES[family], "blob_hash": part}, as_dict=False
         )
         have.update(bytes(r[0]) for r in rows)
     return [s for s in todo if s not in have]
@@ -316,10 +312,12 @@ def extract(items: Iterable[tuple[Any, ...]], workers: int = 1,
 def store(db: Any, rows: list[tuple[bytes, int, bytes]]) -> None:
     """Write (SHA, family, encoded data) rows (replacing rows of another format)."""
     for i in range(0, len(rows), _INSERT):
-        db.executemany(
-            "INSERT INTO m_blob_facts (blob_hash, family, format, data) VALUES (%s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE format = VALUES(format), data = VALUES(data)",
+        db.insert_rows(
+            "m_blob_facts",
+            ["blob_hash", "family", "format", "data"],
             [(sha, family, FAMILIES[family], data) for sha, family, data in rows[i:i + _INSERT]],
+            on_conflict="update",
+            update_columns=["format", "data"],
         )
 
 
@@ -351,22 +349,20 @@ def ingest(db: Any, blobs: dict[bytes, str], read_text: Callable[[str], str | No
 
     pending: list[tuple[bytes, int, bytes]] = []
     done = rows = 0
-    try:
-        for sha_hex, data in extract(items(), workers, len(todo)):
-            sha = bytes.fromhex(sha_hex)
-            pending.extend((sha, family, payload) for family, payload in data.items())
-            done += 1
-            rows += len(data)
-            if progress is not None:
-                progress(1)
-            if len(pending) >= 2000:
-                store(db, pending)
-                db.commit()
-                pending.clear()
-        store(db, pending)
-        db.commit()
-    except Exception:
-        if hasattr(db, "rollback"):
-            db.rollback()
-        raise
+
+    def flush() -> None:
+        with db.transaction():
+            store(db, pending)
+        pending.clear()
+
+    for sha_hex, data in extract(items(), workers, len(todo)):
+        sha = bytes.fromhex(sha_hex)
+        pending.extend((sha, family, payload) for family, payload in data.items())
+        done += 1
+        rows += len(data)
+        if progress is not None:
+            progress(1)
+        if len(pending) >= 2000:
+            flush()
+    flush()
     return {"blobs": len(blobs), "extracted": done, "rows": rows, "seconds": round(time.perf_counter() - started, 1)}

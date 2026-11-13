@@ -56,13 +56,21 @@ def render_index(build: str) -> str:
 logger = logging.getLogger(__name__)
 
 
+def _db_engine():
+    """Engine class of `database.engine`; importing the pool bridge injects the pool configuration."""
+    import webapp.backend.database.pool  # noqa: F401  (configure_pool side effect)
+    from db_engine import get_db_engine
+    from webapp.backend.config import get_backend_db_config
+
+    return get_db_engine(get_backend_db_config().get("engine"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI application lifespan manager for startup pre-warming and graceful shutdown."""
     # Pre-warm DB pool and establish SSH tunnel if configured
     try:
-        from webapp.backend.database.pool import get_db_pool
-        get_db_pool()
+        _db_engine().warm_up()
     except Exception as exc:
         logger.debug("Database pool startup pre-warm deferred: %s", exc)
     # Version/branch catalogs and the default branch's tag walk, in the background (API.md section 2.12)
@@ -85,8 +93,7 @@ async def lifespan(app: FastAPI):
         pass
     # Graceful shutdown: close connection pool and stop SSH tunnel
     try:
-        from webapp.backend.database.pool import close_db_pool
-        close_db_pool()
+        _db_engine().shutdown()
     except Exception:
         pass
     try:
