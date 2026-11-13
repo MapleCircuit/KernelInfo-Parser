@@ -225,5 +225,40 @@ class TestTableReset(LaunchTestBase):
         self.assertEqual(table_reset.describe_reset_target(cfg), "mariadb 'kdb' at 127.0.0.1:3308 via SSH u@srv")
 
 
+class TestConfigureReexecPreservesLaunch(LaunchTestBase):
+    def test_configure_reset_and_parse_survives_memory_guard_reexec(self):
+        import os
+        import pipeline.cli
+
+        captured_env = {}
+
+        def fake_setup_memory_limit(limit_gb):
+            captured_env["KERNELINFO_TUI_LAUNCH"] = os.environ.get("KERNELINFO_TUI_LAUNCH")
+
+        with patch("sys.argv", ["main.py", "--configure", "-c", str(self.config_path)]), \
+                patch("core.tui.app.run_config_tui_launch", return_value={"reset": True, "reset_only": False}) as run_tui, \
+                patch("pipeline.cli.sync_repositories", return_value=[]), \
+                patch("pipeline.cli.setup_memory_limit", side_effect=fake_setup_memory_limit):
+            args = pipeline.cli.arg_handling()
+
+        run_tui.assert_called_once_with(str(self.config_path))
+        self.assertEqual(captured_env["KERNELINFO_TUI_LAUNCH"], json.dumps({"reset": True, "reset_only": False}))
+        self.assertNotIn("KERNELINFO_TUI_LAUNCH", os.environ)
+        self.assertTrue(args.reset)
+        self.assertFalse(args.reset_only)
+
+        # Simulate the re-execed child process inheriting KERNELINFO_TUI_LAUNCH with --configure still in sys.argv
+        with patch.dict(os.environ, {"KERNELINFO_TUI_LAUNCH": captured_env["KERNELINFO_TUI_LAUNCH"]}), \
+                patch("sys.argv", ["main.py", "--configure", "-c", str(self.config_path)]), \
+                patch("core.tui.app.run_config_tui_launch") as run_tui_child, \
+                patch("pipeline.cli.sync_repositories", return_value=[]), \
+                patch("pipeline.cli.setup_memory_limit"):
+            child_args = pipeline.cli.arg_handling()
+
+        run_tui_child.assert_not_called()
+        self.assertTrue(child_args.reset)
+        self.assertFalse(child_args.reset_only)
+
+
 if __name__ == "__main__":
     unittest.main()

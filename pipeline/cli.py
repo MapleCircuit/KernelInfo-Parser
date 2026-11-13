@@ -19,6 +19,7 @@ from core.config import (
 )
 from core.ssh_tunnel import start_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler
+import json
 import os
 import sys
 
@@ -499,26 +500,36 @@ def arg_handling() -> argparse.Namespace:
     if args.modules and args.changed:
         parser.error("--modules and --changed are mutually exclusive")
 
-    # Launch configuration TUI if requested or if no configuration file exists in an interactive session
-    cfg_file = find_config_path(args.config)
-    launch_tui = bool(getattr(args, "configure", False)) or (
-        cfg_file is None
-        and sys.stdin.isatty()
-        and args.unit_test is None
-        and not args.detect_repos
-        and not getattr(args, "worker_once", False)
-    )
-    if launch_tui:
-        from core.tui.app import run_config_tui_launch
-        launch = run_config_tui_launch(args.config)
-        if launch is None:
-            sys.exit(0)
-        # TUI run actions (parse selected tags, table reset) arrive as CLI argument overrides
+    # Launch configuration TUI if requested or if no configuration file exists in an interactive session.
+    # If setup_memory_limit() re-execs under systemd-run, KERNELINFO_TUI_LAUNCH carries the TUI overrides
+    # across execvp so the child process does not re-enter --configure and drop them.
+    tui_launch_env = os.environ.pop("KERNELINFO_TUI_LAUNCH", None)
+    if tui_launch_env is not None:
+        launch = json.loads(tui_launch_env)
         for key, value in launch.items():
             setattr(args, key, value)
         init_config(args.config)
-    elif args.config is not None:
-        init_config(args.config)
+    else:
+        cfg_file = find_config_path(args.config)
+        launch_tui = bool(getattr(args, "configure", False)) or (
+            cfg_file is None
+            and sys.stdin.isatty()
+            and args.unit_test is None
+            and not args.detect_repos
+            and not getattr(args, "worker_once", False)
+        )
+        if launch_tui:
+            from core.tui.app import run_config_tui_launch
+            launch = run_config_tui_launch(args.config)
+            if launch is None:
+                sys.exit(0)
+            # TUI run actions (parse selected tags, table reset) arrive as CLI argument overrides
+            for key, value in launch.items():
+                setattr(args, key, value)
+            init_config(args.config)
+            os.environ["KERNELINFO_TUI_LAUNCH"] = json.dumps(launch)
+        elif args.config is not None:
+            init_config(args.config)
 
     # Register repositories found under workspace.repos_dir into the config file
     if args.detect_repos or get_workspace_config().get("auto_detect_repos", True):
@@ -543,6 +554,7 @@ def arg_handling() -> argparse.Namespace:
     # Enforce memory limit early so re-exec (systemd-run) occurs before opening SSH tunnels or DB connections
     if args.mem_max > 0:
         setup_memory_limit(float(args.mem_max))
+    os.environ.pop("KERNELINFO_TUI_LAUNCH", None)
     dist_cfg = parser_cfg.get("distributed", {}) if isinstance(parser_cfg, dict) else {}
     if getattr(args, "role", None) is None:
         args.role = dist_cfg.get("role", "standalone") if dist_cfg.get("enabled", False) else "standalone"
