@@ -720,7 +720,7 @@ which the webapp never writes (§2.5), exactly as the Kconfig model cache always
 - **Indexed side-stores** (commit relations, release index, source-index fact stores, Kernel API records) are not
   gzip files: they are record stores too large or too query-shaped for a JSON blob, kept through the pluggable
   `cache_engine` (`cache_engine/CACHE_API.md`; `get_cache_engine()`, engine chosen by config `cache.engine`, default
-  `"sqlite"`; the same cache root). Services declare `StoreSpec`s and never touch a storage driver: no `import
+  `"ram"`, also `"sqlite"`; the same cache root). Services declare `StoreSpec`s and never touch a storage driver: no `import
   sqlite3` in `webapp/`. A space is named `<repository>-v<format>` (or `<family>-v<format>`); a layout change bumps the
   format, which rebuilds. Cache failures surface as `cache_engine.CacheError`.
 
@@ -1028,8 +1028,8 @@ Environment variables synchronized via `core.config.sync_environ()` include:
 - `WEBAPP_PORT` (default `8000`)
 - `WEBAPP_RELOAD` (default `true`)
 - `KERNELINFO_CACHE_DIR` (default `~/.cache/kernelinfo`; else config `cache.dir`): the disk cache of derived data and
-  the cache engine's storage (§2.14); config `cache.engine` (default `"sqlite"`, env `KERNELINFO_CACHE_ENGINE`) selects
-  the cache engine (`cache_engine/CACHE_API.md`)
+  the cache engine's storage (§2.14); config `cache.engine` (default `"ram"`, also `"sqlite"`, env
+  `KERNELINFO_CACHE_ENGINE`) selects the cache engine (`cache_engine/CACHE_API.md`)
 
 Webapp keys of `config.json` beyond the bindings (`"webapp"` section):
 - `cache.max_mb` (default `1024`): global cap of the disk cache (§2.14).

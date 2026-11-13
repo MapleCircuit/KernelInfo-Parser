@@ -114,9 +114,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "connect_timeout": 10,
         },
     },
-    # Local caches of derived data (cache_engine/CACHE_API.md): engine name and base directory (empty: the
-    # KERNELINFO_CACHE_DIR environment variable, else ~/.cache/kernelinfo)
-    "cache": {"engine": "sqlite", "dir": ""},
+    # Local caches of derived data (cache_engine/CACHE_API.md): engine name ("ram" or "sqlite") and base
+    # directory (empty: the KERNELINFO_CACHE_DIR environment variable, else ~/.cache/kernelinfo)
+    "cache": {"engine": "ram", "dir": ""},
     "webapp": {
         "host": "0.0.0.0",
         "port": 8000,

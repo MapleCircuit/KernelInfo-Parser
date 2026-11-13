@@ -24,7 +24,7 @@
     }
   },
   "cache": {
-    "engine": "sqlite",
+    "engine": "ram",
     "dir": ""
   },
   "webapp": {

@@ -218,6 +218,8 @@ class TestParserDistributedReentry(_ReentryCase):
         "inp_mem_max": "48",
         "sel_hugepages": "off",
         "inp_cache_max_table_mb": "1024",
+        "sel_cache_engine": "sqlite",
+        "inp_cache_dir": "/var/cache/kernelinfo",
         "chk_dist_enabled": True,
         "sel_role": "worker",
         "inp_worker_id": "node-7",
@@ -230,6 +232,8 @@ class TestParserDistributedReentry(_ReentryCase):
         "inp_mem_max": "0",
         "sel_hugepages": "auto",
         "inp_cache_max_table_mb": "0",
+        "sel_cache_engine": "ram",
+        "inp_cache_dir": "",
         "chk_dist_enabled": False,
         "sel_role": "standalone",
         "inp_worker_id": "",
@@ -238,9 +242,11 @@ class TestParserDistributedReentry(_ReentryCase):
 
     def test_all_fields_round_trip(self) -> None:
         self.round_trip(dict(self.TRUTHY))
-        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))["parser"]
+        disk = json.loads(self.config_path.read_text(encoding="utf-8"))
+        cfg = disk["parser"]
         self.assertEqual(cfg["mem_max"], 48)
         self.assertEqual(cfg["cache_max_table_mb"], 1024)
+        self.assertEqual(disk["cache"], {"engine": "sqlite", "dir": "/var/cache/kernelinfo"})
         self.assertEqual(cfg["distributed"], {
             "enabled": True, "role": "worker", "worker_id": "node-7", "delegate_stable": True,
         })
@@ -248,9 +254,11 @@ class TestParserDistributedReentry(_ReentryCase):
     def test_falsy_values_round_trip_after_truthy(self) -> None:
         self.round_trip(dict(self.TRUTHY))
         self.round_trip(dict(self.FALSY))
-        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))["parser"]
+        disk = json.loads(self.config_path.read_text(encoding="utf-8"))
+        cfg = disk["parser"]
         self.assertEqual(cfg["mem_max"], 0)
         self.assertEqual(cfg["cache_max_table_mb"], 0)
+        self.assertEqual(disk["cache"], {"engine": "ram", "dir": ""})
         self.assertEqual(cfg["distributed"]["worker_id"], "")
         self.assertIs(cfg["distributed"]["delegate_stable"], False)
 

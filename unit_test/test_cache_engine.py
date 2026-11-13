@@ -14,8 +14,9 @@ import unittest
 from unittest import mock
 
 from cache_engine import (BYTES, INT, TEXT, BaseCacheEngine, CacheError, CacheSchemaError, Eq, In, IsNull, Prefix,
-                          Range, StoreSpec, UnknownCacheEngine, available_cache_engines, get_cache_engine,
-                          register_cache_engine)
+                          Range, StoreSpec, UnknownCacheEngine, available_cache_engines, configured_engine_name,
+                          get_cache_engine, register_cache_engine)
+from cache_engine.ram_cache import RAMCacheEngine
 from cache_engine.sqlite_cache import SQLiteCacheEngine
 
 ITEMS = StoreSpec("items", (BYTES("sha"), INT("n"), TEXT("label", null=True)), key=("sha",), indexes=(("n",),))
@@ -294,11 +295,153 @@ class TestSQLiteCacheEngine(CacheEngineContract, unittest.TestCase):
             self.engine.open("test-ns", "demo-v1", (other,))
 
 
+class TestRAMCacheEngine(CacheEngineContract, unittest.TestCase):
+    def make_engine(self, root: str) -> BaseCacheEngine:
+        return RAMCacheEngine(root)
+
+    def test_location_and_close_vs_discard(self) -> None:
+        self.assertEqual(self.space.location, "ram://test-ns/demo-v1")
+        self.assertEqual(self.engine.location("test-ns", "demo-v1"), "ram://test-ns/demo-v1")
+        self.items.put((b"k", 42, "v"))
+        self.space.set_meta("m", "1")
+        self.space.close()
+        with self.assertRaises(CacheError):
+            self.items.get(b"k")
+        with self.assertRaises(CacheError):
+            self.space.get_meta("m")
+        self.assertTrue(self.engine.exists("test-ns", "demo-v1"))
+        with self.assertRaises(CacheSchemaError):
+            self.engine.open("test-ns", "demo-v1", (ITEMS,))
+        reopened = self.engine.open("test-ns", "demo-v1", SPECS)
+        self.assertIsNot(reopened, self.space)
+        self.assertEqual(reopened.store("items").get(b"k"), (b"k", 42, "v"))
+        self.assertEqual(reopened.get_meta("m"), "1")
+        reopened.discard()
+        self.assertFalse(self.engine.exists("test-ns", "demo-v1"))
+
+    def test_size_bytes_and_compact(self) -> None:
+        empty = self.engine.open("test-ns", "empty-v1", SPECS)
+        self.assertEqual(empty.size_bytes(), 0)
+        self.items.put_many((i.to_bytes(2, "big"), i % 5, "x" * 20) for i in range(3000))
+        self.assertGreater(self.space.size_bytes(), 0)
+        # Trigger lazy SortedIndex build then delete most rows and compact
+        self.assertEqual(len(list(self.items.scan(Range("n", ge=0, le=2)))), 1800)
+        self.items.delete_where(Range("n", ge=1))
+        self.space.compact()
+        self.assertEqual(self.items.count(), 600)
+        self.assertEqual(len(list(self.items.scan(Range("n", ge=0, le=2)))), 600)
+
+    def test_sorted_index_duplicates_nulls_range_prefix_limit_zero(self) -> None:
+        # Heavy duplicates + nulls + incremental mutations
+        rows = [(i.to_bytes(2, "big"), i % 4, None if i % 5 == 0 else f"p{i:04d}") for i in range(2500)]
+        self.items.put_many(rows)
+        # Range with both ge/gt and le/lt, and limit=0
+        self.assertEqual(list(self.items.scan(Range("n", ge=1, lt=3), limit=0)), [])
+        self.assertEqual(self.items.count(Range("n", ge=1, gt=1, le=3, lt=3)), 625)  # n == 2
+        # Null ordering: None first in ASC, last in DESC
+        asc_labels = [r[0] for r in self.items.scan(columns=("label",), order_by=["label"], limit=501)]
+        self.assertEqual(asc_labels[:500], [None] * 500)
+        self.assertEqual(asc_labels[500], "p0001")
+        desc_labels = [r[0] for r in self.items.scan(columns=("label",), order_by=["-label"], limit=2001)]
+        self.assertIsNotNone(desc_labels[1999])
+        self.assertIsNone(desc_labels[2000])
+        # Range and Prefix exclude None; Range with all bounds None is a no-op (includes None)
+        self.assertEqual(self.items.count(Range("label")), 2500)
+        self.assertEqual(self.items.count(Range("label", ge="p")), 2000)
+        self.assertEqual(self.items.count(Prefix("label", "p01")), 80)
+        # Incremental add/remove on existing SortedIndex
+        self.items.put((b"\xff\xff", 2, None))
+        self.items.delete(b"\x00\x00")
+        self.assertEqual(self.items.count(Range("label", ge="p")), 2000)
+
+    def test_update_where_indexed_and_unique_and_error_atomicity(self) -> None:
+        self.log.put_many([("a", 1), ("a", 2), ("b", None), ("c", None)])
+        # NULLs do not collide in unique group ("k", "x")
+        self.assertEqual(self.log.count(), 4)
+        # Updating unique field to collide raises CacheError without partial mutation
+        with self.assertRaises(CacheError):
+            self.log.update_where(Eq("k", "a"), {"x": 1})
+        self.assertEqual(sorted(r[1] for r in self.log.scan(Eq("k", "a"))), [1, 2])
+        # Valid update updates indexed field
+        self.assertEqual(self.log.update_where([Eq("k", "a"), Eq("x", 2)], {"k": "z"}), 1)
+        self.assertEqual(list(self.log.scan(Eq("k", "z"))), [("z", 2)])
+        # put_many error atomicity: bad record at index 2 writes nothing
+        with self.assertRaises(CacheSchemaError):
+            self.items.put_many([(b"ok1", 1, None), (b"ok2", 2, None), (b"bad",)])
+        self.assertEqual(self.items.count(), 0)
+
+    def test_concurrent_scan_snapshot_isolation(self) -> None:
+        self.items.put_many((i.to_bytes(2, "big"), i, None) for i in range(100))
+        it = self.items.scan(order_by=["sha"])
+        first = next(it)
+        self.assertEqual(first[1], 0)
+        # Mutate while scan iterator is active
+        self.items.delete_where(Range("n", ge=50))
+        self.items.put((b"\xff\xff", 999, "new"))
+        rest = list(it)
+        self.assertEqual(len(rest), 99)
+        self.assertEqual(self.items.count(), 51)
+
+    def test_large_batch_delta_overlay(self) -> None:
+        self.items.put_many((i.to_bytes(4, "big"), i % 10, None) for i in range(4500))
+        with self.space.batch():
+            self.items.put_many((i.to_bytes(4, "big"), 99, "new") for i in range(4500, 4520))
+            self.items.delete(b"\x00\x00\x00\x00")
+            self.assertIsNone(self.items.get(b"\x00\x00\x00\x00"))
+            self.assertEqual(self.items.get((4505).to_bytes(4, "big")), ((4505).to_bytes(4, "big"), 99, "new"))
+            # In-batch scan materializes delta lazily
+            self.assertEqual(self.items.count(Eq("n", 99)), 20)
+        self.assertEqual(self.items.count(), 4519)
+        with self.assertRaises(RuntimeError):
+            with self.space.batch():
+                self.items.delete((1).to_bytes(4, "big"))
+                raise RuntimeError("rollback")
+        self.assertIsNotNone(self.items.get((1).to_bytes(4, "big")))
+
+    def test_unstarted_scan_does_not_leak_readers(self) -> None:
+        self.items.put_many((i.to_bytes(2, "big"), i, None) for i in range(10))
+        it = self.items.scan()
+        st = self.space._storage.stores["items"]
+        self.assertEqual(st.readers, 1)
+        del it
+        self.assertEqual(st.readers, 0)
+
+    def test_unhashable_key_and_prefix_type_safety(self) -> None:
+        with self.assertRaises(CacheSchemaError):
+            self.items.get([1, 2])
+        with self.assertRaises(CacheSchemaError):
+            self.items.put(([1, 2], 1, None))
+        with self.assertRaises(CacheSchemaError):
+            self.items.delete([1, 2])
+        self.items.put((b"a", 123, "hello"))
+        self.assertEqual(list(self.items.scan(Prefix("n", "12"))), [])
+        self.assertEqual(list(self.items.scan([Eq("n", 123), Prefix("n", "12")])), [])
+        self.assertEqual(list(self.items.scan(Prefix("label", b"he"))), [])
+
+    def test_leading_col_of_composite_unique_is_indexed(self) -> None:
+        links_spec = StoreSpec("links", (TEXT("mid"), BYTES("sha")), unique=(("mid", "sha"),))
+        sp = self.engine.open("test-ns", "links-v1", (links_spec,))
+        links = sp.store("links")
+        links.put_many([("m1", b"s1"), ("m1", b"s2"), ("m2", b"s3")])
+        st = sp._storage.stores["links"]
+        self.assertIn((0,), st.indexes)
+        self.assertEqual(sorted(r[1] for r in links.scan(Eq("mid", "m1"))), [b"s1", b"s2"])
+        self.assertEqual(links.count(Eq("mid", "m1")), 2)
+
+
 class TestFactory(unittest.TestCase):
     def test_registry_and_defaults(self) -> None:
         self.assertIn("sqlite", available_cache_engines())
+        self.assertIn("ram", available_cache_engines())
+        with mock.patch.dict(os.environ, {"KERNELINFO_CACHE_ENGINE": ""}), \
+                mock.patch("core.config.get_config", return_value={}):
+            self.assertEqual(configured_engine_name(), "ram")
+            self.assertIsInstance(get_cache_engine(), RAMCacheEngine)
         self.assertIsInstance(get_cache_engine("sqlite"), SQLiteCacheEngine)
         self.assertIs(get_cache_engine("sqlite"), get_cache_engine("SQLite3"))
+        self.assertIsInstance(get_cache_engine("ram"), RAMCacheEngine)
+        for alias in ("memory", "mem", "in-memory", "in_memory"):
+            self.assertIs(get_cache_engine("ram"), get_cache_engine(alias))
         with self.assertRaises(UnknownCacheEngine):
             get_cache_engine("nope")
 
@@ -331,6 +474,23 @@ class TestFactory(unittest.TestCase):
                 sb = engine.open("ns", "n", (ITEMS,))
             self.assertIsNot(sa, sb)
             self.assertTrue(sa.location.startswith(a) and sb.location.startswith(b))
+            engine.close()
+
+    def test_ram_default_root_is_resolved_per_open(self) -> None:
+        engine = RAMCacheEngine()
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            with mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": a}):
+                sa = engine.open("ns", "n", (ITEMS,))
+                sa.store("items").put((b"k", 1, "a"))
+                self.assertTrue(engine.exists("ns", "n"))
+            with mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": b}):
+                self.assertFalse(engine.exists("ns", "n"))
+                sb = engine.open("ns", "n", (ITEMS,))
+                self.assertIsNone(sb.store("items").get(b"k"))
+                sb.discard()
+            self.assertIsNot(sa, sb)
+            with mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": a}):
+                self.assertTrue(engine.exists("ns", "n"))
             engine.close()
 
 

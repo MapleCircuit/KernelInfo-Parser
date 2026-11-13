@@ -55,6 +55,7 @@ SURFACES: dict[str, dict] = {
             ("cache_engine/base.py", None, "all"),
             ("cache_engine/errors.py", None, "all"),
             ("cache_engine/sqlite_cache.py", ["SQLiteCacheEngine"], "init"),
+            ("cache_engine/ram_cache.py", ["RAMCacheEngine"], "init"),
         ],
     },
 }

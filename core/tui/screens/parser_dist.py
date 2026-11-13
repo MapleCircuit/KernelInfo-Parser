@@ -6,6 +6,7 @@ import curses
 import textwrap
 from typing import Any
 
+from cache_engine import DEFAULT_ENGINE, UnknownCacheEngine, available_cache_engines, get_cache_engine
 from core.config import MEMORY_MODES, _coerce_bool, normalize_memory_mode
 from core.tui.screens.base import BaseScreen
 from core.tui.theme import (
@@ -53,6 +54,16 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
             "A bigger table is not cached: its reads and writes go straight to the database, as in direct mode.",
             "0 = no cap. Lower it to keep huge tables out of RAM.",
         ]),
+    "cache_engine": ("Cache Engine", [
+            "Backend for local rebuildable caches (webapp git-derived indexes). Env KERNELINFO_CACHE_ENGINE overrides it.",
+            "- ram (default): pure-Python in-memory cache; fastest, cleared on process exit.",
+            "- sqlite: persistent SQLite files under Cache Directory; survives restarts.",
+        ]),
+    "cache_dir": ("Cache Directory", [
+            "Base directory for directory-based cache engines (sqlite) and scope key for ram. "
+            "Env KERNELINFO_CACHE_DIR overrides it.",
+            "Leave empty to use ~/.cache/kernelinfo.",
+        ]),
     "distributed": ("Distributed (TL;DR)", [
             "Several machines parse into one shared database (directly or via the SSH tunnel).",
             "- master: parses mainline in order, runs global jobs, posts other branches as tasks. One per network.",
@@ -68,6 +79,7 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
             "- Table Engine: how tables are held while parsing.",
             "- Memory Mode: speed vs. peak RAM.",
             "- Max TE Table: size cap for one cached table.",
+            "- Cache Engine / Dir: backend and path for local rebuildable caches.",
             "- Distributed: split parsing across machines.",
         ],
     ),
@@ -103,11 +115,15 @@ class ParserDistributedScreen(BaseScreen):
         # Retrieve or initialize config sections
         if self.app is not None and hasattr(self.app, "config") and isinstance(self.app.config, dict):
             self.parser_cfg = self.app.config.setdefault("parser", {})
+            self.cache_cfg = self.app.config.setdefault("cache", {})
         else:
             self.parser_cfg = {}
+            self.cache_cfg = {}
 
         if not isinstance(self.parser_cfg, dict):
             self.parser_cfg = {}
+        if not isinstance(self.cache_cfg, dict):
+            self.cache_cfg = {}
 
         self.dist_cfg = self.parser_cfg.setdefault("distributed", {})
         if not isinstance(self.dist_cfg, dict):
@@ -129,6 +145,15 @@ class ParserDistributedScreen(BaseScreen):
         idx_hp = hp_opts.index(cur_hp) if cur_hp in hp_opts else 0
 
         cur_cache_max = str(self.parser_cfg.get("cache_max_table_mb", 0))
+
+        cache_engine_opts = list(available_cache_engines()) or [DEFAULT_ENGINE]
+        cur_ce_raw = str(self.cache_cfg.get("engine") or DEFAULT_ENGINE).strip().lower()
+        try:
+            cur_ce = get_cache_engine(cur_ce_raw).name.lower()
+        except UnknownCacheEngine:
+            cur_ce = DEFAULT_ENGINE
+        idx_ce = cache_engine_opts.index(cur_ce) if cur_ce in cache_engine_opts else 0
+        cur_cache_dir = str(self.cache_cfg.get("dir") or "")
 
         cur_dist_enabled = _coerce_bool(self.dist_cfg.get("enabled"), False)
 
@@ -156,23 +181,31 @@ class ParserDistributedScreen(BaseScreen):
             y=8, x=4, width=12, label="Max TE Table (MB)", value=cur_cache_max, label_width=20
         )
 
+        # Instantiate Local Cache widgets
+        self.sel_cache_engine = SelectList(
+            y=11, x=4, width=16, label="Cache Engine", options=cache_engine_opts, selected_index=idx_ce, label_width=20
+        )
+        self.inp_cache_dir = TextInput(
+            y=12, x=4, width=26, label="Cache Directory", value=cur_cache_dir, label_width=20
+        )
+
         # Instantiate Distributed widgets
         self.chk_dist_enabled = Checkbox(
-            y=13, x=4, label="Enable Distributed Worker Coordination", checked=cur_dist_enabled
+            y=15, x=4, label="Enable Distributed Worker Coordination", checked=cur_dist_enabled
         )
         self.sel_role = SelectList(
-            y=14, x=4, width=16, label="Worker Role", options=role_opts, selected_index=idx_role, label_width=20
+            y=16, x=4, width=16, label="Worker Role", options=role_opts, selected_index=idx_role, label_width=20
         )
         self.inp_worker_id = TextInput(
-            y=15, x=4, width=24, label="Worker Node ID", value=cur_worker_id, label_width=20
+            y=17, x=4, width=24, label="Worker Node ID", value=cur_worker_id, label_width=20
         )
         self.chk_delegate_stable = Checkbox(
-            y=16, x=4, label="Delegate stable branches to workers", checked=cur_delegate_stable
+            y=18, x=4, label="Delegate stable branches to workers", checked=cur_delegate_stable
         )
 
         # Action buttons
-        self.btn_save = Button(y=19, x=4, label="Save Settings", on_click=self.save)
-        self.btn_cancel = Button(y=19, x=24, label="Cancel", on_click=self.cancel)
+        self.btn_save = Button(y=21, x=4, label="Save Settings", on_click=self.save)
+        self.btn_cancel = Button(y=21, x=24, label="Cancel", on_click=self.cancel)
 
         # Status Bar
         self.status_bar = StatusBar(
@@ -191,6 +224,8 @@ class ParserDistributedScreen(BaseScreen):
             self.inp_mem_max,
             self.sel_hugepages,
             self.inp_cache_max_table_mb,
+            self.sel_cache_engine,
+            self.inp_cache_dir,
             self.chk_dist_enabled,
             self.sel_role,
             self.inp_worker_id,
@@ -202,6 +237,8 @@ class ParserDistributedScreen(BaseScreen):
             id(self.sel_table_engine): "table_engine",
             id(self.sel_memory_mode): "memory_mode",
             id(self.inp_cache_max_table_mb): "max_te_table",
+            id(self.sel_cache_engine): "cache_engine",
+            id(self.inp_cache_dir): "cache_dir",
             id(self.chk_dist_enabled): "distributed",
             id(self.sel_role): "distributed",
             id(self.inp_worker_id): "distributed",
@@ -275,10 +312,13 @@ class ParserDistributedScreen(BaseScreen):
         box_w, help_w = self._layout_widths(max_x)
 
         # Box 1: Parser Configuration
-        draw_box(self.stdscr, 3, 2, 8, box_w, title="Parser Engine Configuration", color_pair=PAIR_BORDER)
+        draw_box(self.stdscr, 3, 2, 7, box_w, title="Parser Engine Configuration", color_pair=PAIR_BORDER)
 
-        # Box 2: Distributed & Node Identification
-        draw_box(self.stdscr, 12, 2, 6, box_w, title="Distributed & Node Identification", color_pair=PAIR_BORDER)
+        # Box 2: Local Cache Configuration
+        draw_box(self.stdscr, 10, 2, 4, box_w, title="Local Cache Configuration", color_pair=PAIR_BORDER)
+
+        # Box 3: Distributed & Node Identification
+        draw_box(self.stdscr, 14, 2, 6, box_w, title="Distributed & Node Identification", color_pair=PAIR_BORDER)
 
         # Side help panel for the focused field (F1 shows it as a dialog when the terminal is too narrow)
         if help_w:
@@ -365,8 +405,10 @@ class ParserDistributedScreen(BaseScreen):
 
         if self.app is not None and hasattr(self.app, "config") and isinstance(self.app.config, dict):
             parser_cfg = self.app.config.setdefault("parser", {})
+            cache_cfg = self.app.config.setdefault("cache", {})
         else:
             parser_cfg = self.parser_cfg
+            cache_cfg = self.cache_cfg
 
         dist_cfg = parser_cfg.setdefault("distributed", {})
 
@@ -376,6 +418,10 @@ class ParserDistributedScreen(BaseScreen):
         parser_cfg["hugepages"] = self.sel_hugepages.get_selected()
         parser_cfg.update(int_values)
 
+        # Local cache attributes
+        cache_cfg["engine"] = self.sel_cache_engine.get_selected()
+        cache_cfg["dir"] = self.inp_cache_dir.get_value().strip()
+
         # Distributed & Node attributes
         dist_cfg["enabled"] = self.chk_dist_enabled.is_checked()
         dist_cfg["role"] = self.sel_role.get_selected()
@@ -384,6 +430,7 @@ class ParserDistributedScreen(BaseScreen):
 
         # Update references
         self.parser_cfg = parser_cfg
+        self.cache_cfg = cache_cfg
         self.dist_cfg = dist_cfg
 
         # Mark application dirty and pop screen if supported

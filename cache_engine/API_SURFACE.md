@@ -93,3 +93,10 @@ class UnknownCacheEngine(CacheError, KeyError)  # ``get_cache_engine(name)`` was
 class SQLiteCacheEngine(BaseCacheEngine)  # ``cache.engine = "sqlite"``. ``root`` fixes the cache directory; by default it is resol...
     def __init__(root: str | Path | None=None) -> None
 ```
+
+## cache_engine/ram_cache.py
+
+```python
+class RAMCacheEngine(BaseCacheEngine)  # ``cache.engine = "ram"`` (aliases ``memory``, ``mem``, ``in-memory``, ``in_memory``); p...
+    def __init__(root: Path | str | None=None) -> None
+```

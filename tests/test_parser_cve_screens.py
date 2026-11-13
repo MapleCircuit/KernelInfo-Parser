@@ -29,6 +29,10 @@ class TestParserDistributedScreen(unittest.TestCase):
     def setUp(self) -> None:
         self.win = MockCursesWindow(24, 80)
         self.initial_config = {
+            "cache": {
+                "engine": "ram",
+                "dir": "",
+            },
             "parser": {
                 "table_engine": "cached",
                 "memory_mode": "normal",
@@ -41,7 +45,7 @@ class TestParserDistributedScreen(unittest.TestCase):
                     "worker_id": "worker-node-1",
                     "delegate_stable": False,
                 },
-            }
+            },
         }
         self.app = MockApp(self.initial_config)
         self.screen = ParserDistributedScreen(self.win, self.app)
@@ -52,10 +56,23 @@ class TestParserDistributedScreen(unittest.TestCase):
         self.assertEqual(self.screen.inp_mem_max.get_value(), "60")
         self.assertEqual(self.screen.sel_hugepages.get_selected(), "auto")
         self.assertEqual(self.screen.inp_cache_max_table_mb.get_value(), "0")
+        self.assertEqual(self.screen.sel_cache_engine.get_selected(), "ram")
+        self.assertEqual(self.screen.inp_cache_dir.get_value(), "")
         self.assertFalse(self.screen.chk_dist_enabled.is_checked())
         self.assertEqual(self.screen.sel_role.get_selected(), "standalone")
         self.assertEqual(self.screen.inp_worker_id.get_value(), "worker-node-1")
         self.assertFalse(self.screen.chk_delegate_stable.is_checked())
+
+    def test_cache_engine_options_alias_and_unknown(self) -> None:
+        self.assertEqual(self.screen.sel_cache_engine.options, ["ram", "sqlite"])
+        self.app.config["cache"] = {"engine": "sqlite3", "dir": "/tmp/kcache"}
+        screen = ParserDistributedScreen(self.win, self.app)
+        self.assertEqual(screen.sel_cache_engine.get_selected(), "sqlite")
+        self.assertEqual(screen.inp_cache_dir.get_value(), "/tmp/kcache")
+
+        self.app.config["cache"]["engine"] = "nonexistent-engine"
+        screen = ParserDistributedScreen(self.win, self.app)
+        self.assertEqual(screen.sel_cache_engine.get_selected(), "ram")
 
     def test_memory_mode_options_and_legacy_alias(self) -> None:
         self.assertEqual(self.screen.sel_memory_mode.options, ["normal", "low", "very_low"])
@@ -75,7 +92,11 @@ class TestParserDistributedScreen(unittest.TestCase):
         self.assertNotIn("Trades parse speed", self._screen_text(80))
         self.screen.focus_widget(4)
         self.assertEqual(self.screen.current_help_topic(), "max_te_table")
+        self.screen.focus_widget(5)
+        self.assertEqual(self.screen.current_help_topic(), "cache_engine")
         self.screen.focus_widget(6)
+        self.assertEqual(self.screen.current_help_topic(), "cache_dir")
+        self.screen.focus_widget(8)
         self.assertEqual(self.screen.current_help_topic(), "distributed")
         self.screen.focus_widget(2)
         self.assertEqual(self.screen.current_help_topic(), "overview")
@@ -101,6 +122,8 @@ class TestParserDistributedScreen(unittest.TestCase):
         self.screen.inp_mem_max.set_value("48")
         self.screen.sel_hugepages.set_selected(1)     # "on"
         self.screen.inp_cache_max_table_mb.set_value("1024")
+        self.screen.sel_cache_engine.set_selected(1)  # "sqlite"
+        self.screen.inp_cache_dir.set_value(" /var/cache/kernelinfo ")
         self.screen.chk_dist_enabled.set_checked(True)
         self.screen.sel_role.set_selected(1)          # "master"
         self.screen.inp_worker_id.set_value("master-node-0")
@@ -120,6 +143,10 @@ class TestParserDistributedScreen(unittest.TestCase):
         self.assertEqual(p_cfg["mem_max"], 48)
         self.assertEqual(p_cfg["hugepages"], "on")
         self.assertEqual(p_cfg["cache_max_table_mb"], 1024)
+
+        c_cfg = self.app.config["cache"]
+        self.assertEqual(c_cfg["engine"], "sqlite")
+        self.assertEqual(c_cfg["dir"], "/var/cache/kernelinfo")
 
         d_cfg = p_cfg["distributed"]
         self.assertTrue(d_cfg["enabled"])
@@ -153,6 +180,7 @@ class TestParserDistributedScreen(unittest.TestCase):
         # Verify calls to stdscr
         addstr_calls = [c[1][2] for c in self.win.calls if c[0] == "addstr"]
         self.assertTrue(any("Parser" in text for text in addstr_calls))
+        self.assertTrue(any("Local Cache" in text for text in addstr_calls))
         self.assertTrue(any("Distributed" in text for text in addstr_calls))
 
 

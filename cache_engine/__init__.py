@@ -1,7 +1,7 @@
 """cache_engine - local, rebuildable caches behind a storage-neutral API (cache_engine/CACHE_API.md).
 
 ``get_cache_engine(name=None)`` returns the process-wide engine selected by ``cache.engine`` (config) or
-``KERNELINFO_CACHE_ENGINE`` (default ``"sqlite"``); ``register_cache_engine`` adds implementations.
+``KERNELINFO_CACHE_ENGINE`` (default ``"ram"``); ``register_cache_engine`` adds implementations.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .base import (BYTES, FLOAT, INT, TEXT, BaseCacheEngine, CacheSpace, CacheSt
 from .errors import (CacheBusyError, CacheCorruptError, CacheError, CacheSchemaError, CacheUnavailableError,
                      UnknownCacheEngine)
 
-DEFAULT_ENGINE = "sqlite"
+DEFAULT_ENGINE = "ram"
 DEFAULT_CACHE_DIR = "~/.cache/kernelinfo"
 
 _FACTORIES: dict[str, Callable[[], BaseCacheEngine]] = {}
@@ -51,16 +51,9 @@ def register_cache_engine(name: str, factory: Callable[[], BaseCacheEngine], ali
 
 def available_cache_engines(*, include_aliases: bool = False) -> tuple[str, ...]:
     with _LOCK:
-        names = sorted(_FACTORIES)
         if include_aliases:
-            return tuple(names)
-        seen: set[int] = set()
-        primary = []
-        for n in names:
-            if id(_FACTORIES[n]) not in seen:
-                seen.add(id(_FACTORIES[n]))
-                primary.append(n)
-        return tuple(primary)
+            return tuple(sorted(_FACTORIES))
+        return tuple(sorted(set(_CANON.values())))
 
 
 def configured_engine_name() -> str:
@@ -84,7 +77,9 @@ def get_cache_engine(name: str | None = None) -> BaseCacheEngine:
 
 def _register_builtin() -> None:
     from .sqlite_cache import SQLiteCacheEngine
+    from .ram_cache import RAMCacheEngine
     register_cache_engine("sqlite", SQLiteCacheEngine, ("sqlite3",))
+    register_cache_engine("ram", RAMCacheEngine, ("memory", "mem", "in-memory", "in_memory"))
 
 
 _register_builtin()
