@@ -665,6 +665,13 @@ class ApiClient {
     return this._manRequest(repo, "/api/man/tags", null, "tags");
   }
 
+  /** `GET /api/man/diff`: man entries added, modified or deleted between two revisions. */
+  async getManDiff(repo, versionA, versionB) {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    return this._manRequest(repo, "/api/man/diff", { a: va, b: vb }, `diff_${this._vk(va)}_${this._vk(vb)}`);
+  }
+
   /** `GET /api/man/resolve` (current repository = the kernel): our copy of name(section) for `kernel`, or the man7.org URL. */
   async resolveMan(name, section = "", kernel = "") {
     const params = new URLSearchParams({ name });

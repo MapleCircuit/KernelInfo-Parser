@@ -47,6 +47,7 @@ class RefPicker {
     this.items = [];
     this.highlight = -1;
     this.onSelect = null;
+    this.client = api;
     this.searchSeq = 0;
     this._outsideHandler = null;
   }
@@ -54,9 +55,9 @@ class RefPicker {
   /**
    * Open the picker under anchorEl.
    * @param {HTMLElement} anchorEl
-   * @param {{ current?: string, onSelect: (ref: string) => void, scoped?: boolean }} options
+   * @param {{ current?: string, onSelect: (ref: string) => void, scoped?: boolean, client?: object }} options
    */
-  async open(anchorEl, { current = "", onSelect, scoped = false }) {
+  async open(anchorEl, { current = "", onSelect, scoped = false, client = api }) {
     if (this.popover && this.anchorEl === anchorEl) {
       this.close();
       return;
@@ -66,6 +67,7 @@ class RefPicker {
     this.onSelect = onSelect;
     this.current = current;
     this.scoped = Boolean(scoped);
+    this.client = client || api;
 
     const branch = this.scoped ? state.selectedBranch : "";
     const rect = anchorEl.getBoundingClientRect();
@@ -114,9 +116,10 @@ class RefPicker {
     const seq = ++this.searchSeq;
     const q = query.toLowerCase();
 
+    const client = this.client || api;
     const [versionsRes, commitsRes] = await Promise.allSettled([
-      api.getVersionsCached(true),
-      api.getCommits(this.current || "v3.0", 1, 50, query)
+      client.getVersionsCached(true),
+      client.getCommits(this.current || "HEAD", 1, 50, query)
     ]);
     if (seq !== this.searchSeq || !this.popover) return;
 

@@ -4,12 +4,30 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import "./helpers/dom_shim.mjs";
 import { manHeader, renderManTerm, renderManWeb, safeUrl } from "../js/views/man/man_render.js";
 import {
-  compareTags, groupIndex, isManPagePath, linuxApiTab, linuxSymbolTab, man7Url, manTabFields, manTabTitle, newestTag, pageOfPath, parseManRef, sectionTitle,
+  compareTags, groupIndex, indexSectionLabel, isManPagePath, linuxApiTab, linuxSymbolTab, man7Url, manTabFields, manTabTitle, newestTag, pageOfPath, parseManRef, sectionTitle,
 } from "../js/views/man/man_model.js";
 import { hashRepo, tabRoute } from "../js/tab_routes.js";
 import "../js/routes.js";
+
+// Module singletons start heartbeats when man_view.js imports state.js: keep them unreffed
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (...args) => {
+  const t = realSetInterval(...args);
+  t?.unref?.();
+  return t;
+};
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (...args) => {
+  const t = realSetTimeout(...args);
+  t?.unref?.();
+  return t;
+};
+
+const { defaultManWidth, ManView } = await import("../js/views/man/man_view.js");
 
 const DOC = {
   format: 1,
@@ -130,6 +148,9 @@ test("page paths, refs and section titles", () => {
   assert.equal(man7Url("size_t", "3type"), "https://man7.org/linux/man-pages/man3/size_t.3type.html");
   assert.equal(sectionTitle("2"), "System calls");
   assert.equal(sectionTitle("3const"), "Library functions — constants");
+  assert.equal(indexSectionLabel("2"), "System calls(2)");
+  assert.equal(indexSectionLabel("3const"), "Library functions — constants(3const)");
+  assert.equal(indexSectionLabel("", "Other"), "Other");
   assert.equal(manTabTitle({ manPage: "read", manSec: "2" }), "man read(2)");
   assert.equal(manTabTitle({ manPath: "man/man7/epoll.7" }), "man epoll(7)");
   assert.equal(manTabTitle({}), "Man pages");
@@ -207,4 +228,113 @@ test("man route: hash round trip", () => {
   assert.notEqual(route.navKey({ ...tab, manPage: "write" }), nav);
   for (const k of ["manPage", "manSec", "manMode", "kernelVersion", "kernelRepo", "manPath"]) assert.ok(route.keys.includes(k), k);
   assert.ok(!route.keys.includes("manRepo") && !route.keys.includes("manVersion"));
+});
+
+test("web width defaults to full page and man-mode z-index stacks hover above active", () => {
+  localStorage.removeItem("kip-man-width");
+  assert.equal(defaultManWidth(), "full");
+  localStorage.setItem("kip-man-width", "980");
+  assert.equal(defaultManWidth(), "980");
+  localStorage.removeItem("kip-man-width");
+
+  const css = fs.readFileSync(new URL("../css/man.css", import.meta.url), "utf8");
+  const webRule = /\.man-web\s*\{([^}]*)\}/.exec(css)?.[1] || "";
+  assert.ok(!/max-width\s*:/i.test(webRule), "default .man-web has no max-width restriction");
+  assert.match(css, /\.man-view\.man-narrow\s+\.man-web\s*\{[^}]*max-width:\s*980px;[^}]*margin:\s*0 auto;/s);
+  assert.match(css, /\.man-mode\s+\.code-btn\s*\{[^}]*position:\s*relative;\s*z-index:\s*0;/s);
+  assert.match(css, /\.man-mode\s+\.code-btn\.active\s*\{[^}]*z-index:\s*1;/s);
+  assert.match(css, /\.man-mode\s+\.code-btn:hover[^{]*\{[^}]*z-index:\s*2;/s);
+});
+
+function makeClassList(initial = []) {
+  const set = new Set(initial);
+  return {
+    add: (...cs) => cs.forEach((c) => set.add(c)),
+    remove: (...cs) => cs.forEach((c) => set.delete(c)),
+    toggle: (c, force) => (force === undefined ? (set.has(c) ? (set.delete(c), false) : (set.add(c), true)) : (force ? (set.add(c), true) : (set.delete(c), false))),
+    contains: (c) => set.has(c),
+  };
+}
+
+function makeFakeViewHost() {
+  const indexBtn = { classList: makeClassList(), attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; } };
+  const widthBtn = { classList: makeClassList(), attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; } };
+  const tocEl = { innerHTML: "" };
+  const groupsEl = { innerHTML: "" };
+  const countEl = { textContent: "" };
+  const indexRoot = {
+    querySelector: (sel) => ({ ".man-index-count": countEl, ".man-index-toc": tocEl, ".man-index-groups": groupsEl }[sel] || null),
+  };
+  const bodyEl = { innerHTML: "", scrollTop: 0, querySelector: (sel) => (sel === ".man-index" ? indexRoot : null) };
+  const tagEl = { addEventListener() {}, innerHTML: "" };
+  const rootEl = {
+    classList: makeClassList(),
+    addEventListener() {},
+    querySelector: (sel) => ({
+      ".man-tag": tagEl,
+      ".man-body": bodyEl,
+      '.man-toolbar [data-act="index"]': indexBtn,
+      '.man-toolbar [data-act="width"]': widthBtn,
+    }[sel] || null),
+  };
+  const containerEl = {
+    isConnected: true,
+    _html: "",
+    set innerHTML(html) {
+      this._html = html;
+      const idxClass = /data-act="index"[^>]*class="([^"]*)"|class="([^"]*)"[^>]*data-act="index"/.exec(html);
+      const cls = (idxClass?.[1] || idxClass?.[2] || "").split(/\s+/).filter(Boolean);
+      indexBtn.classList = makeClassList(cls);
+      const idxPressed = /data-act="index"[^>]*aria-pressed="(true|false)"/.exec(html)?.[1];
+      if (idxPressed) indexBtn.attrs["aria-pressed"] = idxPressed;
+    },
+    get innerHTML() { return this._html; },
+    firstElementChild: rootEl,
+    querySelector: (sel) => rootEl.querySelector(sel),
+    querySelectorAll: () => [],
+  };
+  return { containerEl, rootEl, indexBtn, widthBtn, tocEl, countEl };
+}
+
+test("ManView: index button lit on index, TOC shows category(section), width toggles 980px", () => {
+  localStorage.removeItem("kip-man-width");
+  const { containerEl, rootEl, indexBtn, widthBtn, tocEl } = makeFakeViewHost();
+  const view = new ManView();
+  view.api = { getManTags: async () => ({ tags: [] }), getManIndex: async () => ({ pages: [] }), getManPage: async () => ({}) };
+  view.load = () => {};
+  const tab = { id: "t1", type: "man", repo: "man-pages", version: "man-pages-6.9" };
+  view.render(containerEl, tab);
+
+  // Index button starts lit when tab is at the index, unlit on a page
+  assert.equal(indexBtn.classList.contains("active"), true);
+  assert.equal(indexBtn.getAttribute("aria-pressed"), "true");
+  view.setIndexActive(false);
+  assert.equal(indexBtn.classList.contains("active"), false);
+  assert.equal(indexBtn.getAttribute("aria-pressed"), "false");
+  view.setIndexActive(true);
+  assert.equal(indexBtn.classList.contains("active"), true);
+
+  // Index TOC renders "System calls(2)" instead of bare "2"
+  view.index = [{ name: "read", section: "2", summary: "read from a file descriptor" }];
+  view.renderIndexGroups();
+  assert.match(tocEl.innerHTML, />System calls\(2\) <span class="man-muted">1<\/span><\/a>/);
+
+  // Width defaults to full page; toggling to 980px updates root class, button, tab, and localStorage
+  assert.equal(rootEl.classList.contains("man-narrow"), false);
+  view.setWidth("980");
+  assert.equal(rootEl.classList.contains("man-narrow"), true);
+  assert.equal(widthBtn.classList.contains("active"), true);
+  assert.equal(widthBtn.getAttribute("aria-pressed"), "true");
+  assert.equal(localStorage.getItem("kip-man-width"), "980");
+  view.setWidth("full");
+  assert.equal(rootEl.classList.contains("man-narrow"), false);
+  assert.equal(widthBtn.classList.contains("active"), false);
+  assert.equal(localStorage.getItem("kip-man-width"), "full");
+  // migrateLegacy keeps existing tab.version when only manRepo is set
+  view.tab = { id: "t2", type: "man", manRepo: "man-pages", version: "man-pages-6.9" };
+  view.migrateLegacy();
+  assert.equal(view.tab.repo, "man-pages");
+  assert.equal(view.tab.version, "man-pages-6.9");
+
+  localStorage.removeItem("kip-man-width");
 });

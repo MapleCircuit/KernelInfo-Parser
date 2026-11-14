@@ -24,9 +24,9 @@ export async function previousTag(target, client = api) {
     const idx = tags.indexOf(target);
     if (idx > 0) return tags[idx - 1];
     if (idx === -1 && tags.length > 0) return tags[tags.length - 1];
-    return tags.find((t) => t !== target) || "v3.0";
+    return tags.find((t) => t !== target) || target || "v3.0";
   } catch {
-    return "v3.0";
+    return target || "v3.0";
   }
 }
 
@@ -224,6 +224,7 @@ export async function showDiffPicker(anchorEl, { tabId, version, path, current, 
 
   revBtn.onclick = () => refPicker.open(revBtn, {
     current: selVersion,
+    client,
     onSelect: (ref) => {
       selVersion = ref;
       refresh();

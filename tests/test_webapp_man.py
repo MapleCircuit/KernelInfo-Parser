@@ -173,7 +173,7 @@ class ManFixture(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        for cache in (ms._TAG_DATES, ms._PAGE_MAPS, ms._INDEXES, ms._FACTS, ms._DOCS, ms._RESOLVED):
+        for cache in (ms._TAG_DATES, ms._PAGE_MAPS, ms._INDEXES, ms._DIFFS, ms._FACTS, ms._DOCS, ms._RESOLVED):
             dict.clear(cache)
 
     def active(self, name: str):
@@ -366,6 +366,81 @@ class TestManRouter(ManFixture):
         r = c.get("/api/man/resolve", params={"name": "read", "section": "2", "kernel": "v6.9"}, headers={"X-KI-Repo": "linux"})
         self.assertEqual(r.json()["version"], "man-pages-6.9")
         self.assertEqual(c.get("/api/man/resolve", params={"name": "read", "kernel": "-x"}).status_code, 400)
+        r = c.get("/api/man/diff", params={"a": "man-pages-6.9", "b": "man-pages-6.10", "repo": "man-pages"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["summary"], {"added": 2, "modified": 0, "deleted": 0, "unchanged": 6, "total_a": 6, "total_b": 8})
+        self.assertEqual(c.get("/api/man/diff", params={"a": "--x", "b": "man-pages-6.10"}).status_code, 400)
+        self.assertEqual(c.get("/api/man/diff", params={"a": "man-pages-9.99", "b": "man-pages-6.10"}).status_code, 404)
+
+
+class TestManDiff(ManFixture):
+    def test_layout_migration_and_added_modified_deleted(self) -> None:
+        self.active("man-pages")
+        # 5.10 -> 6.9: only printf(3) was modified
+        d56 = ms.diff("man-pages-5.10", "man-pages-6.9")
+        self.assertEqual(d56["source"], "git")
+        self.assertEqual(d56["summary"], {"added": 0, "modified": 1, "deleted": 0, "unchanged": 5, "total_a": 6, "total_b": 6})
+        self.assertEqual([(e["name"], e["section"], e["status"]) for e in d56["entries"]], [("printf", "3", "modified")])
+
+        # 6.9 -> 6.10: man2/ moved to man/man2/ without spurious delete/add; only off_t(2type) and newcall(2) are added
+        d610 = ms.diff("man-pages-6.9", "man-pages-6.10")
+        self.assertEqual(d610["summary"], {"added": 2, "modified": 0, "deleted": 0, "unchanged": 6, "total_a": 6, "total_b": 8})
+        self.assertEqual([(e["name"], e["section"], e["status"]) for e in d610["entries"]],
+                         [("newcall", "2", "added"), ("off_t", "2type", "added")])
+
+        # Reverse: 6.10 -> 5.10 reports deleted + modified
+        drev = ms.diff("man-pages-6.10", "man-pages-5.10")
+        self.assertEqual(drev["summary"], {"added": 0, "modified": 1, "deleted": 2, "unchanged": 5, "total_a": 8, "total_b": 6})
+        self.assertEqual([(e["name"], e["section"], e["status"]) for e in drev["entries"]],
+                         [("newcall", "2", "deleted"), ("off_t", "2type", "deleted"), ("printf", "3", "modified")])
+
+        # Same revision: empty entries, all unchanged
+        same = ms.diff("man-pages-6.10", "man-pages-6.10")
+        self.assertEqual(same["entries"], [])
+        self.assertEqual(same["summary"]["unchanged"], 8)
+
+    def test_modified_semantic_deltas_and_db_source(self) -> None:
+        self.active("linux")  # works from another active repository via manpages_repository()
+        # Verify modified semantic deltas (summary, fn, aliases, alias target) against a branch commit
+        _git(self.man, "checkout", "-q", "-b", "test-delta", "man-pages-6.10")
+        try:
+            _write(self.man, "man/man2/read.2", READ.replace(
+                "read \\- read from a file descriptor",
+                "read, read2 \\- read bytes from an fd",
+            ).replace(
+                ".BI \"ssize_t read(int \" fd \", void \" buf [. count \"], size_t \" count );",
+                ".BI \"ssize_t read(int \" fd \", void \" buf [. count \"], size_t \" count );\n.BI \"ssize_t read2(int \" fd );",
+            ))
+            _write(self.man, "man/man2/pwrite.2", PREAD)
+            _commit_all(self.man, "delta", "2024-07-01T12:00:00+00:00")
+
+            d = ms.diff("man-pages-6.10", "test-delta")
+            self.assertEqual(d["repo"], "man-pages")
+            self.assertEqual(d["summary"], {"added": 0, "modified": 2, "deleted": 0, "unchanged": 6, "total_a": 8, "total_b": 8})
+            by = {e["name"]: e for e in d["entries"]}
+            self.assertTrue(by["read"]["summary_changed"])
+            self.assertEqual(by["read"]["fn_added"], ["read2"])
+            self.assertEqual(by["read"]["aliases_added"], ["read2"])
+            self.assertTrue(by["pwrite"]["so_changed"])
+            self.assertEqual(by["pwrite"]["so_a"], "man/man2/pread.2")
+            self.assertIsNone(by["pwrite"]["so_b"])
+
+            # Stored family-6 DB rows for changed blobs mark source="db"
+            ms._DIFFS.clear()
+            with ms.using_repo("man-pages"):
+                tree_a = ms.git_tree_resolver.list_tree("man-pages-6.10")
+                tree_b = ms.git_tree_resolver.list_tree("test-delta")
+            self.db_rows = {
+                b: {"n": ["x"], "s": "stored", "so": ""}
+                for t in (tree_a, tree_b)
+                for p, b in t.items()
+                if ms.page_of_path(p)
+            }
+            d_db = ms.diff("man-pages-6.10", "test-delta")
+            self.assertEqual(d_db["source"], "db")
+        finally:
+            _git(self.man, "checkout", "-q", "master")
+            _git(self.man, "branch", "-D", "test-delta")
 
 
 class TestVersionsOrder(unittest.TestCase):

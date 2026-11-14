@@ -235,9 +235,12 @@
   border-color: currentColor;
 }
 
-.compare-chip.added .compare-chip-count { color: var(--accent-green); }
-.compare-chip.modified .compare-chip-count { color: var(--accent-yellow); }
-.compare-chip.deleted .compare-chip-count { color: var(--accent-red); }
+.compare-chip.added .compare-chip-count,
+.compare-chip.status-added { color: var(--accent-green); }
+.compare-chip.modified .compare-chip-count,
+.compare-chip.status-changed { color: var(--accent-yellow); }
+.compare-chip.deleted .compare-chip-count,
+.compare-chip.status-removed { color: var(--accent-red); }
 .compare-chip.renamed .compare-chip-count { color: var(--accent-purple); }
 .compare-chip.unchanged .compare-chip-count { color: var(--text-muted); }
 
@@ -691,6 +694,15 @@
 
 /* Compare view, API mode (A6, webapp/API.md §5.11) */
 .compare-api-arch { display: flex; gap: 8px; align-items: center; padding: 6px 0; font-size: 12px; }
+/* Compare view, Man pages mode */
+.compare-man-section { padding: 4px 6px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-primary); font-size: var(--fs-12, 12px); max-width: 240px; }
+.compare-man-summary-bar { margin-bottom: 8px; font-size: var(--fs-12, 12px); color: var(--text-muted); }
+.compare-man-name { flex-shrink: 0; font-weight: 600; color: var(--text-primary); }
+.compare-man-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: var(--font-sans); }
+.compare-man-badge { flex-shrink: 0; padding: 0 5px; border-radius: 3px; font-size: var(--fs-11, 11px); border: 1px solid var(--border-color); color: var(--text-secondary); background: var(--bg-secondary); }
+.compare-man-badge.kind-fn { color: var(--accent-blue); border-color: rgba(88, 166, 255, 0.35); }
+.compare-man-badge.kind-so { color: var(--accent-purple); border-color: rgba(163, 113, 247, 0.35); }
+.compare-man-badge.kind-moved { color: var(--text-muted); }
 .api-diff-sep { width: 12px; }
 .api-diff-list { display: flex; flex-direction: column; font-size: 12px; }
 .api-diff-row { display: grid; grid-template-columns: 18px 92px minmax(160px, 30%) 1fr; gap: 8px; padding: 3px 8px; border-bottom: 1px solid var(--border-color); cursor: pointer; }

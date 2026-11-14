@@ -25,9 +25,13 @@
 .man-toolbar .man-title { font-family: var(--font-mono); }
 .man-tag-label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); }
 .man-tag { max-width: 170px; font-size: var(--fs-12, 12px); }
-.man-mode { display: inline-flex; gap: 0; }
+.man-mode { display: inline-flex; gap: 0; isolation: isolate; }
+.man-mode .code-btn { position: relative; z-index: 0; }
 .man-mode .code-btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .man-mode .code-btn:last-child { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; }
+.man-mode .code-btn.active { z-index: 1; }
+.man-mode .code-btn:hover,
+.man-mode .code-btn:focus-visible { z-index: 2; }
 .man-linux { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; color: var(--text-secondary); }
 .man-linux a { color: var(--accent-blue); text-decoration: none; }
 .man-linux a:hover { text-decoration: underline; }
@@ -47,11 +51,19 @@
 
 /* ---------------------------------------------------------------- web mode (man7.org-like) */
 .man-web {
-  max-width: 980px;
   padding: 12px 24px 32px;
   font-family: var(--font-sans);
   font-size: var(--fs-14, 14px);
   line-height: 1.5;
+}
+.man-view.man-narrow .man-web {
+  max-width: 980px;
+  margin: 0 auto;
+}
+.man-view.man-narrow .man-mode-web .man-alias {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 6px 24px 0;
 }
 .man-web-head, .man-web-foot {
   display: flex;
@@ -155,7 +167,8 @@
   border-radius: var(--radius-md, 4px);
 }
 .man-index-toc { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 8px; font-family: var(--font-mono); font-size: var(--fs-12, 12px); }
-.man-index-toc a { color: var(--accent-blue); text-decoration: none; }
+.man-index-toc a { color: var(--accent-blue); text-decoration: none; white-space: nowrap; }
+.man-index-toc a:hover { text-decoration: underline; }
 .man-index-sec h2 {
   margin: 16px 0 6px;
   font-size: var(--fs-14, 14px);

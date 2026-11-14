@@ -213,3 +213,32 @@ test("project badge only for tabs outside the linux kernel", () => {
   assert.equal(projectBadge("man-pages"), "man-pages");
   assert.equal(projectBadge("other-repo"), "other-repo");
 });
+
+test("compare man-pages mode deep links and reused man tab version update", () => {
+  workspace([
+    { id: "m1", type: "man", manPage: "read", manSec: "2", version: "man-pages-6.9", repo: "man-pages" },
+  ]);
+  urlSync.setRepoHandler((repo) => ({ repo, version: "" }));
+  // Reopening an existing man tab at another revision updates its version
+  state.openTab({ type: "man", repo: "man-pages", version: "man-pages-6.10", manPage: "newcall", manSec: "2" });
+  assert.equal(state.getActiveTab().version, "man-pages-6.10");
+  assert.equal(state.getActiveTab().manPage, "newcall");
+
+  // Deep link to Compare in man-pages mode round-trips cleanly
+  urlSync.applyHash("repo=man-pages&tab=diff&a=man-pages-6.9&b=man-pages-6.10&mode=man&st=added,modified&sec=2&q=read");
+  const diff = state.getActiveTab();
+  assert.equal(diff.type, "diff");
+  assert.equal(diff.repo, "man-pages");
+  assert.equal(diff.mode, "man");
+  assert.equal(diff.versionA, "man-pages-6.9");
+  assert.equal(diff.versionB, "man-pages-6.10");
+  assert.equal(diff.manStatuses, "added,modified");
+  assert.equal(diff.manSection, "2");
+  assert.equal(diff.manQuery, "read");
+  const h = lastHash();
+  assert.equal(h.get("repo"), "man-pages");
+  assert.equal(h.get("mode"), "man");
+  assert.equal(h.get("st"), "added,modified");
+  assert.equal(h.get("sec"), "2");
+  assert.equal(h.get("q"), "read");
+});

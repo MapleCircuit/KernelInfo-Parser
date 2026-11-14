@@ -1540,8 +1540,13 @@ class KernelIdeApp {
           }
         }
       },
-      { title: "Compare versions or commits", hint: "Files & Kconfig changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
+      { title: "Compare versions or commits", hint: "Files, Kconfig & man-pages changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
       { title: "Compare kernel APIs", hint: "Syscalls, exports, parameters, tracepoints and modules added, removed or changed between two revisions", keywords: "api changelog diff exports compare", run: () => state.openTab({ type: "diff", title: "Compare", mode: "api", versionB: v() }) },
+      { title: "Compare man pages", hint: "Man entries added, modified or deleted between two man-pages revisions", keywords: "man manual manpage man-pages diff compare", run: () => {
+        const repo = manPagesRepo();
+        if (!repo) { toast.info("No man-pages repository is configured (a repository whose project is man-pages)"); return; }
+        state.openTab({ type: "diff", title: "Compare", repo, mode: "man" });
+      } },
       { title: "Open man pages", hint: "Linux man-pages index (sections, filter), Web or Terminal rendering", keywords: "man manual manpage man-pages syscall", run: () => this.openManIndex() },
       { title: "Open Kernel API", hint: "Syscalls, exports, parameters, tracepoints, modules, device tables", keywords: "kapi api catalog", run: () => state.openTab({ type: "api", title: "Kernel API", version: v() }) },
       ...apiSections().map((sec) => ({ title: `Kernel API: ${sec.label}`, hint: sec.hint || "", keywords: `kapi ${sec.keywords || ""}`,

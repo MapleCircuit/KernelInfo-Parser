@@ -16,9 +16,10 @@ import { escapeHtml } from "../../components/modal.js";
 import { openDefinition } from "../../utils/definition_picker.js";
 import { isManPagesRepo, manPagesRepo, projects } from "../../utils/projects.js";
 import { renderManTerm, renderManWeb } from "./man_render.js";
-import { groupIndex, linuxApiTab, linuxSymbolTab, man7Url, manLabel, manTabTitle, pageOfPath } from "./man_model.js";
+import { groupIndex, indexSectionLabel, linuxApiTab, linuxSymbolTab, man7Url, manLabel, manTabTitle, pageOfPath } from "./man_model.js";
 
 const MODE_KEY = "kip-man-mode";
+const WIDTH_KEY = "kip-man-width";
 const MAX_SYMBOL_LINKS = 16;
 let idSeq = 0;
 
@@ -39,10 +40,52 @@ function rememberManMode(mode) {
   }
 }
 
+/** Web-mode width a new man view starts with: "full" unless "980" (restricted, centered). */
+export function defaultManWidth() {
+  try {
+    return localStorage.getItem(WIDTH_KEY) === "980" ? "980" : "full";
+  } catch {
+    return "full";
+  }
+}
+
+function rememberManWidth(width) {
+  try {
+    localStorage.setItem(WIDTH_KEY, width);
+  } catch {
+    // not kept: the next view starts in the default width
+  }
+}
+
+const resolveManWidth = (tab) => (tab?.manWidth === "980" || tab?.manWidth === "full" ? tab.manWidth : defaultManWidth());
+
 const modeToggleHtml = (mode) => `<span class="man-mode" role="group" aria-label="Display mode">
   <button type="button" class="code-btn${mode === "web" ? " active" : ""}" data-mode="web" aria-pressed="${mode === "web"}" title="man7.org-like page">Web</button>
   <button type="button" class="code-btn${mode === "term" ? " active" : ""}" data-mode="term" aria-pressed="${mode === "term"}" title="As man(1) shows it in a terminal">Terminal</button>
 </span>`;
+
+const widthToggleHtml = (width) => {
+  const narrow = width === "980";
+  return `<button type="button" class="code-btn${narrow ? " active" : ""}" data-act="width" aria-pressed="${narrow}" title="Toggle web page width: full page or centered 980px">↔ 980px</button>`;
+};
+
+function applyModeButtons(root, mode) {
+  for (const b of root.querySelectorAll(".man-mode [data-mode]")) {
+    const active = b.dataset.mode === mode;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function applyWidthUi(root, width) {
+  const narrow = width === "980";
+  root.classList.toggle("man-narrow", narrow);
+  const btn = root.querySelector('.man-toolbar [data-act="width"]');
+  if (btn) {
+    btn.classList.toggle("active", narrow);
+    btn.setAttribute("aria-pressed", String(narrow));
+  }
+}
 
 /** HTML of a page answer in a mode. */
 function pageHtml(res, mode) {
@@ -115,12 +158,15 @@ export class ManView {
     this.containerEl = containerEl;
     this.tab = tab;
     this.tabId = tab.id;
-    containerEl.innerHTML = `<div class="man-view">
+    const inIndex = !(tab.manPage || tab.manPath);
+    const width = this.widthMode();
+    containerEl.innerHTML = `<div class="man-view${width === "980" ? " man-narrow" : ""}">
       <div class="man-toolbar">
-        <button type="button" class="code-btn" data-act="index" title="Every page of this tag, by section">☰ Index</button>
+        <button type="button" class="code-btn${inIndex ? " active" : ""}" data-act="index" aria-pressed="${inIndex}" title="Every page of this tag, by section">☰ Index</button>
         <span class="man-title"></span>
         <label class="man-tag-label">Tag <select class="man-tag" title="man-pages release"></select></label>
         ${modeToggleHtml(this.mode())}
+        ${widthToggleHtml(width)}
         <span class="man-linux"></span>
         <a class="man-ext" hidden target="_blank" rel="noopener noreferrer" title="The same page on man7.org">man7.org ↗</a>
       </div>
@@ -138,6 +184,17 @@ export class ManView {
 
   mode() {
     return this.tab.manMode === "term" || this.tab.manMode === "web" ? this.tab.manMode : defaultManMode();
+  }
+
+  widthMode() {
+    return resolveManWidth(this.tab);
+  }
+
+  setIndexActive(on) {
+    const btn = this.containerEl?.querySelector('.man-toolbar [data-act="index"]');
+    if (!btn) return;
+    btn.classList.toggle("active", Boolean(on));
+    btn.setAttribute("aria-pressed", String(Boolean(on)));
   }
 
   /**
@@ -159,7 +216,7 @@ export class ManView {
   migrateLegacy() {
     if (!this.tab.manRepo && !this.tab.manVersion) return;
     if (this.tab.manRepo) this.tab.repo = this.tab.manRepo;
-    if (this.tab.manRepo || this.tab.manVersion) this.tab.version = this.tab.manVersion || "";
+    if (this.tab.manVersion) this.tab.version = this.tab.manVersion;
     delete this.tab.manRepo;
     delete this.tab.manVersion;
     state.saveState();
@@ -250,6 +307,7 @@ export class ManView {
   }
 
   async showPage(repo, mv, seq) {
+    this.setIndexActive(false);
     const target = { name: this.tab.manPage || "", section: this.tab.manSec || "", path: this.tab.manPath || "" };
     const label = target.path || manLabel(target.name, target.section);
     this.setTitle(label);
@@ -288,6 +346,7 @@ export class ManView {
   }
 
   async showIndex(repo, mv, seq) {
+    this.setIndexActive(true);
     this.setTitle(`Man pages · ${mv}`);
     this.status(`Loading the index of ${escapeHtml(mv)}…`);
     let res;
@@ -313,6 +372,7 @@ export class ManView {
     input.addEventListener("input", () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
+        if (!this.live(seq)) return;
         this.persist({ manQuery: input.value.trim() });
         this.renderIndexGroups();
       }, 120);
@@ -327,8 +387,10 @@ export class ManView {
     const total = groups.reduce((n, g) => n + g.pages.length, 0);
     root.querySelector(".man-index-count").textContent = `${total.toLocaleString("en-US")} of ${(this.index || []).length.toLocaleString("en-US")} pages`;
     const prefix = `manidx${++idSeq}-`;
-    root.querySelector(".man-index-toc").innerHTML = groups.map((g) =>
-      `<a href="#" data-man-anchor="${escapeHtml(prefix + g.section)}" title="${escapeHtml(g.title)}">${escapeHtml(g.section)} <span class="man-muted">${g.pages.length}</span></a>`).join("");
+    root.querySelector(".man-index-toc").innerHTML = groups.map((g) => {
+      const label = indexSectionLabel(g.section, g.title);
+      return `<a href="#" data-man-anchor="${escapeHtml(prefix + g.section)}" title="${escapeHtml(label)}">${escapeHtml(label)} <span class="man-muted">${g.pages.length}</span></a>`;
+    }).join("");
     root.querySelector(".man-index-groups").innerHTML = groups.length ? groups.map((g) => `<section class="man-index-sec">
       <h2 id="${escapeHtml(prefix + g.section)}">${escapeHtml(g.section)} · ${escapeHtml(g.title)}</h2>
       <ul class="man-index-list">${g.pages.map((p) => `<li><a href="#" data-man-ref="${escapeHtml(p.name)}" data-man-sec="${escapeHtml(p.section || "")}" data-man-path="${escapeHtml(p.path || "")}">${escapeHtml(manLabel(p.name, p.section))}</a>${p.so ? ' <span class="man-muted" title="alias page">→</span>' : ""}${p.summary ? ` <span class="man-summary">${escapeHtml(p.summary)}</span>` : ""}</li>`).join("")}</ul>
@@ -341,7 +403,15 @@ export class ManView {
     const act = e.target.closest("[data-act]");
     if (act?.dataset.act === "index") {
       e.preventDefault();
+      if (!forceNew && !this.tab.manPage && !this.tab.manPath && this.body().querySelector(".man-index")) {
+        this.body().scrollTop = 0;
+        return;
+      }
       this.navigate({ name: "", section: "", path: "" }, { forceNew });
+      return;
+    }
+    if (act?.dataset.act === "width") {
+      this.setWidth(this.widthMode() === "980" ? "full" : "980");
       return;
     }
     const mode = e.target.closest("[data-mode]");
@@ -372,11 +442,15 @@ export class ManView {
     if (mode !== "web" && mode !== "term") return;
     rememberManMode(mode);
     this.persist({ manMode: mode });
-    for (const b of this.containerEl.querySelectorAll(".man-mode [data-mode]")) {
-      b.classList.toggle("active", b.dataset.mode === mode);
-      b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
-    }
+    applyModeButtons(this.containerEl, mode);
     this.renderPage();
+  }
+
+  setWidth(width) {
+    if (width !== "full" && width !== "980") return;
+    rememberManWidth(width);
+    this.persist({ manWidth: width });
+    applyWidthUi(this.containerEl.firstElementChild, width);
   }
 
   /** A cross reference: fetched first, so a page missing at this tag leaves the tab where it is. */
@@ -404,7 +478,7 @@ export class ManView {
     if (forceNew) {
       state.openTab({
         type: "man", repo: this.repo(), version: this.manVersion(), manMode: this.tab.manMode || "",
-        kernelVersion: this.tab.kernelVersion || "", kernelRepo: this.tab.kernelRepo || "", manQuery: "",
+        manWidth: this.tab.manWidth || "", kernelVersion: this.tab.kernelVersion || "", kernelRepo: this.tab.kernelRepo || "", manQuery: "",
         ...fields, title: manTabTitle(fields), forceNew: true,
       });
       return;
@@ -434,11 +508,13 @@ export class ManView {
 export async function mountManDocument(host, opts) {
   const tab = opts.tab || {};
   const mode = () => (tab.manMode === "term" || tab.manMode === "web" ? tab.manMode : defaultManMode());
-  host.innerHTML = `<div class="man-view man-in-code">
+  const widthMode = () => resolveManWidth(tab);
+  host.innerHTML = `<div class="man-view man-in-code${widthMode() === "980" ? " man-narrow" : ""}">
     <div class="man-toolbar">
       ${opts.canGoBack ? '<button type="button" class="code-btn" data-act="back" title="Previous page">← Back</button>' : ""}
       <span class="man-title"><b>${escapeHtml(pageOfPath(opts.path) ? manLabel(pageOfPath(opts.path).name, pageOfPath(opts.path).section) : opts.path)}</b></span>
       ${modeToggleHtml(mode())}
+      ${widthToggleHtml(widthMode())}
       <button type="button" class="code-btn" data-act="source" title="The roff source of this page">&lt;/&gt; Source</button>
       <button type="button" class="code-btn" data-act="tab" title="Open this page in a man pages tab">Man tab</button>
       <span class="man-linux"></span>
@@ -456,10 +532,17 @@ export async function mountManDocument(host, opts) {
     const act = e.target.closest("[data-act]")?.dataset.act;
     if (act === "back") return opts.onBack?.();
     if (act === "source") return opts.onShowSource?.();
+    if (act === "width") {
+      tab.manWidth = widthMode() === "980" ? "full" : "980";
+      rememberManWidth(tab.manWidth);
+      state.saveState();
+      applyWidthUi(root, tab.manWidth);
+      return;
+    }
     if (act === "tab") {
       const p = pageOfPath(opts.path) || {};
       const fields = { manPage: res?.name || p.name || "", manSec: res?.section || p.section || "", manPath: opts.path };
-      state.openTab({ type: "man", repo: opts.repo, version: opts.version, manMode: mode(), ...fields, title: manTabTitle(fields) });
+      state.openTab({ type: "man", repo: opts.repo, version: opts.version, manMode: mode(), manWidth: widthMode(), ...fields, title: manTabTitle(fields) });
       return;
     }
     const m = e.target.closest("[data-mode]");
@@ -467,7 +550,7 @@ export async function mountManDocument(host, opts) {
       tab.manMode = m.dataset.mode;
       rememberManMode(tab.manMode);
       state.saveState();
-      for (const b of root.querySelectorAll(".man-mode [data-mode]")) b.classList.toggle("active", b.dataset.mode === tab.manMode);
+      applyModeButtons(root, tab.manMode);
       draw();
       return;
     }

@@ -41,6 +41,12 @@ export function sectionTitle(section) {
   return `${base} — ${SUFFIX_TITLES[suffix] || suffix}`;
 }
 
+/** Label for an index TOC entry: "System calls(2)". */
+export function indexSectionLabel(section, title = sectionTitle(section)) {
+  const s = String(section || "");
+  return s ? `${title}(${s})` : title;
+}
+
 /** "read(2)" */
 export const manLabel = (name, section) => `${name || "?"}${section ? `(${section})` : ""}`;
 

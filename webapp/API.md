@@ -18,7 +18,7 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L262-L270]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L271-L313]
   - 2.6. Frontend & Service Architectural Invariants [L314-L366]
-- 2B. Backend Domain & Infrastructure Services [L367-L968]
+- 2B. Backend Domain & Infrastructure Services [L367-L969]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L369-L448]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L449-L481]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L482-L511]
@@ -32,16 +32,16 @@ ES-Module IDE frontend.
   - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L808-L853]
   - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L854-L871]
   - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L872-L921]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L922-L968]
-- 3. Database Schema & Underlying Tables [L969-L983]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L984-L989]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L990-L995]
-- 6. Using the Services from Python [L996-L1013]
-- 7. Configuration & Execution [L1014-L1099]
-  - 7.1. Configuration Precedence & Resolution [L1016-L1064]
-  - 7.2. Starting the Server [L1065-L1099]
-- 8. Error Handling, Status Codes & Resilience [L1100-L1131]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1113-L1131]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L922-L969]
+- 3. Database Schema & Underlying Tables [L970-L984]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L985-L990]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L991-L996]
+- 6. Using the Services from Python [L997-L1014]
+- 7. Configuration & Execution [L1015-L1100]
+  - 7.1. Configuration Precedence & Resolution [L1017-L1065]
+  - 7.2. Starting the Server [L1066-L1100]
+- 8. Error Handling, Status Codes & Resilience [L1101-L1132]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1114-L1132]
 <!-- toc:end -->
 
 ---
@@ -956,11 +956,12 @@ repository.
   tags are tried first, then newer ones. One `git cat-file --batch-check` answers every candidate path
   (`man/manS/name.S`, `manS/name.S` for each section to try) at every tag. Without a usable man-pages
   repository, kernel revision or page, the answer is the man7.org URL.
+- **Version comparison**: `man_service.diff(a, b)` matches entries between two man-pages revisions by canonical `(name, section)` from `page_map(sha)` rather than repository path so layout moves (e.g. `man2/` to `man/man2/`) appear as path updates on unchanged or modified entries rather than false deletions and additions. Only entries whose tree blob differs (or that appear on only one side) have facts batch-loaded via `_facts_of`; `.so` alias targets are resolved with `fetch_missing=False` when the target is absent, and modified entries report semantic deltas (`summary_changed`, `so_changed`, `fn_added`, `fn_removed`, `aliases_added`, `aliases_removed`).
 - **Caches** (§2.10): `_TAG_DATES` (per repository), `_PAGE_MAPS` (64 commits), `_INDEXES` (32 commits),
-  `_FACTS` (16,384 blobs), `_DOCS` (256 parsed blobs) and `_RESOLVED` (1,024 `(man-pages repository, name,
-  section, kernel commit)` answers, scoped by the kernel repository) are `RepoScopedCache`s; tag dates and
-  resolve answers are dropped when the refs change (`register_refs_changed`), the commit- and blob-keyed
-  entries are immutable.
+  `_FACTS` (16,384 blobs), `_DOCS` (256 parsed blobs), `_RESOLVED` (1,024 `(man-pages repository, name,
+  section, kernel commit)` answers, scoped by the kernel repository), and `_DIFFS` (64 `(rev_a, rev_b)` diffs,
+  bounded LRU keyed by canonical commit SHAs) are `RepoScopedCache`s; tag dates and resolve answers are dropped
+  when the refs change (`register_refs_changed`), the commit- and blob-keyed entries are immutable.
 - **Input validation**: revisions go through `safe_rev()` (`kernel` of a page silently falls back when it does
   not resolve); names match `^[A-Za-z0-9_.:+-]{1,128}$`, sections `^[0-9][a-z]{0,12}$`, paths must pass
   `is_safe_rel_path()` and be page paths; blobs are read by their tree SHA and `cat-file` specs pass

@@ -1,13 +1,20 @@
 /**
  * diff_view.js - Compare view: file and Kconfig deltas between any two tags or commits.
  */
-import { API_KINDS, API_STATUSES, apiDiffHtml, apiDiffMarkdown, apiDiffRows, apiDiffTsv, filterApiRows } from "./api_diff.js";
+import { API_KINDS, API_STATUSES, KIND_LABEL, apiDiffHtml, apiDiffMarkdown, apiDiffRows, apiDiffTsv, filterApiRows } from "./api_diff.js";
+import {
+  MAN_DOWNLOAD_FORMATS, MAN_STATUS_LABELS, MAN_STATUSES,
+  filterManEntries, manDiffBadges, manDiffMarkdown, manDiffSections, manDiffTsv,
+} from "./man_diff.js";
 import { progressLabel } from "../../utils/job_poll.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { refPicker, shortRef } from "../../components/ref_picker.js";
 import { downloadText } from "../../components/modal.js";
 import { contextMenu } from "../../components/context_menu.js";
+import { debounce } from "../../utils/debounce.js";
+import { isManPagesRepo, manPagesRepo } from "../../utils/projects.js";
+import { manLabel, manTabFields, manTabTitle } from "../man/man_model.js";
 import { previousTag } from "../code_view/file_diff.js";
 
 const PAGE_SIZE = 500;
@@ -61,23 +68,55 @@ export class DiffView {
     this.renameSearches = [];
     this.kconfigFilter = "";
     this.kconfigStatusFilter = new Set();
+    this.manResult = null;
+    this.manStatuses = new Set();
+    this.manSection = "";
+    this.manQuery = "";
+    this.manVisibleCount = PAGE_SIZE;
     // Unchanged files, fetched when the unchanged chip is first selected
     this.unchangedFiles = null;
     this.unchangedLoading = null;
     this.unchangedError = "";
   }
 
+  repo() {
+    return this.tab?.repo || state.activeRepo();
+  }
+
+  isManRepo() {
+    return isManPagesRepo(this.repo());
+  }
+
   async render(containerEl, tabData) {
     this.tab = tabData;
     this.containerEl = containerEl;
-    this.versionB = tabData.versionB || state.currentVersion;
+    if (tabData.mode === "man" && !this.isManRepo()) {
+      const mrepo = manPagesRepo();
+      if (mrepo) {
+        tabData.repo = mrepo;
+        state.updateTabState(tabData.id, { repo: mrepo }, { replace: true });
+      }
+    }
+    const isMan = this.isManRepo();
+    const hasMan = isMan || Boolean(manPagesRepo());
+
+    this.versionB = tabData.versionB || tabData.version || await this.defaultTarget();
     this.versionA = tabData.versionA || await this.defaultBaseFor(this.versionB);
-    this.currentMode = ["kconfig", "api"].includes(tabData.mode) ? tabData.mode : "files";
+    if (isMan) {
+      this.currentMode = tabData.mode === "files" ? "files" : "man";
+    } else {
+      this.currentMode = ["kconfig", "api"].includes(tabData.mode) ? tabData.mode : "files";
+    }
     // API mode (A6): kinds, statuses, filter and ARCH, recorded on the tab
     this.apiKinds = new Set(String(tabData.apiKinds || "").split(",").filter((k) => API_KINDS.includes(k)));
     this.apiStatuses = new Set(String(tabData.apiStatuses || "").split(",").filter((k) => API_STATUSES.includes(k)));
     this.apiQuery = tabData.apiQuery || "";
     this.apiArch = tabData.apiArch || state.kconfigArch() || "x86_64";
+    // Man pages mode: status chips, section and text filter, recorded on the tab
+    this.manStatuses = new Set(String(tabData.manStatuses || "").split(",").filter((k) => MAN_STATUSES.includes(k)));
+    this.manSection = tabData.manSection || "";
+    this.manQuery = tabData.manQuery || "";
+    this.manVisibleCount = PAGE_SIZE;
     // View state recorded on the tab (and so in the URL, §5.26): chips, filters, rename searches
     this.statusFilter = new Set(String(tabData.statuses || "").split(",").filter((k) => FILE_STATUSES.includes(k)));
     this.fileFilter = tabData.query || "";
@@ -92,12 +131,23 @@ export class DiffView {
       this.renameScope = lastSearch.dir;
     }
 
+    const subtitle = isMan
+      ? "Man entries and files changed between any two man-pages release tags or commits."
+      : "Files, Kconfig and API changes between any two release tags or commits.";
+    const modeButtons = isMan
+      ? `<button class="code-btn" data-mode="man" type="button" title="Man entries added, modified or deleted">Man pages <span class="compare-mode-count" id="cmp-count-man"></span></button>
+         <button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>`
+      : `<button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>
+         <button class="code-btn" data-mode="kconfig" type="button">Kconfig <span class="compare-mode-count" id="cmp-count-kconfig"></span></button>
+         <button class="code-btn" data-mode="api" type="button" title="Kernel API changes: syscalls, exports, parameters, tracepoints, modules">API <span class="compare-mode-count" id="cmp-count-api"></span></button>
+         ${hasMan ? `<button class="code-btn" data-mode="man" type="button" title="Compare man entries in the man-pages repository">Man pages <span class="compare-mode-count" id="cmp-count-man"></span></button>` : ""}`;
+
     containerEl.innerHTML = `
       <div class="tools-view-container compare-view">
         <div class="compare-header">
           <div>
             <div class="compare-title">Compare</div>
-            <div class="compare-subtitle">Files and Kconfig changes between any two release tags or commits.</div>
+            <div class="compare-subtitle">${subtitle}</div>
           </div>
           <div class="compare-refs">
             <button class="compare-ref-btn" id="cmp-ref-a" type="button" title="Base revision">
@@ -110,11 +160,7 @@ export class DiffView {
           </div>
         </div>
 
-        <div class="compare-modes">
-          <button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>
-          <button class="code-btn" data-mode="kconfig" type="button">Kconfig <span class="compare-mode-count" id="cmp-count-kconfig"></span></button>
-          <button class="code-btn" data-mode="api" type="button" title="Kernel API changes: syscalls, exports, parameters, tracepoints, modules">API <span class="compare-mode-count" id="cmp-count-api"></span></button>
-        </div>
+        <div class="compare-modes">${modeButtons}</div>
 
         <div id="diff-results-container"></div>
       </div>
@@ -129,6 +175,7 @@ export class DiffView {
       const btn = e.currentTarget;
       refPicker.open(btn, {
         current: which === "a" ? this.versionA : this.versionB,
+        client: this.api,
         onSelect: (ref) => {
           if (which === "a") this.versionA = ref;
           else this.versionB = ref;
@@ -150,6 +197,11 @@ export class DiffView {
     };
     containerEl.querySelectorAll(".compare-modes .code-btn").forEach((btn) => {
       btn.onclick = () => {
+        if (btn.dataset.mode === "man" && !this.isManRepo()) {
+          const mrepo = manPagesRepo();
+          if (mrepo) state.openTab({ type: "diff", title: "Compare", repo: mrepo, mode: "man" });
+          return;
+        }
         if (this.currentMode === btn.dataset.mode) return;
         this.currentMode = btn.dataset.mode;
         this.persist();
@@ -159,6 +211,22 @@ export class DiffView {
     });
 
     await this.loadDiff();
+  }
+
+  /** Default target: the newest release tag of the tab's repository, else state.currentVersion. */
+  async defaultTarget() {
+    try {
+      const res = await this.api.getVersionsCached(true);
+      const all = (res.versions || []).filter((v) => typeof v === "string" || v.ref_type !== 3);
+      const tags = all.map((v) => (typeof v === "string" ? v : v.vname)).filter(Boolean);
+      const isPre = (name) => /-(rc|pre|alpha|beta)\d*$/.test(name);
+      const finals = tags.filter((n) => !isPre(n));
+      if (finals.length) return finals[finals.length - 1];
+      if (tags.length) return tags[tags.length - 1];
+    } catch {
+      // fall back below
+    }
+    return state.currentVersion || "HEAD";
   }
 
   /** Default base: the release tag preceding target (or the latest tag when target is a commit). */
@@ -179,14 +247,18 @@ export class DiffView {
   persist(options = {}) {
     if (!this.tab) return;
     const title = `Compare ${shortRef(this.versionA)}…${shortRef(this.versionB)}`;
+    const mode = this.currentMode === "files" && !this.isManRepo() ? "" : this.currentMode;
     this.persistTabState({
       versionA: this.versionA,
       versionB: this.versionB,
-      mode: this.currentMode === "files" ? "" : this.currentMode,
+      mode,
       apiKinds: API_KINDS.filter((k) => this.apiKinds?.has(k)).join(","),
       apiStatuses: API_STATUSES.filter((k) => this.apiStatuses?.has(k)).join(","),
       apiQuery: this.apiQuery || "",
       apiArch: this.currentMode === "api" ? this.apiArch : "",
+      manStatuses: MAN_STATUSES.filter((k) => this.manStatuses?.has(k)).join(","),
+      manSection: this.manSection || "",
+      manQuery: this.manQuery || "",
       statuses: FILE_STATUSES.filter((k) => this.statusFilter.has(k)).join(","),
       query: this.fileFilter,
       kconfigQuery: this.kconfigFilter,
@@ -223,7 +295,13 @@ export class DiffView {
     resContainer.innerHTML = `<div class="compare-empty">Comparing ${escapeHtml(shortRef(this.versionA))} → ${escapeHtml(shortRef(this.versionB))}…</div>`;
 
     try {
-      if (this.currentMode === "api") {
+      if (this.currentMode === "man") {
+        const res = await this.api.getManDiff(this.repo(), this.versionA, this.versionB);
+        if (seq !== this.loadSeq) return;
+        this.manResult = res;
+        this.manVisibleCount = PAGE_SIZE;
+        this.renderManDiff(resContainer);
+      } else if (this.currentMode === "api") {
         this.apiAbort?.abort();
         this.apiAbort = new AbortController();
         const res = await this.api.requestJob(`/api/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
@@ -306,10 +384,19 @@ export class DiffView {
       clearTimeout(t);
       t = setTimeout(() => {
         this.apiQuery = filter.value.trim();
-        rerender();
-        const f = container.querySelector(".api-diff-filter");
-        f.focus();
-        f.setSelectionRange(f.value.length, f.value.length);
+        this.persist();
+        const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
+        const dlBtn = container.querySelector(".api-diff-download");
+        if (dlBtn) dlBtn.textContent = `⬇ Download (${shown.length})`;
+        const listEl = container.querySelector(".api-diff-list");
+        if (listEl) {
+          listEl.innerHTML = shown.slice(0, 3000).map((r) => `<div class="api-diff-row status-${r.status}" data-kind="${r.kind}" data-key="${escapeHtml(r.key)}" data-status="${r.status}">
+            <span class="api-diff-status">${r.status === "added" ? "+" : r.status === "removed" ? "−" : "~"}</span>
+            <span class="api-diff-kind">${escapeHtml(KIND_LABEL[r.kind] || r.kind)}</span>
+            <span class="api-diff-key">${escapeHtml(r.key)}</span>
+            <span class="api-diff-detail">${escapeHtml(r.detail)}</span></div>`).join("") || '<div class="compare-empty">No API change matches.</div>'
+            + (shown.length > 3000 ? `<div class="compare-empty">… ${shown.length - 3000} more (download the table)</div>` : "");
+        }
       }, 200);
     };
     container.querySelector(".api-diff-download").onclick = (e) => {
@@ -387,11 +474,14 @@ export class DiffView {
     });
 
     const filterInput = resContainer.querySelector("#cmp-file-filter");
-    filterInput.oninput = () => {
-      this.fileFilter = filterInput.value;
+    const applyFileFilter = debounce(() => {
       this.visibleCount = PAGE_SIZE;
       this.renderFileRows();
       this.persist();
+    }, 120);
+    filterInput.oninput = () => {
+      this.fileFilter = filterInput.value;
+      applyFileFilter();
     };
 
     this.wireDownloadMenu(resContainer, (format) => this.downloadFileRows(format));
@@ -828,8 +918,219 @@ export class DiffView {
       title: path.split("/").pop(),
       path,
       version,
+      repo: this.repo(),
       forceNew
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Man pages mode
+  // ---------------------------------------------------------------------------
+
+  renderManDiff(resContainer) {
+    const res = this.manResult || {};
+    const s = res.summary || {};
+    const entries = res.entries || [];
+    const sections = manDiffSections(entries);
+    if (this.manSection && !sections.some((sec) => sec.section === this.manSection)) {
+      this.manSection = "";
+    }
+
+    const countEl = this.containerEl.querySelector("#cmp-count-man");
+    if (countEl) countEl.textContent = entries.length;
+
+    const chip = (key, label, count) => `
+      <button class="compare-chip ${key} ${this.manStatuses.has(key) ? "active" : ""}" data-man-status="${key}" type="button">
+        <span class="compare-chip-count">${count ?? 0}</span> ${label}
+      </button>`;
+
+    const secOptions = sections.map((sec) => `<option value="${escapeHtml(sec.section)}" ${sec.section === this.manSection ? "selected" : ""}>${escapeHtml(`${sec.section} — ${sec.title} (${sec.count})`)}</option>`).join("");
+
+    resContainer.innerHTML = `
+      <div class="compare-toolbar">
+        <div class="compare-chips">
+          ${chip("added", "added", s.added)}
+          ${chip("modified", "modified", s.modified)}
+          ${chip("deleted", "deleted", s.deleted)}
+        </div>
+        <div class="compare-toolbar-right">
+          <select class="compare-man-section" id="cmp-man-section" title="Filter by man section">
+            <option value="">All sections (${entries.length})</option>
+            ${secOptions}
+          </select>
+          <input type="text" class="compare-filter" id="cmp-man-filter" placeholder="Filter entries, summaries, symbols…" value="${escapeHtml(this.manQuery)}" spellcheck="false" />
+          ${this.downloadMenuHtml(MAN_DOWNLOAD_FORMATS, "Download every man entry matching the current filters")}
+        </div>
+      </div>
+      <div class="compare-man-summary-bar">
+        ${entries.length.toLocaleString()} changed · ${(s.unchanged ?? 0).toLocaleString()} unchanged · ${(s.total_b ?? 0).toLocaleString()} entries in ${escapeHtml(shortRef(this.versionB))}${res.source ? ` · source: ${escapeHtml(res.source)}` : ""}
+      </div>
+      <div class="compare-list" id="cmp-man-list"></div>
+    `;
+
+    resContainer.querySelectorAll(".compare-chip[data-man-status]").forEach((btn) => {
+      btn.onclick = () => {
+        const key = btn.dataset.manStatus;
+        if (this.manStatuses.has(key)) this.manStatuses.delete(key);
+        else this.manStatuses.add(key);
+        btn.classList.toggle("active", this.manStatuses.has(key));
+        this.manVisibleCount = PAGE_SIZE;
+        this.persist();
+        this.renderManRows();
+      };
+    });
+
+    const secSelect = resContainer.querySelector("#cmp-man-section");
+    secSelect.onchange = () => {
+      this.manSection = secSelect.value;
+      this.manVisibleCount = PAGE_SIZE;
+      this.persist();
+      this.renderManRows();
+    };
+
+    const filterInput = resContainer.querySelector("#cmp-man-filter");
+    const applyManFilter = debounce(() => {
+      this.manVisibleCount = PAGE_SIZE;
+      this.renderManRows();
+      this.persist();
+    }, 120);
+    filterInput.oninput = () => {
+      this.manQuery = filterInput.value;
+      applyManFilter();
+    };
+
+    this.wireDownloadMenu(resContainer, (format) => this.downloadManRows(format));
+    this.renderManRows();
+  }
+
+  filteredManEntries() {
+    return filterManEntries(this.manResult?.entries || [], this.manStatuses, this.manSection, this.manQuery);
+  }
+
+  renderManRows() {
+    const listEl = this.containerEl.querySelector("#cmp-man-list");
+    if (!listEl) return;
+    const rows = this.filteredManEntries();
+    const countEl = this.containerEl.querySelector("#cmp-download-count");
+    if (countEl) countEl.textContent = `(${rows.length.toLocaleString()})`;
+    const dlBtn = this.containerEl.querySelector("#cmp-download");
+    if (dlBtn) dlBtn.disabled = rows.length === 0;
+
+    if (rows.length === 0) {
+      const total = (this.manResult?.entries || []).length;
+      listEl.innerHTML = `<div class="compare-empty">${total === 0 ? "No man entry differences between these revisions." : "No man entries match the current filter."}</div>`;
+      return;
+    }
+
+    const shown = rows.slice(0, this.manVisibleCount);
+    listEl.innerHTML = shown.map((entry, idx) => this.manRowHtml(entry, idx)).join("") + (
+      rows.length > shown.length
+        ? `<button class="compare-more" id="cmp-man-more" type="button">Show ${Math.min(PAGE_SIZE, rows.length - shown.length)} more (${rows.length - shown.length} remaining)</button>`
+        : ""
+    );
+
+    listEl.querySelectorAll(".compare-row").forEach((rowEl) => {
+      const entry = shown[parseInt(rowEl.dataset.idx, 10)];
+      rowEl.querySelector(".compare-row-main").onclick = () => {
+        const targetPath = entry.path_b || entry.path_a || entry.path;
+        const oldPath = entry.status === "modified" && entry.path_a && entry.path_b && entry.path_a !== entry.path_b ? entry.path_a : "";
+        this.toggleFileDiff(rowEl, targetPath, oldPath, oldPath ? 1 : 50);
+      };
+      rowEl.querySelector(".compare-row-main").addEventListener("auxclick", (e) => {
+        if (e.button === 1) {
+          e.preventDefault();
+          this.openManEntry(entry.status === "deleted" ? this.versionA : this.versionB, entry, true);
+        }
+      });
+      rowEl.querySelectorAll("[data-man-open]").forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const isBase = btn.dataset.manOpen === "a";
+          this.openManEntry(isBase ? this.versionA : this.versionB, entry, e.ctrlKey || e.metaKey);
+        };
+      });
+    });
+
+    const moreBtn = listEl.querySelector("#cmp-man-more");
+    if (moreBtn) {
+      moreBtn.onclick = () => {
+        this.manVisibleCount += PAGE_SIZE;
+        this.renderManRows();
+      };
+    }
+  }
+
+  manRowHtml(entry, idx) {
+    const status = entry.status || "modified";
+    const badges = manDiffBadges(entry).map((b) => `<span class="compare-man-badge kind-${escapeHtml(b.kind)}" title="${escapeHtml(b.title)}">${escapeHtml(b.text)}</span>`).join("");
+    const canOpenBase = status !== "added";
+    const canOpenTarget = status !== "deleted";
+    return `
+      <div class="compare-row" data-idx="${idx}">
+        <div class="compare-row-main" title="Click to show the diff · middle-click to open man page">
+          <span class="compare-status ${status}">${MAN_STATUS_LABELS[status] || "?"}</span>
+          <span class="compare-man-name">${escapeHtml(manLabel(entry.name, entry.section))}</span>
+          <span class="compare-man-summary" title="${escapeHtml(entry.summary || "")}">${escapeHtml(entry.summary || "")}</span>
+          ${badges}
+          <span class="compare-row-actions">
+            ${canOpenBase ? `<button class="code-btn" data-man-open="a" type="button" title="Open man page at ${escapeHtml(this.versionA)}">${escapeHtml(shortRef(this.versionA))}</button>` : ""}
+            ${canOpenTarget ? `<button class="code-btn" data-man-open="b" type="button" title="Open man page at ${escapeHtml(this.versionB)}">${escapeHtml(shortRef(this.versionB))}</button>` : ""}
+          </span>
+        </div>
+      </div>`;
+  }
+
+  openManEntry(version, entry, forceNew = false) {
+    if (!entry) return;
+    const path = version === this.versionA ? (entry.path_a || "") : (entry.path_b || "");
+    state.openTab({
+      type: "man",
+      title: manTabTitle({ manPage: entry.name, manSec: entry.section }),
+      ...manTabFields({
+        repo: this.repo(),
+        version,
+        name: entry.name,
+        section: entry.section,
+        path,
+      }),
+      forceNew,
+    });
+  }
+
+  downloadManRows(format) {
+    const rows = this.filteredManEntries();
+    if (rows.length === 0) return;
+    const statuses = MAN_STATUSES.filter((k) => this.manStatuses.has(k));
+    const filter = [this.manSection, this.manQuery.trim()].filter(Boolean).join("_");
+    const name = this.downloadName("compare-man", statuses, filter);
+
+    if (format === "txt") {
+      downloadText(`${name}.txt`, rows.map((e) => manLabel(e.name, e.section)).join("\n") + "\n");
+      return;
+    }
+    if (format === "md") {
+      downloadText(`${name}.md`, manDiffMarkdown(this.manResult, rows), "text/markdown");
+      return;
+    }
+    if (format === "tsv") {
+      downloadText(`${name}.tsv`, manDiffTsv(rows), "text/tab-separated-values");
+      return;
+    }
+    const data = {
+      base: this.versionA,
+      target: this.versionB,
+      repo: this.repo(),
+      generated: new Date().toISOString(),
+      filters: {
+        statuses: statuses.length ? statuses : MAN_STATUSES.slice(),
+        section: this.manSection,
+        query: this.manQuery.trim(),
+      },
+      summary: this.manResult?.summary || {},
+      count: rows.length,
+      entries: rows,
+    };
+    downloadText(`${name}.json`, JSON.stringify(data, null, 2) + "\n", "application/json");
   }
 
   // ---------------------------------------------------------------------------

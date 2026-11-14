@@ -31,6 +31,15 @@ def resolve_man_page(
     return man_service.resolve(name, section or None, kernel or None)
 
 
+@router.get("/diff")
+def diff_man_pages(
+    a: str = Query(...),
+    b: str = Query(...),
+) -> dict[str, Any]:
+    """Man entries added, modified or deleted between revisions `a` and `b`."""
+    return man_service.diff(a, b)
+
+
 @router.get("/{version_name}/index")
 def get_man_index(version_name: str) -> dict[str, Any]:
     """Every page of a man-pages revision with its summary and `.so` alias target."""

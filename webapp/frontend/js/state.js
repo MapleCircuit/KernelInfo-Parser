@@ -867,12 +867,15 @@ class GlobalState {
       // it was left at belong to what it showed before (§5.28)
       const NAV_KEYS = ["cursorLine", "symbol", "threadId", "messageId", "query", "listMode", "filter", "commitId",
         "versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
+        "manStatuses", "manSection", "manQuery",
         "section", "secId", "person", "role", "sort", "structName", "functionName"];
       // An empty value ("", 0, null) addresses the same thing as an absent one
       const navValue = (x) => JSON.stringify(x === "" || x === 0 || x === null ? undefined : x);
       const routeOf = tabRoute(existing.type);
       const navKeys = routeOf ? [...NAV_KEYS, ...routeOf.keys] : NAV_KEYS;
-      if (navKeys.some((k) => tabData[k] !== undefined && navValue(tabData[k]) !== navValue(existing[k]))) {
+      const nextVer = routeOf && tabData.version ? GlobalState.refOf(tabData.version) : "";
+      if (navKeys.some((k) => tabData[k] !== undefined && navValue(tabData[k]) !== navValue(existing[k]))
+          || (nextVer && nextVer !== existing.version)) {
         delete existing.scrollPositions;
       }
       if (routeOf) {
@@ -882,6 +885,7 @@ class GlobalState {
           if (tabData[key] === "" || tabData[key] === 0 || tabData[key] === null || tabData[key] === false) delete existing[key];
           else existing[key] = tabData[key];
         }
+        if (nextVer) existing.version = nextVer;
       }
       if (tabData.cursorLine) {
         existing.cursorLine = tabData.cursorLine;
@@ -937,7 +941,8 @@ class GlobalState {
       }
       if (tabData.type === "diff") {
         // A Compare deep link: the revisions (when given), mode, chips, filters and rename searches
-        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches", "apiKinds", "apiStatuses", "apiQuery", "apiArch"]) {
+        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
+          "apiKinds", "apiStatuses", "apiQuery", "apiArch", "manStatuses", "manSection", "manQuery"]) {
           if (tabData[key] !== undefined) existing[key] = tabData[key];
         }
       }

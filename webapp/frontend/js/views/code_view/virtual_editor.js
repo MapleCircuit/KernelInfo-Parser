@@ -1553,7 +1553,7 @@ export class VirtualEditor {
     this.tabData.title = docPath.split("/").pop();
     this.tabData.cursorLine = 1;
     this.tabData.docAnchor = anchor || "";
-    this.tabData.docMode = isDocumentationPath(docPath) || isManDocument(docPath) ? "rendered" : "source";
+    this.tabData.docMode = isDocumentationPath(docPath) || isManDocument(docPath, this.api.repo) ? "rendered" : "source";
     state.saveState();
     state.emit("tabs:changed", { paneId: state.activePaneId, activeTabId: this.tabData.id });
   }

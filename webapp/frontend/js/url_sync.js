@@ -340,6 +340,9 @@ class UrlSynchronizer {
           apiStatuses: t.apiStatuses,
           apiQuery: t.apiQuery,
           apiArch: t.apiArch,
+          manStatuses: t.manStatuses,
+          manSection: t.manSection,
+          manQuery: t.manQuery,
           renameSearches: t.renameSearches ? JSON.parse(JSON.stringify(t.renameSearches)) : undefined,
           ...Object.fromEntries((tabRoute(t.type)?.keys || []).filter((k) => t[k] !== undefined)
             .map((k) => [k, typeof t[k] === "object" && t[k] !== null ? JSON.parse(JSON.stringify(t[k])) : t[k]]))
@@ -456,15 +459,24 @@ class UrlSynchronizer {
           apiKinds: params.get("k") || "", apiStatuses: params.get("st") || "", apiQuery: query, apiArch: params.get("arch") || "",
           version: ver,
         });
+      } else if (tabType === "diff" && params.get("mode") === "man") {
+        // Man pages mode (§5.11): st = statuses, sec = section, q = filter
+        open({
+          type: "diff", title: "Compare",
+          versionA: params.get("a") || undefined, versionB: params.get("b") || undefined, mode: "man",
+          manStatuses: params.get("st") || "", manSection: params.get("sec") || "", manQuery: query,
+          version: ver,
+        });
       } else if (tabType === "diff") {
-        const kconfigMode = params.get("mode") === "kconfig";
+        const rawMode = params.get("mode") || "";
+        const kconfigMode = rawMode === "kconfig";
         open({
           type: "diff",
           title: "Compare",
           // Without a/b the tab keeps its revisions (or picks its defaults)
           versionA: params.get("a") || undefined,
           versionB: params.get("b") || undefined,
-          mode: kconfigMode ? "kconfig" : "files",
+          mode: kconfigMode ? "kconfig" : (rawMode === "files" ? "files" : ""),
           statuses: kconfigMode ? undefined : (params.get("st") || ""),
           query: kconfigMode ? undefined : query,
           kconfigQuery: kconfigMode ? query : undefined,
@@ -592,7 +604,13 @@ class UrlSynchronizer {
         params.set("mode", "kconfig");
         if (activeTab.kconfigStatuses) params.set("st", activeTab.kconfigStatuses);
         if (activeTab.kconfigQuery) params.set("q", activeTab.kconfigQuery);
+      } else if (activeTab.mode === "man") {
+        params.set("mode", "man");
+        if (activeTab.manStatuses) params.set("st", activeTab.manStatuses);
+        if (activeTab.manSection) params.set("sec", activeTab.manSection);
+        if (activeTab.manQuery) params.set("q", activeTab.manQuery);
       } else {
+        if (activeTab.mode === "files") params.set("mode", "files");
         if (activeTab.statuses) params.set("st", activeTab.statuses);
         if (activeTab.query) params.set("q", activeTab.query);
         for (const r of activeTab.renameSearches || []) params.append("rn", `${r.sim}:${r.dir || ""}`);

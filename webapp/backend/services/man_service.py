@@ -73,6 +73,8 @@ _TAG_DATES: RepoScopedCache = RepoScopedCache()
 _PAGE_MAPS: RepoScopedCache = RepoScopedCache(maxsize=64)
 # Per repository and commit: the index body
 _INDEXES: RepoScopedCache = RepoScopedCache(maxsize=32)
+# Per repository and commit pair: man-entry diff body
+_DIFFS: RepoScopedCache = RepoScopedCache(maxsize=32)
 # Per blob: facts (man_facts.extract) and document model (man_parser.parse)
 _FACTS: RepoScopedCache = RepoScopedCache(maxsize=16384)
 _DOCS: RepoScopedCache = RepoScopedCache(maxsize=256)
@@ -324,7 +326,14 @@ def _facts_of(blobs: list[str]) -> tuple[dict[str, dict[str, Any]], bool]:
     return facts, covered
 
 
-def _follow_so(path: str, so: str, pm: dict[str, Any], facts: dict[str, dict[str, Any]]) -> str:
+def _follow_so(
+    path: str,
+    so: str,
+    pm: dict[str, Any],
+    facts: dict[str, dict[str, Any]],
+    *,
+    fetch_missing: bool = False,
+) -> str:
     """Final target of a `.so` alias chain through the facts (loops and long chains stop at the last hop)."""
     seen = {path}
     target = resolve_so(so, path)
@@ -333,11 +342,156 @@ def _follow_so(path: str, so: str, pm: dict[str, Any], facts: dict[str, dict[str
         if found is None or found in seen:
             return found or target
         seen.add(found)
-        nxt = (facts.get(pm["paths"][found]) or {}).get("so")
+        blob = pm["paths"][found]
+        f = facts.get(blob)
+        if f is None and fetch_missing:
+            f = _facts_cached(blob) or {}
+        nxt = (f or {}).get("so")
         if not nxt:
             return found
         target = resolve_so(nxt, found)
     return canonical_path(target, pm) or target
+
+
+def _unique_list(items: Any) -> list[str]:
+    return list(dict.fromkeys(x for x in (items or []) if isinstance(x, str) and x))
+
+
+def _entry_meta(path: str, blob: str, pm: dict[str, Any], facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Summary, resolved `.so` target, SYNOPSIS functions and NAME aliases of one page entry."""
+    f = facts.get(blob) or {}
+    so = _follow_so(path, f["so"], pm, facts, fetch_missing=True) if f.get("so") else None
+    summary = f.get("s") or ""
+    if not summary and so and so in pm["paths"]:
+        tblob = pm["paths"][so]
+        tf = facts.get(tblob)
+        if tf is None:
+            tf = _facts_cached(tblob) or {}
+        summary = (tf or {}).get("s") or ""
+    return {
+        "summary": summary,
+        "so": so,
+        "fn": _unique_list(f.get("fn")),
+        "aliases": _unique_list(f.get("n")),
+    }
+
+
+def _build_diff(sha_a: str, sha_b: str) -> dict[str, Any]:
+    """Compare man entries `(name, section)` between two commits of the active man-pages repository."""
+    pm_a = page_map(sha_a)
+    if sha_a == sha_b:
+        total = len(pm_a["paths"])
+        return {
+            "commit_a": sha_a,
+            "commit_b": sha_b,
+            "source": "db",
+            "summary": {"added": 0, "modified": 0, "deleted": 0, "unchanged": total, "total_a": total, "total_b": total},
+            "entries": [],
+        }
+
+    pm_b = page_map(sha_b)
+    map_a = {page_of_path(p): (p, blob) for p, blob in pm_a["paths"].items()}
+    map_b = {page_of_path(p): (p, blob) for p, blob in pm_b["paths"].items()}
+
+    added_keys = [k for k in map_b if k not in map_a]
+    deleted_keys = [k for k in map_a if k not in map_b]
+    common_keys = [k for k in map_a if k in map_b]
+    modified_keys = [k for k in common_keys if map_a[k][1] != map_b[k][1]]
+    unchanged_count = len(common_keys) - len(modified_keys)
+
+    changed_blobs = [map_b[k][1] for k in added_keys]
+    changed_blobs.extend(map_a[k][1] for k in deleted_keys)
+    for k in modified_keys:
+        changed_blobs.append(map_a[k][1])
+        changed_blobs.append(map_b[k][1])
+
+    facts, covered = _facts_of(changed_blobs)
+    entries: list[dict[str, Any]] = []
+
+    for k in added_keys:
+        name, section = k  # type: ignore[misc]
+        path_b, blob_b = map_b[k]
+        mb = _entry_meta(path_b, blob_b, pm_b, facts)
+        entries.append({
+            "name": name,
+            "section": section,
+            "status": "added",
+            "path": path_b,
+            "path_a": None,
+            "path_b": path_b,
+            "summary": mb["summary"],
+            "summary_a": "",
+            "summary_b": mb["summary"],
+            "so": mb["so"],
+            "so_a": None,
+            "so_b": mb["so"],
+        })
+
+    for k in deleted_keys:
+        name, section = k  # type: ignore[misc]
+        path_a, blob_a = map_a[k]
+        ma = _entry_meta(path_a, blob_a, pm_a, facts)
+        entries.append({
+            "name": name,
+            "section": section,
+            "status": "deleted",
+            "path": path_a,
+            "path_a": path_a,
+            "path_b": None,
+            "summary": ma["summary"],
+            "summary_a": ma["summary"],
+            "summary_b": "",
+            "so": ma["so"],
+            "so_a": ma["so"],
+            "so_b": None,
+        })
+
+    for k in modified_keys:
+        name, section = k  # type: ignore[misc]
+        path_a, blob_a = map_a[k]
+        path_b, blob_b = map_b[k]
+        ma = _entry_meta(path_a, blob_a, pm_a, facts)
+        mb = _entry_meta(path_b, blob_b, pm_b, facts)
+        fn_a_set = set(ma["fn"])
+        fn_b_set = set(mb["fn"])
+        al_a_set = set(ma["aliases"])
+        al_b_set = set(mb["aliases"])
+        entries.append({
+            "name": name,
+            "section": section,
+            "status": "modified",
+            "path": path_b,
+            "path_a": path_a,
+            "path_b": path_b,
+            "summary": mb["summary"] or ma["summary"],
+            "summary_a": ma["summary"],
+            "summary_b": mb["summary"],
+            "so": mb["so"],
+            "so_a": ma["so"],
+            "so_b": mb["so"],
+            "summary_changed": ma["summary"] != mb["summary"],
+            "so_changed": ma["so"] != mb["so"],
+            "fn_added": [x for x in mb["fn"] if x not in fn_a_set],
+            "fn_removed": [x for x in ma["fn"] if x not in fn_b_set],
+            "aliases_added": [x for x in mb["aliases"] if x not in al_a_set],
+            "aliases_removed": [x for x in ma["aliases"] if x not in al_b_set],
+        })
+
+    entries.sort(key=lambda e: (section_rank(e["section"]), e["section"], e["name"].lower(), e["name"]))
+    return {
+        "commit_a": sha_a,
+        "commit_b": sha_b,
+        "source": "db" if covered else "git",
+        "summary": {
+            "added": len(added_keys),
+            "modified": len(modified_keys),
+            "deleted": len(deleted_keys),
+            "unchanged": unchanged_count,
+            "total_a": len(map_a),
+            "total_b": len(map_b),
+        },
+        "entries": entries,
+    }
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -356,6 +510,23 @@ def index(v: str) -> dict[str, Any]:
                     hit = _build_index(sha)
                     _INDEXES[sha] = hit
         return {"version": v, "repo": entry["name"], **hit}
+
+
+def diff(a: str, b: str) -> dict[str, Any]:
+    """Man entries added, modified, or deleted between revisions `a` and `b` of the man-pages repository."""
+    entry = _man_repo_or_404()
+    with using_repo(entry["name"]):
+        sha_a = _commit_or_404(a)
+        sha_b = _commit_or_404(b)
+        key = (sha_a, sha_b)
+        hit = _DIFFS.get(key)
+        if hit is None:
+            with _INDEX_LOCK:
+                hit = _DIFFS.get(key)
+                if hit is None:
+                    hit = _build_diff(sha_a, sha_b)
+                    _DIFFS[key] = hit
+        return {"a": a, "b": b, "repo": entry["name"], **hit}
 
 
 def _build_index(sha: str) -> dict[str, Any]:
