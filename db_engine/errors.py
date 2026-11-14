@@ -50,10 +50,15 @@ class ReadOnlyViolation(DBError):
     """A write was attempted through a read-only session (the message names the writer to use)."""
 
 
+class DeadlockError(DBError):
+    """A transaction was rolled back by the database due to a lock deadlock or lock wait timeout; callers may retry."""
+
+
 # MySQL / MariaDB client error numbers
 _DUP_ERRNOS = frozenset({1062, 1586})
 _MISSING_TABLE_ERRNOS = frozenset({1146, 1051})
 _PACKET_ERRNOS = frozenset({1153, 1154})
+_DEADLOCK_ERRNOS = frozenset({1213, 1205})
 _CONN_ERRNOS = frozenset({2002, 2003, 2006, 2013, 2055, 1927})
 _CONN_CLASS_NAMES = frozenset({"InterfaceError", "PoolError"})
 
@@ -75,6 +80,8 @@ def translate_mysql_error(exc: BaseException) -> DBError | None:
         return MissingTableError(f"{text}; create the table or check its name - see DB_API.md 'DDL & Index Management'")
     if errno in _PACKET_ERRNOS or "max_allowed_packet" in low:
         return PacketTooLargeError(text)
+    if errno in _DEADLOCK_ERRNOS or (errno is None and ("deadlock found" in low or "lock wait timeout" in low)):
+        return DeadlockError(text)
     if errno in _CONN_ERRNOS:
         return ConnectionLostError(text)
     names = {c.__name__ for c in type(exc).__mro__}
@@ -121,6 +128,7 @@ __all__ = [
     "ConnectionLostError",
     "PacketTooLargeError",
     "ReadOnlyViolation",
+    "DeadlockError",
     "translate_mysql_error",
     "translate_sqlite_error",
     "raise_translated",

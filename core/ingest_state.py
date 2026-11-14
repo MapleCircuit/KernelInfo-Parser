@@ -27,14 +27,15 @@ import contextlib
 import glob
 import logging
 import os
+import random
 import shutil
 import tempfile
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
-from db_engine import DBError
+from db_engine import DBError, DeadlockError
 from db_engine.spec import Join, NotExists, Select, Value, Where, between, gt, in_select, is_null, le
 
 logger = logging.getLogger(__name__)
@@ -248,20 +249,39 @@ def _completed_after(db: Any, marks: dict[str, int]) -> int | None:
     return int(newest) if newest is not None else None
 
 
+_T = TypeVar("_T")
+
+
+def _run_tx_with_retry(db: Any, fn: Callable[[], _T], *, max_attempts: int = 3) -> _T:
+    """Run `fn()` inside `db.transaction()`, retrying transient database deadlocks."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with db.transaction():
+                return fn()
+        except DeadlockError:
+            if attempt >= max_attempts:
+                raise
+            time.sleep(0.02 * attempt + random.uniform(0.0, 0.03))
+    raise AssertionError("unreachable")
+
+
 def _delete_marks(db: Any, commit_id: int) -> None:
     """Delete the watermark, blob and id-range rows of a run (the id-range table may not exist)."""
-    db.delete_rows("m_ingest_watermark", {"commit_id": commit_id})
-    db.delete_rows("m_ingest_blob", {"commit_id": commit_id})
+    # Check existence with consistent reads before deleting so empty DELETEs do not take InnoDB gap locks.
+    if db.row_exists("m_ingest_watermark", {"commit_id": commit_id}):
+        db.delete_rows("m_ingest_watermark", {"commit_id": commit_id})
+    if db.row_exists("m_ingest_blob", {"commit_id": commit_id}):
+        db.delete_rows("m_ingest_blob", {"commit_id": commit_id})
     try:
-        db.delete_rows("m_ingest_id_range", {"commit_id": commit_id})
+        if db.row_exists("m_ingest_id_range", {"commit_id": commit_id}):
+            db.delete_rows("m_ingest_id_range", {"commit_id": commit_id})
     except DBError:
         pass
 
 
 def discard_marks(db: Any, commit_id: int) -> None:
     """Forget a run's watermarks, id ranges, and parsed blobs (spent after a rollback, unusable when stale)."""
-    with db.transaction():
-        _delete_marks(db, commit_id)
+    _run_tx_with_retry(db, lambda: _delete_marks(db, commit_id))
 
 
 def get_status(db: Any, network_id: int, commit_id: int) -> int | None:
@@ -289,7 +309,8 @@ def set_status(
         update_columns.append("base_commit_id")
     if worker_id is not None:
         update_columns.append("worker_id")
-    with db.transaction():
+
+    def _op() -> None:
         db.insert_rows(
             "m_ingest_state",
             ["network_id", "commit_id", "status", "updated_at", "base_commit_id", "worker_id"],
@@ -299,6 +320,8 @@ def set_status(
         )
         if status == INGEST_DONE:
             _delete_marks(db, commit_id)
+
+    _run_tx_with_retry(db, _op)
 
 
 def begin(
@@ -314,14 +337,25 @@ def begin(
     if not commit_id:
         logger.warning("Not watermarking a run for commit_id 0 (the ref has no resolved head commit).")
         return marks
-    with db.transaction():
+
+    def _op() -> dict[str, int]:
+        local_marks: dict[str, int] = {}
         _delete_marks(db, commit_id)
         rows = []
         for t, col in marked_tables(tables):
-            marks[t.table_name] = int(db.max_value(t.table_name, col, default=0) or 0)
-            rows.append((commit_id, t.table_id, marks[t.table_name]))
+            local_marks[t.table_name] = int(db.max_value(t.table_name, col, default=0) or 0)
+            rows.append((commit_id, t.table_id, local_marks[t.table_name]))
         if rows:
-            db.insert_rows("m_ingest_watermark", ["commit_id", "marked_table_id", "max_id"], rows)
+            db.insert_rows(
+                "m_ingest_watermark",
+                ["commit_id", "marked_table_id", "max_id"],
+                rows,
+                on_conflict="update",
+                update_columns=["max_id"],
+            )
+        return local_marks
+
+    marks = _run_tx_with_retry(db, _op)
     set_status(db, network_id, commit_id, INGEST_PARSING, base_commit_id=base_commit_id, worker_id=worker_id)
     return marks
 
@@ -340,10 +374,13 @@ def record_blobs(db: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
     ids = sorted(set(blob_ids))
     if not ids or not commit_id:
         return
-    with db.transaction():
+
+    def _op() -> None:
         for i in range(0, len(ids), _IN_CHUNK):
             db.insert_rows("m_ingest_blob", ["commit_id", "blob_id"], [(commit_id, b) for b in ids[i:i + _IN_CHUNK]],
                            on_conflict="ignore")
+
+    _run_tx_with_retry(db, _op)
 
 
 def rollback_id_ranges(

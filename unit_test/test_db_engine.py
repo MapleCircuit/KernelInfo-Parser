@@ -1638,6 +1638,14 @@ class TestMariaDBReserveIdBlockSql(unittest.TestCase):
         self.assertTrue(sql.endswith("ON DUPLICATE KEY UPDATE `commit_id` = `commit_id`"))
         self.assertNotIn("ON DUPLICATE", MariaDB._insert_sql(m_commit))
 
+    def test_translate_mysql_error_maps_deadlock(self) -> None:
+        from db_engine.errors import DeadlockError, translate_mysql_error
+
+        err_1213 = mysql.connector.errors.InternalError(errno=1213, msg="Deadlock found when trying to get lock")
+        self.assertIsInstance(translate_mysql_error(err_1213), DeadlockError)
+        err_1205 = mysql.connector.errors.InternalError(errno=1205, msg="Lock wait timeout exceeded")
+        self.assertIsInstance(translate_mysql_error(err_1205), DeadlockError)
+
 
 _generate_engine_test_classes()
 

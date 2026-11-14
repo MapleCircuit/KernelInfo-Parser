@@ -347,6 +347,37 @@ class TestIngestStateDatabase(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(os.path.isdir(test_target))
 
+    def test_begin_skips_delete_when_no_prior_marks_exist(self) -> None:
+        from unittest.mock import patch
+
+        db = seeded()
+        with patch.object(db, "delete_rows", wraps=db.delete_rows) as spy_delete:
+            I.begin(db, 1, 10, TABLES)
+        spy_delete.assert_not_called()
+        self.assertEqual(db.count_rows("m_ingest_watermark"), len(I.marked_tables(TABLES)))
+
+    def test_begin_retries_on_deadlock(self) -> None:
+        from unittest.mock import patch
+        from db_engine import DeadlockError
+
+        db = seeded()
+        orig_insert_rows = db.insert_rows
+        attempts = {"watermark": 0}
+
+        def flaky_insert_rows(table, *args, **kwargs):
+            if table == "m_ingest_watermark":
+                attempts["watermark"] += 1
+                if attempts["watermark"] == 1:
+                    raise DeadlockError("1213 (40001): Deadlock found when trying to get lock")
+            return orig_insert_rows(table, *args, **kwargs)
+
+        with patch.object(db, "insert_rows", side_effect=flaky_insert_rows), patch("core.ingest_state.time.sleep"):
+            marks = I.begin(db, 1, 10, TABLES, base_commit_id=5, worker_id="w1")
+        self.assertEqual(attempts["watermark"], 2)
+        self.assertEqual(marks["m_commit"], 11)
+        self.assertEqual(db.count_rows("m_ingest_watermark"), len(I.marked_tables(TABLES)))
+        self.assertEqual(I.get_status(db, 1, 10), I.INGEST_PARSING)
+
 
 class _OnSQLite:
     """Runs the scenarios of the base class against an in-memory SQLiteDB instead of the MockDB."""

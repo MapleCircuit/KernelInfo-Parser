@@ -29,6 +29,7 @@ from db_engine.DBHandling import MariaDB
 from db_engine.errors import (
     ConnectionLostError,
     DBError,
+    DeadlockError,
     DuplicateKeyError,
     MissingTableError,
     PacketTooLargeError,
@@ -184,6 +185,7 @@ __all__ = [
     "ConnectionLostError",
     "PacketTooLargeError",
     "ReadOnlyViolation",
+    "DeadlockError",
     "ConfigurationError",
     "ProbeResult",
     "CAP_BACKGROUND_COMMIT",
