@@ -434,6 +434,37 @@ class MasterFile:
                 del self._file_list_cache[next(iter(self._file_list_cache))]
         return raw_file.stdout
 
+    def git_tree_blobs(self, version: str) -> dict[str, bytes]:
+        """Retrieve `{path: sha1_bytes}` for all blobs in `version` and populate the file-list cache."""
+        git_dir = self._get_git_dir()
+        ls_res = sp.run(
+            ["git", f"--git-dir={git_dir}", "ls-tree", "-r", self._checked_rev(str(version))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )  # noqa: S603
+        if ls_res.returncode != 0:
+            raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
+        file_blob_hashes: dict[str, bytes] = {}
+        paths: list[str] = []
+        for line in ls_res.stdout.splitlines():
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                path = parts[1]
+                meta = parts[0].split()
+                if len(meta) >= 3 and meta[1] == "blob":
+                    paths.append(path)
+                    h_hex = meta[2]
+                    if len(h_hex) == 40:
+                        file_blob_hashes[path] = bytes.fromhex(h_hex)
+        cache_key = (self.repo_dir, str(version))
+        self._file_list_cache[cache_key] = "\n".join(paths) + ("\n" if paths else "")
+        while len(self._file_list_cache) > 4:
+            del self._file_list_cache[next(iter(self._file_list_cache))]
+        return file_blob_hashes
+
     def get_dir_list(self, version_name: str) -> list[str]:
         """Retrieve full list of relative directory paths for a version from git repository."""
         git_dir = self._get_git_dir()
@@ -453,8 +484,12 @@ class MasterFile:
         start_ref: str | None = None,
         include_pre_releases: bool | None = None,
     ) -> list[str]:
-        """Discover and sequence repository version tags starting from start_ref using git version sorting."""
+        """Discover and sequence repository version tags starting from start_ref using git version sorting.
+
+        Only tags that point at a commit are versions: a tag on a tree (`v2.6.11` in linux.git) has no
+        history to ingest and is left out."""
         git_dir = self._get_git_dir()
+        commit_tags = self._commit_tag_names()
         command = [
             "git",
             f"--git-dir={git_dir}",
@@ -478,6 +513,8 @@ class MasterFile:
         is_version_tag = _version_tag_predicate(raw_tags)
         prefixed = not any(not t.endswith("-tree") and _VERSION_TAG_RE.match(t) for t in raw_tags)
         raw_tags = [t for t in raw_tags if is_version_tag(t)]
+        if commit_tags is not None:
+            raw_tags = [t for t in raw_tags if t in commit_tags]
         if prefixed:
             from parser.git_ast.release_order import release_key
             raw_tags.sort(key=release_key)
@@ -509,6 +546,20 @@ class MasterFile:
             return self._commit_start_sequence(start, tags, is_version_tag)
 
         return tags[matched_idx:]
+
+    def _commit_tag_names(self) -> set[str] | None:
+        """Names of the tags that point at a commit, directly or through an annotated tag (None when git
+        does not report object types)."""
+        names: set[str] = set()
+        typed = False
+        for line in self._git_lines("for-each-ref", "--format=%(refname:lstrip=2)%09%(objecttype)%09%(*objecttype)", "refs/tags"):
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[1] not in ("commit", "tag", "tree", "blob"):
+                continue
+            typed = True
+            if parts[1] == "commit" or (parts[1] == "tag" and len(parts) > 2 and parts[2] == "commit"):
+                names.add(parts[0])
+        return names if typed else None
 
     def _git_lines(self, *args: str) -> list[str]:
         res = sp.run(["git", f"--git-dir={self._get_git_dir()}", *args], capture_output=True, text=True, check=False)

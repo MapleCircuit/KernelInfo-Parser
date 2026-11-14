@@ -161,6 +161,7 @@ def partition_source_epochs(
     target_epoch_files: int = 4500,
     largest_first: bool = True,
     num_workers: int = 0,
+    target_epoch_bytes: int | None = None,
 ) -> list[list[tuple[int, list[str]]]]:
     """Partition source files into batches with dynamic complexity sizing and group them into natural subsystem-aligned epochs.
 
@@ -206,9 +207,15 @@ def partition_source_epochs(
             except Exception:
                 sz = 0
         sizes.append(sz)
-    single_epoch = len(source_files) <= int(target_epoch_files * 1.3)
+    total_bytes = sum(sizes)
+    if target_epoch_bytes is not None and total_bytes > 0:
+        single_epoch = total_bytes <= int(target_epoch_bytes * 1.3)
+    else:
+        single_epoch = len(source_files) <= int(target_epoch_files * 1.3)
+        if not single_epoch and total_bytes > 0:
+            target_epoch_bytes = max(1, int(total_bytes * target_epoch_files / len(source_files)))
     if num_workers > 0 and single_epoch:
-        equal_share = math.ceil(sum(sizes) / (num_workers * _BATCHES_PER_WORKER))
+        equal_share = math.ceil(total_bytes / (num_workers * _BATCHES_PER_WORKER))
         max_batch_bytes = min(max_batch_bytes, max(heavy_file_threshold, equal_share))
 
     batches: list[tuple[int, list[str]]] = []
@@ -251,15 +258,23 @@ def partition_source_epochs(
     if single_epoch:
         return [_ordered(batches)]
 
+    use_bytes = total_bytes > 0 and target_epoch_bytes is not None and target_epoch_bytes > 0
     epochs: list[list[tuple[int, list[str]]]] = []
     current_epoch: list[tuple[int, list[str]]] = []
     current_epoch_files = 0
+    current_epoch_bytes = 0
 
     for idx, (b_id, b_files) in enumerate(batches):
         current_epoch.append((b_id, b_files))
         current_epoch_files += len(b_files)
+        current_epoch_bytes += batch_bytes[b_id]
 
-        if current_epoch_files >= target_epoch_files and idx + 1 < len(batches):
+        threshold_reached = (
+            current_epoch_bytes >= target_epoch_bytes
+            if use_bytes
+            else current_epoch_files >= target_epoch_files
+        )
+        if threshold_reached and idx + 1 < len(batches):
             curr_f = current_epoch[-1][1][-1].split("\t")[-1]
             next_f = batches[idx + 1][1][0].split("\t")[-1]
             curr_parts = os.path.dirname(curr_f).split(os.sep)
@@ -267,10 +282,16 @@ def partition_source_epochs(
             curr_dir = os.sep.join(curr_parts[:2]) if len(curr_parts) > 1 else (curr_parts[0] if curr_parts else "")
             next_dir = os.sep.join(next_parts[:2]) if len(next_parts) > 1 else (next_parts[0] if next_parts else "")
 
-            if curr_dir != next_dir or current_epoch_files >= int(target_epoch_files * 1.35):
+            hard_cap = (
+                current_epoch_bytes >= int(target_epoch_bytes * 1.35)
+                if use_bytes
+                else current_epoch_files >= int(target_epoch_files * 1.35)
+            )
+            if curr_dir != next_dir or hard_cap:
                 epochs.append(_ordered(current_epoch))
                 current_epoch = []
                 current_epoch_files = 0
+                current_epoch_bytes = 0
 
     if current_epoch:
         epochs.append(_ordered(current_epoch))

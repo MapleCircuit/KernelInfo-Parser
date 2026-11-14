@@ -90,6 +90,13 @@ def calls_of(facts: dict, name: str) -> list:
     return [(c[1], c[2]) for c in facts["c"] if c[0] in idx]
 
 
+def release_cache_scope(root) -> None:
+    """End a test's temporary cache scope on every engine: RAM spaces outlive ``close()``, so the scope is dropped;
+    SQLite handles are closed before the directory goes."""
+    get_cache_engine("ram").discard_scope(root)
+    get_cache_engine("sqlite").close()
+
+
 class TestFacts(unittest.TestCase):
     def setUp(self) -> None:
         self.f = sf.extract(MAIN_C)
@@ -166,15 +173,17 @@ static struct file_operations const extra_ops = {
 
 
 class TestFactStore(unittest.TestCase):
+    CACHE_ENGINE = "ram"   # pinned: the developer's config.json must not pick the engine under test
+
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp()
-        self.env = patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.tmp})
+        self.env = patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.tmp, "KERNELINFO_CACHE_ENGINE": self.CACHE_ENGINE})
         self.env.start()
         self.store = si.FactStore()
 
     def tearDown(self) -> None:
+        release_cache_scope(self.tmp)
         self.env.stop()
-        get_cache_engine().close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_round_trip_missing_and_prune(self) -> None:
@@ -186,6 +195,10 @@ class TestFactStore(unittest.TestCase):
         self.assertEqual(self.store.count(), 2)
         self.assertGreater(self.store.prune(1), 0)
         self.assertLess(self.store.count(), 2)
+
+
+class TestFactStoreSQLite(TestFactStore):
+    CACHE_ENGINE = "sqlite"
 
 
 def load_from(files: dict[str, str]):
@@ -292,7 +305,8 @@ class TestBuildFromGit(unittest.TestCase):
                 return real(items)
 
             store = si.FactStore()
-            with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": cache}), patch.object(si, "get_repo_dir", lambda: repo), \
+            with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": cache, "KERNELINFO_CACHE_ENGINE": "ram"}), \
+                    patch.object(si, "get_repo_dir", lambda: repo), \
                     patch.object(si, "fact_store", store), patch.object(si, "extract_many", counting), \
                     patch.object(si, "db_has", lambda shas: set()), patch.object(si, "db_facts", lambda shas: {}):
                 one = si.build_revision(first, workers=1)
@@ -302,7 +316,7 @@ class TestBuildFromGit(unittest.TestCase):
                 again = si.build_revision(second, workers=1)
                 self.assertEqual(len(extracted), len(SOURCES) + 1, "a saved revision is read back, not assembled")
                 self.assertEqual(again.summary(), two.summary())
-                get_cache_engine().close()
+                release_cache_scope(cache)
             self.assertEqual(len(one.paths), len(SOURCES))
             shared = two.nodes_named("shared")[0]
             self.assertIn("extra", [two.name_of(n) for n, _p, _l, _v in two.callees(shared)])
@@ -327,12 +341,13 @@ class TestBuildFromGit(unittest.TestCase):
                 return real(items)
 
             store = si.FactStore()
-            with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": cache}), patch.object(si, "get_repo_dir", lambda: repo), \
+            with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": cache, "KERNELINFO_CACHE_ENGINE": "ram"}), \
+                    patch.object(si, "get_repo_dir", lambda: repo), \
                     patch.object(si, "fact_store", store), patch.object(si, "extract_many", counting), \
                     patch.object(si, "db_has", lambda shas: {s for s in shas if s in stored}), \
                     patch.object(si, "db_facts", lambda shas: {s: stored[s] for s in shas if s in stored}):
                 idx = si.build_revision(head, workers=1)
-                get_cache_engine().close()
+                release_cache_scope(cache)
             self.assertEqual(len(extracted), 1, "only the blob the database lacks is extracted")
             self.assertEqual(idx.struct_report("file_operations")["tables"], 3)
             self.assertEqual(len(idx.nodes_named("helper")), 2)

@@ -61,6 +61,13 @@ def kernel_steps_apply() -> bool:
     return is_kernel_project(getattr(gp, "project_slug", None) or LINUX_PROJECT)
 
 
+def _next_id(db: Any, table: Any) -> int:
+    """Allocate a primary key id for `table`, using `reserve_id_block` in distributed mode."""
+    if getattr(G.TE, "distributed", False) or getattr(G, "distributed", False):
+        return db.reserve_id_block(table, 1)[0]
+    return db.get_next_id(table)
+
+
 def resolve_git_network_and_repo(
     repo_dir: str | None = None,
     repo_name: str | None = None,
@@ -126,7 +133,7 @@ def resolve_git_network_and_repo(
         if proj:
             project_id = proj[0]
         else:
-            project_id = db.get_next_id(m_project)
+            project_id = _next_id(db, m_project)
             db.insert(m_project, (project_id, project_name, project_slug))
 
         # 2. Resolve m_git_network by root_commit_hash
@@ -134,7 +141,7 @@ def resolve_git_network_and_repo(
         if net:
             network_id = net[0]
         else:
-            network_id = db.get_next_id(m_git_network)
+            network_id = _next_id(db, m_git_network)
             net_name = f"{project_slug}-network"
             db.insert(m_git_network, (network_id, project_id, net_name, root_bytes))
 
@@ -143,7 +150,7 @@ def resolve_git_network_and_repo(
         if repo_match:
             repo_id = repo_match[0]
         else:
-            repo_id = db.get_next_id(m_repository)
+            repo_id = _next_id(db, m_repository)
             git_url = ""
             try:
                 url_res = sp.run(
@@ -178,8 +185,11 @@ def resolve_git_network_and_repo(
     return network_id, repo_id
 
 
-def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[str, int]:
-    """Map 40-hex commit hashes already registered in m_commit for `network_id` to their commit ids."""
+def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str], strict: bool = False) -> dict[str, int]:
+    """Map 40-hex commit hashes already registered in m_commit for `network_id` to their commit ids.
+
+    A failed read returns what was found so far, or raises with `strict` (for a caller that inserts every
+    hash it does not get back)."""
     wanted = [h for h in dict.fromkeys(hashes) if isinstance(h, str) and len(h) == 40]
     found: dict[str, int] = {}
     if not wanted:
@@ -195,5 +205,7 @@ def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[
             for c_hash, c_id in rows:
                 found[bytes(c_hash).hex()] = int(c_id)
     except Exception as exc:
+        if strict:
+            raise
         logger.debug(f"_lookup_commit_ids query failed: {exc}")
     return found

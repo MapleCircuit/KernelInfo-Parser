@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import time
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from core.globalstuff import SafeDataType
 from table_engine.shared_buffer import (
@@ -74,6 +74,8 @@ class TECachedDB(TEDirectDB):
     WRITE_HEAVY_TABLES = frozenset({
         "m_ast_hash", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
     })
+    # Values per database read of `prefetch_nodup()` (one `select_in()` call each)
+    NODUP_PREFETCH_CHUNK = 1000
 
     def __init__(
         self,
@@ -98,17 +100,26 @@ class TECachedDB(TEDirectDB):
         # No-duplicate tables whose _nodup_index holds every row the database has (preloaded and indexed
         # since): a key they miss is new, so it needs no lookup (`_committed_nodup_id()`).
         self._nodup_complete: set[int] = set()
+        # Distributed mode: no-duplicate keys `prefetch_nodup()` found absent from the database, per table. Kept
+        # until this engine's own next commit of the table (`_take_staged()`), so a key it stages leaves it.
+        self._nodup_neg: dict[int, set[Any]] = {}
         self._col_indices: dict[int, dict[int, dict[SafeDataType, list[tuple[SafeDataType, ...]]]]] = {}
         self.update_in_mem_indexes: bool = True
         self._shared_buffer: Any | None = None
         # Carried tables (CARRIED_TABLES): their snapshot reader and, per table, the rows committed since
         self._carried_reader: Any | None = None
         self._carried_overlays: dict[int, dict[Any, tuple[SafeDataType, ...]]] = {}
+        # Carried tables with rows staged while `update_in_mem_indexes` was off (not in their overlay yet)
+        self._carried_unindexed: set[int] = set()
+        # Rows were committed (or preloaded) since the last write-heavy eviction and heap trim of `commit_all()`
+        self._upkeep_due: bool = True
         # Version-scoped tables preloaded in full from a version on: table_id -> (version column, first version).
         # A primary-key miss at or after that version is final (`_miss_is_final()`).
         self._preload_window: dict[int, tuple[int, int]] = {}
         # Cached tables the size ceiling excluded at the last start: table_id -> measured bytes
         self._oversized: dict[int, int] = {}
+        # Cached tables whose preload failed at the last start: served from the database like oversized ones
+        self._preload_failed: set[int] = set()
         try:
             from core.config import get_parser_config
             parser_cfg = get_parser_config()
@@ -140,7 +151,11 @@ class TECachedDB(TEDirectDB):
         A table the ceiling excluded (`_apply_cache_ceiling()`) reports as uncached, so every one of its
         reads and writes takes the `TEDirectDB` path to the database instead of the in-memory caches.
         """
-        return bool(getattr(table, "te_cached", False)) and table.table_id not in self._oversized
+        return (
+            bool(getattr(table, "te_cached", False))
+            and table.table_id not in self._oversized
+            and table.table_id not in self._preload_failed
+        )
 
     def _apply_cache_ceiling(self) -> None:
         """Measure every cached table and exclude the ones above `cache_max_bytes` from caching.
@@ -348,6 +363,7 @@ class TECachedDB(TEDirectDB):
         self._pk_index.clear()
         self._nodup_index.clear()
         self._nodup_complete.clear()
+        self._nodup_neg.clear()
         self._col_indices.clear()
         self._shared_buffer = None
         self._preload_window.clear()
@@ -370,6 +386,7 @@ class TECachedDB(TEDirectDB):
                 cache.pop(table_id, None)
         self._carried_overlays = {}
         self._carried_reader = None
+        self._carried_unindexed.clear()
 
     def _drop_uncommitted_carried(self) -> None:
         """Remove rows staged but never committed from the carried overlays (the database does not have them)."""
@@ -459,6 +476,7 @@ class TECachedDB(TEDirectDB):
         if is_worker:
             # A forked worker never owns the parent's background commit
             self._pending = None
+            self._pending_error = None
             self.async_commits = False
         if is_worker and (self._shared_buffer is not None or self._carried_reader is not None):
             if getattr(self, "db", None) is not None:
@@ -468,6 +486,8 @@ class TECachedDB(TEDirectDB):
                     pass
             self.db = db()
             self.queued_view = {}
+            self._nodup_neg.clear()
+            self._upkeep_due = True
             for table_id, table in self.tables.items():
                 self.queued_set[table_id] = {}
                 self.queued_update[table_id] = []
@@ -481,8 +501,8 @@ class TECachedDB(TEDirectDB):
                 if self.db is not None:
                     try:
                         self.next_id[table_id] = self.db.get_next_id(table)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[TECachedDB] Could not read the next id of {table.table_name}: {e}")
             self.update_in_mem_indexes = True
             return
 
@@ -492,7 +512,9 @@ class TECachedDB(TEDirectDB):
         super().start_new_db(db, is_worker=is_worker)
         self.clear_cache()
         self.update_in_mem_indexes = True
+        self._upkeep_due = True
         # Decided before anything is preloaded or carried: a table the ceiling excludes is not cached at all
+        self._preload_failed = set()
         self._apply_cache_ceiling()
 
         carried_ids = {
@@ -532,6 +554,8 @@ class TECachedDB(TEDirectDB):
                 continue
 
             rows = self._load_preload_rows(table, min_active_vid)
+            if table_id in self._preload_failed:
+                continue
             if rows and table_id in carried_rows:
                 # Packed into the carried buffer below: no heap indexing for rows about to be replaced
                 carried_rows[table_id] = rows
@@ -573,7 +597,7 @@ class TECachedDB(TEDirectDB):
 
         for table in self.tables.values():
             t_id = table.table_id
-            if t_id in self._carried_overlays or segments.contains_table(t_id):
+            if t_id in self._carried_overlays or segments.contains_table(t_id) or t_id in self._preload_failed:
                 # A packed or carried table resolves committed keys through its segment and overlay instead
                 continue
             if table.no_duplicate:
@@ -605,7 +629,9 @@ class TECachedDB(TEDirectDB):
 
         The rows are taken over one at a time as the projected rows are built, so a table is never held
         twice over (the driver's own list is left untouched).
-        Returns an empty list when the table has no rows in the window or could not be read.
+        Returns an empty list when the table has no rows in the window. A read that fails raises for a
+        hash-keyed or carried table (`_is_hash_keyed()`, `CARRIED_TABLES`); any other table is logged and put in
+        `_preload_failed`, which keeps it out of the cache so its reads go to the database.
         """
         table_id = table.table_id
         is_v_scoped = self._is_version_scoped(table)
@@ -614,7 +640,14 @@ class TECachedDB(TEDirectDB):
 
         try:
             raw_rows = self.db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)
-        except Exception:
+        except Exception as e:
+            if _is_hash_keyed(table) or table.table_name in self.CARRIED_TABLES:
+                # Cached as empty, every hash lookup would miss and mint duplicates: the start must fail
+                raise
+            logger.warning(
+                f"[TECachedDB] Could not preload {table.table_name}: {e}. Reading it straight from the database."
+            )
+            self._preload_failed.add(table_id)
             return []
 
         vid_col = self._get_vid_col_idx(table) if getattr(table, "version_scoped", False) else None
@@ -742,7 +775,7 @@ class TECachedDB(TEDirectDB):
                 if shared_row is not None and self._match_columns(table, shared_row, columns):
                     return shared_row
             if self._is_version_scoped(table) and self.db is not None and not self._miss_is_final(table_id, columns, pk):
-                return self._db_read((table_id,), self.db.select, table, columns)
+                return self._select_with_pending(table_id, columns)
             return None
 
         # 2. Deduplication Key Fast-Path (no_duplicate=True)
@@ -785,7 +818,7 @@ class TECachedDB(TEDirectDB):
                     return shared_row
 
             if self._is_version_scoped(table) and self.db is not None:
-                return self._db_read((table_id,), self.db.select, table, columns)
+                return self._select_with_pending(table_id, columns)
             return None
 
         # 4. In-Memory Linear Scan Fallback with Hoisted Filters
@@ -834,7 +867,7 @@ class TECachedDB(TEDirectDB):
                     return shared_row
 
         if self._is_version_scoped(table) and self.db is not None:
-            return self._db_read((table_id,), self.db.select, table, columns)
+            return self._select_with_pending(table_id, columns)
 
         return None
 
@@ -854,6 +887,9 @@ class TECachedDB(TEDirectDB):
         if keys_map is not None and key in keys_map:
             return keys_map[key]
         if (table_id in self._nodup_complete and not self.distributed) or self.db is None:
+            return None
+        neg = self._nodup_neg.get(table_id)
+        if neg and key in neg:
             return None
         table = self.tables[table_id]
         filter_cols = (None, *columns[1:]) + (None,) * (table.length - len(columns))
@@ -878,7 +914,58 @@ class TECachedDB(TEDirectDB):
         version = columns[window[0]]
         if type(version) is not int or version < window[1]:
             return False
+        if self.distributed and version != self.current_commit_id and version != window[1]:
+            # Peers write the versions between the base and this node's own after the preload
+            return False
         return pk not in self._committed_pks.get(table_id, ())
+
+    def prefetch_nodup(self, table_id: int, rows: Iterable[tuple[SafeDataType, ...]]) -> None:
+        """Resolve the no-duplicate keys of `rows` (column tuples as `get()` / `set()` take them, id column None)
+        with chunked database reads, so the lookups that follow need none.
+
+        Only distributed mode reads: peers insert rows after this node's preload, so a key the cache misses is
+        otherwise read on its own (`_committed_nodup_id()`). Keys the cache, the staging or an earlier lookup
+        answers are skipped; the rest are read `NODUP_PREFETCH_CHUNK` values at a time with `select_in()` on the
+        first key column (the remaining key columns are matched here). Hits go to `_committed_nodup_keys`
+        (ids never change), misses to `_nodup_neg` until this engine's next commit of the table.
+        """
+        table = self.tables.get(table_id)
+        if (
+            not self.distributed
+            or self.db is None
+            or table is None
+            or not table.no_duplicate
+            or table.length < 2
+            or not self._is_cached(table)
+        ):
+            return
+        index = self._nodup_index.get(table_id, {})
+        staged = self.queued_set.get(table_id, {})
+        keys_map = self._committed_nodup_keys.setdefault(table_id, {})
+        neg = self._nodup_neg.setdefault(table_id, set())
+        wanted: dict[Any, None] = {}
+        for row in rows:
+            if len(row) < 2 or any(c is None for c in row[1:]):
+                continue
+            key = self._sanitize_key(tuple(row[1:]))
+            if key in index or key in staged or key in keys_map or key in neg:
+                continue
+            wanted[key] = None
+        if not wanted:
+            return
+        lengths = {len(k) for k in wanted}
+        values = list(dict.fromkeys(k[0] for k in wanted))
+        chunk = max(1, int(self.NODUP_PREFETCH_CHUNK))
+        for start in range(0, len(values), chunk):
+            found = self._db_read((table_id,), self.db.select_in, table, 1, tuple(values[start:start + chunk]))
+            for db_row in found or ():
+                for n in lengths:
+                    key = self._sanitize_key(tuple(db_row[1:1 + n]))
+                    if key in wanted:
+                        keys_map[key] = db_row[0]
+        for key in wanted:
+            if key not in keys_map:
+                neg.add(key)
 
     def set(
         self,
@@ -903,6 +990,9 @@ class TECachedDB(TEDirectDB):
         if not self.update_in_mem_indexes:
             # Not indexed: the cache no longer holds every row of the window
             self._preload_window.pop(table_id, None)
+            if table_id in self._carried_overlays:
+                # Its overlay misses this row: the commit that takes it records it (`_take_staged()`)
+                self._carried_unindexed.add(table_id)
             if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
                 # Staging is not indexed, but a key the database already has must still resolve to its row
                 existing_id = self._committed_nodup_id(table_id, columns)
@@ -915,6 +1005,8 @@ class TECachedDB(TEDirectDB):
                     proj_row = self._project_row(table, columns)
                     if existing_row == proj_row:
                         return columns
+            if table.no_duplicate:
+                self._forget_nodup_miss(table_id, columns)
             return super().set(table_id, columns)
 
         self._ensure_table(table_id)
@@ -947,6 +1039,7 @@ class TECachedDB(TEDirectDB):
             else:
                 assigned_id = self._allocate_id(table_id)
             self.queued_set[table_id][key] = assigned_id
+            self._forget_nodup_miss(table_id, columns)
             row = (assigned_id, *columns[1:])
             proj_row = self._project_row(table, row)
             pos = len(self._cached_rows[table_id])
@@ -990,13 +1083,16 @@ class TECachedDB(TEDirectDB):
                 raise ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")
 
         proj_row = self._project_row(table, columns)
+        self.queued_set[table_id][pk] = columns
+        self._index_staged_row(table_id, columns)
+        if table_id in self._carried_overlays:
+            # Only primary-key lookups reach a carried table: its overlay (the PK view's local layer) is all it needs
+            self._pk_index[table_id][pk] = proj_row
+            return columns
         pos = len(self._cached_rows[table_id])
         self._cached_rows[table_id].append(proj_row)
         self._cached_rows_pos[table_id][pk] = pos
-
-        self.queued_set[table_id][pk] = columns
         self._index_row(table, proj_row)
-        self._index_staged_row(table_id, columns)
         return columns
 
     def update(
@@ -1044,16 +1140,31 @@ class TECachedDB(TEDirectDB):
 
         return columns
 
-    def _queued_carried_rows(self, table_ids: Sequence[int]) -> dict[int, list[tuple[Any, tuple[SafeDataType, ...]]]]:
-        """Rows of carried tables about to be committed, as (primary key, row) pairs."""
-        return {
-            t_id: list(self.queued_set[t_id].items())
-            for t_id in table_ids
-            if t_id in self._carried_overlays and self.queued_set.get(t_id)
-        }
+    def _forget_nodup_miss(self, table_id: int, columns: tuple[SafeDataType, ...]) -> None:
+        """A key being staged is no longer absent: drop it from the remembered misses (`_nodup_neg`)."""
+        neg = self._nodup_neg.get(table_id)
+        if neg:
+            neg.discard(self._sanitize_key(tuple(columns[1:])))
+
+    def _take_staged(self, table_ids: Iterable[int]) -> CommitBatch | None:
+        """`TEDirectDB._take_staged()`, then forget the remembered no-duplicate misses of every table it took:
+        a miss never outlives this engine's next commit of its table."""
+        batch = super()._take_staged(table_ids)
+        if batch is not None:
+            self._upkeep_due = True
+            for t_id in batch.staged:
+                self._nodup_neg.pop(t_id, None)
+            unindexed = self._carried_unindexed.intersection(batch.staged)
+            if unindexed:
+                # Rows staged while indexing was off are not in the overlay yet; indexed ones are already
+                self._record_carried({
+                    t_id: list(batch.staged[t_id][0].items()) for t_id in unindexed if t_id in batch.table_ids
+                })
+                self._carried_unindexed.difference_update(unindexed)
+        return batch
 
     def _record_carried(self, committed: dict[int, list[tuple[Any, tuple[SafeDataType, ...]]]]) -> None:
-        """Add rows now in the database to the carried overlays, whether or not the heap cache saw them."""
+        """Add rows taken by a commit to the carried overlays (the rows staged while indexing was off)."""
         for t_id, items in committed.items():
             overlay = self._carried_overlays.get(t_id)
             if overlay is None:
@@ -1070,23 +1181,50 @@ class TECachedDB(TEDirectDB):
         keep their rows: they are the snapshot extension the next version reuses. A table without cache
         structures (e.g. after `clear_cache()`) is left alone: recreating only some of them made `_ensure_table()`
         skip the rest, and the next `set()` failed on `_col_indices`.
+
+        Rows still staged (deferred `m_ast_hash` rows, or rows no commit took yet) are not in the database:
+        they stay cached and their keys stay out of `_committed_pks`, which would make the commit that takes
+        them skip them. The column index is rebuilt from the rows kept, so it never references evicted rows;
+        `_nodup_index` keeps its keys (they are the deduplication keys).
         """
         if table_id in self._carried_overlays or table_id not in self._cached_rows:
             return
+        if self._is_deferred(table_id):
+            # Every staged row is held back from commits: none of them is in the database yet
+            return
+        table = self.tables[table_id]
+        staged = self.queued_set.get(table_id)
+        keep = staged if staged and not table.no_duplicate else None
         committed = self._committed_pks.setdefault(table_id, set())
         pk_index = self._pk_index.get(table_id)
+        kept_rows: list[tuple[SafeDataType, ...]] = []
         if isinstance(pk_index, SharedTablePKView):
-            committed.update(pk_index.drain_local())
+            for pk, row in zip(pk_index._local.keys(), pk_index._local.values()) if keep is not None else ():
+                if pk in keep:
+                    kept_rows.append(row)
+            committed.update(pk for pk in pk_index.drain_local() if keep is None or pk not in keep)
         else:
             if pk_index:
-                committed.update(pk_index.keys())
+                if keep is None:
+                    committed.update(pk_index.keys())
+                else:
+                    for pk, row in pk_index.items():
+                        if pk in keep:
+                            kept_rows.append(row)
+                        else:
+                            committed.add(pk)
             self._pk_index[table_id] = {}
         rows = self._cached_rows.get(table_id)
         if isinstance(rows, SharedTableRowSequenceView):
             rows.drop_appended()
+            self._col_indices[table_id] = {}
         else:
             self._cached_rows[table_id] = []
+            pk_set = set(table.primary) if table.primary else set()
+            self._col_indices[table_id] = {c: {} for c in range(table.length) if c not in pk_set}
         self._cached_rows_pos[table_id] = {}
+        for row in kept_rows:
+            self._cache_row(table, row)
 
     def commit(self, table_id: int, update_in_mem_indexes: bool = True) -> None:
         """Flush staged insert and update operations for target table to database.
@@ -1095,10 +1233,7 @@ class TECachedDB(TEDirectDB):
             table_id: Target table identifier integer.
             update_in_mem_indexes: If False, clears target table from in-memory cache structures.
         """
-        self.wait_for_commit()
-        carried = self._queued_carried_rows((table_id,))
         super().commit(table_id, update_in_mem_indexes=update_in_mem_indexes)
-        self._record_carried(carried)
         if not update_in_mem_indexes and table_id in self.tables:
             self._preload_window.pop(table_id, None)
             self._cached_rows.pop(table_id, None)
@@ -1106,6 +1241,7 @@ class TECachedDB(TEDirectDB):
             self._pk_index.pop(table_id, None)
             self._nodup_index.pop(table_id, None)
             self._nodup_complete.discard(table_id)
+            self._nodup_neg.pop(table_id, None)
             self._col_indices.pop(table_id, None)
             self._attach_carried_views()
         elif update_in_mem_indexes and table_id in self.tables:
@@ -1116,9 +1252,12 @@ class TECachedDB(TEDirectDB):
     def commit_all(self, max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None:
         """Flush staged operations across ALL tables and optionally clear in-memory caches.
 
-        With `async_commits` the rows are written by a background thread: the cache upkeep below (carried overlays,
-        write-heavy eviction) runs meanwhile, as if the write had landed, and any database read of those tables
+        With `async_commits` the rows are written by a background thread: the cache upkeep below (write-heavy
+        eviction) runs meanwhile, as if the write had landed, and any database read of those tables
         waits for it (`_db_read()`).
+
+        A call that takes no batch returns once the previous commit is joined when nothing was committed since
+        the last eviction and trim (`_upkeep_due`).
 
         Args:
             max_workers: Maximum concurrent worker threads.
@@ -1126,8 +1265,10 @@ class TECachedDB(TEDirectDB):
         """
         self.wait_for_commit()
         t_start = time.perf_counter()
-        carried = self._queued_carried_rows(tuple(self._carried_overlays))
         batch = self._take_staged(tuple(self.tables))
+        if batch is None and update_in_mem_indexes and not self._upkeep_due:
+            # Nothing staged and nothing committed since the last upkeep: eviction and trim would find nothing
+            return
         background = batch is not None and self._background_commit_allowed(update_in_mem_indexes)
         if background:
             self._submit(batch, max_workers)
@@ -1135,7 +1276,6 @@ class TECachedDB(TEDirectDB):
             # On failure the tables not committed are back in staging (see _restore_batch) and the error propagates
             self._write_batch(batch, max_workers)
         t_written = time.perf_counter()
-        self._record_carried(carried)
         if not update_in_mem_indexes:
             self.clear_cache()
         else:
@@ -1146,6 +1286,7 @@ class TECachedDB(TEDirectDB):
         # Committed rows are freed by reference counting: return the freed C heap pages without a full GC pass
         from core.globalstuff import trim_heap
         trim_heap()
+        self._upkeep_due = False
         elapsed = time.perf_counter() - t_start
         if batch is not None and not background and elapsed >= 2.0:
             logger.info(

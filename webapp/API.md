@@ -18,7 +18,7 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L262-L269]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L270-L312]
   - 2.6. Frontend & Service Architectural Invariants [L313-L365]
-- 2B. Backend Domain & Infrastructure Services [L366-L968]
+- 2B. Backend Domain & Infrastructure Services [L366-L967]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L368-L447]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L448-L480]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L481-L510]
@@ -28,20 +28,20 @@ ES-Module IDE frontend.
   - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L663-L698]
   - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L699-L726]
   - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L727-L755]
-  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L756-L807]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L808-L853]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L854-L871]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L872-L921]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L922-L968]
-- 3. Database Schema & Underlying Tables [L969-L983]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L984-L989]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L990-L995]
-- 6. Using the Services from Python [L996-L1013]
-- 7. Configuration & Execution [L1014-L1070]
-  - 7.1. Configuration Precedence & Resolution [L1016-L1051]
-  - 7.2. Starting the Server [L1052-L1070]
-- 8. Error Handling, Status Codes & Resilience [L1071-L1102]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1084-L1102]
+  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L756-L806]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L807-L852]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L853-L870]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L871-L920]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L921-L967]
+- 3. Database Schema & Underlying Tables [L968-L982]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L983-L988]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L989-L994]
+- 6. Using the Services from Python [L995-L1012]
+- 7. Configuration & Execution [L1013-L1069]
+  - 7.1. Configuration Precedence & Resolution [L1015-L1050]
+  - 7.2. Starting the Server [L1051-L1069]
+- 8. Error Handling, Status Codes & Resilience [L1070-L1101]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1083-L1101]
 <!-- toc:end -->
 
 ---
@@ -382,7 +382,7 @@ may any router, service, middleware, or background task in `webapp/` execute dat
      entries are skipped. This is the authoritative file list for every revision.
    - `list_dir(rev, directory)` returns `(subdirectory names, {path: blob_sha} of the direct files)` from a
      per-commit directory index built in one pass over `list_tree` (`DERIVED_CACHE_SIZE` = 4 commits), so
-     expanding a directory no longer scans the whole tree. `search_index(rev)` is the per-commit list of
+     expanding a directory avoids scanning the whole tree. `search_index(rev)` is the per-commit list of
      `(lowercased path, lowercased basename, path)` that the file palette scans (`GET /api/fs/search`).
    - `resolve_commit_sha(rev)` answers are cached (4096 entries per repository): a full SHA that names a
      commit permanently, any other name for `REV_SHA_TTL` (15 s), and all names are dropped when the `git`
@@ -782,8 +782,7 @@ request open.
   annotation; `Link:` (lore.kernel.org, lkml.kernel.org/r, patch.msgid.link) and `Message-Id:` → message-ids
   (unbracketed, URL-decoded, lower-cased, as in §5.26). Lines must start the line: a `Fixes` word in prose or
   a quoted `> commit … upstream.` is not a relation. A revert or backport naming an abbreviated hash keeps it
-  as a prefix (resolved like `Fixes:` targets; before `INDEX_FORMAT` 2 an odd-length one failed the whole
-  build).
+  as a prefix (resolved like `Fixes:` targets).
 - **Build**: two `git log --all` passes run in parallel — trailers only
   (`%(trailers:key=Fixes,key=Cc,key=Link,key=Message-Id)`) for commits matching `^Fixes:`, `^Cc:.*stable@`,
   `^Link:`, `^Message-Id:`, and bodies for reverts and backports — streamed into a cache_engine space
@@ -817,7 +816,7 @@ Shared answers about releases, from Git:
   repository's tags — the kernel scheme's (`vX.Y…`, `next-YYYYMMDD`) when it has any, else every
   `<prefix>X.Y[.Z][-rcN]` release (`man-pages-6.9`, `foo-1.2.3`), the prefix being the tag's family with chains
   of its own (`parser/git_ast/GIT_API.md` §7). A man-pages or any other tagged repository therefore has a
-  release index, release statistics and release reports like the kernel; the SQLite index's ranges come from
+  release index, release statistics and release reports like the kernel; the cache index's ranges come from
   `release_ranges()` (the previous tag of each chain), as the parser's.
 - **Previous release** (`previous`): `v3.1 → v3.0`, `v3.1-rc1 → v3.0`, `v3.1-rc2 → v3.1-rc1`, `v3.0.5 →
   v3.0.4`, `v3.0.1 → v3.0`, `v2.6.39 → v2.6.38`; `range_of(tag)` gives the commit range `(previous, tag)`.
@@ -827,8 +826,8 @@ Shared answers about releases, from Git:
   current commit in the current format (`db_covers_all()`, cached until the `git`/`parsed` token changes, a
   negative answer for 60 s), lookups read it (500 SHAs per query, a row counts only when its segment's tag
   still names the same commit) and a SHA without a row is on no release chain; `ensure_release_index()` then
-  answers `done` without building the SQLite file. When it does not (tags fetched since the last parse, an
-  older database), the SQLite index below answers once current, and until then the database rows that exist.
+  answers `done` without building the cache index. When it does not (tags fetched since the last parse, an
+  older database), the cache index below answers once current, and until then the database rows that exist.
   `release_token()` (in report cache keys) changes with either source. `walk_segments(from_tag, to_tag)`
   follows `base_tag` from `to_tag`'s segment to `from_tag` (≤ 200 segments, `None` when not reached or a
   segment is stale) and `segment_commits(ids)` lists their commits. `first_containing()`,
@@ -972,7 +971,7 @@ repository.
 | :--- | :--- | :--- |
 | **Versions / Git Refs** | `m_git_ref`, `m_commit` | Version and reference identifiers (`ref_id`, `commit_id`, `ref_name`), chronological author dates, commit SHAs |
 | **Filesystem & Blobs** | `m_file_blob`, `m_file_name`, `m_bridge_checkpoint`, `m_file_reference` | File instances, content blobs, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and compiler-verified `#include` / Kbuild provenance |
-| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_map_ast`, `m_tag` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`); `m_map_ast.map_id` is the tag id, so the file token maps join `m_map_ast.map_id = m_bridge_tag.tag_id` (`m_bridge_map` is no longer written) |
+| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_map_ast`, `m_tag` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`); `m_map_ast.map_id` is the tag id, so the file token maps join `m_map_ast.map_id = m_bridge_tag.tag_id` |
 | **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` (views over `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_def`, `m_blob_symbol_ref`; see `core/API.md`) | Definitions and usage cross-references (calls, field access, type usages, macro expansions). `def_id` of a definition stored once per tag is computed (not indexable) and `ref_id` may be NULL, so services select every needed column in the query that finds the rows instead of re-fetching by id. Rows of given target AST ids come from the engine's `symbol_refs_of_targets()` / `symbol_def_blobs_of_targets()` instead of `WHERE ast_id IN (...)` on the views, which takes seconds per target |
 | **Kconfig** | `m_ast` (types `Kconfig_*`), `m_tag`, `m_bridge_tag` | Kconfig entries as tags (where each definition is, per blob and version). Menus, dependencies and values come from the semantic model built from Git per revision and ARCH (§4.4); there are no Kconfig tables |
 | **Maintainers** | `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_person`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry` | Subsystem sections, pattern rules, maintainers, reviewers, and historical `CREDITS` biographies |

@@ -170,7 +170,8 @@ def _start_git_commit_worker() -> None:
     mark_owner(result_dir)
     gp.PURGE_LIST.append(result_dir)
     gp._commit_result_dir = result_dir
-    known_count = len(gp.commit_ids_by_hash) if getattr(gp, "commit_ids_by_hash", None) else None
+    # Size of the range as Step 1 walked it (None when it did not: the parser then counts the range itself)
+    known_count = getattr(gp, "commit_range_count", None)
     proc = _MP.Process(
         target=_git_commit_worker,
         args=(

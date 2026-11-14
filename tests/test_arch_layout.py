@@ -339,5 +339,28 @@ class TestRealKernelLayouts(unittest.TestCase):
         self.assertEqual(layout.arch_trees(), {"x86"})
 
 
+    def test_database_error_propagates(self) -> None:
+        """A failing write of Step 6.8 is not swallowed: the version must not be marked done without m_arch_root."""
+        from contextlib import contextmanager
+        from unittest.mock import MagicMock, patch
+
+        import main
+        import pipeline.arch_layouts
+
+        db = MagicMock()
+        db.select_rows.side_effect = RuntimeError("db down")
+
+        @contextmanager
+        def fake_db():
+            yield db
+
+        with patch.object(main.gp, "VID", 7), patch.object(main.gp, "Version_Name", "v2.6.12"), \
+             patch.object(main.gp, "file_blob_hashes", dict.fromkeys(OLD_TREE, b"\0" * 20), create=True), \
+             patch.object(main.MF, "get_file", side_effect=lambda path, version: OLD_TREE[path]), \
+             patch.object(main.G, "DB", fake_db):
+            with self.assertRaises(RuntimeError):
+                pipeline.arch_layouts.processing_arch_layouts("v2.6.12")
+
+
 if __name__ == "__main__":
     unittest.main()

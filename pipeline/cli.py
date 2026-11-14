@@ -563,7 +563,8 @@ def arg_handling() -> argparse.Namespace:
     if getattr(args, "delegate_stable", None) is None:
         args.delegate_stable = dist_cfg.get("delegate_stable", True)
     if getattr(args, "delegate_branches", None) is None:
-        args.delegate_branches = dist_cfg.get("delegate_branches", [])
+        # None (key absent or null): every non-trunk branch is discovered and delegated; [] delegates none
+        args.delegate_branches = dist_cfg.get("delegate_branches")
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
     ml_cfg = get_mailing_list_config()
@@ -600,7 +601,9 @@ def arg_handling() -> argparse.Namespace:
     if args.ssh_strict_host_key_checking is not None:
         ssh_cfg["strict_host_key_checking"] = args.ssh_strict_host_key_checking
 
-    if ssh_cfg.get("enabled"):
+    # `-u --no-live-db` promises a run without the database: no tunnel, no connection
+    offline_tests = args.unit_test is not None and bool(args.no_live_db)
+    if ssh_cfg.get("enabled") and not offline_tests:
         start_ssh_tunnel(ssh_cfg)
         # Re-fetch db_cfg since start_ssh_tunnel reroutes host and port
         db_cfg = get_db_config()
@@ -657,16 +660,20 @@ def arg_handling() -> argparse.Namespace:
         gp.create_table_all()
         G.emergency_shutdown(0)
     if args.unit_test is not None:
-        try:
-            with G.DB() as db:
-                missing = db.test_tables(gp.Table_Array)
-                if missing:
-                    logger.info(f"Missing tables detected ({missing}), creating tables...")
-                    missing_tables = [tbl for tbl in gp.Table_Array if tbl.table_name in missing]
-                    db.create_table(missing_tables)
-                ensure_db_instance(db)
-        except Exception as e:
-            logger.debug(f"DB check before unit tests: {e}")
+        if offline_tests:
+            from unit_test import runner as offline_runner
+            os.environ[offline_runner.NO_LIVE_DB_ENV] = "1"
+        else:
+            try:
+                with G.DB() as db:
+                    missing = db.test_tables(gp.Table_Array)
+                    if missing:
+                        logger.info(f"Missing tables detected ({missing}), creating tables...")
+                        missing_tables = [tbl for tbl in gp.Table_Array if tbl.table_name in missing]
+                        db.create_table(missing_tables)
+                    ensure_db_instance(db)
+            except Exception as e:
+                logger.debug(f"DB check before unit tests: {e}")
 
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests

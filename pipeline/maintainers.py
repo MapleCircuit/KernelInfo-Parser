@@ -66,11 +66,9 @@ def processing_maintainer_files(version: str) -> None:
     if maintainers_blob_id is None:
         logger.info(f"Version '{version}' has no MAINTAINERS blob row; skipping maintainer file matching.")
         return
-    try:
-        file_list_raw = MF.git_file_list(gp.Version_Name)
-    except Exception as e:
-        logger.debug(f"Failed to get git_file_list for maintainer matching in {version}: {e}")
-        return
+    # A failing listing propagates: the version then stays INGEST_PARSING instead of being marked done
+    # without m_maintainer_file rows
+    file_list_raw = MF.git_file_list(gp.Version_Name)
     all_files = file_list_raw.splitlines() if file_list_raw else []
     if not all_files:
         return
@@ -98,11 +96,8 @@ def processing_maintainer_files(version: str) -> None:
             logger.info(f"[Step 6.7] MAINTAINERS sections and paths of '{version}' are unchanged since '{base_name}': nothing to match.")
             return
 
-    try:
-        raw_maintainers = MF.get_file("MAINTAINERS", gp.Version_Name)
-    except Exception as e:
-        logger.debug(f"MAINTAINERS file not found for version '{version}': {e}")
-        return
+    # A failing read propagates (see the file listing above)
+    raw_maintainers = MF.get_file("MAINTAINERS", gp.Version_Name)
     if not raw_maintainers:
         return
 

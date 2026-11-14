@@ -99,12 +99,11 @@ def _register_file_names(items: list[str]) -> None:
 
     Workers find these ids in the inherited cache instead of allocating colliding ids of their own.
     """
-    for item in items:
-        if not item:
-            continue
-        for p in item.split("\t")[1:]:
-            if p:
-                G.TE.set(m_file_name.table_id, (None, p))
+    paths = [p for item in items if item for p in item.split("\t")[1:] if p]
+    # One chunked read for the paths another node may have registered, instead of one read per new path
+    G.TE.prefetch_nodup(m_file_name.table_id, [(None, p) for p in paths])
+    for p in paths:
+        G.TE.set(m_file_name.table_id, (None, p))
     G.TE.commit(m_file_name.table_id)
 
 
@@ -202,6 +201,9 @@ def _format_time_split(split: dict[str, float]) -> str:
 
         text += (
             f"; workers {pct('busy_s'):.0f}% parsing (dependency pruning {split.get('worker_prune_s', 0.0):.1f}s, "
+            f"ref views {split.get('worker_ref_views_s', 0.0):.1f}s, "
+            f"pre-resolve {split.get('worker_pre_resolve_s', 0.0):.1f}s, "
+            f"encode {split.get('worker_encode_s', 0.0):.1f}s, "
             f"DB reads {int(split.get('worker_db_reads', 0)):,} in {split.get('worker_db_read_s', 0.0):.1f}s), "
             f"{pct('send_wait_s'):.0f}% blocked sending to the parent, "
             f"{pct('task_wait_s') + pct('tail_idle_s'):.0f}% without a task (or exited), "
@@ -235,8 +237,10 @@ def _publish_file_symbols() -> None:
     """Pack the symbols published since the previous call into a new file-scoped shared segment.
 
     Forked workers query the segments (`gp._shared_symbols`) per target file without copying them,
-    so the parent's heap copies are dropped once packed.
+    so the parent's heap copies (including `resolved_symbols` / `resolved_names` on evacuated ChangeSets)
+    are dropped once packed.
     """
+    published_paths = list(gp.file_symbols.keys())
     if gp.file_symbols or gp._ast_staged_symbols or gp._ast_staged_names:
         t_build = time.perf_counter()
         builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
@@ -254,6 +258,20 @@ def _publish_file_symbols() -> None:
                 f"segment {len(gp._shared_symbols.segments)} ({segment.nbytes // (1024 * 1024)}MB, "
                 f"{time.perf_counter() - t_build:.1f}s); {gp._shared_symbols.sym_count} shared symbols in total."
             )
+    cs_dict = getattr(gp, "ChangeSet_Dict", None)
+    if cs_dict is not None and published_paths:
+        evacuated_store = getattr(cs_dict, "_evacuated_store", None)
+        lru_cache = getattr(cs_dict, "_lru_cache", None)
+        for path in published_paths:
+            if evacuated_store is not None:
+                cs_obj = evacuated_store.get(path) or (lru_cache.get(path) if lru_cache is not None else None)
+            else:
+                cs_obj = cs_dict.get(path)
+            if cs_obj is not None:
+                if hasattr(cs_obj, "resolved_symbols"):
+                    cs_obj.resolved_symbols = None
+                if hasattr(cs_obj, "resolved_names"):
+                    cs_obj.resolved_names = None
     gp.file_symbols.clear()
     gp.file_names.clear()
     gp._ast_staged_symbols.clear()
@@ -477,9 +495,20 @@ def _run_worker_stage(
                 result.files_ingested += len(batch_dict)
             except Exception as e:
                 logger.error(COLOR.red(f"{label}: ingesting batch {b_id} failed: {e}"), exc_info=True)
-                error_list.append((
-                    f"Batch {b_id} ({len(batch_files.get(b_id, ()))} files)", f"Ingest failed: {e}", traceback.format_exc()
-                ))
+                tb = traceback.format_exc()
+                batch_items = batch_files.get(b_id, ())
+                if batch_items:
+                    ingest_errors = [
+                        (item if "\t" in item else f"?\t{item}", f"Ingest failed: {e}", tb)
+                        for item in batch_items
+                    ]
+                    error_list.extend(ingest_errors)
+                    stage_file_errors.extend(ingest_errors)
+                    _raise_if_systemic(label, stage_file_errors, files_returned)
+                else:
+                    error_list.append((
+                        f"Batch {b_id} (0 files)", f"Ingest failed: {e}", tb
+                    ))
             parent_split["ingest_s"] += time.perf_counter() - t_ingest
             del batch_dict
 
@@ -559,12 +588,18 @@ def _run_worker_stage(
             f"file per batch) and {len(unfinished)} batch(es) not parsed yet; parsing them again."
         ))
     else:
-        # These single files killed a worker twice: report them and keep going with the rest
+        # Single-file batches that killed a worker twice are lost; multi-file batches (from `unfinished`)
+        # are split into single-file batches so one bad file does not fail its batchmates.
         retry_batches = []
         for b_id in suspects:
-            for f in batch_files[b_id]:
-                result.lost_files.append(f)
-                error_list.append((f, "A worker process died while parsing this file; it was not ingested.", ""))
+            b_items = batch_files[b_id]
+            if len(b_items) > 1:
+                for f in b_items:
+                    retry_batches.append((next_id + len(retry_batches), [f]))
+            else:
+                for f in b_items:
+                    result.lost_files.append(f)
+                    error_list.append((f, "A worker process died while parsing this file; it was not ingested.", ""))
     next_id += len(retry_batches)
     retry_batches += [(next_id + i, batch_files[b_id]) for i, b_id in enumerate(unfinished)]
 

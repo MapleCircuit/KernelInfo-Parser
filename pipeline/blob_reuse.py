@@ -7,6 +7,7 @@ from core.globalstuff import (
 )
 from core import ingest_state
 import os
+import time
 
 from collections.abc import Iterable
 from db_engine import (
@@ -94,17 +95,41 @@ def _tagged_blob_ids(blob_ids: Iterable[int]) -> set[int]:
     return tagged
 
 
-def _known_blob_id(fpath: str, b_hash: bytes) -> int | None:
-    """Id of an existing m_file_blob row for a path's blob, else None.
+def _blob_types(fpath: str) -> tuple[int, ...]:
+    """File types an m_file_blob row of `fpath`'s blob can be stored under: the name-based one, and for a
+    `.c`/`.h` path the content-aware one (`ChangeSet.get_file_type()`: T_ASM for a header written in assembly)."""
+    return (type_check(fpath), T_ASM) if fpath.endswith((".c", ".h")) else (type_check(fpath),)
 
-    A parsed `.c`/`.h` blob is stored under the content-aware type (`ChangeSet.get_file_type()`: T_ASM for a
-    header written in assembly), so that type is tried when the name-based one misses.
-    """
-    for ftype in (type_check(fpath), T_ASM) if fpath.endswith((".c", ".h")) else (type_check(fpath),):
+
+def _known_blob_id(fpath: str, b_hash: bytes) -> int | None:
+    """Id of an existing m_file_blob row for a path's blob, else None (every type of `_blob_types()` is tried)."""
+    for ftype in _blob_types(fpath):
         row = G.TE.get(m_file_blob.table_id, (None, b_hash, ftype))
         if row is not None:
             return row[0]
     return None
+
+
+def _prefetch_known_blobs(items: Iterable[str], file_blob_hashes: dict[str, bytes]) -> int:
+    """Announce to the TableEngine the m_file_blob keys `_known_blob_id()` is about to look up for the change
+    lines `items`, so they are resolved with a few chunked reads instead of one read per file and type.
+
+    Returns the number of paths announced."""
+    rows: list[tuple] = []
+    paths = 0
+    for item in items:
+        if not item:
+            continue
+        parts = item.split("\t")
+        if parts[0].startswith("D"):
+            continue
+        b_hash = file_blob_hashes.get(parts[-1])
+        if b_hash:
+            paths += 1
+            rows.extend((None, b_hash, ftype) for ftype in _blob_types(parts[-1]))
+    if rows:
+        G.TE.prefetch_nodup(m_file_blob.table_id, rows)
+    return paths
 
 
 def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
@@ -120,6 +145,8 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
     Returns:
         The change lines that still need parsing, in `gp.Change_List` order.
     """
+    t_lookup = time.perf_counter()
+    checked = _prefetch_known_blobs(gp.Change_List or (), file_blob_hashes)
     candidates: dict[str, tuple[str, str, int]] = {}
     for item in gp.Change_List or ():
         if not item:
@@ -135,6 +162,10 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
         if blob_id is not None:
             candidates[item] = (op, fpath, blob_id)
 
+    logger.info(
+        f"[Step 4.5] {checked} changed file(s) checked against m_file_blob in {time.perf_counter() - t_lookup:.1f}s "
+        f"({len(candidates)} blob(s) already stored)."
+    )
     tagged = _tagged_blob_ids(b_id for _op, _path, b_id in candidates.values())
     # Checkpoint rows of this version from an interrupted earlier run (one query instead of one per file)
     checkpointed: set[int] | None = None
@@ -172,7 +203,10 @@ def _record_reparsed_blobs(file_blob_hashes: dict[str, bytes]) -> None:
     """Record blobs that already exist (unparsed blobs of intermediate commits) and are about to be parsed,
     so an interruption can clear their partial rows (core/ingest_state.py)."""
     blob_ids = set()
-    for item in [*(gp.worker_change_list or ()), *(getattr(gp, "Symlink_List", None) or ())]:
+    items = [*(gp.worker_change_list or ()), *(getattr(gp, "Symlink_List", None) or ())]
+    # Mostly answered by the lookups of _reuse_parsed_blobs(); only keys it did not see are read
+    _prefetch_known_blobs(items, file_blob_hashes)
+    for item in items:
         if not item:
             continue
         parts = item.split("\t")

@@ -11,6 +11,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import subprocess as sp
@@ -328,14 +330,44 @@ def unlock_dependent_tasks(
     return count
 
 
-def resolve_branch_base_dependency(
+def _load_tag_map(repo_dir: str | Path) -> dict[str, str]:
+    """Map commit SHA -> first alphabetical tag name via a single `git show-ref --tags -d` call."""
+    try:
+        res = sp.run(
+            ["git", "-C", str(repo_dir), "show-ref", "--tags", "-d"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return {}
+    if res.returncode != 0 or not res.stdout:
+        return {}
+    tag_targets: dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        if not ref.startswith("refs/tags/"):
+            continue
+        tag_name = ref[len("refs/tags/"):]
+        if tag_name.endswith("^{}"):
+            tag_targets[tag_name[:-3]] = sha
+        else:
+            tag_targets.setdefault(tag_name, sha)
+    by_sha: dict[str, list[str]] = {}
+    for tag_name, sha in tag_targets.items():
+        by_sha.setdefault(sha, []).append(tag_name)
+    return {sha: sorted(names)[0] for sha, names in by_sha.items()}
+
+
+def _resolve_branch_merge_base(
     repo_dir: str | Path,
     branch: str,
-    db: Any = None,
-    network_id: int = 1,
-    version_states: dict[str, tuple[int, str]] | None = None,
-) -> tuple[str, int]:
-    """Determine upstream base ref and commit ID for a branch using git merge-base."""
+    tag_map: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Run `git merge-base` for a branch against its upstream trunk and return `(base_ref, sha)`."""
     upstream = "history/master" if str(branch).startswith("history/") else "master"
     try:
         res = sp.run(
@@ -345,30 +377,100 @@ def resolve_branch_base_dependency(
             check=False,
         )
         if res.returncode != 0 or not res.stdout.strip():
-            return ("", 0)
+            return ("", "")
         sha = res.stdout.strip()
-        tag_res = sp.run(
-            ["git", "-C", str(repo_dir), "tag", "--points-at", sha],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        tags = [t.strip() for t in tag_res.stdout.splitlines() if t.strip()]
-        base_ref = tags[0] if tags else upstream
-
-        base_cid = 0
-        if version_states and base_ref in version_states:
-            base_cid = version_states[base_ref][0]
-        elif db is not None and len(sha) == 40:
-            row = db.select_one(
-                "m_commit", ["commit_id"], {"network_id": network_id, "commit_hash": bytes.fromhex(sha)}, as_dict=False
+        if tag_map is not None:
+            base_ref = tag_map.get(sha, upstream)
+        else:
+            tag_res = sp.run(
+                ["git", "-C", str(repo_dir), "tag", "--points-at", sha],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            if row and row[0]:
-                base_cid = int(row[0])
-        return (base_ref, base_cid)
+            tags = [t.strip() for t in tag_res.stdout.splitlines() if t.strip()]
+            base_ref = tags[0] if tags else upstream
+        return (base_ref, sha)
     except Exception as e:
         logger.warning("Could not resolve merge-base for branch '%s': %s", branch, e)
+        return ("", "")
+
+
+def _resolve_base_commit_id(
+    db: Any,
+    network_id: int,
+    base_ref: str,
+    sha: str,
+    version_states: dict[str, tuple[int, str]] | None = None,
+) -> int:
+    """Resolve database commit_id for a merge-base ref/SHA from `version_states` or `m_commit`."""
+    if not base_ref:
+        return 0
+    if version_states and base_ref in version_states:
+        return version_states[base_ref][0]
+    if db is not None and len(sha) == 40:
+        row = db.select_one(
+            "m_commit", ["commit_id"], {"network_id": network_id, "commit_hash": bytes.fromhex(sha)}, as_dict=False
+        )
+        if row and row[0]:
+            return int(row[0])
+    return 0
+
+
+def resolve_branch_base_dependency(
+    repo_dir: str | Path,
+    branch: str,
+    db: Any = None,
+    network_id: int = 1,
+    version_states: dict[str, tuple[int, str]] | None = None,
+    tag_map: dict[str, str] | None = None,
+) -> tuple[str, int]:
+    """Determine upstream base ref and commit ID for a branch using git merge-base."""
+    base_ref, sha = _resolve_branch_merge_base(repo_dir, branch, tag_map=tag_map)
+    if not base_ref:
         return ("", 0)
+    base_cid = _resolve_base_commit_id(db, network_id, base_ref, sha, version_states)
+    return (base_ref, base_cid)
+
+
+# Branches the master parses itself; every other branch is delegated
+TRUNK_REFS = frozenset({"history/master", "history/HEAD", "master", "main", "origin/master", "origin/main"})
+
+
+def delegated_branches(delegate_branches: Sequence[str] | None, repo_dir: str | Path | None) -> list[str]:
+    """Branches published as worker tasks: the given list, or with None every branch of the repository
+    matching its branch filter except the trunks (`TRUNK_REFS`). An empty list delegates no branch."""
+    if delegate_branches is not None:
+        return list(delegate_branches)
+    if not repo_dir:
+        return []
+    from core.config import find_repository_branches
+    try:
+        return [b for b in find_repository_branches(Path(repo_dir)) if b not in TRUNK_REFS]
+    except Exception as e:
+        logger.warning("Could not auto-discover branches for delegation: %s", e)
+        return []
+
+
+def partition_master_refs(
+    target_refs: Sequence[str],
+    all_tags: Iterable[str],
+    delegate_stable: bool = True,
+    delegate_branches: Iterable[str] = (),
+) -> tuple[list[str], list[str]]:
+    """Split the refs of a master run into `(kept, delegated)`, each in `target_refs` order.
+
+    Delegated are exactly the refs `publish_delegable_chains()` publishes from the same arguments: the next
+    snapshots, the stable updates with `delegate_stable`, and `delegate_branches`. The master keeps the rest:
+    mainline release tags, trunk branches and refs that are no release tag (historical names such as
+    `0.95a`, bare commits).
+    """
+    kinds = {"next", "stable"} if delegate_stable else {"next"}
+    published = {r["tag"] for r in release_order.release_ranges(all_tags) if r["kind"] in kinds}
+    published.update(b for b in delegate_branches if b not in TRUNK_REFS)
+    kept = [t for t in target_refs if t not in published]
+    delegated = [t for t in target_refs if t in published]
+    return kept, delegated
 
 
 def publish_delegable_chains(
@@ -452,24 +554,67 @@ def publish_delegable_chains(
         ))
 
     # Add custom or auto-discovered delegated branches
-    branches_to_delegate = list(delegate_branches) if delegate_branches is not None else []
-    if delegate_branches is None and repo_dir:
-        from core.config import find_repository_branches
-        try:
-            discovered = find_repository_branches(Path(repo_dir))
-            trunks = {"history/master", "history/HEAD", "master", "main", "origin/master", "origin/main"}
-            branches_to_delegate = [b for b in discovered if b not in trunks]
-        except Exception as e:
-            logger.warning("Could not auto-discover branches for delegation: %s", e)
+    branches_to_delegate = delegated_branches(delegate_branches, repo_dir)
 
     repo_path = repo_dir or "repos/linux"
+    existing_by_ref: dict[str, tuple[int, str, int]] = {}
+    if branches_to_delegate:
+        try:
+            existing_rows = db.select_rows(
+                "m_parse_task",
+                ["ref_name", "commit_id", "base_ref_name", "base_commit_id"],
+                {"network_id": network_id},
+                as_dict=False,
+            )
+            for row in existing_rows:
+                if row and row[0]:
+                    existing_by_ref[str(row[0])] = (
+                        int(row[1] or 0),
+                        str(row[2] or ""),
+                        int(row[3] or 0),
+                    )
+        except Exception:
+            existing_by_ref = {}
+
+    resolved_bases: dict[str, tuple[str, int]] = {}
+    branches_to_resolve: list[str] = []
+    for b_ref in branches_to_delegate:
+        cid, st = version_states.get(b_ref, (0, "new"))
+        existing = existing_by_ref.get(b_ref)
+        if st == "done" or (existing is not None and cid > 0 and existing[0] == cid):
+            ex_base_ref = existing[1] if existing else ""
+            ex_base_cid = existing[2] if existing else 0
+            if ex_base_ref and ex_base_cid == 0 and ex_base_ref in version_states:
+                ex_base_cid = version_states[ex_base_ref][0]
+            resolved_bases[b_ref] = (ex_base_ref, ex_base_cid)
+        else:
+            branches_to_resolve.append(b_ref)
+
+    if branches_to_resolve:
+        tag_map = _load_tag_map(repo_path)
+        max_workers = min(8, len(branches_to_resolve), max(1, os.cpu_count() or 4))
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                merge_results = list(
+                    pool.map(
+                        lambda br: _resolve_branch_merge_base(repo_path, br, tag_map=tag_map),
+                        branches_to_resolve,
+                    )
+                )
+        else:
+            merge_results = [_resolve_branch_merge_base(repo_path, br, tag_map=tag_map) for br in branches_to_resolve]
+
+        for b_ref, (base_ref, sha) in zip(branches_to_resolve, merge_results):
+            resolved_bases[b_ref] = (
+                base_ref,
+                _resolve_base_commit_id(db, network_id, base_ref, sha, version_states),
+            )
+
     for b_idx, b_ref in enumerate(branches_to_delegate):
         cid, st = version_states.get(b_ref, (0, "new"))
         b_kind = "history" if str(b_ref).startswith("history/") else ("next" if "next" in str(b_ref) else "branch")
         chain_name = f"branch:{b_ref}"
-        base_ref, base_cid = resolve_branch_base_dependency(
-            repo_path, b_ref, db=db, network_id=network_id, version_states=version_states
-        )
+        base_ref, base_cid = resolved_bases[b_ref]
         initial_status = TASK_PENDING
         if st == "done":
             initial_status = TASK_DONE

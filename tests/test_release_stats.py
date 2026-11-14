@@ -252,6 +252,41 @@ class TestIngest(unittest.TestCase):
         """Join of a per-segment table to its segment row (alias s)."""
         return (Join(("m_release_segment", "s"), {"s.segment_id": f"{table}.segment_id"}),)
 
+    def test_process_pool_matches_the_serial_path(self) -> None:
+        todo = rst.plan(rst.release_tags(self.dir), {})
+        serial = [rst.compute(self.dir, r) for r in todo]
+        pooled = list(rst.compute_all(self.dir, todo, workers=2, processes=2))
+        threaded = list(rst.compute_all(self.dir, todo, workers=2, processes=0))
+        self.assertEqual(pooled, serial)
+        self.assertEqual(threaded, serial)
+
+    def test_distributed_person_ids_come_from_leased_blocks(self) -> None:
+        class FakeDB:
+            def __init__(self) -> None:
+                self.blocks: list[int] = []
+                self.rows: list[tuple] = []
+
+            def select_rows(self, *a, **k):
+                return [(5, "Old", "old@x.org")]
+
+            def reserve_id_block(self, table, size, commit_id=0):
+                self.blocks.append(size)
+                start = 1000 + 256 * len(self.blocks)
+                return start, start + size - 1
+
+            def insert_rows(self, table, cols, rows, **k):
+                self.rows.extend(rows)
+
+        db = FakeDB()
+        persons = rst._Persons(db, distributed=True)
+        ids = persons.resolve(db, [("A", "a@x"), ("B", "b@x")])
+        self.assertEqual(sorted(v for k, v in ids.items() if k in {("A", "a@x"), ("B", "b@x")}), [1256, 1257])
+        self.assertEqual((db.blocks, persons.added), ([256], 2))
+        alone = FakeDB()
+        local = rst._Persons(alone)
+        self.assertEqual(local.resolve(alone, [("A", "a@x")])[("A", "a@x")], 6)
+        self.assertEqual(alone.blocks, [])
+
     def test_ingest_and_incremental(self) -> None:
         summary = rst.ingest(self.db, self.dir, repo_id=1, workers=2)
         self.assertEqual((summary["state"], summary["tags"], summary["segments"]), ("updated", 4, 4))

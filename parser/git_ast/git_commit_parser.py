@@ -371,6 +371,7 @@ class GitCommitParser:
         """
         EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         range_count = 0
+        capped = False
         if not old_rev or old_rev == EMPTY_TREE or str(old_rev) == "0":
             revision_arg = new_rev
             effective_limit = limit or INITIAL_HUNK_COMMIT_CAP
@@ -386,11 +387,13 @@ class GitCommitParser:
                     range_count = self.count_commits(revision_arg)
                 if range_count < 0 or range_count > RANGE_HUNK_COMMIT_CAP:
                     effective_limit = RANGE_HUNK_COMMIT_CAP
+                    capped = True
                     logger.warning(
                         f"[Git] '{revision_arg}' spans "
                         f"{range_count if range_count >= 0 else 'an unreportable number of'} commits: reading diff "
                         f"hunks for the newest {RANGE_HUNK_COMMIT_CAP} only. The older commits of the range keep "
-                        f"their DAG rows but get no m_commit_file/m_bridge_commit_tag rows."
+                        f"their DAG rows and get m_commit_file rows from a name-status pass, but no "
+                        f"m_bridge_commit_tag rows."
                     )
         max_flag = [f"-n{effective_limit}"] if effective_limit else []
         # ~1,800 commits/s of -U0 patch text, with a floor for the pathological commit and a hard ceiling
@@ -414,7 +417,7 @@ class GitCommitParser:
             return [], {}
 
         commits, file_hunks_map = self.parse_commit_log_with_hunks(raw_output)
-        if range_count > RANGE_HUNK_COMMIT_CAP and not limit:
+        if capped and not limit:
             skip_count = len(commits)
             remain_args = [
                 "log",
@@ -424,7 +427,10 @@ class GitCommitParser:
                 revision_arg,
                 "--",
             ]
-            remain_out = self._run_git(remain_args, max_output_bytes=512 * 1024 * 1024, timeout=300)
+            # A name-status log lists a few thousand commits per second; an unsized range gets the long timeout
+            remaining = range_count - skip_count if range_count > 0 else 0
+            remain_timeout = min(3600.0, max(300.0, remaining / 500.0)) if remaining > 0 else 1800.0
+            remain_out = self._run_git(remain_args, max_output_bytes=512 * 1024 * 1024, timeout=remain_timeout)
             if remain_out:
                 older_commits = self.parse_commit_log(remain_out)
                 commits.extend(older_commits)

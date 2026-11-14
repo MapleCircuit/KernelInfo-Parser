@@ -56,6 +56,11 @@ class RecordingDriver(BaseDBEngine):
         self.size_calls: list[tuple[str, tuple[int, ...] | None, int | None]] = []
         self.view_select_returns: dict[tuple, tuple | None] = {}
         self.view_select_multiple_returns: dict[tuple, list[tuple]] = defaultdict(list)
+        self.select_in_calls: list[tuple[str, int, tuple]] = []
+        # Rows select_in() answers from (rows written by other nodes, not preloaded)
+        self.db_rows: dict[str, list[tuple]] = defaultdict(list)
+        # (table names, exception) select_preload() raises for those tables
+        self.preload_error: tuple[set[str], BaseException] | None = None
         self.is_closed: bool = False
 
     def __enter__(self) -> RecordingDriver:
@@ -82,6 +87,12 @@ class RecordingDriver(BaseDBEngine):
         self.select_calls.append((table.table_name, data))
         return self.select_returns.get((table.table_name, data))
 
+    def select_in(self, table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
+        self.calls.append(("select_in", (table.table_name, col_idx, tuple(values)), {}))
+        self.select_in_calls.append((table.table_name, col_idx, tuple(values)))
+        wanted = set(values)
+        return [row for row in self.db_rows.get(table.table_name, []) if row[col_idx] in wanted]
+
     def select_preload(
         self,
         table: Table,
@@ -90,6 +101,8 @@ class RecordingDriver(BaseDBEngine):
     ) -> list[tuple[SafeDataType, ...]]:
         self.calls.append(("select_preload", (table.table_name, cached_columns, min_vid), {}))
         self.preload_calls.append((table.table_name, cached_columns, min_vid))
+        if self.preload_error is not None and table.table_name in self.preload_error[0]:
+            raise self.preload_error[1]
         return list(self.preload_returns.get(table.table_name, []))
 
     def table_size(
@@ -784,6 +797,156 @@ class GenericTableEngineTestCase:
             self.assertEqual(off_driver.size_calls, [])
             self.assertTrue(off_te._is_cached(t_fn))
             off_te.close()
+
+
+class _CachedEngineCase(unittest.TestCase):
+    """TECachedDB behaviour tested directly against a RecordingDriver (no generic engine dispatch)."""
+
+    def setUp(self) -> None:
+        self.tt = TestTableCollection(prefix="t_")
+        self.driver = RecordingDriver()
+        self.te = TECachedDB(hugepages="off")
+        self.te.start(self.tt.tables_list, lambda: self.driver)
+
+    def tearDown(self) -> None:
+        self.te.close()
+
+
+class TestNodupPrefetch(_CachedEngineCase):
+    """Distributed lookups of new no-duplicate keys cost one database read each before prefetch_nodup()."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.te.distributed = True
+        self.fn = self.tt.t_file_name
+        self.blob = self.tt.t_file_blob
+
+    def _reads(self) -> int:
+        return len(self.driver.select_in_calls) + len(self.driver.select_calls)
+
+    def test_prefetch_reads_in_chunks_and_lookups_need_no_read(self) -> None:
+        self.te.NODUP_PREFETCH_CHUNK = 4
+        paths = [f"drivers/f{i}.c" for i in range(10)]
+        self.driver.db_rows[self.fn.table_name] = [(500 + i, p) for i, p in enumerate(paths[:3])]
+        before = self.te.db_reads
+        self.te.prefetch_nodup(self.fn.table_id, [(None, p) for p in paths])
+        self.assertEqual(len(self.driver.select_in_calls), 3, "10 keys in chunks of 4: 3 reads")
+        self.assertEqual(self.te.db_reads - before, 3, "prefetch reads are counted in db_reads")
+        found = [self.te.get(self.fn.table_id, (None, p)) for p in paths]
+        self.assertEqual(found[:3], [(500, paths[0]), (501, paths[1]), (502, paths[2])])
+        self.assertEqual(found[3:], [None] * 7)
+        self.assertEqual(self._reads(), 3, "every lookup was answered by the prefetch")
+        self.te.prefetch_nodup(self.fn.table_id, [(None, p) for p in paths])
+        self.assertEqual(self._reads(), 3, "keys already answered are not read again")
+
+    def test_remaining_key_columns_are_matched(self) -> None:
+        self.driver.db_rows[self.blob.table_name] = [(7, b"h" * 20, 1)]
+        self.te.prefetch_nodup(self.blob.table_id, [(None, b"h" * 20, 1), (None, b"h" * 20, 2)])
+        self.assertEqual(len(self.driver.select_in_calls), 1)
+        self.assertEqual(self.te.get(self.blob.table_id, (None, b"h" * 20, 1)), (7, b"h" * 20, 1))
+        self.assertIsNone(self.te.get(self.blob.table_id, (None, b"h" * 20, 2)))
+        self.assertEqual(self._reads(), 1)
+
+    def test_misses_last_until_the_tables_next_commit(self) -> None:
+        self.te.prefetch_nodup(self.fn.table_id, [(None, "a.c"), (None, "b.c")])
+        self.assertIsNone(self.te.get(self.fn.table_id, (None, "a.c")))
+        self.assertEqual(self._reads(), 1)
+        # A peer inserts a.c; our own commit of the table ends the remembered misses
+        self.driver.select_returns[(self.fn.table_name, (None, "a.c"))] = (900, "a.c")
+        self.te.set(self.fn.table_id, (None, "c.c"))
+        self.te.commit_all()
+        self.assertEqual(self.te.get(self.fn.table_id, (None, "a.c")), (900, "a.c"))
+        a_reads = [c for c in self.driver.select_calls if c == (self.fn.table_name, (None, "a.c"))]
+        self.assertEqual(len(a_reads), 1, "the miss was read again after the commit")
+
+    def test_staged_key_is_found_and_leaves_the_misses(self) -> None:
+        self.te.prefetch_nodup(self.fn.table_id, [(None, "new.c")])
+        row = self.te.set(self.fn.table_id, (None, "new.c"))
+        self.assertNotIn(("new.c",), self.te._nodup_neg.get(self.fn.table_id, set()))
+        self.assertEqual(self.te.get(self.fn.table_id, (None, "new.c")), row)
+        self.assertEqual(self.te.set(self.fn.table_id, (None, "new.c")), row)
+
+    def test_not_distributed_is_a_no_op(self) -> None:
+        self.te.distributed = False
+        self.te.prefetch_nodup(self.fn.table_id, [(None, "x.c"), (None, "y.c")])
+        self.assertEqual(self._reads(), 0)
+        self.assertIsNone(self.te.get(self.fn.table_id, (None, "x.c")))
+        self.assertEqual(self._reads(), 0, "a complete preloaded table answers misses itself")
+
+    def test_direct_engine_prefetch_is_a_no_op(self) -> None:
+        te = TEDirectDB()
+        te.start(self.tt.tables_list, lambda: self.driver)
+        te.distributed = True
+        te.prefetch_nodup(self.fn.table_id, [(None, "x.c")])
+        self.assertEqual(self.driver.select_in_calls, [])
+        te.close()
+
+
+class TestDistributedMissIsFinal(_CachedEngineCase):
+    """Peers write the versions between the base and this node's own after the preload."""
+
+    def test_only_own_and_base_versions_are_final(self) -> None:
+        cp = self.tt.t_bridge_checkpoint
+        self.te._preload_window[cp.table_id] = (0, 10)
+        self.te.current_commit_id = 14
+        final = {v: self.te._miss_is_final(cp.table_id, (v, 1, None), (v, 1)) for v in (9, 10, 12, 14, 15)}
+        self.assertEqual(final, {9: False, 10: True, 12: True, 14: True, 15: True})
+        self.te.distributed = True
+        final = {v: self.te._miss_is_final(cp.table_id, (v, 1, None), (v, 1)) for v in (9, 10, 12, 14, 15)}
+        self.assertEqual(final, {9: False, 10: True, 12: False, 14: True, 15: False})
+
+
+class TestPreloadFailure(unittest.TestCase):
+    """A failed preload became an empty cache with no database fallback (silently disabling deduplication)."""
+
+    def setUp(self) -> None:
+        self.tt = TestTableCollection(prefix="t_")
+        self.driver = RecordingDriver()
+
+    def test_hash_keyed_table_fails_the_start(self) -> None:
+        t_hash = self.tt.t_ast_hash
+        self.driver.preload_error = ({t_hash.table_name}, RuntimeError("lost connection"))
+        te = TECachedDB(hugepages="off")
+        with self.assertRaises(RuntimeError):
+            te.start(self.tt.tables_list, lambda: self.driver)
+
+    def test_other_table_is_read_from_the_database(self) -> None:
+        fn = self.tt.t_file_name
+        self.driver.preload_error = ({fn.table_name}, RuntimeError("timeout"))
+        te = TECachedDB(hugepages="off")
+        with self.assertLogs("table_engine.te_cached_db", "WARNING"):
+            te.start(self.tt.tables_list, lambda: self.driver)
+        self.assertFalse(te._is_cached(fn))
+        self.driver.select_returns[(fn.table_name, (None, "mm/slab.c"))] = (77, "mm/slab.c")
+        self.assertEqual(te.get(fn.table_id, (None, "mm/slab.c")), (77, "mm/slab.c"))
+        self.assertIn((fn.table_name, (None, "mm/slab.c")), self.driver.select_calls)
+        # The next start that preloads it caches it again
+        self.driver.preload_error = None
+        te.start_new_db(lambda: self.driver)
+        self.assertTrue(te._is_cached(fn))
+        te.close()
+
+
+class TestResyncNextId(unittest.TestCase):
+    def test_drops_the_leased_block_and_rereads_next_id(self) -> None:
+        tt = TestTableCollection(prefix="t_")
+        driver = RecordingDriver()
+        te = TEDirectDB()
+        te.start(tt.tables_list, lambda: driver)
+        fn = tt.t_file_name
+        te._id_cursor[fn.table_id], te._id_limit[fn.table_id] = 5, 9
+        driver.next_ids[fn.table_name] = 40
+        te.resync_next_id(fn)
+        self.assertNotIn(fn.table_id, te._id_cursor)
+        self.assertNotIn(fn.table_id, te._id_limit)
+        self.assertEqual(te.set(fn.table_id, (None, "a.c"))[0], 40)
+        te.distributed = True
+        driver.next_ids[fn.table_name] = 99
+        te._id_cursor[fn.table_id], te._id_limit[fn.table_id] = 50, 60
+        te.resync_next_id(fn)
+        self.assertNotIn(fn.table_id, te._id_cursor)
+        self.assertEqual(te.next_id[fn.table_id], 41, "distributed mode leases a new block instead of re-reading")
+        te.close()
 
 
 # =============================================================================

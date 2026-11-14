@@ -1318,8 +1318,9 @@ class BaseDBEngine(ABC):
         base_commit_id, status)`; `(network_id, ref_name)` identifies a task. An existing task keeps its progress: a
         FAILED task, or a DONE one that is published as not done, starts over (status as published, `retry_count`
         0, `error_msg` cleared); a LEASED or RECLAIMING task keeps its state unless it is published as DONE; any
-        other task takes the published status. A known `commit_id` / `base_commit_id` is never replaced by 0. One
-        transaction; every row is its own statement.
+        other task takes the published status. A known `commit_id` / `base_commit_id` is never replaced by 0. The
+        rows go out as chunked multi-row upserts (`insert_rows(on_conflict="update", update_exprs=...)`) in one
+        transaction; rows are applied in order, so a task listed twice ends as if published twice.
         """
         if not rows:
             return 0
@@ -1345,16 +1346,11 @@ class BaseDBEngine(ABC):
         }
         columns = ["network_id", "chain_name", "chain_kind", "seq_order", "ref_name", "commit_id", "base_ref_name",
                    "base_commit_id", "status"]
-        enqueued = 0
         with self.transaction():
-            for row in rows:
-                changed = self.insert_rows(
-                    "m_parse_task", columns, [tuple(row)], on_conflict="update",
-                    update_columns=["chain_name", "chain_kind", "seq_order", "base_ref_name"], update_exprs=update_exprs,
-                )
-                if changed > 0:
-                    enqueued += 1
-        return enqueued
+            return self.insert_rows(
+                "m_parse_task", columns, [tuple(row) for row in rows], on_conflict="update",
+                update_columns=["chain_name", "chain_kind", "seq_order", "base_ref_name"], update_exprs=update_exprs,
+            )
 
     def record_task_failure(
         self,

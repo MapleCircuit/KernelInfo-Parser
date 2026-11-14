@@ -77,6 +77,13 @@ FILES = {"drivers/foo/foo.c": DRIVER_C, "drivers/foo/foo.h": FOO_H, "kernel/sys.
          "tools/foo.c": "module_param(tool_only, int, 0);\n"}
 
 
+def release_cache_scope(root) -> None:
+    """End a test's temporary cache scope on every engine: RAM spaces outlive ``close()``, so the scope is dropped;
+    SQLite handles are closed before the directory goes."""
+    get_cache_engine("ram").discard_scope(root)
+    get_cache_engine("sqlite").close()
+
+
 class TestExtract(unittest.TestCase):
     def test_driver(self) -> None:
         r = kf.extract(DRIVER_C)
@@ -134,6 +141,7 @@ class KconfigStub:
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class TestCatalogsFromRecords(unittest.TestCase):
+    CACHE_ENGINE = "ram"   # pinned: the developer's config.json must not pick the engine under test
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@x", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
@@ -159,7 +167,7 @@ class TestCatalogsFromRecords(unittest.TestCase):
 
         self.stored: dict[str, dict] = {}
         self.patches = [
-            patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": str(self.cache)}),
+            patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": str(self.cache), "KERNELINFO_CACHE_ENGINE": self.CACHE_ENGINE}),
             patch.object(si, "get_repo_dir", lambda: self.repo),
             patch.object(si, "_settings", lambda: {"workers": 1, "max_mb": 64, "revisions": 0}),
             patch.object(si, "db_facts", lambda shas, family, fmt, decoder: {s: self.stored[s] for s in shas if s in self.stored}),
@@ -172,9 +180,9 @@ class TestCatalogsFromRecords(unittest.TestCase):
             p.start()
 
     def tearDown(self) -> None:
+        release_cache_scope(self.cache)
         for p in reversed(self.patches):
             p.stop()
-        get_cache_engine().close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_records_database_first_then_local_store(self) -> None:
@@ -221,6 +229,10 @@ class TestCatalogsFromRecords(unittest.TestCase):
         self.assertEqual(dev["tables"], 1)
         self.assertEqual([(e["vendor"], e["device"], e["line"]) for e in dev["entries"]], [(0x8086, 0x10D3, 20), (0x1234, 0x0001, 20)],
                          "constants from the driver, its header and pci_ids.h")
+
+
+class TestCatalogsFromRecordsSQLite(TestCatalogsFromRecords):
+    CACHE_ENGINE = "sqlite"
 
 
 if __name__ == "__main__":

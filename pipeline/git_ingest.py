@@ -37,11 +37,22 @@ from pipeline.state import MF, gp, logger
 
 
 
+# The empty tree: the "previous version" of a version parsed without a base
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# New commits written per transaction by _ingest_commit_range()
+_DAG_BATCH_COMMITS = 5000
+
+
 def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[str, int]:
     """Register `commits` (newest first, as git log lists them) with their parents and contributors.
 
     Existing commits and persons are looked up and new rows inserted in bulk: a few statements per
-    thousand commits instead of several round trips and transaction commits per commit.
+    thousand commits instead of several round trips and transaction commits per commit. The new commits
+    are written oldest first in batches of `_DAG_BATCH_COMMITS`, each batch in one transaction together
+    with the parent, contributor, relation and link rows of its commits, so a commit stored in the
+    database always has its rows. The head of the range is written last: an interrupted ingest leaves it
+    missing and the next run resumes at the first commit that is not stored.
 
     Returns:
         Commit hash -> commit_id for every commit of the range and every parent already registered.
@@ -51,7 +62,10 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
     ordered = [c for c in reversed(commits) if isinstance(c.commit_hash, str) and len(c.commit_hash) == 40]
     in_range = [c.commit_hash for c in ordered]
     outside_parents = {p for c in ordered for p in (c.parents or ())} - set(in_range)
-    commit_ids = _lookup_commit_ids(db, network_id, [*in_range, *outside_parents])
+    # Strict: treating stored commits as new would insert every one of them a second time
+    commit_ids = _lookup_commit_ids(db, network_id, [*in_range, *outside_parents], strict=True)
+    # Hashes whose m_commit row is in the database (grows with every batch written below)
+    stored: set[str] = set(commit_ids)
 
     person_ids: dict[tuple[str, str], int] = {}
     try:
@@ -112,56 +126,87 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
         person_ids[key] = pid
         return pid
 
-    new_commits: list[tuple] = []
-    for commit in ordered:
-        if commit.commit_hash in commit_ids:
-            continue
-        author_pid = _person_id(commit.author_name, commit.author_email)
-        committer_pid = _person_id(
-            commit.committer_name or commit.committer_email or commit.author_name,
-            commit.committer_email or commit.author_email,
-        )
-        c_id = _next_id(m_commit)
-        commit_ids[commit.commit_hash] = c_id
-        new_commits.append((
-            c_id,
-            network_id,
-            bytes.fromhex(commit.commit_hash),
-            author_pid,
-            int(commit.author_date or 0),
-            committer_pid,
-            int(commit.committer_date or 0),
-            (commit.subject or "")[:500],
-            commit.message or "",
-        ))
-
-    # Parents and contributors of every commit in the range (both tables skip rows already present)
-    parent_rows: list[tuple[int, int, int]] = []
-    contributor_rows: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
-    for commit in ordered:
-        c_id = commit_ids[commit.commit_hash]
-        for p_idx, p_hash in enumerate(commit.parents or ()):
-            p_cid = commit_ids.get(p_hash)
-            if p_cid is not None:
-                parent_rows.append((c_id, p_cid, p_idx))
-        for contrib in commit.contributors:
-            pid = _person_id(contrib.name, contrib.email)
-            contributor_rows.setdefault((c_id, pid, int(contrib.role)), (c_id, pid, int(contrib.role), int(contrib.priority)))
+    new = [c for c in ordered if c.commit_hash not in stored]
+    for commit in new:
+        commit_ids[commit.commit_hash] = _next_id(m_commit)
 
     # What the new commits' messages say about other commits and mail (core/API.md section 6, Step 1)
     relation_rows, link_rows = commit_relation_rows(
-        [(row[0], row[2].hex(), row[8]) for row in new_commits], getattr(MF, "repo_dir", None))
+        [(commit_ids[c.commit_hash], c.commit_hash, c.message or "") for c in new], getattr(MF, "repo_dir", None))
+    relations_of: dict[int, list[tuple]] = {}
+    for row in relation_rows:
+        relations_of.setdefault(row[0], []).append(row)
+    links_of: dict[int, list[tuple]] = {}
+    for row in link_rows:
+        links_of.setdefault(row[0], []).append(row)
 
-    for table, rows in (
-        (m_maintainer_person, new_persons),
-        (m_commit, new_commits),
-        (m_commit_parent, parent_rows),
-        (m_bridge_commit_person, list(contributor_rows.values())),
-        (m_commit_relation, relation_rows),
-        (m_commit_link, link_rows),
-    ):
-        if rows:
-            db.insert(table, tuple(rows))
+    # A parent link is written with the later of its two commits: the id of a commit that is not stored
+    # yet is lost when the run stops before its batch. Links of a stored commit to a new parent (the run
+    # that stored the child stopped before the parent's batch) wait for that parent like any other.
+    waiting_links: dict[str, list[tuple[int, int, int]]] = {}
+    new_hashes = {c.commit_hash for c in new}
+    for commit in ordered:
+        if commit.commit_hash in new_hashes:
+            continue
+        for p_idx, p_hash in enumerate(commit.parents or ()):
+            if p_hash in new_hashes:
+                waiting_links.setdefault(p_hash, []).append((commit_ids[commit.commit_hash], commit_ids[p_hash], p_idx))
+
+    for start in range(0, len(new), _DAG_BATCH_COMMITS):
+        batch = new[start:start + _DAG_BATCH_COMMITS]
+        batch_hashes = {c.commit_hash for c in batch}
+        first_person = len(new_persons)
+        commit_rows: list[tuple] = []
+        parent_rows: list[tuple[int, int, int]] = []
+        contributor_rows: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+        batch_relations: list[tuple] = []
+        batch_links: list[tuple] = []
+        for commit in batch:
+            c_id = commit_ids[commit.commit_hash]
+            author_pid = _person_id(commit.author_name, commit.author_email)
+            committer_pid = _person_id(
+                commit.committer_name or commit.committer_email or commit.author_name,
+                commit.committer_email or commit.author_email,
+            )
+            commit_rows.append((
+                c_id,
+                network_id,
+                bytes.fromhex(commit.commit_hash),
+                author_pid,
+                int(commit.author_date or 0),
+                committer_pid,
+                int(commit.committer_date or 0),
+                (commit.subject or "")[:500],
+                commit.message or "",
+            ))
+            for p_idx, p_hash in enumerate(commit.parents or ()):
+                p_cid = commit_ids.get(p_hash)
+                if p_cid is None:
+                    continue
+                if p_hash in stored or p_hash in batch_hashes:
+                    parent_rows.append((c_id, p_cid, p_idx))
+                else:
+                    waiting_links.setdefault(p_hash, []).append((c_id, p_cid, p_idx))
+            parent_rows.extend(waiting_links.pop(commit.commit_hash, ()))
+            for contrib in commit.contributors:
+                pid = _person_id(contrib.name, contrib.email)
+                contributor_rows.setdefault(
+                    (c_id, pid, int(contrib.role)), (c_id, pid, int(contrib.role), int(contrib.priority)))
+            batch_relations.extend(relations_of.get(c_id, ()))
+            batch_links.extend(links_of.get(c_id, ()))
+
+        with db.transaction():
+            for table, rows in (
+                (m_maintainer_person, new_persons[first_person:]),
+                (m_commit, commit_rows),
+                (m_commit_parent, parent_rows),
+                (m_bridge_commit_person, list(contributor_rows.values())),
+                (m_commit_relation, batch_relations),
+                (m_commit_link, batch_links),
+            ):
+                if rows:
+                    db.insert(table, tuple(rows))
+        stored.update(batch_hashes)
     return commit_ids
 
 
@@ -260,18 +305,23 @@ def ingest_git_dag(
             )
             _purge_partial_version(db, known_cid)
 
+    base_vid, base_name, preset_base = _version_base()
     gp.commit_ids_by_hash = {}
+    gp.commit_range_count = None
     if head_commit_id is None:
         from parser.git_ast import GitCommitParser
         git_parser = GitCommitParser(repo_dir=repo_path)
-        base_rev = getattr(gp, "Old_Version_Name", None)
         # The DAG only needs commit metadata and parents; per-commit file lists come from processing_git_commits
-        commits = git_parser.parse_version_commits(old_rev=base_rev, new_rev=version_or_ref, limit=limit, with_files=False)
-        logger.info(f"[Git DAG] Ingesting {len(commits)} commits up to '{version_or_ref}'")
+        commits = git_parser.parse_version_commits(old_rev=base_name, new_rev=version_or_ref, limit=limit, with_files=False)
+        since = f"since '{base_name}'" if base_name and base_name != EMPTY_TREE else "(whole history)"
+        logger.info(f"[Git DAG] Ingesting {len(commits)} commits up to '{version_or_ref}' {since}")
         with G.DB() as db:
             commit_hash_to_id = _ingest_commit_range(db, commits, network_id)
         # Reused by processing_git_commits() instead of one m_commit lookup per commit
         gp.commit_ids_by_hash = commit_hash_to_id
+        if not limit:
+            # Size of base..version, the range Step 6.5 reads the diff hunks of
+            gp.commit_range_count = len(commits)
         head_commit_id = commit_hash_to_id.get(head_commit_hex)
 
     if head_commit_id is None:
@@ -324,7 +374,7 @@ def ingest_git_dag(
                 network_id,
                 head_commit_id,
                 TABLES,
-                base_commit_id=getattr(gp, "Old_VID", 0) or 0,
+                base_commit_id=base_vid,
                 worker_id=getattr(G, "node_id", "") or "",
             )
         if getattr(G, "distributed", False) and getattr(G, "node_id", None):
@@ -333,12 +383,36 @@ def ingest_git_dag(
             if getattr(gp, "_active_task_id", None) and db is not None:
                 db.update_rows("m_parse_task", {"commit_id": head_commit_id}, {"task_id": gp._active_task_id})
 
-    if getattr(G, "distributed_role", None) != distributed.ROLE_WORKER and not getattr(gp, "_repair_base_set", False):
-        gp.Old_VID = gp.VID
-        gp.Old_Version_Name = gp.Version_Name
+    if not preset_base:
+        gp.Old_VID = base_vid
+        gp.Old_Version_Name = base_name
     gp.VID = head_commit_id
     gp.Version_Name = version_or_ref
     return head_commit_id, is_checkpoint, already_ingested
+
+
+def _version_base() -> tuple[int, Any, bool]:
+    """`(commit_id, ref, preset)` of the version the next one is parsed against.
+
+    - A worker task and a repair step set `gp.Old_VID` / `gp.Old_Version_Name` themselves (`preset`): they
+      are used and left as they are.
+    - Otherwise the version this process parsed last (`gp.VID` / `gp.Version_Name`) is the base.
+    - Before the first version of a process, a base set by the caller is kept (a resumed run continues from
+      the last finished version, the mainline bridge from the history tip); without one the version is
+      parsed against the empty tree.
+
+    The ref is what the DAG walk, the checkout and the tree diff start from, the commit id what
+    `m_ingest_state.base_commit_id` records.
+    """
+    old_vid = int(getattr(gp, "Old_VID", 0) or 0)
+    old_name = getattr(gp, "Old_Version_Name", None)
+    if getattr(G, "distributed_role", None) == distributed.ROLE_WORKER or getattr(gp, "_repair_base_set", False):
+        return old_vid, old_name, True
+    if getattr(gp, "VID", 0):
+        return int(gp.VID), gp.Version_Name, False
+    if old_vid and old_name and old_name != EMPTY_TREE:
+        return old_vid, old_name, True
+    return 0, EMPTY_TREE, False
 
 
 def _previous_ingest(db: Any, network_id: int, commit_id: int, version_or_ref: str) -> str:
@@ -420,7 +494,7 @@ def finish_version_ingest(commit_id: int | None) -> None:
                 if not leased:
                     raise RuntimeError(f"Worker lease for task {gp._active_task_id} expired or was revoked; aborting completion.")
             ingest_state.set_status(db, getattr(gp, "network_id", 1), commit_id, ingest_state.INGEST_DONE)
-            refresh_person_identities(db, "version ingested")
+            refresh_person_identities(db, "version ingested", only_if_incomplete=True)
             _compact_checkpoint(db, getattr(gp, "Old_VID", 0), commit_id)
             if getattr(G, "distributed", False) and getattr(G, "distributed_role", None) != distributed.ROLE_WORKER:
                 from core.distributed import unlock_dependent_tasks
@@ -483,8 +557,6 @@ def _ensure_full_checkpoint(commit_id: int | None) -> None:
         if db is None:
             return
         restored = checkpoints.expand(db, commit_id)
-    if restored:
-        logger.info(f"[Checkpoint] Expanded the delta checkpoint of commit_id {commit_id} ({restored} rows restored).")
     if restored:
         logger.info(f"[Checkpoint] Expanded the delta checkpoint of commit_id {commit_id} ({restored} rows restored).")
 

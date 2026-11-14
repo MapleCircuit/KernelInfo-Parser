@@ -1051,7 +1051,7 @@ interactive UI surfaces:
   (`state.activeVersion()`), never to the header selection, and every view passes its own revision explicitly
   (code view, explorer, blame gutters, include popover, XRef modal, NodeMap). A commit chosen in the palette's
   `#` mode, *Explore Files at this Commit* in the commits view and *Explore at commit* in the file history
-  modal therefore no longer repoint an open tab: they move the header selection and open that commit in a tab
+  modal therefore do not repoint an open tab: they move the header selection and open that commit in a tab
   of its own.
 - **Guarded switch for KConfig tabs** (§5.0): applying a revision to a KConfig tab also **carries that tab's
   configuration to the target revision and drops the configuration saved for the revision it leaves**
@@ -1524,7 +1524,7 @@ interactive UI surfaces:
   so the drawing is exactly as deep as the file is long and the track below the last line is shaded rather
   than pretending to be content. The slider's height is the share of the document the viewport shows and its
   travel is `mapHeight − sliderHeight`, so at the bottom of the file its lower edge meets the last line
-  instead of running past it (it is also looked up inside the tab's own container, so split panes no longer
+  instead of running past it (it is also looked up inside the tab's own container, so split panes do not
   share one slider). Clicking or dragging the minimap scrolls to that position, and a `ResizeObserver` on the
   editor body redraws it when the pane, the window or the sidebar changes its size.
 

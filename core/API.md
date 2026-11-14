@@ -12,36 +12,36 @@ agents.
   - 1.3. Global Constants & Enums [L153-L238]
 - 2. Filesystem & Git Subsystem (`core/FileHandler.py`) [L239-L311]
   - 2.1. `MasterFile` (`mf`) [L241-L311]
-- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L312-L503]
-  - 3.1. `GreatProcessor` (`gp`) [L314-L503]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L504-L696]
-  - Relational Table Families (`core/DBLayout.py`) [L516-L585]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L586-L669]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L670-L696]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L697-L875]
-  - 5.1. Data Sanitization Helpers [L699-L705]
-  - 5.2. `Table` Class Interface [L706-L734]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L735-L831]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L832-L854]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L855-L875]
-- 6. End-to-End Inter-Module Execution Lifecycle [L876-L1020]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1021-L1344]
-  - 7.1. Unified Configuration Hierarchy [L1023-L1086]
-  - 7.1.1. Repository Auto-Detection & Selection [L1087-L1147]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1148-L1198]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1199-L1242]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1243-L1344]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1345-L1596]
-  - 8.1. High-Level Architecture [L1347-L1390]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1391-L1416]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1417-L1596]
-- 9. CVE List Ingestion (`parser/cve/`) [L1597-L1630]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1631-L1691]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1692-L1822]
-  - 11.1. Architecture & Roles [L1698-L1750]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1751-L1790]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1791-L1822]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1823-L1860]
+- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L312-L513]
+  - 3.1. `GreatProcessor` (`gp`) [L314-L513]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L514-L706]
+  - Relational Table Families (`core/DBLayout.py`) [L526-L595]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L596-L679]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L680-L706]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L707-L887]
+  - 5.1. Data Sanitization Helpers [L709-L715]
+  - 5.2. `Table` Class Interface [L716-L744]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L745-L843]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L844-L866]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L867-L887]
+- 6. End-to-End Inter-Module Execution Lifecycle [L888-L1033]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1034-L1356]
+  - 7.1. Unified Configuration Hierarchy [L1036-L1099]
+  - 7.1.1. Repository Auto-Detection & Selection [L1100-L1160]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1161-L1211]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1212-L1255]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1256-L1356]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1357-L1608]
+  - 8.1. High-Level Architecture [L1359-L1402]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1403-L1428]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1429-L1608]
+- 9. CVE List Ingestion (`parser/cve/`) [L1609-L1642]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1643-L1703]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1704-L1838]
+  - 11.1. Architecture & Roles [L1710-L1765]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1766-L1806]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1807-L1838]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1839-L1876]
 <!-- toc:end -->
 
 ---
@@ -397,22 +397,23 @@ Central runtime container, schema registry, and worker IPC coordinator.
     TableEngine. Worker-local mutations never dirty parent memory pages or trigger Copy-on-Write duplication.
   - Workers invoke `reclaim_system_memory()` after processing each batch to release fragmented C-heap pages
     back to the OS via glibc `malloc_trim(0)`.
-  - **Worker Stage Runner (`main._run_worker_stage`)**: Stage 1, every Stage 2 epoch and retries share one
+  - **Worker Stage Runner (`pipeline/worker_stage.py:_run_worker_stage`)**: Stage 1, every Stage 2 epoch and retries share one
     runner. Workers are forked from the `fork` multiprocessing context with the parent DB socket closed and
     reopened around the fork (`on_started` callbacks run after the reopen). Each worker owns a duplex pipe (no
     shared task queue or lock): the parent's reader thread sends it batches in order, two ahead of the one it
     parses, and a stop frame once none is left; the worker answers each with one result frame (pickled once,
-    `(batch_cs_dict, per_file_errors)`, zlib-compressed in low memory modes) and ends with a done frame. The
-    reader thread hands at most 2 serialized batches to the ingest thread, and `send_bytes` blocks while the
+    `(batch_cs_dict, per_file_errors)` or `(batch_cs_dict, per_file_errors, blob_symbols)` when streaming fetched
+    blob symbols, zlib-compressed in low memory modes) and ends with a done frame. The
+    reader thread hands up to `_PREFETCH_DEPTH` (8) serialized batches to the ingest thread, and `send_bytes` blocks while the
     parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the
     worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per
     batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they
     make progress; files that kill a worker again are reported. If no worker can initialize (an init-failure
     frame from every worker, e.g. the database is unreachable), the stage raises. Ingest failures are recorded
     per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops
-    on time. Stage 1 header batches are bounded by bytes and kept in include order; Stage 1 and each epoch log
+    on time. Stage 1 header batches are bounded by bytes and queued largest-first (`largest_first=True`); Stage 1 and each epoch log
     their parsing time and the gap between the first and the last worker exit.
-  - **Systemic failure stop (`main._raise_if_systemic`)**: One error message on at least
+  - **Systemic failure stop (`pipeline/systemic.py:_raise_if_systemic`)**: One error message on at least
     `SYSTEMIC_ERROR_MIN_FILES` (5) files and on at least `SYSTEMIC_ERROR_FRACTION` (half) of the files parsed
     so far raises `SystemicParseError`. Each stage checks its own files after every batch that carries errors
     (stopping its workers at once), and `trigger_multicore()` checks both stages together at the end. The
@@ -431,20 +432,23 @@ Central runtime container, schema registry, and worker IPC coordinator.
     stage); a failed background commit puts its rows back into staging, and they are committed again there
     through `_commit_all_with_retry()`. While the parent waits for worker results (a 1s poll without a batch),
     `_maybe_idle_commit()` also starts a background commit once 100k rows are staged (`_IDLE_COMMIT_MIN_ROWS`,
-    `G.TE.staged_rows`) and none is running. Commits outside the stages (header resolution, epoch boundaries,
-    Phase 2, Steps 6.x and 7) stay synchronous.
+    `G.TE.staged_rows`) and none is running. `DependencyScheduler.resolve_headers()` also enables
+    `async_commits` so the final Stage 1 wave commit overlaps `_publish_file_symbols()`, and `finalize()`
+    disables/waits on `async_commits`; commits outside the stages (epoch boundaries, Phase 2, Steps 6.x and 7)
+    stay synchronous.
   - **Stage time split**: Each stage logs `<label> time split: ...` (`_stage_time_split()`,
     `_format_time_split()`): how long the parent waited for results, decoded and ingested them (with its
     database reads), how long it was blocked by commits out of how long they took to write and how many rows,
-    its GC/trim time, and the workers' share of time parsing (dependency pruning and database reads called
-    out), blocked sending results to the parent, without a task (including the time a worker had already
-    exited while another still parsed, `worker_tail_idle_s`), and in GC. Workers measure their part and send
+    its GC/trim time, and the workers' share of time parsing (`ref views`, `pre-resolve`, `encode`, dependency
+    pruning, and database reads called out), blocked sending results to the parent, without a task (including
+    the time a worker had already exited while another still parsed, `worker_tail_idle_s`), and in GC. Workers
+    measure their part and send
     it with their done frame (`_WORKER_SPLIT_KEYS`; a bare done frame is still accepted). In normal memory
-    modes the parent no longer runs a full collection every 10 ingested batches (the automatic collector and
-    the trim after each commit cover it). Batch sizes shrink for small stages (`_balanced_batch_size()`: about
+    modes the parent relies on the automatic collector and the trim after each commit instead of running a full
+    collection every 10 ingested batches. Batch sizes shrink for small stages (`_balanced_batch_size()`: about
     4 batches per worker, at least 4 files each, at most the memory profile's size) so a version with a few
     hundred changed files does not leave most workers waiting on one large batch. When Stage 2's sources (or
-    Stage 1's headers, kept in include order) fit in one epoch, `partition_source_epochs(num_workers=...)`
+    Stage 1's headers, queued largest-first) fit in one epoch, `partition_source_epochs(num_workers=...)`
     also caps a batch's bytes at an equal share (`_BATCHES_PER_WORKER` batches per worker), so batches cost
     about the same.
   - **Symbol counters**: Workers send `core/SymbolRows.STATS` with their done frame (`symbol_stats`), and each
@@ -452,7 +456,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
     per blob (changed reused tag, conflicting key, outside tag, without tag); R keys refined by position`
     (`_log_symbol_stats()`). Many items per blob under "changed reused tag" means reused tags are not being
     shared.
-  - **Memory Modes (`main._memory_profile()`)**: normal: `CPUS - 1` workers, 200-file header batches, Stage 2
+  - **Memory Modes (`pipeline/worker_stage.py:_memory_profile()`)**: normal: `CPUS - 1` workers, 200-file header batches, Stage 2
     batches of 200 (50 with heavy files) up to 1.5MB, ~4,500-file epochs; low: `CPUS // 2` workers, 50 / 50
     (25) / 750KB / 4,500; very-low: `min(2, CPUS // 4)` workers, 25 / 25 (10) / 350KB / 2,000.
   - **Stage 2 Multi-Epoch Streaming**: Source files are partitioned into natural subsystem-aligned epochs
@@ -492,6 +496,12 @@ Central runtime container, schema registry, and worker IPC coordinator.
     `VID` row yet returns `None` uncached, since its previous version's symbols would be stale. Definitions
     stored once per tag are resolved with one `get_in(m_blob_symbol, blob_id)` read for the blob (plus a
     staged lookup per missing key for a blob written in this update) instead of one read per symbol key.
+  - `get_files_symbols_from_db_many(paths: Iterable[str], version=None) -> dict[str, dict[tuple[str, int], int]]`:
+    Batch-loads symbol maps for uncached unchanged dependencies in chunked 1,000-row reads across
+    `m_file_name`, `m_bridge_file`, `m_bridge_tag`/`m_tag`/`m_ast`, `m_blob_symbol_def`, `m_tag_def`, and
+    `m_blob_symbol`. `file_processing_worker` parses each batch first, collects uncached unchanged
+    `foreign_deps`, and invokes it before running `preprocess_ref_views()` / `pre_resolve_operations()` /
+    `prune_unchanged_dependencies()`.
   - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`,
     `unchanged_symbol_cache` and the per-version symbol state also reset by `init_cs_dict()`
     (`_clear_version_symbols()`: `file_deps`, `cs_op_counts`, `file_symbols`, `file_names`, `completed_paths`,
@@ -783,9 +793,11 @@ Represents a parsed file diff and acts as the relational staging buffer.
        `force_stubs=False` `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None`.
      - **Step 1c (Database Lookup)**: For files not in flight, `gp.get_file_symbols_from_db(rel_file)` returns
        the file's symbols, cached into `gp.file_symbols` / `gp.file_names`.
-     - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, then
-       `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)` lookups by `(name, type)`,
-       notbind type and name. Misses are recorded in `gp._ast_negative_cache`.
+     - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, `gp._ast_ref_memo`
+       (memoized parent-side `m_ast` `(name, type)` / `(name, None)` lookups, invalidated on version reset and
+       negative-cache clear), and `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)`
+       lookups by `(name, type)`, notbind type, and name. Misses (including `(sym_name, None)`) are recorded in
+       `gp._ast_negative_cache`.
      - **Step 3 (Stubs)**: With `force_stubs=True`, or for a file that is not in flight, stages a canonical
        `notbind` stub symbol (discarding negative cache entries). Parsing workers (`gp._is_worker`) never
        stage stubs: their TableEngine is never committed, so the reference is left for the parent.
@@ -797,7 +809,7 @@ Represents a parsed file diff and acts as the relational staging buffer.
   - `preprocess_ref_views() -> None`: Pre-unpacks intra-file `OP_REF_VIEW` operations into concrete
     `OP_VIEW_SET` on worker cores before IPC serialization, distributing schema pattern matching across CPU
     cores.
-  - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Phase
+  - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Stage
     1 to pre-resolve references targeting unchanged files in a single unified pass over `self.cs` and prunes
     satisfied entries from `foreign_deps`.
   - `pre_resolve_operations(resolved_symbols_map, resolved_names_map=None) -> list`: Worker-side method
@@ -937,7 +949,7 @@ Main Process (trigger_multicore)          Worker Process 1..N
   │  │                                       │ ├── CS.preprocess_ref_views()
   │  │                                       │ ├── CS.pre_resolve_operations(shared_symbols) (Worker-side view unpacking & ref resolution)
   │  │                                       │ ├── CS.clear_bloat()
-  │  │                                       │ └── Per-worker pipe -> reader thread (holds at most 2 serialized batches)
+  │  │                                       │ └── Per-worker pipe -> reader thread (holds up to _PREFETCH_DEPTH = 8 serialized batches)
   │  │                                       └─► DependencyScheduler.ingest_batch() (Sub-millisecond lock-free staging into TableEngine)
   │  └── symlink_files
   │      (Appended to gp.Symlink_List for zero-duplication deferred alias)
@@ -970,9 +982,10 @@ Main Process (In-Process Wave Resolution)       TableEngine & Database
   │  ├─ Wave Selection (ready queue, sorted):      │
   │  │  wave = files whose deps all executed; completions feed the next wave
   │  ├─ [PRECISION CYCLE BREAKING] If wave empty: │
-  │  │  ├─ Selects single top candidate with most │
-  │  │  │  dependents in remaining DAG            │
-  │  │  ├─ Executes with force_stubs=True         │
+  │  │  ├─ Selects single top candidate inside a  │
+  │  │  │  source SCC (`_source_scc_candidates()`)│
+  │  │  ├─ Executes with force_stubs=True and logs│
+  │  │  │  unresolved ops; tracks `cycle_breaks`  │
   │  │  └─ Evacuates buffers, updates symbols,    │
   │  │     unlocking unblocked dependents in wave │
   │  │                                            │
@@ -1004,7 +1017,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   │  │                                            │  via file_pre_extracted_tags)   │
   │  ├─ processing_maintainer_files(version) ────►│                                 │
   │  ├─ processing_kbuild(version) ──────────────►│                                 │
-  │  ├─ processing_arch_layouts(version) (Step 6.8: m_arch_root -> shared m_arch_layout rows, raw SQL) ──►│
+  │  ├─ processing_arch_layouts(version) (Step 6.8: m_arch_root -> shared m_arch_layout rows, bulk insert_rows) ──►│
   │  ├─ processing_source_facts(version) (Step 6.9: m_blob_facts the database lacks, families 1-6) ──►│
   │  └─ Kernel-only steps (processing_kbuild, processing_maintainer_files, processing_arch_layouts) return
   │     at once for a project that is not a kernel tree (kernel_steps_apply(): gp.project_slug "man-pages")
@@ -1308,8 +1321,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `InputTrace` of the files it used, by blob, the top Makefile without its release lines, and every tree
     query with its answer; the trace is replayed against the next tree; logged as `reused N of M ARCH
     layouts`, all 31 at v3.0.1; the memo lives for the run, so its first version evaluates everything): a
-    layout is looked up by `layout_digest()` and only a new one writes its `m_arch_layout_entry` rows (v3.0:
-    31 ARCH values, 167 rows; v3.0.1 then writes none).
+    layout is looked up by `layout_digest()` and only a new one writes its `m_arch_layout_entry` rows.
   - Step 6.9 (`processing_source_facts`, `parser/facts_ingest.py`) extracts the per-blob facts `m_blob_facts` lacks (or holds in an older format)
     for the version's files across all 6 fact families:
     - family 1 (`source_facts.FAMILY`): functions, calls, member calls and ops tables of `.c`/`.h` blobs (`parser/source_facts.py`, `source_facts.FACTS_FORMAT`);
@@ -1328,11 +1340,11 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     query latency for unresolved symbols.
   - Milestone checkpointing correctly targets active version `gp.VID` (falling back to HEAD commit id) rather
     than oldest ancestor commits.
-- **Milestone Release Checkpointing**:
-  - Snapshot registration into `m_bridge_checkpoint` uses a one-shot count check (`COUNT(*) FROM
-    m_bridge_checkpoint WHERE commit_id = %s`). If already complete, snapshot staging is bypassed in
-    $0\text{ms}$; if partial or fresh, existing file IDs are filtered in memory and missing entries are staged
-    directly without row-by-row `G.TE.get()` database roundtrips.
+- **Per-File Checkpoint Check (`pipeline/commits.py`)**:
+  - `processing_git_commits()` reads stored `m_bridge_checkpoint.fnid` values for `checkpoint_cid`
+    (`gp.VID`, falling back to `head_commit_id`) and checks every file in `gp.file_blob_ids` (or
+    `gp.Change_List`); any file missing from both stored rows and `G.TE` staging is staged into
+    `m_bridge_checkpoint` and logged as a warning.
 - **Multiprocessing Socket Refresh**:
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
     resets in-memory caches and destroys preloaded table state.
@@ -1718,10 +1730,13 @@ and isolated crash recovery.
     `db.enqueue_parse_tasks(rows)`, a conditional upsert (`db_engine/DB_API.md` §2.11) that keeps in-flight state and known commit ids:
     - **Stable Chains (Case B)**: Series branches `vX.Y.1 .. vX.Y.Z` whose base commit is already `INGEST_DONE`.
     - **Past, Secondary & Next Branches (Case A)**: Discovered non-trunk branches (`history/*` secondary,
-      `stable/*`, `linux-next/*`) or explicit `--delegate-branch` targets. Uses `resolve_branch_base_dependency()`
-      via `git merge-base` against upstream trunks (`history/master` for history branches, `master` for stable and
-      linux-next) to resolve `base_ref_name` and `base_commit_id`, enqueuing tasks in `TASK_PENDING` (or `TASK_ELIGIBLE`
-      if base is already `INGEST_DONE`).
+      `stable/*`, `linux-next/*`) or explicit `--delegate-branch` targets. Reuses existing `m_parse_task` base
+      dependencies for completed (`"done"`) or unchanged (`commit_id` match) branches, and resolves remaining
+      branches in parallel via `git merge-base` against upstream trunks (`history/master` for history branches,
+      `master` for stable and linux-next) paired with a single `git show-ref --tags -d` tag lookup to resolve
+      `base_ref_name` and `base_commit_id`, enqueuing tasks in `TASK_PENDING` (or `TASK_ELIGIBLE` if base is
+      already `INGEST_DONE`). (Writing a Git commit-graph via `git commit-graph write --reachable` avoids
+      packfile commit decompression during `merge-base`.)
     - **Preservation of Resolved IDs & Status**: Task publishing preserves existing non-zero commit IDs upon duplicate-key collision via `commit_id = IF(VALUES(commit_id) > 0, VALUES(commit_id), commit_id)` and `base_commit_id = IF(VALUES(base_commit_id) > 0, VALUES(base_commit_id), base_commit_id)`.
     - **Republishing Recovery**: Tasks in `TASK_FAILED` (4) are reset to their initial status (`TASK_ELIGIBLE` or `TASK_PENDING`) with `retry_count = 0` and cleared `error_msg`. Tasks previously marked `TASK_DONE` (3) that are no longer marked `"done"` in `version_states` (due to version purge or rollback) are reset to their initial computed status. In-flight leased (`TASK_LEASED`) and reclaiming (`TASK_RECLAIMING`) tasks retain their operational state unless `version_states` confirms completion.
   - Automatically transitions dependent tasks from `TASK_PENDING` (0) to `TASK_ELIGIBLE` (1) upon completing a
@@ -1780,8 +1795,9 @@ and isolated crash recovery.
   - `_tagged_blob_ids()` ignores blobs currently claimed by an active in-flight `INGEST_PARSING` run in
     `m_ingest_blob`.
   - Secondary indexing on `m_ingest_blob(blob_id)` enables high-performance lookups of active blob reservations.
-  - `m_ast_hash` commits are deferred until Step 7, ensuring peer nodes never link against an uncommitted AST
-    node from another machine.
+  - `m_ast_hash` commits are deferred until Step 7 in distributed mode when another node is registered in
+    `m_parse_node` (`_has_peer_nodes()`), ensuring peer nodes never link against an uncommitted AST node from
+    another machine.
 - **Checkpoint Pinning (`core/checkpoints.py`)**:
   - `is_checkpoint_pinned()` prevents compacting an ancestor base checkpoint into a delta while a secondary
     worker is actively using or scheduled to use it as `Old_VID`, checking both leased tasks in `m_parse_task`

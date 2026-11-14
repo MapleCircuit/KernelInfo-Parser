@@ -114,7 +114,7 @@ def processing_git_commits(version: str) -> None:
         commits, file_hunks_map = precomputed
 
     if commits is None:
-        known_count = len(gp.commit_ids_by_hash) if getattr(gp, "commit_ids_by_hash", None) else None
+        known_count = getattr(gp, "commit_range_count", None)
         commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
             gp.Old_Version_Name, gp.Version_Name, limit=getattr(gp, "commit_limit", None), known_commit_count=known_count
         )
@@ -324,7 +324,9 @@ def processing_git_commits(version: str) -> None:
             for cid, b_id, tid in tag_bridges:
                 G.TE.set(m_bridge_commit_tag.table_id, (cid, b_id, tid))
 
-    # Stage m_bridge_checkpoint for milestone release version
+    # Safety net for the version's checkpoint: the ChangeSets, blob reuse, unchanged files and symlinks staged
+    # one m_bridge_checkpoint row per file. A file with a blob but no row (stored or staged) gets one here,
+    # so the tree of the version never silently lacks a file.
     checkpoint_cid = gp.VID if (gp.VID and gp.VID != 0) else head_commit_id
     if checkpoint_cid is not None and checkpoint_cid != 0:
         if hasattr(gp, "file_blob_ids") and gp.file_blob_ids:
@@ -335,36 +337,31 @@ def processing_git_commits(version: str) -> None:
             blob_items = []
 
         if blob_items:
-            existing_count = 0
-            existing_fnids: set[int] = set()
+            stored_fnids: set[int] | None = None
             try:
                 with G.DB() as db:
-                    existing_count = db.count_rows("m_bridge_checkpoint", {"commit_id": checkpoint_cid})
-                    if 0 < existing_count < len(blob_items):
-                        existing_fnids = set(db.select_values("m_bridge_checkpoint", "fnid", {"commit_id": checkpoint_cid}))
+                    stored_fnids = {int(f) for f in db.select_values("m_bridge_checkpoint", "fnid", {"commit_id": checkpoint_cid})}
             except Exception as e:
-                logger.debug(f"Note on checking m_bridge_checkpoint existing rows: {e}")
-
-            if existing_count >= len(blob_items) and existing_count > 0:
-                logger.info(f"Milestone checkpoint for commit {checkpoint_cid} is already fully populated ({existing_count} files); skipping.")
-            else:
+                logger.warning(f"Could not read the checkpoint rows of commit {checkpoint_cid} ({e}); checkpoint check skipped.")
+            if stored_fnids is not None:
                 staged_count = 0
                 for f_path, b_id in blob_items:
-                    if b_id != 0:
-                        f_nid = get_fnid_for_path(f_path)
-                        if f_nid is not None and f_nid not in existing_fnids:
-                            existing_fnids.add(f_nid)
-                            G.TE.set(
-                                m_bridge_checkpoint.table_id,
-                                (
-                                    checkpoint_cid,
-                                    f_nid,
-                                    b_id,
-                                ),
-                            )
-                            staged_count += 1
+                    if not b_id:
+                        continue
+                    f_nid = get_fnid_for_path(f_path)
+                    if f_nid is None or f_nid in stored_fnids:
+                        continue
+                    stored_fnids.add(f_nid)
+                    # Rows staged since the last commit (e.g. the symlinks of Step 6.1) are not stored yet
+                    if G.TE.get(m_bridge_checkpoint.table_id, (checkpoint_cid, f_nid, None)) is not None:
+                        continue
+                    G.TE.set(m_bridge_checkpoint.table_id, (checkpoint_cid, f_nid, b_id))
+                    staged_count += 1
                 if staged_count > 0:
-                    logger.info(f"Staged {staged_count} milestone snapshot files into m_bridge_checkpoint for commit {checkpoint_cid}.")
+                    logger.warning(
+                        f"[Checkpoint] {staged_count} file(s) of commit {checkpoint_cid} had no m_bridge_checkpoint row; "
+                        f"staged them from the version's blob map."
+                    )
 
     # Step 6.5: Resolve mailing list emails for ingested commits
     try:

@@ -157,6 +157,14 @@ def _binary_names_of(sources: Sequence[Any]) -> frozenset[str]:
     return frozenset(names)
 
 
+def _translated(exc: BaseException) -> BaseException | None:
+    """Neutral equivalent of the mysql-connector error `exc` (keeping its `failed_table_ids`), or None."""
+    neutral = translate_mysql_error(exc)
+    if neutral is not None and hasattr(exc, "failed_table_ids"):
+        neutral.failed_table_ids = exc.failed_table_ids  # type: ignore[attr-defined]
+    return neutral
+
+
 def _wrap_driver_errors(fn: Any) -> Any:
     """Translate mysql-connector errors raised by `fn` to the neutral `db_engine.errors` classes."""
     if inspect.isgeneratorfunction(fn):
@@ -166,7 +174,7 @@ def _wrap_driver_errors(fn: Any) -> Any:
             try:
                 yield from fn(*args, **kwargs)
             except mysql.connector.Error as exc:
-                neutral = translate_mysql_error(exc)
+                neutral = _translated(exc)
                 if neutral is None:
                     raise
                 raise neutral from exc
@@ -178,7 +186,7 @@ def _wrap_driver_errors(fn: Any) -> Any:
         try:
             return fn(*args, **kwargs)
         except mysql.connector.Error as exc:
-            neutral = translate_mysql_error(exc)
+            neutral = _translated(exc)
             if neutral is None:
                 raise
             raise neutral from exc

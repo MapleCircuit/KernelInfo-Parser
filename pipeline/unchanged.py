@@ -253,7 +253,10 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
             file_fnid_cache[symlink_path] = sym_fnid
             if hasattr(gp, "file_blob_ids") and isinstance(gp.file_blob_ids, dict):
                 gp.file_blob_ids[symlink_path] = target_fid
-            logger.info(f"Symlink aliased: '{symlink_path}' -> '{norm_target}' (fid {target_fid})")
+            # Unchanged symlinks (change line "U") are re-aliased on every version: DEBUG only
+            (logger.debug if op == "U" else logger.info)(
+                f"Symlink aliased: '{symlink_path}' -> '{norm_target}' (fid {target_fid})"
+            )
         else:
             logger.info(
                 f"Symlink target '{norm_target}' not found in active tree; falling back to raw processing for '{symlink_path}'"

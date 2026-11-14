@@ -274,20 +274,28 @@ def set_status(
     network_id: int,
     commit_id: int,
     status: int,
-    base_commit_id: int = 0,
-    worker_id: str = "",
+    base_commit_id: int | None = None,
+    worker_id: str | None = None,
 ) -> None:
-    """Record a version's ingestion status (upsert); a finished version also drops its bookkeeping (one transaction)."""
+    """Record a version's ingestion status (upsert); a finished version also drops its bookkeeping (one transaction).
+
+    `base_commit_id` / `worker_id` left at None keep the values an existing row holds (a new row gets 0 / "")."""
     if not commit_id:
         # commit_id 0 is the "unresolved ref" sentinel of m_git_ref, not a version being ingested
         logger.warning("Ignoring an ingestion status for commit_id 0 (the ref has no resolved head commit).")
         return
+    update_columns = ["status", "updated_at"]
+    if base_commit_id is not None:
+        update_columns.append("base_commit_id")
+    if worker_id is not None:
+        update_columns.append("worker_id")
     with db.transaction():
         db.insert_rows(
             "m_ingest_state",
             ["network_id", "commit_id", "status", "updated_at", "base_commit_id", "worker_id"],
-            [(network_id, commit_id, status, int(time.time()), base_commit_id, worker_id)],
+            [(network_id, commit_id, status, int(time.time()), base_commit_id or 0, worker_id or "")],
             on_conflict="update",
+            update_columns=update_columns,
         )
         if status == INGEST_DONE:
             _delete_marks(db, commit_id)

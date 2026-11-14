@@ -158,6 +158,49 @@ class TestLinuxBranchesAndDistributed(unittest.TestCase):
         self.assertEqual(tasks["stable/linux-3.0.y"]["base_ref_name"], "v3.0")
         self.assertEqual(tasks["stable/linux-3.0.y"]["status"], distributed.TASK_ELIGIBLE)
 
+    def test_publish_delegable_chains_reuses_unchanged_branch_bases(self):
+        """Verify publish_delegable_chains skips git merge-base for done or unchanged branches."""
+        db = DistDB()
+        version_states = {
+            "v3.0": (100, "done"),
+            "master": (500, "done"),
+            "linux-next/master": (600, "new"),
+            "stable/linux-3.0.y": (700, "done"),
+        }
+        distributed.publish_delegable_chains(
+            db,
+            network_id=1,
+            repo_id=1,
+            all_tags=["v3.0"],
+            version_states=version_states,
+            delegate_branches=["linux-next/master", "stable/linux-3.0.y"],
+            repo_dir="repos/linux",
+        )
+        with patch("core.distributed._resolve_branch_merge_base") as mock_mb:
+            distributed.publish_delegable_chains(
+                db,
+                network_id=1,
+                repo_id=1,
+                all_tags=["v3.0"],
+                version_states=version_states,
+                delegate_branches=["linux-next/master", "stable/linux-3.0.y"],
+                repo_dir="repos/linux",
+            )
+            mock_mb.assert_not_called()
+
+    def test_load_tag_map_handles_peeled_and_lightweight_tags(self):
+        """Verify _load_tag_map prefers peeled annotated targets and selects alphabetically."""
+        fake_stdout = (
+            "1111111111111111111111111111111111111111 refs/tags/v3.0-b\n"
+            "2222222222222222222222222222222222222222 refs/tags/v3.0-b^{}\n"
+            "2222222222222222222222222222222222222222 refs/tags/v3.0-a\n"
+        )
+        with patch("core.distributed.sp.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = fake_stdout
+            tag_map = distributed._load_tag_map("repos/linux")
+        self.assertEqual(tag_map, {"2222222222222222222222222222222222222222": "v3.0-a"})
+
     def test_claim_next_task_priority(self):
         """Verify claim_next_task hands out chains in the order history -> stable -> next -> other branches."""
         elig = distributed.TASK_ELIGIBLE

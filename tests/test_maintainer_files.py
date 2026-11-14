@@ -174,6 +174,25 @@ class TestStep67(unittest.TestCase):
         self.assertEqual(staged, [])
         parse.assert_not_called()
 
+    def test_listing_and_read_failures_propagate(self) -> None:
+        ids = {"alpha driver": 1, "beta driver": 4, "the rest": 3}
+        import main
+        import pipeline.maintainers
+        scope = (ids, {1, 2, 3}, {1, 2, 3}, True)
+        for broken in ("git_file_list", "get_file"):
+            mf = mock.MagicMock()
+            mf.git_file_list.side_effect = lambda rev: "\n".join(PATHS_V1 if rev == "v1" else PATHS_V2)
+            mf.get_file.return_value = V2
+            getattr(mf, broken).side_effect = OSError("git failed")
+            with mock.patch.object(pipeline.maintainers, "MF", mf), mock.patch.object(main.G, "TE", mock.MagicMock()), \
+                    mock.patch.object(pipeline.maintainers, "_maintainer_scope", return_value=scope), \
+                    mock.patch.object(pipeline.maintainers, "get_fid_for_path", return_value=77), \
+                    mock.patch.object(main.gp, "VID", 2), mock.patch.object(main.gp, "Old_VID", 1, create=True), \
+                    mock.patch.object(main.gp, "Version_Name", "v2", create=True), \
+                    mock.patch.object(main.gp, "Old_Version_Name", "v1", create=True):
+                with self.assertRaises(OSError, msg=broken):
+                    pipeline.maintainers.processing_maintainer_files("v2")
+
     def test_changed_section_and_new_path(self) -> None:
         ids = {"alpha driver": 1, "beta driver": 4, "the rest": 3}
         staged, parse, fnids = self._run((ids, {1, 2, 3}, {1, 2, 3}, True))

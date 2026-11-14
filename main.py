@@ -23,6 +23,7 @@ from core.config import (
     repository_project,
 )
 from core.ssh_tunnel import start_ssh_tunnel
+import contextlib
 import sys
 
 import time
@@ -46,8 +47,34 @@ from pipeline.update import update
 
 
 
+def _shutdown_node() -> None:
+    """Stop the heartbeat and remove this node from m_parse_node. Idempotent and never raises: it runs on
+    every way out of `main()` (also from `G.emergency_shutdown()`, before the SSH tunnel stops)."""
+    daemon = getattr(G, "heartbeat_daemon", None)
+    node_id = getattr(G, "node_id", None)
+    G.heartbeat_daemon = None
+    G.node_id = None
+    if daemon is not None:
+        with contextlib.suppress(Exception):
+            daemon.stop()
+    if node_id:
+        try:
+            with G.DB() as db:
+                distributed.unregister_node(db, node_id)
+        except BaseException as e:  # noqa: BLE001 - e.g. Ctrl+C also stopped the SSH tunnel
+            logger.warning(COLOR.yellow(f"[Distributed] Node '{node_id}' stays registered until its heartbeat expires: {e}"))
+
+
 def main() -> None:
     """Set the plan for what version to parse."""
+    try:
+        _run()
+    finally:
+        _shutdown_node()
+
+
+def _run() -> None:
+    """Apply the arguments and run the requested mode."""
     args = arg_handling()
     if args.mem_max > 0:
         setup_memory_limit(float(args.mem_max))
@@ -223,6 +250,8 @@ def main() -> None:
         )
         heartbeat_daemon.start()
         G.heartbeat_daemon = heartbeat_daemon
+        if _shutdown_node not in G.shutdown_hooks:
+            G.shutdown_hooks.append(_shutdown_node)
     else:
         G.node_id = None
         G.heartbeat_daemon = None
@@ -315,22 +344,26 @@ def main() -> None:
                 with G.DB() as db:
                     if db is not None:
                         refresh_person_identities(db, "worker shutdown", only_if_incomplete=True)
-                with G.DB() as db:
-                    distributed.unregister_node(db, node_id)
             except Exception as e:  # noqa: BLE001
                 # E.g. Ctrl+C also stopped the SSH tunnel: an unfinished lease expires and a peer reclaims it
                 logger.warning(COLOR.yellow(f"[Worker] Shutdown cleanup skipped, database unreachable: {e}"))
-            G.heartbeat_daemon = None
-            G.node_id = None
+            _shutdown_node()
         logger.info("[Worker] Secondary worker shutdown complete.")
         G.emergency_shutdown(worker_exit_code)
         return
 
     if role == distributed.ROLE_MASTER:
+        # Release tags the chains are built from: the documented default list starts at v3.0, a run that
+        # starts at an older release takes the list from there
         all_tags = MF.get_version_tags(include_pre_releases=True)
-        if target_refs and len(target_refs) > 0 and target_refs[0] in all_tags:
-            start_idx = all_tags.index(target_refs[0])
-            all_tags = all_tags[start_idx:]
+        if target_refs and target_refs[0] in all_tags:
+            all_tags = all_tags[all_tags.index(target_refs[0]):]
+        elif target_refs and not is_branch_pipeline:
+            from_start = MF.get_version_tags(start_ref=target_refs[0], include_pre_releases=True)
+            if len(from_start) > 1:
+                all_tags = from_start
+        delegate_stable = bool(getattr(args, "delegate_stable", True))
+        branch_refs = distributed.delegated_branches(getattr(args, "delegate_branches", None), repo_path)
         with G.DB() as db:
             distributed.publish_delegable_chains(
                 db,
@@ -338,23 +371,17 @@ def main() -> None:
                 repo_id,
                 all_tags,
                 version_states,
-                delegate_stable=getattr(args, "delegate_stable", True),
-                delegate_branches=getattr(args, "delegate_branches", None),
+                delegate_stable=delegate_stable,
+                delegate_branches=branch_refs,
                 repo_dir=repo_path,
             )
-        if getattr(args, "delegate_stable", True):
-            # Every project: the stable / next chains of the repository's release tags (any tag scheme,
-            # release_order.release_tag_names) and the delegated branches are published above; the master
-            # keeps the mainline release tags and the trunk branches
-            from parser.git_ast import release_order
-            releases = set(release_order.release_tag_names(all_tags))
-            mainline_set = {r["tag"] for r in release_order.release_ranges(releases) if r["kind"] == "mainline"}
-            trunk_refs = {"history/master", "history/HEAD", "master", "main", "origin/master", "origin/main"}
-            orig_len = len(target_refs)
-            target_refs = [t for t in target_refs if t in mainline_set or t in trunk_refs]
-            logger.info(COLOR.cyan(
-                f"[Master] Mainline exclusive mode active. Delegated {orig_len - len(target_refs)} version(s) to secondary workers; parsing {len(target_refs)} mainline/trunk release(s)."
-            ))
+        # The master keeps what is not published: mainline release tags, trunk branches and refs that are no
+        # release tag (core/distributed.py partition_master_refs)
+        target_refs, delegated_refs = distributed.partition_master_refs(target_refs, all_tags, delegate_stable, branch_refs)
+        logger.info(COLOR.cyan(
+            f"[Master] Parsing {len(target_refs)} mainline/trunk ref(s); {len(delegated_refs)} stable/next/branch "
+            f"ref(s) of this run are published as tasks for secondary workers."
+        ))
 
     # Release statistics of every release tag (core/API.md section 10); --release-stats does only this
     if getattr(args, "release_stats", False) or not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
@@ -375,6 +402,10 @@ def main() -> None:
 
     if repair_mode or backfill_target:
         canonical_tags = MF.get_version_tags(start_ref=target_refs[0] if target_refs else None, include_pre_releases=True)
+        if role == distributed.ROLE_MASTER:
+            # Delegated chains are the workers' to parse: a stable tag is no gap of the master's chain
+            canonical_tags, _delegated = distributed.partition_master_refs(
+                canonical_tags, canonical_tags, bool(getattr(args, "delegate_stable", True)))
         for ref in [r for r, (_cid, st) in version_states.items() if st == "legacy"]:
             _resolve_legacy_state(ref, version_states, network_id)
         orchestrate_repair_pipeline(
@@ -432,8 +463,7 @@ def main() -> None:
             if r_st == "interrupted" and r_cid > 0:
                 with G.DB() as db:
                     if db is not None:
-                        if not ingest_state.rollback_version(db, network_id, r_cid, TABLES):
-                            _purge_partial_version(db, r_cid)
+                        ingest_state.clean_interrupted_version(db, network_id, r_cid, TABLES)
                 _forget_rolled_back_rows()
                 logger.warning(COLOR.yellow(
                     f"[Release Pipeline] Detected interrupted version '{resume_ref}' (commit_id {r_cid}). Rolled back partial database rows."
@@ -504,12 +534,7 @@ def main() -> None:
         sys.exit(1)
     finally:
         quit_listener.stop()
-        if is_distributed and heartbeat_daemon is not None and node_id is not None:
-            heartbeat_daemon.stop()
-            with G.DB() as db:
-                distributed.unregister_node(db, node_id)
-            G.heartbeat_daemon = None
-            G.node_id = None
+        _shutdown_node()
         if getattr(G, "STAGE_PROFILER", None) is not None:
             print(G.STAGE_PROFILER.format_stage_report())
 

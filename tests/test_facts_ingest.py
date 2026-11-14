@@ -83,6 +83,27 @@ class TestFactsIngest(unittest.TestCase):
         self.assertEqual((res["extracted"], res["rows"], reads), (1, 1, ["kernel/a.c"]))
         self.assertEqual(kf.decode(stored(conn)[(A, KAPI)][1])["x"], [["a", "plain", "", 2]])
 
+    def test_known_blobs_issue_no_facts_read_and_all_families_use_one_pass(self) -> None:
+        conn = facts_db()
+        reads: list[str] = []
+        real = conn.select_rows
+
+        def spy(table, *args, **kwargs):
+            if table == "m_blob_facts":
+                reads.append(table)
+            return real(table, *args, **kwargs)
+
+        conn.select_rows = spy
+        known: set[bytes] = set()
+        blobs = {A: "kernel/a.c", B: "include/b.h"}
+        res = fi.ingest(conn, blobs, lambda p: TEXTS[p], workers=1, known=known)
+        self.assertEqual(res["extracted"], 2)
+        self.assertEqual(len(reads), 1, "one query covers every family of up to 1000 SHAs")
+        self.assertEqual(known, {A, B})
+        reads.clear()
+        again = fi.ingest(conn, blobs, lambda p: TEXTS[p], workers=1, known=known)
+        self.assertEqual((again["extracted"], again["blobs"], reads), (0, 0, []))
+
     def test_unreadable_and_huge_blobs_are_stored_empty(self) -> None:
         conn = facts_db()
         res = fi.ingest(conn, {A: "gone.c"}, lambda path: None, workers=1)

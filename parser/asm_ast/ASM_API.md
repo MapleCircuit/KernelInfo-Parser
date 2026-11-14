@@ -79,7 +79,7 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
-  │     └── (m_map_ast is keyed by the tag (map_id = tag_id); m_bridge_map is no longer written)
+  │     └── (m_map_ast is keyed by the tag, map_id = tag_id)
 ==================================================================================================
 ```
 

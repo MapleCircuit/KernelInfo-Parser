@@ -865,5 +865,60 @@ class TestPhaseBSpecs(unittest.TestCase):
         self.assertIn("DB_API.md 'Spec Write Primitives'", str(b.exception))
 
 
+
+class TestEnqueueParseTasksBatch(unittest.TestCase):
+    """`enqueue_parse_tasks()` sends one multi-row upsert with the same per-row rules as one call per row."""
+
+    COLS = ["task_id", "network_id", "chain_name", "chain_kind", "seq_order", "ref_name", "commit_id",
+            "base_ref_name", "base_commit_id", "status", "worker_id", "lease_expires_at", "retry_count", "error_msg"]
+    # existing tasks: FAILED, DONE, LEASED, RECLAIMING, PENDING (with progress that must survive or reset)
+    SEED = [
+        (1, 1, "c", "stable", 1, "v1", 11, "v0", 10, 4, "w", 5, 3, "boom"),
+        (2, 1, "c", "stable", 2, "v2", 12, "v1", 11, 3, "w", 5, 1, "old"),
+        (3, 1, "c", "stable", 3, "v3", 13, "v2", 12, 2, "w", 5, 0, ""),
+        (4, 1, "c", "stable", 4, "v4", 14, "v3", 13, 5, "w", 5, 0, ""),
+        (5, 1, "c", "stable", 5, "v5", 15, "v4", 14, 0, "", 0, 2, "x"),
+    ]
+    PUBLISH = [
+        (1, "c2", "stable", 1, "v1", 0, "v0", 0, 1),     # FAILED -> starts over, ids kept
+        (1, "c2", "stable", 2, "v2", 22, "v1", 0, 1),    # DONE published as not done -> reopened, commit_id 22
+        (1, "c2", "stable", 3, "v3", 0, "v2", 0, 1),     # LEASED keeps its state
+        (1, "c2", "stable", 4, "v4", 0, "v3", 0, 3),     # RECLAIMING published as DONE -> DONE
+        (1, "c2", "stable", 5, "v5", 0, "v4", 0, 1),     # PENDING takes the published status
+        (1, "c2", "stable", 6, "v6", 16, "v5", 15, 0),   # new task
+        (1, "c2", "stable", 6, "v6", 0, "v5", 0, 1),     # same task again: applied after the row above
+    ]
+
+    def _engines(self):
+        from core.DBLayout import m_parse_task
+        from db_engine import SQLiteDB
+
+        def sqlite():
+            db = SQLiteDB(":memory:", foreign_keys=False)
+            db.create_table([m_parse_task])
+            return db
+
+        return {"SQLiteDB": sqlite, "MockDB": lambda: MockDB(use_global=False)}
+
+    def _tasks(self, db):
+        return db.select_rows("m_parse_task", self.COLS[1:], order_by=["ref_name"])
+
+    def test_batch_matches_one_call_per_row(self) -> None:
+        for name, make in self._engines().items():
+            with self.subTest(engine=name):
+                batch, single = make(), make()
+                for db in (batch, single):
+                    db.insert_rows("m_parse_task", self.COLS, self.SEED)
+                self.assertEqual(batch.enqueue_parse_tasks(self.PUBLISH), len(self.PUBLISH))
+                self.assertEqual(sum(single.enqueue_parse_tasks([row]) for row in self.PUBLISH), len(self.PUBLISH))
+                self.assertEqual(self._tasks(batch), self._tasks(single))
+                by_ref = {t[4]: t for t in self._tasks(batch)}
+                self.assertEqual(by_ref["v1"][5:], (11, "v0", 10, 1, "w", 5, 0, ""))
+                self.assertEqual(by_ref["v2"][5], 22)
+                self.assertEqual(by_ref["v3"][8], 2)
+                self.assertEqual(by_ref["v4"][8], 3)
+                self.assertEqual(by_ref["v6"][5:9], (16, "v5", 15, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

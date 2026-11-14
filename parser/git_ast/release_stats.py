@@ -11,7 +11,7 @@ Summarizes every release tag of a repository, ingested or not, into `m_release_s
 - Per segment: one `git log` (merges included: commit, parents, author, message) whose trailers are read
   with the parser's own `iter_trailers()` (merges are counted, not summarized), and every commit of the
   segment stored in `m_commit_release` (the first segment of each chain containing it); per diff range
-  one `git diff --shortstat`. Ranges run on `WORKERS` threads and are written in release order, one
+  one `git diff --shortstat`. Ranges are computed on a process pool (`process_workers()`; the record summaries are CPU-bound, so threads would be serialized by the GIL; `WORKERS` threads when no pool can start) and are written in release order, one
   transaction per segment, so an interrupted run resumes where it stopped.
 - Incremental: a tag already summarized with the same commit, bases and `FORMAT` costs nothing; a moved
   tag, a changed base (a tag inserted before it) or an older format is summarized again.
@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import multiprocessing
+import os
 import re
 import subprocess
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 from db_engine.spec import Join
 from parser.git_ast.git_commit_parser import iter_trailers
@@ -183,7 +186,15 @@ def compute(repo: Path, rng: dict[str, Any]) -> dict[str, Any]:
 class _Persons:
     """(name, email) -> person_id over m_maintainer_person, inserting the ones not registered yet."""
 
-    def __init__(self, db: Any) -> None:
+    ID_BLOCK = 256
+
+    def __init__(self, db: Any, distributed: bool = False) -> None:
+        self.distributed = distributed
+        self.added = 0
+        self._cursor = 0
+        self._limit = -1
+        # Ids assigned by mint() and not inserted yet
+        self._minted: dict[tuple[str, str], int] = {}
         rows_raw = db.select_rows("m_maintainer_person", ["person_id", "name", "email"])
         rows = [(int(pid), _text(name), _text(email)) for pid, name, email in rows_raw]
         # A row stored in its normalized form wins over older unnormalized duplicates (main._ingest_commit_range)
@@ -193,13 +204,37 @@ class _Persons:
             self.ids.setdefault(stored_person_key(name, email), pid)
         self.next_id = max([pid for pid, _, _ in rows] + [0]) + 1
 
+    def _mint(self, db: Any) -> int:
+        """The next person id: max+1 when alone, else from a block leased with `reserve_id_block` (other nodes
+        lease person id blocks concurrently)."""
+        if not self.distributed:
+            pid = self.next_id
+            self.next_id += 1
+            return pid
+        if self._cursor > self._limit:
+            from core.DBLayout import m_maintainer_person
+            self._cursor, self._limit = db.reserve_id_block(m_maintainer_person, self.ID_BLOCK)
+        pid = self._cursor
+        self._cursor += 1
+        return pid
+
+    def mint(self, db: Any, keys: Iterable[tuple[str, str]]) -> None:
+        """Assign ids to the keys not registered yet, for `resolve()` to insert. Called outside a transaction:
+        leasing an id block (distributed mode) is refused inside one."""
+        for key in keys:
+            if key not in self.ids and key not in self._minted:
+                self._minted[key] = self._mint(db)
+
     def resolve(self, db: Any, keys: Iterable[tuple[str, str]]) -> dict[tuple[str, str], int]:
         new = []
         for key in keys:
             if key not in self.ids:
-                self.ids[key] = self.next_id
-                new.append((self.next_id, key[0], key[1]))
-                self.next_id += 1
+                pid = self._minted.pop(key, None)
+                if pid is None:
+                    pid = self._mint(db)
+                self.ids[key] = pid
+                new.append((pid, key[0], key[1]))
+                self.added += 1
         if new:
             db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], new)
         return self.ids
@@ -294,8 +329,38 @@ def write_segment(db: Any, repo_id: int, rng: dict[str, Any], result: dict[str, 
     return segment_id
 
 
+def process_workers() -> int:
+    """Processes of the summarizing pool: min(cpu, 8) - 1, at least 1."""
+    return max(1, min(os.cpu_count() or 4, 8) - 1)
+
+
+def _compute_args(args: tuple[Path, dict[str, Any]]) -> dict[str, Any]:
+    """Module-level (picklable) pool entry: touches neither the database nor global state."""
+    return compute(*args)
+
+
+def compute_all(repo: Path, todo: list[dict[str, Any]], workers: int = WORKERS,
+                processes: int | None = None) -> Iterator[dict[str, Any]]:
+    """The `compute()` results of the ranges, in order, from a process pool (`processes`, default
+    `process_workers()`); `workers` threads when the pool cannot start or breaks (and for a single range)."""
+    processes = process_workers() if processes is None else processes
+    done = 0
+    if processes >= 1 and len(todo) > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=min(processes, len(todo)), mp_context=multiprocessing.get_context("fork")) as pool:
+                for result in pool.map(_compute_args, [(repo, r) for r in todo]):
+                    done += 1
+                    yield result
+            return
+        except (BrokenProcessPool, OSError, NotImplementedError, ImportError) as exc:
+            logger.warning(f"[Release stats] Process pool unavailable ({exc}); using threads.")
+    rest = todo[done:]
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        yield from pool.map(lambda r: compute(repo, r), rest)
+
+
 def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str], None] | None = None,
-           workers: int = WORKERS) -> dict[str, Any]:
+           workers: int = WORKERS, distributed: bool = False) -> dict[str, Any]:
     """Bring the release statistics of `repo` (m_repository `repo_id`) up to its tags. Returns a summary
     {state: "current" | "updated", tags, segments, persons_added, seconds}."""
     started = time.time()
@@ -308,8 +373,7 @@ def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str]
         return {"state": "current", "tags": len(tags), "segments": 0, "persons_added": 0, "seconds": 0.0}
     # Replacing a mainline segment can move a person's first release later: recompute those from scratch
     replaced_mainline = any(r["tag"] in stored and r["chain"] == CHAIN_MAINLINE for r in todo)
-    persons = _Persons(db)
-    first_persons = persons.next_id
+    persons = _Persons(db, distributed)
     tag_of = {row[0]: t for t, row in stored.items() if row[6] == CHAIN_MAINLINE}
     first = None if replaced_mainline else _first_releases(db, repo_id, tag_of)
     logger.info(f"[Release stats] {len(todo)} of {len(tags)} release tag(s) to summarize"
@@ -323,22 +387,22 @@ def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str]
             db.delete_rows("m_commit_release", {"segment_id": old_ids})
     done = 0
     last_log = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        # Computed in parallel, written in release order (pool.map keeps it): a person's first
-        # release is decided by the earliest mainline segment, and an interrupted run resumes cleanly
-        for rng, result in zip(todo, pool.map(lambda r: compute(repo, r), todo)):
-            old = stored.get(rng["tag"])
-            with db.transaction():
-                write_segment(db, repo_id, rng, result, persons, old[0] if old else None, first)
-            done += 1
-            if progress:
-                progress(done, len(todo), rng["tag"])
-            if time.time() - last_log > 20:
-                logger.info(f"[Release stats] {done}/{len(todo)} ({rng['tag']}: {result['commits']} commits)")
-                last_log = time.time()
+    # Computed in parallel, written in release order: a person's first release is decided by the earliest
+    # mainline segment, and an interrupted run resumes cleanly
+    for rng, result in zip(todo, compute_all(repo, todo, workers)):
+        old = stored.get(rng["tag"])
+        persons.mint(db, (key for key, _role in result["people"]))
+        with db.transaction():
+            write_segment(db, repo_id, rng, result, persons, old[0] if old else None, first)
+        done += 1
+        if progress:
+            progress(done, len(todo), rng["tag"])
+        if time.time() - last_log > 20:
+            logger.info(f"[Release stats] {done}/{len(todo)} ({rng['tag']}: {result['commits']} commits)")
+            last_log = time.time()
     if replaced_mainline:
         mainline = {row[0]: t for t, row in stored_segments(db, repo_id).items() if row[6] == CHAIN_MAINLINE}
         with db.transaction():
             _rebuild_first_releases(db, repo_id, mainline)
-    return {"state": "updated", "tags": len(tags), "segments": done, "persons_added": persons.next_id - first_persons,
+    return {"state": "updated", "tags": len(tags), "segments": done, "persons_added": persons.added,
             "seconds": round(time.time() - started, 1)}

@@ -210,16 +210,23 @@ def fact_blobs(file_blob_hashes: dict[str, bytes]) -> dict[bytes, str]:
     return out
 
 
+def present(db: Any, shas: Iterable[bytes], families: Iterable[int]) -> dict[int, set[bytes]]:
+    """family -> the SHAs with a row of the family in its current format; one pass over the table for all families."""
+    wanted = {f: FAMILIES[f] for f in families}
+    have: dict[int, set[bytes]] = {f: set() for f in wanted}
+    todo = sorted(set(shas))
+    for i in range(0, len(todo), _IN):
+        rows = db.select_rows("m_blob_facts", ["blob_hash", "family", "format"], {"blob_hash": todo[i:i + _IN]}, as_dict=False)
+        for sha, family, fmt in rows:
+            if int(family) in wanted and int(fmt) == wanted[int(family)]:
+                have[int(family)].add(bytes(sha))
+    return have
+
+
 def missing(db: Any, shas: Iterable[bytes], family: int) -> list[bytes]:
     """The SHAs without a row of the family in its current format."""
     todo = sorted(set(shas))
-    have: set[bytes] = set()
-    for i in range(0, len(todo), _IN):
-        part = todo[i:i + _IN]
-        rows = db.select_rows(
-            "m_blob_facts", ["blob_hash"], {"family": family, "format": FAMILIES[family], "blob_hash": part}, as_dict=False
-        )
-        have.update(bytes(r[0]) for r in rows)
+    have = present(db, todo, (family,))[family]
     return [s for s in todo if s not in have]
 
 
@@ -323,20 +330,27 @@ def store(db: Any, rows: list[tuple[bytes, int, bytes]]) -> None:
 
 def ingest(db: Any, blobs: dict[bytes, str], read_text: Callable[[str], str | None], workers: int = 1,
            families: Iterable[int] | None = None, read_sha: Callable[[bytes], str | None] | None = None,
-           progress: Callable[[int], None] | None = None) -> dict[str, Any]:
+           progress: Callable[[int], None] | None = None, known: set[bytes] | None = None) -> dict[str, Any]:
     """Extract and store the facts the database lacks of the blobs (SHA -> a path to read it from), each blob read
     once for all its missing families (`families`: only those).
 
     `read_text(path)` returns the file's text (None: unreadable; stored as a blob without facts); `read_sha(sha)`,
-    when given, reads it by blob SHA instead (the backfill: no checkout). `progress(n)` is called per extracted blob."""
+    when given, reads it by blob SHA instead (the backfill: no checkout). `progress(n)` is called per extracted blob.
+    `known`, when given, holds SHAs already complete for every family: they are not checked, and every SHA checked
+    complete or written is added to it (pass it only when `families` is None, i.e. all families are covered)."""
     started = time.perf_counter()
     if db is None or not blobs:
         return {"blobs": len(blobs), "extracted": 0, "rows": 0, "seconds": 0.0}
     wanted = [f for f in FAMILIES if families is None or f in set(families)]
+    if known:
+        blobs = {s: p for s, p in blobs.items() if s not in known}
     need: dict[bytes, list[int]] = {}
+    have = present(db, blobs, wanted) if blobs else {}
     for family in wanted:
-        for sha in missing(db, (s for s, p in blobs.items() if family in families_of(p)), family):
+        for sha in sorted(s for s, p in blobs.items() if family in families_of(p) and s not in have[family]):
             need.setdefault(sha, []).append(family)
+    if known is not None:
+        known.update(s for s in blobs if s not in need)
     if not need:
         return {"blobs": len(blobs), "extracted": 0, "rows": 0, "seconds": round(time.perf_counter() - started, 1)}
     todo = sorted(need)
@@ -365,4 +379,6 @@ def ingest(db: Any, blobs: dict[bytes, str], read_text: Callable[[str], str | No
         if len(pending) >= 2000:
             flush()
     flush()
+    if known is not None:
+        known.update(todo)
     return {"blobs": len(blobs), "extracted": done, "rows": rows, "seconds": round(time.perf_counter() - started, 1)}

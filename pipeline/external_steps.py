@@ -17,6 +17,17 @@ from pipeline.state import MF, gp, logger
 
 
 
+# SHAs known complete for every family, per (fact formats, network, repository); a change of the fact format or of
+# the family set, or another repository / network, selects another set
+_FACTS_MEMO: dict[tuple, set[bytes]] = {}
+
+
+def _facts_memo_key() -> tuple:
+    """Memo key of the current fact formats, family set, network and repository."""
+    return (tuple(sorted(facts_ingest.FAMILIES.items())), getattr(gp, "network_id", None),
+            getattr(gp, "repo_id", None), str(getattr(MF, "repo_dir", "")))
+
+
 def processing_source_facts(version: str) -> int:
     """Step 6.9: extract the per-blob facts `m_blob_facts` lacks of this version's files (parser/facts_ingest.py):
     functions, calls and ops tables of the `.c` / `.h` blobs (family 1), Kernel API macros of the `.c` / `.h` / `.S`
@@ -42,7 +53,11 @@ def processing_source_facts(version: str) -> int:
     with G.DB() as db:
         if db is None:
             return 0
-        result = facts_ingest.ingest(db, blobs, read_text, workers)
+        key = _facts_memo_key()
+        if key not in _FACTS_MEMO:
+            _FACTS_MEMO.clear()
+            _FACTS_MEMO[key] = set()
+        result = facts_ingest.ingest(db, blobs, read_text, workers, known=_FACTS_MEMO[key])
     if result["extracted"]:
         logger.info(
             f"[Source Facts] '{version}': {result['extracted']} of {result['blobs']} source blob(s) extracted "
@@ -89,7 +104,7 @@ def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | N
                     "they are summarized once the version is recovered."
                 ))
                 return {"state": "deferred"}
-            summary = release_stats.ingest(db, Path(repo_path), repo_id)
+            summary = release_stats.ingest(db, Path(repo_path), repo_id, distributed=bool(getattr(G, "distributed", False)))
             if summary.get("persons_added"):
                 refresh_person_identities(db, "release statistics added persons")
     except Exception as exc:  # noqa: BLE001 - release statistics never block parsing

@@ -124,7 +124,7 @@ class MariaDB(MariaDBConnection, MariaDBTables, MariaDBIndexes, MariaDBViews, Ma
 for _name in (
     "_raw_query", "_raw_query_one", "_raw_query_iter", "_raw_execute", "_raw_executemany",
     "select", "select_in", "select_preload", "view_select", "view_select_multiple", "table_size",
-    "insert", "update", "get_next_id", "reserve_id_block",
+    "insert", "update", "get_next_id", "reserve_id_block", "commit", "commit_tables_parallel",
     "select_rows", "iter_rows", "insert_rows", "update_rows", "delete_rows", "copy_rows",
     "drop_tables", "drop_table", "create_table", "create_view", "create_index", "remove_index",
 ):

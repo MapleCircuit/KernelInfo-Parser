@@ -244,8 +244,7 @@ class MariaDBSpec:
                     with contextlib.closing(self.cnx.cursor()) as cur:
                         cur.execute(sql, flat_params)
                         rc = cur.rowcount
-                        if getattr(self.cnx, "autocommit", True) and not self._in_txn:
-                            self.cnx.commit()
+                        self._last_ok = time.monotonic()  # outside transaction() autocommit has committed it
                         if on_conflict in ("update", "replace"):
                             return len(batch)  # server counts 1 or 2 per row; every offered row is written
                         return max(0, rc)

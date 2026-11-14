@@ -46,9 +46,7 @@ class MariaDBTables:
         if not isinstance(tables, (tuple, list)):
             tables = (tables,)
 
-        self.check_if_connected()
-        self._cur.execute("SHOW TABLES")
-        existing_tables = {row[0] for row in self._cur.fetchall()}
+        existing_tables = {row[0] for row in self._fetch_all("SHOW TABLES")}
 
         missing_tables = [table.table_name for table in tables if table.table_name not in existing_tables]
 
@@ -140,26 +138,25 @@ class MariaDBTables:
         Outputs:
             Next available sequence integer ID.
         """
-        self.check_if_connected()
         if table.table_id not in self._next_id_sql_cache:
             self._next_id_sql_cache[table.table_id] = (
                 f"SELECT COALESCE(MAX(`{table.init_columns[0][0]}`), 0)+1 FROM `{table.table_name}`;"
             )
-        self._cur.execute(self._next_id_sql_cache[table.table_id])
-        return self._cur.fetchone()[0]
+        return self._fetch_one(self._next_id_sql_cache[table.table_id])[0]
 
     @staticmethod
-    def _insert_sql(table: Table) -> str:
+    def _insert_sql(table: Table, skip_existing: bool = False) -> str:
         """Build the parameterized INSERT statement for `table`.
 
-        For `idempotent_pk` tables, rows whose primary key already exists are skipped individually via a
-        no-op `ON DUPLICATE KEY UPDATE`: a plain multi-row INSERT fails as a whole on one duplicate, which
-        would drop every other row of the chunk. (`INSERT IGNORE` would skip the same rows, but
-        mysql-connector stops batching it into multi-row statements and sends one round trip per row.)
+        For `idempotent_pk` tables (and with `skip_existing`), rows whose key already exists are skipped
+        individually via a no-op `ON DUPLICATE KEY UPDATE pk = pk`: a plain multi-row INSERT fails as a whole on
+        one duplicate, which would drop every other row of the chunk. `INSERT IGNORE` would skip the same rows but
+        also downgrades every other error of the statement (truncated values, foreign-key failures, ...) to a
+        warning, so the no-op update is the narrower tool.
         """
         sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
-        if getattr(table, "idempotent_pk", False) and table.init_primary:
-            pk_col = table.init_primary[0]
+        if (skip_existing or getattr(table, "idempotent_pk", False)) and (table.init_primary or skip_existing):
+            pk_col = table.init_primary[0] if table.init_primary else table.init_columns[0][0]
             sql += f" ON DUPLICATE KEY UPDATE `{pk_col}` = `{pk_col}`"
         return sql
 
@@ -177,17 +174,32 @@ class MariaDBTables:
         Process:
             1. Constructs parameterized `INSERT INTO table VALUES (%s, ...)` (`_insert_sql()`; `idempotent_pk`
                tables add a no-op `ON DUPLICATE KEY UPDATE` so only already-present rows are skipped).
-            2. If `data` is a batch tuple, chunks into 1000-row slices and executes `executemany` with auto-retry.
-            3. If `data` is a single row tuple, executes `execute` with auto-retry.
-            4. Commits transaction.
+            2. If `data` is a batch tuple, chunks it by row count and estimated bytes and executes each chunk
+               (outside `transaction()` a chunk whose connection was lost is retried on a new connection, skipping
+               rows that already exist: the lost acknowledgement may belong to a chunk the server committed).
+            3. If `data` is a single row tuple, executes it with the same retry.
 
         Outputs:
             None.
         """
+        self._insert(table, data)
+
+    def _insert(
+        self,
+        table: Table,
+        data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...],
+        skip_existing: bool = False,
+    ) -> None:
+        """`insert()`; with `skip_existing` every statement skips rows whose key already exists.
+
+        Used to write a table again after an attempt whose outcome is unknown (lost COMMIT acknowledgement): the
+        TableEngine allocates the primary keys, so an existing key can only be this writer's own earlier write.
+        """
         if not data:
             return
 
-        sql = self._insert_sql(table)
+        sql = self._insert_sql(table, skip_existing)
+        retry_sql = self._insert_sql(table, True)
 
         has_large_cols = any(
             col[1].is_large
@@ -206,7 +218,8 @@ class MariaDBTables:
             for attempt in range(3):
                 self.check_if_connected()
                 try:
-                    self._cur.executemany(sql, chunk_data)
+                    self._cur.executemany(retry_sql if attempt else sql, chunk_data)
+                    self._last_ok = time.monotonic()
                     return
                 except mysql.connector.Error as err:
                     if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
@@ -263,7 +276,8 @@ class MariaDBTables:
             for attempt in range(3):
                 self.check_if_connected()
                 try:
-                    self._cur.execute(sql, data)
+                    self._cur.execute(retry_sql if attempt else sql, data)
+                    self._last_ok = time.monotonic()
                     break
                 except mysql.connector.Error as err:
                     if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
@@ -289,15 +303,6 @@ class MariaDBTables:
                         raise
                     time.sleep(0.2 * (attempt + 1))
 
-        if self._in_txn:
-            return
-        self.check_if_connected()
-        try:
-            self.cnx.commit()
-        except mysql.connector.Error as err:
-            if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
-                raise DuplicateKeyError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
-            raise
 
     def update(
         self,
@@ -351,6 +356,7 @@ class MariaDBTables:
                 self.check_if_connected()
                 try:
                     self._cur.executemany(sql, chunk_data)
+                    self._last_ok = time.monotonic()
                     return
                 except mysql.connector.Error as err:
                     if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(chunk_data) > 1:
@@ -402,6 +408,7 @@ class MariaDBTables:
                 self.check_if_connected()
                 try:
                     self._cur.execute(sql, data)
+                    self._last_ok = time.monotonic()
                     break
                 except mysql.connector.Error as err:
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
@@ -425,9 +432,6 @@ class MariaDBTables:
                         raise
                     time.sleep(0.2 * (attempt + 1))
 
-        if not self._in_txn:
-            self.check_if_connected()
-            self.cnx.commit()
 
     def commit_tables_parallel(
         self,
@@ -445,11 +449,12 @@ class MariaDBTables:
 
         Process:
             1. Filters non-empty table payloads.
-            2. If single table (and not `dedicated`), executes directly on current connection.
-            3. Otherwise dispatches concurrently via ThreadPoolExecutor. Each table is written by its own MariaDB
-               connection as one transaction (`transaction()`); a lost connection rolls that table back and the
-               table is written again on a new connection (3 attempts).
-            4. If any table fails, the first error is raised once every table has finished, with
+            2. Every table is written as one transaction (`transaction()`): a single table (and not `dedicated`)
+               on this instance's connection, otherwise each table on a dedicated writer connection
+               (`_lease_writer()`) of a ThreadPoolExecutor. A lost connection rolls that table back and the
+               table is written again (3 attempts); since a lost COMMIT acknowledgement may hide a committed
+               attempt, the later attempts skip rows whose key already exists (`_insert(skip_existing=True)`).
+            3. If any table fails, the first error is raised once every table has finished, with
                `failed_table_ids` naming all tables that were not committed (the others are).
 
         Outputs:
@@ -459,51 +464,48 @@ class MariaDBTables:
         if not valid_items:
             return []
 
-        if len(valid_items) == 1 and not dedicated:
-            table, insert_data, update_data = valid_items[0]
-            t_start = time.perf_counter()
-            try:
-                if insert_data:
-                    self.insert(table, insert_data)
-                if update_data:
-                    self.update(table, update_data)
-            except Exception as e:
-                e.failed_table_ids = {table.table_id}
-                raise
-            return [TableCommitStat(table.table_name, len(insert_data), len(update_data), time.perf_counter() - t_start)]
-
-        from concurrent.futures import ThreadPoolExecutor
-        workers = min(len(valid_items), max_workers or 8)
         transient = (mysql.connector.OperationalError, mysql.connector.InterfaceError, ConnectionError, OSError)
 
         def _commit_table(
             item: tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]],
+            own: bool = False,
         ) -> TableCommitStat:
             table, insert_data, update_data = item
             t_start = time.perf_counter()
             for attempt in range(3):
                 worker_db = None
+                ok = False
                 try:
-                    from db_engine.DBHandling import MariaDB  # the composed driver class (mixins cannot import it at load)
-                    worker_db = MariaDB()
+                    worker_db = self if own else self._lease_writer()
                     with worker_db.transaction():
                         if insert_data:
-                            worker_db.insert(table, insert_data)
+                            worker_db._insert(table, insert_data, skip_existing=attempt > 0)
                         if update_data:
                             worker_db.update(table, update_data)
+                    ok = True
                     break
                 except transient as e:
                     if attempt == 2:
                         raise
                     logger.warning(
-                        f"Parallel commit of '{table.table_name}' lost its connection ({e}); "
+                        f"Commit of '{table.table_name}' lost its connection ({e}); "
                         f"rolled back, writing it again (attempt {attempt + 2}/3)..."
                     )
                     time.sleep(0.5 * (attempt + 1))
                 finally:
-                    if worker_db is not None:
-                        worker_db.close()
+                    if worker_db is not None and not own:
+                        self._release_writer(worker_db, ok)
             return TableCommitStat(table.table_name, len(insert_data), len(update_data), time.perf_counter() - t_start)
+
+        if len(valid_items) == 1 and not dedicated:
+            try:
+                return [_commit_table(valid_items[0], own=True)]
+            except Exception as e:
+                e.failed_table_ids = {valid_items[0][0].table_id}
+                raise
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(valid_items), max_workers or 8)
 
         stats: list[TableCommitStat] = []
         failed: list[tuple[Table, BaseException]] = []
@@ -541,7 +543,6 @@ class MariaDBTables:
         Outputs:
             Matching row tuple `tuple[SafeDataType, ...]` or None.
         """
-        self.check_if_connected()
         mask = tuple(val is not None for val in data)
         cache_key = (table.table_id, mask)
         sql = self._select_sql_cache.get(cache_key)
@@ -554,8 +555,7 @@ class MariaDBTables:
             self._select_sql_cache[cache_key] = sql
 
         params = tuple(val for val in data if val is not None)
-        self._cur.execute(sql, params)
-        res = self._cur.fetchone()
+        res = self._fetch_one(sql, params)
         if res is None:
             return None
         return self._normalize_table_row(table, res)
@@ -579,14 +579,13 @@ class MariaDBTables:
             return []
         col = table.init_columns[col_idx][0]
         rows: list[tuple[SafeDataType, ...]] = []
-        self.check_if_connected()
         for start in range(0, len(uniq), 1000):
             chunk = uniq[start:start + 1000]
-            self._cur.execute(
+            fetched = self._fetch_all(
                 f"SELECT * FROM `{table.table_name}` WHERE `{col}` IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
                 tuple(chunk),
             )
-            rows.extend(self._normalize_table_row(table, r) for r in self._cur.fetchall())
+            rows.extend(self._normalize_table_row(table, r) for r in fetched)
         return rows
 
     @staticmethod
@@ -631,13 +630,11 @@ class MariaDBTables:
         Outputs:
             Size in bytes, or 0 if the table is not in the catalog (not created yet).
         """
-        self.check_if_connected()
-        self._cur.execute(
+        catalog = self._fetch_one(
             "SELECT COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0), COALESCE(TABLE_ROWS, 0) "
             "FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s;",
             (table.table_name,),
         )
-        catalog = self._cur.fetchone()
         if not catalog:
             return 0
         stored_bytes, row_count = int(catalog[0] or 0), int(catalog[1] or 0)
@@ -646,11 +643,10 @@ class MariaDBTables:
 
         predicate = self._version_predicate(table) if (min_vid is not None and min_vid > 0) else None
         if predicate is not None and row_count > 0:
-            self._cur.execute(
+            window = self._fetch_one(
                 f"SELECT COUNT(*) FROM `{table.table_name}` WHERE {predicate};",  # noqa: S608
                 (min_vid,),
             )
-            window = self._cur.fetchone()
             # A window wider than the catalog's row estimate is the estimate being stale, not a bigger table
             row_count = min(row_count, int(window[0] or 0)) if window else row_count
             stored_bytes = min(stored_bytes, int(stored_bytes * row_count / max(int(catalog[1] or 0), 1)))
@@ -676,7 +672,6 @@ class MariaDBTables:
         Outputs:
             List of row tuples containing selected columns in requested order.
         """
-        self.check_if_connected()
         has_min_vid = min_vid is not None and min_vid > 0
         cache_key = (table.table_id, cached_columns, has_min_vid)
         sql = self._preload_sql_cache.get(cache_key)
@@ -701,8 +696,7 @@ class MariaDBTables:
             self._preload_sql_cache[cache_key] = sql
 
         params = (min_vid,) if has_min_vid else ()
-        self._cur.execute(sql, params)
-        rows = self._cur.fetchall()
+        rows = self._fetch_all(sql, params)
         if not rows:
             return []
 

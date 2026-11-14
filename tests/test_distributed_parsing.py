@@ -229,6 +229,7 @@ class TestDistributedParsing(unittest.TestCase):
 
         mock_daemon = MagicMock()
         orig_distributed = getattr(G, "distributed", False)
+        orig_role = getattr(G, "distributed_role", None)
         orig_node_id = getattr(G, "node_id", None)
         orig_daemon = getattr(G, "heartbeat_daemon", None)
         orig_active_task = getattr(gp, "_active_task_id", None)
@@ -236,6 +237,8 @@ class TestDistributedParsing(unittest.TestCase):
 
         try:
             G.distributed = True
+            # A worker parses against the base of its task (gp.Old_VID), whatever it parsed before
+            G.distributed_role = distributed.ROLE_WORKER
             G.node_id = "worker-node-1"
             G.heartbeat_daemon = mock_daemon
             gp._active_task_id = 123
@@ -268,6 +271,7 @@ class TestDistributedParsing(unittest.TestCase):
             mock_db.update_rows.assert_any_call("m_parse_task", {"commit_id": 777}, {"task_id": 123})
         finally:
             G.distributed = orig_distributed
+            G.distributed_role = orig_role
             G.node_id = orig_node_id
             G.heartbeat_daemon = orig_daemon
             gp._active_task_id = orig_active_task
@@ -425,19 +429,101 @@ class TestDistributedParsing(unittest.TestCase):
         db.drop_tables(["m_parse_node"], ignore_fk=True)
         self.assertEqual(backfills.interrupted_ingests(db), 4)
 
-    def test_master_target_refs_tag_scoping(self):
-        """Verify Master task publication scopes all_tags starting from target_refs[0]."""
-        all_tags = ["v2.6.39", "v3.0", "v3.0.1", "v3.1", "v3.2"]
-        target_refs = ["v3.0", "v3.1", "v3.2"]
+    def test_master_keeps_mainline_and_non_release_refs(self):
+        """The master parses what is not published: pre-3.0 mainline tags and historical names included."""
+        tags = ["0.01", "0.95a", "2.4.0", "2.4.1", "v2.6.38", "v2.6.38.1", "v2.6.39-rc1", "v2.6.39", "v3.0",
+                "v3.0.1", "v3.1-rc1", "v3.1", "next-20260810"]
+        kept, delegated = distributed.partition_master_refs(tags, tags, delegate_stable=True)
+        self.assertEqual(kept, ["0.01", "0.95a", "2.4.0", "v2.6.38", "v2.6.39-rc1", "v2.6.39", "v3.0", "v3.1-rc1", "v3.1"])
+        self.assertEqual(delegated, ["2.4.1", "v2.6.38.1", "v3.0.1", "next-20260810"])
+        # Every ref is either the master's or a published task: none is dropped
+        self.assertEqual(sorted(kept + delegated), sorted(tags))
 
-        if target_refs and len(target_refs) > 0 and target_refs[0] in all_tags:
-            start_idx = all_tags.index(target_refs[0])
-            scoped_tags = all_tags[start_idx:]
-        else:
-            scoped_tags = all_tags
+    def test_master_keeps_stable_updates_when_not_delegating(self):
+        tags = ["v3.0", "v3.0.1", "v3.1", "next-20260810"]
+        kept, delegated = distributed.partition_master_refs(tags, tags, delegate_stable=False)
+        self.assertEqual(kept, ["v3.0", "v3.0.1", "v3.1"])
+        # The next chains are published either way, so the master leaves them to the workers
+        self.assertEqual(delegated, ["next-20260810"])
 
-        self.assertEqual(scoped_tags, ["v3.0", "v3.0.1", "v3.1", "v3.2"])
-        self.assertNotIn("v2.6.39", scoped_tags)
+    def test_master_keeps_trunk_branches_and_delegates_the_others(self):
+        refs = ["master", "history/master", "stable/linux-3.0.y", "topic/x"]
+        kept, delegated = distributed.partition_master_refs(
+            refs, ["v3.0"], delegate_branches=["stable/linux-3.0.y", "master"])
+        self.assertEqual(kept, ["master", "history/master", "topic/x"])
+        self.assertEqual(delegated, ["stable/linux-3.0.y"])
+
+    def test_delegated_branches_none_discovers_and_empty_list_delegates_none(self):
+        with unittest.mock.patch("core.config.find_repository_branches", return_value=["master", "stable/linux-3.0.y"]):
+            self.assertEqual(distributed.delegated_branches(None, "repo"), ["stable/linux-3.0.y"])
+            self.assertEqual(distributed.delegated_branches([], "repo"), [])
+            self.assertEqual(distributed.delegated_branches(["x"], "repo"), ["x"])
+        self.assertEqual(distributed.delegated_branches(None, None), [])
+
+    def test_version_base_is_the_previous_version(self):
+        """The base of the DAG walk, of the tree diff and of m_ingest_state is the version parsed last."""
+        from main import G, gp
+        from pipeline import git_ingest
+
+        saved = {k: getattr(gp, k, None) for k in ("VID", "Version_Name", "Old_VID", "Old_Version_Name", "_repair_base_set")}
+        orig_role = getattr(G, "distributed_role", None)
+        try:
+            G.distributed_role = "standalone"
+            gp._repair_base_set = False
+            # First version of a fresh run: no base
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 0, git_ingest.EMPTY_TREE, 0, 0
+            self.assertEqual(git_ingest._version_base(), (0, git_ingest.EMPTY_TREE, False))
+            # Second version: the first one, although gp.Old_* still describes the version before it
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 10, "v3.0", 0, git_ingest.EMPTY_TREE
+            self.assertEqual(git_ingest._version_base(), (10, "v3.0", False))
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 20, "v3.1-rc1", 10, "v3.0"
+            self.assertEqual(git_ingest._version_base(), (20, "v3.1-rc1", False))
+            # Resumed run / mainline bridge: the caller's base is kept for the first version of the process
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 0, git_ingest.EMPTY_TREE, 20, "v3.1-rc1"
+            self.assertEqual(git_ingest._version_base(), (20, "v3.1-rc1", True))
+            # Repair step and worker task: always the caller's base
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 30, "v3.1-rc2", 10, "v3.0"
+            gp._repair_base_set = True
+            self.assertEqual(git_ingest._version_base(), (10, "v3.0", True))
+            gp._repair_base_set = False
+            G.distributed_role = distributed.ROLE_WORKER
+            self.assertEqual(git_ingest._version_base(), (10, "v3.0", True))
+        finally:
+            G.distributed_role = orig_role
+            for key, value in saved.items():
+                if value is None and key == "_repair_base_set":
+                    if hasattr(gp, key):
+                        delattr(gp, key)
+                else:
+                    setattr(gp, key, value)
+
+    def test_ingest_git_dag_walks_from_the_previous_version(self):
+        """A sequential run walks previous..version and records the previous version as the ingest base."""
+        from main import G, gp
+        from pipeline.git_ingest import ingest_git_dag
+        from core.DBLayout import m_commit
+
+        mock_db = MagicMock()
+        mock_db.select.return_value = None
+        mock_db.reserve_id_block.side_effect = lambda table, count: (777, 777) if table == m_commit else (888, 888)
+        saved = {k: getattr(gp, k, None) for k in ("VID", "Version_Name", "Old_VID", "Old_Version_Name")}
+        orig = (getattr(G, "distributed_role", None), getattr(G, "distributed", False), G.DB)
+        try:
+            G.distributed, G.distributed_role = True, distributed.ROLE_MASTER
+            G.DB = lambda: unittest.mock.MagicMock(__enter__=lambda s: mock_db, __exit__=lambda s, e, t, b: None)
+            gp.VID, gp.Version_Name, gp.Old_VID, gp.Old_Version_Name = 500, "v3.0", 0, "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            mock_git_parser = MagicMock()
+            mock_git_parser.parse_version_commits.return_value = []
+            with unittest.mock.patch("parser.git_ast.GitCommitParser", return_value=mock_git_parser), \
+                 unittest.mock.patch("core.ingest_state.begin") as mock_begin:
+                ingest_git_dag("v3.1-rc1", 1, 1, "repo")
+            self.assertEqual(mock_git_parser.parse_version_commits.call_args.kwargs["old_rev"], "v3.0")
+            self.assertEqual(mock_begin.call_args.kwargs["base_commit_id"], 500)
+            self.assertEqual((gp.Old_VID, gp.Old_Version_Name, gp.VID, gp.Version_Name), (500, "v3.0", 777, "v3.1-rc1"))
+        finally:
+            G.distributed_role, G.distributed, G.DB = orig
+            for key, value in saved.items():
+                setattr(gp, key, value)
 
     def test_mark_task_failed_cid_zero_does_not_cascade_unrelated(self):
         """Verify mark_task_failed when cid==0 does not match or fail tasks with base_commit_id=0."""

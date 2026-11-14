@@ -9,11 +9,21 @@ from core.DBLayout import (
     TABLES,
     m_git_ref,
 )
-from pipeline.git_ingest import _forget_rolled_back_rows, _purge_partial_version
+from pipeline.git_ingest import _forget_rolled_back_rows
 from pipeline.state import gp, logger
 from pipeline.update import update
 
 
+
+
+def _update_on_preset_base(version: str, repo_path: str) -> None:
+    """Parse `version` against the base the repair step put in `gp.Old_VID` / `gp.Old_Version_Name`
+    (`ingest_git_dag()` otherwise takes the version this process parsed last)."""
+    gp._repair_base_set = True
+    try:
+        update(version, repo_path=repo_path)
+    finally:
+        gp._repair_base_set = False
 
 
 def orchestrate_repair_pipeline(
@@ -91,10 +101,9 @@ def orchestrate_repair_pipeline(
             if st_m == "interrupted" and cid_m > 0:
                 with G.DB() as db:
                     if db is not None:
-                        if not ingest_state.rollback_version(db, network_id, cid_m, TABLES):
-                            _purge_partial_version(db, cid_m)
+                        ingest_state.clean_interrupted_version(db, network_id, cid_m, TABLES)
                 _forget_rolled_back_rows()
-            update(m_ver, repo_path=repo_path)
+            _update_on_preset_base(m_ver, repo_path)
             with G.DB() as db:
                 v_row = db.select(m_git_ref, (None, repo_id, None, m_ver, None, None, None, None))
                 if v_row and v_row[4]:
@@ -114,7 +123,7 @@ def orchestrate_repair_pipeline(
             if current_base and current_base in version_states:
                 gp.Old_VID = version_states[current_base][0]
                 gp.Old_Version_Name = current_base
-            update(succ, repo_path=repo_path)
+            _update_on_preset_base(succ, repo_path)
             logger.info(COLOR.green(f"[Repair Pipeline] Successfully re-aligned downstream successor '{succ}' with base '{current_base}'."))
 
     return True

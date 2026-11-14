@@ -8,6 +8,8 @@ import subprocess as sp
 
 import time
 from collections import Counter
+from typing import Any
+from db_engine import ne
 from core.SymbolRows import STATS as SYMBOL_STATS
 from core.DBLayout import (
     m_file_name,
@@ -29,6 +31,28 @@ from pipeline.unchanged import processing_symlinks
 from pipeline.worker_stage import WORKER_SYMBOL_STATS, _log_symbol_stats
 
 
+
+
+# Step 2 creates the performance indexes once per process
+_PERFORMANCE_INDEXES_READY = False
+
+
+def _has_peer_nodes() -> bool:
+    """True if another parser node is currently registered in `m_parse_node` (so deferred `m_ast_hash` writes are needed)."""
+    node_id = getattr(G, "node_id", "") or ""
+    network_id = getattr(gp, "network_id", None) or 1
+    try:
+        with G.DB() as db:
+            if db is None:
+                return True
+            where: dict[str, Any] = {"network_id": network_id}
+            if node_id:
+                where["node_id"] = ne(node_id)
+            row = db.select_one("m_parse_node", ["node_id"], where, as_dict=False)
+            return row is not None
+    except Exception:
+        # Fail safe: if we cannot check, defer as distributed mode normally requires
+        return True
 
 
 def update(version: str, repo_path: str | None = None) -> None:
@@ -85,9 +109,13 @@ def update(version: str, repo_path: str | None = None) -> None:
         ("ast_index", m_ast, (m_ast.name, m_ast.type_id)),
         ("file_name_index", m_file_name, (m_file_name.fname,)),
     )
+    global _PERFORMANCE_INDEXES_READY
     with G.measure_stage("Step 2: Performance Index Setup", count=len(performance_indexes), units="indexes"):
-        with G.DB() as db:
-            db.create_indexes(performance_indexes)
+        if not _PERFORMANCE_INDEXES_READY:
+            with G.DB() as db:
+                db.create_indexes(performance_indexes)
+            # Once per process: a --reset happens before update() is first called
+            _PERFORMANCE_INDEXES_READY = True
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 2. Halting '{version}' early."))
@@ -110,28 +138,31 @@ def update(version: str, repo_path: str | None = None) -> None:
     with G.measure_stage("Step 4: Tree Diff & Blob Hashes"):
         MF.generate_change_list(gp)
 
-        git_dir = MF._get_git_dir()
-        ls_res = sp.run(
-            ["git", f"--git-dir={git_dir}", "ls-tree", "-r", f"{version}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if ls_res.returncode != 0:
-            # Without blob hashes every parsed file would share the all-zero hash (one m_file_blob row per type)
-            raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
-        file_blob_hashes: dict[str, bytes] = {}
-        for line in ls_res.stdout.splitlines():
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                path = parts[1]
-                meta = parts[0].split()
-                if len(meta) >= 3 and meta[1] == "blob":
-                    h_hex = meta[2]
-                    if len(h_hex) == 40:
-                        file_blob_hashes[path] = bytes.fromhex(h_hex)
+        if hasattr(MF, "git_tree_blobs"):
+            file_blob_hashes = MF.git_tree_blobs(version)
+        else:
+            git_dir = MF._get_git_dir()
+            ls_res = sp.run(
+                ["git", f"--git-dir={git_dir}", "ls-tree", "-r", f"{version}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if ls_res.returncode != 0:
+                # Without blob hashes every parsed file would share the all-zero hash (one m_file_blob row per type)
+                raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
+            file_blob_hashes = {}
+            for line in ls_res.stdout.splitlines():
+                if not line:
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    path = parts[1]
+                    meta = parts[0].split()
+                    if len(meta) >= 3 and meta[1] == "blob":
+                        h_hex = meta[2]
+                        if len(h_hex) == 40:
+                            file_blob_hashes[path] = bytes.fromhex(h_hex)
         gp.file_blob_hashes = file_blob_hashes
 
     if G.is_deadline_exceeded():
@@ -150,7 +181,7 @@ def update(version: str, repo_path: str | None = None) -> None:
         if hasattr(G.TE, "distributed"):
             G.TE.distributed = getattr(G, "distributed", False)
             G.TE.current_commit_id = getattr(gp, "VID", 0)
-            G.TE.defer_ast_hash = G.TE.distributed
+            G.TE.defer_ast_hash = _has_peer_nodes() if G.TE.distributed else False
         G.TE.start(gp.Table_Array, G.DB)
         _log_preload_summary(time.perf_counter() - t_preload)
 
@@ -182,13 +213,8 @@ def update(version: str, repo_path: str | None = None) -> None:
     scheduler.finalize()
     _log_symbol_stats(version, symbols_base)
 
-    # Commit all pending rows from Multicore / Stage 2 execution before post-processing steps; the caches stay:
-    # Step 6.1 stages m_file_name / m_file_blob rows whose deduplication needs them (clearing them minted
-    # duplicate rows for paths and blobs already in the database)
-    G.TE.commit_all()
-
-    reclaim_system_memory()
-
+    # scheduler.finalize() already committed and reclaimed memory; the caches stay for Step 6.1, which stages
+    # m_file_name / m_file_blob rows whose deduplication needs them
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Multicore Parsing. Finalizing '{version}'..."))
         if getattr(G.TE, "defer_ast_hash", False):

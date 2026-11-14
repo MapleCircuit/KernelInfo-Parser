@@ -288,6 +288,8 @@ class ChangeSet:
         self.batch_cs_dict: dict[str, ChangeSet] | None = None
         self.unresolved_indices: set[int] | None = None
         self.blocked_on: str | None = None
+        # Message of the FILE_ERROR that stopped parsing (unreadable source); the worker reports it per file
+        self.file_error: str | None = None
         self.profiler: PipelineProfiler | None = (
             PipelineProfiler(file_path=self.current_path or "") if G.PROFILING_ENABLED else None
         )
@@ -532,14 +534,41 @@ class ChangeSet:
                             if found is not None:
                                 return to_safe_data(found)
 
-                    # Exact match check via TE with negative query caching
+                    # Exact match check via TE with negative query caching and per-stage memoization (O-07)
                     gp_neg_cache = getattr(gp, "_ast_negative_cache", None)
                     neg_key = (safe_sym_name, safe_sym_type) if safe_sym_name is not None else None
-                    is_neg_cached = gp_neg_cache is not None and neg_key in gp_neg_cache
+                    is_neg_cached = gp_neg_cache is not None and (
+                        neg_key in gp_neg_cache or (safe_sym_name is not None and (safe_sym_name, None) in gp_neg_cache)
+                    )
                     # Parsing workers never commit their TableEngine: a stub staged there would carry a
                     # worker-local id with no m_ast row, so the parent stages it when it executes the ref.
                     is_worker = bool(getattr(gp, "_is_worker", False))
 
+                    ref_memo: dict[Any, int | None] | None = None
+                    use_vid_key = False
+                    if not is_worker:
+                        gp_memo = getattr(gp, "_ast_ref_memo", None) if gp is not None else None
+                        if isinstance(gp_memo, dict):
+                            if gp_neg_cache is not None:
+                                if gp_neg_cache:
+                                    gp._ast_ref_memo_neg_seen = True
+                                elif getattr(gp, "_ast_ref_memo_neg_seen", False):
+                                    gp_memo.clear()
+                                    gp._ast_ref_memo_neg_seen = False
+                            ref_memo = gp_memo
+                        else:
+                            te = G.TE
+                            te_memo = getattr(te, "_ast_ref_memo", None)
+                            if not isinstance(te_memo, dict):
+                                te_memo = {}
+                                try:
+                                    te._ast_ref_memo = te_memo
+                                except Exception:
+                                    pass
+                            ref_memo = te_memo
+                            use_vid_key = True
+
+                    vid_key = getattr(self, "current_vid", 0) if use_vid_key else 0
                     if not (is_neg_cached or is_worker):
                         # Exact (name, type), then its notbind variant, then any type of that name
                         for lookup_type, cache_type in (
@@ -547,18 +576,35 @@ class ChangeSet:
                             (safe_notbind_type, safe_notbind_type),
                             (None, safe_sym_type),
                         ):
-                            res = G.TE.get(m_ast.table_id, (None, safe_sym_name, lookup_type))
-                            if res is not None and len(res) > query[1] and res[query[1]] is not None:
-                                found_id = res[query[1]]
-                                if gp_staged_syms is not None and cache_type is not None:
-                                    gp_staged_syms[(safe_sym_name, cache_type)] = found_id
-                                if gp_staged_names is not None and (lookup_type is None or safe_sym_name not in gp_staged_names):
-                                    gp_staged_names[safe_sym_name] = found_id
-                                return to_safe_data(found_id)
+                            memo_key = (
+                                (vid_key, safe_sym_name, lookup_type)
+                                if use_vid_key
+                                else (safe_sym_name, lookup_type)
+                            )
+                            if ref_memo is not None and memo_key in ref_memo:
+                                found_id = ref_memo[memo_key]
+                                if found_id is None:
+                                    continue
+                            else:
+                                res = G.TE.get(m_ast.table_id, (None, safe_sym_name, lookup_type))
+                                if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                                    found_id = res[query[1]]
+                                    if ref_memo is not None and safe_sym_name is not None:
+                                        ref_memo[memo_key] = found_id
+                                else:
+                                    if ref_memo is not None and safe_sym_name is not None:
+                                        ref_memo[memo_key] = None
+                                    continue
+                            if gp_staged_syms is not None and cache_type is not None:
+                                gp_staged_syms[(safe_sym_name, cache_type)] = found_id
+                            if gp_staged_names is not None and (lookup_type is None or safe_sym_name not in gp_staged_names):
+                                gp_staged_names[safe_sym_name] = found_id
+                            return to_safe_data(found_id)
 
                         # Record miss in negative cache
                         if gp_neg_cache is not None and neg_key is not None:
                             gp_neg_cache.add(neg_key)
+                            gp_neg_cache.add((safe_sym_name, None))
 
                     if (force_stubs or not is_active_foreign) and not is_worker:
                         set_res = G.TE.set(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
@@ -571,6 +617,20 @@ class ChangeSet:
                             if gp_neg_cache is not None and neg_key is not None:
                                 gp_neg_cache.discard(neg_key)
                                 gp_neg_cache.discard((safe_sym_name, safe_notbind_type))
+                                gp_neg_cache.discard((safe_sym_name, None))
+                            if ref_memo is not None and safe_sym_name is not None:
+                                nb_key = (
+                                    (vid_key, safe_sym_name, safe_notbind_type)
+                                    if use_vid_key
+                                    else (safe_sym_name, safe_notbind_type)
+                                )
+                                any_key = (
+                                    (vid_key, safe_sym_name, None)
+                                    if use_vid_key
+                                    else (safe_sym_name, None)
+                                )
+                                ref_memo[nb_key] = stub_id
+                                ref_memo.pop(any_key, None)
                             return to_safe_data(stub_id)
 
                     # Suspended waiting on target file
@@ -1346,6 +1406,7 @@ class ChangeSet:
         if not self.current_path or self.file_operation == "R100":
             return
 
+        staged_before_parse = len(self.cs)
         try:
             current_type = self.get_file_type()
             if current_type == T_C:
@@ -1372,8 +1433,30 @@ class ChangeSet:
         except FILE_ERROR as e:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)
-            self.cs = []
+            # The file stays registered in the version's tree: only what the parser staged is dropped
+            del self.cs[staged_before_parse:]
+            self.route = [REF_ROOT]
+            self.route_count = []
+            self.multi_stack = []
+            self.no_ref_depth = 0
+            self._cached_route = (REF_ROOT,)
+            self._drop_store_entries_from(staged_before_parse)
             self.symbol_rows = None
+            self.file_error = f"Unreadable source file: {e}"
+
+    def _drop_store_entries_from(self, n: int) -> None:
+        """Forget the `store_dict` positions of operations at index >= `n` (they were truncated from `cs`)."""
+        for key, entry in list(self.store_dict.items()):
+            if key == REF_MULTI:
+                self.store_dict[key] = [
+                    [i for i in group if not isinstance(i, int) or i < n] if group is not None else group
+                    for group in entry
+                ]
+            elif isinstance(entry, dict):
+                for tid in [t for t, i in entry.items() if isinstance(i, int) and i >= n]:
+                    del entry[tid]
+                if not entry:
+                    del self.store_dict[key]
 
     def clear_bloat(self) -> None:
         """Remove un-picklable and ephemeral parsing structures before IPC serialization."""
@@ -1383,6 +1466,8 @@ class ChangeSet:
         self.parsers = {}
         self.prior_tags = None
         self.prior_tags_map = None
+        for name in _PARSE_ONLY_PRIOR_ATTRS:
+            self.__dict__.pop(name, None)
         self.active_tag_list = None
         self.pending_symbol_refs = []
         self.last_tag_ref = None
@@ -1402,6 +1487,18 @@ class ChangeSet:
         result += f"cs({','.join(map(str, self.cs))}),"
         result += f"cs_result({','.join(map(str, self.cs_result))})"
         return result
+
+
+# Previous-version tag data only parsing reads: never pickled to the parent
+_PARSE_ONLY_PRIOR_ATTRS = (
+    "prior_tags_by_name",
+    "prior_tags_by_pos",
+    "prior_unmatched_symbols",
+    "prior_tags_max_span",
+    "_prior_tags_by_pos_sorted",
+    "_batch_prior_tags",
+    "_batch_prior_items",
+)
 
 
 class Table:

@@ -158,8 +158,7 @@ class MariaDBViews:
                 sql = base_sql + base_joins
                 if base_where:
                     sql += " WHERE " + " AND ".join(base_where)
-                self._cur.execute(sql, tuple(base_params))
-                rows = self._cur.fetchall()
+                rows = self._fetch_all(sql, tuple(base_params))
                 candidate_ids = [row[0] for row in rows]
                 if not candidate_ids:
                     return None if limit_one else []
@@ -176,8 +175,7 @@ class MariaDBViews:
                     sql = base_sql + base_joins + " WHERE " + " AND ".join(where_clauses)
                     params = list(cand_batch) + base_params
 
-                    self._cur.execute(sql, tuple(params))
-                    rows = self._cur.fetchall()
+                    rows = self._fetch_all(sql, tuple(params))
                     surviving_ids.extend(row[0] for row in rows)
 
                     # Short-circuit for limit_one if we already found surviving candidates
@@ -223,8 +221,7 @@ class MariaDBViews:
                         slice_offset += 1
 
                 sql += " WHERE " + " AND ".join(where_clauses) + " LIMIT 1"
-                self._cur.execute(sql, tuple(params))
-                chunk_row = self._cur.fetchone()
+                chunk_row = self._fetch_one(sql, tuple(params))
 
                 if chunk_row is not None:
                     full_row.extend(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in chunk_row)
@@ -260,7 +257,6 @@ class MariaDBViews:
         Outputs:
             First matching joined row tuple `tuple[SafeDataType, ...]` or None.
         """
-        self.check_if_connected()
         total_aliases = 1
         if len(joins) > 0 and len(joins[0]) > 1:
             total_aliases += sum(join[2] if len(join) > 2 else 1 for join in joins)
@@ -270,8 +266,7 @@ class MariaDBViews:
 
         sql, params = self._build_view_query(tables, joins, columns)
         sql += " LIMIT 1"
-        self._cur.execute(sql, params)
-        res = self._cur.fetchone()
+        res = self._fetch_one(sql, params)
         if res is None:
             return None
         return self._normalize_view_row(self._view_binary_indices(tables, joins), res)
@@ -315,7 +310,6 @@ class MariaDBViews:
         Outputs:
             List of matching joined row tuples `list[tuple[SafeDataType, ...]]`.
         """
-        self.check_if_connected()
         total_aliases = 1
         if len(joins) > 0 and len(joins[0]) > 1:
             total_aliases += sum(join[2] if len(join) > 2 else 1 for join in joins)
@@ -324,8 +318,7 @@ class MariaDBViews:
             return self._chunked_view_select(tables, joins, columns, limit_one=False)  # type: ignore[return-value]
 
         sql, params = self._build_view_query(tables, joins, columns)
-        self._cur.execute(sql, params)
-        rows = self._cur.fetchall()
+        rows = self._fetch_all(sql, params)
         if not rows:
             return []
         binary = self._view_binary_indices(tables, joins)

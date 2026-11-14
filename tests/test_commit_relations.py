@@ -186,6 +186,7 @@ class Store:
 class TestOnRepository(unittest.TestCase):
     """The repository of tests/test_webapp_release_index.py: a fix with Fixes:/Cc: stable/Link:, its
     backport on a stable branch, a revert."""
+    CACHE_ENGINE = "ram"   # pinned: the developer's config.json must not pick the engine under test
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -205,7 +206,8 @@ class TestOnRepository(unittest.TestCase):
         from webapp.backend.services.jobs import JobManager
         self.wcr, self.rs = wcr, rs
         self.patches = [
-            mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.T.cache.name}),
+            mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.T.cache.name,
+                                         "KERNELINFO_CACHE_ENGINE": self.CACHE_ENGINE}),
             mock.patch.object(rs, "get_repo_dir", lambda: self.repo),
             mock.patch.object(wcr, "get_repo_dir", lambda: self.repo),
             mock.patch.object(rs, "jobs", JobManager(workers=1)),
@@ -307,6 +309,10 @@ class TestOnRepository(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
+class TestOnRepositorySQLite(TestOnRepository):
+    CACHE_ENGINE = "sqlite"
+
+
 class TestStableReport(unittest.TestCase):
     """The stable-missing report from SQL equals the SQLite answer (tests/test_webapp_stable.py repository)."""
 
@@ -328,7 +334,7 @@ class TestStableReport(unittest.TestCase):
         from webapp.backend.services import stable_service as ss
         from webapp.backend.services.jobs import JobManager
         patches = [
-            mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.T.cache.name}),
+            mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.T.cache.name, "KERNELINFO_CACHE_ENGINE": "ram"}),
             mock.patch.object(rs, "get_repo_dir", lambda: self.repo),
             mock.patch.object(wcr, "get_repo_dir", lambda: self.repo),
             mock.patch("webapp.backend.config.get_repo_dir", lambda: self.repo),

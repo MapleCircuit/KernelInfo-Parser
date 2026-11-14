@@ -38,6 +38,7 @@ KEY RESPONSIBILITIES:
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     from core.TableHandling import Table
     from db_engine.base import BaseDBEngine
 
+
+logger = logging.getLogger(__name__)
 
 AST_HASH_BYTES = 16
 
@@ -88,6 +91,10 @@ class CommitBatch:
         default_factory=list
     )
     staged: dict[int, tuple[dict[Any, Any], list[tuple[SafeDataType, ...]]]] = field(default_factory=dict)
+    staged_indexes: dict[int, tuple[dict[Any, Any], dict[Any, Any]]] = field(default_factory=dict)
+    insert_payloads: dict[int, tuple[tuple[SafeDataType, ...], ...]] = field(default_factory=dict)
+    update_tables: frozenset[int] = frozenset()
+    col_values: dict[tuple[int, int], frozenset[Any]] = field(default_factory=dict)
     added_nodup: dict[int, list[Any]] = field(default_factory=dict)
     added_pks: dict[int, list[Any]] = field(default_factory=dict)
     added_unique: dict[int, dict[tuple[int, ...], list[tuple[SafeDataType, ...]]]] = field(default_factory=dict)
@@ -164,6 +171,7 @@ class TEDirectDB:
         # Background commits: commit_all() returns once a writer thread has the rows (see wait_for_commit())
         self.async_commits: bool = False
         self._pending: CommitBatch | None = None
+        self._pending_error: BaseException | None = None
         self._join_tables_cache: dict[JoinsType, frozenset[int]] = {}
         # Cumulative counters (callers diff them per stage): commits, rows written, seconds the writes took,
         # seconds the caller was blocked by them (all of a synchronous write, the join of a background one)
@@ -285,8 +293,11 @@ class TEDirectDB:
             self._pending = None
             self.async_commits = False
         self.close()
+        self._pending_error = None
         self.db = db()
         self.queued_view = {}
+        self._committed_unique_keys = {}
+        self._join_tables_cache = {}
         if self.distributed:
             self._id_cursor.clear()
             self._id_limit.clear()
@@ -307,8 +318,8 @@ class TEDirectDB:
             if self.db is not None:
                 try:
                     self.next_id[table_id] = self.db.get_next_id(table)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[TableEngine] Could not read the next id of {table.table_name}: {e}")
         self.update_in_mem_indexes = True
 
     def start(self, tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None:
@@ -394,17 +405,21 @@ class TEDirectDB:
         table_id: int,
         columns: tuple[SafeDataType, ...],
         staged_rows: Callable[[], Iterable[tuple[SafeDataType, ...]]],
+        indexes: tuple[dict[Any, Any], dict[Any, Any]] | None = None,
     ) -> tuple[SafeDataType, ...] | None:
         """First staged row matching a partial filter: through a secondary index, else the most selective
         single-column index, else a scan of `staged_rows()`. An index answers definitively (no scan after it)."""
         matches = self._row_matches
-        sec_dict = self._queued_sec_indexes.get(table_id, {})
+        if indexes is None:
+            sec_dict = self._queued_sec_indexes.get(table_id, {})
+            single_dict = self._queued_single_col_indexes.get(table_id, {})
+        else:
+            sec_dict, single_dict = indexes
         for col_positions in self._table_sec_indexes.get(table_id, ()):
             if all(c < len(columns) and columns[c] is not None for c in col_positions):
                 key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
                 return next((r for r in sec_dict.get(col_positions, {}).get(key, ()) if matches(r, columns)), None)
 
-        single_dict = self._queued_single_col_indexes.get(table_id, {})
         matching_cols = [
             c for c in self._table_single_col_indexes.get(table_id, ()) if c < len(columns) and columns[c] is not None
         ]
@@ -419,6 +434,64 @@ class TEDirectDB:
             return next((r for r in best if matches(r, columns)), None)
 
         return next((r for r in staged_rows() if matches(r, columns)), None)
+
+    def _find_in_staged_dict(
+        self,
+        table: Table,
+        table_id: int,
+        columns: tuple[SafeDataType, ...],
+        staged: dict[Any, Any],
+        indexes: tuple[dict[Any, Any], dict[Any, Any]] | None = None,
+        check_committed_nodup: bool = True,
+    ) -> tuple[SafeDataType, ...] | None:
+        """Search a staging dict (either live `queued_set` or an in-flight `CommitBatch.staged` dict)."""
+        if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
+            key = self._sanitize_key(columns[1:])
+            candidates = (
+                (staged.get(key), self._committed_nodup_keys.get(table_id, {}).get(key))
+                if check_committed_nodup
+                else (staged.get(key),)
+            )
+            for known_id in candidates:
+                if known_id is not None and (columns[0] is None or known_id == columns[0]):
+                    return (known_id, *columns[1:])
+            return None
+        if table.no_duplicate:
+            return self._find_staged(
+                table_id,
+                columns,
+                lambda: ((v, *k) if isinstance(k, tuple) else (v, k) for k, v in staged.items()),
+                indexes=indexes,
+            )
+        if all(columns[i] is not None for i in table.primary):
+            row = staged.get(self._pk_of(table_id, columns))
+            if row is not None and self._row_matches(row, columns):
+                return row
+            return None
+        return self._find_staged(table_id, columns, staged.values, indexes=indexes)
+
+    def _select_with_pending(self, table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None:
+        """Search the in-flight commit batch after a staging miss; if absent and no updates are in flight for
+        `table_id`, query the database without joining the commit thread."""
+        table = self.tables[table_id]
+        batch = self._pending
+        if batch is not None and table_id in batch.table_ids:
+            if table_id in batch.update_tables:
+                return self._db_read((table_id,), self.db.select, table, columns)
+            staged_entry = batch.staged.get(table_id)
+            if staged_entry and staged_entry[0]:
+                row = self._find_in_staged_dict(
+                    table,
+                    table_id,
+                    columns,
+                    staged_entry[0],
+                    indexes=batch.staged_indexes.get(table_id),
+                    check_committed_nodup=False,
+                )
+                if row is not None:
+                    return row
+            return self._db_read((), self.db.select, table, columns)
+        return self._db_read((table_id,), self.db.select, table, columns)
 
     def get(
         self,
@@ -449,25 +522,9 @@ class TEDirectDB:
         # 1. Staging check in queued_set
         staged = self.queued_set.get(table_id)
         if staged is not None:
-            if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
-                key = self._sanitize_key(columns[1:])
-                for known_id in (staged.get(key), self._committed_nodup_keys.get(table_id, {}).get(key)):
-                    if known_id is not None and (columns[0] is None or known_id == columns[0]):
-                        return (known_id, *columns[1:])
-            elif table.no_duplicate:
-                row = self._find_staged(
-                    table_id, columns, lambda: ((v, *k) if isinstance(k, tuple) else (v, k) for k, v in staged.items())
-                )
-                if row is not None:
-                    return row
-            elif all(columns[i] is not None for i in table.primary):
-                row = staged.get(self._pk_of(table_id, columns))
-                if row is not None and self._row_matches(row, columns):
-                    return row
-            else:
-                row = self._find_staged(table_id, columns, staged.values)
-                if row is not None:
-                    return row
+            row = self._find_in_staged_dict(table, table_id, columns, staged)
+            if row is not None:
+                return row
 
         # 2. Emptiness guard: Table has never received data and has no seed insert
         if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and not staged:
@@ -476,7 +533,7 @@ class TEDirectDB:
         if self.db is None:
             return None
 
-        return self._db_read((table_id,), self.db.select, table, columns)
+        return self._select_with_pending(table_id, columns)
 
     def _allocate_id(self, table_id: int) -> int:
         """Allocate next sequential ID, leasing blocks from m_table_sequence in distributed mode."""
@@ -500,6 +557,28 @@ class TEDirectDB:
         assigned_id = self.next_id.get(table_id, 1)
         self.next_id[table_id] = assigned_id + 1
         return assigned_id
+
+    def resync_next_id(self, table: Table) -> None:
+        """Forget the id sequence held for `table`: rows were written to it outside the TableEngine.
+
+        The next allocation leases a fresh block (distributed mode) or continues from the next id the
+        database reports, so it never reuses an id those rows took.
+        """
+        table_id = table.table_id
+        self._id_cursor.pop(table_id, None)
+        self._id_limit.pop(table_id, None)
+        if self.distributed or self.db is None:
+            return
+        self.next_id[table_id] = self.db.get_next_id(table)
+
+    def prefetch_nodup(self, table_id: int, rows: Iterable[tuple[SafeDataType, ...]]) -> None:
+        """Announce the no-duplicate keys of `rows` (column tuples as `get()` / `set()` take them, id column
+        None) that the caller is about to look up one by one.
+
+        An engine that caches lookups resolves them with one chunked database read; this engine reads the
+        database on every lookup, so there is nothing to warm.
+        """
+        return None
 
     def set(
         self,
@@ -705,14 +784,45 @@ class TEDirectDB:
             return []
         return self._db_read(self._join_table_ids(joins), self.db.view_select_multiple, self.tables, joins, columns)
 
+    def _has_pending_overlap(self, table_id: int, col_idx: int, values: Sequence[SafeDataType]) -> bool:
+        """Whether `values` on `col_idx` may overlap the in-flight batch for `table_id` (or updates are in flight)."""
+        batch = self._pending
+        if batch is None or table_id not in batch.table_ids:
+            return False
+        if table_id in batch.update_tables:
+            return True
+        ins_rows = batch.insert_payloads.get(table_id)
+        if not ins_rows:
+            return False
+        table = self.tables[table_id]
+        if table.primary and col_idx == table.primary[0]:
+            lo = ins_rows[0][col_idx]
+            hi = ins_rows[-1][col_idx]
+            if lo is not None and hi is not None:
+                try:
+                    if all(v is not None and (v < lo or v > hi) for v in values):
+                        return False
+                except TypeError:
+                    pass
+        col_set = batch.col_values.get((table_id, col_idx))
+        if col_set is None:
+            col_set = frozenset(
+                bytes(r[col_idx]) if isinstance(r[col_idx], (bytearray, memoryview)) else r[col_idx]
+                for r in ins_rows if col_idx < len(r)
+            )
+            batch.col_values[(table_id, col_idx)] = col_set
+        return any((bytes(v) if isinstance(v, (bytearray, memoryview)) else v) in col_set for v in values)
+
     def get_in(self, table_id: int, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
         """Fetch every committed row of a table whose column `col_idx` is one of `values` from the database.
 
-        Staged rows are not included. The read waits for a background commit writing the table (`_db_read()`).
+        Staged rows are not included. Waits for a background commit writing the table only when `values` can
+        overlap the in-flight rows for `col_idx` or the table has updates in flight.
         """
         if self.db is None or not values:
             return []
-        return self._db_read((table_id,), self.db.select_in, self.tables[table_id], col_idx, tuple(values))
+        barrier_ids = (table_id,) if self._has_pending_overlap(table_id, col_idx, values) else ()
+        return self._db_read(barrier_ids, self.db.select_in, self.tables[table_id], col_idx, tuple(values))
 
     def view_set(
         self,
@@ -901,11 +1011,12 @@ class TEDirectDB:
         Returns None when none of the tables has staged rows.
         """
         batch = CommitBatch()
+        update_table_ids: list[int] = []
         for table_id in table_ids:
             table = self.tables.get(table_id)
             if table is None:
                 continue
-            if self.defer_ast_hash and table.table_name == "m_ast_hash":
+            if self._is_deferred(table_id):
                 continue
             staged_set = self.queued_set.get(table_id)
             staged_upd = self.queued_update.get(table_id)
@@ -961,6 +1072,10 @@ class TEDirectDB:
 
                     insert_payload = tuple(rows)
                 self.queued_set[table_id] = {}
+                batch.staged_indexes[table_id] = (
+                    self._queued_sec_indexes.get(table_id) or {},
+                    self._queued_single_col_indexes.get(table_id) or {},
+                )
                 self._reset_staged_indexes(table_id)
 
             update_payload: tuple[tuple[SafeDataType, ...], ...] = ()
@@ -972,10 +1087,20 @@ class TEDirectDB:
             if insert_payload or update_payload:
                 batch.tables_data.append((table, insert_payload, update_payload))
                 batch.rows += len(insert_payload) + len(update_payload)
+                if insert_payload:
+                    batch.insert_payloads[table_id] = insert_payload
+                if update_payload:
+                    update_table_ids.append(table_id)
         if not batch.staged:
             return None
         batch.table_ids = frozenset(table.table_id for table, _ins, _upd in batch.tables_data)
+        batch.update_tables = frozenset(update_table_ids)
         return batch
+
+    def _is_deferred(self, table_id: int) -> bool:
+        """Whether commits leave the staged rows of `table_id` in staging (`m_ast_hash` while `defer_ast_hash`)."""
+        table = self.tables.get(table_id)
+        return bool(self.defer_ast_hash and table is not None and table.table_name == "m_ast_hash")
 
     def _tracks_committed_pks(self, table_id: int) -> bool:
         """Whether committed primary keys of a hash-keyed table are kept in `_committed_pks` for deduplication."""
@@ -1063,24 +1188,36 @@ class TEDirectDB:
         """Rows staged for the next commit (inserts and updates, all tables)."""
         return sum(len(q) for q in self.queued_set.values()) + sum(len(u) for u in self.queued_update.values())
 
-    def wait_for_commit(self) -> None:
+    def wait_for_commit(self, *, raise_on_error: bool = True) -> None:
         """Join the pending background commit.
 
         If it failed, the tables it did not commit go back to staging and its error is raised (a retried
-        `commit_all()` writes them again).
+        `commit_all()` writes them again). An interrupted join leaves the batch pending for the next call.
         """
+        if self._pending_error is not None:
+            if raise_on_error:
+                err = self._pending_error
+                self._pending_error = None
+                raise err
+            return
         batch = getattr(self, "_pending", None)
         if batch is None:
             return
-        self._pending = None
         t_start = time.perf_counter()
-        if batch.thread is not None:
-            batch.thread.join()
-        batch.wait_s = time.perf_counter() - t_start
+        try:
+            if batch.thread is not None:
+                batch.thread.join()
+        finally:
+            # An interrupted join keeps the batch pending: the writer still runs, and the next call joins it again
+            batch.wait_s += time.perf_counter() - t_start
+        self._pending = None
         self._account_commit(batch, blocked_s=batch.wait_s)
         if batch.error is not None:
             self._restore_batch(batch, getattr(batch.error, "failed_table_ids", None))
-            raise batch.error
+            if raise_on_error:
+                raise batch.error
+            self._pending_error = batch.error
+            return
         self._on_background_commit_done(batch)
 
     def _on_background_commit_done(self, batch: CommitBatch) -> None:
@@ -1127,10 +1264,14 @@ class TEDirectDB:
                 self.queued_update[table_id] = list(staged_upd) + self.queued_update.get(table_id, [])
 
     def _await_writes(self, table_ids: Iterable[int] | None = None) -> None:
-        """Read-your-writes barrier: join the pending background commit if it writes any of `table_ids` (None: any)."""
+        """Read-your-writes barrier: join the pending background commit if it writes any of `table_ids` (None: any).
+
+        If the joined commit failed, its un-committed tables are restored to staging and the error is held for
+        the next `commit_all()` / `wait_for_commit()` / `close()` rather than raising inside an unrelated read.
+        """
         batch = self._pending
         if batch is not None and (table_ids is None or not batch.table_ids.isdisjoint(table_ids)):
-            self.wait_for_commit()
+            self.wait_for_commit(raise_on_error=False)
 
     def _join_table_ids(self, joins: JoinsType) -> frozenset[int]:
         """Ids of every table a join graph reads."""

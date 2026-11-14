@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import main
 import pipeline.arch_layouts
@@ -150,6 +151,58 @@ class TestCommitRangeIngestion(unittest.TestCase):
             self.assertEqual(pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1), ids)
             self.assertEqual({name: len(rows) for name, rows in MockDB.store.items()}, rows_before)
             self.assertEqual(pipeline.git_network._lookup_commit_ids(db, 1, [c1, "f" * 40]), {c1: ids[c1]})
+
+    def _chain(self) -> tuple[list[str], list[GitCommit]]:
+        """a <- b <- c <- d <- e, listed newest first with c before d (a parent dated after its child)."""
+        a, b, c, d, e = (ch * 40 for ch in "abcde")
+        commits = [
+            _commit(e, "E", "e@x", [d], [("E", "e@x")]),
+            _commit(c, "C", "c@x", [b]),
+            _commit(d, "D", "d@x", [c]),
+            _commit(b, "B", "b@x", [a]),
+            _commit(a, "A", "a@x", []),
+        ]
+        return [a, b, c, d, e], commits
+
+    def _parent_links(self) -> set[tuple[int, int]]:
+        return {(row[0], row[1]) for row in MockDB.store[m_commit_parent.table_name].values()}
+
+    def test_batches_write_a_parent_link_with_the_later_commit(self) -> None:
+        (a, b, c, d, e), commits = self._chain()
+        with mock.patch.object(pipeline.git_ingest, "_DAG_BATCH_COMMITS", 1), MockDB() as db:
+            ids = pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
+        self.assertEqual(self._parent_links(), {(ids[b], ids[a]), (ids[c], ids[b]), (ids[d], ids[c]), (ids[e], ids[d])})
+        self.assertEqual(len(MockDB.store[m_commit.table_name]), 5)
+
+    def test_interrupted_ingest_resumes_without_losing_parent_links(self) -> None:
+        (a, b, c, d, e), commits = self._chain()
+        with mock.patch.object(pipeline.git_ingest, "_DAG_BATCH_COMMITS", 1), MockDB() as db:
+            real_insert = db.insert
+
+            def failing_insert(table, rows):
+                # The batch of `c` (written after `d`: it is listed before it) never reaches the database
+                if table is m_commit and any(bytes(r[2]).hex() == c for r in rows):
+                    raise RuntimeError("connection lost")
+                return real_insert(table, rows)
+
+            with mock.patch.object(db, "insert", side_effect=failing_insert), self.assertRaises(RuntimeError):
+                pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
+            stored = {bytes(row[2]).hex(): row[0] for row in MockDB.store[m_commit.table_name].values()}
+            self.assertEqual(set(stored), {a, b, d})
+            # The head is written last, and d's link to the missing c is not stored with a lost id
+            self.assertEqual(self._parent_links(), {(stored[b], stored[a])})
+
+            ids = pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
+        self.assertEqual({h: ids[h] for h in (a, b, d)}, stored)
+        self.assertEqual(self._parent_links(), {(ids[b], ids[a]), (ids[c], ids[b]), (ids[d], ids[c]), (ids[e], ids[d])})
+        self.assertEqual(len(MockDB.store[m_commit.table_name]), 5)
+
+    def test_failed_commit_lookup_stops_the_ingest(self) -> None:
+        _hashes, commits = self._chain()
+        with MockDB() as db, mock.patch.object(db, "select_rows", side_effect=RuntimeError("read failed")):
+            with self.assertRaises(RuntimeError):
+                pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
+        self.assertFalse(MockDB.store.get(m_commit.table_name))
 
     def test_person_identity_is_name_and_email(self) -> None:
         self.assertEqual(pipeline.blob_reuse._person_key("A", "a@x"), ("A", "a@x"))

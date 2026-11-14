@@ -71,7 +71,7 @@ from db_engine import (
 )
 from db_engine.DBHandling import MariaDB
 from db_engine.mariadb_support import parse_server_setting
-from db_engine.errors import PacketTooLargeError
+from db_engine.errors import ConnectionLostError, MissingTableError, PacketTooLargeError
 from unit_test.harness import (
     TestTableCollection,
     test_feature,
@@ -986,6 +986,7 @@ def _offline_mariadb() -> MariaDB:
         db.sessions += 1
 
     db._init_session = _init_session
+    db.connect_sql = _FakeCnx
     return db
 
 
@@ -997,23 +998,358 @@ class TestMariaDBSessions(unittest.TestCase):
         self.assertEqual(db.sessions, 1, "a reconnected session lacks sql_mode and the disabled checks")
 
     def test_transaction_fails_instead_of_reconnecting(self) -> None:
-        db = _offline_mariadb()
+        # Inside transaction() nothing pings or reconnects: the statement on the dead connection fails, the
+        # transaction rolls back and the read is not retried on a new connection.
+        server = _Server()
+        db = _scripted_mariadb(server)
+        cnx = db.cnx
         with self.assertRaises(ConnectionError):
             with db.transaction():
-                self.assertFalse(db.cnx.autocommit)
-                db.cnx.lost = True
-                db.check_if_connected()
-        self.assertEqual(db.cnx.rollbacks, 1)
-        self.assertEqual(db.cnx.commits, 0)
-        self.assertTrue(db.cnx.autocommit)
+                self.assertFalse(cnx._autocommit)
+                cnx.dead = True
+                db.select(_scratch_table(), (1, None))
+        self.assertEqual((cnx.rollbacks, cnx.commits), (1, 0))
         self.assertFalse(db._in_txn)
         self.assertEqual(db.sessions, 0)
+        self.assertEqual(len(server.connections), 1, "no reconnect inside the transaction")
 
     def test_transaction_commits_once(self) -> None:
         db = _offline_mariadb()
         with db.transaction():
             pass
         self.assertEqual((db.cnx.commits, db.cnx.rollbacks), (1, 0))
+
+
+class _Server:
+    """Shared state of a scripted MariaDB server: committed statements, round trips and an answer per query."""
+
+    def __init__(self, fail=None, answer=None) -> None:
+        self.committed: list[tuple[str, Any]] = []
+        self.log: list[tuple[str, Any, bool]] = []   # (sql, params, autocommit at execution)
+        self.round_trips = 0
+        self.connections: list["_ScriptCnx"] = []
+        self.fail = fail                             # fail(sql, params, cnx) -> exception to raise, or None
+        self.answer = answer or (lambda sql, params: [(1,)])
+
+
+class _ScriptCursor:
+    def __init__(self, cnx: "_ScriptCnx") -> None:
+        self.cnx = cnx
+        self.rows: list = []
+        self.rowcount = 0
+        self.with_rows = False
+
+    def execute(self, sql, params=()) -> None:
+        self.cnx._statement(sql, params, self)
+
+    def executemany(self, sql, seq) -> None:
+        self.cnx._statement(sql, list(seq), self)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+    def fetchmany(self, n):
+        out, self.rows = self.rows[:n], self.rows[n:]
+        return out
+
+    def close(self) -> None:
+        pass
+
+
+class _ScriptCnx:
+    """mysql-connector connection double: every statement, ping and autocommit read is one round trip."""
+
+    def __init__(self, server: _Server) -> None:
+        self.server = server
+        self._autocommit = True
+        self.autocommit_reads = 0
+        self.pending: list = []
+        self.pings = self.commits = self.rollbacks = self.inserts = 0
+        self.dead = False
+        self.lose_commit_ack = False
+        self.connection_id = len(server.connections) + 1
+        server.connections.append(self)
+
+    @property
+    def autocommit(self) -> bool:
+        self.autocommit_reads += 1
+        self.server.round_trips += 1          # mysql-connector runs SELECT @@session.autocommit
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        if self.dead:
+            raise mysql.connector.OperationalError(errno=2013, msg="Lost connection to server during query")
+        self.server.round_trips += 1
+        self._autocommit = value
+
+    def ping(self, reconnect=False, attempts=1, delay=0) -> None:
+        self.server.round_trips += 1
+        self.pings += 1
+        if self.dead:
+            raise mysql.connector.InterfaceError(errno=2013, msg="Lost connection to server during query")
+
+    def cursor(self, dictionary=False, **kwargs) -> _ScriptCursor:
+        return _ScriptCursor(self)
+
+    def _statement(self, sql, params, cur) -> None:
+        if self.dead:
+            raise mysql.connector.OperationalError(errno=2013, msg="Lost connection to server during query")
+        self.server.round_trips += 1
+        self.server.log.append((sql, params, self._autocommit))
+        if sql.startswith("INSERT"):
+            self.inserts += 1
+        err = self.server.fail(sql, params, self) if self.server.fail else None
+        if err is not None:
+            raise err
+        cur.rows = list(self.server.answer(sql, params))
+        cur.rowcount = len(params) if isinstance(params, list) else 1
+        (self.server.committed if self._autocommit else self.pending).append((sql, params))
+
+    def commit(self) -> None:
+        self.server.round_trips += 1
+        self.commits += 1
+        self.server.committed.extend(self.pending)
+        self.pending = []
+        if self.lose_commit_ack:
+            self.lose_commit_ack = False
+            self.dead = True
+            raise mysql.connector.OperationalError(errno=2013, msg="Lost connection to server during query")
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        self.pending = []
+
+    def close(self) -> None:
+        self.dead = True
+
+
+def _scripted_mariadb(server: _Server) -> MariaDB:
+    """A `MariaDB` whose connections (also after a reconnect or for a writer) are `_ScriptCnx` on `server`."""
+    db = MariaDB.__new__(MariaDB)
+    db.sessions = 0
+
+    def _connect() -> _ScriptCnx:
+        return _ScriptCnx(server)
+
+    def _init_session() -> None:
+        db.sessions += 1
+
+    db.connect_sql = _connect
+    db._init_session = _init_session
+    db.cnx = _connect()
+    db._cur = db.cnx.cursor()
+    db._select_sql_cache, db._preload_sql_cache, db._view_sql_cache, db._next_id_sql_cache = {}, {}, {}, {}
+    db._lease_writer = lambda: _scripted_mariadb(server)
+    db._release_writer = lambda writer, healthy: writer.close()
+    return db
+
+
+def _scratch_table(name: str = "t_scripted", table_id: int = 9001) -> Table:
+    return Table(
+        table_id=table_id,
+        table_name=name,
+        columns=(("id", "INT", "NOT NULL"), ("val", "INT", "NOT NULL")),
+        primary=("id",),
+        no_duplicate=False,
+    )
+
+
+def _inserted_ids(entries) -> set[int]:
+    return {row[0] for sql, params, *_ in entries if sql.startswith("INSERT") for row in params}
+
+
+class TestMariaDBRoundTrips(unittest.TestCase):
+    """Reads cost one round trip on a recently used connection; lost connections are retried only outside transactions."""
+
+    def test_recently_used_connection_reads_in_one_round_trip(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        table = _scratch_table()
+        db.select(table, (1, None))                       # first use: one ping, then the statement
+        before = server.round_trips
+        for _ in range(5):
+            db.select(table, (1, None))
+            db.server_variable("version")
+            db._raw_query("SELECT 1")
+        self.assertEqual(server.round_trips - before, 15, "exactly one round trip per read")
+        self.assertEqual(db.cnx.pings, 1)
+        self.assertEqual(db.cnx.autocommit_reads, 0)
+
+    def test_idle_connection_is_pinged_once(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        db._last_ok = 0.0
+        db._raw_query("SELECT 1")
+        db._raw_query("SELECT 1")
+        self.assertEqual(db.cnx.pings, 1)
+
+    def test_writes_send_no_autocommit_query_and_no_noop_commit(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        db._raw_execute("UPDATE t SET a = 1")
+        db._raw_executemany("UPDATE t SET a = %s", [(1,), (2,)])
+        db.insert_rows("t_scripted", ["id", "val"], [(1, 1), (2, 2)])
+        db.insert(_scratch_table(), ((3, 3), (4, 4)))
+        db.update(_scratch_table(), ((3, 5),))
+        self.assertEqual((db.cnx.autocommit_reads, db.cnx.commits), (0, 0))
+        with db.transaction():
+            db.insert_rows("t_scripted", ["id", "val"], [(5, 5)])
+            db._raw_execute("UPDATE t SET a = 2")
+        self.assertEqual((db.cnx.autocommit_reads, db.cnx.commits), (0, 1))
+        self.assertEqual(db.cnx.pings, 1, "no ping per statement, also inside the transaction")
+
+    def test_enqueue_parse_tasks_is_one_multi_row_upsert(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        rows = [(1, "c", "stable", i, f"v{i}", 0, f"v{i - 1}", 0, 1) for i in range(1, 501)]
+        self.assertEqual(db.enqueue_parse_tasks(rows), 500)
+        inserts = [(sql, params) for sql, params, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 1)
+        self.assertIn("ON DUPLICATE KEY UPDATE", inserts[0][0])
+        self.assertEqual(inserts[0][0].count("(%s, %s, %s, %s, %s, %s, %s, %s, %s)"), 500)
+        self.assertEqual(db.cnx.commits, 1)
+
+    def test_lost_read_reconnects_and_retries_once(self) -> None:
+        server = _Server(answer=lambda sql, params: [("11.8.6-MariaDB",)])
+        db = _scripted_mariadb(server)
+        db._raw_query("SELECT 1")
+        db.cnx.dead = True                                # dropped while the connection looked fresh
+        self.assertEqual(db.server_variable("version"), "11.8.6-MariaDB")
+        self.assertEqual(db.select(_scratch_table(), (1, None)), ("11.8.6-MariaDB",))
+        self.assertEqual(len(server.connections), 2)
+        self.assertEqual(db.sessions, 1, "the new session is initialized")
+
+    def test_forked_child_opens_its_own_connection(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        parent_cnx = db.cnx
+        db._pid = -1                                      # opened by another process
+        db._raw_query("SELECT 1")
+        self.assertIsNot(db.cnx, parent_cnx)
+        self.assertFalse(parent_cnx.dead, "the parent's session is never closed by the child")
+        self.assertEqual(db.sessions, 1)
+
+
+class TestMariaDBNeutralErrors(unittest.TestCase):
+    """Driver errors of `transaction()`, `commit()` and `commit_tables_parallel()` leave as `db_engine.errors` types."""
+
+    def setUp(self) -> None:
+        patcher = unittest.mock.patch("time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_lost_commit_in_transaction_is_neutral(self) -> None:
+        db = _scripted_mariadb(_Server())
+        db.cnx.lose_commit_ack = True
+        with self.assertRaises(ConnectionLostError) as ctx:
+            with db.transaction():
+                db._raw_execute("UPDATE t SET a = 1")
+        self.assertIsInstance(ctx.exception.__cause__, mysql.connector.Error)
+        self.assertFalse(db._in_txn)
+
+    def test_commit_is_neutral(self) -> None:
+        db = _scripted_mariadb(_Server())
+        with self.assertRaises(ConnectionLostError):
+            with db.transaction():
+                db.cnx.lose_commit_ack = True
+                db.commit()
+
+    def test_parallel_commit_error_is_neutral_and_names_failed_tables(self) -> None:
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT INTO `t_bad`"):
+                return mysql.connector.ProgrammingError(errno=1146, msg="Table 't_bad' doesn't exist")
+            return None
+
+        db = _scripted_mariadb(_Server(fail=fail))
+        bad, good = _scratch_table("t_bad", 9004), _scratch_table("t_good", 9005)
+        with self.assertRaises(MissingTableError) as ctx:
+            db.commit_tables_parallel([(bad, ((1, 1),), ()), (good, ((1, 1),), ())])
+        self.assertEqual(ctx.exception.failed_table_ids, {bad.table_id})
+
+
+class TestMariaDBCommitAtomicity(unittest.TestCase):
+    """`commit_tables_parallel()` writes every table as one transaction and survives a lost COMMIT acknowledgement."""
+
+    def setUp(self) -> None:
+        patcher = unittest.mock.patch("time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_single_table_is_atomic_when_the_connection_drops_mid_table(self) -> None:
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT") and cnx.inserts == 2:   # the second chunk of every attempt
+                cnx.dead = True
+                return mysql.connector.OperationalError(errno=2013, msg="Lost connection to server during query")
+            return None
+
+        server = _Server(fail=fail)
+        db = _scripted_mariadb(server)
+        table = _scratch_table()
+        rows = tuple((i, i) for i in range(1, 12001))           # 3 chunks of at most 5000 rows
+        with self.assertRaises(ConnectionLostError) as ctx:     # neutral, with the failed tables kept
+            db.commit_tables_parallel([(table, rows, ())])
+        self.assertEqual(ctx.exception.failed_table_ids, {table.table_id})
+        self.assertEqual(_inserted_ids(server.committed), set(), "no chunk of a failed table may stay committed")
+        self.assertTrue(all(not autocommit for sql, _, autocommit in server.log if sql.startswith("INSERT")))
+        self.assertEqual(sum(c.inserts for c in server.connections), 6, "3 attempts of 2 chunks each")
+
+    def test_lost_commit_ack_is_retried_with_skip_existing_rows(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        db.cnx.lose_commit_ack = True                       # the server commits, the OK packet is lost
+        table = _scratch_table()
+        rows = tuple((i, i) for i in range(1, 11))
+        stats = db.commit_tables_parallel([(table, rows, ())])
+        self.assertEqual([s.inserted for s in stats], [10])
+        inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 2)
+        self.assertNotIn("ON DUPLICATE KEY", inserts[0])
+        self.assertTrue(inserts[1].endswith("ON DUPLICATE KEY UPDATE `id` = `id`"), inserts[1])
+
+    def test_parallel_tables_retry_with_skip_existing_rows(self) -> None:
+        server = _Server()
+        db = _scripted_mariadb(server)
+        lost, kept = _scratch_table("t_lost", 9002), _scratch_table("t_kept", 9003)
+        lease = db._lease_writer
+        leased: list = []
+
+        def _lease():
+            writer = lease()
+            if not leased:
+                writer.cnx.lose_commit_ack = True            # first writer's COMMIT is acknowledged too late
+            leased.append(writer)
+            return writer
+
+        db._lease_writer = _lease
+        stats = db.commit_tables_parallel([(lost, ((1, 1),), ()), (kept, ((2, 2),), ())], max_workers=1)
+        self.assertEqual(sorted(s.table_name for s in stats), ["t_kept", "t_lost"])
+        inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 3)
+        self.assertNotIn("ON DUPLICATE KEY", inserts[0])
+        self.assertIn("ON DUPLICATE KEY UPDATE `id` = `id`", inserts[1], "the retried table skips existing rows")
+        self.assertNotIn("ON DUPLICATE KEY", inserts[2])
+
+    def test_autocommit_chunk_retry_skips_existing_rows(self) -> None:
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT") and len(server.log) == 2 and cnx.connection_id == 1:
+                cnx.dead = True                              # chunk 2 may or may not have been committed
+                return mysql.connector.OperationalError(errno=2013, msg="Lost connection to server during query")
+            return None
+
+        server = _Server(fail=fail)
+        db = _scripted_mariadb(server)
+        table = _scratch_table()
+        db.insert(table, tuple((i, i) for i in range(1, 12001)))
+        inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 4)
+        self.assertNotIn("ON DUPLICATE KEY", inserts[0])
+        self.assertIn("ON DUPLICATE KEY UPDATE `id` = `id`", inserts[2], "the retried chunk skips existing rows")
+        self.assertNotIn("ON DUPLICATE KEY", inserts[3])
+        self.assertEqual(_inserted_ids(server.committed), set(range(1, 12001)))
 
 
 class _TuningCursor:
@@ -1093,7 +1429,8 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
         sample_data = tuple((b"\x01" * 32, f"int func_{i}() {{ return {i}; }}") for i in range(6))
         maria.insert(self.t_code, sample_data)
         self.assertGreater(maria._cur.executemany.call_count, 1)
-        maria.cnx.commit.assert_called_once()
+        # Outside transaction() the connection autocommits every chunk: no extra (no-op) COMMIT round trip
+        maria.cnx.commit.assert_not_called()
 
     def test_byte_bounded_chunking_large_payloads(self) -> None:
         """Tables with large text columns are chunked into smaller batches based on size."""
@@ -1182,80 +1519,117 @@ def _generate_engine_test_classes() -> None:
 class TestMariaDBReserveIdBlockSql(unittest.TestCase):
     """The MariaDB sequence allocator's statements (driver internals, moved from the distributed tests)."""
 
+    @staticmethod
+    def _engine(fetch=(500,)):
+        db = MariaDB.__new__(MariaDB)
+        db.cnx = MagicMock()
+        db.cnx.autocommit = True
+        cur = MagicMock()
+        db.cnx.cursor.return_value = cur
+        cur.fetchone.return_value = fetch
+        db.check_if_connected = MagicMock()
+        return db, cur
+
     def test_reserve_id_block_upsert_initialization(self):
-        """Verify reserve_id_block executes sequence upsert before SELECT FOR UPDATE."""
-        mock_cnx = MagicMock()
-        mock_cur = MagicMock()
-        mock_cnx.cursor.return_value = mock_cur
-        mock_cur.fetchone.return_value = (500,)
-
-        class MockBaseEngine:
-            def __init__(self, cnx):
-                self.cnx = cnx
-
-        engine = MockBaseEngine(mock_cnx)
-        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=1000, commit_id=12)
+        """The floor is read without locks, then upserted before SELECT ... FOR UPDATE."""
+        engine, mock_cur = self._engine((500,))
+        start, end = engine.reserve_id_block(m_ast, block_size=1000, commit_id=12)
 
         self.assertEqual(start, 500)
         self.assertEqual(end, 1499)
 
         exec_calls = mock_cur.execute.call_args_list
-        self.assertIn("INSERT INTO m_table_sequence", exec_calls[0][0][0])
-        # The upsert seeds a missing sequence row from MAX(pk) + 1 and never moves an existing one backwards
-        self.assertIn("COALESCE(MAX(ast_id), 0) + 1 FROM m_ast", exec_calls[0][0][0])
-        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", exec_calls[0][0][0])
-        self.assertIn("SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE", exec_calls[1][0][0])
-        self.assertIn("UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s", exec_calls[2][0][0])
-        self.assertEqual(exec_calls[2][0][1], (1500, m_ast.table_id))
+        # A plain consistent read of MAX(pk) + 1: no INSERT ... SELECT, which would lock-wait on an appending commit
+        self.assertEqual(exec_calls[0][0][0], "SELECT COALESCE(MAX(`ast_id`), 0) + 1 FROM `m_ast`")
+        self.assertIn("INSERT INTO m_table_sequence (seq_table_id, next_id) VALUES (%s, %s)", exec_calls[1][0][0])
+        self.assertNotIn("SELECT", exec_calls[1][0][0])
+        self.assertEqual(exec_calls[1][0][1], (m_ast.table_id, 500))
+        # The upsert never moves an existing sequence backwards
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", exec_calls[1][0][0])
+        self.assertIn("SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE", exec_calls[2][0][0])
+        self.assertIn("UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s", exec_calls[3][0][0])
+        self.assertEqual(exec_calls[3][0][1], (1500, m_ast.table_id))
+        self.assertIn("INSERT INTO m_ingest_id_range", exec_calls[4][0][0])
 
     def test_reserve_id_block_disables_autocommit_during_lock(self):
-        """Verify reserve_id_block sets autocommit=False during the lock and restores original autocommit."""
-        mock_cnx = MagicMock()
-        mock_cnx.autocommit = True
-        mock_cur = MagicMock()
-        mock_cnx.cursor.return_value = mock_cur
-        mock_cur.fetchone.return_value = (100,)
-
+        """The locking statements run with autocommit off; autocommit is restored and one COMMIT is sent."""
+        engine, mock_cur = self._engine((100,))
         autocommit_during_execute = []
+        mock_cur.execute.side_effect = lambda sql, params=(): autocommit_during_execute.append(engine.cnx.autocommit)
 
-        def track_execute(sql, params=()):
-            autocommit_during_execute.append(mock_cnx.autocommit)
+        start, end = engine.reserve_id_block(m_ast, block_size=100, commit_id=5)
 
-        mock_cur.execute.side_effect = track_execute
-
-        class MockBaseEngine:
-            def __init__(self, cnx):
-                self.cnx = cnx
-
-        engine = MockBaseEngine(mock_cnx)
-        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=100, commit_id=5)
-
-        self.assertEqual(start, 100)
-        self.assertEqual(end, 199)
-        self.assertTrue(len(autocommit_during_execute) >= 3)
-        self.assertTrue(all(val is False for val in autocommit_during_execute))
-        self.assertTrue(mock_cnx.autocommit)
-        mock_cnx.commit.assert_called_once()
+        self.assertEqual((start, end), (100, 199))
+        self.assertEqual(autocommit_during_execute[0], True, "the MAX(pk) floor is an autocommit consistent read")
+        self.assertEqual(len(autocommit_during_execute), 5)
+        self.assertTrue(all(val is False for val in autocommit_during_execute[1:]))
+        self.assertTrue(engine.cnx.autocommit)
+        engine.cnx.commit.assert_called_once()
 
     def test_reserve_id_block_sql_advances_sequence_beyond_existing_max(self) -> None:
         from core.DBLayout import m_file_reference
 
-        db = MariaDB.__new__(MariaDB)
-        mock_cnx = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cnx.cursor.return_value = mock_cursor
-        db.cnx = mock_cnx
-
+        db, mock_cursor = self._engine((50000,))
         executed = []
         mock_cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
-        mock_cursor.fetchone.return_value = (50000,)
 
         start_id, end_id = db.reserve_id_block(m_file_reference, 1000)
         self.assertEqual(start_id, 50000)
         self.assertEqual(end_id, 50999)
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", executed[1][0])
+        self.assertFalse(any("m_ingest_id_range" in sql for sql, _ in executed), "commit_id 0 records no range")
 
-        upsert_sql = executed[0][0]
-        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", upsert_sql)
+    def test_reserve_id_block_retries_a_deadlocked_range_insert(self) -> None:
+        engine, mock_cur = self._engine((10,))
+        calls = {"range": 0}
+
+        def execute(sql, params=()):
+            if "m_ingest_id_range" in sql:
+                calls["range"] += 1
+                if calls["range"] == 1:
+                    raise mysql.connector.errors.InternalError(errno=1213, msg="Deadlock found when trying to get lock")
+
+        mock_cur.execute.side_effect = execute
+        with unittest.mock.patch("time.sleep"):
+            self.assertEqual(engine.reserve_id_block(m_ast, 10, commit_id=3), (10, 19))
+        self.assertEqual(calls["range"], 2, "the rolled-back block is reserved again, not returned unpersisted")
+        engine.cnx.rollback.assert_called_once()
+        engine.cnx.commit.assert_called_once()
+        self.assertEqual(engine.check_if_connected.call_count, 2, "each attempt checks its connection")
+
+    def test_reserve_id_block_ignores_other_range_errors(self) -> None:
+        engine, mock_cur = self._engine((10,))
+
+        def execute(sql, params=()):
+            if "m_ingest_id_range" in sql:
+                raise mysql.connector.errors.ProgrammingError(errno=1146, msg="Table 'm_ingest_id_range' doesn't exist")
+
+        mock_cur.execute.side_effect = execute
+        self.assertEqual(engine.reserve_id_block(m_ast, 10, commit_id=3), (10, 19))
+        engine.cnx.commit.assert_called_once()
+
+    def test_reserve_id_block_lost_connection_reconnects(self) -> None:
+        server = _Server(answer=lambda sql, params: [(7,)])
+        db = _scripted_mariadb(server)
+        db._raw_query("SELECT 1")
+        db.cnx.dead = True                           # dropped while it looked fresh
+        with unittest.mock.patch("time.sleep"):
+            self.assertEqual(db.reserve_id_block(m_ast, 5), (7, 11))
+        self.assertEqual(len(server.connections), 2)
+        self.assertTrue(server.connections[1]._autocommit, "autocommit restored on the new connection")
+
+    def test_reserve_id_block_refuses_to_run_inside_a_transaction(self) -> None:
+        from db_engine import MockDB, UnsupportedOperation
+
+        db = _scripted_mariadb(_Server())
+        with self.assertRaises(UnsupportedOperation):
+            with db.transaction():
+                db.reserve_id_block(m_ast, 5)
+        self.assertEqual(db.cnx.commits, 0)
+        mock = MockDB(use_global=False)
+        with self.assertRaises(UnsupportedOperation):
+            with mock.transaction():
+                mock.reserve_id_block(m_ast, 5)
 
     def test_insert_sql_idempotent_tables_skip_only_existing_rows(self) -> None:
         from core.DBLayout import m_commit, m_commit_file

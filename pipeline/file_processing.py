@@ -16,7 +16,7 @@ import threading
 from collections import Counter
 import pickle
 import traceback
-from parser.c_ast.tag_tracker import query_prior_tags
+from parser.c_ast.tag_tracker import query_prior_tags_many
 from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import ChangeSet
@@ -315,7 +315,7 @@ def file_processing_worker(
                     old_fids: dict[str, int] = {}
                     for cf in changed_files:
                         p = cf.split("\t")
-                        if not p[0].startswith("D") and not p[0].startswith("A"):
+                        if not p[0].startswith(("D", "A")) and p[0] != "R100":
                             lp = p[1] if (p[0].startswith("R") and len(p) >= 3) else p[-1]
                             fn_row = m_file_name.get(None, lp)
                             if fn_row and len(fn_row) >= 3 and fn_row[2]:
@@ -325,14 +325,13 @@ def file_processing_worker(
                                     old_fids[lp] = bf_row[2][2]
                     if old_fids:
                         all_tag_ids: set[int] = set()
-                        for fid in set(old_fids.values()):
-                            p_tags = query_prior_tags(fid)
-                            if p_tags:
-                                batch_prior_tags[fid] = p_tags
-                                for t in p_tags:
-                                    tid = t[1] if len(t) > 1 else t[0]
-                                    if tid:
-                                        all_tag_ids.add(tid)
+                        # One chunked read for the batch; every fid gets an entry so an empty one is never re-queried
+                        batch_prior_tags.update(query_prior_tags_many(G.TE.db, set(old_fids.values())))
+                        for p_tags in batch_prior_tags.values():
+                            for t in p_tags:
+                                tid = t[1] if len(t) > 1 else t[0]
+                                if tid:
+                                    all_tag_ids.add(tid)
                         if all_tag_ids:
                             tag_id_list = sorted(all_tag_ids)
                             ref_rows = G.TE.get_in(m_tag_ref.table_id, 0, tag_id_list) or ()
@@ -349,6 +348,7 @@ def file_processing_worker(
                 except Exception as e:
                     logger.debug(f"Worker {worker_id} batch prefetch prior tags failed: {e}")
 
+            parsed_batch: list[tuple[str, ChangeSet]] = []
             for f_idx, changed_file in enumerate(changed_files):
                 try:
                     CS = ChangeSet(changed_file)
@@ -367,6 +367,44 @@ def file_processing_worker(
 
                     default_processing(CS)
                     CS.parse()
+                    # Only parsing reads the batch-wide prior-tag data; it must not ride on the result frame
+                    CS._batch_prior_tags = CS._batch_prior_items = None
+                    if CS.file_error:
+                        batch_errors.append((changed_file, CS.file_error, ""))
+                    parsed_batch.append((changed_file, CS))
+                except Exception as e:
+                    err_str = str(e)
+                    logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
+                    batch_errors.append((changed_file, err_str, traceback.format_exc()))
+                finally:
+                    G.CURRENT_PARSING_FILE = None
+
+                # Periodic memory reclamation in low/very-low memory modes
+                if G.LOW_MEMORY_MODE and (f_idx + 1) % 25 == 0:
+                    reclaim_system_memory()
+
+            # Bulk-load uncached unchanged header symbol maps across the parsed batch before pre-resolving (O-06)
+            if parsed_batch and gp_ref is not None and hasattr(gp_ref, "get_files_symbols_from_db_many"):
+                changed_set = getattr(gp_ref, "_changed_paths_set", ())
+                completed_set = getattr(gp_ref, "completed_paths", ())
+                in_committed_stage = shared_symbols is not None
+                uncached_deps: set[str] = set()
+                for _, cs in parsed_batch:
+                    for dep in getattr(cs, "foreign_deps", ()) or ():
+                        if dep in gp_ref.unchanged_symbol_cache:
+                            continue
+                        if dep in changed_set and not (in_committed_stage and dep in completed_set):
+                            continue
+                        uncached_deps.add(dep)
+                if uncached_deps:
+                    try:
+                        gp_ref.get_files_symbols_from_db_many(uncached_deps, version=vid)
+                    except Exception as e:
+                        logger.debug(f"Worker {worker_id} bulk header symbol preload failed: {e}")
+
+            for changed_file, CS in parsed_batch:
+                try:
+                    G.CURRENT_PARSING_FILE = CS.current_path
 
                     # Pre-unpack intra-file AST view schemas in parallel workers to distribute CPU load
                     t_phase = time.perf_counter()
@@ -382,7 +420,8 @@ def file_processing_worker(
                     split["pre_resolve_s"] += t_resolve - t_views
 
                     # In normal memory mode, pre-resolve unchanged DB dependencies to prune foreign_deps
-                    if not G.LOW_MEMORY_MODE:
+                    # (Stage 2 only: pre_resolve_operations above did the same lookups and trimmed foreign_deps)
+                    if not G.LOW_MEMORY_MODE and not shared_symbols:
                         CS.prune_unchanged_dependencies()
                     split["prune_s"] += time.perf_counter() - t_resolve
 
@@ -395,10 +434,6 @@ def file_processing_worker(
                     batch_errors.append((changed_file, err_str, traceback.format_exc()))
                 finally:
                     G.CURRENT_PARSING_FILE = None
-
-                # Periodic memory reclamation in low/very-low memory modes
-                if G.LOW_MEMORY_MODE and (f_idx + 1) % 25 == 0:
-                    reclaim_system_memory()
 
             t_put = time.perf_counter()
             split["busy_s"] += t_put - t_task

@@ -682,7 +682,15 @@ class SQLiteDB(BaseDBEngine):
         return int(self._scalar(f"SELECT COALESCE(MAX({pk}), 0) + 1 FROM {table.table_name}") or 1)
 
     def reserve_id_block(self, table: Table, block_size: int, commit_id: int = 0) -> tuple[int, int]:
-        """Atomically reserve `[start, end]` ids from `m_table_sequence` (seeded from the table's maximum)."""
+        """Atomically reserve `[start, end]` ids from `m_table_sequence` (seeded from the table's maximum).
+
+        Like `MariaDB`, it commits on its own and raises `UnsupportedOperation` inside `transaction()`.
+        """
+        if self._in_txn:
+            raise UnsupportedOperation(
+                "reserve_id_block() commits its own transaction and cannot run inside transaction(); reserve the "
+                "ids before entering it - see DB_API.md 'Sequence Tracking & Single-Row CRUD'"
+            )
         table_id = getattr(table, "table_id", None)
         if table_id is None or not self.table_exists("m_table_sequence"):
             return super().reserve_id_block(table, block_size, commit_id)

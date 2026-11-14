@@ -340,10 +340,6 @@ class TestNewPairsOnce(unittest.TestCase):
         from core.DBLayout import m_file_reference
 
         te_mock = mock.MagicMock()
-        te_mock.db = None
-        te_mock._id_cursor = {m_file_reference.table_id: 1353}
-        te_mock._id_limit = {m_file_reference.table_id: 10000}
-        te_mock.next_id = {m_file_reference.table_id: 1353}
         te_mock.queued_set = {}
         db = self._db()
 
@@ -357,9 +353,30 @@ class TestNewPairsOnce(unittest.TestCase):
                 mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
             pipeline.file_references.processing_file_references("v3.1")
 
-        self.assertNotIn(m_file_reference.table_id, te_mock._id_cursor)
-        self.assertNotIn(m_file_reference.table_id, te_mock._id_limit)
-        self.assertEqual(te_mock.next_id[m_file_reference.table_id], db.get_next_id(m_file_reference))
+        te_mock.resync_next_id.assert_called_with(m_file_reference)
+
+    def test_b29_delete_rolls_back_when_include_insert_fails(self) -> None:
+        from contextlib import contextmanager
+        from unittest import mock
+        import main
+        import pipeline.file_references
+
+        db = self._db()
+
+        @contextmanager
+        def fake_db():
+            yield db
+
+        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", mock.MagicMock()), \
+                mock.patch.object(pipeline.file_references, "processing_kbuild"), \
+                mock.patch.object(pipeline.file_references, "processing_doc_references"), \
+                mock.patch.object(pipeline.file_references, "processing_include_references", side_effect=RuntimeError("copy failed")), \
+                mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
+            pipeline.file_references.processing_file_references("v3.1")
+
+        # Transaction rolled back: stale rows must still be present
+        left = db.select_values("m_file_reference", "details", order_by=["ref_id"])
+        self.assertEqual(left, ["kept", "stale", "stale"])
 
 
 if __name__ == "__main__":

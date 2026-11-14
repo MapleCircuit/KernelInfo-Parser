@@ -17,6 +17,7 @@ import bisect
 from typing import Any
 import logging
 from core.globalstuff import ASTT, OP_REF, REF_POS, REF_ROOT, compute_code_hash
+from db_engine.spec import Join
 from core.DBLayout import m_file_name, m_file_blob, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_map_ast, m_moved_tag
 from core.SymbolRows import load_prior_items as load_prior_symbol_items
 
@@ -67,6 +68,38 @@ PRIOR_TAG_COLUMNS = m_bridge_tag.length + m_tag.length + m_ast.length
 def query_prior_tags(old_fid: int) -> list[tuple[Any, ...]] | None:
     """Tags of a previous-version blob joined with their m_tag and m_ast rows (`PRIOR_TAG_COLUMNS` columns)."""
     return m_bridge_tag.view_get_multiple(_PRIOR_TAG_JOINS, old_fid, *(None,) * (PRIOR_TAG_COLUMNS - 1))
+
+
+PRIOR_TAG_CHUNK = 1000
+_PRIOR_TAG_SELECT = (
+    [f"b.{c[0]}" for c in m_bridge_tag.init_columns]
+    + [f"t.{c[0]}" for c in m_tag.init_columns]
+    + [f"a.{c[0]}" for c in m_ast.init_columns]
+)
+
+
+def query_prior_tags_many(db: Any, old_fids: Any) -> dict[int, list[tuple[Any, ...]]]:
+    """`query_prior_tags()` for many blobs in chunked reads: `{fid: rows}` with an entry (maybe `[]`) for every fid.
+
+    Rows have the shape and per-blob order `query_prior_tags(fid)` returns. `db` is the engine of the reading
+    process (the worker's own connection).
+    """
+    from core.TableHandling import normalize_data_tuple
+
+    fids = sorted({int(f) for f in old_fids})
+    out: dict[int, list[tuple[Any, ...]]] = {f: [] for f in fids}
+    joins = [
+        Join(("m_tag", "t"), {"t.tag_id": "b.tag_id"}),
+        Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+    ]
+    for i in range(0, len(fids), PRIOR_TAG_CHUNK):
+        chunk = fids[i:i + PRIOR_TAG_CHUNK]
+        rows = db.select_rows(
+            ("m_bridge_tag", "b"), _PRIOR_TAG_SELECT, {"b.blob_id": chunk}, joins=joins, as_dict=False
+        )
+        for row in rows:
+            out[row[0]].append(normalize_data_tuple(tuple(row)))
+    return out
 
 
 def get_prior_tags(CS: Any, with_indexes: bool = True, with_symbols: bool = True) -> None:

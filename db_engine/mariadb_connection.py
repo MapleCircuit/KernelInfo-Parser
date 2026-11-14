@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Iterator, Sequence, Self
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, Self
 from types import TracebackType
 import mysql.connector
 from mysql.connector.constants import ClientFlag
@@ -23,12 +23,29 @@ from db_engine.base import (
 )
 from db_engine.errors import (
     ConfigurationError,
+    ConnectionLostError,
     ReadOnlyViolation,
+    UnsupportedOperation,
+    translate_mysql_error,
 )
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
-from db_engine.mariadb_support import MAX_ALLOWED_PACKET, _TUNING_FIRST, _TUNING_GROW_ONLY, logger, parse_server_setting
+from db_engine.mariadb_support import _TUNING_FIRST, _TUNING_GROW_ONLY, logger, parse_server_setting
+
+# A connection used within this many seconds is trusted without a COM_PING round trip
+IDLE_PING_S = 30.0
+# Client errors meaning the connection itself is gone (server gone away, lost during query, lost connection)
+_LOST_ERRNOS = frozenset({2006, 2013, 2055})
+
+
+def _is_connection_lost(exc: BaseException) -> bool:
+    """True when `exc` means the connection is gone (a read may then reconnect and run again)."""
+    if isinstance(exc, (mysql.connector.InterfaceError, ConnectionError)):
+        return True
+    if getattr(exc, "errno", None) in _LOST_ERRNOS:
+        return True
+    return isinstance(exc, OSError)
 
 
 
@@ -39,6 +56,12 @@ class MariaDBConnection:
     supports_background_commit = True
 
     _in_txn = False
+
+    # time.monotonic() of the last statement known to have succeeded (0.0: check the connection before use)
+    _last_ok = 0.0
+
+    # Process that opened `cnx`; a forked child never sends on the inherited socket and opens its own connection
+    _pid: int | None = None
 
     dialect = "mariadb"
 
@@ -94,6 +117,8 @@ class MariaDBConnection:
         self._view_sql_cache: dict[tuple[JoinsType, tuple[bool, ...]], str] = {}
         self._next_id_sql_cache: dict[int, str] = {}
         self._init_session()
+        self._pid = os.getpid()
+        self._last_ok = time.monotonic()
 
     def apply_server_tuning(
         self,
@@ -204,38 +229,24 @@ class MariaDBConnection:
         return notes
 
     def _init_session(self) -> None:
-        """Set session parameters and attempt global packet configuration.
-
-        Args:
-            None.
+        """Configure session parameters in a single round trip.
 
         Process:
-            1. Sets `SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`.
-            2. Configures session timeouts (`wait_timeout`, `interactive_timeout`, `net_read_timeout`, `net_write_timeout`).
-            3. Attempts `SET GLOBAL max_allowed_packet = 1GB`, suppressing privilege errors.
-            4. Commits session configuration.
-
-        Outputs:
-            None.
+            1. Sets `sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, disables per-session `foreign_key_checks` and
+               `unique_checks`, and sets session timeouts (`wait_timeout`, `interactive_timeout`,
+               `net_read_timeout`, `net_write_timeout`) in one `SET SESSION` statement (falling back to
+               `sql_mode` alone if a restricted server rejects the optional variables).
+            2. Commits session configuration.
         """
-        self._cur.execute("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';")
         try:
-            self._cur.execute("SET SESSION foreign_key_checks = 0;")
-            self._cur.execute("SET SESSION unique_checks = 0;")
+            self._cur.execute(
+                "SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO', "
+                "foreign_key_checks = 0, unique_checks = 0, "
+                "wait_timeout = 28800, interactive_timeout = 28800, "
+                "net_read_timeout = 3600, net_write_timeout = 3600;"
+            )
         except mysql.connector.Error:
-            pass
-        try:
-            self._cur.execute("SET SESSION wait_timeout = 28800;")
-            self._cur.execute("SET SESSION interactive_timeout = 28800;")
-            self._cur.execute("SET SESSION net_read_timeout = 3600;")
-            self._cur.execute("SET SESSION net_write_timeout = 3600;")
-        except mysql.connector.Error:
-            pass
-        try:
-            self._cur.execute(f"SET GLOBAL max_allowed_packet = {MAX_ALLOWED_PACKET};")
-        except mysql.connector.Error:
-            # Setting global variable may require SUPER/SYSTEM_VARIABLES_ADMIN privileges
-            pass
+            self._cur.execute("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';")
         self.cnx.commit()
 
     def __enter__(self) -> Self:
@@ -372,56 +383,107 @@ class MariaDBConnection:
         return mysql.connector.connect(**conn_kwargs)
 
     def check_if_connected(self) -> None:
-        """Verify connection health and automatically reconnect if dropped.
-
-        Args:
-            None.
+        """Make sure the instance has a usable connection, reconnecting if it was dropped.
 
         Process:
-            Checks active connection via `ping(reconnect=True)`. If disconnected, attempts up to 3 reconnects,
-            re-creating the cursor and re-initializing session state. A reconnect made by the ping itself also
-            re-initializes the session (the new session would otherwise lack `sql_mode` and the disabled checks).
-            Inside `transaction()` nothing reconnects: the server rolled the transaction back, so it fails.
-
-        Outputs:
-            None. Guarantees healthy connection or raises ConnectionError.
+            A connection used successfully within `IDLE_PING_S` seconds is trusted as is (no round trip); an
+            idle one is checked with one `ping()`. A missing or dead connection is replaced by `_reconnect()`
+            (new connection, new cursor, `_init_session()`; 3 attempts). A forked child drops the connection
+            it inherited (without closing it, which would end the parent's session) and opens its own.
+            Inside `transaction()` nothing is checked: a dead connection makes the next statement fail, the
+            server has rolled the transaction back and the caller retries all of it.
 
         Raises:
-            ConnectionError: If connection cannot be re-established after 3 attempts, or was lost in a transaction.
+            ConnectionLostError: If no connection can be opened after 3 attempts, or there is none inside a
+                transaction.
         """
+        pid = getattr(self, "_pid", None)
+        if pid is not None and pid != os.getpid():
+            self.cnx = None
+            self._cur = None
+            self._pid = None
         in_txn = getattr(self, "_in_txn", False)
         if getattr(self, "cnx", None) is not None:
             if in_txn:
-                try:
-                    self.cnx.ping(reconnect=False)
-                    return
-                except Exception as e:
-                    raise ConnectionError(f"Database connection lost inside a transaction: {e}") from e
+                return
+            if getattr(self, "_cur", None) is not None and time.monotonic() - self._last_ok < IDLE_PING_S:
+                return
             try:
-                conn_id = getattr(self.cnx, "connection_id", None)
-                self.cnx.ping(reconnect=True, attempts=3, delay=1)
-                if getattr(self.cnx, "connection_id", None) != conn_id:
+                self.cnx.ping(reconnect=False)
+                if getattr(self, "_cur", None) is None:
                     self._cur = self.cnx.cursor()
-                    self._init_session()
-                elif getattr(self, "_cur", None) is None:
-                    self._cur = self.cnx.cursor()
+                self._last_ok = time.monotonic()
                 return
             except Exception:
                 self.close()
         if in_txn:
-            raise ConnectionError("Database connection lost inside a transaction")
+            raise ConnectionLostError("Database connection lost inside a transaction")
+        self._reconnect()
 
+    def _reconnect(self) -> None:
+        """Replace the connection with a new one (new cursor, `_init_session()`), up to 3 attempts."""
+        self.close()
         for attempt in range(3):
             logger.warning("No SQL connection. Reconnection attempt %d/3...", attempt + 1)
             try:
                 self.cnx = self.connect_sql()
                 self._cur = self.cnx.cursor()
                 self._init_session()
+                self._pid = os.getpid()
+                self._last_ok = time.monotonic()
                 return
+            except ConfigurationError:
+                raise
             except Exception as e:
                 if attempt == 2:
-                    raise ConnectionError(f"Failed to reconnect to database after 3 attempts: {e}") from e
+                    raise ConnectionLostError(f"Failed to reconnect to database after 3 attempts: {e}") from e
                 time.sleep(0.5 * (attempt + 1))
+
+    def _read(self, fn: Callable[[], Any]) -> Any:
+        """Run the read `fn()` (which uses `self.cnx` / `self._cur` when called).
+
+        Outside `transaction()` a read whose connection was lost reconnects and runs once more (reads are
+        idempotent); inside one the error propagates like for any statement.
+        """
+        self.check_if_connected()
+        try:
+            result = fn()
+        except Exception as exc:
+            if getattr(self, "_in_txn", False) or not _is_connection_lost(exc):
+                raise
+            logger.warning("[DB] Connection lost during a read (%s); reconnecting and reading again", exc)
+            self._reconnect()
+            result = fn()
+        self._last_ok = time.monotonic()
+        return result
+
+    def _fetch_one(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        """First row of the read `sql` on the shared cursor (with the reconnect-and-retry of `_read()`)."""
+
+        def run() -> Any:
+            self._cur.execute(sql, params)
+            return self._cur.fetchone()
+
+        return self._read(run)
+
+    def _fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[Any]:
+        """All rows of the read `sql` on the shared cursor (with the reconnect-and-retry of `_read()`)."""
+
+        def run() -> list[Any]:
+            self._cur.execute(sql, params)
+            return self._cur.fetchall()
+
+        return self._read(run)
+
+    def _lease_writer(self) -> Any:
+        """A dedicated writer connection (a separate `MariaDB` instance) for one table of `commit_tables_parallel()`."""
+        from db_engine.DBHandling import MariaDB  # the composed driver class (mixins cannot import it at load)
+
+        return MariaDB()
+
+    def _release_writer(self, writer: Any, healthy: bool) -> None:
+        """Give back a connection of `_lease_writer()`."""
+        writer.close()
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[Self]:
@@ -431,12 +493,20 @@ class MariaDBConnection:
         back on the server, so it fails (`ConnectionError` or the driver error) and the caller retries all of it.
         """
         self.check_if_connected()
-        self.cnx.autocommit = False
+        try:
+            self.cnx.autocommit = False
+        except mysql.connector.Error as exc:
+            self._last_ok = 0.0
+            raise (translate_mysql_error(exc) or exc) from exc
         self._in_txn = True
         try:
             yield self
-            self.cnx.commit()
+            try:
+                self.cnx.commit()
+            except mysql.connector.Error as exc:
+                raise (translate_mysql_error(exc) or exc) from exc
         except BaseException:
+            self._last_ok = 0.0  # the next call checks the connection before using it
             try:
                 self.cnx.rollback()
             except Exception:
@@ -447,7 +517,7 @@ class MariaDBConnection:
             try:
                 self.cnx.autocommit = True
             except Exception:
-                pass
+                self.close()  # a connection that cannot leave the transaction is not reused
 
     def _require_writable(self) -> None:
         """Raise `ReadOnlyViolation` on a driver that backs a read-only session."""
@@ -458,8 +528,8 @@ class MariaDBConnection:
             )
 
     def commit(self) -> None:
-        """Commit pending transaction on connection."""
-        if hasattr(self, "cnx") and self.cnx:
+        """Commit the pending work of `transaction()`; outside one every statement is already committed (autocommit)."""
+        if getattr(self, "_in_txn", False) and getattr(self, "cnx", None):
             self.cnx.commit()
 
     def rollback(self) -> None:
@@ -482,12 +552,14 @@ class MariaDBConnection:
         dictionary: bool = True,
     ) -> list[dict[str, Any] | tuple[SafeDataType, ...]]:
         """Execute a SQL query and return all matching records."""
-        self.check_if_connected()
-        import contextlib
-        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
-            cursor.execute(sql, tuple(params or ()))
-            rows = cursor.fetchall()
-            return list(rows) if rows else []
+
+        def run() -> list[Any]:
+            with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
+                cursor.execute(sql, tuple(params or ()))
+                rows = cursor.fetchall()
+                return list(rows) if rows else []
+
+        return self._read(run)
 
     def _raw_query_one(
         self,
@@ -496,11 +568,13 @@ class MariaDBConnection:
         dictionary: bool = True,
     ) -> dict[str, Any] | tuple[SafeDataType, ...] | None:
         """Execute a SQL query and return a single record or None."""
-        self.check_if_connected()
-        import contextlib
-        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
-            cursor.execute(sql, tuple(params or ()))
-            return cursor.fetchone()
+
+        def run() -> Any:
+            with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
+                cursor.execute(sql, tuple(params or ()))
+                return cursor.fetchone()
+
+        return self._read(run)
 
     def _raw_query_iter(
         self,
@@ -509,22 +583,28 @@ class MariaDBConnection:
         dictionary: bool = True,
         chunk_size: int = 2000,
     ) -> Iterator[dict[str, Any] | tuple[SafeDataType, ...]]:
-        """Stream query result rows in batches of chunk_size."""
-        self.check_if_connected()
-        import contextlib
-        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
-            cursor.execute(sql, tuple(params or ()))
-            while True:
-                chunk = cursor.fetchmany(chunk_size)
-                if not chunk:
-                    break
+        """Stream query result rows in batches of chunk_size (the first batch has the reconnect-and-retry of `_read()`)."""
+
+        def start() -> tuple[Any, list[Any]]:
+            cursor = self.cnx.cursor(dictionary=dictionary)
+            try:
+                cursor.execute(sql, tuple(params or ()))
+                return cursor, cursor.fetchmany(chunk_size)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    cursor.close()
+                raise
+
+        cursor, chunk = self._read(start)
+        with contextlib.closing(cursor):
+            while chunk:
                 yield from chunk
+                chunk = cursor.fetchmany(chunk_size)
 
     def _raw_execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
-        """Execute a DML or DDL SQL statement."""
+        """Execute a DML or DDL SQL statement (committed by autocommit outside `transaction()`)."""
         self._require_writable()
         self.check_if_connected()
-        import contextlib
         with contextlib.closing(self.cnx.cursor()) as cursor:
             cursor.execute(sql, tuple(params or ()))
             if getattr(cursor, "with_rows", False):
@@ -533,17 +613,15 @@ class MariaDBConnection:
                 except Exception:
                     pass
             rowcount = cursor.rowcount
-        if getattr(self.cnx, "autocommit", True):
-            self.cnx.commit()
+        self._last_ok = time.monotonic()
         return max(0, rowcount)
 
     def _raw_executemany(self, sql: str, params_seq: Sequence[Sequence[Any]]) -> int:
-        """Execute a parameterized SQL statement repeatedly."""
+        """Execute a parameterized SQL statement repeatedly (committed by autocommit outside `transaction()`)."""
         if not params_seq:
             return 0
         self._require_writable()
         self.check_if_connected()
-        import contextlib
         with contextlib.closing(self.cnx.cursor()) as cursor:
             cursor.executemany(sql, [tuple(p) for p in params_seq])
             if getattr(cursor, "with_rows", False):
@@ -552,8 +630,7 @@ class MariaDBConnection:
                 except Exception:
                     pass
             rowcount = cursor.rowcount
-        if getattr(self.cnx, "autocommit", True):
-            self.cnx.commit()
+        self._last_ok = time.monotonic()
         return max(0, rowcount)
 
     # -------------------------------------------------------------------------
@@ -565,28 +642,49 @@ class MariaDBConnection:
         block_size: int,
         commit_id: int = 0,
     ) -> tuple[int, int]:
-        """Reserve an atomic block of primary key IDs [start_id, end_id] for target table."""
+        """Reserve an atomic block of primary key IDs [start_id, end_id] for target table.
+
+        Process (up to 3 attempts, each on a checked connection; a lost connection is replaced):
+            1. Reads `COALESCE(MAX(pk), 0) + 1` of the table with a plain consistent read (autocommit, no locks, so
+               it never waits for a commit appending to the same table).
+            2. In one transaction: upserts that floor into `m_table_sequence` (`next_id = GREATEST(next_id, floor)`,
+               which X-locks the sequence row, so concurrent callers are serialized), reads `next_id`, advances it
+               by `block_size` and, with `commit_id > 0`, records the range in `m_ingest_id_range`. A failure of
+               that last insert is logged and ignored unless it is a deadlock (1213, InnoDB rolled the whole
+               transaction back) or a lost connection, which retry the attempt.
+
+        Raises:
+            UnsupportedOperation: Inside `transaction()` (the reservation commits on its own).
+        """
         table_id = getattr(table, "table_id", None)
-        if table_id is not None and hasattr(self, "cnx") and getattr(self, "cnx", None):
-            import contextlib
-            old_autocommit = getattr(self.cnx, "autocommit", True)
-            for attempt in range(3):
-                try:
+        if table_id is None or not getattr(self, "cnx", None):
+            return super().reserve_id_block(table, block_size, commit_id)
+        if getattr(self, "_in_txn", False):
+            raise UnsupportedOperation(
+                "reserve_id_block() commits its own transaction and cannot run inside transaction(); reserve the "
+                "ids before entering it - see DB_API.md 'Sequence Tracking & Single-Row CRUD'"
+            )
+        pk_col = table.init_columns[0][0]
+        for attempt in range(3):
+            try:
+                self.check_if_connected()
+                with contextlib.closing(self.cnx.cursor()) as cur:
+                    cur.execute(f"SELECT COALESCE(MAX(`{pk_col}`), 0) + 1 FROM `{table.table_name}`")  # noqa: S608
+                    row = cur.fetchone()
+                    floor = int(row[0]) if row and row[0] is not None else 1
                     self.cnx.autocommit = False
-                    with contextlib.closing(self.cnx.cursor()) as cur:
-                        pk_col = table.init_columns[0][0]
+                    try:
                         cur.execute(
-                            f"INSERT INTO m_table_sequence (seq_table_id, next_id) "
-                            f"SELECT %s, COALESCE(MAX({pk_col}), 0) + 1 FROM {table.table_name} "
-                            f"ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))",
-                            (table_id,),
+                            "INSERT INTO m_table_sequence (seq_table_id, next_id) VALUES (%s, %s) "
+                            "ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))",
+                            (table_id, floor),
                         )
                         cur.execute(
                             "SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE",
                             (table_id,),
                         )
                         row = cur.fetchone()
-                        start_id = int(row[0]) if row and row[0] is not None else 1
+                        start_id = int(row[0]) if row and row[0] is not None else floor
                         end_id = start_id + block_size - 1
                         cur.execute(
                             "UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s",
@@ -599,24 +697,28 @@ class MariaDBConnection:
                                     "VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE end_id = GREATEST(end_id, VALUES(end_id))",
                                     (commit_id, table_id, start_id, end_id),
                                 )
-                            except Exception as e_range:
+                            except mysql.connector.Error as e_range:
+                                if getattr(e_range, "errno", None) == 1213 or _is_connection_lost(e_range):
+                                    raise
                                 logger.warning(f"[DB] Error recording ingest ID range for table {table_id}: {e_range}")
-                    self.cnx.commit()
-                    return (start_id, end_id)
-                except Exception as e:
-                    try:
-                        self.cnx.rollback()
-                    except Exception:
-                        pass
-                    logger.warning(f"[DB] reserve_id_block attempt {attempt + 1}/3 failed for {table.table_name}: {e}")
-                    if attempt == 2:
-                        raise
-                finally:
-                    try:
-                        self.cnx.autocommit = old_autocommit
-                    except Exception:
-                        pass
-        return super().reserve_id_block(table, block_size, commit_id)
+                        self.cnx.commit()
+                    finally:
+                        self.cnx.autocommit = True
+                self._last_ok = time.monotonic()
+                return (start_id, end_id)
+            except Exception as e:
+                self._last_ok = 0.0  # the next attempt checks the connection (and replaces a dead one)
+                try:
+                    self.cnx.rollback()
+                except Exception:
+                    pass
+                if _is_connection_lost(e):
+                    self.close()
+                logger.warning(f"[DB] reserve_id_block attempt {attempt + 1}/3 failed for {table.table_name}: {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        raise AssertionError("unreachable")
 
     @classmethod
     def probe_connection(cls, cfg: Mapping[str, Any]) -> ProbeResult:

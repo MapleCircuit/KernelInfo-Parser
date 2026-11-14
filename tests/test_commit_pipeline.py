@@ -22,7 +22,7 @@ import main
 import pipeline.source_order
 import pipeline.worker_protocol
 import pipeline.worker_stage
-from core.DBLayout import m_ast, m_blob_symbol_def, m_bridge_checkpoint, m_bridge_tag, m_file_name, m_tag
+from core.DBLayout import m_ast, m_ast_hash, m_blob_symbol_def, m_bridge_checkpoint, m_bridge_tag, m_file_name, m_tag
 from core.GreatProcessor import GreatProcessor
 from core.SymbolRows import STATS as SYMBOL_STATS
 from core.globalstuff import G
@@ -95,12 +95,15 @@ class TestBackgroundCommits(_EngineCase):
         self.assertEqual(self.te.pending_commit_rows, 1, "commit_all() must return while the write is pending")
         self.assertEqual(_stored(m_blob_symbol_def), {})
         self.assertEqual(self.te.queued_set[m_blob_symbol_def.table_id], {}, "staging starts a new generation")
-        threading.Timer(0.2, _GatedDB.gate.set).start()
-        # m_blob_symbol_def is not cached: this read goes to the database and must see the pending write
+        # O-01: get() finds the row in the in-flight batch without joining the writer thread
         found = self.te.get(m_blob_symbol_def.table_id, (row[0],) + (None,) * (m_blob_symbol_def.length - 1))
         self.assertEqual(found[0], row[0])
+        self.assertEqual(self.te.pending_commit_rows, 1)
+        threading.Timer(0.15, _GatedDB.gate.set).start()
+        # A join-graph read still waits for the background write
+        self.te._await_writes((m_blob_symbol_def.table_id,))
         self.assertEqual(self.te.pending_commit_rows, 0)
-        self.assertGreaterEqual(self.te.commit_stats["blocked_s"], 0.1)
+        self.assertGreaterEqual(self.te.commit_stats["blocked_s"], 0.08)
         self.assertEqual(self.te.commit_stats["background"], 1)
         self.assertEqual(_GatedDB.dedicated_calls, 1, "a background write must not use the engine's connection")
 
@@ -115,6 +118,32 @@ class TestBackgroundCommits(_EngineCase):
         finally:
             _GatedDB.gate.set()
             self.te.wait_for_commit()
+
+    def test_interrupted_join_keeps_the_batch_pending(self) -> None:
+        self.te.async_commits = True
+        row = self._stage_symbol("interrupted")
+        _GatedDB.gate.clear()
+        self.te.commit_all()
+        batch = self.te._pending
+        real_join = batch.thread.join
+        calls = []
+
+        def _join_once_interrupted(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return real_join(*args)
+
+        batch.thread.join = _join_once_interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.te.wait_for_commit()
+        self.assertIs(self.te._pending, batch, "an interrupted join must not drop the batch")
+        self.assertEqual(self.te.commit_stats["commits"], 0)
+        _GatedDB.gate.set()
+        self.te.wait_for_commit()
+        self.assertIsNone(self.te._pending)
+        self.assertEqual((self.te.commit_stats["commits"], self.te.commit_stats["rows"]), (1, 1))
+        self.assertIn(row[0], _stored(m_blob_symbol_def))
 
     def test_failed_background_commit_puts_its_rows_back(self) -> None:
         self.te.async_commits = True
@@ -168,6 +197,167 @@ class TestPreloadWindow(_EngineCase):
         self.te.set(m_bridge_checkpoint.table_id, (5, 78, 9))
         self.te.update_in_mem_indexes = True
         self.assertEqual(self._get(5, 79)[1], 1)
+
+
+class TestDeferredHashEviction(_EngineCase):
+    """Deferred m_ast_hash rows of a heap-cached (not carried) table were evicted into _committed_pks by the
+    intermediate commits, so the final commit skipped them and they were never written."""
+
+    def test_deferred_rows_survive_intermediate_commits(self) -> None:
+        self.assertNotIn(m_ast_hash.table_id, self.te._carried_overlays)
+        self.te.defer_ast_hash = True
+        h = b"\x05" * 16
+        self.te.set(m_ast_hash.table_id, (h, 42))
+        self.te.commit_all()
+        self.te.commit(m_ast_hash.table_id)
+        self.assertNotIn(h, self.te._committed_pks[m_ast_hash.table_id])
+        self.assertEqual(self.te.get(m_ast_hash.table_id, (h, None)), (h, 42))
+        self.te.defer_ast_hash = False
+        self.te.commit_all()
+        self.assertIn(h, _stored(m_ast_hash))
+
+    def test_rows_staged_but_not_taken_stay_cached(self) -> None:
+        cp = m_bridge_checkpoint.table_id
+        self.te.set(cp, (5, 1, 9))
+        self.te.commit_all()
+        self.te.set(cp, (5, 2, 9))
+        self.te._evict_committed_rows(cp)
+        self.assertIn((5, 1), self.te._committed_pks[cp])
+        self.assertNotIn((5, 2), self.te._committed_pks[cp])
+        self.te.commit_all()
+        self.assertIn((5, 2), _stored(m_bridge_checkpoint))
+        # The column index never references evicted rows
+        self.assertFalse(any(self.te._col_indices[cp].values()))
+
+
+class TestCarriedUpkeep(unittest.TestCase):
+    """Every commit_all copied and re-projected the whole deferred m_ast_hash set into the carried overlay."""
+
+    def setUp(self) -> None:
+        self.saved = (G.DB, G.TE, main.gp.Old_VID)
+        MockDB.reset()
+        G.DB = MockDB
+        main.gp.Old_VID = 0
+        self.te = TECachedDB(hugepages="auto")
+        G.TE = self.te
+        self.te.start(main.gp.Table_Array, MockDB)
+        self.te.set(m_ast_hash.table_id, (b"\x01" * 16, 1))
+        self.te.commit_all()
+        self.te.close()
+        self.te.start(main.gp.Table_Array, MockDB)  # loads the carried snapshot
+
+    def tearDown(self) -> None:
+        try:
+            self.te.close()
+        except Exception:
+            pass
+        G.DB, G.TE, main.gp.Old_VID = self.saved
+        MockDB.reset()
+
+    def test_deferred_set_costs_nothing_per_commit_and_overlay_matches_database(self) -> None:
+        t_id = m_ast_hash.table_id
+        if t_id not in self.te._carried_overlays:
+            self.skipTest("shared buffer unavailable")
+        self.te.defer_ast_hash = True
+        hashes = [i.to_bytes(16, "big") for i in range(2, 3002)]
+        for n, h in enumerate(hashes):
+            self.te.set(t_id, (h, 10 + n))
+        self.te.update_in_mem_indexes = False
+        unindexed = b"\xee" * 16
+        self.te.set(t_id, (unindexed, 9))
+        self.te.update_in_mem_indexes = True
+        self.te.set(m_file_name.table_id, (None, "kernel/fork.c"))
+        projected = []
+        real_project = self.te._project_row
+        self.te._project_row = lambda table, row: projected.append(row) or real_project(table, row)
+        self.te.commit_all()
+        self.te.commit_all()
+        self.assertEqual(projected, [], "a commit that does not take the deferred rows must not touch them")
+        self.te.defer_ast_hash = False
+        self.te.commit_all()
+        self.assertEqual(len(projected), 3001, "the commit taking a row staged without indexes records its table once")
+        del self.te._project_row
+        in_memory = {row for row in self.te._carried_rows_in_memory()[t_id]}
+        stored = set(_stored(m_ast_hash).values())
+        self.assertEqual(in_memory - {(b"\x00" * 16, 0)}, stored - {(b"\x00" * 16, 0)})
+        self.assertIn((unindexed, 9), in_memory)
+        self.te.close()
+        self.te.start(main.gp.Table_Array, MockDB)
+        self.assertEqual(self.te.get(t_id, (unindexed, None)), (unindexed, 9))
+        # A carried table stages into its PK overlay only (no row list, positions or column index)
+        staged = self.te.set(t_id, (b"\xdd" * 16, 5))
+        self.assertEqual(self.te._cached_rows[t_id]._appended, [])
+        self.assertEqual((self.te._cached_rows_pos[t_id], self.te._col_indices[t_id]), ({}, {}))
+        self.assertEqual(self.te.get(t_id, (b"\xdd" * 16, None)), staged)
+        self.assertEqual(self.te.get(t_id, (hashes[-1], None)), (hashes[-1], 3009))
+
+
+class TestEvictionAndRestartLeaks(_EngineCase):
+    def test_evicted_row_in_flight_is_read_without_joining_the_write(self) -> None:
+        cp = m_bridge_checkpoint.table_id
+        self.te.async_commits = True
+        self.te.set(cp, (5, 77, 9))
+        _GatedDB.gate.clear()
+        self.te.commit_all()
+        self.assertIsNotNone(self.te._pending)
+        self.assertIn((5, 77), self.te._committed_pks[cp], "evicted from the heap while being written")
+        try:
+            before = self.te.db_reads
+            self.assertEqual(self.te.get(cp, (5, 77, None))[:3], (5, 77, 9))
+            self.assertEqual(self.te.db_reads - before, 0)
+            self.assertIsNotNone(self.te._pending, "in-flight hit does not join the write")
+            # A lookup by the non-key column also hits the in-flight batch via its preserved staged index
+            self.assertEqual(self.te.get(cp, (None, None, 9))[:3], (5, 77, 9))
+            self.assertEqual(self.te.db_reads - before, 0)
+            self.assertIsNotNone(self.te._pending)
+            # An in-flight miss on a non-PK column falls back to the database without joining the write
+            self.assertIsNone(self.te.get(cp, (None, 999, None)))
+            self.assertEqual(self.te.db_reads - before, 1)
+            self.assertIsNotNone(self.te._pending)
+        finally:
+            _GatedDB.gate.set()
+            self.te.wait_for_commit()
+
+    def test_restart_resets_committed_unique_keys_and_join_cache(self) -> None:
+        self.te._committed_unique_keys[m_file_name.table_id] = {(1,): {("x",)}}
+        self.te._join_table_ids((((m_file_name.table_id, 0),),))
+        self.te.start_new_db(_GatedDB)
+        self.assertEqual((self.te._committed_unique_keys, self.te._join_tables_cache), ({}, {}))
+
+    def test_failing_next_id_is_logged(self) -> None:
+        from unittest import mock
+        with mock.patch.object(_GatedDB, "get_next_id", side_effect=RuntimeError("gone")):
+            with self.assertLogs("table_engine.te_direct_db", "WARNING"):
+                self.te.start_new_db(_GatedDB)
+
+
+class TestEmptyCommitAll(_EngineCase):
+    """commit_all() with nothing staged evicted the write-heavy tables and trimmed the heap every time."""
+
+    def test_empty_commit_skips_the_upkeep_once_it_ran(self) -> None:
+        from unittest import mock
+        self._stage_symbol("probe")
+        with mock.patch("core.globalstuff.trim_heap") as trim:
+            self.te.commit_all()
+            self.assertEqual(trim.call_count, 1)
+            self.te.commit_all()
+            self.te.commit_all()
+            self.assertEqual(trim.call_count, 1, "an empty commit_all() does no upkeep")
+            self.te.set(m_bridge_checkpoint.table_id, (5, 1, 2))
+            self.te.commit(m_bridge_checkpoint.table_id)
+            self.te.commit_all()
+            self.assertEqual(trim.call_count, 2, "rows committed since the last upkeep make it due again")
+            self.te.commit_all(update_in_mem_indexes=False)
+            self.assertEqual(trim.call_count, 3, "a teardown commit always purges the caches")
+
+    def test_empty_commit_still_raises_a_failed_background_commit(self) -> None:
+        self.te.async_commits = True
+        self.te.set(m_file_name.table_id, (None, "lib/sort.c"))
+        _GatedDB.fail_tables = {"m_file_name"}
+        self.te.commit_all()
+        self.te._pending.thread.join()
+        with self.assertRaises(RuntimeError):
+            self.te.commit_all()
 
 
 class TestIdleCommit(_EngineCase):
@@ -369,6 +559,107 @@ class TestBatchBytes(unittest.TestCase):
         batches = epochs[0]
         self.assertEqual(batches[0][1], ["M\tf0.c"], "the large file is its own batch, dispatched first")
         self.assertGreater(len(batches), 2)
+
+
+class TestPendingReadBypass(_EngineCase):
+    """O-01: reads search the in-flight batch and skip joining `_pending` when they miss or don't overlap."""
+
+    def test_get_hits_pending_and_misses_read_db_without_joining(self) -> None:
+        self.te.async_commits = True
+        sym = self._stage_symbol("in_flight")
+        _GatedDB.gate.clear()
+        self.te.commit_all()
+        try:
+            before = self.te.db_reads
+            # Hit in _pending by PK: returns without joining or querying DB
+            found = self.te.get(m_blob_symbol_def.table_id, (sym[0],) + (None,) * (m_blob_symbol_def.length - 1))
+            self.assertEqual(found[0], sym[0])
+            self.assertEqual(self.te.db_reads - before, 0)
+            self.assertIsNotNone(self.te._pending)
+
+            # Miss in _pending: queries DB without joining _pending
+            miss = self.te.get(m_blob_symbol_def.table_id, (sym[0] + 1000,) + (None,) * (m_blob_symbol_def.length - 1))
+            self.assertIsNone(miss)
+            self.assertEqual(self.te.db_reads - before, 1)
+            self.assertIsNotNone(self.te._pending)
+        finally:
+            _GatedDB.gate.set()
+            self.te.wait_for_commit()
+
+    def test_get_joins_when_table_has_updates_in_flight(self) -> None:
+        self.te.async_commits = True
+        sym = self._stage_symbol("to_update")
+        self.te.commit_all()
+        self.te.wait_for_commit()
+        updated = (sym[0], sym[1], sym[2], sym[3], "updated_name", sym[5], sym[6], sym[7], sym[8])
+        self.te.update(m_blob_symbol_def.table_id, updated)
+        _GatedDB.gate.clear()
+        self.te.commit_all()
+        self.assertIsNotNone(self.te._pending)
+        threading.Timer(0.1, _GatedDB.gate.set).start()
+        found = self.te.get(m_blob_symbol_def.table_id, (sym[0],) + (None,) * (m_blob_symbol_def.length - 1))
+        self.assertIsNone(self.te._pending, "in-flight update must join the commit")
+        self.assertEqual(found[4], "updated_name")
+
+    def test_get_in_skips_join_without_overlap_and_joins_on_overlap(self) -> None:
+        self.te.async_commits = True
+        # Commit an earlier row first so DB has something to return
+        early = self._stage_symbol("early")
+        self.te.commit_all()
+        self.te.wait_for_commit()
+
+        # Now stage two new rows in flight
+        s1 = self._stage_symbol("flight_1")
+        s2 = self._stage_symbol("flight_2")
+        _GatedDB.gate.clear()
+        self.te.commit_all()
+        try:
+            # 1. PK column (col 0) with values strictly outside [s1[0], s2[0]]: no join
+            got = self.te.get_in(m_blob_symbol_def.table_id, 0, [early[0]])
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0][0], early[0])
+            self.assertIsNotNone(self.te._pending, "non-overlapping PK range must not join")
+
+            # 2. Non-PK column (col 4 = symbol name) without overlap: no join
+            got_name = self.te.get_in(m_blob_symbol_def.table_id, 4, ["early", "absent"])
+            self.assertEqual(len(got_name), 1)
+            self.assertIsNotNone(self.te._pending, "non-overlapping non-PK values must not join")
+
+            # 3. Overlapping value on PK column: joins the commit
+            threading.Timer(0.1, _GatedDB.gate.set).start()
+            got_overlap = self.te.get_in(m_blob_symbol_def.table_id, 0, [s1[0]])
+            self.assertIsNone(self.te._pending, "overlapping get_in must join the commit")
+            self.assertEqual(got_overlap[0][0], s1[0])
+        finally:
+            _GatedDB.gate.set()
+            self.te.wait_for_commit()
+
+
+class TestDeferredCommitError(_EngineCase):
+    """B-18: a failed background commit joined by `_await_writes()` restores rows and raises on commit/wait/close."""
+
+    def test_await_writes_restores_and_defers_error_to_wait_commit_close(self) -> None:
+        for trigger_method in ("wait_for_commit", "commit_all", "close"):
+            with self.subTest(trigger=trigger_method):
+                self.te.async_commits = True
+                row = self.te.set(m_file_name.table_id, (None, f"drivers/{trigger_method}.c"))
+                _GatedDB.fail_tables = {"m_file_name"}
+                self.te.commit_all()
+                self.te._pending.thread.join()
+                # _await_writes() must NOT raise inside an unrelated read, and must restore the failed row
+                self.te._await_writes((m_file_name.table_id,))
+                self.assertIn(self.te._sanitize_key((f"drivers/{trigger_method}.c",)), self.te.queued_set[m_file_name.table_id])
+                _GatedDB.fail_tables = set()
+                with self.assertRaises(RuntimeError):
+                    getattr(self.te, trigger_method)()
+                if trigger_method == "close":
+                    # Re-open for tearDown / next subtest
+                    self.te.start_new_db(_GatedDB)
+                else:
+                    # Subsequent commit succeeds and writes the restored row
+                    self.te.commit_all()
+                    self.te.wait_for_commit()
+                    self.assertIn(row[0], _stored(m_file_name))
 
 
 if __name__ == "__main__":

@@ -194,18 +194,8 @@ _FILE_REFERENCE_TABLES = ("m_file_reference", "m_kbuild_symbol")
 
 def _resync_file_reference_ids() -> None:
     """Re-read the next m_file_reference id from the database after rows were written outside the TableEngine."""
-    if hasattr(G.TE, "_id_cursor"):
-        G.TE._id_cursor.pop(m_file_reference.table_id, None)
-    if hasattr(G.TE, "_id_limit"):
-        G.TE._id_limit.pop(m_file_reference.table_id, None)
-    te_db = getattr(G.TE, "db", None)
     try:
-        if te_db is not None:
-            G.TE.next_id[m_file_reference.table_id] = te_db.get_next_id(m_file_reference)
-        else:
-            with G.DB() as db:
-                if db is not None:
-                    G.TE.next_id[m_file_reference.table_id] = db.get_next_id(m_file_reference)
+        G.TE.resync_next_id(m_file_reference)
     except Exception as exc:  # noqa: BLE001 - the TableEngine keeps its own cursor
         logger.debug(f"Could not resynchronize the m_file_reference id sequence: {exc}")
 
@@ -221,19 +211,23 @@ def processing_file_references(version: str) -> None:
     if gp.VID == 0:
         return
 
-    # Ensure all parent tables (m_file_blob, m_file_name, m_bridge_checkpoint) are committed before referencing
-    G.TE.commit_all()
-
+    # The caller (pipeline/update.py Step 6.5) already committed the parent tables (m_file_blob, m_file_name,
+    # m_bridge_checkpoint) before this step, so no commit is repeated here.
     with G.DB() as pairs_db:
         started = time.perf_counter()
         with pairs_db.new_checkpoint_pairs(gp.VID, gp.Old_VID or 0) as new_pairs:
-            with pairs_db.transaction():
-                for table in _FILE_REFERENCE_TABLES:
-                    new_pairs.delete_rows_of(table)
+            # 1. Clear stale rows and re-insert set-based include references atomically in one transaction
+            try:
+                with pairs_db.transaction():
+                    for table in _FILE_REFERENCE_TABLES:
+                        new_pairs.delete_rows_of(table)
+                    processing_include_references(version, new_pairs)
+            except Exception as e:
+                logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
             logger.info(f"[Step 6.6] New (path, blob) pairs computed once and cleared in {time.perf_counter() - started:.1f}s.")
             logger.info(f"Recomputing file references for {len(new_pairs.pairs)} (path, blob) pairs new in version '{version}'.")
 
-            # 2. Resynchronize TableEngine sequence next_id before staging fresh rows
+            # 2. Resynchronize TableEngine sequence next_id after include copy before staging Kbuild/Doc rows
             _resync_file_reference_ids()
 
             # Rows staged in this run (rows of other pairs were cleared or are not recomputed)
@@ -243,15 +237,9 @@ def processing_file_references(version: str) -> None:
             processing_kbuild(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs.pairs)
             processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs.pairs)
 
-            # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
+            # 4. Commit TableEngine queued m_file_reference rows
             if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
                 G.TE.commit(m_file_reference.table_id, update_in_mem_indexes=False)
 
-            # 5. Populate C/ASM and Kconfig include references with a set-based copy (claims N+1..M via server AUTO_INCREMENT)
-            try:
-                processing_include_references(version, new_pairs)
-            except Exception as e:
-                logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
-
-    # 6. Resynchronize next_id so subsequent operations and commit_all have the accurate sequence boundary
+    # 5. Resynchronize next_id so subsequent operations and commit_all have the accurate sequence boundary
     _resync_file_reference_ids()

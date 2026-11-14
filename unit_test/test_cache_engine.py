@@ -117,6 +117,26 @@ class CacheEngineContract:
         self.assertEqual(list(self.log.scan()), rows)
         self.assertEqual(list(self.log.scan(Eq("k", "a"), columns=("x",))), [(2,), (1,)])
 
+    def test_keyless_store_filtered_scans_keep_insertion_order(self) -> None:
+        # Row 7 and 8 share k: hash-set iteration order would return them reversed ({7, 8} iterates as 8, 7).
+        rows = [("b", 9), ("c", 8), ("d", 7), ("e", 6), ("f", 5), ("g", 4), ("h", None), ("q", 3), ("q", 1),
+                ("a", 2), ("q", 0), ("b", 10)]
+        self.assertEqual(self.log.put_many(rows, replace=False), len(rows))
+
+        def expect(pred) -> list[tuple]:
+            return [r for r in rows if pred(r)]
+
+        self.assertEqual(list(self.log.scan(Eq("k", "q"))), expect(lambda r: r[0] == "q"))
+        self.assertEqual(list(self.log.scan({"k": ["q", "b"]})), expect(lambda r: r[0] in ("q", "b")))
+        self.assertEqual(list(self.log.scan(Range("x", ge=1, le=9))), expect(lambda r: r[1] is not None and 1 <= r[1] <= 9))
+        self.assertEqual(list(self.log.scan(Prefix("k", "q"))), expect(lambda r: r[0] == "q"))
+        self.assertEqual(list(self.log.scan([Eq("k", "q"), Range("x", ge=1)])), [("q", 3), ("q", 1)])
+        self.assertEqual(list(self.log.scan(IsNull("x", negate=True), columns=("k",)))[:3], [("b",), ("c",), ("d",)])
+        self.assertEqual(list(self.log.scan(Eq("k", "q"), limit=2)), [("q", 3), ("q", 1)])
+        # replace=True moves a colliding record to the end, as a delete plus insert does
+        self.log.put(("q", 3))
+        self.assertEqual(list(self.log.scan(Eq("k", "q"))), [("q", 1), ("q", 0), ("q", 3)])
+
     def test_aggregates(self) -> None:
         self.assertEqual((self.items.count(), self.items.sum("n"), self.items.max("n")), (0, 0, None))
         self._fill()
@@ -137,6 +157,36 @@ class CacheEngineContract:
         self.items.clear()
         self.assertEqual(self.items.count(), 0)
 
+    def _bounded(self, fn, timeout: float = 20.0) -> None:
+        """Run ``fn`` in a daemon thread so a deadlock fails the test instead of hanging the suite."""
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout)
+        self.assertFalse(t.is_alive(), "operation deadlocked")
+        if errors:
+            raise errors[0]
+
+    def test_range_and_prefix_writes_on_fresh_store_do_not_hang(self) -> None:
+        self._fill()  # no sorted index exists yet: the write builds one while it holds the space locks
+
+        def work() -> None:
+            self.assertEqual(self.items.delete_where(Range("n", lt=1)), 10)
+            self.assertEqual(self.items.update_where(Prefix("label", "l1"), {"n": 7}), 8)  # l1, l10-l19 minus n=0
+            self.assertEqual(self.items.count(Eq("n", 7)), 8)
+            self.assertEqual(self.items.get(bytes([1, 0])), (bytes([1, 0]), 7, "l1"))
+            self.assertIsNone(self.space.get_meta("absent"))
+
+        self._bounded(work)
+        self._bounded(lambda: self.assertEqual(self.items.count(), 20))
+
     def test_schema_errors(self) -> None:
         with self.assertRaises(CacheSchemaError):
             list(self.items.scan(Eq("nope", 1)))
@@ -147,6 +197,30 @@ class CacheEngineContract:
         with self.assertRaises(CacheError):
             self.items.put((b"a", 1))  # wrong arity
         self.assertEqual(self.items.count(), 0)
+
+    def test_put_many_with_unusable_value_writes_nothing(self) -> None:
+        self.items.put((b"base", 0, None))
+        for replace in (True, False):
+            with self.assertRaises(CacheError):
+                self.items.put_many([(b"ok", 1, None), ([1], 2, None)], replace=replace)   # unusable key
+            with self.assertRaises(CacheError):
+                self.items.put_many([(b"ok", 1, None), (b"bad", [1], None)], replace=replace)  # indexed field
+            with self.assertRaises(CacheError):
+                self.log.put_many([("ok", 1), (["k"], 2)], replace=replace)                  # unique group
+        self.assertEqual((self.items.count(), self.log.count()), (1, 0))
+        self.assertIsNone(self.items.get(b"ok"))
+
+    def test_batch_with_unusable_value_rolls_back_everything(self) -> None:
+        self.items.put_many((i.to_bytes(4, "big"), i, None) for i in range(50))
+        self.space.set_meta("k", "v")
+        with self.assertRaises(CacheError):
+            with self.space.batch():
+                self.pairs.put((1, 1, "x"))
+                self.space.set_meta("k", "other")
+                self.items.put((b"new", 1, None))
+                self.items.put_many([(b"new2", 2, None), (b"bad", [1], None)])
+        self.assertEqual((self.items.count(), self.pairs.count(), self.space.get_meta("k")), (50, 0, "v"))
+        self.assertIsNone(self.items.get(b"new"))
 
     # ---------------------------------------------------------------- space
     def test_metadata(self) -> None:
@@ -190,6 +264,24 @@ class CacheEngineContract:
         t.join()
         seen.append(self.items.count())
         self.assertEqual(seen, [0, 1])
+
+    def test_batch_of_closed_handle_fails_without_corrupting_reopened_space(self) -> None:
+        self.items.put((b"base", 0, None))
+        again = None
+        with self.assertRaises(CacheError):
+            with self.space.batch():
+                self.items.put((b"old", 1, None))
+                self.space.close()
+                again = self.engine.open("test-ns", "demo-v1", SPECS)
+                self.assertIsNot(again, self.space)
+                again.store("items").put((b"new", 2, None))
+                again.set_meta("k", "new")
+        self.assertIs(self.engine.open("test-ns", "demo-v1", SPECS), again)
+        items = again.store("items")
+        self.assertEqual(sorted(r[0] for r in items.scan()), [b"base", b"new"])
+        self.assertEqual(again.get_meta("k"), "new")
+        items.put((b"after", 3, None))
+        self.assertEqual(items.count(), 3)
 
     def test_space_clear_resets_stores_and_meta(self) -> None:
         self._fill()
@@ -319,6 +411,19 @@ class TestRAMCacheEngine(CacheEngineContract, unittest.TestCase):
         reopened.discard()
         self.assertFalse(self.engine.exists("test-ns", "demo-v1"))
 
+    def test_discard_scope_drops_only_that_root(self) -> None:
+        self.items.put((b"k", 1, None))
+        other_root = os.path.join(self.tmp, "other")
+        other = RAMCacheEngine(other_root)
+        self.assertEqual(self.engine.discard_scope(other_root), 0)
+        self.assertEqual(self.engine.discard_scope(self.tmp), 1)
+        self.assertFalse(self.engine.exists("test-ns", "demo-v1"))
+        with self.assertRaises(CacheError):
+            self.items.get(b"k")                       # the handle is closed
+        fresh = self.engine.open("test-ns", "demo-v1", SPECS)
+        self.assertEqual(fresh.store("items").count(), 0)
+        other.close()
+
     def test_size_bytes_and_compact(self) -> None:
         empty = self.engine.open("test-ns", "empty-v1", SPECS)
         self.assertEqual(empty.size_bytes(), 0)
@@ -406,6 +511,151 @@ class TestRAMCacheEngine(CacheEngineContract, unittest.TestCase):
         del it
         self.assertEqual(st.readers, 0)
 
+    def test_iterator_finalized_inside_a_locked_section_does_not_deadlock(self) -> None:
+        self.items.put_many((i.to_bytes(2, "big"), i, None) for i in range(10))
+        storage = self.space._storage
+
+        def same_thread() -> None:
+            it = self.items.scan()
+            with self.space._wlock, self.space._commit_lock:  # as an in-place write holds them
+                del it                                        # finalizer runs on the lock-holding thread
+                self.assertEqual(storage.stores["items"].readers, 0)
+
+        self._bounded(same_thread)
+
+        held, release = threading.Event(), threading.Event()
+
+        def holder() -> None:
+            with self.space._commit_lock:
+                held.set()
+                release.wait(5)
+
+        it = self.items.scan()                     # pin first (pinning takes the lock)
+        release_target = storage.stores["items"]
+        t = threading.Thread(target=holder)
+        t.start()
+        self.assertTrue(held.wait(5))
+        del it                                     # another thread holds the lock: the release is queued
+        self.assertEqual(len(storage.released), 1)
+        self.assertEqual(release_target.readers, 1)
+        release.set()
+        t.join(5)
+        self.items.put((b"\xff\xff", 1, None))     # next locked operation applies it and writes in place
+        self.assertEqual(len(storage.released), 0)
+        self.assertEqual(release_target.readers, 0)
+        self.assertIs(storage.stores["items"], release_target)
+
+    def test_clone_of_pinned_state_tolerates_concurrent_sorted_index_build(self) -> None:
+        from cache_engine import ram_cache
+        self.items.put_many((i.to_bytes(2, "big"), i, f"l{i}") for i in range(100))
+        self.assertEqual(self.items.count(Range("n", ge=0)), 100)    # sorted index on n exists: clone copies it
+        pinned = self.items.scan()
+        next(pinned)                                                 # the committed state is pinned: writes clone
+        real_copy = ram_cache._SortedIndex.copy
+        reader_errors: list[BaseException] = []
+        fired = []
+
+        def copy_with_concurrent_reader(si):
+            if not fired:
+                fired.append(1)
+
+                def reader() -> None:   # builds the label index into the state being cloned
+                    try:
+                        self.assertEqual(len(list(self.items.scan(Range("label", ge="l")))), 100)
+                    except BaseException as exc:  # noqa: BLE001
+                        reader_errors.append(exc)
+
+                t = threading.Thread(target=reader)
+                t.start()
+                t.join(5)
+                self.assertFalse(t.is_alive())
+            return real_copy(si)
+
+        with mock.patch.object(ram_cache._SortedIndex, "copy", copy_with_concurrent_reader):
+            self.items.put((b"new", 1000, "x"))
+        self.assertEqual(fired, [1])
+        self.assertEqual(reader_errors, [])
+        self.assertEqual(self.items.count(), 101)
+        self.assertEqual(len(list(pinned)), 99)
+        with self.space.batch():                                     # a batch base clones the same way
+            pinned = self.items.scan()
+            self.items.put((b"new2", 1001, "y"))
+        del pinned
+
+    def test_concurrent_writes_and_pinned_range_readers_stress(self) -> None:
+        import time
+        cols = ("sha", "n", "label")
+        self.items.put_many((i.to_bytes(2, "big"), i, f"l{i}") for i in range(300))
+        errors: list[BaseException] = []
+        stop = time.monotonic() + 0.6
+
+        def reader(col: str) -> None:
+            try:
+                while time.monotonic() < stop:
+                    lo = {"sha": b"", "n": 0, "label": ""}[col]
+                    list(self.items.scan(Range(col, ge=lo)))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def writer() -> None:
+            try:
+                i = 0
+                while time.monotonic() < stop:   # > 25 % of the rows: drops sorted indexes, readers rebuild them
+                    self.items.put_many(((70000 + i * 100 + k).to_bytes(4, "big"), k, f"w{k}") for k in range(100))
+                    self.items.delete_where(Range("n", ge=100000))
+                    i += 1
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=reader, args=(c,)) for c in cols * 2] + [threading.Thread(target=writer)]
+        [t.start() for t in threads]
+        [t.join(10) for t in threads]
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(errors, [])
+
+    def test_mixed_type_values_raise_schema_error_and_never_corrupt(self) -> None:
+        # Fields are not type-checked: values that cannot be ordered together surface as CacheSchemaError.
+        self.items.put_many((i.to_bytes(2, "big"), i, f"l{i}") for i in range(20))
+        self.assertEqual(self.items.count(Range("n", ge=0)), 20)       # sorted index on n exists
+        self.items.put((b"str", "seven", "x"))                         # write never fails on the sorted index
+        self.items.update_where(Eq("sha", bytes([0, 1])), {"n": "one"})
+        self.assertEqual(self.items.get(b"str"), (b"str", "seven", "x"))
+        self.assertEqual(self.items.count(), 21)
+        with self.assertRaises(CacheSchemaError):
+            list(self.items.scan(Range("n", ge=0)))
+        with self.assertRaises(CacheSchemaError):
+            list(self.items.scan(order_by=["n"]))
+        with self.assertRaises(CacheSchemaError):
+            self.items.count(Range("n", ge=0))
+        with self.assertRaises(CacheSchemaError):
+            self.items.max("n")
+        with self.assertRaises(CacheSchemaError):
+            self.items.sum("n")
+        with self.assertRaises(CacheSchemaError):
+            self.items.delete_where(Range("n", lt=5))
+        with self.assertRaises(CacheSchemaError):
+            self.items.update_where(Eq("n", 3), {"n": [1]})           # unhashable value for an indexed field
+        with self.assertRaises(CacheSchemaError):
+            list(self.items.scan(Range("label", ge=1)))              # bound of another type than the values
+        self.assertEqual(self.items.count(), 21)
+        self.assertEqual(self.items.count(Eq("n", 3)), 1)
+        self.assertEqual(self.items.count(Eq("n", "one")), 1)
+        self.assertEqual(self.space._storage.stores["items"].readers, 0)
+
+    def test_batch_commit_builds_every_state_before_swapping(self) -> None:
+        from cache_engine import ram_cache
+        self.items.put_many((i.to_bytes(4, "big"), i, None) for i in range(ram_cache._BATCH_DELTA_THRESHOLD + 10))
+        pinned = self.items.scan()
+        next(pinned)                                  # readers > 0: the delta is applied to a clone at commit
+        with mock.patch.object(ram_cache._KeyedDelta, "apply_to", side_effect=TypeError("boom")):
+            with self.assertRaises(CacheSchemaError):
+                with self.space.batch():
+                    self.pairs.put((1, 1, "x"))       # working state (small store)
+                    self.items.put((b"new", 1, None)) # delta (large simple keyed store)
+                    self.space.set_meta("k", "v")
+        self.assertEqual((self.pairs.count(), self.items.get(b"new"), self.space.get_meta("k")), (0, None, None))
+        del pinned
+
     def test_unhashable_key_and_prefix_type_safety(self) -> None:
         with self.assertRaises(CacheSchemaError):
             self.items.get([1, 2])
@@ -418,6 +668,38 @@ class TestRAMCacheEngine(CacheEngineContract, unittest.TestCase):
         self.assertEqual(list(self.items.scan([Eq("n", 123), Prefix("n", "12")])), [])
         self.assertEqual(list(self.items.scan(Prefix("label", b"he"))), [])
 
+    def test_reopened_handle_shares_locks_with_closed_handle(self) -> None:
+        inside, proceed = threading.Event(), threading.Event()
+        outcome: list[str] = []
+
+        def old_batch() -> None:
+            try:
+                with self.space.batch():
+                    self.items.put((b"old", 1, None))
+                    inside.set()
+                    proceed.wait(5)
+                outcome.append("committed")
+            except CacheError:
+                outcome.append("error")
+
+        a = threading.Thread(target=old_batch)
+        a.start()
+        self.assertTrue(inside.wait(5))
+        self.space.close()
+        again = self.engine.open("test-ns", "demo-v1", SPECS)
+        self.assertIs(again._wlock, self.space._wlock)
+        self.assertIs(again._commit_lock, self.space._commit_lock)
+        b = threading.Thread(target=lambda: again.store("items").put((b"new", 2, None)))
+        b.start()
+        b.join(0.2)
+        self.assertTrue(b.is_alive())  # the new handle's writer waits for the old handle's batch
+        proceed.set()
+        a.join(5)
+        b.join(5)
+        self.assertEqual(outcome, ["error"])
+        self.assertEqual([r[0] for r in again.store("items").scan()], [b"new"])
+        self.assertEqual(again._storage.stores["items"].readers, 0)
+
     def test_leading_col_of_composite_unique_is_indexed(self) -> None:
         links_spec = StoreSpec("links", (TEXT("mid"), BYTES("sha")), unique=(("mid", "sha"),))
         sp = self.engine.open("test-ns", "links-v1", (links_spec,))
@@ -427,6 +709,59 @@ class TestRAMCacheEngine(CacheEngineContract, unittest.TestCase):
         self.assertIn((0,), st.indexes)
         self.assertEqual(sorted(r[1] for r in links.scan(Eq("mid", "m1"))), [b"s1", b"s2"])
         self.assertEqual(links.count(Eq("mid", "m1")), 2)
+
+    def test_bounded_reads_do_not_pin_or_force_clone(self) -> None:
+        from cache_engine import ram_cache
+        self._fill()
+        st_before = self.space._storage.stores["items"]
+        with mock.patch.object(ram_cache._StoreState, "clone", wraps=ram_cache._StoreState.clone) as clone_spy:
+            self.assertEqual(set(self.items.get_many([b"\x00\x00", b"\x01\x00"]).keys()), {b"\x00\x00", b"\x01\x00"})
+            self.assertEqual(st_before.readers, 0)
+            self.assertEqual(self.items.count(), 30)
+            self.assertEqual(st_before.readers, 0)
+            self.assertEqual(self.items.sum("n"), 30)
+            self.assertEqual(st_before.readers, 0)
+            self.assertEqual(self.items.max("n"), 2)
+            self.assertEqual(st_before.readers, 0)
+            self.items.put((b"e", 5, "five"))
+            self.assertEqual(clone_spy.call_count, 0)
+        self.assertIs(self.space._storage.stores["items"], st_before)
+
+    def test_keyless_unique_batch_put_many_mutates_in_place_when_unpinned(self) -> None:
+        from cache_engine import ram_cache
+        links_spec = StoreSpec("links", (TEXT("mid"), BYTES("sha")), unique=(("mid", "sha"),))
+        sp = self.engine.open("test-ns", "links-o18", (links_spec,))
+        links = sp.store("links")
+        links.put_many([("m1", b"s1"), ("m2", b"s2")])
+        st_before = sp._storage.stores["links"]
+
+        with mock.patch.object(ram_cache._StoreState, "clone", wraps=ram_cache._StoreState.clone) as clone_spy:
+            with sp.batch():
+                written1 = links.put_many([("m3", b"s3"), ("m1", b"s1")], replace=True)
+                written2 = links.put_many([("m3", b"s3"), ("m4", b"s4"), ("m4", b"s4")], replace=False)
+            self.assertEqual(clone_spy.call_count, 0)
+        self.assertEqual(written1, 2)
+        self.assertEqual(written2, 1)
+        self.assertIs(sp._storage.stores["links"], st_before)
+        self.assertEqual(links.count(), 4)
+
+        # Rollback on error inside batch leaves the store untouched and does not clone.
+        with self.assertRaises(RuntimeError):
+            with sp.batch():
+                links.put_many([("m5", b"s5")])
+                raise RuntimeError("abort")
+        self.assertIs(sp._storage.stores["links"], st_before)
+        self.assertEqual(links.count(), 4)
+
+        # When a scan pins the state (readers > 0), batch() clones instead of mutating the pinned snapshot.
+        pinned = links.scan()
+        first = next(pinned)
+        with sp.batch():
+            links.put_many([("m6", b"s6")])
+        self.assertIsNot(sp._storage.stores["links"], st_before)
+        self.assertEqual(links.count(), 5)
+        self.assertEqual(len([first, *pinned]), 4)
+        self.assertEqual(st_before.readers, 0)
 
 
 class TestFactory(unittest.TestCase):

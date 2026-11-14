@@ -19,6 +19,9 @@ from pipeline.worker_stage import _commit_all_with_retry
 
 
 
+_CHUNK_COMMIT_ROW_CAP = 500_000
+
+
 class DependencyScheduler:
     """Dependency-driven ChangeSet resolution and execution scheduler with two-stage streaming ingestion.
 
@@ -65,13 +68,19 @@ class DependencyScheduler:
         self.gp.ChangeSet_Dict[path] = cs_obj
 
     def _maybe_chunk_commit(self) -> None:
-        if self.executed_count % self.chunk_commit_interval == 0:
-            # If an async background commit is still writing and memory is healthy, defer to allow async overlap
-            if getattr(G.TE, "async_commits", False) and getattr(G.TE, "pending_commit_rows", 0) > 0 and not G.LOW_MEMORY_MODE:
-                if self.executed_count % (2 * self.chunk_commit_interval) != 0:
-                    return
-            _commit_all_with_retry("Chunk")
-            reclaim_system_memory()
+        raw_staged = getattr(G.TE, "staged_rows", 0)
+        staged_rows = raw_staged if isinstance(raw_staged, int) else 0
+        row_cap_hit = staged_rows >= _CHUNK_COMMIT_ROW_CAP
+        count_hit = self.executed_count % self.chunk_commit_interval == 0
+        if not row_cap_hit and not count_hit:
+            return
+        # If an async background commit is still writing and memory is healthy, defer to allow async overlap
+        # (unless the staged row cap itself has been reached, or we are at 2x the count interval).
+        if getattr(G.TE, "async_commits", False) and getattr(G.TE, "pending_commit_rows", 0) > 0 and not G.LOW_MEMORY_MODE:
+            if not row_cap_hit and self.executed_count % (2 * self.chunk_commit_interval) != 0:
+                return
+        _commit_all_with_retry("Chunk")
+        reclaim_system_memory()
 
     def _execute(self, path: str, cs_obj: ChangeSet, defer: bool) -> bool:
         """Execute a ChangeSet: on success evacuate it and wake its waiters, otherwise park it."""
@@ -157,6 +166,9 @@ class DependencyScheduler:
 
     def resolve_headers(self) -> None:
         """Resolve all remaining header ChangeSets in wave order, breaking circular deadlocks with stubs."""
+        # Keep async_commits enabled so the final Stage 1 wave commit overlaps _publish_file_symbols()
+        if hasattr(G.TE, "wait_for_commit"):
+            G.TE.async_commits = True
         execute_phase2_parallel_waves(self.gp, chunk_commit_interval=self.chunk_commit_interval, completed_set=self.completed)
         self.completed.update(self.gp.ChangeSet_Dict.keys())
         self.pending_deps.clear()
@@ -200,6 +212,9 @@ class DependencyScheduler:
         # The caches stay: Step 6.1 (symlink resolution) still stages m_file_name / m_file_blob rows and a
         # cleared cache mints new ids for paths and blobs already in the database. They are cleared after
         # git commit processing, where nothing stages into those parent tables any more.
+        if hasattr(G.TE, "wait_for_commit"):
+            G.TE.async_commits = False
+            G.TE.wait_for_commit()
         G.TE.commit_all()
         # Every ChangeSet has executed: the Stage 2 shared symbol segments are no longer read
         self.gp.close_shared_symbols()
@@ -225,6 +240,58 @@ def _stored_changeset_executed(cs_dict: Any, path: str) -> bool | None:
             return None
     unresolved = getattr(cs, "unresolved_indices", None)
     return bool(getattr(cs, "cs_processed", False)) and not unresolved
+
+
+def _source_scc_candidates(remaining: set[str], deps: dict[str, set[str]]) -> list[str]:
+    """Return nodes in SCCs that have no unresolved dependencies outside their own SCC (iterative Tarjan)."""
+    index_counter = 0
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    source_nodes: list[str] = []
+
+    for start in sorted(remaining):
+        if start in indices:
+            continue
+        call_stack: list[tuple[str, Any]] = [(start, iter(deps.get(start, ())))]
+        indices[start] = lowlink[start] = index_counter
+        index_counter += 1
+        stack.append(start)
+        on_stack.add(start)
+
+        while call_stack:
+            v, it = call_stack[-1]
+            try:
+                w = next(it)
+                if w not in remaining:
+                    continue
+                if w not in indices:
+                    indices[w] = lowlink[w] = index_counter
+                    index_counter += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    call_stack.append((w, iter(deps.get(w, ()))))
+                elif w in on_stack and indices[w] < lowlink[v]:
+                    lowlink[v] = indices[w]
+            except StopIteration:
+                call_stack.pop()
+                if call_stack:
+                    parent = call_stack[-1][0]
+                    if lowlink[v] < lowlink[parent]:
+                        lowlink[parent] = lowlink[v]
+                if lowlink[v] == indices[v]:
+                    scc: list[str] = []
+                    while True:
+                        w = stack.pop()
+                        on_stack.remove(w)
+                        scc.append(w)
+                        if w == v:
+                            break
+                    scc_set = set(scc)
+                    if all(dep in scc_set for node in scc for dep in deps.get(node, ()) if dep in remaining):
+                        source_nodes.extend(scc)
+    return source_nodes
 
 
 def execute_phase2_parallel_waves(
@@ -290,6 +357,7 @@ def execute_phase2_parallel_waves(
             dependents[target].add(path)
 
     wave_num = 0
+    cycle_breaks = 0
     executed_count = 0
     last_commit_count = 0
     t_phase2_start = time.perf_counter()
@@ -314,24 +382,29 @@ def execute_phase2_parallel_waves(
             if G.is_deadline_exceeded():
                 logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Wave Resolution. Halting early..."))
                 break
-            wave_num += 1
             t_wave_start = time.perf_counter()
             # Wave selection: files with no unexecuted dependencies in remaining (sorted for reproducible ids)
             wave = sorted(ready)
             ready.clear()
 
             if not wave:
-                # Deadlock: force the file most others wait on (ties: fewest operations to stub, then path).
-                # Chosen from the dependency counts alone: decompressing every candidate cost seconds per break.
-                cand_path = max(remaining, key=lambda k: (len(dependents.get(k, ())), -op_counts.get(k, 0), k))
+                # Deadlock: pick the victim inside a source SCC (no unresolved dependencies outside itself),
+                # preferring the file most others wait on (ties: fewest operations to stub, then path).
+                candidates = _source_scc_candidates(remaining, deps) or list(remaining)
+                cand_path = max(candidates, key=lambda k: (len(dependents.get(k, ())), -op_counts.get(k, 0), k))
+                cycle_breaks += 1
                 logger.warning(COLOR.yellow(
-                    f"[Phase 2] Breaking circular dependency deadlock: precision force-resolving 1 stub "
+                    f"[Phase 2] Breaking circular dependency deadlock #{cycle_breaks}: precision force-resolving 1 stub "
                     f"(candidate '{cand_path}' has {len(dependents.get(cand_path, ()))} dependents, {len(remaining)} files remaining)"
                 ))
 
                 cand_cs = gp.ChangeSet_Dict[cand_path]
                 cand_cs.gp = gp
-                cand_cs.execute(force_stubs=True)
+                if not cand_cs.execute(force_stubs=True):
+                    logger.error(COLOR.red(
+                        f"[Phase 2] '{cand_path}': {len(cand_cs.unresolved_indices or ())} operations remain unresolved "
+                        f"after stub resolution (blocked on '{cand_cs.blocked_on}'); they are dropped."
+                    ))
                 extract_tags_and_evacuate_cs(cand_cs)
                 gp.ChangeSet_Dict[cand_path] = cand_cs
                 _finish(cand_path)
@@ -345,6 +418,8 @@ def execute_phase2_parallel_waves(
                     reclaim_system_memory()
                     last_commit_count = executed_count
                 continue
+
+            wave_num += 1
 
             logger.info(COLOR.cyan(
                 f"[Phase 2] Wave {wave_num}: resolving {len(wave)} files ({len(remaining)} remaining)..."
@@ -398,7 +473,8 @@ def execute_phase2_parallel_waves(
             commit_time = time.perf_counter() - t_commit
 
     avg_velocity = executed_count / max(0.001, resolution_time)
+    breaks_suffix = f" ({cycle_breaks} cycle breaks)" if cycle_breaks else ""
     logger.info(COLOR.green(
-        f"[Phase 2] Completed resolution of {executed_count} ChangeSets across {wave_num} waves "
+        f"[Phase 2] Completed resolution of {executed_count} ChangeSets across {wave_num} waves{breaks_suffix} "
         f"in {resolution_time:.1f}s ({avg_velocity:.1f} files/s); final commit {commit_time:.1f}s."
     ))

@@ -12,10 +12,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cache_engine import get_cache_engine
 from webapp.backend.services import commit_relations as cr
 from webapp.backend.services import release_service as rs
 from webapp.backend.services import stable_service as ss
 from webapp.backend.services.jobs import JobManager
+
+
+def release_cache_scope(root) -> None:
+    """End a test's temporary cache scope on every engine: RAM spaces outlive ``close()``, so the scope is dropped;
+    SQLite handles are closed before the directory goes."""
+    get_cache_engine("ram").discard_scope(root)
+    get_cache_engine("sqlite").close()
 
 
 class TestAnnotations(unittest.TestCase):
@@ -38,6 +46,8 @@ class TestAnnotations(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class TestMissingReport(unittest.TestCase):
+    CACHE_ENGINE = "ram"   # pinned: the developer's config.json must not pick the engine under test
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.tmp = tempfile.TemporaryDirectory()
@@ -73,11 +83,12 @@ class TestMissingReport(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        release_cache_scope(cls.cache.name)
         cls.tmp.cleanup()
         cls.cache.cleanup()
 
     def test_report(self) -> None:
-        with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.cache.name}), \
+        with patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.cache.name, "KERNELINFO_CACHE_ENGINE": self.CACHE_ENGINE}), \
                 patch.object(rs, "get_repo_dir", lambda: self.repo), patch.object(cr, "get_repo_dir", lambda: self.repo), \
                 patch.object(rs, "jobs", JobManager(workers=1)), patch.object(cr, "jobs", JobManager(workers=1)):
             rs._TAGS_CACHE.clear()
@@ -94,6 +105,10 @@ class TestMissingReport(unittest.TestCase):
             self.assertEqual(shas[self.cc]["mainline_release"], "v1.1")
             self.assertFalse(ss.build_report("v1.1")["available"])  # no stable tags of 1.1.y
             self.assertEqual([s["series"] for s in ss.stable_series()], ["v1.0"])
+
+
+class TestMissingReportSQLite(TestMissingReport):
+    CACHE_ENGINE = "sqlite"
 
 
 if __name__ == "__main__":

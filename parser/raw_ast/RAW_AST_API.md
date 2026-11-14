@@ -137,7 +137,7 @@ tag_ref = stage_new_tag(CS, content_hash, ast_ref, s_tag_id)
 # 3. Spatial file coordinates
 stage_bridge_tag(CS, tag_ref, (1, line_count), (1, last_char_count), positional=True)
 
-# 4. Spatial AST map, keyed by the tag (map_id = tag_id; m_bridge_map is no longer written)
+# 4. Spatial AST map, keyed by the tag (map_id = tag_id)
 stage_tag_map(CS, tag_ref, ast_ref, line_count, last_char_count, positional=True)
 ```
 

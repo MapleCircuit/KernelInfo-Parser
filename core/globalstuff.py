@@ -158,6 +158,8 @@ class GlobalStuff:
         self.CURRENT_PARSING_DIR: str | None = None
 
         self.BP_ON_SHUTDOWN = False
+        # Run by emergency_shutdown() before the SSH tunnel stops (e.g. unregistering a distributed node)
+        self.shutdown_hooks: list = []
         self.BP_ON_REF_FAIL = False
 
         self.OVERRIDE_TABLE_CREATION_PRINT = False
@@ -238,9 +240,16 @@ class GlobalStuff:
             yield None
 
     def emergency_shutdown(self, number_error: int = 1) -> None:
-        """Close the program cleanly by deleting the git files."""
+        """Close the program cleanly by deleting the git files.
+
+        `shutdown_hooks` (callables taking no argument) run first, while the database is still reachable:
+        the SSH tunnel is stopped below.
+        """
         if self.BP_ON_SHUTDOWN:
             self.BP()
+        for hook in list(getattr(self, "shutdown_hooks", ())):
+            with contextlib.suppress(Exception):
+                hook()
 
         gp_obj = getattr(sys.modules.get("__main__"), "gp", None)
         if gp_obj and hasattr(gp_obj, "PURGE_LIST"):

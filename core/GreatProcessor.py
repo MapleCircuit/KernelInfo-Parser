@@ -267,6 +267,8 @@ class GreatProcessor:
         self.file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]] = {}
         self.file_blob_ids: dict[str, int] = {}
         self._ast_negative_cache: set[tuple[str, int]] = set()
+        self._ast_ref_memo: dict[tuple[str, int | None], int | None] = {}
+        self._ast_ref_memo_neg_seen: bool = False
         # File-scoped shared memory symbol segments published during Stage 2 (SharedSymbolChain)
         self._shared_symbols = None
         # Commit hash -> commit_id for the version's commit range, registered by ingest_git_dag()
@@ -296,6 +298,8 @@ class GreatProcessor:
         self.file_pre_extracted_tags = {}
         self.file_blob_ids = {}
         self._ast_negative_cache = set()
+        self._ast_ref_memo = {}
+        self._ast_ref_memo_neg_seen = False
 
     def init_cs_dict(self) -> None:
         """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
@@ -371,7 +375,12 @@ class GreatProcessor:
             return self.unchanged_symbol_cache[rel_file]
         fid = bf_row[2][2]
         # A file unchanged in this update points at a blob written by an earlier version: its map is final
-        complete_blob = rel_file not in getattr(self, "_changed_paths_set", ())
+        # A changed file that executed before this stage's workers forked (Stage 2: the wave pass and the
+        # inter-epoch commits wrote its rows before the fork) is as final as an unchanged one for a worker.
+        in_committed_stage = getattr(self, "_is_worker", False) and getattr(self, "_shared_symbols", None) is not None
+        complete_blob = rel_file not in getattr(self, "_changed_paths_set", ()) or (
+            in_committed_stage and rel_file in getattr(self, "completed_paths", ())
+        )
         if complete_blob:
             known = self.blob_symbol_cache.get(fid)
             if known is None:
@@ -438,7 +447,8 @@ class GreatProcessor:
                 for r in t_defs:
                     key = r[m_tag_def.sym_key[1]]
                     if key not in targets:
-                        bs_row = None if complete_blob else te.get(m_blob_symbol.table_id, (fid, key, None))
+                        # A Stage 2 worker has nothing staged for blobs written before its fork
+                        bs_row = None if (complete_blob or in_committed_stage) else te.get(m_blob_symbol.table_id, (fid, key, None))
                         targets[key] = bs_row[target_col] if bs_row else None
                     d_ast_id = targets[key]
                     d_name = r[m_tag_def.name[1]]
@@ -451,6 +461,229 @@ class GreatProcessor:
             self._store_blob_symbols(fid, sym_map)
         self.unchanged_symbol_cache[rel_file] = sym_map
         return sym_map
+
+    def get_files_symbols_from_db_many(
+        self, paths: Iterable[str], version: int | None = None
+    ) -> dict[str, dict[tuple[str, int], int]]:
+        """Bulk-load `(name, type_id) -> ast_id` symbol maps for uncached headers in chunked DB reads."""
+        req_paths = [p for p in dict.fromkeys(paths) if p]
+        result: dict[str, dict[tuple[str, int], int]] = {}
+        pending_paths: list[str] = []
+        for p in req_paths:
+            if p in self.unchanged_symbol_cache:
+                result[p] = self.unchanged_symbol_cache[p]
+            else:
+                pending_paths.append(p)
+        if not pending_paths:
+            return result
+
+        from core.DBLayout import (
+            m_ast,
+            m_blob_symbol,
+            m_blob_symbol_def,
+            m_bridge_file,
+            m_bridge_tag,
+            m_file_name,
+            m_tag,
+            m_tag_def,
+        )
+        from db_engine.spec import Join
+
+        te = getattr(G, "TE", None)
+        if te is None or not getattr(te, "tables", None):
+            return result
+        if (
+            m_file_name.table_id not in te.tables
+            or m_bridge_file.table_id not in te.tables
+            or m_bridge_tag.table_id not in te.tables
+            or m_tag.table_id not in te.tables
+        ):
+            return result
+
+        db = getattr(te, "db", None)
+        if db is None:
+            for p in pending_paths:
+                sm = self.get_file_symbols_from_db(p)
+                if sm is not None:
+                    result[p] = sm
+            return result
+
+        chunk_size = 1000
+        fname_col = m_file_name.fname[1]
+        fnid_col = m_file_name.fnid[1]
+        path_to_fnid: dict[str, int] = {}
+        for i in range(0, len(pending_paths), chunk_size):
+            chunk = pending_paths[i : i + chunk_size]
+            for r in te.get_in(m_file_name.table_id, fname_col, chunk) or ():
+                fn = r[fname_col]
+                if isinstance(fn, (bytes, bytearray)):
+                    fn = fn.decode("utf-8", "replace")
+                fid_val = r[fnid_col]
+                if fn and fid_val:
+                    path_to_fnid[fn] = int(fid_val)
+
+        for p in pending_paths:
+            if p not in path_to_fnid:
+                self.unchanged_symbol_cache[p] = {}
+                result[p] = {}
+
+        if not path_to_fnid:
+            return result
+
+        vid = int(version if version is not None else (getattr(self, "VID", 0) or 0))
+        old_vid = int(getattr(self, "Old_VID", 0) or 0)
+        changed_paths = getattr(self, "_changed_paths_set", ())
+        in_committed_stage = bool(getattr(self, "_is_worker", False) and getattr(self, "_shared_symbols", None) is not None)
+        completed_paths = getattr(self, "completed_paths", ())
+
+        fnid_to_paths: dict[int, list[str]] = {}
+        for p, fnid in path_to_fnid.items():
+            fnid_to_paths.setdefault(fnid, []).append(p)
+
+        all_fnids = sorted(fnid_to_paths)
+        fnid_to_blob: dict[int, int] = {}
+        if vid > 0 and all_fnids:
+            for i in range(0, len(all_fnids), chunk_size):
+                chunk = all_fnids[i : i + chunk_size]
+                for fnid, bid in db.select_rows(
+                    m_bridge_file.table_name, ["fnid", "blob_id"], {"commit_id": vid, "fnid": chunk}, as_dict=False
+                ):
+                    if bid:
+                        fnid_to_blob[int(fnid)] = int(bid)
+
+        if old_vid > 0:
+            fallback_fnids = sorted(
+                fnid
+                for fnid, ps in fnid_to_paths.items()
+                if fnid not in fnid_to_blob and any(p not in changed_paths for p in ps)
+            )
+            for i in range(0, len(fallback_fnids), chunk_size):
+                chunk = fallback_fnids[i : i + chunk_size]
+                for fnid, bid in db.select_rows(
+                    m_bridge_file.table_name, ["fnid", "blob_id"], {"commit_id": old_vid, "fnid": chunk}, as_dict=False
+                ):
+                    if bid:
+                        fnid_to_blob[int(fnid)] = int(bid)
+
+        blobs_to_load: dict[int, bool] = {}
+        blob_to_paths: dict[int, list[str]] = {}
+        for p, fnid in path_to_fnid.items():
+            fid = fnid_to_blob.get(fnid)
+            if fid is None:
+                if p in changed_paths:
+                    continue
+                self.unchanged_symbol_cache[p] = {}
+                result[p] = {}
+                continue
+
+            complete_blob = (p not in changed_paths) or (in_committed_stage and p in completed_paths)
+            if complete_blob:
+                known = self.blob_symbol_cache.get(fid)
+                if known is None:
+                    known = self._blob_symbols_fetched.get(fid)
+                if known is not None:
+                    self._note_blob_symbols_used(fid)
+                    self.unchanged_symbol_cache[p] = known
+                    result[p] = known
+                    continue
+
+            blobs_to_load[fid] = blobs_to_load.get(fid, False) or complete_blob
+            blob_to_paths.setdefault(fid, []).append(p)
+
+        if not blobs_to_load:
+            return result
+
+        fids = sorted(blobs_to_load)
+        sym_maps: dict[int, dict[tuple[str, int], int]] = {fid: {} for fid in fids}
+        blob_tag_ids: dict[int, list[int]] = {fid: [] for fid in fids}
+        all_tag_ids: set[int] = set()
+
+        joins = [
+            Join(("m_tag", "t"), {"t.tag_id": "b.tag_id"}),
+            Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"}),
+        ]
+        for i in range(0, len(fids), chunk_size):
+            chunk = fids[i : i + chunk_size]
+            rows = db.select_rows(
+                ("m_bridge_tag", "b"),
+                ["b.blob_id", "b.tag_id", "a.ast_id", "a.name", "a.type_id"],
+                {"b.blob_id": chunk},
+                joins=joins,
+                as_dict=False,
+            )
+            for fid, tid, ast_id, ast_name, ast_type in rows:
+                if isinstance(ast_name, (bytes, bytearray)):
+                    ast_name = ast_name.decode("utf-8", "replace")
+                if ast_name and ast_id:
+                    sym_maps[fid][(ast_name, ast_type)] = ast_id
+                if tid:
+                    blob_tag_ids[fid].append(tid)
+                    all_tag_ids.add(tid)
+
+        if m_blob_symbol_def.table_id in te.tables:
+            bsd_blob = m_blob_symbol_def.blob_id[1]
+            bsd_ast = m_blob_symbol_def.ast_id[1]
+            bsd_name = m_blob_symbol_def.name[1]
+            bsd_type = m_blob_symbol_def.type_id[1]
+            for i in range(0, len(fids), chunk_size):
+                chunk = fids[i : i + chunk_size]
+                for r in te.get_in(m_blob_symbol_def.table_id, bsd_blob, chunk) or ():
+                    if len(r) > bsd_type:
+                        d_ast_id = r[bsd_ast]
+                        d_name = r[bsd_name]
+                        d_type = r[bsd_type]
+                        if isinstance(d_name, (bytes, bytearray)):
+                            d_name = d_name.decode("utf-8", "replace")
+                        if d_name and d_ast_id:
+                            sym_maps[r[bsd_blob]][(d_name, d_type)] = d_ast_id
+
+        if all_tag_ids and m_tag_def.table_id in te.tables and m_blob_symbol.table_id in te.tables:
+            tag_defs_by_tid: dict[int, list[tuple[int, str, int]]] = {}
+            sorted_tids = sorted(all_tag_ids)
+            td_tid = m_tag_def.tag_id[1]
+            td_key = m_tag_def.sym_key[1]
+            td_name = m_tag_def.name[1]
+            td_type = m_tag_def.type_id[1]
+            for i in range(0, len(sorted_tids), chunk_size):
+                chunk = sorted_tids[i : i + chunk_size]
+                for r in te.get_in(m_tag_def.table_id, td_tid, chunk) or ():
+                    d_name = r[td_name]
+                    if isinstance(d_name, (bytes, bytearray)):
+                        d_name = d_name.decode("utf-8", "replace")
+                    if d_name:
+                        tag_defs_by_tid.setdefault(r[td_tid], []).append((r[td_key], d_name, r[td_type]))
+
+            if tag_defs_by_tid:
+                bs_blob = m_blob_symbol.blob_id[1]
+                bs_key = m_blob_symbol.sym_key[1]
+                bs_target = m_blob_symbol.target_ast_id[1]
+                targets_by_blob: dict[int, dict[int, int | None]] = {fid: {} for fid in fids}
+                for i in range(0, len(fids), chunk_size):
+                    chunk = fids[i : i + chunk_size]
+                    for r in te.get_in(m_blob_symbol.table_id, bs_blob, chunk) or ():
+                        targets_by_blob[r[bs_blob]][r[bs_key]] = r[bs_target]
+
+                for fid in fids:
+                    targets = targets_by_blob[fid]
+                    complete_blob = blobs_to_load[fid]
+                    sm = sym_maps[fid]
+                    for tid in blob_tag_ids[fid]:
+                        for key, d_name, d_type in tag_defs_by_tid.get(tid, ()):
+                            if key not in targets:
+                                bs_row = None if (complete_blob or in_committed_stage) else te.get(m_blob_symbol.table_id, (fid, key, None))
+                                targets[key] = bs_row[bs_target] if bs_row else None
+                            d_ast_id = targets[key]
+                            if d_ast_id:
+                                sm[(d_name, d_type)] = d_ast_id
+
+        for fid, sm in sym_maps.items():
+            if blobs_to_load[fid]:
+                self._store_blob_symbols(fid, sm)
+            for p in blob_to_paths[fid]:
+                self.unchanged_symbol_cache[p] = sm
+                result[p] = sm
+
+        return result
 
     def _store_blob_symbols(self, fid: int, sym_map: dict[tuple[str, int], int]) -> None:
         """Keep a complete blob's symbol map: in the cache (parent), or to send to the parent (worker)."""

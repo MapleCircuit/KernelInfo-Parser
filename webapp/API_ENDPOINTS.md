@@ -97,7 +97,7 @@ version.
     {
       "project_id": 1,
       "name": "Linux Kernel",
-      "repo_path": "/home/scottviger/kernelinfo/linux",
+      "repo_path": "/path/to/linux",
       "default_branch": "master",
       "tag_views": [
         {
@@ -261,7 +261,7 @@ it.
   blob contents directly from Git for the requested revision in sub-millisecond time (~0.1ms small / ~0.2ms
   big files). Preserves 100% byte fidelity without relying on local working tree checkouts. One stream answers
   one read at a time, so `git_reader` (`GitReaderPool`) keeps up to `READERS_PER_REPO` (4) of them per
-  repository, spawned only when every existing one is busy: a file view no longer waits behind a history
+  repository, spawned only when every existing one is busy: a file view does not wait behind a history
   timeline (hundreds of blobs), a Kconfig model build or an include walk.
 - **Indexed blob**: found by content: the Git blob SHA of the file is `m_file_blob.blob_hash`, so the tokens
   always belong to the text served, at a tag, at a branch that moved since it was parsed, or at a commit never
@@ -1019,7 +1019,7 @@ configuration (`build_condition.js`), so one response serves every configuration
 cached per (revision, ARCH) (4 entries); the first request of a revision reads its Makefiles and lists the
 `#include`d `.c`/`.S` sources once (`_included_sources()`: from the parser's stored directives, `m_blob_facts`
 family 3, when every `.c`/`.h`/`.S` blob of the commit has them — directives start a line, so one inside a
-comment no longer counts — else one `git grep`, ~1 s; kept on disk per commit SHA, `included-sources`).
+comment does not count — else one `git grep`, ~1 s; kept on disk per commit SHA, `included-sources`).
 - **Parameters**: `path` (query, repeatable, up to 64), `arch` (default `x86_64`).
 - **Response**: `{version, arch, srcarch, files: {path: {status, expr, rules, reason}}}`:
   - `status`: `rule` (Kbuild rules name the object; `expr` says when it is built), `other_arch` (in an
@@ -1456,7 +1456,7 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
   for a merge, so the parser stages **no file rows for merge commits** (`parser/git_ast/GIT_API.md` §2); for
   any commit whose staged list is empty the service resolves it live with `git diff -M --name-status <first
   parent> <commit>` and reports `files_source: "git"` — the same comparison `.../diff/{hash}` renders, so the
-  *Modified Files* count can no longer disagree with **± Show changes**. A commit that genuinely changes
+  *Modified Files* count agrees with **± Show changes**. A commit that genuinely changes
   nothing keeps an empty list and `files_source: "none"`. `is_merge` is set from the commit's parent count in
   `m_commit_parent`, which also gives the first parent of that diff (Git is asked, `rev-list --parents`, only
   for a commit without parent rows: a root, or one whose parents were not ingested), and a list longer than

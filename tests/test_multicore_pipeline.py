@@ -12,6 +12,7 @@ import signal
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import main
 import pipeline.changesets
@@ -26,9 +27,10 @@ import pipeline.worker_protocol
 import pipeline.worker_stage
 from core.DBLayout import m_ast
 from core.GreatProcessor import GreatProcessor
-from core.globalstuff import G, REF_FILE
+from core.globalstuff import FILE_ERROR, G, REF_FILE
 from core.TableHandling import ChangeSet
 from db_engine import MockDB
+from tests.db_fixtures import make_db
 from table_engine.shared_buffer import SharedSymbolBuilder, SharedSymbolChain
 
 
@@ -47,6 +49,9 @@ class _RecordingTE:
         return (900 + len(self.set_calls), *columns[1:])
 
     def commit_all(self, *args, **kwargs) -> None:
+        return None
+
+    def start_new_db(self, *args, **kwargs) -> None:
         return None
 
 
@@ -525,3 +530,357 @@ class TestEpochOrdering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeConn:
+    """Worker-side pipe end: serves one task frame, then reports a closed pipe; keeps what is sent."""
+
+    def __init__(self, batches: list[tuple[int, list[str]]]) -> None:
+        self._frames = [pipeline.worker_protocol._FRAME_TASK + pickle.dumps(b) for b in batches]
+        self.sent: list[bytes] = []
+
+    def recv_bytes(self) -> bytes:
+        if not self._frames:
+            raise EOFError
+        return self._frames.pop(0)
+
+    def send_bytes(self, frame) -> None:
+        self.sent.append(bytes(frame))
+
+    def close(self) -> None:
+        return None
+
+
+def _run_worker(files: list[str], *, shared_symbols=None, mf=None, parse=None):
+    """Run `file_processing_worker` over one batch; returns (ChangeSets by path, errors, calls)."""
+    gp_ref = types.SimpleNamespace(
+        VID=2, Old_VID=0, Version_Name="v", file_blob_hashes=None, _shared_symbols=shared_symbols,
+    )
+    captured: dict = {}
+    calls = {"prune": 0, "resolve": 0}
+
+    def _encode(batch_id, batch_dict, errors, compress, blob_symbols=None):
+        captured["dict"], captured["errors"] = dict(batch_dict), list(errors)
+        return b"frame"
+
+    def _prune(self):
+        calls["prune"] += 1
+
+    def _resolve(self, shared):
+        calls["resolve"] += 1
+
+    with mock.patch.object(G, "TE", _RecordingTE()), \
+            mock.patch.object(pipeline.file_processing, "_encode_batch_result", _encode), \
+            mock.patch.object(ChangeSet, "prune_unchanged_dependencies", _prune), \
+            mock.patch.object(ChangeSet, "pre_resolve_operations", _resolve), \
+            mock.patch("parser.raw_ast.raw_ast.raw_ast_parse", parse or (lambda cs: None)), \
+            mock.patch.object(ChangeSet, "preprocess_ref_views", lambda self: None), \
+            mock.patch.object(type(G), "LOW_MEMORY_MODE", False), \
+            mock.patch.object(type(G), "VERY_LOW_MEMORY_MODE", False):
+        pipeline.file_processing.file_processing_worker(
+            _FakeConn([(0, files)]), 2, gp_ref, mf or types.SimpleNamespace(get_file=lambda p, v: "text"), 0
+        )
+    return captured["dict"], captured["errors"], calls
+
+
+class TestWorkerBody(unittest.TestCase):
+    def test_stage_two_does_not_prune_dependencies(self) -> None:
+        _, _, calls = _run_worker(["A\tdocs/a.txt"], shared_symbols=object())
+        self.assertEqual(calls, {"prune": 0, "resolve": 1})
+
+    def test_stage_one_prunes_dependencies(self) -> None:
+        _, _, calls = _run_worker(["A\tdocs/a.txt"])
+        self.assertEqual(calls, {"prune": 1, "resolve": 0})
+
+    def test_result_changeset_carries_no_prior_tag_data(self) -> None:
+        done, errors, _ = _run_worker(["A\tdocs/a.txt"])
+        self.assertEqual(errors, [])
+        state = done["docs/a.txt"].__dict__
+        for name in (
+            "_batch_prior_tags", "_batch_prior_items", "prior_tags_by_name", "prior_tags_by_pos",
+            "prior_unmatched_symbols", "prior_tags_max_span", "_prior_tags_by_pos_sorted",
+        ):
+            self.assertNotIn(name, state)
+
+    def test_clear_bloat_pickle_does_not_grow_with_prior_tag_data(self) -> None:
+        def pickled(rows: int) -> int:
+            cs = ChangeSet("M\tdocs/a.txt")
+            cs._batch_prior_tags = {1: [(i,) * 14 for i in range(rows)]}
+            cs._batch_prior_items = {i: ({}, {}) for i in range(rows)}
+            cs.prior_tags_by_name = {str(i): [(i, i, i, i)] for i in range(rows)}
+            cs.prior_tags_by_pos = [(i, i, i, i, "n", 1) for i in range(rows)]
+            cs.prior_unmatched_symbols = [(i, i, "n", 1, i, i) for i in range(rows)]
+            cs.prior_tags_max_span = 3
+            cs._prior_tags_by_pos_sorted = True
+            cs.clear_bloat()
+            for name in ("_batch_prior_tags", "_batch_prior_items", "prior_tags_by_name", "prior_tags_by_pos",
+                         "prior_unmatched_symbols", "prior_tags_max_span", "_prior_tags_by_pos_sorted"):
+                self.assertNotIn(name, cs.__dict__)
+            return len(pickle.dumps(cs))
+
+        self.assertEqual(pickled(10), pickled(5000))
+
+    def test_unreadable_file_is_a_per_file_error_and_stays_in_the_tree(self) -> None:
+        def unreadable(cs):
+            cs.store(m_ast.set(None, "half-staged", 3))  # staged by the parser before it failed
+            raise FILE_ERROR(OSError("cannot read docs/a.txt"))
+
+        done, errors, _ = _run_worker(["A\tdocs/a.txt"], parse=unreadable)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], "A\tdocs/a.txt")
+        self.assertIn("Unreadable source file", errors[0][1])
+        cs = done["docs/a.txt"]
+        self.assertTrue(cs.cs, "the file name / file / bridge operations staged before parsing are kept")
+        self.assertEqual(len(cs.cs), 3)
+        # the error is counted by the systemic-failure check, which looks at keys holding a tab
+        self.assertIn("\t", errors[0][0])
+
+
+class TestPriorTagBatchQuery(unittest.TestCase):
+    def test_batched_rows_match_per_blob_rows(self) -> None:
+        from core.DBLayout import TABLES, m_ast as ast_t, m_bridge_tag, m_tag
+        from parser.c_ast.tag_tracker import query_prior_tags, query_prior_tags_many
+
+        db = make_db("sqlite", rows={
+            "m_ast": [{"ast_id": 1, "name": "a", "type_id": 3}, {"ast_id": 2, "name": "b", "type_id": 4}],
+            "m_tag": [
+                {"tag_id": 1, "hash": b"\x01" * 32, "ast_id": 1, "hl_s": 0, "hl_l": 2},
+                {"tag_id": 2, "hash": b"\x02" * 32, "ast_id": 2, "hl_s": 1, "hl_l": 3},
+                {"tag_id": 3, "hash": b"\x03" * 32, "ast_id": 1, "hl_s": 4, "hl_l": 1},
+            ],
+            "m_bridge_tag": [
+                {"blob_id": 10, "tag_id": 1, "line_s": 1, "line_e": 2, "char_s": 0, "char_e": 5},
+                {"blob_id": 10, "tag_id": 2, "line_s": 3, "line_e": 4, "char_s": 0, "char_e": 5},
+                {"blob_id": 11, "tag_id": 3, "line_s": 1, "line_e": 9, "char_s": 0, "char_e": 5},
+            ],
+        })
+        tables = {t.table_id: t for t in TABLES}
+
+        class _TE:
+            def view_get_multiple(self, joins, columns):
+                return db.view_select_multiple(tables, joins, columns)
+
+        with mock.patch.object(G, "TE", _TE()), mock.patch("parser.c_ast.tag_tracker.PRIOR_TAG_CHUNK", 2):
+            batched = query_prior_tags_many(db, [10, 11, 12])
+            for fid in (10, 11, 12):
+                self.assertEqual(batched[fid], list(query_prior_tags(fid) or []), fid)
+        self.assertEqual(batched[12], [])
+        self.assertEqual(len(batched[10]), 2)
+
+
+class TestSchedulerAndStageFixes(unittest.TestCase):
+    """Tests for B-25, B-26, B-27, O-02.2, O-04(b), O-13, O-14, O-15, O-16, A-05."""
+
+    def test_b25_cycle_breaker_picks_source_scc_and_counts_breaks(self) -> None:
+        from pipeline.scheduler import _source_scc_candidates, execute_phase2_parallel_waves
+
+        # Cycle: a.h <-> b.h. Downstream chain: c.h -> a.h, d.h -> c.h, e.h -> c.h (c.h has more dependents!)
+        remaining = {"a.h", "b.h", "c.h", "d.h", "e.h"}
+        deps = {
+            "a.h": {"b.h"},
+            "b.h": {"a.h"},
+            "c.h": {"a.h"},
+            "d.h": {"c.h"},
+            "e.h": {"c.h"},
+        }
+        candidates = _source_scc_candidates(remaining, deps)
+        self.assertEqual(set(candidates), {"a.h", "b.h"})
+
+        # Full execute_phase2_parallel_waves check: c.h must NOT be stubbed; only a.h or b.h is stubbed
+        class _FakeCS:
+            def __init__(self, path: str, f_deps: set[str]):
+                self.path = path
+                self.foreign_deps = f_deps
+                self.cs_processed = False
+                self.unresolved_indices = [0]
+                self.blocked_on = None
+                self.gp = None
+                self.forced = False
+                self.cs = []
+
+            def execute(self, force_stubs: bool = False) -> bool:
+                if force_stubs:
+                    self.forced = True
+                    self.cs_processed = True
+                    return True
+                # Succeeds once all foreign_deps are processed
+                if all(gp.ChangeSet_Dict[d].cs_processed for d in self.foreign_deps):
+                    self.cs_processed = True
+                    return True
+                return False
+
+        class _FakeGP:
+            def __init__(self):
+                self.file_deps = {k: set(v) for k, v in deps.items()}
+                self.ChangeSet_Dict = {k: _FakeCS(k, v) for k, v in deps.items()}
+                self.cs_op_counts = {k: 1 for k in deps}
+                self.completed_paths = set()
+
+        gp = _FakeGP()
+        fake_te = mock.MagicMock()
+        with mock.patch("pipeline.scheduler.G.TE", fake_te), \
+                mock.patch("pipeline.scheduler.extract_tags_and_evacuate_cs"), \
+                mock.patch("pipeline.scheduler.reclaim_system_memory"), \
+                self.assertLogs(main.logger, "INFO") as logs:
+            execute_phase2_parallel_waves(gp, completed_set=set())
+
+        forced_files = [k for k, cs in gp.ChangeSet_Dict.items() if cs.forced]
+        self.assertEqual(len(forced_files), 1)
+        self.assertIn(forced_files[0], {"a.h", "b.h"})
+        self.assertFalse(gp.ChangeSet_Dict["c.h"].forced)
+        self.assertTrue(any("1 cycle breaks" in msg for msg in logs.output))
+
+    def test_o02_2_maybe_chunk_commit_triggers_on_staged_rows_cap(self) -> None:
+        from pipeline.scheduler import DependencyScheduler, _CHUNK_COMMIT_ROW_CAP
+
+        gp = mock.MagicMock()
+        sched = DependencyScheduler(gp, chunk_commit_interval=1000)
+        sched.executed_count = 1  # Not on count interval
+
+        fake_te = mock.MagicMock()
+        fake_te.staged_rows = _CHUNK_COMMIT_ROW_CAP
+        fake_te.async_commits = True
+        fake_te.pending_commit_rows = 100
+        with mock.patch("pipeline.scheduler.G.TE", fake_te), \
+                mock.patch("pipeline.scheduler._commit_all_with_retry") as commit_mock, \
+                mock.patch("pipeline.scheduler.reclaim_system_memory"):
+            sched._maybe_chunk_commit()
+        commit_mock.assert_called_once_with("Chunk")
+
+    def test_o13_o14_async_commits_through_resolve_headers_and_publish_clears_resolved(self) -> None:
+        from pipeline.scheduler import DependencyScheduler
+
+        gp = mock.MagicMock()
+        gp.ChangeSet_Dict = {}
+        gp.file_deps = {}
+        sched = DependencyScheduler(gp)
+
+        fake_te = mock.MagicMock()
+        fake_te.async_commits = False
+        with mock.patch("pipeline.scheduler.G.TE", fake_te), \
+                mock.patch("pipeline.scheduler.execute_phase2_parallel_waves"):
+            sched.resolve_headers()
+        self.assertTrue(fake_te.async_commits)
+
+        # O-14: _publish_file_symbols clears resolved_symbols and resolved_names on published paths
+        cs_a = mock.MagicMock()
+        cs_a.resolved_symbols = {("foo", 1): 10}
+        cs_a.resolved_names = {"foo": 10}
+        fake_gp = mock.MagicMock()
+        fake_gp.file_symbols = {"a.h": {("foo", 1): 10}}
+        fake_gp._ast_staged_symbols = {}
+        fake_gp._ast_staged_names = {}
+        fake_gp.file_names = {}
+        fake_gp.unchanged_symbol_cache = {}
+        fake_gp.ChangeSet_Dict = {"a.h": cs_a}
+        fake_gp._shared_symbols = None
+
+        fake_seg = mock.MagicMock()
+        fake_seg.sym_count = 1
+        fake_seg.nbytes = 0
+        with mock.patch("pipeline.worker_stage.gp", fake_gp), \
+                mock.patch("pipeline.worker_stage.SharedSymbolBuilder") as builder_cls, \
+                mock.patch("pipeline.worker_stage.reclaim_system_memory"):
+            builder_cls.return_value.build_file_scoped.return_value = fake_seg
+            pipeline.worker_stage._publish_file_symbols()
+
+        self.assertIsNone(cs_a.resolved_symbols)
+        self.assertIsNone(cs_a.resolved_names)
+
+    def test_b26_ingest_failure_records_per_file_tabbed_errors(self) -> None:
+        errors: list = []
+
+        def _ingest(batch: dict) -> None:
+            raise RuntimeError("boom")
+
+        batches = [(0, ["M\ta.c", "M\tb.c"])]
+        with mock.patch.object(G, "DB", MockDB):
+            pipeline.worker_stage._run_worker_stage("[test]", batches, _ingest, 1, errors, worker_target=_crashing_worker)
+        tabbed = [e for e in errors if "\t" in e[0]]
+        self.assertEqual([e[0] for e in tabbed], ["M\ta.c", "M\tb.c"])
+
+    def test_b27_retry_round_splits_multi_file_unfinished_batch(self) -> None:
+        ingested: dict[str, int] = {}
+        errors: list = []
+        # Batch 0 crashes in round 1; batch 1 is unfinished in round 1, then crashes on "crash.c" in round 2!
+        # Round 2 must split batch 1 into single-file batches so "ok.c" is NOT marked lost.
+        batches = [(0, ["crash.c"]), (1, ["ok.c", "crash.c"])]
+        with mock.patch.object(G, "DB", MockDB):
+            result = pipeline.worker_stage._run_worker_stage(
+                "[test]", batches, ingested.update, 1, errors, worker_target=_crashing_worker
+            )
+        self.assertIn("ok.c", ingested)
+        self.assertEqual(result.lost_files, ["crash.c", "crash.c"])
+
+    def test_o16_format_time_split_includes_worker_subphases(self) -> None:
+        text = pipeline.worker_stage._format_time_split({
+            "workers": 2.0,
+            "worker_busy_s": 8.0,
+            "worker_task_wait_s": 1.0,
+            "worker_send_wait_s": 1.0,
+            "worker_gc_s": 0.0,
+            "worker_tail_idle_s": 0.0,
+            "worker_prune_s": 0.5,
+            "worker_ref_views_s": 1.2,
+            "worker_pre_resolve_s": 2.3,
+            "worker_encode_s": 0.4,
+            "worker_db_reads": 5.0,
+            "worker_db_read_s": 0.1,
+        })
+        self.assertIn("ref views 1.2s", text)
+        self.assertIn("pre-resolve 2.3s", text)
+        self.assertIn("encode 0.4s", text)
+
+    def test_o15_partition_source_epochs_cuts_by_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            files = []
+            # 10 files of 100KB each (total 1MB); target_epoch_bytes=300KB -> multiple epochs
+            for i in range(10):
+                p = os.path.join(d, f"dir{i // 2}", f"f{i}.c")
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(b"x" * 100_000)
+                files.append(f"M\tdir{i // 2}/f{i}.c")
+            epochs = pipeline.source_order.partition_source_epochs(
+                files,
+                working_dir=d,
+                normal_batch_size=1,
+                heavy_batch_size=1,
+                target_epoch_files=100,
+                target_epoch_bytes=300_000,
+            )
+        self.assertGreater(len(epochs), 1)
+        self.assertEqual(sum(len(b[1]) for ep in epochs for b in ep), 10)
+
+    def test_o04b_has_peer_nodes_checks_m_parse_node(self) -> None:
+        from contextlib import contextmanager
+        import pipeline.update
+
+        db_no_peers = make_db("sqlite", rows={"m_parse_node": [{"node_id": "self-1", "network_id": 1, "role": "master", "hostname": "h", "pid": 1, "active_commit_id": 0, "heartbeat_at": 1}]})
+        db_with_peer = make_db("sqlite", rows={"m_parse_node": [
+            {"node_id": "self-1", "network_id": 1, "role": "master", "hostname": "h", "pid": 1, "active_commit_id": 0, "heartbeat_at": 1},
+            {"node_id": "peer-2", "network_id": 1, "role": "worker", "hostname": "h", "pid": 2, "active_commit_id": 0, "heartbeat_at": 1},
+        ]})
+
+        @contextmanager
+        def _ctx(db):
+            yield db
+
+        with mock.patch.object(G, "node_id", "self-1", create=True), \
+                mock.patch.object(pipeline.update.gp, "network_id", 1, create=True):
+            with mock.patch.object(G, "DB", lambda: _ctx(db_no_peers)):
+                self.assertFalse(pipeline.update._has_peer_nodes())
+            with mock.patch.object(G, "DB", lambda: _ctx(db_with_peer)):
+                self.assertTrue(pipeline.update._has_peer_nodes())
+
+    def test_a05_git_network_uses_reserve_id_block_when_distributed(self) -> None:
+        from core.DBLayout import m_project
+        import pipeline.git_network
+
+        fake_db = mock.MagicMock()
+        fake_db.reserve_id_block.return_value = (42, 42)
+        with mock.patch.object(G.TE, "distributed", True, create=True):
+            nid = pipeline.git_network._next_id(fake_db, m_project)
+        self.assertEqual(nid, 42)
+        fake_db.reserve_id_block.assert_called_once_with(m_project, 1)
+        fake_db.get_next_id.assert_not_called()

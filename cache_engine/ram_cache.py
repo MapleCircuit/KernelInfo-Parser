@@ -1,11 +1,17 @@
 """cache_engine/ram_cache.py - Pure-Python in-RAM implementation of the cache engine (cache_engine/CACHE_API.md).
 
 Stores records in Python dicts with inline-1-or-set hash indexes, lazy chunked sorted indexes for range/prefix/order_by
-queries, copy-on-write MVCC snapshots for lock-free concurrent readers, and re-entrant atomic ``batch()`` transactions.
+queries, and re-entrant atomic ``batch()`` transactions. Locking (both re-entrant locks live on the shared
+``_SpaceStorage``, so every handle of a space uses the same ones): the write lock serialises writers and ``batch()``
+holders; the commit lock guards committed-state swaps, in-place writes and reader pin counters. Point and bounded materializing reads (``get``, ``get_many``, ``count``, ``sum``, ``max``, metadata) run under the commit
+lock without pinning ``readers``; ``scan`` pins the committed state (``readers += 1`` under the commit lock) and then
+reads it without the lock, and a writer that meets a pinned state copies it (copy-on-write) instead of changing it in
+place. Nothing survives the process.
 """
 from __future__ import annotations
 
 import bisect
+import collections
 import contextlib
 import heapq
 import operator
@@ -22,6 +28,16 @@ _SORTED_LOAD = 1024
 _SORTED_SPLIT = 2048
 _BATCH_DELTA_THRESHOLD = 4096
 _BULK_INVALIDATE_RATIO = 0.25
+_SCALAR_TYPES = frozenset({int, float, str, bytes, bool, type(None)})
+
+
+@contextlib.contextmanager
+def _type_errors_as_schema(store: str) -> Iterator[None]:
+    """Report values that cannot be hashed or ordered together (fields are not type-checked) as a schema error."""
+    try:
+        yield
+    except TypeError as exc:
+        raise CacheSchemaError(f"store {store!r}: values cannot be compared or hashed: {exc}") from exc
 
 
 def _prefix_bounds(value: Any) -> tuple[Any, Any]:
@@ -51,7 +67,7 @@ class _StoreSchema:
         "spec", "name", "n_fields", "field_names", "field_pos", "field_types",
         "field_nullable", "non_null_pos", "key_pos", "key_single", "key_getter",
         "unique_groups", "unique_extractors", "index_groups", "index_extractors",
-        "simple_keyed",
+        "simple_keyed", "hash_pos",
     )
 
     def __init__(self, spec: StoreSpec) -> None:
@@ -103,6 +119,18 @@ class _StoreSchema:
             for grp in idx_set
         )
         self.simple_keyed = bool(self.key_pos) and not self.unique_groups
+        # Fields that are dict keys somewhere (key, unique groups, hash indexes): must be hashable.
+        self.hash_pos = tuple(sorted(set(self.key_pos).union(*(g for g, _ in self.unique_groups), *idx_set)))
+
+    def check_hashable(self, rec: Record) -> None:
+        for i in self.hash_pos:
+            v = rec[i]
+            if type(v) not in _SCALAR_TYPES:
+                try:
+                    hash(v)
+                except TypeError as exc:
+                    raise CacheSchemaError(
+                        f"store {self.name!r}: field {self.field_names[i]!r} holds an unhashable value") from exc
 
     def extract_key(self, rec: Record) -> Key:
         return self.key_getter(rec)  # type: ignore[misc]
@@ -499,7 +527,15 @@ class _StoreState:
         self.readers: int = 0
         self.deleted_since_compact: int = 0
 
-    def clone(self) -> "_StoreState":
+    def clone(self, lock: "threading.RLock | None" = None) -> "_StoreState":
+        """Copy for copy-on-write. ``lock``: the space's commit lock when the state is shared (committed or a
+        batch base): pinned readers add lazy sorted indexes to it under that lock, so the index map is snapshotted
+        under it. Rows and hash indexes change only under the write lock, which the caller holds."""
+        if lock is not None:
+            with lock:
+                sorted_items = list(self.sorted_indexes.items())
+        else:
+            sorted_items = list(self.sorted_indexes.items())
         out = _StoreState.__new__(_StoreState)
         out.schema = self.schema
         out.rows = dict(self.rows)
@@ -509,7 +545,7 @@ class _StoreState:
             g: {k: (set(v) if type(v) is set else v) for k, v in idx.items()}
             for g, idx in self.indexes.items()
         }
-        out.sorted_indexes = {col: si.copy() for col, si in self.sorted_indexes.items()}
+        out.sorted_indexes = {col: si.copy() for col, si in sorted_items}
         out.readers = 0
         out.deleted_since_compact = self.deleted_since_compact
         return out
@@ -524,8 +560,11 @@ class _StoreState:
         for grp, idx_get in schema.index_extractors:
             _idx_add(self.indexes[grp], idx_get(rec), pk)
         if update_sorted and self.sorted_indexes:
-            for col, si in self.sorted_indexes.items():
-                si.add(rec[col], pk)
+            for col, si in list(self.sorted_indexes.items()):
+                try:
+                    si.add(rec[col], pk)
+                except TypeError:
+                    self._drop_sorted(col)
 
     def _index_remove(self, pk: Key, rec: Record, *, update_sorted: bool = True) -> None:
         schema = self.schema
@@ -538,8 +577,16 @@ class _StoreState:
         for grp, idx_get in schema.index_extractors:
             _idx_remove(self.indexes[grp], idx_get(rec), pk)
         if update_sorted and self.sorted_indexes:
-            for col, si in self.sorted_indexes.items():
-                si.remove(rec[col], pk)
+            for col, si in list(self.sorted_indexes.items()):
+                try:
+                    si.remove(rec[col], pk)
+                except TypeError:
+                    self._drop_sorted(col)
+
+    def _drop_sorted(self, col: int) -> None:
+        """A sorted index met values it cannot order (mixed types): drop it instead of failing the write; the next
+        range/order query rebuilds it and reports the mixed values as ``CacheSchemaError``."""
+        self.sorted_indexes.pop(col, None)
 
     def _find_unique_collisions(self, rec: Record, own_pk: Key | None = None) -> list[Key]:
         collisions: list[Key] = []
@@ -805,7 +852,10 @@ class _StoreState:
             for idx_dict, idx_get in touched_indexes:
                 _idx_remove(idx_dict, idx_get(old), pk)
             for col, si in touched_sorted:
-                si.remove(old[col], pk)
+                try:
+                    si.remove(old[col], pk)
+                except TypeError:
+                    self._drop_sorted(col)
 
             rows[pk] = new_rec
 
@@ -816,7 +866,12 @@ class _StoreState:
             for idx_dict, idx_get in touched_indexes:
                 _idx_add(idx_dict, idx_get(new_rec), pk)
             for col, si in touched_sorted:
-                si.add(new_rec[col], pk)
+                try:
+                    si.add(new_rec[col], pk)
+                except TypeError:
+                    self._drop_sorted(col)
+            if touched_sorted and len(touched_sorted) != len(self.sorted_indexes.keys() & upd_cols):
+                touched_sorted = [(c, si) for c, si in touched_sorted if self.sorted_indexes.get(c) is si]
         return len(new_recs)
 
     def clear_all(self) -> None:
@@ -849,10 +904,11 @@ class _StoreState:
 class _KeyedDelta:
     """O(delta) overlay for large simple keyed stores inside a ``batch()``."""
 
-    __slots__ = ("base", "schema", "puts", "deletes")
+    __slots__ = ("base", "schema", "puts", "deletes", "lock")
 
-    def __init__(self, base: _StoreState) -> None:
+    def __init__(self, base: _StoreState, lock: "threading.RLock") -> None:
         self.base = base
+        self.lock = lock
         self.schema = base.schema
         self.puts: dict[Key, Record] = {}
         self.deletes: set[Key] = set()
@@ -909,7 +965,7 @@ class _KeyedDelta:
         return deleted
 
     def materialize(self) -> _StoreState:
-        st = self.base.clone()
+        st = self.base.clone(self.lock)
         if self.deletes:
             st.apply_delete_keys(self.deletes)
         if self.puts:
@@ -921,6 +977,81 @@ class _KeyedDelta:
             target.apply_delete_keys(self.deletes)
         if self.puts:
             target.apply_put_many(list(self.puts.values()), replace=True)
+
+
+class _KeylessDelta:
+    """O(delta) overlay for keyless stores inside a ``batch()`` (avoids full-store CoW clones on ``put_many``)."""
+
+    __slots__ = ("base", "schema", "lock", "batches", "staged_uniques", "has_replace_true", "_materialized")
+
+    def __init__(self, base: _StoreState, lock: "threading.RLock") -> None:
+        self.base = base
+        self.lock = lock
+        self.schema = base.schema
+        self.batches: list[tuple[list[Record], bool]] = []
+        self.staged_uniques: list[set[Any]] = [set() for _ in self.schema.unique_groups]
+        self.has_replace_true = False
+        self._materialized: _StoreState | None = None
+
+    def put_many(self, records: list[Record], replace: bool) -> int:
+        if self._materialized is not None:
+            return self._materialized.apply_put_many(records, replace)
+        unique_groups = self.schema.unique_groups
+        if not unique_groups:
+            self.batches.append((records, replace))
+            return len(records)
+        if replace:
+            self.has_replace_true = True
+            for u_set, (u_get, has_null, is_single) in zip(self.staged_uniques, self.schema.unique_extractors):
+                for rec in records:
+                    uv = u_get(rec)
+                    if not (has_null and (uv is None if is_single else None in uv)):
+                        u_set.add(uv)
+            self.batches.append((records, True))
+            return len(records)
+        if self.has_replace_true and len(unique_groups) > 1:
+            self._materialized = self.materialize()
+            return self._materialized.apply_put_many(records, False)
+        accepted: list[Record] = []
+        u_checks = list(zip(self.base.uniques, self.staged_uniques, self.schema.unique_extractors))
+        for rec in records:
+            collides = False
+            pending: list[tuple[set[Any], Any]] = []
+            for u_dict, u_set, (u_get, has_null, is_single) in u_checks:
+                uv = u_get(rec)
+                if has_null and (uv is None if is_single else None in uv):
+                    continue
+                if uv in u_dict or uv in u_set:
+                    collides = True
+                    break
+                pending.append((u_set, uv))
+            if collides:
+                continue
+            for u_set, uv in pending:
+                u_set.add(uv)
+            accepted.append(rec)
+        if accepted:
+            self.batches.append((accepted, False))
+        return len(accepted)
+
+    def materialize(self) -> _StoreState:
+        if self._materialized is not None:
+            return self._materialized
+        st = self.base.clone(self.lock)
+        self.apply_to(st)
+        return st
+
+    def apply_to(self, target: _StoreState) -> None:
+        if self._materialized is not None:
+            target.rows = self._materialized.rows
+            target.indexes = self._materialized.indexes
+            target.uniques = self._materialized.uniques
+            target.sorted_indexes = self._materialized.sorted_indexes
+            target.next_rid = self._materialized.next_rid
+            target.deleted_since_compact = self._materialized.deleted_since_compact
+            return
+        for records, replace in self.batches:
+            target.apply_put_many(records, replace)
 
 
 # ----------------------------------------------------------------------------------------- query planner & predicates
@@ -1010,7 +1141,7 @@ def _validate_and_normalize_conds(schema: _StoreSchema, where: Where, single_cal
     return out
 
 
-def _get_sorted_index(state: _StoreState, col: int, lock: threading.Lock) -> _SortedIndex:
+def _get_sorted_index(state: _StoreState, col: int, lock: threading.RLock) -> _SortedIndex:
     si = state.sorted_indexes.get(col)
     if si is not None:
         return si
@@ -1024,14 +1155,17 @@ def _plan_candidates(
     conds: list[tuple[int, Condition]],
     order_specs: list[tuple[int, bool]],
     limit: int | None,
-    lock: threading.Lock,
+    lock: threading.RLock,
+    insertion_order: bool = False,
 ) -> tuple[Iterable[tuple[Key, Record]], list[tuple[int, Condition]], bool]:
     """Select the narrowest index for ``conds``.
 
-    Returns ``(candidate_pairs, residual_conds, already_ordered_by_first)``.
+    Returns ``(candidate_pairs, residual_conds, already_ordered_by_first)``. ``insertion_order``: a keyless store
+    yields its candidates in row-id (insertion) order, as the scan contract requires without ``order_by``.
     """
     schema = state.schema
     rows = state.rows
+    in_order = insertion_order and not schema.key_pos
     if not rows:
         return (), [], False
 
@@ -1178,7 +1312,10 @@ def _plan_candidates(
     if best_hash is not None:
         _, lookup_v, idx, g_cis = best_hash
         res = [conds[i] for i in range(len(conds)) if i not in g_cis]
-        pairs_iter = ((pk, rows[pk]) for pk in _idx_iter(idx, lookup_v))
+        pks: Iterable[Key] = _idx_iter(idx, lookup_v)
+        if in_order:
+            pks = sorted(pks)
+        pairs_iter = ((pk, rows[pk]) for pk in pks)
         return pairs_iter, res, False
 
     # 5. Hash index In (1-col)
@@ -1195,6 +1332,9 @@ def _plan_candidates(
     if best_in is not None:
         _, dedup, idx, ci = best_in
         res = [conds[i] for i in range(len(conds)) if i != ci]
+        if in_order:
+            merged = sorted({pk for v in dedup for pk in _idx_iter(idx, v)})
+            return ((pk, rows[pk]) for pk in merged), res, False
         def _in_gen() -> Iterator[tuple[Key, Record]]:
             for v in dedup:
                 for pk in _idx_iter(idx, v):
@@ -1207,7 +1347,10 @@ def _plan_candidates(
             si = _get_sorted_index(state, pos, lock)
             res = [conds[j] for j in range(len(conds)) if j != i]
             already = len(order_specs) == 1 and order_specs[0] == (pos, False)
-            return ((pk, rows[pk]) for pk in si.range_pks(c.ge, c.gt, c.le, c.lt)), res, already
+            range_pks: Iterable[Key] = si.range_pks(c.ge, c.gt, c.le, c.lt)
+            if in_order:
+                range_pks = sorted(range_pks)
+            return ((pk, rows[pk]) for pk in range_pks), res, already
         if isinstance(c, Prefix):
             pfx = _normalize_prefix(c.value)
             expected_type = FieldType.TEXT if isinstance(pfx, str) else FieldType.BYTES
@@ -1216,8 +1359,11 @@ def _plan_candidates(
             si = _get_sorted_index(state, pos, lock)
             lo, hi = _prefix_bounds(pfx)
             res = [conds[j] for j in range(len(conds)) if j != i]
+            prefix_pks: Iterable[Key] = si.range_pks(ge=lo, lt=hi)
+            if in_order:
+                prefix_pks = sorted(prefix_pks)
             return (
-                ((pk, rec) for pk in si.range_pks(ge=lo, lt=hi) if (rec := rows[pk])[pos].startswith(pfx)),
+                ((pk, rec) for pk in prefix_pks if (rec := rows[pk])[pos].startswith(pfx)),
                 res,
                 False,
             )
@@ -1282,13 +1428,27 @@ def _compile_projector(col_indices: Sequence[int] | None) -> Callable[[Record], 
 class _SpaceStorage:
     """Backing storage for one ``(namespace, name)`` space owned by ``RAMCacheEngine``."""
 
-    __slots__ = ("specs", "schemas", "stores", "meta")
+    __slots__ = ("specs", "schemas", "stores", "meta", "wlock", "commit_lock", "released")
 
     def __init__(self, specs: tuple[StoreSpec, ...]) -> None:
         self.specs = specs
         self.schemas = {s.name: _StoreSchema(s) for s in specs}
         self.stores = {s.name: _StoreState(self.schemas[s.name]) for s in specs}
         self.meta: dict[str, str] = {}
+        # Locks live with the storage, so every handle of the space (one closed, one reopened) serialises on them.
+        self.wlock = threading.RLock()          # writers and batch() holders
+        self.commit_lock = threading.RLock()    # committed-state swaps, in-place writes, reader pin counters
+        self.released: collections.deque[_StoreState] = collections.deque()  # pins released by finalizers
+
+    def drain_released(self) -> None:
+        """Apply pin releases deferred by ``_PinnedIter.__del__`` (caller holds ``commit_lock``)."""
+        released = self.released
+        while released:
+            try:
+                st = released.popleft()
+            except IndexError:
+                break
+            st.readers -= 1
 
 
 class _BatchTx:
@@ -1299,11 +1459,11 @@ class _BatchTx:
     def __init__(self, storage: _SpaceStorage) -> None:
         self.storage = storage
         self.working: dict[str, _StoreState] = {}
-        self.deltas: dict[str, _KeyedDelta] = {}
+        self.deltas: dict[str, _KeyedDelta | _KeylessDelta] = {}
         self.meta: dict[str, str] | None = None
         self.meta_cleared: bool = False
 
-    def get_write_target(self, name: str, *, allow_delta: bool) -> _StoreState | _KeyedDelta:
+    def get_write_target(self, name: str, *, allow_delta: bool) -> _StoreState | _KeyedDelta | _KeylessDelta:
         w = self.working.get(name)
         if w is not None:
             return w
@@ -1316,11 +1476,16 @@ class _BatchTx:
             self.working[name] = w
             return w
         base = self.storage.stores[name]
-        if allow_delta and base.schema.simple_keyed and len(base.rows) > _BATCH_DELTA_THRESHOLD:
-            d = _KeyedDelta(base)
-            self.deltas[name] = d
-            return d
-        w = base.clone()
+        if allow_delta:
+            if base.schema.simple_keyed and len(base.rows) > _BATCH_DELTA_THRESHOLD:
+                d = _KeyedDelta(base, self.storage.commit_lock)
+                self.deltas[name] = d
+                return d
+            if not base.schema.key_pos:
+                d = _KeylessDelta(base, self.storage.commit_lock)
+                self.deltas[name] = d
+                return d
+        w = base.clone(self.storage.commit_lock)
         self.working[name] = w
         return w
 
@@ -1354,6 +1519,10 @@ class _PinnedIter:
     def __next__(self) -> tuple:
         try:
             return next(self._it)
+        except TypeError as exc:
+            self.close()
+            raise CacheSchemaError(
+                f"store {self._store.spec.name!r}: values cannot be compared or hashed: {exc}") from exc
         except BaseException:
             self.close()
             raise
@@ -1364,7 +1533,20 @@ class _PinnedIter:
             self._store._end_read(self._st, True)
 
     def __del__(self) -> None:
-        self.close()
+        # A finalizer can run on any thread at any allocation, including inside a critical section of the space:
+        # never block here. Without the lock at hand the release is queued and applied by the next locked operation.
+        if not self._pinned:
+            return
+        self._pinned = False
+        storage = self._store.space._storage
+        lock = storage.commit_lock
+        if lock.acquire(blocking=False):
+            try:
+                self._st.readers -= 1
+            finally:
+                lock.release()
+        else:
+            storage.released.append(self._st)
 
 
 class _RAMStore(CacheStore):
@@ -1384,6 +1566,7 @@ class _RAMStore(CacheStore):
         if tx is not None:
             return tx.get_read_state(self.spec.name), False
         with self.space._commit_lock:
+            self.space._storage.drain_released()
             st = self.space._storage.stores[self.spec.name]
             st.readers += 1
             return st, True
@@ -1392,6 +1575,17 @@ class _RAMStore(CacheStore):
         if pinned:
             with self.space._commit_lock:
                 st.readers -= 1
+
+    @contextlib.contextmanager
+    def _locked_read_state(self) -> Iterator[_StoreState]:
+        """Yield the store state for a bounded materializing read without pinning ``readers``."""
+        self._check_open()
+        tx = self.space._current_tx()
+        if tx is not None:
+            yield tx.get_read_state(self.spec.name)
+            return
+        with self.space._commit_lock:
+            yield self.space._storage.stores[self.spec.name]
 
     def _mutate(self, fn: Callable[[_StoreState], Any]) -> Any:
         self._check_open()
@@ -1402,10 +1596,11 @@ class _RAMStore(CacheStore):
                 target = tx.get_write_target(name, allow_delta=False)
                 return fn(target)
             with self.space._commit_lock:
+                self.space._storage.drain_released()
                 st = self.space._storage.stores[name]
                 if st.readers == 0:
                     return fn(st)
-            cloned = st.clone()
+            cloned = st.clone(self.space._commit_lock)
             res = fn(cloned)
             with self.space._commit_lock:
                 self.space._storage.stores[name] = cloned
@@ -1436,17 +1631,11 @@ class _RAMStore(CacheStore):
             d = tx.deltas.get(self.spec.name)
             if d is not None:
                 return d.get_many(key_list)
-        st, pinned = self._begin_read()
-        try:
-            rows = st.rows
-            out: dict[Key, Record] = {}
-            for k in key_list:
-                rec = rows.get(k)
-                if rec is not None:
-                    out[k] = rec
-            return out
-        finally:
-            self._end_read(st, pinned)
+            rows = tx.get_read_state(self.spec.name).rows
+            return {k: rec for k in key_list if (rec := rows.get(k)) is not None}
+        with self.space._commit_lock:
+            rows = self.space._storage.stores[self.spec.name].rows
+            return {k: rec for k in key_list if (rec := rows.get(k)) is not None}
 
     def scan(self, where: Where = None, *, columns: Sequence[str] | None = None,
              order_by: Sequence[str] = (), limit: int | None = None) -> Iterator[tuple]:
@@ -1486,6 +1675,8 @@ class _RAMStore(CacheStore):
         if cur is None:
             return
         if type(cur) is set:
+            if not self._schema.key_pos:
+                cur = sorted(cur)  # keyless: row ids are insertion order
             if projector is None:
                 for pk in cur:
                     yield rows[pk]
@@ -1500,7 +1691,7 @@ class _RAMStore(CacheStore):
                    order_specs: list[tuple[int, bool]], lim: int | None,
                    projector: Callable[[Record], tuple] | None) -> Iterator[tuple]:
         candidates, residual, already_ordered = _plan_candidates(
-            st, conds, order_specs, lim, self.space._commit_lock)
+            st, conds, order_specs, lim, self.space._commit_lock, insertion_order=not order_specs)
         pred = _compile_predicates(residual)
 
         if order_specs and not already_ordered:
@@ -1529,10 +1720,21 @@ class _RAMStore(CacheStore):
                     return
 
     def count(self, where: Where = None) -> int:
+        with _type_errors_as_schema(self.spec.name):
+            return self._count(where)
+
+    def sum(self, field: str, where: Where = None) -> int | float:
+        with _type_errors_as_schema(self.spec.name):
+            return self._sum(field, where)
+
+    def max(self, field: str, where: Where = None) -> Any:
+        with _type_errors_as_schema(self.spec.name):
+            return self._max(field, where)
+
+    def _count(self, where: Where) -> int:
         self._check_open()
         conds = _validate_and_normalize_conds(self._schema, where, single_call=False)
-        st, pinned = self._begin_read()
-        try:
+        with self._locked_read_state() as st:
             if not conds:
                 return len(st.rows)
             if len(conds) == 1:
@@ -1564,15 +1766,12 @@ class _RAMStore(CacheStore):
             if pred is None:
                 return sum(1 for _ in candidates)
             return sum(1 for _, rec in candidates if pred(rec))
-        finally:
-            self._end_read(st, pinned)
 
-    def sum(self, field: str, where: Where = None) -> int | float:
+    def _sum(self, field: str, where: Where) -> int | float:
         self._check_open()
         pos = self._schema.check_field(field)
         conds = _validate_and_normalize_conds(self._schema, where, single_call=False)
-        st, pinned = self._begin_read()
-        try:
+        with self._locked_read_state() as st:
             if not conds:
                 if not st.rows:
                     return 0
@@ -1590,15 +1789,12 @@ class _RAMStore(CacheStore):
                 if v is not None:
                     total += v
             return total
-        finally:
-            self._end_read(st, pinned)
 
-    def max(self, field: str, where: Where = None) -> Any:
+    def _max(self, field: str, where: Where) -> Any:
         self._check_open()
         pos = self._schema.check_field(field)
         conds = _validate_and_normalize_conds(self._schema, where, single_call=False)
-        st, pinned = self._begin_read()
-        try:
+        with self._locked_read_state() as st:
             if not conds:
                 if not st.rows:
                     return None
@@ -1619,8 +1815,6 @@ class _RAMStore(CacheStore):
                 if v is not None and (best is None or v > best):
                     best = v
             return best
-        finally:
-            self._end_read(st, pinned)
 
     # ------------------------------------------------------------------ writes
     def put(self, record: Record) -> None:
@@ -1631,6 +1825,7 @@ class _RAMStore(CacheStore):
         schema = self._schema
         n_fields = schema.n_fields
         non_null = schema.non_null_pos
+        check_hashable = schema.check_hashable
         validated: list[Record] = []
         append = validated.append
         for r in records:
@@ -1647,6 +1842,7 @@ class _RAMStore(CacheStore):
                 if out[i] is None:
                     raise CacheSchemaError(
                         f"store {schema.name!r}: field {schema.field_names[i]!r} is not nullable")
+            check_hashable(out)
             append(out)
         if not validated:
             return 0
@@ -1655,14 +1851,15 @@ class _RAMStore(CacheStore):
             tx = self.space._current_tx()
             if tx is not None:
                 target = tx.get_write_target(name, allow_delta=True)
-                if isinstance(target, _KeyedDelta):
+                if not isinstance(target, _StoreState):
                     return target.put_many(validated, replace)
                 return target.apply_put_many(validated, replace)
             with self.space._commit_lock:
+                self.space._storage.drain_released()
                 st = self.space._storage.stores[name]
                 if st.readers == 0:
                     return st.apply_put_many(validated, replace)
-            cloned = st.clone()
+            cloned = st.clone(self.space._commit_lock)
             n = cloned.apply_put_many(validated, replace)
             with self.space._commit_lock:
                 self.space._storage.stores[name] = cloned
@@ -1685,10 +1882,11 @@ class _RAMStore(CacheStore):
                     return target.delete_many(key_list)
                 return target.apply_delete_keys(key_list)
             with self.space._commit_lock:
+                self.space._storage.drain_released()
                 st = self.space._storage.stores[name]
                 if st.readers == 0:
                     return st.apply_delete_keys(key_list)
-            cloned = st.clone()
+            cloned = st.clone(self.space._commit_lock)
             n = cloned.apply_delete_keys(key_list)
             with self.space._commit_lock:
                 self.space._storage.stores[name] = cloned
@@ -1711,7 +1909,8 @@ class _RAMStore(CacheStore):
                 pks = [pk for pk, rec in candidates if pred(rec)]
             return st.apply_delete_keys(pks)
 
-        return self._mutate(_do)
+        with _type_errors_as_schema(self.spec.name):  # raised by the planner, before anything is deleted
+            return self._mutate(_do)
 
     def update_where(self, where: Where, values: Mapping[str, Any]) -> int:
         self._check_open()
@@ -1724,6 +1923,11 @@ class _RAMStore(CacheStore):
                 raise CacheSchemaError(f"cannot update key field {name!r}")
             if val is None and not self._schema.field_nullable[pos]:
                 raise CacheSchemaError(f"store {self.spec.name!r}: field {name!r} is not nullable")
+            if pos in self._schema.hash_pos and type(val) not in _SCALAR_TYPES:
+                try:
+                    hash(val)
+                except TypeError as exc:
+                    raise CacheSchemaError(f"store {self.spec.name!r}: field {name!r}: unhashable value") from exc
             updates[pos] = val
         conds = _validate_and_normalize_conds(self._schema, where, single_call=False)
 
@@ -1736,7 +1940,8 @@ class _RAMStore(CacheStore):
                 pks = [pk for pk, rec in candidates if pred(rec)]
             return st.apply_update_pks(pks, updates)
 
-        return self._mutate(_do)
+        with _type_errors_as_schema(self.spec.name):  # raised by the planner, before anything is updated
+            return self._mutate(_do)
 
     def clear(self) -> None:
         self._check_open()
@@ -1752,6 +1957,7 @@ class _RAMStore(CacheStore):
                     tx.working[name] = _StoreState(self._schema)
                 return
             with self.space._commit_lock:
+                self.space._storage.drain_released()
                 st = self.space._storage.stores[name]
                 if st.readers == 0:
                     st.clear_all()
@@ -1776,8 +1982,9 @@ class _RAMSpace(CacheSpace):
         self._scope = scope
         self._storage = storage
         self.specs = storage.specs
-        self._wlock = threading.RLock()
-        self._commit_lock = threading.Lock()
+        self._wlock = storage.wlock
+        self._commit_lock = storage.commit_lock
+        # Batch state is per handle: a handle reopened on the same thread never joins a batch of a closed handle.
         self._tls = threading.local()
         self._closed = False
         self._stores = {s.name: _RAMStore(self, storage.schemas[s.name]) for s in storage.specs}
@@ -1811,22 +2018,36 @@ class _RAMSpace(CacheSpace):
                 self._commit_tx(tx)
 
     def _commit_tx(self, tx: _BatchTx) -> None:
-        # Prepare any delta targets that have active readers outside commit_lock if needed
+        storage = self._storage
         with self._commit_lock:
-            for name, w in tx.working.items():
-                self._storage.stores[name] = w
-            for name, d in tx.deltas.items():
-                base = self._storage.stores[name]
-                if base.readers == 0:
-                    d.apply_to(base)
-                else:
-                    cloned = base.clone()
-                    d.apply_to(cloned)
-                    self._storage.stores[name] = cloned
+            if self._closed:
+                raise CacheError(f"cache space {self.namespace}/{self.name} was closed during batch(); "
+                                 "the batch is discarded")
+            storage.drain_released()
+            # Build every new state before anything is swapped in: a failure here leaves the space untouched.
+            in_place: list[tuple[_StoreState, _KeyedDelta | _KeylessDelta]] = []
+            replaced: dict[str, _StoreState] = dict(tx.working)
+            try:
+                for name, d in tx.deltas.items():
+                    base = storage.stores[name]
+                    if base.readers == 0:
+                        in_place.append((base, d))
+                    else:
+                        cloned = base.clone()
+                        d.apply_to(cloned)
+                        replaced[name] = cloned
+            except TypeError as exc:
+                raise CacheSchemaError(f"cache space {self.namespace}/{self.name}: {exc}") from exc
+            # Records were validated (arity, nulls, hashability) when written and sorted-index maintenance drops a
+            # lazy index instead of failing, so applying the deltas in place does not raise.
+            for name, st in replaced.items():
+                storage.stores[name] = st
+            for base, d in in_place:
+                d.apply_to(base)
             if tx.meta is not None:
-                self._storage.meta = tx.meta
+                storage.meta = tx.meta
             elif tx.meta_cleared:
-                self._storage.meta.clear()
+                storage.meta.clear()
 
     def store(self, name: str) -> CacheStore:
         self._check_open()
@@ -1882,6 +2103,7 @@ class _RAMSpace(CacheSpace):
                 tx.meta_cleared = True
                 return
             with self._commit_lock:
+                self._storage.drain_released()
                 for name, st in self._storage.stores.items():
                     if st.readers == 0:
                         st.clear_all()
@@ -1893,6 +2115,7 @@ class _RAMSpace(CacheSpace):
         self._check_open()
         with self._wlock:
             with self._commit_lock:
+                self._storage.drain_released()
                 for name, st in self._storage.stores.items():
                     if st.readers == 0:
                         st.compact()
@@ -1913,7 +2136,8 @@ class _RAMSpace(CacheSpace):
             return total
 
     def close(self) -> None:
-        self._closed = True
+        with self._commit_lock:  # orders close against a concurrent batch commit (which then fails or completes)
+            self._closed = True
         self.engine._forget(self)
 
     def discard(self) -> None:
@@ -1929,7 +2153,8 @@ class RAMCacheEngine(BaseCacheEngine):
     """``cache.engine = "ram"`` (aliases ``memory``, ``mem``, ``in-memory``, ``in_memory``); pure-Python in-RAM cache engine.
 
     ``root`` scopes spaces in process memory; by default it is resolved on every open via
-    ``cache_engine.cache_root()``. Spaces persist in memory across ``close()``/``open()`` until ``discard()``.
+    ``cache_engine.cache_root()``. Spaces stay in process memory across ``close()``/``open()`` until ``discard()`` or
+    ``discard_scope()``; nothing survives the process.
     """
 
     name = "ram"
@@ -1993,3 +2218,17 @@ class RAMCacheEngine(BaseCacheEngine):
             spaces = list(self._spaces.values())
         for space in spaces:
             space.close()
+
+    def discard_scope(self, root: Path | str) -> int:
+        """Close and drop every space held under the cache root ``root`` (``close()`` keeps the data); returns the
+        number of spaces dropped. Releases a temporary scope, e.g. at the end of a test."""
+        scope = str(Path(root))
+        with self._lock:
+            spaces = [s for k, s in self._spaces.items() if k[0] == scope]
+            keys = [k for k in self._backing if k[0] == scope]
+        for space in spaces:
+            space.close()
+        with self._lock:
+            for k in keys:
+                self._backing.pop(k, None)
+        return len(keys)

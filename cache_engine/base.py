@@ -262,7 +262,7 @@ class CacheSpace(abc.ABC):
 
     @abc.abstractmethod
     def size_bytes(self) -> int:
-        """Storage used by the space (0 when it holds nothing on disk)."""
+        """Engine-defined size of the space in bytes (on disk, or an estimate for in-memory engines; 0 when empty)."""
 
     @abc.abstractmethod
     def discard(self) -> None:
