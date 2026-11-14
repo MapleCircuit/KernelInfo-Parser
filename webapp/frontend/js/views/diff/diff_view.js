@@ -352,7 +352,7 @@ export class DiffView {
     const archSel = container.querySelector(".api-diff-arch");
     this.api.getKconfigPresets(this.versionB).then((p) => {
       archSel.innerHTML = (p?.targets || []).map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === this.apiArch ? "selected" : ""}>${escapeHtml(t.label || t.id)}</option>`).join("") || archSel.innerHTML;
-    }).catch(() => {});
+    }).catch(() => { });
     archSel.onchange = () => {
       this.apiArch = archSel.value;
       this.persist();
@@ -403,16 +403,20 @@ export class DiffView {
       const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
       const r = e.currentTarget.getBoundingClientRect();
       const base = `api-${String(this.versionA).replace(/[^A-Za-z0-9._-]/g, "_")}-${String(this.versionB).replace(/[^A-Za-z0-9._-]/g, "_")}`;
-      contextMenu.renderMenu(r.left, r.bottom + 4, { header: { title: "Download", sub: `${shown.length} changes` }, items: [
-        { label: "Summary (.md)", icon: "⬇", onClick: () => downloadText(`${base}.md`, apiDiffMarkdown(res, shown), "text/markdown") },
-        { label: "Table (.tsv)", icon: "⬇", onClick: () => downloadText(`${base}.tsv`, apiDiffTsv(shown)) },
-        { label: "JSON", icon: "⬇", onClick: () => downloadText(`${base}.json`, JSON.stringify(res, null, 1), "application/json") },
-      ] });
+      contextMenu.renderMenu(r.left, r.bottom + 4, {
+        header: { title: "Download", sub: `${shown.length} changes` }, items: [
+          { label: "Summary (.md)", icon: "⬇", onClick: () => downloadText(`${base}.md`, apiDiffMarkdown(res, shown), "text/markdown") },
+          { label: "Table (.tsv)", icon: "⬇", onClick: () => downloadText(`${base}.tsv`, apiDiffTsv(shown)) },
+          { label: "JSON", icon: "⬇", onClick: () => downloadText(`${base}.json`, JSON.stringify(res, null, 1), "application/json") },
+        ]
+      });
     };
     const open = (row, forceNew) => {
       const removed = row.dataset.status === "removed";
-      state.openTab({ type: "api", title: "Kernel API", view: row.dataset.kind, sel: "", query: row.dataset.key,
-        arch: this.apiArch, version: removed ? this.versionA : this.versionB, forceNew });
+      state.openTab({
+        type: "api", title: "Kernel API", view: row.dataset.kind, sel: "", query: row.dataset.key,
+        arch: this.apiArch, version: removed ? this.versionA : this.versionB, forceNew
+      });
     };
     container.querySelector(".api-diff-list").addEventListener("click", (e) => {
       const row = e.target.closest(".api-diff-row");
@@ -1142,8 +1146,8 @@ export class DiffView {
     const res = this.kconfigResult || {};
     const symbols = (res.symbols || (
       [...(res.added || []).map((n) => ({ name: n, change: "added" })),
-       ...(res.removed || []).map((n) => ({ name: n, change: "removed" })),
-       ...(res.changed || []).map((n) => ({ name: n, change: "changed" }))]
+      ...(res.removed || []).map((n) => ({ name: n, change: "removed" })),
+      ...(res.changed || []).map((n) => ({ name: n, change: "changed" }))]
     )).map((sym) => ({ ...sym, status: KCONFIG_STATUS_OF[sym.change] || "modified" }));
     const files = (res.files || []).map((f) => ({ ...f, status: KCONFIG_STATUS_OF[f.change] || "modified" }));
     return { symbols, files };
@@ -1344,7 +1348,7 @@ export class DiffView {
     const changesHtml = (sym.changes || []).map((c) => {
       if (Array.isArray(c.added) || Array.isArray(c.removed)) {
         const items = [...(c.removed || []).map((x) => `<code class="diff-del">− ${escapeHtml(show(x))}</code>`),
-          ...(c.added || []).map((x) => `<code class="diff-add">+ ${escapeHtml(show(x))}</code>`)];
+        ...(c.added || []).map((x) => `<code class="diff-add">+ ${escapeHtml(show(x))}</code>`)];
         return `<div class="compare-sym-change"><span class="compare-sym-field">${escapeHtml(c.field)}</span> ${items.join(" ") || "reordered"}</div>`;
       }
       if (c.field === "help") return `<div class="compare-sym-change"><span class="compare-sym-field">help</span> text changed</div>`;
