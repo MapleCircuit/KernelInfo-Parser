@@ -16,6 +16,7 @@ from core.config import (
     MANPAGES_PROJECT,
     get_db_config,
     get_default_repo_path,
+    get_logging_config,
     get_repositories_config,
     get_repository,
     get_webapp_config,
@@ -159,3 +160,8 @@ def get_backend_db_config() -> dict[str, Any]:
 def get_backend_server_config() -> dict[str, Any]:
     """Retrieve verified web application server bindings."""
     return get_webapp_config()
+
+
+def get_backend_logging_config() -> dict[str, Any]:
+    """Retrieve verified web application logging configuration."""
+    return get_logging_config("webapp")

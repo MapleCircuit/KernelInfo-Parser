@@ -4,6 +4,7 @@ Both are pure ASGI middleware: BaseHTTPMiddleware runs every request through an 
 memory stream, which every API call paid twice.
 """
 from __future__ import annotations
+import logging
 import time
 from collections import deque
 from starlette.responses import JSONResponse
@@ -124,3 +125,69 @@ class RepoContextMiddleware:
             await self.app(scope, receive, send)
         finally:
             reset_active_repository(token)
+
+
+def _has_uvicorn_access_handler() -> bool:
+    """Return True only when uvicorn attached its own non-managed access handler."""
+    uv_access = logging.getLogger("uvicorn.access")
+    return any(getattr(h, "_kip_log_target", None) is None for h in uv_access.handlers)
+
+
+class RequestLoggingMiddleware:
+    """Pure ASGI middleware logging HTTP requests and unhandled exceptions via `webapp.request`.
+
+    Under uvicorn, `uvicorn.access` already logs completed requests; this middleware avoids
+    duplicating access lines when uvicorn has its own access handler attached while still
+    logging unhandled exceptions and non-uvicorn ASGI/TestClient runs.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "-")
+        path = scope.get("path", "-")
+        started = time.monotonic()
+        status_code = 500
+        req_logger = logging.getLogger("webapp.request")
+
+        async def send_with_status(message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message.get("status", 500))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_status)
+        except Exception:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            req_logger.exception(
+                "%s %s -> 500 (%.1f ms)",
+                method,
+                path,
+                elapsed_ms,
+                extra={"status_code": 500},
+            )
+            raise
+
+        if not _has_uvicorn_access_handler():
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if status_code >= 500:
+                level = logging.ERROR
+            elif status_code >= 400:
+                level = logging.WARNING
+            else:
+                level = logging.INFO
+            req_logger.log(
+                level,
+                "%s %s -> %d (%.1f ms)",
+                method,
+                path,
+                status_code,
+                elapsed_ms,
+                extra={"status_code": status_code},
+            )

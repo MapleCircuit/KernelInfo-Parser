@@ -9,7 +9,14 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from webapp.backend.security.middleware import RepoContextMiddleware, SecurityHeadersMiddleware, SlidingWindowRateLimiter
+from core.logging_setup import setup_webapp_logging
+from webapp.backend.config import get_backend_logging_config
+from webapp.backend.security.middleware import (
+    RepoContextMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+    SlidingWindowRateLimiter,
+)
 from webapp.backend.routers import (
     versions_router,
     filesystem_router,
@@ -68,6 +75,10 @@ def _db_engine():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI application lifespan manager for startup pre-warming and graceful shutdown."""
+    if get_backend_logging_config().get("enabled") and not any(
+        getattr(h, "_kip_log_target", None) == "webapp" for h in logging.getLogger().handlers
+    ):
+        setup_webapp_logging()
     # Pre-warm DB pool and establish SSH tunnel if configured
     try:
         _db_engine().warm_up()
@@ -105,6 +116,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI web application instance."""
+    setup_webapp_logging()
     app = FastAPI(
         title="KernelInfo-Parser Developer Platform",
         version="2.0.0",
@@ -128,6 +140,7 @@ def create_app() -> FastAPI:
     )
     # Inside RepoContextMiddleware: the change tokens are those of the request's repository
     app.add_middleware(SyncHeaderMiddleware)
+    app.add_middleware(RequestLoggingMiddleware)
     # Outermost: the selected repository must be visible to every inner middleware and endpoint
     app.add_middleware(RepoContextMiddleware)
 

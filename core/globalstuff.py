@@ -838,14 +838,39 @@ STANDARD_C_KEYWORDS: dict[str, ASTT] = {
 
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI SGR/CSI escape sequences from text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 class FileContextFormatter(logging.Formatter):
     """Logging formatter that prepends [current_file] if G.CURRENT_PARSING_FILE is set."""
 
+    def __init__(
+        self,
+        fmt: str | None = None,
+        datefmt: str | None = None,
+        *,
+        strip_ansi_codes: bool = False,
+    ) -> None:
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.strip_ansi_codes = strip_ansi_codes
+
     def format(self, record: logging.LogRecord) -> str:
         file_ctx = getattr(G, "CURRENT_PARSING_FILE", None)
-        if file_ctx and not str(record.msg).startswith(f"[{file_ctx}]"):
-            record.msg = f"[{file_ctx}] {record.msg}"
-        return super().format(record)
+        orig_msg = record.msg
+        try:
+            if file_ctx:
+                msg_text = orig_msg if isinstance(orig_msg, str) else str(orig_msg)
+                if not msg_text.startswith(f"[{file_ctx}]"):
+                    record.msg = f"[{file_ctx}] {msg_text}"
+            formatted = super().format(record)
+        finally:
+            record.msg = orig_msg
+        return strip_ansi(formatted) if self.strip_ansi_codes else formatted
 
 
 def configure_logging(fmt: str = "%(asctime)s - %(levelname)s - %(message)s", level: int = logging.INFO) -> None:
@@ -855,7 +880,8 @@ def configure_logging(fmt: str = "%(asctime)s - %(levelname)s - %(message)s", le
 
     for handler in logging.root.handlers:
         h_fmt = handler.formatter._fmt if handler.formatter and getattr(handler.formatter, "_fmt", None) else fmt
-        handler.setFormatter(FileContextFormatter(h_fmt))
+        keep_strip = isinstance(handler.formatter, FileContextFormatter) and handler.formatter.strip_ansi_codes
+        handler.setFormatter(FileContextFormatter(h_fmt, strip_ansi_codes=keep_strip or isinstance(handler, logging.FileHandler)))
 
 
 configure_logging()

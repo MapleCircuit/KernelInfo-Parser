@@ -203,9 +203,50 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "repos_dir": "repos",
         "auto_detect_repos": True,
     },
+    # File logging for parser and webapp backend (disabled by default)
+    "logging": {
+        "parser": {
+            "enabled": False,
+            "dir": "",
+            "file": "parser.log",
+            "error_dir": "",
+            "error_file": "",
+            "level": "INFO",
+        },
+        "webapp": {
+            "enabled": False,
+            "dir": "",
+            "file": "webapp.log",
+            "request_mode": "all",
+            "error_dir": "",
+            "error_file": "",
+            "level": "INFO",
+        },
+    },
     # Populated by sync_repositories() from Git repositories found under workspace.repos_dir
     "repositories": [],
 }
+
+VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+VALID_WEBAPP_REQUEST_MODES = ("all", "errors")
+
+
+def normalize_log_level(val: Any) -> str:
+    """Return canonical logging level name ('DEBUG', 'INFO', 'WARNING', 'ERROR', or 'CRITICAL')."""
+    level = str(val or "").strip().upper()
+    if level == "WARN":
+        level = "WARNING"
+    return level if level in VALID_LOG_LEVELS else "INFO"
+
+
+def normalize_webapp_request_mode(val: Any) -> str:
+    """Return canonical webapp request logging mode ('all' or 'errors')."""
+    mode = str(val or "").strip().lower()
+    if mode in ("error", "errors", "errors_only", "error_only", "only_errors"):
+        return "errors"
+    if mode in ("all", "all_requests", "requests"):
+        return "all"
+    return "all"
 
 # Keys every repositories[] entry carries once detected (see detect_repository())
 REPOSITORY_KEYS = (
@@ -559,6 +600,57 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         if not ml_sec["ssh_tunnel"].get("remote_port"):
             ml_sec["ssh_tunnel"]["remote_port"] = 8192
 
+    if "logging" not in merged or not isinstance(merged["logging"], dict):
+        merged["logging"] = copy.deepcopy(DEFAULT_CONFIG["logging"])
+    log_sec = merged["logging"]
+    for target in ("parser", "webapp"):
+        default_target = copy.deepcopy(DEFAULT_CONFIG["logging"][target])
+        if target not in log_sec or not isinstance(log_sec[target], dict):
+            log_sec[target] = default_target
+        else:
+            for k, v in default_target.items():
+                log_sec[target].setdefault(k, v)
+
+    p_log = log_sec["parser"]
+    if env_p_log_en := _get_user_env("KIP_PARSER_LOG_ENABLED"):
+        p_log["enabled"] = _coerce_bool(env_p_log_en, False)
+    else:
+        p_log["enabled"] = _coerce_bool(p_log.get("enabled"), False)
+    if (env_p_log_dir := _get_user_env("KIP_PARSER_LOG_DIR")) is not None:
+        p_log["dir"] = env_p_log_dir
+    if (env_p_log_file := _get_user_env("KIP_PARSER_LOG_FILE")) is not None:
+        p_log["file"] = env_p_log_file
+    if (env_p_log_err_dir := _get_user_env("KIP_PARSER_LOG_ERROR_DIR")) is not None:
+        p_log["error_dir"] = env_p_log_err_dir
+    if (env_p_log_err_file := _get_user_env("KIP_PARSER_LOG_ERROR_FILE")) is not None:
+        p_log["error_file"] = env_p_log_err_file
+    if env_p_log_lvl := _get_user_env("KIP_PARSER_LOG_LEVEL"):
+        p_log["level"] = normalize_log_level(env_p_log_lvl)
+    else:
+        p_log["level"] = normalize_log_level(p_log.get("level"))
+
+    w_log = log_sec["webapp"]
+    if env_w_log_en := _get_user_env("KIP_WEBAPP_LOG_ENABLED"):
+        w_log["enabled"] = _coerce_bool(env_w_log_en, False)
+    else:
+        w_log["enabled"] = _coerce_bool(w_log.get("enabled"), False)
+    if (env_w_log_dir := _get_user_env("KIP_WEBAPP_LOG_DIR")) is not None:
+        w_log["dir"] = env_w_log_dir
+    if (env_w_log_file := _get_user_env("KIP_WEBAPP_LOG_FILE")) is not None:
+        w_log["file"] = env_w_log_file
+    if env_w_log_mode := (_get_user_env("KIP_WEBAPP_LOG_REQUEST_MODE") or _get_user_env("KIP_WEBAPP_LOG_MODE")):
+        w_log["request_mode"] = normalize_webapp_request_mode(env_w_log_mode)
+    else:
+        w_log["request_mode"] = normalize_webapp_request_mode(w_log.get("request_mode"))
+    if (env_w_log_err_dir := _get_user_env("KIP_WEBAPP_LOG_ERROR_DIR")) is not None:
+        w_log["error_dir"] = env_w_log_err_dir
+    if (env_w_log_err_file := _get_user_env("KIP_WEBAPP_LOG_ERROR_FILE")) is not None:
+        w_log["error_file"] = env_w_log_err_file
+    if env_w_log_lvl := _get_user_env("KIP_WEBAPP_LOG_LEVEL"):
+        w_log["level"] = normalize_log_level(env_w_log_lvl)
+    else:
+        w_log["level"] = normalize_log_level(w_log.get("level"))
+
     # 4. Synchronize into os.environ for low-level and child worker compatibility
     sync_environ(merged)
 
@@ -621,6 +713,19 @@ def get_mailing_list_config() -> dict[str, Any]:
 def get_workspace_config() -> dict[str, Any]:
     """Retrieve active workspace configuration section."""
     return get_config().get("workspace", copy.deepcopy(DEFAULT_CONFIG["workspace"]))
+
+
+def get_logging_config(target: str | None = None) -> dict[str, Any]:
+    """Retrieve active logging configuration section (whole dict, or `'parser'` / `'webapp'`)."""
+    log_cfg = get_config().get("logging", copy.deepcopy(DEFAULT_CONFIG["logging"]))
+    if target is None:
+        return log_cfg
+    if target not in ("parser", "webapp"):
+        raise ValueError(f"Unknown logging target: {target!r}")
+    section = log_cfg.get(target)
+    if isinstance(section, dict):
+        return section
+    return copy.deepcopy(DEFAULT_CONFIG["logging"][target])
 
 
 def get_repos_dir() -> Path:

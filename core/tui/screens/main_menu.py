@@ -10,6 +10,7 @@ from core.tui.screens.db_content import DBContentScreen
 from core.tui.screens.diagnostics import DiagnosticsScreen
 from core.tui.screens.git_select import GitRepoSelectScreen
 from core.tui.screens.launch import RUN_SAVED, launch_pipeline
+from core.tui.screens.logging_cfg import LoggingScreen
 from core.tui.screens.parser_dist import ParserDistributedScreen
 from core.tui.screens.repos import RepositoriesScreen
 from core.tui.screens.table_reset import run_table_reset
@@ -35,6 +36,7 @@ class MainMenuScreen(BaseScreen):
         ("2", "Database, SSH Tunnel & Auth", "Database credentials, socket, and SSH port forwarding"),
         ("3", "Parser Engine & Distributed Node ID", "Memory limit, hugepages, worker_id, master/worker role"),
         ("4", "CVE Catalog & Mailing List", "CVE list clone directory, lore storage & ML daemon tunnel"),
+        ("L", "Logging Configuration", "Parser & webapp log files, directories, levels & request filter"),
         ("5", "Run Diagnostics (Test All)", "Verify all database, SSH, git, CVE, and daemon configurations"),
         ("6", "Git Repository Manager", "Linux, CVE & other repos: select, clone, add, remotes, fetch all"),
         ("7", "Parse Specific Versions / Tags", "Pick one or more release tags with the tag selector and parse them"),
@@ -88,7 +90,7 @@ class MainMenuScreen(BaseScreen):
         self.safe_addstr(
             2,
             2,
-            "Use Arrow keys and [Enter] to navigate, or press hotkeys [1-9, S, R, P, Q].",
+            "Use Arrow keys and [Enter] to navigate, or press hotkeys [1-9, L, S, R, P, Q].",
             curses.A_NORMAL,
         )
 
@@ -176,6 +178,7 @@ class MainMenuScreen(BaseScreen):
             "2": DatabaseSSHScreen,
             "3": ParserDistributedScreen,
             "4": CVEMailingListScreen,
+            "L": LoggingScreen,
             "5": DiagnosticsScreen,
             "6": GitRepoSelectScreen,
             "7": VersionParseScreen,

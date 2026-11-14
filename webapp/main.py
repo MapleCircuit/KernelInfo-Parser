@@ -38,8 +38,10 @@ if __name__ == "__main__":
     cli = parse_args()
     apply_config_path(cli)
     import uvicorn
+    from core.logging_setup import setup_webapp_logging
     from webapp.backend.config import get_backend_server_config
 
+    setup_webapp_logging()
     cfg = get_backend_server_config()
     uvicorn.run(
         "webapp.main:app",

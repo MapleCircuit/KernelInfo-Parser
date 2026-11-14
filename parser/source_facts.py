@@ -388,6 +388,11 @@ def init_worker() -> None:
         os.nice(10)
     except OSError:
         pass
+    try:
+        from core.logging_setup import configure_worker_logging_from_env
+        configure_worker_logging_from_env()
+    except Exception:
+        pass
 
 
 def extract_many(items: list[tuple[str, str]]) -> list[tuple[str, dict[str, Any] | None]]:

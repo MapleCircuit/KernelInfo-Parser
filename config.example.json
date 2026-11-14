@@ -75,6 +75,25 @@
     "repos_dir": "repos",
     "auto_detect_repos": true
   },
+  "logging": {
+    "parser": {
+      "enabled": false,
+      "dir": "",
+      "file": "parser.log",
+      "error_dir": "",
+      "error_file": "",
+      "level": "INFO"
+    },
+    "webapp": {
+      "enabled": false,
+      "dir": "",
+      "file": "webapp.log",
+      "request_mode": "all",
+      "error_dir": "",
+      "error_file": "",
+      "level": "INFO"
+    }
+  },
   "repositories": [
     {
       "name": "linux",

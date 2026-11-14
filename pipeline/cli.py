@@ -17,6 +17,7 @@ from core.config import (
     sync_repositories,
     normalize_memory_mode,
 )
+from core.logging_setup import setup_parser_logging
 from core.ssh_tunnel import start_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler
 import json
@@ -555,6 +556,8 @@ def arg_handling() -> argparse.Namespace:
     if args.mem_max > 0:
         setup_memory_limit(float(args.mem_max))
     os.environ.pop("KERNELINFO_TUI_LAUNCH", None)
+    if args.unit_test is None:
+        setup_parser_logging()
     dist_cfg = parser_cfg.get("distributed", {}) if isinstance(parser_cfg, dict) else {}
     if getattr(args, "role", None) is None:
         args.role = dist_cfg.get("role", "standalone") if dist_cfg.get("enabled", False) else "standalone"
