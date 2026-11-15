@@ -220,11 +220,14 @@ class KernelIdeApp {
     // A repository was added, removed, parsed for the first time or went missing (sync `projects` token)
     state.subscribe("projects:updated", () => this.initVersionSelector());
 
-    // The active tab belongs to another project: the header lists that project's branches and revisions
+    // The active tab or header Project switched to another repository: update the activity bar
+    // and header selectors (sidebar only reloads when it follows the active tab or no tab is open)
     state.subscribe("repo:synced", async () => {
-      this.updateActivityBar(state.activeRepo());
+      this.updateActivityBar(state.currentRepo || state.activeRepo());
       await this.initVersionSelector();
-      await this.loadSidebarFileTree();
+      if (!state.getActiveTab() || state.activeRepo() === state.currentRepo) {
+        await this.loadSidebarFileTree();
+      }
     });
 
     // A version finished parsing (or was rolled back), a branch moved or tags were fetched
@@ -255,7 +258,7 @@ class KernelIdeApp {
     // The active tab decides what Apply would switch, so the buttons follow tab changes
     state.subscribe("tabs:changed", () => {
       this.updateVersionSelectorDisplay();
-      this.updateActivityBar(state.activeRepo());
+      this.updateActivityBar(state.currentRepo || state.activeRepo());
     });
 
     console.info("KernelInfo Developer IDE fully initialized.");
@@ -993,7 +996,7 @@ class KernelIdeApp {
           return `<option value="${escapeAttr(p.repo)}" ${p.repo === state.currentRepo ? "selected" : ""} ${p.available ? "" : "disabled"}>${escapeAttr(label)}</option>`;
         }).join("");
         projSelect.title = "Repository (projects detected under workspace.repos_dir)";
-        this.updateActivityBar(state.activeRepo());
+        this.updateActivityBar(state.currentRepo || state.activeRepo());
         projSelect.onchange = () => this.switchProject(projSelect.value);
       } catch (err) {
         console.warn("Could not load projects:", err);
@@ -1032,22 +1035,20 @@ class KernelIdeApp {
       const branchNames = (this.branches || []).map((b) => b.name);
       // The branch scope only narrows what the dropdowns offer, so it is read in the background:
       // the lists render complete and narrow once the walk of that branch's history comes back
-      this.loadBranchScope(state.selectedBranch).then(() => this.updateVersionSelectorDisplay());
+      this.loadBranchScope(state.selectedBranch).then(() => { if (!stale()) this.updateVersionSelectorDisplay(); });
 
       // Validate and sanitize the explored and the selected revision (commit SHAs and branch names
       // are valid targets too)
       const valid = (ref) => this.versionByName.has(ref) || isCommitRef(ref) || branchNames.includes(ref);
-      const fallback = () => {
-        // The man-pages project (§5.38): its newest tag, parsed or not (its pages render from Git too)
-        if (isManPagesRepo(state.currentRepo)) {
-          const newest = newestTag(this.tagVersions.map((t) => t.vname));
-          if (newest) return newest;
-        }
-        const indexed = this.tagVersions.filter((t) => t.indexed && !t.rcOnly);
-        return (indexed[indexed.length - 1] || this.tagVersions[this.tagVersions.length - 1] || { vname: "v3.0" }).vname;
-      };
-      if (!valid(state.currentVersion)) state.currentVersion = fallback();
-      if (!valid(state.selectedVersion)) state.selectedVersion = state.currentVersion;
+      const matchesActive = !state.getActiveTab() || state.activeRepo() === state.currentRepo;
+      const needCurFallback = matchesActive && !valid(state.currentVersion);
+      const needSelFallback = !valid(state.selectedVersion);
+      if (needCurFallback || needSelFallback) {
+        const fb = await this.defaultVersionOf(state.currentRepo);
+        if (stale()) return;
+        if (needCurFallback) state.currentVersion = fb;
+        if (needSelFallback) state.selectedVersion = matchesActive ? state.currentVersion : fb;
+      }
 
       // Picking a release selects its final tag (or its latest sub-version when it was never released
       // on its own or is absent from the active branch scope).
@@ -1083,6 +1084,7 @@ class KernelIdeApp {
         refPicker.open(commitBtn, {
           current: state.selectedVersion,
           scoped: true, // its tag search offers the releases of the selected branch (§5.13)
+          client: api.forRepo(state.currentRepo),
           onSelect: (ref) => {
             if (ref) state.setSelectedVersion(ref);
           }
@@ -1096,9 +1098,21 @@ class KernelIdeApp {
       applyBtn.onclick = async () => {
         const target = state.selectedVersion;
         const tab = state.getActiveTab();
+        const targetRepo = state.currentRepo || state.activeRepo();
         if (!tab) {
-          openVersionInNewTab(target);
+          openVersionInNewTab(target, targetRepo);
           toast.info(`No tab to switch: opened a repository explorer on ${shortRef(target)}`);
+          return;
+        }
+        if (state.repoOf(tab) !== targetRepo) {
+          if (PROJECT_MOVABLE_TABS[tab.type] && isTabFeatureEnabled(targetRepo, tab.type)) {
+            const label = (this.projects || []).find((p) => p.repo === targetRepo)?.name || targetRepo;
+            const patch = PROJECT_MOVABLE_TABS[tab.type](tab, label);
+            state.moveTabToRepository(tab, targetRepo, target, patch);
+            toast.success(`${tab.title} switched to ${label} @ ${shortRef(target)}`);
+          } else {
+            toast.info(`${tab.title} belongs to ${state.repoOf(tab)}: use New Tab to open ${targetRepo} @ ${shortRef(target)}`);
+          }
           return;
         }
         if (tab.version === target) {
@@ -1110,7 +1124,7 @@ class KernelIdeApp {
     }
     const newTabBtn = document.getElementById("version-newtab-btn");
     if (newTabBtn) {
-      newTabBtn.onclick = () => openVersionInNewTab(state.selectedVersion);
+      newTabBtn.onclick = () => openVersionInNewTab(state.selectedVersion, state.currentRepo || state.activeRepo());
     }
 
     this.updateVersionSelectorDisplay();
@@ -1187,7 +1201,7 @@ class KernelIdeApp {
     const branch = typeof name === "string" ? name.trim() : "";
     state.setSelectedBranch(branch);
     if (branch && !branch.startsWith("view:")) {
-      state.setSelectedVersion(branch);
+      state.setSelectedVersion(branch, { rememberTag: false });
     }
     this.renderBranchSelector();
     await this.loadBranchScope(branch);
@@ -1350,6 +1364,10 @@ class KernelIdeApp {
     const branch = state.selectedBranch;
     const tags = (this.tagVersions || []).filter((t) => this.releaseOnBranch(t));
     const tag = this.versionByName?.get(cur);
+    const isTag = Boolean(tag) && tag.ref_type !== 2 && tag.ref_type !== 3;
+    if (isTag && this.headerRepo && this.headerRepo === state.currentRepo) {
+      state.rememberRepoTag(this.headerRepo, tag.vname);
+    }
     const base = tag ? this.releaseOf(cur) : null;
 
     const select = document.getElementById("version-select");
@@ -1463,31 +1481,84 @@ class KernelIdeApp {
     // Apply stands out while the selection is not what the current tab shows
     const applyBtn = document.getElementById("version-apply-btn");
     const activeTab = state.getActiveTab();
+    const headerRepo = state.currentRepo || state.activeRepo();
     if (applyBtn) {
-      const pending = Boolean(activeTab) && activeTab.version !== cur;
+      const crossRepo = Boolean(activeTab) && state.repoOf(activeTab) !== headerRepo;
+      const movableCrossRepo = crossRepo && Boolean(PROJECT_MOVABLE_TABS[activeTab.type] && isTabFeatureEnabled(headerRepo, activeTab.type));
+      const pending = Boolean(activeTab) && (crossRepo ? movableCrossRepo : activeTab.version !== cur);
       applyBtn.classList.toggle("pending", pending);
-      applyBtn.title = activeTab
-        ? (pending
-          ? `Switch ${activeTab.title} from ${shortRef(activeTab.version)} to ${shortRef(cur)}`
-          : `${activeTab.title} is already on ${shortRef(cur)}`)
-        : `Open ${shortRef(cur)} in a new tab`;
+      applyBtn.title = !activeTab
+        ? `Open ${shortRef(cur)} in a new tab`
+        : crossRepo
+          ? (movableCrossRepo
+            ? `Switch ${activeTab.title} to ${headerRepo} @ ${shortRef(cur)}`
+            : `${activeTab.title} belongs to ${state.repoOf(activeTab)} (use New Tab for ${headerRepo})`)
+          : (pending
+            ? `Switch ${activeTab.title} from ${shortRef(activeTab.version)} to ${shortRef(cur)}`
+            : `${activeTab.title} is already on ${shortRef(cur)}`);
     }
     const newTabBtn = document.getElementById("version-newtab-btn");
     if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
   }
 
   /**
-   * Default revision of a project: its latest parsed release (else its newest tag, else its default
-   * branch); the man-pages project's newest release tag, parsed or not (§5.38).
+   * Default revision when switching to `repo` (§5.18):
+   * 1. The last valid tag used in `repo` (`state.selectedVersionByRepo[repo]`), if it is still a tag of `repo`.
+   * 2. Otherwise, the latest parsed final (non-prerelease) tag reachable from `master` (or the repository's
+   *    default branch when `master` does not exist).
+   * 3. Fallbacks when no parsed final tag exists on `master` (e.g. git-only repositories): newest final tag on
+   *    `master`, else latest parsed final tag overall, else newest final tag overall, else default branch / "HEAD".
    */
   async defaultVersionOf(repo) {
+    const isPrerelease = (v) => Boolean(v.is_prerelease) || /-(?:rc|pre|alpha|beta|test)(?:[.-]?\d+)?$/i.test(v.vname || "");
     let version = "";
     try {
-      const res = await api.forRepo(repo).getVersions(true);
-      const versions = (res.versions || []).filter((v) => !v.is_prerelease);
-      const indexed = versions.filter((v) => v.indexed !== false && v.ref_type !== 3);
-      version = (indexed[indexed.length - 1] || versions[versions.length - 1] || {}).vname || "";
-      if (isManPagesRepo(repo)) version = newestTag(versions.filter((v) => v.ref_type !== 2 && v.ref_type !== 3).map((v) => v.vname)) || version;
+      const client = api.forRepo(repo);
+      const [vRes, bRes] = await Promise.all([
+        client.getVersions(true),
+        client.getBranches().catch(() => null),
+      ]);
+      const allEntries = vRes.versions || [];
+      const tags = allEntries.filter((v) => v.vname && v.ref_type !== 2 && v.ref_type !== 3);
+
+      // 1. Last valid tag used in this repository
+      const lastUsed = state.selectedVersionByRepo?.[repo];
+      if (lastUsed && tags.some((v) => v.vname === lastUsed)) {
+        return lastUsed;
+      }
+
+      // 2. Latest parsed (final) tag reachable from master (else default branch)
+      const branches = bRes?.branches || [];
+      const projectDefBranch = (this.projects || []).find((p) => p.repo === repo)?.default_branch || "";
+      const masterBranch = branches.some((b) => b.name === "master")
+        ? "master"
+        : (branches.find((b) => b.is_default)?.name || projectDefBranch || "master");
+
+      let masterTags = null;
+      if (masterBranch) {
+        try {
+          const btRes = await client.getBranchTags(masterBranch);
+          if (Array.isArray(btRes?.tags)) masterTags = new Set(btRes.tags);
+        } catch (err) {
+          console.warn(`Could not list tags on ${masterBranch} for ${repo}:`, err);
+        }
+      }
+
+      const finalTags = tags.filter((v) => !isPrerelease(v));
+      const finalOnMaster = masterTags ? finalTags.filter((v) => masterTags.has(v.vname)) : finalTags;
+      const parsedFinalOnMaster = finalOnMaster.filter((v) => v.indexed !== false);
+      const parsedFinalAny = finalTags.filter((v) => v.indexed !== false);
+
+      const pickLatest = (list) => {
+        if (!list.length) return "";
+        if (isManPagesRepo(repo)) return newestTag(list.map((v) => v.vname)) || list[list.length - 1].vname;
+        return list[list.length - 1].vname;
+      };
+
+      version = pickLatest(parsedFinalOnMaster)
+        || pickLatest(parsedFinalAny)
+        || pickLatest(finalOnMaster)
+        || pickLatest(finalTags);
     } catch (err) {
       console.warn("Could not load versions for project:", err);
     }
@@ -1495,29 +1566,19 @@ class KernelIdeApp {
   }
 
   /**
-   * The header's Project picked `repo` (§5.18): no tab is closed and nothing is asked. A tab whose address
-   * holds in any repository (explorer, commits, search, treemap, status) moves to `repo` at its default
-   * revision, like Apply moves it to another revision; any other active tab stays and the project's
-   * default view opens next to it (the man index in the man-pages project, else a repository explorer).
-   * Without an open tab it only becomes the project new tabs open in.
+   * The header's Project picked `repo` (§5.18): the active tab remains unchanged (no tab is moved,
+   * closed or opened). Updates the header's selected project, branch scope and tag/release choices,
+   * and updates the activity bar to show only the valid tabs for `repo`.
    */
   async switchProject(repo) {
     const projSelect = document.getElementById("project-select");
-    const tab = state.getActiveTab();
-    if (!repo || repo === state.activeRepo()) return;
+    if (!repo || repo === state.currentRepo) return;
+    const seq = (this._switchProjectSeq = (this._switchProjectSeq || 0) + 1);
     const version = await this.defaultVersionOf(repo);
+    if (seq !== this._switchProjectSeq || repo === state.currentRepo) return;
     const label = (this.projects || []).find((p) => p.repo === repo)?.name || repo;
-    if (!tab) {
-      state.setDefaultRepository(repo, version);
-    } else if (PROJECT_MOVABLE_TABS[tab.type] && isTabFeatureEnabled(repo, tab.type)) {
-      const patch = PROJECT_MOVABLE_TABS[tab.type](tab, label);
-      state.moveTabToRepository(tab, repo, version, patch);
-    } else if (isManPagesRepo(repo) && hasFeature(repo, "man")) {
-      state.openTab({ type: "man", title: "Man pages", manPage: "", manSec: "", manPath: "", manQuery: "", repo, version, kernelVersion: "", kernelRepo: "" });
-    } else {
-      state.openTab({ type: "explorer", title: `Explorer ${shortRef(version)}`, path: "", repo, version, forceNew: true });
-    }
-    this.updateActivityBar(state.activeRepo());
+    state.setSelectedRepository(repo, version);
+    this.updateActivityBar(state.currentRepo || state.activeRepo());
     if (projSelect) projSelect.value = state.currentRepo;
     toast.success(`Project ${label} @ ${shortRef(version)}`);
   }
@@ -1725,7 +1786,7 @@ class KernelIdeApp {
    * from the kernel, at the man-pages tag released on or before the explored kernel revision
    * (`/api/man/resolve`), else the newest tag.
    */
-  updateActivityBar(repo = state.activeRepo() || state.currentRepo) {
+  updateActivityBar(repo = state.currentRepo || state.activeRepo()) {
     const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "man", "compare"];
     for (const action of gated) {
       const btn = document.querySelector(`.activity-btn[data-action="${action}"]`);
@@ -1735,14 +1796,15 @@ class KernelIdeApp {
     }
   }
 
-  async openManIndex() {
-    if (!hasFeature(state.activeRepo(), "man")) {
+  async openManIndex(targetRepo = state.currentRepo || state.activeRepo()) {
+    if (!hasFeature(targetRepo, "man")) {
       toast.info("Man pages feature is disabled for this project");
       return;
     }
     const index = { manPage: "", manSec: "", manPath: "", manQuery: "", title: "Man pages" };
-    if (isManPagesRepo(state.activeRepo())) {
-      state.openTab({ type: "man", ...index, repo: state.activeRepo(), version: state.activeVersion(), kernelVersion: "", kernelRepo: "" });
+    if (isManPagesRepo(targetRepo)) {
+      const version = targetRepo === state.activeRepo() ? state.activeVersion() : state.selectedVersion;
+      state.openTab({ type: "man", ...index, repo: targetRepo, version, kernelVersion: "", kernelRepo: "" });
       return;
     }
     const repo = manPagesRepo();
@@ -1750,8 +1812,8 @@ class KernelIdeApp {
       toast.info("No man-pages repository is configured (a repository whose project is man-pages)");
       return;
     }
-    const kernel = state.activeVersion();
-    const kernelRepo = state.activeRepo();
+    const kernel = targetRepo === state.activeRepo() ? state.activeVersion() : state.selectedVersion;
+    const kernelRepo = targetRepo;
     let mv = "";
     try {
       const res = await api.forRepo(kernelRepo).resolveMan("intro", "1", kernel);
@@ -1764,7 +1826,7 @@ class KernelIdeApp {
   }
 
   setupActivityBar() {
-    this.updateActivityBar(state.activeRepo());
+    this.updateActivityBar(state.currentRepo || state.activeRepo());
     const buttons = document.querySelectorAll(".activity-btn");
 
     buttons.forEach((btn) => {
@@ -1775,30 +1837,35 @@ class KernelIdeApp {
           this.toggleSidebar();
           return;
         }
+        const targetRepo = state.currentRepo || state.activeRepo();
         const tabType = (action === "compare" || action === "tools") ? "diff" : action;
-        if (!isTabFeatureEnabled(state.activeRepo(), tabType)) {
+        if (!isTabFeatureEnabled(targetRepo, tabType)) {
           toast.info(`Feature '${action}' is disabled for this project`);
           return;
         }
+        const tabTarget = {
+          repo: targetRepo,
+          version: targetRepo === state.activeRepo() ? state.activeVersion() : state.selectedVersion,
+        };
         if (action === "kconfig") {
           const a = state.kconfigArch();
-          state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a });
+          state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a, ...tabTarget });
         } else if (action === "nodemap") {
-          state.openTab({ type: "nodemap", title: "NodeMap Canvas" });
+          state.openTab({ type: "nodemap", title: "NodeMap Canvas", ...tabTarget });
         } else if (action === "maintainers") {
-          state.openTab({ type: "maintainers", title: "Maintainers" });
+          state.openTab({ type: "maintainers", title: "Maintainers", ...tabTarget });
         } else if (action === "commits") {
-          state.openTab({ type: "commits", title: "Commits" });
+          state.openTab({ type: "commits", title: "Commits", ...tabTarget });
         } else if (action === "mail") {
-          state.openTab({ type: "mail", title: "Mailing List" });
+          state.openTab({ type: "mail", title: "Mailing List", ...tabTarget });
         } else if (action === "api") {
-          state.openTab({ type: "api", title: "Kernel API" });
+          state.openTab({ type: "api", title: "Kernel API", ...tabTarget });
         } else if (action === "insights") {
-          state.openTab({ type: "insights", title: "Insights" });
+          state.openTab({ type: "insights", title: "Insights", ...tabTarget });
         } else if (action === "man") {
-          this.openManIndex();
+          this.openManIndex(targetRepo);
         } else if (action === "compare" || action === "tools") {
-          state.openTab({ type: "diff", title: "Compare" });
+          state.openTab({ type: "diff", title: "Compare", ...tabTarget });
         }
       });
     });

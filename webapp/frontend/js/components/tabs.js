@@ -611,6 +611,10 @@ export class TabsComponent {
     const target = state.selectedVersion;
     const live = state.findTab(tab?.id);
     if (!target || !live) return;
+    if (state.currentRepo && state.repoOf(live) !== state.currentRepo) {
+      toast.info(`${live.title} belongs to ${state.repoOf(live)} (header Project is ${state.currentRepo})`);
+      return;
+    }
     if (live.version === target) {
       toast.info(`${live.title} is already on ${shortRef(target)}`);
       return;

@@ -34,10 +34,12 @@ export async function requestVersionSwitch(target, tab = state.getActiveTab()) {
 }
 
 /** Open a repository explorer on the revision selected in the header ("New Tab"). */
-export function openVersionInNewTab(version = state.selectedVersion) {
+export function openVersionInNewTab(version = state.selectedVersion, repo = state.currentRepo || state.activeRepo()) {
   const ref = typeof version === "string" ? version.trim() : "";
   if (!ref) return false;
-  state.openTab({ type: "explorer", title: `Explorer ${ref}`, path: "", version: ref, forceNew: true });
+  const tabData = { type: "explorer", title: `Explorer ${ref}`, path: "", version: ref, forceNew: true };
+  if (repo) tabData.repo = repo;
+  state.openTab(tabData);
   return true;
 }
 

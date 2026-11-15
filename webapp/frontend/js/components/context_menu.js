@@ -977,14 +977,15 @@ class ContextMenu {
     // Header selection vs. this tab's own revision (§5.24.5): either side can be copied to the other
     const selected = state.selectedVersion || "";
     const tabRef = tab.version || state.currentVersion || "";
+    const otherRepo = Boolean(state.currentRepo) && state.repoOf(tab) !== state.currentRepo;
     const same = !selected || !tabRef || selected === tabRef;
 
     const items = [
       {
         label: `Apply Current Tag${selected ? ` (${shortRef(selected)})` : ""}`,
         icon: "⤓",
-        shortcut: same ? "already on it" : "",
-        disabled: same,
+        shortcut: otherRepo ? "other project" : (same ? "already on it" : ""),
+        disabled: otherRepo || same,
         onClick: () => onApplyCurrentTag && onApplyCurrentTag()
       },
       {

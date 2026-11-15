@@ -67,8 +67,14 @@ class GlobalState {
     // and the one new tabs open in. Every tab records its own (`tab.repo`), so one session holds tabs of
     // several projects; the shared API client addresses the active tab's (§5.18).
     this.currentRepo = "";
+    // True after the header's Project selector picks another repository while keeping the active tab
+    // unchanged; cleared as soon as the active tab changes or moves.
+    this._repoManualOverride = false;
+    this._repoOverrideTabId = null;
     // Branch scope of the header per repository: switching to a tab of another project restores its own
     this.selectedBranchByRepo = {};
+    // Last valid tag used per repository: switching Project restores it when available
+    this.selectedVersionByRepo = {};
     // KConfig tabs holding the Kconfig constraint engine. Several may hold it at once: each one
     // resolves its own configuration, and a code tab picks which of them it follows.
     this.kconfigEngineTabIds = [];
@@ -192,11 +198,24 @@ class GlobalState {
    * to it (`setVersion`) and **New Tab** opens a repository explorer on it, so a tab's revision only
    * ever changes when the user asks for it.
    */
-  setSelectedVersion(version) {
+  setSelectedVersion(version, options = {}) {
     const vStr = GlobalState.refOf(version);
     if (!vStr || vStr === this.selectedVersion) return false;
     this.selectedVersion = vStr;
+    if (options.rememberTag !== false && this.currentRepo && !/^[0-9a-f]{7,40}$/i.test(vStr)) {
+      this.selectedVersionByRepo[this.currentRepo] = vStr;
+    }
     this.emit("version:selected", vStr);
+    this.saveState();
+    return true;
+  }
+
+  /** Remember the last valid tag used in `repo` so switching back restores it. */
+  rememberRepoTag(repo, tag) {
+    const r = typeof repo === "string" ? repo : "";
+    const vStr = GlobalState.refOf(tag);
+    if (!r || !vStr || this.selectedVersionByRepo[r] === vStr) return false;
+    this.selectedVersionByRepo[r] = vStr;
     this.saveState();
     return true;
   }
@@ -250,6 +269,8 @@ class GlobalState {
     const isActive = !tab || tab === this.getActiveTab();
     if (isActive) this.currentVersion = vStr;
     this.selectedVersion = vStr;
+    const repo = this.repoOf(tab);
+    if (repo && !/^[0-9a-f]{7,40}$/i.test(vStr)) this.selectedVersionByRepo[repo] = vStr;
 
     // Update the tab's version so it reloads in the newly selected version
     if (tab && tab.version !== vStr) {
@@ -295,6 +316,12 @@ class GlobalState {
    */
   syncRepoFromActiveTab() {
     const tab = this.getActiveTab();
+    const activeId = tab?.id || null;
+    if (this._repoManualOverride) {
+      if (activeId === this._repoOverrideTabId) return false;
+      this._repoManualOverride = false;
+      this._repoOverrideTabId = null;
+    }
     const repo = tab?.repo || "";
     if (!repo || repo === this.currentRepo) return false;
     this._enterRepo(repo);
@@ -302,25 +329,46 @@ class GlobalState {
     if (v) {
       this.currentVersion = v;
       this.selectedVersion = v;
+      if (!/^[0-9a-f]{7,40}$/i.test(v)) this.selectedVersionByRepo[repo] = v;
     }
     this.emit("repo:synced", repo);
     this.saveState();
     return true;
   }
 
-  /** Header project for new tabs while no tab is open (nothing else changes). */
-  setDefaultRepository(repo, defaultVersion = "") {
+  /**
+   * Select a project in the header without moving, opening, or closing any tab (§5.18).
+   * When a tab is open, only the header's project (`currentRepo`), branch scope and selected
+   * revision (`selectedVersion`) change; `currentVersion` keeps the active tab's revision.
+   * When no tab is open, `currentVersion` updates too and `version:changed` is emitted.
+   */
+  setSelectedRepository(repo, defaultVersion = "") {
     if (!repo || repo === this.currentRepo) return false;
     this._enterRepo(repo);
     const v = GlobalState.refOf(defaultVersion);
-    if (v) {
-      this.currentVersion = v;
-      this.selectedVersion = v;
+    const activeTab = this.getActiveTab();
+    if (activeTab) {
+      this._repoManualOverride = true;
+      this._repoOverrideTabId = activeTab.id;
+      if (v) this.selectedVersion = v;
+    } else {
+      this._repoManualOverride = false;
+      this._repoOverrideTabId = null;
+      if (v) {
+        this.currentVersion = v;
+        this.selectedVersion = v;
+      }
     }
+    if (v && !/^[0-9a-f]{7,40}$/i.test(v)) this.selectedVersionByRepo[repo] = v;
     this.saveState();
     this.emit("repo:synced", repo);
-    this.emit("version:changed", this.currentVersion);
+    if (!activeTab) this.emit("version:changed", this.currentVersion);
     return true;
+  }
+
+  /** Header project for new tabs while no tab is open (nothing else changes). */
+  setDefaultRepository(repo, defaultVersion = "") {
+    return this.setSelectedRepository(repo, defaultVersion);
   }
 
   /**
@@ -341,9 +389,12 @@ class GlobalState {
       else tab[key] = value;
     }
     if (tab === this.getActiveTab()) {
+      this._repoManualOverride = false;
+      this._repoOverrideTabId = null;
       this.syncRepoFromActiveTab();
       this.currentVersion = tab.version;
       this.selectedVersion = tab.version;
+      if (tab.version && !/^[0-9a-f]{7,40}$/i.test(tab.version)) this.selectedVersionByRepo[repo] = tab.version;
       this.emit("version:changed", this.currentVersion);
     } else {
       this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
@@ -717,6 +768,8 @@ class GlobalState {
   syncVersionFromTab(version) {
     const vStr = GlobalState.refOf(version);
     if (!vStr) return;
+    const repo = this.activeRepo() || this.currentRepo;
+    if (repo && !/^[0-9a-f]{7,40}$/i.test(vStr)) this.selectedVersionByRepo[repo] = vStr;
     const changed = this.currentVersion !== vStr || this.selectedVersion !== vStr;
     if (!changed) return;
     this.currentVersion = vStr;
@@ -1124,9 +1177,17 @@ class GlobalState {
     this.selectedVersion = GlobalState.refOf(sessionData.selectedVersion) || this.currentVersion;
     this.selectedBranch = typeof sessionData.selectedBranch === "string" ? sessionData.selectedBranch : "";
     this.setBranchTags("", null); // app.js reads the tags of the adopted session's branch
+    this._repoManualOverride = false;
+    this._repoOverrideTabId = null;
     if (typeof sessionData.repo === "string") this.currentRepo = sessionData.repo;
     this.selectedBranchByRepo = sessionData.selectedBranchByRepo && typeof sessionData.selectedBranchByRepo === "object"
       ? { ...sessionData.selectedBranchByRepo } : {};
+    this.selectedVersionByRepo = sessionData.selectedVersionByRepo && typeof sessionData.selectedVersionByRepo === "object"
+      ? { ...sessionData.selectedVersionByRepo } : {};
+    if (this.currentRepo && this.selectedVersion && !this.selectedVersionByRepo[this.currentRepo]
+        && !/^[0-9a-f]{7,40}$/i.test(this.selectedVersion)) {
+      this.selectedVersionByRepo[this.currentRepo] = this.selectedVersion;
+    }
     this.splitMode = sessionData.splitMode || "single";
     this.activePaneId = sessionData.activePaneId || "pane-1";
     if (Array.isArray(sessionData.panes) && sessionData.panes.length > 0) {
@@ -1241,6 +1302,7 @@ class GlobalState {
         selectedBranch: this.selectedBranch,
         repo: this.currentRepo,
         selectedBranchByRepo: { ...this.selectedBranchByRepo, ...(this.currentRepo ? { [this.currentRepo]: this.selectedBranch } : {}) },
+        selectedVersionByRepo: { ...this.selectedVersionByRepo },
         kconfigEngineTabIds: this.kconfigEngineTabIds,
         // Only the descriptors: each engine's values live in kconfigProfiles under profileKey
         kconfigEngineProfiles: Object.fromEntries(Object.entries(this.kconfigEngines).map(([id, e]) => [
