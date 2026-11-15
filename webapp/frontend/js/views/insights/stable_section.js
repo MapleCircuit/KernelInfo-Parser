@@ -6,11 +6,13 @@ import { api } from "../../api.js";
 import { escapeHtml } from "../../components/modal.js";
 import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
+import { hasFeature } from "../../utils/projects.js";
 
 const REASON = { "cc-stable": "Cc: stable", fixes: "Fixes a commit of the series" };
 
 registerInsightsSection({
   id: "stable", label: "Stable", order: 50, releaseScoped: true, keywords: "stable backport missing cc",
+  visible: (repo) => hasFeature(repo, "stable"),
   hint: "Mainline fixes marked for a stable series that it does not carry",
   emptyText: "Every marked commit has a backport in this series.",
   async releaseOptions(ctx) {

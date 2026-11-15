@@ -4,6 +4,44 @@
  * controller the Compare view mounts.
  */
 import { escapeHtml } from "../../components/modal.js";
+import { hasFeature, isManPagesRepo } from "../../utils/projects.js";
+
+export function compareModesForRepo(repo) {
+  const isMan = isManPagesRepo(repo);
+  const modes = [];
+  if (isMan && hasFeature(repo, "man")) modes.push("man");
+  modes.push("files");
+  if (hasFeature(repo, "kconfig")) modes.push("kconfig");
+  if (hasFeature(repo, "api")) modes.push("api");
+  return modes;
+}
+
+export function compareSubtitleForModes(modes, isMan = false) {
+  const labels = {
+    man: "Man entries",
+    files: "Files",
+    kconfig: "Kconfig",
+    api: "API",
+  };
+  const parts = modes.map((m) => labels[m] || m);
+  if (isMan) {
+    const joined = parts.length <= 1 ? (parts[0] || "Files")
+      : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+    return `${joined} changed between any two man-pages release tags or commits.`;
+  }
+  if (parts.length <= 1 && parts[0] === "Files") {
+    return "Files changed between any two release tags or commits.";
+  }
+  const joined = parts.length <= 1 ? (parts[0] || "Files")
+    : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  return `${joined} changes between any two release tags or commits.`;
+}
+
+export function resolveCompareMode(requestedMode, modes, isMan = false) {
+  if (requestedMode && modes.includes(requestedMode)) return requestedMode;
+  if (isMan && modes.includes("man")) return "man";
+  return modes.includes("files") ? "files" : (modes[0] || "files");
+}
 
 export const API_KINDS = ["syscalls", "exports", "params", "tracepoints", "modules"];
 export const API_STATUSES = ["added", "removed", "changed"];

@@ -1,7 +1,7 @@
 /**
  * diff_view.js - Compare view: file and Kconfig deltas between any two tags or commits.
  */
-import { API_KINDS, API_STATUSES, KIND_LABEL, apiDiffHtml, apiDiffMarkdown, apiDiffRows, apiDiffTsv, filterApiRows } from "./api_diff.js";
+import { API_KINDS, API_STATUSES, KIND_LABEL, apiDiffHtml, apiDiffMarkdown, apiDiffRows, apiDiffTsv, compareModesForRepo, compareSubtitleForModes, filterApiRows, resolveCompareMode } from "./api_diff.js";
 import {
   MAN_DOWNLOAD_FORMATS, MAN_STATUS_LABELS, MAN_STATUSES,
   filterManEntries, manDiffBadges, manDiffMarkdown, manDiffSections, manDiffTsv,
@@ -13,7 +13,7 @@ import { refPicker, shortRef } from "../../components/ref_picker.js";
 import { downloadText } from "../../components/modal.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { debounce } from "../../utils/debounce.js";
-import { isManPagesRepo, manPagesRepo } from "../../utils/projects.js";
+import { isManPagesRepo } from "../../utils/projects.js";
 import { manLabel, manTabFields, manTabTitle } from "../man/man_model.js";
 import { previousTag } from "../code_view/file_diff.js";
 
@@ -90,23 +90,12 @@ export class DiffView {
   async render(containerEl, tabData) {
     this.tab = tabData;
     this.containerEl = containerEl;
-    if (tabData.mode === "man" && !this.isManRepo()) {
-      const mrepo = manPagesRepo();
-      if (mrepo) {
-        tabData.repo = mrepo;
-        state.updateTabState(tabData.id, { repo: mrepo }, { replace: true });
-      }
-    }
     const isMan = this.isManRepo();
-    const hasMan = isMan || Boolean(manPagesRepo());
+    const modes = compareModesForRepo(this.repo());
 
     this.versionB = tabData.versionB || tabData.version || await this.defaultTarget();
     this.versionA = tabData.versionA || await this.defaultBaseFor(this.versionB);
-    if (isMan) {
-      this.currentMode = tabData.mode === "files" ? "files" : "man";
-    } else {
-      this.currentMode = ["kconfig", "api"].includes(tabData.mode) ? tabData.mode : "files";
-    }
+    this.currentMode = resolveCompareMode(tabData.mode, modes, isMan);
     // API mode (A6): kinds, statuses, filter and ARCH, recorded on the tab
     this.apiKinds = new Set(String(tabData.apiKinds || "").split(",").filter((k) => API_KINDS.includes(k)));
     this.apiStatuses = new Set(String(tabData.apiStatuses || "").split(",").filter((k) => API_STATUSES.includes(k)));
@@ -131,16 +120,14 @@ export class DiffView {
       this.renameScope = lastSearch.dir;
     }
 
-    const subtitle = isMan
-      ? "Man entries and files changed between any two man-pages release tags or commits."
-      : "Files, Kconfig and API changes between any two release tags or commits.";
-    const modeButtons = isMan
-      ? `<button class="code-btn" data-mode="man" type="button" title="Man entries added, modified or deleted">Man pages <span class="compare-mode-count" id="cmp-count-man"></span></button>
-         <button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>`
-      : `<button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>
-         <button class="code-btn" data-mode="kconfig" type="button">Kconfig <span class="compare-mode-count" id="cmp-count-kconfig"></span></button>
-         <button class="code-btn" data-mode="api" type="button" title="Kernel API changes: syscalls, exports, parameters, tracepoints, modules">API <span class="compare-mode-count" id="cmp-count-api"></span></button>
-         ${hasMan ? `<button class="code-btn" data-mode="man" type="button" title="Compare man entries in the man-pages repository">Man pages <span class="compare-mode-count" id="cmp-count-man"></span></button>` : ""}`;
+    const subtitle = compareSubtitleForModes(modes, isMan);
+    const modeBtnHtml = {
+      man: `<button class="code-btn" data-mode="man" type="button" title="Man entries added, modified or deleted">Man pages <span class="compare-mode-count" id="cmp-count-man"></span></button>`,
+      files: `<button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>`,
+      kconfig: `<button class="code-btn" data-mode="kconfig" type="button">Kconfig <span class="compare-mode-count" id="cmp-count-kconfig"></span></button>`,
+      api: `<button class="code-btn" data-mode="api" type="button" title="Kernel API changes: syscalls, exports, parameters, tracepoints, modules">API <span class="compare-mode-count" id="cmp-count-api"></span></button>`,
+    };
+    const modeButtons = modes.map((m) => modeBtnHtml[m] || "").join("\n         ");
 
     containerEl.innerHTML = `
       <div class="tools-view-container compare-view">
@@ -197,11 +184,6 @@ export class DiffView {
     };
     containerEl.querySelectorAll(".compare-modes .code-btn").forEach((btn) => {
       btn.onclick = () => {
-        if (btn.dataset.mode === "man" && !this.isManRepo()) {
-          const mrepo = manPagesRepo();
-          if (mrepo) state.openTab({ type: "diff", title: "Compare", repo: mrepo, mode: "man" });
-          return;
-        }
         if (this.currentMode === btn.dataset.mode) return;
         this.currentMode = btn.dataset.mode;
         this.persist();

@@ -11,6 +11,7 @@ import { configLookup, evalBuild } from "../kconfig/build_condition.js";
 import { openDefinition } from "../../utils/definition_picker.js";
 import { showSymbolHistoryModal } from "../../components/symbol_history_modal.js";
 import { handleManLinkClick, manLinkHtml } from "../man/man_links.js";
+import { hasFeature } from "../../utils/projects.js";
 
 const fileLink = (path, line, label = null, version = "") =>
   `<a href="#" data-open-file="${escapeHtml(path)}" data-line="${line || 1}"${version ? ` data-version="${escapeHtml(version)}"` : ""}>${escapeHtml(label || `${path}:${line || 1}`)}</a>`;
@@ -38,14 +39,17 @@ function exprText(e) {
   return JSON.stringify(e);
 }
 
-const optionLinks = (opts, version) => (opts || []).map((o) => `<a href="#" data-kconfig="${escapeHtml(o)}" data-version="${escapeHtml(version)}">CONFIG_${escapeHtml(o)}</a>`).join(", ");
+const optionLinks = (opts, version, repo = "") => (opts || []).map((o) => hasFeature(repo, "kconfig")
+  ? `<a href="#" data-kconfig="${escapeHtml(o)}" data-version="${escapeHtml(version)}">CONFIG_${escapeHtml(o)}</a>`
+  : `<code>CONFIG_${escapeHtml(o)}</code>`).join(", ");
 
 function commonClicks(e, ctx) {
   const nt = ctx.forceNew || e.ctrlKey || e.metaKey;
+  const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
   // man 2 <name>: our man-pages copy at the tag of this kernel revision, else man7.org (§5.38)
-  if (handleManLinkClick(e, { kernel: ctx.version, repo: ctx.api?.repo || "", forceNew: nt })) return true;
+  if (hasFeature(repo, "man") && handleManLinkClick(e, { kernel: ctx.version, repo: ctx.api?.repo || "", forceNew: nt })) return true;
   const k = e.target.closest("[data-kconfig]");
-  if (k) {
+  if (k && hasFeature(repo, "kconfig")) {
     e.preventDefault();
     // Opening the KConfig view on an option changes no value: no §5.0 dialog
     const arch = ctx.arch || state.kconfigArch();
@@ -65,7 +69,7 @@ function commonClicks(e, ctx) {
     return true;
   }
   const cg = e.target.closest("[data-callgraph]");
-  if (cg) {
+  if (cg && hasFeature(repo, "callgraph")) {
     e.preventDefault();
     state.openTab({ type: "callgraph", title: `Callgraph: ${cg.dataset.callgraph}`, functionName: cg.dataset.callgraph, version: ctx.version, forceNew: nt });
     return true;
@@ -94,16 +98,23 @@ registerApiSection({
     { id: "unnumbered", label: "unnumbered", test: (r) => r.status === "unnumbered" },
   ],
   detailHtml: (r, ctx) => {
+    const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
     const d = r.definition;
     const sig = d ? `long ${r.entry}(${(d.args || []).map((a) => `${a.type} ${a.name}`).join(", ") || "void"})` : "";
+    const actions = [];
+    if (d) {
+      actions.push(`<a href="#" data-definition="${escapeHtml(r.entry)}">Go to definition</a>`);
+      actions.push(`<a href="#" data-history-path="${escapeHtml(d.path)}" data-history-line="${d.line_s}">History</a>`);
+      if (hasFeature(repo, "callgraph")) actions.push(`<a href="#" data-callgraph="${escapeHtml(r.entry)}">Callers</a>`);
+    }
+    if (hasFeature(repo, "man")) actions.push(manLinkHtml(r.name, "2", `man 2 ${escapeHtml(r.name)}`));
     return `<h2>${escapeHtml(r.name)}</h2>
       <dl class="sv-kv"><dt>Number</dt><dd>${r.nr ?? "none on this ARCH"} ${r.abi ? `(${escapeHtml(r.abi)})` : ""}</dd>
       <dt>Entry point</dt><dd><code>${escapeHtml(r.entry)}</code>${r.compat_entry ? ` · compat <code>${escapeHtml(r.compat_entry)}</code>` : ""}</dd>
       <dt>Status</dt><dd>${escapeHtml(r.status)}</dd>
       ${d ? `<dt>Definition</dt><dd>${fileLink(d.path, d.line_s, null, ctx.version)} <code>${escapeHtml(d.macro)}</code></dd>` : ""}</dl>
       ${sig ? `<pre>${escapeHtml(sig)}</pre>` : ""}
-      <p>${d ? `<a href="#" data-definition="${escapeHtml(r.entry)}">Go to definition</a> · <a href="#" data-history-path="${escapeHtml(d.path)}" data-history-line="${d.line_s}">History</a> · <a href="#" data-callgraph="${escapeHtml(r.entry)}">Callers</a> · ` : ""}
-      ${manLinkHtml(r.name, "2", `man 2 ${escapeHtml(r.name)}`)}</p>`;
+      ${actions.length ? `<p>${actions.join(" · ")}</p>` : ""}`;
   },
   onDetailClick: commonClicks,
   downloads: [{ label: "Syscalls", ext: "tsv", build: (rows) => toTsv(rows, [["nr", (r) => r.nr ?? ""], ["abi", (r) => r.abi], ["name", (r) => r.name], ["entry", (r) => r.entry],
@@ -222,25 +233,29 @@ registerApiSection({
     { id: "asmodule", label: "built as module", test: (m) => m.built === "m" }, { id: "notbuilt", label: "not built", test: (m) => m.built === "n" },
   ],
   fetchDetail: (ctx, key) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/modules/${encodeURIComponent(key)}?arch=${encodeURIComponent(ctx.arch)}`, { timeoutMs: 60000 }),
-  detailHtml: (m, ctx) => `<h2>${escapeHtml(m.modname)}.ko</h2>
+  detailHtml: (m, ctx) => {
+    const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
+    return `<h2>${escapeHtml(m.modname)}.ko</h2>
     <dl class="sv-kv"><dt>Object</dt><dd><code>${escapeHtml(m.target)}</code></dd>
     <dt>Built when</dt><dd><code>${escapeHtml(exprText(m.expr))}</code>${builtUnderEngine(m.expr, ctx.version, ctx.arch) ? ` · built: <b>${escapeHtml(builtUnderEngine(m.expr, ctx.version, ctx.arch))}</b>` : ""}</dd>
-    <dt>Options</dt><dd>${optionLinks(m.options, ctx.version) || "—"}</dd>
+    <dt>Options</dt><dd>${optionLinks(m.options, ctx.version, repo) || "—"}</dd>
     <dt>License</dt><dd>${escapeHtml(m.license || "missing")}</dd>
     ${m.description ? `<dt>Description</dt><dd>${escapeHtml(m.description)}</dd>` : ""}
     ${m.authors.length ? `<dt>Authors</dt><dd>${m.authors.map(escapeHtml).join("<br>")}</dd>` : ""}
-    ${m.init ? `<dt>Init</dt><dd><a href="#" data-callgraph="${escapeHtml(m.init.replace(/^.*\(|\)$/g, ""))}">${escapeHtml(m.init)}</a> (callgraph)</dd>` : ""}
+    ${m.init ? `<dt>Init</dt><dd>${hasFeature(repo, "callgraph") ? `<a href="#" data-callgraph="${escapeHtml(m.init.replace(/^.*\(|\)$/g, ""))}">${escapeHtml(m.init)}</a> (callgraph)` : `<code>${escapeHtml(m.init)}</code>`}</dd>` : ""}
     ${m.firmware.length ? `<dt>Firmware</dt><dd>${m.firmware.map(escapeHtml).join("<br>")}</dd>` : ""}
     ${m.aliases.length ? `<dt>Aliases</dt><dd>${m.aliases.slice(0, 20).map(escapeHtml).join("<br>")}</dd>` : ""}</dl>
     <h3>Sources</h3>${m.members.map((p) => `<div>${fileLink(p, 1, p, ctx.version)}</div>`).join("")}
     ${m.device_tables.length ? `<h3>Device tables</h3>${m.device_tables.map((t) => `<div>${escapeHtml(t.bus)}: ${fileLink(t.path, t.line, t.table, ctx.version)} <a href="#" data-devtable="${escapeHtml(t.table)}">devices</a></div>`).join("")}` : ""}
     ${m.params?.length ? `<h3>Parameters</h3><table>${m.params.map((p) => `<tr><td>${escapeHtml(p.full_name)}</td><td><code>${escapeHtml(p.type)}</code></td><td>${escapeHtml(p.description || "")}</td></tr>`).join("")}</table>` : ""}
     ${m.exports?.length ? `<h3>Exports (${m.exports.length})</h3><div>${m.exports.slice(0, 100).map((e) => `<code>${escapeHtml(e.symbol)}</code>`).join(" ")}</div>` : ""}
-    ${(m.maintainers || []).length ? `<h3>Maintainers</h3>${m.maintainers.slice(0, 8).map((s) => `<div><a href="#" data-maint="${escapeHtml(s.sec_id ?? "")}">${escapeHtml(s.name || s.section || "")}</a></div>`).join("")}` : ""}`,
+    ${(m.maintainers || []).length && hasFeature(repo, "maintainers") ? `<h3>Maintainers</h3>${m.maintainers.slice(0, 8).map((s) => `<div><a href="#" data-maint="${escapeHtml(s.sec_id ?? "")}">${escapeHtml(s.name || s.section || "")}</a></div>`).join("")}` : ""}`;
+  },
   onDetailClick(e, ctx) {
     if (commonClicks(e, ctx)) return true;
+    const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
     const mt = e.target.closest("[data-maint]");
-    if (mt && mt.dataset.maint) {
+    if (mt && mt.dataset.maint && hasFeature(repo, "maintainers")) {
       e.preventDefault();
       state.openTab({ type: "maintainers", title: "Maintainers", secId: parseInt(mt.dataset.maint, 10), version: ctx.version, forceNew: ctx.forceNew || e.ctrlKey || e.metaKey });
       return true;

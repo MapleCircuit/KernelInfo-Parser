@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Query
+from fastapi import APIRouter, Body, Depends, Query
 
+from webapp.backend.config import require_feature
 from webapp.backend.routers.insights import job_answer
 from webapp.backend.services import kapi_service as k
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH
 
-router = APIRouter(prefix="/api/kapi", tags=["kapi"])
+router = APIRouter(prefix="/api/kapi", tags=["kapi"], dependencies=[Depends(require_feature("api"))])
 
 Arch = Annotated[str, Query(description="ARCH value (x86_64, i386, arm, ...)")]
 
@@ -21,7 +22,7 @@ def _page(rows: list[dict[str, Any]], q: str, offset: int, limit: int, text) -> 
     return rows[offset:offset + limit], len(rows)
 
 
-@router.get("/diff")
+@router.get("/diff", dependencies=[Depends(require_feature("api", "compare"))])
 def get_api_diff(
     a: Annotated[str, Query(description="Base revision")],
     b: Annotated[str, Query(description="Target revision")],

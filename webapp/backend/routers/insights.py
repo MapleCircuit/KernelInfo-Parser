@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from webapp.backend.config import require_feature
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.jobs import retry_after_ms
 
-router = APIRouter(prefix="/api/insights", tags=["insights"])
+router = APIRouter(prefix="/api/insights", tags=["insights"], dependencies=[Depends(require_feature("insights"))])
 NO_STORE = {"Cache-Control": "no-store"}
 
 
@@ -25,14 +26,14 @@ def job_answer(state: dict[str, Any], shape=None) -> Any:
     return JSONResponse(body, status_code=202, headers=NO_STORE)
 
 
-@router.get("/{version_name}/stable/series")
+@router.get("/{version_name}/stable/series", dependencies=[Depends(require_feature("stable"))])
 def get_stable_series(version_name: str) -> dict[str, Any]:
     """Releases that have stable tags (H2): [{series, stable_tags, last}], newest first."""
     from webapp.backend.services.stable_service import stable_series
     return {"series": stable_series()}
 
 
-@router.get("/{version_name}/stable/missing")
+@router.get("/{version_name}/stable/missing", dependencies=[Depends(require_feature("stable"))])
 def get_stable_missing(
     version_name: str,
     series: Annotated[str, Query(description="A release with stable tags, e.g. v3.0")],
@@ -52,7 +53,7 @@ def get_stable_missing(
     return job_answer(missing_report(series, wait=2.0), shape)
 
 
-@router.get("/{version_name}/release-stats")
+@router.get("/{version_name}/release-stats", dependencies=[Depends(require_feature("commits"))])
 def get_release_stats(version_name: str) -> Any:
     """Statistics of a release (H6): commits, merges, authors, first-timers, lines, days, -rc count, top
     authors / reviewers / testers / reporters / ackers / sign-offs, employers. The version is the release."""
@@ -61,7 +62,7 @@ def get_release_stats(version_name: str) -> Any:
     return job_answer(release_stats(version_name, wait=2.0))
 
 
-@router.get("/release-stats/series")
+@router.get("/release-stats/series", dependencies=[Depends(require_feature("commits"))])
 def get_release_stats_series(
     tags: Annotated[list[str] | None, Query(alias="tag", description="Releases (repeatable, at most 40)")] = None,
 ) -> dict[str, Any]:
@@ -72,7 +73,7 @@ def get_release_stats_series(
     return {"series": release_stats_series(tags or [])}
 
 
-@router.get("/{version_name}/merge-window")
+@router.get("/{version_name}/merge-window", dependencies=[Depends(require_feature("commits"))])
 def get_merge_window(version_name: str) -> Any:
     """The pulls merged for a release (H5): per first-parent merge its source tree, ref, sender, commit
     count, top directories, MAINTAINERS section, [GIT PULL] thread and merge-window day; commits per day."""
@@ -81,7 +82,7 @@ def get_merge_window(version_name: str) -> Any:
     return job_answer(merge_window(version_name, wait=2.0))
 
 
-@router.get("/{version_name}/subsystems")
+@router.get("/{version_name}/subsystems", dependencies=[Depends(require_feature("maintainers"))])
 def get_subsystem_health(
     version_name: str,
     window: Annotated[int, Query(ge=1, le=12, description="Releases up to this one")] = 4,
@@ -93,7 +94,7 @@ def get_subsystem_health(
     return job_answer(subsystem_health(version_name, window, wait=2.0))
 
 
-@router.get("/{version_name}/subsystems/{sec_id}")
+@router.get("/{version_name}/subsystems/{sec_id}", dependencies=[Depends(require_feature("maintainers"))])
 def get_subsystem_health_one(version_name: str, sec_id: int, window: Annotated[int, Query(ge=1, le=12)] = 4) -> Any:
     """One section of the health report (the Maintainers view's Health panel)."""
     from webapp.backend.services.insights_service import subsystem_health
@@ -108,7 +109,7 @@ def get_subsystem_health_one(version_name: str, sec_id: int, window: Annotated[i
     return job_answer(subsystem_health(version_name, window, wait=2.0), pick)
 
 
-@router.get("/{version_name}/cves")
+@router.get("/{version_name}/cves", dependencies=[Depends(require_feature("cve"))])
 def get_release_cves(
     version_name: str,
     state: Annotated[str, Query(pattern="^(|affected|possibly|fixed)$")] = "",

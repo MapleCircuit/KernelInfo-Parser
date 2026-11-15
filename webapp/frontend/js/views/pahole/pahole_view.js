@@ -6,6 +6,7 @@ import { state } from "../../state.js";
 import { escapeHtml } from "../../components/modal.js";
 import { refPicker } from "../../components/ref_picker.js";
 import { compareHtml, historySvg } from "./pahole_compare.js";
+import { hasFeature } from "../../utils/projects.js";
 
 export class PaholeView {
   constructor() {
@@ -19,6 +20,7 @@ export class PaholeView {
     this.containerEl = containerEl;
     this.tabId = tabData.id;
     this.currentVersion = tabData.version || state.currentVersion;
+    const repo = tabData.repo || state.activeRepo();
     if (tabData.structName) {
       this.structName = tabData.structName.replace(/^(struct|union)\s+/, "").trim();
     }
@@ -37,7 +39,7 @@ export class PaholeView {
             <div style="display:flex;gap:8px;">
               <input type="text" id="pahole-search-input" value="${escapeHtml(this.structName)}" placeholder="Struct name..." />
               <button class="code-btn active" id="pahole-search-btn">Analyze</button>
-              <button class="code-btn" id="pahole-btn-nodemap" title="Open struct layout in NodeMap">🗺️ Open in NodeMap</button>
+              ${hasFeature(repo, "nodemap") ? '<button class="code-btn" id="pahole-btn-nodemap" title="Open struct layout in NodeMap">🗺️ Open in NodeMap</button>' : ""}
               <button class="code-btn" id="pahole-btn-compare" title="Compare this layout with another revision, member by member (N3)">⇄ Compare with…</button>
               <button class="code-btn" id="pahole-btn-history" title="Size, holes and cachelines at each release where the definition changed (N3)">📈 History</button>
             </div>

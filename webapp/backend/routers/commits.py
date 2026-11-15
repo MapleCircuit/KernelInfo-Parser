@@ -2,8 +2,9 @@
 from __future__ import annotations
 import re
 from typing import Annotated, Any
-from fastapi import APIRouter, Query, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+from webapp.backend.config import require_feature
 from webapp.backend.services import commit_relations, release_service
 from webapp.backend.services.commit_facts import commit_ids, git_facts, release_badges
 from webapp.backend.services.git_service import GitService
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/api", tags=["commits"])
 git_service = GitService()
 
 
-@router.get("/commits/{version_name}/list")
+@router.get("/commits/{version_name}/list", dependencies=[Depends(require_feature("commits"))])
 def get_commits(
     version_name: str,
     page: int = Query(1, ge=1),
@@ -24,25 +25,25 @@ def get_commits(
     return git_service.get_commits(version_name, page, limit, q)
 
 
-@router.get("/commits/{version_name}/detail/{commit_id_or_hash}")
+@router.get("/commits/{version_name}/detail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits"))])
 def get_commit(version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
     """Commit details, files and multi-contributor trailers."""
     return git_service.get_commit_detail(commit_id_or_hash)
 
 
-@router.post("/commits/{version_name}/resolve_mail/{commit_id_or_hash}")
+@router.post("/commits/{version_name}/resolve_mail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits", "mail"))])
 def resolve_commit_mail(version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
     """On-demand resolution of a commit against the mailing list archive."""
     return git_service.resolve_commit_mail(commit_id_or_hash)
 
 
-@router.get("/commits/{version_name}/diff/{commit_hash}")
+@router.get("/commits/{version_name}/diff/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
 def get_commit_diff(version_name: str, commit_hash: str, context: int = Query(3, ge=0, le=20)) -> dict[str, Any]:
     """Structured diff of one commit against its first parent, with old/new line numbers per row."""
     return git_service.get_commit_diff(commit_hash, context)
 
 
-@router.get("/commits/{version_name}/blame/{path:path}")
+@router.get("/commits/{version_name}/blame/{path:path}", dependencies=[Depends(require_feature("commits"))])
 def get_blame(
     version_name: str,
     path: str,
@@ -54,13 +55,13 @@ def get_blame(
     return git_service.get_blame(version_name, path, move=bool(move), copy=bool(copy), ignore_ws=bool(ws))
 
 
-@router.get("/commits/{version_name}/history/{path:path}")
+@router.get("/commits/{version_name}/history/{path:path}", dependencies=[Depends(require_feature("commits"))])
 def get_file_history(version_name: str, path: str, limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     """Commits that changed a file, newest first, and its last change."""
     return git_service.get_file_history(version_name, path, limit)
 
 
-@router.get("/commits/{version_name}/timeline")
+@router.get("/commits/{version_name}/timeline", dependencies=[Depends(require_feature("commits"))])
 def get_commit_timeline(
     version_name: str,
     limit: int = Query(100, ge=1, le=250),
@@ -71,7 +72,7 @@ def get_commit_timeline(
     return git_service.get_commit_timeline(version_name, limit=limit, direction=direction, cursor_id=cursor_id)
 
 
-@router.get("/commits/{version_name}/search")
+@router.get("/commits/{version_name}/search", dependencies=[Depends(require_feature("commits"))])
 def search_commits(version_name: str, q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
     """Commit search by hash prefix, subject or author (at least two characters)."""
     if len(q.strip()) < 2:
@@ -79,7 +80,7 @@ def search_commits(version_name: str, q: str = Query(...), limit: int = Query(50
     return git_service.get_commits(version_name, page=1, limit=limit, query=q)
 
 
-@router.post("/version/{version_name}/patch/series")
+@router.post("/version/{version_name}/patch/series", dependencies=[Depends(require_feature("patch"))])
 def format_patch_series(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """A multi-file patch series in git format-patch form (P3): cover letter, [PATCH n/N], To/Cc,
     base-commit, plus whether it applies cleanly to its base (checked in memory)."""
@@ -87,7 +88,7 @@ def format_patch_series(version_name: str, payload: dict[str, Any] = Body(...)) 
     return format_series(version_name, payload)
 
 
-@router.post("/version/{version_name}/patch/format")
+@router.post("/version/{version_name}/patch/format", dependencies=[Depends(require_feature("patch"))])
 def format_patch(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """RFC-2822 email patch from in-browser edits."""
     return git_service.format_patch(version_name, payload)
@@ -120,7 +121,7 @@ def _building(state: dict[str, Any], what: str) -> JSONResponse:
     return JSONResponse(body, status_code=202, headers=NO_STORE)
 
 
-@router.get("/commits/{version_name}/released/{commit_hash}")
+@router.get("/commits/{version_name}/released/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
 def get_released(version_name: str, commit_hash: str) -> Any:
     """First tag and release containing a commit (H3): {commit, first_tag, first_release, first_stable,
     released} or {released: false, branches}. 202 while the release index is first built."""
@@ -132,7 +133,7 @@ def get_released(version_name: str, commit_hash: str) -> Any:
     return body if info.get("released") else JSONResponse(body, headers=NO_STORE)
 
 
-@router.post("/commits/{version_name}/released")
+@router.post("/commits/{version_name}/released", dependencies=[Depends(require_feature("commits"))])
 def post_released(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
     """Batched first releases (timeline cards, popovers): {results: {hash: {...}}, index: {state}}."""
     hashes = _hashes(payload)
@@ -174,7 +175,7 @@ def _enrich(relations: dict[str, Any]) -> dict[str, Any]:
     return relations
 
 
-@router.get("/commits/{version_name}/relations/{commit_hash}")
+@router.get("/commits/{version_name}/relations/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
 def get_relations(version_name: str, commit_hash: str) -> Any:
     """What a commit fixes and what fixed it, reverts, backports, Cc: stable and mail links (H1, H2):
     m_commit_relation for ingested commits, else the commit relation index (webapp/API.md section 2.16),
@@ -199,7 +200,7 @@ def get_relations(version_name: str, commit_hash: str) -> Any:
     return JSONResponse(body, headers=NO_STORE) if body.get("refreshing") else body
 
 
-@router.post("/commits/{version_name}/relations")
+@router.post("/commits/{version_name}/relations", dependencies=[Depends(require_feature("commits"))])
 def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
     """Relation counts of many commits (timeline chips): {results: {hash: {fixed_by, reverted_by,
     backports, fixes, stable_cc}}}. Ingested commits are counted in the database; the others in the
@@ -223,7 +224,7 @@ def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> An
 
 
 
-@router.get("/commits/{version_name}/query")
+@router.get("/commits/{version_name}/query", dependencies=[Depends(require_feature("commits"))])
 def query_commits(
     version_name: str,
     path: Annotated[list[str] | None, Query(description="Touched path or glob (repeatable, at most 8): fs/ext4, *.h, !drivers/")] = None,

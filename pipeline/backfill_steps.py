@@ -9,7 +9,7 @@ from core.config import (
 
 import argparse
 import contextlib
-from pipeline.git_network import kernel_steps_apply
+from pipeline.git_network import feature_enabled
 from pipeline.state import MF, logger
 
 
@@ -98,8 +98,8 @@ def run_automatic_backfills(args: argparse.Namespace) -> None:
                 backfills.backfill_commit_relations(db, str(MF.repo_dir))
         if not finished:
             return
-        # The Kbuild backfill reads the Makefiles of this run's repository: none for a project that is not a kernel tree
-        if kbuild_empty and kernel_steps_apply():
+        # The Kbuild backfill reads the Makefiles of this run's repository: none when kconfig is disabled
+        if kbuild_empty and feature_enabled("kconfig"):
             if getattr(args, "no_backfill", False):
                 logger.info("[Backfill Kbuild] m_kbuild_symbol is empty; skipped (--no-backfill). Run --backfill-kbuild to fill it.")
             else:

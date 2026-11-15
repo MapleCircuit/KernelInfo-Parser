@@ -18,7 +18,7 @@ import { showPatchModal } from "../../components/patch_modal.js";
 import { isDocumentationPath } from "../docs/rst_renderer.js";
 import { isManPagePath } from "../man/man_model.js";
 import { mountManDocument } from "../man/man_view.js";
-import { isManPagesRepo } from "../../utils/projects.js";
+import { hasFeature, isManPagesRepo } from "../../utils/projects.js";
 
 /** A page file of the man-pages project renders as a man page (§5.38). */
 const isManDocument = (path, repo) => isManPagesRepo(repo) && isManPagePath(path);
@@ -180,6 +180,11 @@ export class VirtualEditor {
   updateEngineButton() {
     const btn = this.containerEl?.querySelector("#btn-kconfig-engine");
     if (!btn) return;
+    if (!hasFeature(this.api?.repo, "kconfig")) {
+      btn.hidden = true;
+      return;
+    }
+    btn.hidden = false;
     const engines = state.kconfigEngineList();
     const engine = engines.find((e) => e.tabId === this.engineTabId);
     btn.classList.toggle("active", Boolean(engine));
@@ -263,28 +268,31 @@ export class VirtualEditor {
       }
     }
 
+    const repo = this.api?.repo;
     // Action buttons in priority order: first item is first to hide/overflow (right-to-left)
     const priorityButtons = [
       { id: "btn-copy-link", label: "Copy Link to Lines…", icon: "🔗" },
       { id: "btn-outline", label: () => (this.outline.open ? "Hide Outline" : "Show Outline"), icon: "☰" },
       { id: "btn-file-refs", label: "Referenced by…", icon: "⇇" },
-      { id: "btn-create-patch", label: "Create Patch", icon: "✎" },
+      ...(hasFeature(repo, "patch") ? [{ id: "btn-create-patch", label: "Create Patch", icon: "✎" }] : []),
       { id: "btn-copy-raw", label: "Copy File", icon: "📋" },
-      { id: "btn-file-history", label: "File History", icon: "📜" },
-      {
-        id: "btn-toggle-blame",
-        label: () => (this.showBlame ? "Hide Blame Annotations" : "Show Git Blame"),
-        icon: () => (this.showBlame ? "✓" : "👁"),
-      },
+      ...(hasFeature(repo, "commits") ? [
+        { id: "btn-file-history", label: "File History", icon: "📜" },
+        {
+          id: "btn-toggle-blame",
+          label: () => (this.showBlame ? "Hide Blame Annotations" : "Show Git Blame"),
+          icon: () => (this.showBlame ? "✓" : "👁"),
+        },
+      ] : []),
       { id: "btn-file-diff", label: "Diff File...", icon: "⇄" },
-      {
+      ...(hasFeature(repo, "kconfig") ? [{
         id: "btn-kconfig-engine",
         label: () => {
           const e = state.kconfigEngineList().find((x) => x.tabId === this.engineTabId);
           return e ? `KConfig Engine (${e.arch})` : "KConfig Engine...";
         },
         icon: "⚙",
-      },
+      }] : []),
     ];
 
     // Measure natural widths when visible
@@ -684,7 +692,7 @@ export class VirtualEditor {
 
   /** #ifdef dimming is only active while the Kconfig engine is enabled with a resolved configuration. */
   dimmingAvailable() {
-    return state.kconfigConfigActive(this.engineTabId) && PREPROCESSED_RE.test(this.currentFilePath || "");
+    return hasFeature(this.api?.repo, "kconfig") && state.kconfigConfigActive(this.engineTabId) && PREPROCESSED_RE.test(this.currentFilePath || "");
   }
 
   computeDimming() {
@@ -732,7 +740,7 @@ export class VirtualEditor {
     const banner = this.containerEl?.querySelector("#code-build-banner");
     if (!banner) return;
     const path = this.currentFilePath || "";
-    if (!state.kconfigConfigActive(this.engineTabId) || this.isDoc || !BUILD_TRACKED_RE.test(path)) {
+    if (!hasFeature(this.api?.repo, "kconfig") || !state.kconfigConfigActive(this.engineTabId) || this.isDoc || !BUILD_TRACKED_RE.test(path)) {
       banner.hidden = true;
       return;
     }
@@ -844,13 +852,19 @@ export class VirtualEditor {
     for (const [a, b] of this.diffMarks?.ranges || []) {
       for (let n = a; n <= b; n++) this.diffMarkedLines.add(n);
     }
+    const repo = this.api?.repo;
     // Documentation renders kernel.org-style by default unless a specific source line was requested
-    this.isMan = isManDocument(this.currentFilePath, this.api.repo);
-    this.isDoc = this.isMan || isDocumentationPath(this.currentFilePath);
+    this.isMan = hasFeature(repo, "man") && isManDocument(this.currentFilePath, repo);
+    this.isDoc = this.isMan || (hasFeature(repo, "docs") && isDocumentationPath(this.currentFilePath));
     if (this.isDoc && !tabData.docMode) {
       tabData.docMode = this.targetCursorLine > 1 ? "source" : "rendered";
     }
     this.docMode = this.isDoc ? tabData.docMode : "source";
+    const kconfigOn = hasFeature(repo, "kconfig");
+    const cveOn = hasFeature(repo, "cve");
+    const maintOn = hasFeature(repo, "maintainers");
+    const commitsOn = hasFeature(repo, "commits");
+    const patchOn = hasFeature(repo, "patch");
 
     // Every segment of the path opens the repository explorer of this revision on that directory
     const pathParts = (this.currentFilePath || "").split("/").filter(Boolean);
@@ -875,25 +889,25 @@ export class VirtualEditor {
           </div>
           <div class="code-actions">
             ${this.isDoc ? `<button class="code-btn ${this.docMode === "rendered" ? "active" : ""}" id="btn-doc-toggle" title="Toggle rendered documentation / raw source">${this.docMode === "rendered" ? "📖 Rendered" : "&lt;/&gt; Source"}</button>` : ""}
-            <button type="button" id="kconfig-dim-chip" class="code-dim-chip" style="display:none;" aria-pressed="false"></button>
+            <button type="button" id="kconfig-dim-chip" class="code-dim-chip" style="display:none;"${kconfigOn ? "" : " hidden"} aria-pressed="false"></button>
             ${this.diffMarks ? `<span class="code-diffmark-chip ${this.diffMarks.kind === "del" ? "del" : "add"}" title="Lines ${this.diffMarks.kind === "del" ? "removed" : "added or changed"} by commit ${this.diffMarks.commit || ""}">
               ± ${(this.diffMarks.commit || "").slice(0, 8)}: ${this.diffMarkedLines.size} line${this.diffMarkedLines.size === 1 ? "" : "s"} ${this.diffMarks.kind === "del" ? "removed" : "changed"}
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
             <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
-            <span id="file-security-badge" class="code-security-badge" style="display:none;" title="Security Insights"></span>
-            <span id="file-subsystem" class="code-subsystem-chip" style="display:none;" title="Subsystem"></span>
-            <span id="file-last-changed" class="code-last-changed" style="display:none;" title="Click to view full commit history"></span>
-            <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"></button>
+            <span id="file-security-badge" class="code-security-badge" style="display:none;"${cveOn ? "" : " hidden"} title="Security Insights"></span>
+            <span id="file-subsystem" class="code-subsystem-chip" style="display:none;"${maintOn ? "" : " hidden"} title="Subsystem"></span>
+            <span id="file-last-changed" class="code-last-changed" style="display:none;"${commitsOn ? "" : " hidden"} title="Click to view full commit history"></span>
+            <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"${kconfigOn ? "" : " hidden"}></button>
             <button class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
-            <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 History</button>
-            <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it">Blame</button>
-            <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" style="display:none;" aria-haspopup="true">⚙</button>
+            <button class="code-btn" id="btn-file-history" title="View commit history for this file"${commitsOn ? "" : " hidden"}>📜 History</button>
+            <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it"${commitsOn ? "" : " hidden"}>Blame</button>
+            <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" style="display:none;"${commitsOn ? "" : " hidden"} aria-haspopup="true">⚙</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
             <button type="button" class="code-btn" id="btn-outline" title="Outline of this file's definitions">☰ Outline</button>
             <button type="button" class="code-btn" id="btn-file-refs" title="Files including this one, Kconfig sources, Kbuild rules and documents naming it">⇇ Refs<span class="code-btn-badge" id="file-refs-count"></span></button>
             <button type="button" class="code-btn" id="btn-copy-link" title="Copy a link to the selected lines (click line numbers to select; Shift+click extends)">🔗 Link</button>
-            <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch">✎ Patch</button>
+            <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch"${patchOn ? "" : " hidden"}>✎ Patch</button>
             <button type="button" class="code-btn code-overflow-btn" id="btn-code-overflow" title="More actions" style="display:none;" aria-haspopup="true" aria-expanded="false">▾</button>
           </div>
         </div>
@@ -1368,7 +1382,7 @@ export class VirtualEditor {
       this.astOverlay.indexMultiLineSpans(this.rawLines);
 
       // Update last changed metadata chip in toolbar if available
-      if (res.file_info && res.file_info.last_changed) {
+      if (hasFeature(this.api?.repo, "commits") && res.file_info && res.file_info.last_changed) {
         const lc = res.file_info.last_changed;
         const lastChangedEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-last-changed");
         if (lastChangedEl) {
@@ -1382,52 +1396,56 @@ export class VirtualEditor {
       }
 
       // Fetch CVE security badge for this file
-      this.api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
-        const badge = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
-        if (!badge) return;
-        const total = cveRes?.total ?? (Array.isArray(cveRes?.cves) ? cveRes.cves.length : 0);
-        if (total > 0) {
-          badge.style.display = "inline-flex";
-          badge.innerHTML = `🛡️ ${total} CVE${total === 1 ? "" : "s"}`;
-          badge.title = `${total} CVE${total === 1 ? "" : "s"} associated with ${this.currentFilePath} (click to view Security Insights)`;
-          badge.onclick = () => {
-            state.openTab({
-              type: "insights",
-              title: "Insights · Security",
-              view: "security",
-              version: this.currentVersion,
-            });
-          };
-          this.updateToolbarOverflow();
-        } else {
-          badge.style.display = "none";
-        }
-      }).catch((err) => console.warn("CVE lookup failed:", err));
+      if (hasFeature(this.api?.repo, "cve")) {
+        this.api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
+          const badge = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
+          if (!badge) return;
+          const total = cveRes?.total ?? (Array.isArray(cveRes?.cves) ? cveRes.cves.length : 0);
+          if (total > 0) {
+            badge.style.display = "inline-flex";
+            badge.innerHTML = `🛡️ ${total} CVE${total === 1 ? "" : "s"}`;
+            badge.title = `${total} CVE${total === 1 ? "" : "s"} associated with ${this.currentFilePath} (click to view Security Insights)`;
+            badge.onclick = () => {
+              state.openTab({
+                type: "insights",
+                title: "Insights · Security",
+                view: "security",
+                version: this.currentVersion,
+              });
+            };
+            this.updateToolbarOverflow();
+          } else {
+            badge.style.display = "none";
+          }
+        }).catch((err) => console.warn("CVE lookup failed:", err));
+      }
 
       // Fetch Subsystem indicator for this file
-      this.api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
-        const subChip = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
-        if (!subChip) return;
-        const subs = matchRes?.subsystems || [];
-        const subName = subs[0] || matchRes?.files?.[0]?.subsystems?.[0]?.name || "";
-        if (subName) {
-          subChip.style.display = "inline-flex";
-          subChip.innerHTML = `🏷️ ${escapeHtml(subName)}`;
-          subChip.title = `Subsystem: ${subName} (click to view Maintainers)`;
-          subChip.onclick = () => {
-            state.openTab({
-              type: "maintainers",
-              title: "Maintainers",
-              section: "subsystems",
-              query: subName,
-              version: this.currentVersion,
-            });
-          };
-          this.updateToolbarOverflow();
-        } else {
-          subChip.style.display = "none";
-        }
-      }).catch((err) => console.warn("Subsystem lookup failed:", err));
+      if (hasFeature(this.api?.repo, "maintainers")) {
+        this.api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
+          const subChip = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
+          if (!subChip) return;
+          const subs = matchRes?.subsystems || [];
+          const subName = subs[0] || matchRes?.files?.[0]?.subsystems?.[0]?.name || "";
+          if (subName) {
+            subChip.style.display = "inline-flex";
+            subChip.innerHTML = `🏷️ ${escapeHtml(subName)}`;
+            subChip.title = `Subsystem: ${subName} (click to view Maintainers)`;
+            subChip.onclick = () => {
+              state.openTab({
+                type: "maintainers",
+                title: "Maintainers",
+                section: "subsystems",
+                query: subName,
+                version: this.currentVersion,
+              });
+            };
+            this.updateToolbarOverflow();
+          } else {
+            subChip.style.display = "none";
+          }
+        }).catch((err) => console.warn("Subsystem lookup failed:", err));
+      }
 
       // Load server tokens into AST overlay
       if (Array.isArray(res.tokens)) {
@@ -1553,7 +1571,7 @@ export class VirtualEditor {
     this.tabData.title = docPath.split("/").pop();
     this.tabData.cursorLine = 1;
     this.tabData.docAnchor = anchor || "";
-    this.tabData.docMode = isDocumentationPath(docPath) || isManDocument(docPath, this.api.repo) ? "rendered" : "source";
+    this.tabData.docMode = (hasFeature(this.api?.repo, "docs") && isDocumentationPath(docPath)) || (hasFeature(this.api?.repo, "man") && isManDocument(docPath, this.api?.repo)) ? "rendered" : "source";
     state.saveState();
     state.emit("tabs:changed", { paneId: state.activePaneId, activeTabId: this.tabData.id });
   }

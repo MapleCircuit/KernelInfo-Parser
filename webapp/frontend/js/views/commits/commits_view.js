@@ -12,6 +12,7 @@ import { toast } from "../../components/toast.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
+import { hasFeature } from "../../utils/projects.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -656,7 +657,8 @@ export class CommitsView {
       onProgress: (p) => { if (live() && body) body.innerHTML = `<span class="rel-loading">Indexing commit relations (first use)… ${escapeHtml(progressLabel(p))}</span>`; },
     }).then((rel) => {
       if (!live() || !body) return;
-      const html = relationsHtml(rel);
+      const repo = this.api?.repo || state.activeRepo();
+      const html = relationsHtml(rel, { showCve: hasFeature(repo, "cve"), showMail: hasFeature(repo, "mail") });
       body.innerHTML = html || '<span class="rel-none">No Fixes:, revert or backport relation, and no Cc: stable.</span>';
       if (countEl) countEl.textContent = relationsCount(rel) ? `(${relationsCount(rel)})` : "";
     }).catch((err) => {
@@ -687,13 +689,13 @@ export class CommitsView {
       return true;
     }
     const cve = e.target.closest(".rel-cve[data-cve]");
-    if (cve) {
+    if (cve && hasFeature(this.api?.repo, "cve")) {
       e.preventDefault();
       state.openTab({ type: "insights", title: "Insights · Security", view: "security", sel: cve.dataset.cve, version: this.currentVersion, forceNew: forceNew || e.ctrlKey || e.metaKey });
       return true;
     }
     const mail = e.target.closest(".rel-mail[data-mid]");
-    if (mail) {
+    if (mail && hasFeature(this.api?.repo, "mail")) {
       e.preventDefault();
       state.openTab({ type: "mail", title: "LKML thread", messageId: mail.dataset.mid, forceNew: forceNew || e.ctrlKey || e.metaKey });
       return true;
@@ -767,7 +769,7 @@ export class CommitsView {
         </div>
 
         <!-- Mailing List Discussions & Linked Emails -->
-        <div class="m-card" style="margin-bottom:16px;" id="commit-mail-card">
+        ${hasFeature(this.api?.repo, "mail") ? `<div class="m-card" style="margin-bottom:16px;" id="commit-mail-card">
           <div class="m-card-title" style="display:flex;justify-content:space-between;align-items:center;">
             <span>✉ Mailing List Discussions &amp; Patches (${(c.linked_emails || []).length})</span>
             <button class="code-btn" id="btn-open-ml-search" style="font-size:10px;padding:2px 8px;" title="Search LKML for this commit subject">
@@ -777,7 +779,7 @@ export class CommitsView {
           <div id="commit-linked-emails-body" style="display:flex;flex-direction:column;gap:6px;font-size:11px;">
             ${this.renderLinkedEmailsHtml(c)}
           </div>
-        </div>
+        </div>` : ""}
 
         <!-- Contributors & Signoffs (Trailers) -->
         ${(() => {

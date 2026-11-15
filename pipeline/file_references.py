@@ -17,7 +17,7 @@ from core.DBLayout import (
     m_kbuild_symbol,
 )
 from pipeline.changesets import get_fid_for_path, get_fnid_for_path
-from pipeline.git_network import kernel_steps_apply
+from pipeline.git_network import feature_enabled
 from pipeline.state import MF, gp, logger
 
 
@@ -86,7 +86,7 @@ def processing_kbuild(
     when its target file does not exist. `staged_file_refs` is unused (kept for callers). Skipped for a project
     that is not a kernel tree (`kernel_steps_apply()`: the man-pages' GNUmakefile is no Kbuild file).
     """
-    if gp.VID == 0 or not kernel_steps_apply():
+    if gp.VID == 0 or not feature_enabled("kconfig"):
         return
     from parser.kbuild_parser import KbuildParser
     from parser import kbuild_symbols
@@ -134,7 +134,7 @@ def processing_doc_references(
     references to the document's own path); `new_pairs` limits the scan to the (fnid, blob_id) pairs new
     in this version (None: all).
     """
-    if gp.VID == 0:
+    if gp.VID == 0 or not feature_enabled("docs"):
         return
     if staged_file_refs is None:
         staged_file_refs = set()

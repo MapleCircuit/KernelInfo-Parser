@@ -8,14 +8,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
+from webapp.backend.config import require_feature
 from webapp.backend.services import man_service
 
 router = APIRouter(prefix="/api/man", tags=["man"])
 
 
-@router.get("/tags")
+@router.get("/tags", dependencies=[Depends(require_feature("man"))])
 def get_man_tags() -> dict[str, Any]:
     """The man-pages release tags with their dates, newest first."""
     return man_service.tags()
@@ -31,7 +32,7 @@ def resolve_man_page(
     return man_service.resolve(name, section or None, kernel or None)
 
 
-@router.get("/diff")
+@router.get("/diff", dependencies=[Depends(require_feature("man", "compare"))])
 def diff_man_pages(
     a: str = Query(...),
     b: str = Query(...),
@@ -40,13 +41,13 @@ def diff_man_pages(
     return man_service.diff(a, b)
 
 
-@router.get("/{version_name}/index")
+@router.get("/{version_name}/index", dependencies=[Depends(require_feature("man"))])
 def get_man_index(version_name: str) -> dict[str, Any]:
     """Every page of a man-pages revision with its summary and `.so` alias target."""
     return man_service.index(version_name)
 
 
-@router.get("/{version_name}/page")
+@router.get("/{version_name}/page", dependencies=[Depends(require_feature("man"))])
 def get_man_page(
     version_name: str,
     path: str = Query(""),

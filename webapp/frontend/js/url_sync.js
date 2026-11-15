@@ -18,6 +18,7 @@
  */
 import { state } from "./state.js";
 import { hashRepo, routeKeys, tabRoute } from "./tab_routes.js";
+import { isTabFeatureEnabled } from "./utils/projects.js";
 
 /** Compare rename searches from `rn=<similarity>:<directory>` entries (applied in order; empty dir = whole tree). */
 function parseRenameSearches(values) {
@@ -80,6 +81,11 @@ class UrlSynchronizer {
    */
   setRepoHandler(fn) {
     this.repoHandler = typeof fn === "function" ? fn : null;
+  }
+
+  /** Install an optional notice callback for rejected/fallback deep-link features. */
+  setNoticeHandler(fn) {
+    this.noticeHandler = typeof fn === "function" ? fn : null;
   }
 
   /** Apply an address (or, without one, write the active tab's): a tab of the project its `repo=` names. */
@@ -389,6 +395,13 @@ class UrlSynchronizer {
 
       // Restoring a revision from the hash selects it in the header; the tab opened below carries it
       if (v) state.setSelectedVersion(v);
+
+      const targetRepo = repo || state.activeRepo();
+      if (tabType !== "explorer" && !isTabFeatureEnabled(targetRepo, tabType)) {
+        this.noticeHandler?.(`Feature '${tabType}' is disabled for project '${targetRepo || "current"}'; opening Explorer instead`);
+        open({ type: "explorer", title: `Explorer ${ver ? ver : ""}`.trim(), path: dir, version: ver, forceNew: true });
+        return;
+      }
 
       const route = tabRoute(tabType);
       if (route?.fromHash) {

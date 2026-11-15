@@ -10,7 +10,7 @@ import subprocess as sp
 from core.DBLayout import (
     m_commit_email,
 )
-from pipeline.git_network import _lookup_commit_ids
+from pipeline.git_network import _lookup_commit_ids, feature_enabled
 from pipeline.state import MF, gp, logger
 
 
@@ -25,6 +25,10 @@ def resolve_version_mailing_list_commits(
     """Resolve mailing list patch emails and pull request threads for commits in the active version."""
     from parser.mailing_list.ml_client import MailingListClient
     from parser.mailing_list.ml_types import CommitFeatures
+
+    if not feature_enabled("mail"):
+        logger.debug("Mailing list commit resolution is disabled for this repository.")
+        return 0
 
     ml_cfg = get_mailing_list_config()
     if not ml_cfg.get("enabled", True):

@@ -4,6 +4,7 @@ Provides:
 - RepositoriesScreen: Master view listing all configured and detected repositories.
 - RepoDetailScreen: Detail view editing project name, default branch, start ref, git URL,
   interactive branch selection with pattern filtering, and tag view regex rules.
+- RepoFeaturesScreen: Per-repository feature overrides editor against project defaults.
 """
 
 from __future__ import annotations
@@ -17,13 +18,18 @@ from typing import Any, Callable, List, Optional, Set, Tuple
 
 from core.config import (
     DEFAULT_TAG_VIEWS,
+    PROJECT_FEATURE_DEFS,
     REPO_ROOT,
     _merge_repositories,
+    default_project_features,
     detect_repository,
     find_repository_branches,
     find_repository_dirs,
     get_repos_dir,
     is_git_repository,
+    normalize_feature_overrides,
+    prune_default_feature_overrides,
+    repository_project,
     resolve_repo_path,
 )
 from core.tui.screens.base import BaseScreen
@@ -591,11 +597,15 @@ class RepoDetailScreen(BaseScreen):
             render_item_func=self._render_tag_view_item,
         )
 
+        # Per-repository feature overrides
+        self.feature_overrides: dict[str, bool] = normalize_feature_overrides(self.repo_entry.get("features"))
+
         # Action Buttons
         self.save_btn = Button(y=19, x=2, label="Save (S)", on_click=self.save_changes)
-        self.test_btn = Button(y=19, x=16, label="Test (T)", on_click=self.test_repo_settings)
-        self.reset_tags_btn = Button(y=19, x=30, label="Reset Tags (R)", on_click=self.reset_tag_views_to_presets)
-        self.cancel_btn = Button(y=19, x=51, label="Cancel (Esc)", on_click=self.on_esc)
+        self.test_btn = Button(y=19, x=15, label="Test (T)", on_click=self.test_repo_settings)
+        self.features_btn = Button(y=19, x=28, label=self._features_button_label(), on_click=self.open_features_screen)
+        self.reset_tags_btn = Button(y=19, x=45, label="Reset Tags (R)", on_click=self.reset_tag_views_to_presets)
+        self.cancel_btn = Button(y=19, x=64, label="Cancel (Esc)", on_click=self.on_esc)
 
         self.status_bar = StatusBar(
             shortcuts=[
@@ -604,6 +614,7 @@ class RepoDetailScreen(BaseScreen):
                 ("↑/↓", "Row"),
                 ("Space", "Toggle"),
                 ("Enter/A/D", "Edit/Add/Del Rule"),
+                ("F", "Features"),
                 ("T", "Test"),
                 ("S", "Save"),
                 ("R", "Reset Tags"),
@@ -623,6 +634,7 @@ class RepoDetailScreen(BaseScreen):
             self.tag_views_list,
             self.save_btn,
             self.test_btn,
+            self.features_btn,
             self.reset_tags_btn,
             self.cancel_btn,
         ]
@@ -655,6 +667,49 @@ class RepoDetailScreen(BaseScreen):
             tag_rule_index=self.tag_views_list.get_selected_index(),
         )
 
+    def _effective_project_slug(self) -> str:
+        """Return the project slug currently active in the form."""
+        return self.project_input.value.strip() or repository_project(self.repo_entry)
+
+    def _pruned_feature_overrides(self) -> dict[str, bool]:
+        """Return feature overrides that differ from the effective project's defaults."""
+        return prune_default_feature_overrides(self._effective_project_slug(), self.feature_overrides)
+
+    def _features_button_label(self) -> str:
+        """Return the Features button label, showing custom override count when non-empty."""
+        count = len(self._pruned_feature_overrides())
+        return f"Features: {count} (F)" if count > 0 else "Features (F)"
+
+    def _update_features_button_label(self) -> None:
+        """Refresh the Features button label and width to match current overrides."""
+        label = self._features_button_label()
+        self.features_btn.label = label
+        self.features_btn.width = len(label) + 4
+
+    def _apply_feature_overrides(self, overrides: dict[str, bool]) -> None:
+        """Apply updated feature overrides from RepoFeaturesScreen."""
+        self.feature_overrides = prune_default_feature_overrides(self._effective_project_slug(), overrides)
+        self._update_features_button_label()
+        count = len(self.feature_overrides)
+        if count:
+            self.status_bar.set_message(f"Updated feature overrides ({count} custom).", color=PAIR_SUCCESS)
+        else:
+            self.status_bar.set_message("Features set to project defaults.", color=PAIR_SUCCESS)
+
+    def open_features_screen(self) -> RepoFeaturesScreen:
+        """Open the per-repository feature overrides sub-screen."""
+        screen = RepoFeaturesScreen(
+            self.stdscr,
+            self.app,
+            repo_name=str(self.repo_entry.get("name") or self._effective_project_slug()),
+            project_slug=self._effective_project_slug(),
+            overrides=self.feature_overrides,
+            on_apply=self._apply_feature_overrides,
+        )
+        if self.app is not None and hasattr(self.app, "push_screen"):
+            self.app.push_screen(screen)
+        return screen
+
     def _get_form_snapshot(self) -> dict[str, Any]:
         """Capture every editable value for unsaved-change detection."""
         return {
@@ -664,6 +719,7 @@ class RepoDetailScreen(BaseScreen):
             "git_url": self.git_url_input.value.strip(),
             "branches": sorted(self.selected_branches),
             "tag_views": copy.deepcopy(self.tag_views),
+            "features": self._pruned_feature_overrides(),
         }
 
     def has_unsaved_changes(self) -> bool:
@@ -856,6 +912,13 @@ class RepoDetailScreen(BaseScreen):
         self.repo_entry["git_url"] = self.git_url_input.value.strip()
         self.repo_entry["branches"] = [b for b in self.all_branches if b in self.selected_branches]
         self.repo_entry["tag_views"] = copy.deepcopy(self.tag_views)
+        pruned_features = self._pruned_feature_overrides()
+        if pruned_features:
+            self.repo_entry["features"] = pruned_features
+        else:
+            self.repo_entry.pop("features", None)
+        self.feature_overrides = pruned_features
+        self._update_features_button_label()
         self._initial_snapshot = self._get_form_snapshot()
         self._remember_view_state()
 
@@ -940,10 +1003,21 @@ class RepoDetailScreen(BaseScreen):
             btn_y = max(15, 10 + list_h + 1)
             self.save_btn.y = btn_y
             self.test_btn.y = btn_y
+            self.features_btn.y = btn_y
             self.reset_tags_btn.y = btn_y
             self.cancel_btn.y = btn_y
 
             self.status_bar.y = max_y - 1
+
+        self._update_features_button_label()
+        buttons = [self.save_btn, self.test_btn, self.features_btn, self.reset_tags_btn, self.cancel_btn]
+        avail = max(1, max_x - 3)
+        total_w = sum(len(b.label) + 4 for b in buttons)
+        gap = 2 if total_w + 2 * (len(buttons) - 1) <= avail else 1
+        cur_x = 2
+        for b in buttons:
+            b.x = cur_x
+            cur_x += len(b.label) + 4 + gap
 
         # Header Title
         repo_name = self.repo_entry.get("name") or "New Repository"
@@ -1039,6 +1113,9 @@ class RepoDetailScreen(BaseScreen):
             if ch in (ord("T"), ord("t")):
                 self.test_repo_settings()
                 return True
+            if ch in (ord("F"), ord("f")):
+                self.open_features_screen()
+                return True
             if ch in (ord("R"), ord("r")):
                 self.reset_tag_views_to_presets()
                 return True
@@ -1071,3 +1148,227 @@ class RepoDetailScreen(BaseScreen):
         if focused is self.branch_filter_input and res:
             self.filter_branches(self.branch_filter_input.value)
         return res
+
+
+class RepoFeaturesScreen(BaseScreen):
+    """Per-repository feature overrides editor against project defaults."""
+
+    def __init__(
+        self,
+        stdscr: Any,
+        app: Any = None,
+        repo_name: str = "",
+        project_slug: str = "linux",
+        overrides: Optional[dict[str, bool]] = None,
+        on_apply: Optional[Callable[[dict[str, bool]], None]] = None,
+    ) -> None:
+        super().__init__(stdscr, app)
+        self.project_slug = project_slug or "linux"
+        self.repo_name = repo_name or self.project_slug
+        self.defaults: dict[str, bool] = default_project_features(self.project_slug)
+        self.draft_overrides: dict[str, bool] = prune_default_feature_overrides(self.project_slug, overrides)
+        self._initial_overrides: dict[str, bool] = dict(self.draft_overrides)
+        self.on_apply = on_apply
+        self._last_yx: Tuple[int, int] = (0, 0)
+
+        self.feature_list = ScrollableList(
+            y=2,
+            x=2,
+            height=15,
+            width=76,
+            items=list(PROJECT_FEATURE_DEFS),
+            title="Features ([Space] Toggle, [R] Reset All)",
+            render_item_func=self._render_feature_item,
+        )
+
+        self.done_btn = Button(y=21, x=2, label="Done (Enter/D)", on_click=self.apply_and_back)
+        self.reset_btn = Button(y=21, x=22, label="Reset Defaults (R)", on_click=self.reset_defaults)
+        self.cancel_btn = Button(y=21, x=46, label="Cancel (Esc)", on_click=self.on_esc)
+
+        self.status_bar = StatusBar(
+            shortcuts=[
+                ("↑/↓", "Feature"),
+                ("Space", "Toggle"),
+                ("R", "Reset All"),
+                ("Enter/D", "Apply"),
+                ("Esc", "Cancel"),
+            ],
+            y=23,
+        )
+
+        self.widgets = [
+            self.feature_list,
+            self.done_btn,
+            self.reset_btn,
+            self.cancel_btn,
+        ]
+        self.focus_widget(0)
+
+    def _render_feature_item(self, feat: dict[str, Any]) -> str:
+        """Render one feature row with effective state, default, and override marker."""
+        key = feat["key"]
+        label = feat["label"]
+        default_val = bool(self.defaults.get(key, False))
+        default_str = "On" if default_val else "Off"
+        if key in self.draft_overrides:
+            val = self.draft_overrides[key]
+            state_str = "Enabled [override]" if val else "Disabled [override]"
+        else:
+            val = default_val
+            state_str = f"Default ({default_str})"
+        marker = "[X]" if val else "[ ]"
+        return f"{marker} {label:<18} | Default: {default_str:<3} | {state_str}"
+
+    def toggle_selected_feature(self) -> bool:
+        """Toggle the highlighted feature's effective value, storing only non-default overrides."""
+        feat = self.feature_list.get_selected()
+        if feat is None:
+            return False
+        key = feat["key"]
+        default_val = bool(self.defaults.get(key, False))
+        current_val = self.draft_overrides.get(key, default_val)
+        new_val = not current_val
+        if new_val == default_val:
+            self.draft_overrides.pop(key, None)
+        else:
+            self.draft_overrides[key] = new_val
+        return True
+
+    def reset_defaults(self) -> None:
+        """Clear all feature overrides so every feature uses the project default."""
+        self.draft_overrides.clear()
+        self.status_bar.set_message("Reset all features to project defaults.", color=PAIR_SUCCESS)
+
+    def apply_and_back(self) -> None:
+        """Apply pruned overrides via callback and return to RepoDetailScreen."""
+        pruned = prune_default_feature_overrides(self.project_slug, self.draft_overrides)
+        if callable(self.on_apply):
+            self.on_apply(pruned)
+        if self.app is not None and hasattr(self.app, "pop_screen"):
+            self.app.pop_screen()
+
+    def on_esc(self) -> bool:
+        """Return to RepoDetailScreen, confirming first if draft overrides changed."""
+        if self.draft_overrides != self._initial_overrides:
+            choice = safe_modal_dialog(
+                self.stdscr,
+                title="Unsaved Feature Changes",
+                message="Discard unsaved feature override changes?",
+                buttons=["Discard", "Cancel"],
+                default_button=1,
+            )
+            if choice != "Discard":
+                return True
+        if self.app is not None and hasattr(self.app, "pop_screen"):
+            self.app.pop_screen()
+        return True
+
+    def _selected_description_lines(self, width: int, max_lines: int) -> list[str]:
+        """Wrap the highlighted feature's description into at most `max_lines` rows."""
+        feat = self.feature_list.get_selected()
+        if feat is None or width <= 0 or max_lines <= 0:
+            return []
+        text = f"{feat['label']} ({feat['key']}): {feat['description']}"
+        lines = [text[i : i + width] for i in range(0, len(text), width)] or [""]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1][:-1] + "…"
+        return lines
+
+    def draw(self) -> None:
+        """Render the per-repository feature overrides screen."""
+        self.clear()
+        max_y, max_x = self.get_maxyx()
+
+        if (max_y, max_x) != self._last_yx:
+            self._last_yx = (max_y, max_x)
+            list_h = max(5, max_y - 8)
+            self.feature_list.y = 2
+            self.feature_list.x = 2
+            self.feature_list.height = list_h
+            self.feature_list.width = max(30, max_x - 4)
+
+            btn_y = max(9, max_y - 3)
+            buttons = [self.done_btn, self.reset_btn, self.cancel_btn]
+            avail = max(1, max_x - 3)
+            total_w = sum(len(b.label) + 4 for b in buttons)
+            gap = 2 if total_w + 2 * (len(buttons) - 1) <= avail else 1
+            cur_x = 2
+            for b in buttons:
+                b.y = btn_y
+                b.x = cur_x
+                cur_x += len(b.label) + 4 + gap
+
+            self.status_bar.y = max_y - 1
+
+        header_text = f" Features: {self.repo_name} (project: {self.project_slug}) "
+        self.safe_addstr(
+            0,
+            max(2, (max_x - len(header_text)) // 2),
+            header_text,
+            get_color(PAIR_HEADER) | curses.A_BOLD,
+        )
+
+        for widget in self.widgets:
+            if hasattr(widget, "draw"):
+                widget.draw(self.stdscr)
+
+        desc_top = self.feature_list.y + self.feature_list.height + 1
+        desc_rows = max(0, self.done_btn.y - desc_top)
+        for i, line in enumerate(self._selected_description_lines(max(1, max_x - 4), desc_rows)):
+            self.safe_addstr(desc_top + i, 2, line, get_color(PAIR_MUTED))
+
+        self.status_bar.draw(self.stdscr)
+        self.refresh()
+
+    def handle_key(self, ch: int) -> bool:
+        """Handle navigation, toggling, reset, apply, and cancel keys."""
+        if ch == 27:  # Esc
+            return self.on_esc()
+        if ch == 9:  # Tab
+            self.focus_next()
+            return True
+        if ch in (curses.KEY_BTAB, 353):  # Shift-Tab
+            self.focus_prev()
+            return True
+
+        focused = self.get_focused_widget()
+
+        if focused is self.feature_list:
+            if ch == ord(" "):
+                self.toggle_selected_feature()
+                return True
+            if ch in (10, 13, curses.KEY_ENTER):
+                self.apply_and_back()
+                return True
+            if ch in (curses.KEY_UP, curses.KEY_DOWN):
+                idx = focused.get_selected_index()
+                if ch == curses.KEY_UP:
+                    if focused.items and idx > 0:
+                        focused.select_prev()
+                    else:
+                        self.focus_prev()
+                else:
+                    if focused.items and idx < len(focused.items) - 1:
+                        focused.select_next()
+                    else:
+                        self.focus_next()
+                return True
+
+        if isinstance(focused, Button) and ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            return focused.handle_key(ch)
+
+        if ch in (ord("r"), ord("R")):
+            self.reset_defaults()
+            return True
+        if ch in (ord("d"), ord("D")):
+            self.apply_and_back()
+            return True
+        if ch == curses.KEY_UP:
+            self.focus_prev()
+            return True
+        if ch == curses.KEY_DOWN:
+            self.focus_next()
+            return True
+
+        return super().handle_key(ch)

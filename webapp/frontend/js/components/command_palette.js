@@ -13,6 +13,9 @@ import { shortcuts } from "../utils/shortcuts.js";
 import { groupByFile, grepSummary, highlightRanges } from "../utils/grep_format.js";
 import { viewOf } from "../utils/active_views.js";
 import { KIND_ICONS, matchSymbols } from "../views/code_view/outline_model.js";
+import { hasFeature } from "../utils/projects.js";
+
+const MODE_FEATURE = { "#": "commits", "?": "kconfig", "@": "mail" };
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -119,7 +122,7 @@ class CommandPalette {
         <div class="cmdp-results" role="listbox"></div>
         <div class="cmdp-footer">
           <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Ctrl+Enter</kbd> new tab</span>${this.keyHint()}
-          <span class="cmdp-prefixes"><code>/</code> commands <code>$</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>@</code> mail <code>%</code> code</span>
+          <span class="cmdp-prefixes"><code>/</code> commands <code>$</code> symbols ${hasFeature(state.activeRepo(), "commits") ? "<code>#</code> commits " : ""}${hasFeature(state.activeRepo(), "kconfig") ? "<code>?</code> kconfig " : ""}<code>:</code> line ${hasFeature(state.activeRepo(), "mail") ? "<code>@</code> mail " : ""}<code>%</code> code</span>
         </div>
       </div>`;
     document.body.appendChild(backdrop);
@@ -155,7 +158,10 @@ class CommandPalette {
 
   parse() {
     const raw = this.el?.querySelector(".cmdp-input").value || "";
-    const mode = MODES[raw[0]] ? raw[0] : "";
+    const ch = raw[0];
+    const feat = MODE_FEATURE[ch];
+    const allowed = !feat || hasFeature(state.activeRepo(), feat);
+    const mode = (MODES[ch] && allowed) ? ch : "";
     return { mode, query: (mode ? raw.slice(1) : raw).trim() };
   }
 
@@ -240,11 +246,12 @@ class CommandPalette {
     } else if (!query) {
       items = this.commandProvider().slice(0, 8).map((c) => ({ section: "Suggested commands", icon: "›", title: c.title, detail: c.hint || "", run: c.run }));
     } else {
+      const repo = state.activeRepo();
       const wantFiles = mode === "";
       const wantSymbols = mode === "" || mode === "$";
-      const wantKconfig = mode === "" || mode === "?";
-      const wantCommits = mode === "#";
-      const wantMail = mode === "@" || (mode === "" && query.length >= 3);
+      const wantKconfig = hasFeature(repo, "kconfig") && (mode === "" || mode === "?");
+      const wantCommits = hasFeature(repo, "commits") && mode === "#";
+      const wantMail = hasFeature(repo, "mail") && (mode === "@" || (mode === "" && query.length >= 3));
       const [files, symbols, kconfig, commits, mail] = await Promise.allSettled([
         wantFiles ? api.searchFiles(version, query, 25) : null,
         wantSymbols && query.length >= 2 ? api.searchSymbols(version, query, mode === "$" ? 50 : 15) : null,

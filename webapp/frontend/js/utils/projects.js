@@ -24,14 +24,91 @@ export function projectOf(repo) {
 export const isManPagesRepo = (repo) => projectSlug(projectOf(repo)) === "man-pages";
 export const isLinuxRepo = (repo) => projectSlug(projectOf(repo)) === "linux";
 
+export const DEFAULT_KERNEL_FEATURES = Object.freeze({
+  kconfig: true,
+  api: true,
+  nodemap: true,
+  maintainers: true,
+  commits: true,
+  mail: true,
+  insights: true,
+  stable: true,
+  cve: true,
+  man: true,
+  pahole: true,
+  callgraph: true,
+  docs: true,
+  patch: true,
+  compare: true,
+});
+
+export const DEFAULT_MANPAGES_FEATURES = Object.freeze({
+  kconfig: false,
+  api: false,
+  nodemap: false,
+  maintainers: false,
+  commits: true,
+  mail: false,
+  insights: true,
+  stable: false,
+  cve: false,
+  man: true,
+  pahole: false,
+  callgraph: false,
+  docs: false,
+  patch: true,
+  compare: true,
+});
+
+export const TAB_FEATURE = Object.freeze({
+  kconfig: "kconfig",
+  api: "api",
+  nodemap: "nodemap",
+  maintainers: "maintainers",
+  commits: "commits",
+  mail: "mail",
+  insights: "insights",
+  man: "man",
+  pahole: "pahole",
+  callgraph: "callgraph",
+  patch: "patch",
+  diff: "compare",
+});
+
+export function repoFeatures(repo) {
+  const base = isManPagesRepo(repo) ? DEFAULT_MANPAGES_FEATURES : DEFAULT_KERNEL_FEATURES;
+  const overrides = projectOf(repo)?.features;
+  return overrides && typeof overrides === "object" ? { ...base, ...overrides } : { ...base };
+}
+
+export function hasFeature(repo, feature) {
+  if (!feature) return true;
+  const feats = repoFeatures(repo);
+  if (Array.isArray(feature)) return feature.every((f) => !f || Boolean(feats[f]));
+  return Boolean(feats[feature]);
+}
+
+export const tabTypeFeature = (type) => TAB_FEATURE[type] || "";
+
+export function isTabFeatureEnabled(repo, type) {
+  const feat = tabTypeFeature(type);
+  if (!feat) return true;
+  if (type === "man") return hasFeature(repo, "man") && (isManPagesRepo(repo) || Boolean(manPagesRepo()));
+  return hasFeature(repo, feat);
+}
+
 /** First available repository of a project (`preferred` first when it is one), "" when none is configured. */
 export function repoOfProject(slug, preferred = "") {
-  const ok = (p) => projectSlug(p) === slug && p.available !== false;
+  const ok = (p) => p && projectSlug(p) === slug && p.available !== false;
   if (preferred && ok(projectOf(preferred))) return preferred;
   return PROJECTS.find(ok)?.repo || "";
 }
 
-export const manPagesRepo = (preferred = "") => repoOfProject("man-pages", preferred);
+export function manPagesRepo(preferred = "") {
+  const ok = (p) => p && projectSlug(p) === "man-pages" && p.available !== false && hasFeature(p.repo, "man");
+  if (preferred && ok(projectOf(preferred))) return preferred;
+  return PROJECTS.find(ok)?.repo || "";
+}
 export const linuxRepo = (preferred = "") => repoOfProject("linux", preferred);
 
 /**

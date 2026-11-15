@@ -13,11 +13,13 @@ from core.globalstuff import (
 from core.quit_listener import GracefulQuitListener
 from core import ingest_state, distributed
 from core.config import (
+    default_project_features,
     get_parser_config,
     get_ssh_tunnel_config,
     get_mailing_list_config,
     get_repository,
     get_default_repo_path,
+    repo_feature_enabled,
     resolve_repo_path,
     is_kernel_project,
     repository_project,
@@ -148,12 +150,17 @@ def _run() -> None:
     # in this repository; --cve does only this. A repository of a project that is not a kernel tree (man-pages)
     # has no kernel commits to resolve: the CVE list is left to the kernel repository's runs
     if repo_entry is None:
-        kernel_repo = is_kernel_project(repo_project_slug(repo_path, [MF.get_root_commit() or ""]))
+        slug = repo_project_slug(repo_path, [MF.get_root_commit() or ""])
+        kernel_repo = is_kernel_project(slug)
+        cve_enabled = default_project_features(slug)["cve"]
     else:
         kernel_repo = is_kernel_project(repository_project(repo_entry))
+        cve_enabled = repo_feature_enabled(repo_entry, "cve")
     if not kernel_repo and getattr(args, "cve", False):
         logger.warning(COLOR.yellow(f"[CVE] '{repo_path}' is not a kernel repository; --cve has nothing to resolve in it."))
-    if kernel_repo and role != distributed.ROLE_WORKER and (getattr(args, "cve", False) or not getattr(args, "no_cve", False)):
+    if kernel_repo and role != distributed.ROLE_WORKER and (
+        getattr(args, "cve", False) or (cve_enabled and not getattr(args, "no_cve", False))
+    ):
         _cve_net, cve_repo_id = resolve_git_network_and_repo(repo_path)
         summary = processing_cve_list(force=bool(getattr(args, "cve_full", False)), kernel_repo=repo_path, repo_id=cve_repo_id)
         if summary and summary.get("state") == "current":

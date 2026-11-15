@@ -7,6 +7,7 @@ import { api } from "../../api.js";
 import { escapeHtml } from "../../components/modal.js";
 import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
+import { hasFeature } from "../../utils/projects.js";
 
 const SETUP = `<h2>CVE records are not configured</h2>
 <p>The Security section reads CVE records from a local git clone, either the CVE Program's list (every CNA; the Linux kernel's records are picked out) or the kernel CNA's own repository:</p>
@@ -46,6 +47,7 @@ function versionItem(v) {
 
 registerInsightsSection({
   id: "security", label: "Security", order: 60, releaseScoped: true, keywords: "cve vulnerability security",
+  visible: (repo) => hasFeature(repo, "cve"),
   hint: "Linux kernel CVEs affecting a release, or fixed in it",
   emptyText: "No CVE record affects this release or is fixed in it.",
   async releaseOptions(ctx) {

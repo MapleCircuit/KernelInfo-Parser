@@ -18,7 +18,9 @@ from core.tui.theme import (
     safe_addstr,
     draw_box,
 )
+from core.config import PROJECT_FEATURE_DEFS
 from core.tui.screens.base import BaseScreen
+from core.tui.screens.repos import RepoDetailScreen, RepoFeaturesScreen
 from core.tui.widgets import (
     TextInput,
     Checkbox,
@@ -433,6 +435,148 @@ class TestTuiWidgets(unittest.TestCase):
         small_dialog = ModalDialog(small_win, "Title", "A very long message " * 5, ["OK", "Cancel"])
         small_dialog.draw()
         self.assertTrue(len(small_win.calls) > 0)
+
+
+class _DummyApp:
+    """Minimal app stub tracking screen stack and dirty flag."""
+
+    def __init__(self) -> None:
+        self.screen_stack: list[BaseScreen] = []
+        self.is_dirty = False
+        self.config: dict[str, object] = {}
+
+    def push_screen(self, screen: BaseScreen) -> None:
+        self.screen_stack.append(screen)
+        screen.on_enter()
+
+    def pop_screen(self) -> BaseScreen | None:
+        if not self.screen_stack:
+            return None
+        popped = self.screen_stack.pop()
+        popped.on_leave()
+        return popped
+
+
+class TestRepoFeaturesTui(unittest.TestCase):
+    """Test per-project feature overrides in RepoDetailScreen and RepoFeaturesScreen."""
+
+    def test_man_pages_enable_api_and_save_persists_override(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "man-pages", "project": "man-pages", "branches": ["master"]}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+
+        self.assertFalse(detail.has_unsaved_changes())
+        self.assertEqual(detail.features_btn.label, "Features (F)")
+
+        # Move focus off TextInput so 'f' triggers Features shortcut
+        detail.focus_widget(detail.widgets.index(detail.branch_list))
+        self.assertTrue(detail.handle_key(ord("f")))
+        self.assertEqual(len(app.screen_stack), 2)
+        feat_screen = app.screen_stack[-1]
+        self.assertIsInstance(feat_screen, RepoFeaturesScreen)
+
+        # Select 'api' (index 1 in PROJECT_FEATURE_DEFS) and toggle it On
+        api_idx = next(i for i, d in enumerate(PROJECT_FEATURE_DEFS) if d["key"] == "api")
+        feat_screen.feature_list.set_selected(api_idx)
+        self.assertIn("Default (Off)", feat_screen._render_feature_item(PROJECT_FEATURE_DEFS[api_idx]))
+        self.assertTrue(feat_screen.handle_key(ord(" ")))
+        self.assertIn("Enabled [override]", feat_screen._render_feature_item(PROJECT_FEATURE_DEFS[api_idx]))
+
+        # Apply with 'D'
+        self.assertTrue(feat_screen.handle_key(ord("d")))
+        self.assertEqual(len(app.screen_stack), 1)
+        self.assertTrue(detail.has_unsaved_changes())
+        self.assertEqual(detail.features_btn.label, "Features: 1 (F)")
+
+        detail.save_changes()
+        self.assertTrue(app.is_dirty)
+        self.assertEqual(entry.get("features"), {"api": True})
+
+    def test_linux_disable_kconfig_and_toggle_back_omits_features(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "branches": ["master"]}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+
+        feat_screen = detail.open_features_screen()
+        kconfig_idx = next(i for i, d in enumerate(PROJECT_FEATURE_DEFS) if d["key"] == "kconfig")
+        feat_screen.feature_list.set_selected(kconfig_idx)
+        self.assertIn("Default (On)", feat_screen._render_feature_item(PROJECT_FEATURE_DEFS[kconfig_idx]))
+
+        # Toggle kconfig Off -> Disabled [override]
+        feat_screen.handle_key(ord(" "))
+        self.assertIn("Disabled [override]", feat_screen._render_feature_item(PROJECT_FEATURE_DEFS[kconfig_idx]))
+        feat_screen.handle_key(10)  # Enter applies
+        self.assertTrue(detail.has_unsaved_changes())
+
+        detail.save_changes()
+        self.assertEqual(entry.get("features"), {"kconfig": False})
+        self.assertFalse(detail.has_unsaved_changes())
+
+        # Reopen features screen and toggle kconfig back to default On
+        feat_screen2 = detail.open_features_screen()
+        feat_screen2.feature_list.set_selected(kconfig_idx)
+        feat_screen2.handle_key(ord(" "))
+        self.assertIn("Default (On)", feat_screen2._render_feature_item(PROJECT_FEATURE_DEFS[kconfig_idx]))
+        feat_screen2.apply_and_back()
+
+        self.assertTrue(detail.has_unsaved_changes())
+        self.assertEqual(detail.features_btn.label, "Features (F)")
+        detail.save_changes()
+        self.assertNotIn("features", entry)
+
+    def test_reset_defaults_hotkey_and_esc_handling(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "features": {"kconfig": False, "api": False}}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+
+        self.assertEqual(detail.features_btn.label, "Features: 2 (F)")
+        feat_screen = detail.open_features_screen()
+
+        # Unchanged Esc pops immediately without modal
+        self.assertTrue(feat_screen.handle_key(27))
+        self.assertEqual(len(app.screen_stack), 1)
+
+        # Reopen, reset with 'R', then Esc with Cancel keeps screen open; Discard pops
+        feat_screen = detail.open_features_screen()
+        self.assertTrue(feat_screen.handle_key(ord("r")))
+        self.assertEqual(feat_screen.draft_overrides, {})
+
+        with patch("core.tui.screens.repos.safe_modal_dialog", return_value="Cancel"):
+            self.assertTrue(feat_screen.handle_key(27))
+            self.assertEqual(len(app.screen_stack), 2)
+
+        feat_screen.apply_and_back()
+        self.assertEqual(len(app.screen_stack), 1)
+        self.assertTrue(detail.has_unsaved_changes())
+
+        # Esc on RepoDetailScreen prompts when feature overrides changed
+        with patch("core.tui.screens.repos.safe_modal_dialog", return_value="Cancel") as mock_dlg:
+            self.assertTrue(detail.handle_key(27))
+            mock_dlg.assert_called_once()
+            self.assertEqual(len(app.screen_stack), 1)
+
+    def test_draw_and_resize_80x24_and_120x40(self) -> None:
+        for rows, cols in [(24, 80), (40, 120), (16, 80)]:
+            win = MockCursesWindow(rows, cols)
+            entry = {"name": "linux", "project": "linux", "features": {"kconfig": False}}
+            detail = RepoDetailScreen(win, repo_entry=entry)
+            detail.draw()
+            self.assertTrue(len(win.calls) > 0)
+
+            feat_screen = detail.open_features_screen()
+            feat_screen.draw()
+            self.assertTrue(len(win.calls) > 0)
+
+            # Verify header and feature rows rendered
+            rendered = "\n".join(args[2] for op, args, _ in win.calls if op == "addstr")
+            self.assertIn("Features: linux (project: linux)", rendered)
+            self.assertIn("Kconfig Engine", rendered)
 
 
 if __name__ == "__main__":

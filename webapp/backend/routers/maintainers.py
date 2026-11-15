@@ -1,10 +1,11 @@
 """webapp/backend/routers/maintainers.py - Subsystems Roster, Maintainers & CREDITS."""
 from __future__ import annotations
 from typing import Any
-from fastapi import APIRouter, Query, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from webapp.backend.config import require_feature
 from webapp.backend.services.maintainer_service import MaintainerService
 
-router = APIRouter(prefix="/api", tags=["maintainers"])
+router = APIRouter(prefix="/api", tags=["maintainers"], dependencies=[Depends(require_feature("maintainers"))])
 maintainer_service = MaintainerService()
 
 

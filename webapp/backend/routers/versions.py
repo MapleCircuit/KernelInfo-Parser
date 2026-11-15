@@ -21,6 +21,7 @@ from core.config import (
     MANPAGES_TAG_VIEWS,
     detect_default_branch,
     matches_branch_filter,
+    resolve_repo_features,
 )
 from parser.git_ast.release_order import PREFIXED_SERIES, PREFIXED_TAG_RE, parse_tag, release_key
 from webapp.backend.config import (
@@ -175,6 +176,7 @@ def projects_catalog() -> list[dict[str, Any]]:
             "available": resolve_repo_path(repo).exists(),
             "active": False,
             "tag_views": repo.get("tag_views") or copy.deepcopy(default_views),
+            "features": resolve_repo_features(repo),
         })
     return projects
 

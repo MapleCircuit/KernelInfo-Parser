@@ -626,5 +626,114 @@ class TestNonKernelProjects(unittest.TestCase):
             self.assertEqual(pipeline.arch_layouts.processing_arch_layouts("v0"), 0)
 
 
+class TestFeatureGating(unittest.TestCase):
+    """Per-repository feature flags and pipeline step gating."""
+
+    def setUp(self) -> None:
+        self.mock = unittest.mock
+        self.saved = (
+            G.DB,
+            getattr(main.gp, "VID", 0),
+            getattr(main.gp, "project_slug", None),
+            getattr(main.gp, "file_blob_hashes", None),
+            getattr(main.gp, "project_features", None),
+        )
+        MockDB.reset()
+        G.DB = MockDB
+        pipeline.git_network._network_repo_cache.clear()
+        pipeline.git_network._repo_project_cache.clear()
+        pipeline.external_steps._FACTS_MEMO.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "linux")
+        os.makedirs(self.repo, exist_ok=True)
+        subprocess.run(["git", "-C", self.repo, "init", "-q"], check=True)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@e",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@e",
+        }
+        subprocess.run(["git", "-C", self.repo, "commit", "-q", "--allow-empty", "-m", "c0"], check=True, env=env)
+
+    def tearDown(self) -> None:
+        G.DB, main.gp.VID, main.gp.project_slug, main.gp.file_blob_hashes, main.gp.project_features = self.saved
+        pipeline.git_network._network_repo_cache.clear()
+        pipeline.git_network._repo_project_cache.clear()
+        pipeline.external_steps._FACTS_MEMO.clear()
+        MockDB.reset()
+        self.tmp.cleanup()
+
+    def test_resolve_stores_project_features_and_caches(self) -> None:
+        entry = {"name": "linux", "path": self.repo, "project": "linux", "features": {"api": False, "kconfig": False}}
+        with self.mock.patch.object(pipeline.git_network, "get_repository", return_value=entry):
+            net_id, repo_id = pipeline.git_network.resolve_git_network_and_repo(self.repo)
+        self.assertFalse(pipeline.git_network.feature_enabled("api"))
+        self.assertFalse(pipeline.git_network.feature_enabled("kconfig"))
+        self.assertTrue(pipeline.git_network.feature_enabled("docs"))
+        main.gp.project_features = None
+        with self.mock.patch.object(pipeline.git_network, "get_repository", side_effect=AssertionError("looked up again")):
+            self.assertEqual(pipeline.git_network.resolve_git_network_and_repo(self.repo), (net_id, repo_id))
+        self.assertFalse(pipeline.git_network.feature_enabled("api"))
+
+    def test_disabled_features_gate_pipeline_steps(self) -> None:
+        main.gp.VID = 5
+        main.gp.project_slug = "linux"
+        main.gp.file_blob_hashes = {"Makefile": b"\1" * 20}
+        main.gp.project_features = {
+            "kconfig": False,
+            "docs": False,
+            "maintainers": False,
+            "mail": False,
+            "commits": False,
+            "insights": False,
+        }
+        boom = AssertionError("gated step ran")
+        with self.mock.patch.object(pipeline.file_references, "_version_file_list", side_effect=boom), \
+                self.mock.patch.object(pipeline.arch_layouts, "compute_layout_rows", side_effect=boom), \
+                self.mock.patch.object(pipeline.maintainers, "get_fid_for_path", side_effect=boom):
+            pipeline.file_references.processing_kbuild("v3.0")
+            pipeline.file_references.processing_doc_references("v3.0")
+            self.assertEqual(pipeline.arch_layouts.processing_arch_layouts("v3.0"), 0)
+            pipeline.maintainers.processing_maintainer_files("v3.0")
+
+        self.assertEqual(
+            pipeline.mailing_list_steps.resolve_version_mailing_list_commits([object()], {}),
+            0,
+        )
+        self.assertIsNone(pipeline.external_steps.processing_release_stats(self.repo, 1))
+
+    def test_source_facts_filters_families_by_feature(self) -> None:
+        main.gp.VID = 5
+        main.gp.project_slug = "man-pages"
+        main.gp.file_blob_hashes = {"man/man2/read.2": b"\2" * 20}
+        main.gp.project_features = {"api": False, "kconfig": False, "docs": False, "man": True}
+        with self.mock.patch("parser.facts_ingest.ingest", return_value={"extracted": 0, "blobs": 1, "rows": 0, "seconds": 0.0}) as mock_ingest:
+            pipeline.external_steps.processing_source_facts("man-pages-6.9")
+        mock_ingest.assert_called_once()
+        self.assertEqual(mock_ingest.call_args.kwargs.get("families"), (1, 3, 6))
+
+        main.gp.project_features = {"api": True, "kconfig": True, "docs": True, "man": True}
+        with self.mock.patch("parser.facts_ingest.ingest", return_value={"extracted": 0, "blobs": 1, "rows": 0, "seconds": 0.0}) as mock_ingest:
+            pipeline.external_steps.processing_source_facts("v3.0")
+        mock_ingest.assert_called_once()
+        self.assertNotIn("families", mock_ingest.call_args.kwargs)
+
+    def test_automatic_kbuild_backfill_gated_by_kconfig(self) -> None:
+        import argparse
+        from core import backfills
+        from parser.git_ast.commit_relations import BACKFILL_DONE
+
+        main.gp.project_slug = "linux"
+        main.gp.project_features = {"kconfig": False}
+        args = argparse.Namespace(no_backfill=False)
+        fake_db = self.mock.MagicMock()
+        fake_db.row_exists.side_effect = [True, False]
+        with self.mock.patch.object(G, "DB", return_value=self.mock.MagicMock(__enter__=lambda s: fake_db, __exit__=lambda s, *a: None)), \
+                self.mock.patch.object(backfills, "commit_relations_state", return_value=BACKFILL_DONE), \
+                self.mock.patch.object(backfills, "backfill_kbuild", side_effect=AssertionError("kbuild backfill ran")):
+            pipeline.backfill_steps.run_automatic_backfills(args)
+
+
 if __name__ == "__main__":
     unittest.main()

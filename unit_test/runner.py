@@ -104,6 +104,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_pahole_compare",
     "tests.test_webapp_watch",
     "tests.test_webapp_theme_contrast",
+    "tests.test_webapp_features",
     "tests.test_webapp_frontend_js",
     "tests.test_tui",
     "tests.test_tui_app",

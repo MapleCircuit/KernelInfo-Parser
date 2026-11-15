@@ -46,8 +46,18 @@ export class SectionedView {
     this.result = null;
   }
 
+  repo() {
+    return this.tab?.repo || state.activeRepo();
+  }
+
+  visibleSections() {
+    const r = this.repo();
+    return this.sections.filter((s) => !s.visible || s.visible(r));
+  }
+
   get section() {
-    return this.sections.find((s) => s.id === this.tab?.view) || this.sections[0];
+    const visible = this.visibleSections();
+    return visible.find((s) => s.id === this.tab?.view) || visible[0] || null;
   }
 
   ctx(extra = {}) {
@@ -82,7 +92,12 @@ export class SectionedView {
     this.tabId = tabData.id;
     this.tab = tabData;
     this.version = tabData.version || state.currentVersion;
+    const visible = this.visibleSections();
     const sec = this.section;
+    if (!sec) {
+      containerEl.innerHTML = `<div class="sv-container"><div class="sv-empty">No sections are enabled for this project.</div></div>`;
+      return;
+    }
     containerEl.innerHTML = `
       <div class="sv-container${tabData.listCollapsed ? " list-collapsed" : ""}">
         <button type="button" class="sv-rail" title="Show the list" aria-label="Show the list">
@@ -90,7 +105,7 @@ export class SectionedView {
         </button>
         <div class="sv-list-col">
           <div class="sv-head">
-            <div class="sv-sections" role="tablist">${this.sections.map((s) => `<button type="button" role="tab" class="sv-pill${s.id === sec.id ? " active" : ""}" data-section="${escapeHtml(s.id)}" aria-selected="${s.id === sec.id}">${escapeHtml(s.label)}</button>`).join("")}</div>
+            <div class="sv-sections" role="tablist">${visible.map((s) => `<button type="button" role="tab" class="sv-pill${s.id === sec.id ? " active" : ""}" data-section="${escapeHtml(s.id)}" aria-selected="${s.id === sec.id}">${escapeHtml(s.label)}</button>`).join("")}</div>
             <div class="sv-controls">
               <select class="sv-release" title="Release" hidden></select>
               <select class="sv-arch" title="ARCH" hidden></select>
@@ -215,7 +230,7 @@ export class SectionedView {
 
   async switchSection(id) {
     this.abort?.abort();
-    this.persist({ view: id, sel: "", filter: "", title: `${this.title} · ${this.sections.find((s) => s.id === id)?.label || id}` });
+    this.persist({ view: id, sel: "", filter: "", title: `${this.title} · ${this.visibleSections().find((s) => s.id === id)?.label || id}` });
     this.render(this.containerEl, this.tab);
   }
 

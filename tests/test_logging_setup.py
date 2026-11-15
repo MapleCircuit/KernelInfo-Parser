@@ -42,6 +42,8 @@ class TestLoggingConfig(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_cfg = copy.deepcopy(config_mod._ACTIVE_CONFIG)
         self._orig_cfg_path = config_mod._LOADED_CONFIG_PATH
+        if config_mod._ACTIVE_CONFIG is None:
+            config_mod.get_config()
         self._orig_env = dict(os.environ)
         config_mod.reset_config()
 
@@ -174,6 +176,8 @@ class TestLoggingSetupRuntime(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self._orig_cfg = copy.deepcopy(config_mod._ACTIVE_CONFIG)
         self._orig_cfg_path = config_mod._LOADED_CONFIG_PATH
+        if config_mod._ACTIVE_CONFIG is None:
+            config_mod.get_config()
         self._orig_env = dict(os.environ)
         self._orig_stdout = sys.stdout
         self._orig_stderr = sys.stderr

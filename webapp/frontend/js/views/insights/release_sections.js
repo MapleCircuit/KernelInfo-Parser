@@ -10,6 +10,7 @@ import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
 import { compareReleases } from "../sections/release_order.js";
 import { barChartSvg, hbarsHtml, kpiHtml, sparklineSvg } from "../../utils/svg_charts.js";
+import { hasFeature, isManPagesRepo } from "../../utils/projects.js";
 
 const n = (x) => (x == null ? "—" : Number(x).toLocaleString("en-US"));
 const date = (t) => (t ? new Date(t * 1000).toISOString().slice(0, 10) : "");
@@ -18,6 +19,7 @@ const ROLE_LABEL = { authors: "Authors", reviewers: "Reviewed-by", testers: "Tes
 // ------------------------------------------------------------------ H6 release stats
 registerInsightsSection({
   id: "release-stats", label: "Release stats", order: 10, releaseScoped: true, keywords: "statistics contributors employers authors",
+  visible: (repo) => hasFeature(repo, "commits"),
   hint: "Commits, contributors, first-timers, reviewers and employers of a release",
   async fetchList(ctx) {
     const r = await (ctx.api || api).getInsights(ctx.release, "release-stats", { ...ctx, cacheKey: `rstats2_${ctx.release}` });
@@ -78,6 +80,7 @@ registerInsightsSection({
 // ------------------------------------------------------------------ H5 merge window
 registerInsightsSection({
   id: "merge-window", label: "Merge window", order: 20, releaseScoped: true, keywords: "pulls merge window rc1 maintainers",
+  visible: (repo) => hasFeature(repo, "commits") && !isManPagesRepo(repo) && (hasFeature(repo, "kconfig") || hasFeature(repo, "maintainers") || hasFeature(repo, "mail")),
   hint: "The pulls merged for a release, day by day",
   async fetchList(ctx) {
     const r = await (ctx.api || api).getInsights(ctx.release, "merge-window", { ...ctx, cacheKey: `mwin_${ctx.release}` });
@@ -100,8 +103,8 @@ registerInsightsSection({
       <dt>Source</dt><dd>${escapeHtml(p.source_url || "local branch")} ${p.ref ? `<code>${escapeHtml(p.ref)}</code>` : ""}</dd>
       ${p.sender ? `<dt>Sender</dt><dd>${escapeHtml(p.sender)}</dd>` : ""}
       <dt>Commits</dt><dd>${n(p.commits)} — <a href="#" data-query="${escapeHtml(`range:${p.parents[0]}..${p.parents[1]}`)}">list them</a></dd>
-      ${p.section ? `<dt>Subsystem</dt><dd><a href="#" data-section="${escapeHtml(p.section.sec_id)}">${escapeHtml(p.section.name)}</a></dd>` : ""}
-      ${p.thread ? `<dt>Pull request</dt><dd><a href="#" data-mid="${escapeHtml(p.thread.message_id)}" data-tid="${p.thread.thread_id}">[GIT PULL] thread</a></dd>` : ""}
+      ${p.section && hasFeature(ctx.view?.repo(), "maintainers") ? `<dt>Subsystem</dt><dd><a href="#" data-section="${escapeHtml(p.section.sec_id)}">${escapeHtml(p.section.name)}</a></dd>` : ""}
+      ${p.thread && hasFeature(ctx.view?.repo(), "mail") ? `<dt>Pull request</dt><dd><a href="#" data-mid="${escapeHtml(p.thread.message_id)}" data-tid="${p.thread.thread_id}">[GIT PULL] thread</a></dd>` : ""}
     </dl>
     ${p.dirs?.length ? `<h3>Top directories</h3>${hbarsHtml(p.dirs.map((d) => ({ label: d.dir, value: d.percent })), { max: 100, format: (v) => `${v}%` })}` : ""}
     ${p.body ? `<h3>Tag message</h3><pre>${escapeHtml(p.body)}</pre>` : ""}`,
@@ -136,6 +139,7 @@ const FLAG = { orphan_active: "orphan but active", silent_maintainers: "silent m
 
 registerInsightsSection({
   id: "subsystems", label: "Subsystem health", order: 30, releaseScoped: true, keywords: "maintainers health review bus factor orphan",
+  visible: (repo) => hasFeature(repo, "maintainers"),
   hint: "Review coverage, bus factor and maintainer activity of every MAINTAINERS section",
   windowOptions: [1, 2, 3, 4, 6, 8, 12], windowDefault: 4, windowLabel: (w) => `${w} release${w > 1 ? "s" : ""}`,
   async fetchList(ctx) {

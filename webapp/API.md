@@ -18,30 +18,30 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L262-L270]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L271-L313]
   - 2.6. Frontend & Service Architectural Invariants [L314-L366]
-- 2B. Backend Domain & Infrastructure Services [L367-L969]
+- 2B. Backend Domain & Infrastructure Services [L367-L977]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L369-L448]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L449-L481]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L482-L511]
-  - 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`) [L512-L562]
-  - 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`) [L563-L643]
-  - 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`) [L644-L663]
-  - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L664-L699]
-  - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L700-L727]
-  - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L728-L756]
-  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L757-L807]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L808-L853]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L854-L871]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L872-L921]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L922-L969]
-- 3. Database Schema & Underlying Tables [L970-L984]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L985-L990]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L991-L996]
-- 6. Using the Services from Python [L997-L1014]
-- 7. Configuration & Execution [L1015-L1100]
-  - 7.1. Configuration Precedence & Resolution [L1017-L1065]
-  - 7.2. Starting the Server [L1066-L1100]
-- 8. Error Handling, Status Codes & Resilience [L1101-L1132]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1114-L1132]
+  - 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`) [L512-L570]
+  - 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`) [L571-L651]
+  - 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`) [L652-L671]
+  - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L672-L707]
+  - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L708-L735]
+  - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L736-L764]
+  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L765-L815]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L816-L861]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L862-L879]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L880-L929]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L930-L977]
+- 3. Database Schema & Underlying Tables [L978-L992]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L993-L998]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L999-L1004]
+- 6. Using the Services from Python [L1005-L1022]
+- 7. Configuration & Execution [L1023-L1108]
+  - 7.1. Configuration Precedence & Resolution [L1025-L1073]
+  - 7.2. Starting the Server [L1074-L1108]
+- 8. Error Handling, Status Codes & Resilience [L1109-L1140]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1122-L1140]
 <!-- toc:end -->
 
 ---
@@ -559,6 +559,14 @@ evaluated in three progressive tiers to optimize latency:
    `man_service.using_repo(name)`, which sets the request's repository `ContextVar` for the block and resets it
    afterwards, so `get_repo_dir()`, the Git reader pool, `git_tree_resolver` and `RepoScopedCache` keys all
    follow the other repository.
+8. **Per-repository feature gating**: `webapp/backend/config.py` resolves effective feature flags for the active
+   repository from `core.config.resolve_repo_features()` (`get_active_features()`, `is_feature_enabled(feature,
+   repo=None)`). `require_feature(*features)` is a FastAPI dependency that rejects requests with `403 Forbidden`
+   when any required feature is disabled for the active repository. `GET /api/projects` exposes each repository's
+   resolved `"features"` map. Cross-repository man-pages helpers in `webapp/backend/services/man_service.py` also
+   enforce feature flags: `manpages_repository()` selects only a man-pages repository with `"man"` enabled,
+   `resolve()` returns the `unavailable` payload when `"man"` is disabled on the active repository, and
+   `_linux_block()` populates `syscall` only when `"api"` is enabled on the target kernel repository.
 
 ### 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`)
 Clients must follow server changes without the user knowing to reload. The server keeps five change tokens

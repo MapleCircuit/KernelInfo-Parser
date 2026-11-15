@@ -45,6 +45,7 @@ from webapp.backend.config import (
     RepoScopedCache,
     get_active_repository,
     get_repo_dir,
+    is_feature_enabled,
     is_manpages_entry,
     list_repositories,
     reset_active_repository,
@@ -103,11 +104,16 @@ def _available(entry: dict[str, Any]) -> bool:
 
 
 def manpages_repository() -> dict[str, Any] | None:
-    """The request's repository when it is the man-pages, else the first available configured man-pages repository."""
+    """The request's repository when it is the man-pages with `man` enabled, else the first available
+    configured man-pages repository with `man` enabled."""
     active = get_active_repository()
     if is_manpages_entry(active):
-        return active
-    return next((r for r in list_repositories() if is_manpages_entry(r) and r.get("name") and _available(r)), None)
+        return active if is_feature_enabled("man", active) else None
+    return next(
+        (r for r in list_repositories()
+         if is_manpages_entry(r) and r.get("name") and _available(r) and is_feature_enabled("man", r)),
+        None,
+    )
 
 
 def linux_repository(preferred: str | None = None) -> dict[str, Any] | None:
@@ -586,12 +592,14 @@ def _release_tag_at(date: int | None) -> str | None:
 
 def _linux_block(name: str, section: str, facts: dict[str, Any] | None, man_date: int | None,
                  kernel: str | None, kernel_repo: str | None) -> dict[str, Any]:
-    block: dict[str, Any] = {"repo": None, "version": None, "syscall": name if section == "2" else None,
+    block: dict[str, Any] = {"repo": None, "version": None, "syscall": None,
                              "symbols": symbols_of(facts)}
     entry = linux_repository(kernel_repo)
     if entry is None or not _available(entry):
         return block
     block["repo"] = entry["name"]
+    if section == "2" and is_feature_enabled("api", entry):
+        block["syscall"] = name
     with using_repo(entry["name"]):
         if kernel and is_safe_rev(kernel) and git_tree_resolver.resolve_commit_sha(kernel):
             block["version"] = kernel
@@ -701,6 +709,8 @@ def resolve(name: str, section: str | None = None, kernel: str | None = None) ->
         safe_rev(kernel, "kernel revision")
     url = man7_url(name, section)
     unavailable = {"available": False, "url": url, "name": name, "section": section or None}
+    if not is_feature_enabled("man"):
+        return unavailable
     kernel = kernel or _default_kernel()
     ksha = git_tree_resolver.resolve_commit_sha(kernel)
     mentry = manpages_repository()

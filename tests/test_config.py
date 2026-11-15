@@ -604,5 +604,111 @@ class TestManPagesRepository(unittest.TestCase):
         self.assertEqual(list_version_tags(path, include_pre_releases=False), ["man-pages-6.9", "man-pages-6.10"])
 
 
+class TestProjectFeatureConfig(unittest.TestCase):
+    """Canonical per-project feature definitions, overrides, pruning, and sparse repo schema."""
+
+    def setUp(self) -> None:
+        reset_config()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        reset_config()
+        self.tmp.cleanup()
+
+    def test_feature_defaults_for_linux_and_manpages(self) -> None:
+        from core.config import (
+            DEFAULT_KERNEL_FEATURES,
+            DEFAULT_MANPAGES_FEATURES,
+            PROJECT_FEATURE_DEFS,
+            PROJECT_FEATURE_KEYS,
+            default_project_features,
+        )
+
+        self.assertEqual(len(PROJECT_FEATURE_DEFS), 15)
+        self.assertEqual(len(PROJECT_FEATURE_KEYS), 15)
+        self.assertTrue(all(DEFAULT_KERNEL_FEATURES[k] for k in PROJECT_FEATURE_KEYS))
+        self.assertEqual(default_project_features("linux"), DEFAULT_KERNEL_FEATURES)
+        self.assertEqual(default_project_features("custom-kernel"), DEFAULT_KERNEL_FEATURES)
+        self.assertEqual(default_project_features("man-pages"), DEFAULT_MANPAGES_FEATURES)
+        for enabled_key in ("commits", "insights", "man", "patch", "compare"):
+            self.assertTrue(DEFAULT_MANPAGES_FEATURES[enabled_key])
+        for disabled_key in ("kconfig", "api", "nodemap", "maintainers", "mail", "stable", "cve", "pahole", "callgraph", "docs"):
+            self.assertFalse(DEFAULT_MANPAGES_FEATURES[disabled_key])
+
+    def test_normalize_resolve_prune_and_enabled(self) -> None:
+        from core.config import (
+            normalize_feature_overrides,
+            prune_default_feature_overrides,
+            repo_feature_enabled,
+            resolve_repo_features,
+        )
+
+        self.assertEqual(normalize_feature_overrides(None), {})
+        self.assertEqual(normalize_feature_overrides(["kconfig"]), {})
+        self.assertEqual(
+            normalize_feature_overrides({"api": False, "unknown": True, "kconfig": 1, "docs": "yes", "man": True}),
+            {"api": False, "man": True},
+        )
+
+        linux_entry = {"project": "linux", "features": {"api": False, "bogus": True}}
+        resolved_linux = resolve_repo_features(linux_entry)
+        self.assertFalse(resolved_linux["api"])
+        self.assertTrue(resolved_linux["kconfig"])
+        self.assertFalse(repo_feature_enabled(linux_entry, "api"))
+        self.assertTrue(repo_feature_enabled(linux_entry, "kconfig"))
+
+        man_entry = {"project": "man-pages", "features": {"kconfig": True}}
+        resolved_man = resolve_repo_features(man_entry)
+        self.assertTrue(resolved_man["kconfig"])
+        self.assertFalse(resolved_man["api"])
+        self.assertTrue(repo_feature_enabled(man_entry, "kconfig"))
+
+        self.assertEqual(prune_default_feature_overrides("linux", {"api": False, "kconfig": True}), {"api": False})
+        self.assertEqual(prune_default_feature_overrides("man-pages", {"kconfig": True, "man": True}), {"kconfig": True})
+
+    def test_features_sparse_in_detect_and_normalized_in_merge_and_load(self) -> None:
+        from core.config import (
+            REPOSITORY_KEYS,
+            _merge_repositories,
+            _missing_repo_keys,
+            detect_repository,
+            load_config,
+        )
+
+        self.assertIn("features", REPOSITORY_KEYS)
+        repo_path = self.root / "linux"
+        _make_git_repo(repo_path, commits=2)
+        entry = detect_repository(repo_path)
+        self.assertNotIn("features", entry)
+        self.assertEqual(_missing_repo_keys(entry), [])
+
+        merged, _ = _merge_repositories(
+            [
+                {**entry, "features": {"api": False, "invalid": True, "docs": "no"}},
+                {**entry, "path": str(repo_path), "features": {"invalid": True}},
+            ],
+            [repo_path],
+        )
+        self.assertEqual(merged[0]["features"], {"api": False})
+        self.assertNotIn("features", merged[1])
+
+        cfg_path = self.root / "config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "repositories": [
+                        {"name": "linux", "path": "repos/linux", "project": "linux", "features": {"cve": False, "bad": 1}},
+                        {"name": "empty", "path": "repos/empty", "project": "linux", "features": {}},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_config(cfg_path)
+        self.assertEqual(loaded["repositories"][0]["features"], {"cve": False})
+        self.assertNotIn("features", loaded["repositories"][1])
+
+
 if __name__ == "__main__":
     unittest.main()

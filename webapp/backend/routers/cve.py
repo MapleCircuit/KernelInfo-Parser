@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
+from webapp.backend.config import require_feature
 from webapp.backend.services import cve_service
 
-router = APIRouter(prefix="/api/cve", tags=["cve"])
+router = APIRouter(prefix="/api/cve", tags=["cve"], dependencies=[Depends(require_feature("cve"))])
 
 
 @router.get("/status")

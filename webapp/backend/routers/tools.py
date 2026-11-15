@@ -1,7 +1,8 @@
 """webapp/backend/routers/tools.py - Pahole Layout, Function Callgraph & Revision Compare."""
 from __future__ import annotations
 from typing import Any
-from fastapi import APIRouter, Body, Query
+from fastapi import APIRouter, Body, Depends, Query
+from webapp.backend.config import require_feature
 from webapp.backend.services.pahole_service import PaholeService
 from webapp.backend.services.callgraph_service import CallgraphService
 from webapp.backend.services.diff_service import DiffService, RENAME_SIMILARITY
@@ -12,19 +13,19 @@ callgraph_service = CallgraphService()
 diff_service = DiffService()
 
 
-@router.get("/tools/{version_name}/pahole/{struct_name}")
+@router.get("/tools/{version_name}/pahole/{struct_name}", dependencies=[Depends(require_feature("pahole"))])
 def get_struct_layout(version_name: str, struct_name: str) -> dict[str, Any]:
     """Pahole-style memory layout of a C struct (estimated from its AST)."""
     return pahole_service.get_struct_layout(version_name, struct_name)
 
 
-@router.get("/tools/{version_name}/callgraph/{function_name}")
+@router.get("/tools/{version_name}/callgraph/{function_name}", dependencies=[Depends(require_feature("callgraph"))])
 def get_callgraph(version_name: str, function_name: str) -> dict[str, Any]:
     """Bidirectional caller and callee callgraph."""
     return callgraph_service.get_function_callgraph(version_name, function_name)
 
 
-@router.get("/tools/diff/versions")
+@router.get("/tools/diff/versions", dependencies=[Depends(require_feature("compare"))])
 def get_version_diff(
     version_a: str = Query(...),
     version_b: str = Query(...),
@@ -33,7 +34,7 @@ def get_version_diff(
     return diff_service.get_versions_diff(version_a, version_b)
 
 
-@router.get("/tools/diff/unchanged")
+@router.get("/tools/diff/unchanged", dependencies=[Depends(require_feature("compare"))])
 def get_unchanged_files(
     version_a: str = Query(...),
     version_b: str = Query(...),
@@ -42,7 +43,7 @@ def get_unchanged_files(
     return diff_service.get_unchanged_files(version_a, version_b)
 
 
-@router.get("/tools/diff/file")
+@router.get("/tools/diff/file", dependencies=[Depends(require_feature("compare"))])
 def get_file_diff(
     version_a: str = Query(...),
     version_b: str = Query(...),
@@ -54,7 +55,7 @@ def get_file_diff(
     return diff_service.get_file_diff(version_a, version_b, path, old_path, similarity)
 
 
-@router.get("/tools/diff/blobs")
+@router.get("/tools/diff/blobs", dependencies=[Depends(require_feature("compare"))])
 def get_blob_diff(
     version_a: str = Query(...),
     path_a: str = Query(...),
@@ -65,7 +66,7 @@ def get_blob_diff(
     return diff_service.get_blob_diff(version_a, path_a, version_b, path_b)
 
 
-@router.get("/tools/diff/renames")
+@router.get("/tools/diff/renames", dependencies=[Depends(require_feature("compare"))])
 def search_renames(
     version_a: str = Query(...),
     version_b: str = Query(...),
@@ -76,13 +77,13 @@ def search_renames(
     return diff_service.search_renames(version_a, version_b, path, similarity)
 
 
-@router.get("/diff/kconfig/{v1}/{v2}")
+@router.get("/diff/kconfig/{v1}/{v2}", dependencies=[Depends(require_feature("compare", "kconfig"))])
 def get_kconfig_diff(v1: str, v2: str) -> dict[str, Any]:
     """Kconfig symbol definitions added, removed and changed between two revisions."""
     return diff_service.get_kconfig_diff(v1, v2)
 
 
-@router.post("/tools/{version_name}/checkpatch")
+@router.post("/tools/{version_name}/checkpatch", dependencies=[Depends(require_feature("patch"))])
 def post_checkpatch(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Run scripts/checkpatch.pl of the configured release tag on a patch (P4; off by default: {enabled: false})."""
     from webapp.backend.services.checkpatch_service import check_patch
@@ -90,7 +91,7 @@ def post_checkpatch(version_name: str, payload: dict[str, Any] = Body(...)) -> d
     return check_patch(patch if isinstance(patch, str) else "")
 
 
-@router.get("/tools/{version_name}/implementations")
+@router.get("/tools/{version_name}/implementations", dependencies=[Depends(require_feature("callgraph"))])
 def get_implementations(
     version_name: str,
     struct: str = Query(""),
@@ -119,7 +120,7 @@ def get_implementations(
     return job_answer(index_state(version_name, struct, wait=3.0), shape)
 
 
-@router.get("/tools/{version_name}/callpath")
+@router.get("/tools/{version_name}/callpath", dependencies=[Depends(require_feature("callgraph"))])
 def get_callpath(
     version_name: str,
     src: str = Query("", alias="from"),
@@ -139,14 +140,14 @@ def get_callpath(
                                      indirect=indirect, arch=arch.strip()))
 
 
-@router.get("/tools/pahole/compare")
+@router.get("/tools/pahole/compare", dependencies=[Depends(require_feature("pahole"))])
 def get_pahole_compare(a: str = Query(...), b: str = Query(...), struct: str = Query(...)) -> dict[str, Any]:
     """A struct's layout at two revisions, member by member (N3)."""
     from webapp.backend.services.pahole_compare import compare
     return compare(a, b, struct)
 
 
-@router.get("/tools/{version_name}/pahole/{struct_name}/history")
+@router.get("/tools/{version_name}/pahole/{struct_name}/history", dependencies=[Depends(require_feature("pahole"))])
 def get_pahole_history(version_name: str, struct_name: str, include_rc: bool = Query(False)) -> Any:
     """Size, holes and cachelines of a struct at each release where its definition changed (N3); 202 while it runs."""
     from webapp.backend.routers.insights import job_answer

@@ -14,7 +14,7 @@ import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { escapeHtml } from "../../components/modal.js";
 import { openDefinition } from "../../utils/definition_picker.js";
-import { isManPagesRepo, manPagesRepo, projects } from "../../utils/projects.js";
+import { hasFeature, isManPagesRepo, manPagesRepo, projects } from "../../utils/projects.js";
 import { renderManTerm, renderManWeb } from "./man_render.js";
 import { groupIndex, indexSectionLabel, linuxApiTab, linuxSymbolTab, man7Url, manLabel, manTabTitle, pageOfPath } from "./man_model.js";
 
@@ -108,7 +108,7 @@ export function linuxLinksHtml(res, kernel = "", kernelRepo = "") {
   const t = linuxTarget(res, kernel, kernelRepo);
   if (!linux || !t.repo || !t.version) return "";
   const parts = [];
-  if (linux.syscall) parts.push(`<a href="#" data-linux-syscall="${escapeHtml(linux.syscall)}" title="${escapeHtml(`The ${linux.syscall} system call in the Kernel API tab`)}">syscall <b>${escapeHtml(linux.syscall)}</b></a>`);
+  if (linux.syscall && hasFeature(t.repo, "api")) parts.push(`<a href="#" data-linux-syscall="${escapeHtml(linux.syscall)}" title="${escapeHtml(`The ${linux.syscall} system call in the Kernel API tab`)}">syscall <b>${escapeHtml(linux.syscall)}</b></a>`);
   for (const s of (Array.isArray(linux.symbols) ? linux.symbols : []).slice(0, MAX_SYMBOL_LINKS)) {
     parts.push(`<a href="#" data-linux-symbol="${escapeHtml(s)}" title="${escapeHtml(`Definition of ${s} in ${t.repo} ${t.version}`)}"><code>${escapeHtml(s)}</code></a>`);
   }
@@ -125,6 +125,7 @@ async function followLinuxLink(a, res, { kernel = "", kernelRepo = "", forceNew 
   const syscall = a.dataset.linuxSyscall;
   const symbol = a.dataset.linuxSymbol;
   if (syscall) {
+    if (!hasFeature(t.repo, "api")) return;
     state.openTab({ ...linuxApiTab({ repo: t.repo, version: t.version, name: syscall }), forceNew });
     return;
   }

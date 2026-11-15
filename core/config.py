@@ -17,7 +17,7 @@ import re
 import stat
 import subprocess
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -261,7 +261,9 @@ REPOSITORY_KEYS = (
     "branch_filter",
     "branches",
     "tag_views",
+    "features",
 )
+OPTIONAL_REPOSITORY_KEYS = frozenset({"features"})
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
@@ -651,7 +653,15 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         w_log["level"] = normalize_log_level(w_log.get("level"))
 
-    # 4. Synchronize into os.environ for low-level and child worker compatibility
+    # 4. Normalize repository feature overrides if present
+    if isinstance(merged.get("repositories"), list):
+        merged["repositories"] = [
+            _normalize_repo_entry_features(dict(entry))
+            for entry in merged["repositories"]
+            if isinstance(entry, dict)
+        ]
+
+    # 5. Synchronize into os.environ for low-level and child worker compatibility
     sync_environ(merged)
 
     return merged
@@ -869,6 +879,176 @@ def repository_project(entry: dict[str, Any] | None) -> str:
     return str((entry or {}).get("project") or "").strip() or LINUX_PROJECT
 
 
+PROJECT_FEATURE_DEFS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "kconfig",
+        "label": "Kconfig Engine",
+        "description": "Kconfig menuconfig, defconfigs, Kbuild rules, ARCH layouts & #ifdef dimming",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "api",
+        "label": "Kernel API",
+        "description": "Kernel API catalog: syscalls, exports, params, tracepoints, modules & devices",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "nodemap",
+        "label": "NodeMap Canvas",
+        "description": "Schematic interactive graph canvas",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "maintainers",
+        "label": "Maintainers",
+        "description": "MAINTAINERS subsystems, CREDITS & file subsystem badges",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "commits",
+        "label": "Git Commits",
+        "description": "Commit timeline, commit search, blame & release stats",
+        "kernel": True,
+        "man_pages": True,
+    },
+    {
+        "key": "mail",
+        "label": "Mailing List",
+        "description": "Public-inbox LKML threads, patch series & mail resolver",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "insights",
+        "label": "Insights",
+        "description": "Release analytics tab",
+        "kernel": True,
+        "man_pages": True,
+    },
+    {
+        "key": "stable",
+        "label": "Stable Tracking",
+        "description": "Linux -stable series missing-backport tracking",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "cve",
+        "label": "CVE Security",
+        "description": "Kernel CVE ingestion, file security badges & Insights security",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "man",
+        "label": "Man Pages",
+        "description": "Man pages index, renderer, cross-links & Compare man mode",
+        "kernel": True,
+        "man_pages": True,
+    },
+    {
+        "key": "pahole",
+        "label": "Pahole Structs",
+        "description": "Struct memory layout, cachelines & padding holes inspector",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "callgraph",
+        "label": "Callgraph",
+        "description": "Function caller/callee graph & callpath explorer",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "docs",
+        "label": "Documentation",
+        "description": "Rendered Sphinx/reST documentation viewer & doc reference extraction",
+        "kernel": True,
+        "man_pages": False,
+    },
+    {
+        "key": "patch",
+        "label": "Patches & Checkpatch",
+        "description": "Create patch, Patch series tab & checkpatch runner",
+        "kernel": True,
+        "man_pages": True,
+    },
+    {
+        "key": "compare",
+        "label": "Compare",
+        "description": "Version & commit comparison; sub-modes follow kconfig/api/man",
+        "kernel": True,
+        "man_pages": True,
+    },
+)
+PROJECT_FEATURE_KEYS: tuple[str, ...] = tuple(d["key"] for d in PROJECT_FEATURE_DEFS)
+_PROJECT_FEATURE_KEY_SET: frozenset[str] = frozenset(PROJECT_FEATURE_KEYS)
+DEFAULT_KERNEL_FEATURES: dict[str, bool] = {d["key"]: bool(d["kernel"]) for d in PROJECT_FEATURE_DEFS}
+DEFAULT_MANPAGES_FEATURES: dict[str, bool] = {d["key"]: bool(d["man_pages"]) for d in PROJECT_FEATURE_DEFS}
+
+
+def default_project_features(slug: str | None) -> dict[str, bool]:
+    """Return a copy of the default feature flags for project `slug`."""
+    if not is_kernel_project(slug):
+        return dict(DEFAULT_MANPAGES_FEATURES)
+    return dict(DEFAULT_KERNEL_FEATURES)
+
+
+def normalize_feature_overrides(raw: Any) -> dict[str, bool]:
+    """Validate and normalize a repository's feature override mapping, dropping invalid entries."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        logger.warning("Ignoring invalid repository features override (expected dict, got %s)", type(raw).__name__)
+        return {}
+    normalized: dict[str, bool] = {}
+    for key, val in raw.items():
+        if not isinstance(key, str) or key not in _PROJECT_FEATURE_KEY_SET:
+            logger.warning("Ignoring unknown repository feature key %r", key)
+            continue
+        if not isinstance(val, bool):
+            logger.warning("Ignoring non-boolean value %r for repository feature %r", val, key)
+            continue
+        normalized[key] = val
+    return normalized
+
+
+def resolve_repo_features(entry: dict[str, Any] | None) -> dict[str, bool]:
+    """Merge default project features for `entry` with any valid `entry['features']` overrides."""
+    features = default_project_features(repository_project(entry))
+    if isinstance(entry, Mapping) and "features" in entry and entry["features"] is not None:
+        features.update(normalize_feature_overrides(entry["features"]))
+    return features
+
+
+def prune_default_feature_overrides(slug: str | None, overrides: Mapping[str, Any] | None) -> dict[str, bool]:
+    """Return only feature overrides that differ from the project defaults for `slug`."""
+    defaults = default_project_features(slug)
+    normalized = normalize_feature_overrides(overrides)
+    return {k: v for k, v in normalized.items() if v != defaults[k]}
+
+
+def repo_feature_enabled(entry: dict[str, Any] | None, feature: str) -> bool:
+    """True when `feature` is enabled for repository `entry`."""
+    return bool(resolve_repo_features(entry).get(feature, False))
+
+
+def _normalize_repo_entry_features(entry: dict[str, Any]) -> dict[str, Any]:
+    """Normalize `entry['features']` in place, omitting the key when empty."""
+    if "features" in entry:
+        normalized = normalize_feature_overrides(entry["features"])
+        if normalized:
+            entry["features"] = normalized
+        else:
+            entry.pop("features", None)
+    return entry
+
+
 def is_manpages_repository(name: str, git_url: str = "", root_commit: str = "") -> bool:
     """True for a clone of the Linux man-pages: its root commit, a `man-pages` directory or a `man-pages.git` URL."""
     url = (git_url or "").strip().rstrip("/")
@@ -1038,7 +1218,7 @@ def find_repository_dirs(repos_dir: Path | None = None) -> list[Path]:
 
 
 def _missing_repo_keys(entry: dict[str, Any]) -> list[str]:
-    return [k for k in REPOSITORY_KEYS if k not in entry]
+    return [k for k in REPOSITORY_KEYS if k not in OPTIONAL_REPOSITORY_KEYS and k not in entry]
 
 
 def _merge_repositories(
@@ -1048,7 +1228,7 @@ def _merge_repositories(
 
     Git metadata is only computed for repositories that are new or incomplete.
     """
-    merged = [dict(e) for e in existing if isinstance(e, dict)]
+    merged = [_normalize_repo_entry_features(dict(e)) for e in existing if isinstance(e, dict)]
     known = {resolve_repo_path(e).resolve(): e for e in merged if e.get("path")}
     changes: list[str] = []
     for repo_dir in repo_dirs:

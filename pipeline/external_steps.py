@@ -12,6 +12,7 @@ from typing import Any
 from pathlib import Path
 from parser import facts_ingest
 from pipeline.git_ingest import refresh_person_identities
+from pipeline.git_network import feature_enabled
 from pipeline.state import MF, gp, logger
 
 
@@ -22,9 +23,28 @@ from pipeline.state import MF, gp, logger
 _FACTS_MEMO: dict[tuple, set[bytes]] = {}
 
 
-def _facts_memo_key() -> tuple:
+_FACT_FEATURE_MAP: dict[int, str] = {
+    2: "api",
+    4: "kconfig",
+    5: "docs",
+    6: "man",
+}
+
+
+def _selected_fact_families() -> tuple[int, ...] | None:
+    """Fact family ids enabled for the active repository, or None when all families are enabled."""
+    selected = tuple(
+        f for f in facts_ingest.FAMILIES
+        if f not in _FACT_FEATURE_MAP or feature_enabled(_FACT_FEATURE_MAP[f])
+    )
+    if len(selected) == len(facts_ingest.FAMILIES):
+        return None
+    return selected
+
+
+def _facts_memo_key(families: tuple[int, ...] | None = None) -> tuple:
     """Memo key of the current fact formats, family set, network and repository."""
-    return (tuple(sorted(facts_ingest.FAMILIES.items())), getattr(gp, "network_id", None),
+    return (tuple(sorted(facts_ingest.FAMILIES.items())), families, getattr(gp, "network_id", None),
             getattr(gp, "repo_id", None), str(getattr(MF, "repo_dir", "")))
 
 
@@ -50,14 +70,18 @@ def processing_source_facts(version: str) -> int:
         workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
     except (TypeError, ValueError):
         workers = 4
+    families = _selected_fact_families()
     with G.DB() as db:
         if db is None:
             return 0
-        key = _facts_memo_key()
+        key = _facts_memo_key(families)
         if key not in _FACTS_MEMO:
             _FACTS_MEMO.clear()
             _FACTS_MEMO[key] = set()
-        result = facts_ingest.ingest(db, blobs, read_text, workers, known=_FACTS_MEMO[key])
+        ingest_kwargs: dict[str, Any] = {"known": _FACTS_MEMO[key]}
+        if families is not None:
+            ingest_kwargs["families"] = families
+        result = facts_ingest.ingest(db, blobs, read_text, workers, **ingest_kwargs)
     if result["extracted"]:
         logger.info(
             f"[Source Facts] '{version}': {result['extracted']} of {result['blobs']} source blob(s) extracted "
@@ -92,6 +116,9 @@ def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | N
     core/API.md section 10). Skipped while a version ingestion is interrupted: its rollback deletes the
     persons created after its watermark, with every row naming them, so no row may name them before it ran.
     Never blocks parsing: a failure is logged and the run goes on."""
+    if not (feature_enabled("commits") or feature_enabled("insights")):
+        logger.debug("[Release stats] Skipped: both 'commits' and 'insights' features are disabled.")
+        return None
     from parser.git_ast import release_stats
     try:
         with G.DB() as db:

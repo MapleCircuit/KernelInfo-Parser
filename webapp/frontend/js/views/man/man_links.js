@@ -12,6 +12,7 @@ import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { escapeHtml } from "../../components/modal.js";
 import { man7Url, manTabFields, manTabTitle } from "./man_model.js";
+import { hasFeature } from "../../utils/projects.js";
 
 /** `<a>` of a man page reference: data-man-link/-sec carry the page, href the man7.org fallback. */
 export function manLinkHtml(name, section, label = null, cls = "") {
@@ -31,6 +32,10 @@ export function manTabOfResolve(res, { kernel = "", kernelRepo = "", mode = "" }
  */
 export async function openManReference(name, section, { kernel = state.activeVersion(), repo = state.activeRepo(), forceNew = false } = {}) {
   if (!name) return false;
+  if (!hasFeature(repo, "man")) {
+    window.open(man7Url(name, section), "_blank", "noopener,noreferrer");
+    return false;
+  }
   let res = null;
   try {
     res = await api.forRepo(repo).resolveMan(name, section, kernel);

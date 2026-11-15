@@ -1,11 +1,12 @@
 """webapp/backend/routers/kconfig.py - Kconfig models, defconfigs, symbol provenance and the auto-solver."""
 from __future__ import annotations
 from typing import Annotated, Any
-from fastapi import APIRouter, Query, Body
+from fastapi import APIRouter, Body, Depends, Query
+from webapp.backend.config import require_feature
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
 from webapp.backend.services.history_service import history_service
 
-router = APIRouter(prefix="/api", tags=["kconfig"])
+router = APIRouter(prefix="/api", tags=["kconfig"], dependencies=[Depends(require_feature("kconfig"))])
 kconfig_service = KconfigService()
 
 ToolchainParam = Annotated[str | None, Query(description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls")]

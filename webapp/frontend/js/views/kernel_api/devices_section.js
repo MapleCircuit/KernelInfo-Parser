@@ -8,6 +8,7 @@ import { toast } from "../../components/toast.js";
 import { registerApiSection } from "./kernel_api_view.js";
 import { builtUnderEngine } from "./api_sections.js";
 import { toTsv } from "../sections/section_model.js";
+import { hasFeature } from "../../utils/projects.js";
 
 const PASTE = `<div class="dev-paste"><h3>Find drivers</h3>
   <textarea class="dev-input" rows="5" spellcheck="false" placeholder="Paste lspci -nn, lsusb or modalias lines, vendor:device ids, compatible strings or ACPI ids…"></textarea>
@@ -16,12 +17,13 @@ const PASTE = `<div class="dev-paste"><h3>Find drivers</h3>
 
 function resultsHtml(res, ctx) {
   if (!res.lines.length) return '<p class="sv-empty">No device id recognized in the input.</p>';
+  const kconfigOn = hasFeature(ctx.repo || "", "kconfig");
   return res.lines.map((l) => `<div class="dev-line"><div class="dev-input-line"><code>${escapeHtml(l.input)}</code> <span class="sv-row-sub">${escapeHtml(l.ids.join(", "))}</span></div>
     ${l.matches.length ? l.matches.map((m) => {
       const built = m.expr ? builtUnderEngine(m.expr, ctx.version, ctx.arch) : "";
       return `<div class="dev-match"><span class="sv-tag ${m.match_kind === "exact" ? "ok" : "info"}">${escapeHtml(m.match_kind)}</span>
         <b>${escapeHtml(m.module || "(not a module of this ARCH)")}</b>
-        ${m.options.map((o) => `<a href="#" data-kconfig="${escapeHtml(o)}">CONFIG_${escapeHtml(o)}</a>`).join(" ")}
+        ${m.options.map((o) => kconfigOn ? `<a href="#" data-kconfig="${escapeHtml(o)}">CONFIG_${escapeHtml(o)}</a>` : `<code>CONFIG_${escapeHtml(o)}</code>`).join(" ")}
         <a href="#" data-open-file="${escapeHtml(m.path)}" data-line="${m.line}">${escapeHtml(m.table)}</a>
         ${built ? `<span class="sv-tag ${built === "n" ? "bad" : "ok"}">built: ${escapeHtml(built)}</span>` : ""}</div>`;
     }).join("") : '<div class="sv-empty">No driver of this revision lists it.</div>'}</div>`).join("");
@@ -45,7 +47,8 @@ registerApiSection({
   downloads: [{ label: "Device entries", ext: "tsv", build: (rows) => toTsv(rows, [["bus", (e) => e.bus], ["id", (e) => e.id], ["table", (e) => e.table], ["path", (e) => `${e.path}:${e.line}`]]) }],
   onDetailClick(e, ctx) {
     const k = e.target.closest("[data-kconfig]");
-    if (!k) return false;
+    const repo = ctx.view?.repo?.() || ctx.api?.repo || "";
+    if (!k || !hasFeature(repo, "kconfig")) return false;
     e.preventDefault();
     import("../../state.js").then(({ state }) => state.openTab({ type: "kconfig", title: `KConfig (${ctx.arch})`, arch: ctx.arch, symbol: k.dataset.kconfig, version: ctx.version }));
     return true;
@@ -69,7 +72,7 @@ document.addEventListener("click", async (e) => {
     const res = await api.forTab(tab).request(`/api/kapi/${encodeURIComponent(version || tab?.version || state.currentVersion)}/devices/match`, {
       method: "POST", body: JSON.stringify({ text, arch }), timeoutMs: 90000,
     });
-    results.innerHTML = resultsHtml(res, { version: tab?.version || state.currentVersion, arch });
+    results.innerHTML = resultsHtml(res, { version: tab?.version || state.currentVersion, arch, repo: state.repoOf(tab) });
   } catch (err) {
     results.innerHTML = "";
     toast.error(`Matching failed: ${err.message}`);
@@ -82,7 +85,7 @@ document.addEventListener("click", (e) => {
   import("../../state.js").then(({ state }) => {
     const tab = state.getActiveTab();
     if (a.dataset.openFile) state.openTab({ type: "code", title: a.dataset.openFile.split("/").pop(), path: a.dataset.openFile, cursorLine: parseInt(a.dataset.line, 10) || 1, version: tab?.version || state.currentVersion });
-    else state.openTab({ type: "kconfig", title: `KConfig (${tab?.arch || state.kconfigArch()})`, arch: tab?.arch || state.kconfigArch(), symbol: a.dataset.kconfig, version: tab?.version || state.currentVersion });
+    else if (hasFeature(state.repoOf(tab), "kconfig")) state.openTab({ type: "kconfig", title: `KConfig (${tab?.arch || state.kconfigArch()})`, arch: tab?.arch || state.kconfigArch(), symbol: a.dataset.kconfig, version: tab?.version || state.currentVersion });
   });
 });
 

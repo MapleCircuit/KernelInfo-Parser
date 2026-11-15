@@ -18,6 +18,7 @@ import { showFileHistoryModal } from "./file_history_modal.js";
 import { openDefinition } from "../utils/definition_picker.js";
 import { blameBeforeTarget } from "../views/code_view/blame_options.js";
 import { referenceMenuItems } from "./file_references.js";
+import { hasFeature } from "../utils/projects.js";
 
 class ContextMenu {
   constructor() {
@@ -224,7 +225,7 @@ class ContextMenu {
       } catch (err) {
         toast.error(`Header lookup failed: ${err.message}`);
       }
-    } else if (isKconfig) {
+    } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
       try {
         const detail = await api.getSymbolDetail(v, tokenName);
         if (detail && detail.file_path) {
@@ -313,7 +314,7 @@ class ContextMenu {
           }
         }
       });
-    } else if (isKconfig) {
+    } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
       items.push({
         label: "Jump to Kconfig Declaration",
         icon: "📍",
@@ -451,23 +452,25 @@ class ContextMenu {
       }
     });
 
-    items.push({
-      label: "Open in NodeMap",
-      icon: "🗺️",
-      onClick: () => {
-        state.openTab({
-          type: "nodemap",
-          title: "NodeMap Canvas",
-          version: v,
-          initialNode: {
-            name: tokenData.header || tokenName,
-            type: isInclude ? "include" : (tokenData.type_id || "symbol"),
-            astId: tokenData.ast_id
-          }
-        });
-        toast.success(`Opened ${tokenName} in NodeMap`);
-      }
-    });
+    if (hasFeature(state.activeRepo(), "nodemap")) {
+      items.push({
+        label: "Open in NodeMap",
+        icon: "🗺️",
+        onClick: () => {
+          state.openTab({
+            type: "nodemap",
+            title: "NodeMap Canvas",
+            version: v,
+            initialNode: {
+              name: tokenData.header || tokenName,
+              type: isInclude ? "include" : (tokenData.type_id || "symbol"),
+              astId: tokenData.ast_id
+            }
+          });
+          toast.success(`Opened ${tokenName} in NodeMap`);
+        }
+      });
+    }
 
     this.renderMenu(x, y, {
       header: {
@@ -537,7 +540,7 @@ class ContextMenu {
             }
           }
         });
-      } else if (isKconfig) {
+      } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
         items.push({
           label: "Open in Kconfig Viewer",
           icon: "⚙️",
@@ -609,7 +612,8 @@ class ContextMenu {
 
       const showStructAction = isStruct || (isCFile && cleanName && /^[a-zA-Z_]\w*$/.test(cleanName) && !isFunction && !token.isInclude);
 
-      if (showStructAction && cleanName) {
+      const repo = state.activeRepo();
+      if (showStructAction && cleanName && hasFeature(repo, "pahole")) {
         items.push({
           label: `Show Struct Layout: struct ${cleanName}`,
           icon: "📐",
@@ -625,7 +629,7 @@ class ContextMenu {
         });
       }
 
-      if (isFunction && cleanName) {
+      if (isFunction && cleanName && hasFeature(repo, "callgraph")) {
         items.push({
           label: `Show Callgraph: ${cleanName}()`,
           icon: "📊",
@@ -655,23 +659,25 @@ class ContextMenu {
         }
       });
 
-      items.push({
-        label: "Open in NodeMap",
-        icon: "🗺️",
-        onClick: () => {
-          state.openTab({
-            type: "nodemap",
-            title: "NodeMap Canvas",
-            version: v,
-            initialNode: {
-              name: token.header || token.name,
-              type: token.isInclude ? "include" : (token.type_id || "symbol"),
-              astId: token.ast_id
-            }
-          });
-          toast.success(`Opened ${token.name} in NodeMap`);
-        }
-      });
+      if (hasFeature(repo, "nodemap")) {
+        items.push({
+          label: "Open in NodeMap",
+          icon: "🗺️",
+          onClick: () => {
+            state.openTab({
+              type: "nodemap",
+              title: "NodeMap Canvas",
+              version: v,
+              initialNode: {
+                name: token.header || token.name,
+                type: token.isInclude ? "include" : (token.type_id || "symbol"),
+                astId: token.ast_id
+              }
+            });
+            toast.success(`Opened ${token.name} in NodeMap`);
+          }
+        });
+      }
 
       if (!isKconfig) {
         items.push({
@@ -682,7 +688,7 @@ class ContextMenu {
       }
 
       items.push({ separator: true });
-    } else if (selection && this.isKconfigToken({ name: selection }, filePath, ftype)) {
+    } else if (selection && this.isKconfigToken({ name: selection }, filePath, ftype) && hasFeature(state.activeRepo(), "kconfig")) {
       items.push({
         label: `Open in Kconfig Viewer (${this.getKconfigSymbolName(selection)})`,
         icon: "⚙️",
@@ -715,26 +721,31 @@ class ContextMenu {
         onClick: () => state.openTab({ type: "search", title: `Search: ${searchText.slice(0, 24)}`, query: searchText, regex: false, word: Boolean(token && !selection), version: v })
       });
     }
-    items.push({
-      label: "Create Patch from This File…",
-      icon: "✎",
-      onClick: () => showPatchModal(v, filePath)
-    });
-    items.push({
-      label: "View Line Blame & Commit Details",
-      icon: "🕒",
-      onClick: () => this.showCommitDetailModal(blame, filePath, line, v)
-    });
-    // H9: re-blame the line at the parent of the commit that last touched it (§5.21)
-    if (blame) {
-      const before = blameBeforeTarget(blame, filePath);
-      items.push(before ? {
-        label: `Blame Before This Change (${before.path === filePath ? "" : `${before.path}, `}≈ line ${before.line})`,
-        icon: "⏮",
-        title: `Open ${before.path} at ${before.version.slice(0, 12)}, the parent of ${String(blame.commit_hash || "").slice(0, 12)}, with blame on (middle-click: new tab)`,
-        onClick: () => openBlameBefore(before, false),
-        onMiddleClick: () => openBlameBefore(before, true),
-      } : { label: "Blame Before This Change (root commit)", icon: "⏮", disabled: true });
+    const repoCtx = state.activeRepo();
+    if (hasFeature(repoCtx, "patch")) {
+      items.push({
+        label: "Create Patch from This File…",
+        icon: "✎",
+        onClick: () => showPatchModal(v, filePath)
+      });
+    }
+    if (hasFeature(repoCtx, "commits")) {
+      items.push({
+        label: "View Line Blame & Commit Details",
+        icon: "🕒",
+        onClick: () => this.showCommitDetailModal(blame, filePath, line, v)
+      });
+      // H9: re-blame the line at the parent of the commit that last touched it (§5.21)
+      if (blame) {
+        const before = blameBeforeTarget(blame, filePath);
+        items.push(before ? {
+          label: `Blame Before This Change (${before.path === filePath ? "" : `${before.path}, `}≈ line ${before.line})`,
+          icon: "⏮",
+          title: `Open ${before.path} at ${before.version.slice(0, 12)}, the parent of ${String(blame.commit_hash || "").slice(0, 12)}, with blame on (middle-click: new tab)`,
+          onClick: () => openBlameBefore(before, false),
+          onMiddleClick: () => openBlameBefore(before, true),
+        } : { label: "Blame Before This Change (root commit)", icon: "⏮", disabled: true });
+      }
     }
 
     items.push({ separator: true });
@@ -1114,7 +1125,8 @@ class ContextMenu {
       if (isStruct || isFunction) {
         items.push({ separator: true });
       }
-      if (isStruct) {
+      const repo = state.activeRepo();
+      if (isStruct && hasFeature(repo, "pahole")) {
         const cleanStruct = nodeName.replace(/^(struct|union)\s+/, "").trim();
         items.push({
           label: `Show Struct Layout: struct ${cleanStruct}`,
@@ -1129,7 +1141,7 @@ class ContextMenu {
           }
         });
       }
-      if (isFunction) {
+      if (isFunction && hasFeature(repo, "callgraph")) {
         items.push({
           label: `Show Callgraph: ${nodeName}`,
           icon: "📊",

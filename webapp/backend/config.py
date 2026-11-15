@@ -11,6 +11,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
+
 from core.config import (
     LINUX_PROJECT,
     MANPAGES_PROJECT,
@@ -20,6 +22,8 @@ from core.config import (
     get_repositories_config,
     get_repository,
     get_webapp_config,
+    repo_feature_enabled,
+    resolve_repo_features,
     resolve_repo_path,
 )
 
@@ -59,6 +63,31 @@ def repository_project_slug(repo: dict[str, Any] | None) -> str:
 def is_manpages_entry(repo: dict[str, Any] | None) -> bool:
     """True for the repositories[] entry of a Linux man-pages clone."""
     return repository_project_slug(repo) == MANPAGES_PROJECT
+
+
+def get_active_features() -> dict[str, bool]:
+    """Resolved feature flags for the current request's repository."""
+    return resolve_repo_features(get_active_repository())
+
+
+def is_feature_enabled(feature: str, repo: dict[str, Any] | None = None) -> bool:
+    """True when `feature` is enabled for `repo` (or the current request's repository)."""
+    return repo_feature_enabled(repo if repo is not None else get_active_repository(), feature)
+
+
+def require_feature(*features: str):
+    """FastAPI dependency rejecting requests with 403 when any named feature is disabled for the active repo."""
+    def _check() -> None:
+        repo = get_active_repository()
+        disabled = [f for f in features if not repo_feature_enabled(repo, f)]
+        if disabled:
+            name = str(repo.get("name") or "default")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Feature(s) disabled for repository '{name}': {', '.join(disabled)}",
+            )
+
+    return _check
 
 
 def get_active_repo_name() -> str:

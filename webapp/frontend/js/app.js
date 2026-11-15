@@ -43,7 +43,7 @@ import { InsightsView, insightsSections } from "./views/insights/insights_view.j
 import { ManView } from "./views/man/man_view.js";
 import { newestTag } from "./views/man/man_model.js";
 import { KERNEL_FAMILY, familyOf, prefixedFinals, prefixedReleaseOf } from "./views/sections/release_order.js";
-import { PROJECT_MOVABLE_TABS, isManPagesRepo, manPagesRepo, setProjects } from "./utils/projects.js";
+import { PROJECT_MOVABLE_TABS, hasFeature, isManPagesRepo, isTabFeatureEnabled, manPagesRepo, setProjects } from "./utils/projects.js";
 import "./views/sections/all_sections.js";
 import { statusLine } from "./views/status/status_model.js";
 import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
@@ -177,6 +177,7 @@ class KernelIdeApp {
       }
       return { repo, version: project?.default_branch || "" };
     });
+    urlSync.setNoticeHandler((msg) => toast.info(msg));
     if (!urlSync.deferred) urlSync.init();
 
     // 7. Command palette (Ctrl+K / Ctrl+P search, Ctrl+Shift+P commands)
@@ -208,6 +209,7 @@ class KernelIdeApp {
 
     // The active tab belongs to another project: the header lists that project's branches and revisions
     state.subscribe("repo:synced", async () => {
+      this.updateActivityBar(state.activeRepo());
       await this.initVersionSelector();
       await this.loadSidebarFileTree();
     });
@@ -238,7 +240,10 @@ class KernelIdeApp {
     state.subscribe("version:selected", () => this.updateVersionSelectorDisplay());
 
     // The active tab decides what Apply would switch, so the buttons follow tab changes
-    state.subscribe("tabs:changed", () => this.updateVersionSelectorDisplay());
+    state.subscribe("tabs:changed", () => {
+      this.updateVersionSelectorDisplay();
+      this.updateActivityBar(state.activeRepo());
+    });
 
     console.info("KernelInfo Developer IDE fully initialized.");
   }
@@ -975,9 +980,7 @@ class KernelIdeApp {
           return `<option value="${escapeAttr(p.repo)}" ${p.repo === state.currentRepo ? "selected" : ""} ${p.available ? "" : "disabled"}>${escapeAttr(label)}</option>`;
         }).join("");
         projSelect.title = "Repository (projects detected under workspace.repos_dir)";
-        // The Man activity button (§5.38) exists while a man-pages repository is configured
-        const manBtn = document.querySelector('.activity-btn[data-action="man"]');
-        if (manBtn) manBtn.hidden = !manPagesRepo();
+        this.updateActivityBar(state.activeRepo());
         projSelect.onchange = () => this.switchProject(projSelect.value);
       } catch (err) {
         console.warn("Could not load projects:", err);
@@ -1492,25 +1495,29 @@ class KernelIdeApp {
     const label = (this.projects || []).find((p) => p.repo === repo)?.name || repo;
     if (!tab) {
       state.setDefaultRepository(repo, version);
-    } else if (PROJECT_MOVABLE_TABS[tab.type]) {
+    } else if (PROJECT_MOVABLE_TABS[tab.type] && isTabFeatureEnabled(repo, tab.type)) {
       const patch = PROJECT_MOVABLE_TABS[tab.type](tab, label);
       state.moveTabToRepository(tab, repo, version, patch);
-    } else if (isManPagesRepo(repo)) {
+    } else if (isManPagesRepo(repo) && hasFeature(repo, "man")) {
       state.openTab({ type: "man", title: "Man pages", manPage: "", manSec: "", manPath: "", manQuery: "", repo, version, kernelVersion: "", kernelRepo: "" });
     } else {
       state.openTab({ type: "explorer", title: `Explorer ${shortRef(version)}`, path: "", repo, version, forceNew: true });
     }
+    this.updateActivityBar(state.activeRepo());
     if (projSelect) projSelect.value = state.currentRepo;
     toast.success(`Project ${label} @ ${shortRef(version)}`);
   }
 
   /** Commands listed in the palette (">" prefix). */
   paletteCommands() {
+    const repo = state.activeRepo();
+    const enabled = (f) => hasFeature(repo, f);
     const v = () => state.getActiveTab()?.version || state.currentVersion;
     const activeCode = () => {
       const tab = state.getActiveTab();
       return tab && tab.type === "code" && tab.path ? tab : null;
     };
+    const visibleInsights = insightsSections().filter((sec) => !sec.visible || sec.visible(repo));
     const commands = [
       { title: "Switch workspace session…", hint: "Choose or open a saved session", keywords: "session workspace window", run: () => showSessionPickerModal({ allowClose: true }) },
       {
@@ -1540,20 +1547,26 @@ class KernelIdeApp {
           }
         }
       },
-      { title: "Compare versions or commits", hint: "Files, Kconfig & man-pages changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
-      { title: "Compare kernel APIs", hint: "Syscalls, exports, parameters, tracepoints and modules added, removed or changed between two revisions", keywords: "api changelog diff exports compare", run: () => state.openTab({ type: "diff", title: "Compare", mode: "api", versionB: v() }) },
-      { title: "Compare man pages", hint: "Man entries added, modified or deleted between two man-pages revisions", keywords: "man manual manpage man-pages diff compare", run: () => {
-        const repo = manPagesRepo();
-        if (!repo) { toast.info("No man-pages repository is configured (a repository whose project is man-pages)"); return; }
-        state.openTab({ type: "diff", title: "Compare", repo, mode: "man" });
-      } },
-      { title: "Open man pages", hint: "Linux man-pages index (sections, filter), Web or Terminal rendering", keywords: "man manual manpage man-pages syscall", run: () => this.openManIndex() },
-      { title: "Open Kernel API", hint: "Syscalls, exports, parameters, tracepoints, modules, device tables", keywords: "kapi api catalog", run: () => state.openTab({ type: "api", title: "Kernel API", version: v() }) },
-      ...apiSections().map((sec) => ({ title: `Kernel API: ${sec.label}`, hint: sec.hint || "", keywords: `kapi ${sec.keywords || ""}`,
-        run: () => state.openTab({ type: "api", title: `Kernel API · ${sec.label}`, view: sec.id, version: v() }) })),
-      { title: "Open Insights", hint: "Release stats, merge window, subsystem health, stable, security", keywords: "insights report statistics", run: () => state.openTab({ type: "insights", title: "Insights", version: v() }) },
-      ...insightsSections().map((sec) => ({ title: `Insights: ${sec.label}`, hint: sec.hint || "", keywords: `insights ${sec.keywords || ""}`,
-        run: () => state.openTab({ type: "insights", title: `Insights · ${sec.label}`, view: sec.id, version: v() }) })),
+      ...(enabled("compare") ? [
+        { title: "Compare versions or commits", hint: "Files, Kconfig & man-pages changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
+        ...(enabled("api") ? [{ title: "Compare kernel APIs", hint: "Syscalls, exports, parameters, tracepoints and modules added, removed or changed between two revisions", keywords: "api changelog diff exports compare", run: () => state.openTab({ type: "diff", title: "Compare", mode: "api", versionB: v() }) }] : []),
+        ...(isTabFeatureEnabled(repo, "man") ? [{ title: "Compare man pages", hint: "Man entries added, modified or deleted between two man-pages revisions", keywords: "man manual manpage man-pages diff compare", run: () => {
+          const mRepo = manPagesRepo();
+          if (!mRepo) { toast.info("No man-pages repository is configured (a repository whose project is man-pages)"); return; }
+          state.openTab({ type: "diff", title: "Compare", repo: mRepo, mode: "man" });
+        } }] : []),
+      ] : []),
+      ...(isTabFeatureEnabled(repo, "man") ? [{ title: "Open man pages", hint: "Linux man-pages index (sections, filter), Web or Terminal rendering", keywords: "man manual manpage man-pages syscall", run: () => this.openManIndex() }] : []),
+      ...(enabled("api") ? [
+        { title: "Open Kernel API", hint: "Syscalls, exports, parameters, tracepoints, modules, device tables", keywords: "kapi api catalog", run: () => state.openTab({ type: "api", title: "Kernel API", version: v() }) },
+        ...apiSections().map((sec) => ({ title: `Kernel API: ${sec.label}`, hint: sec.hint || "", keywords: `kapi ${sec.keywords || ""}`,
+          run: () => state.openTab({ type: "api", title: `Kernel API · ${sec.label}`, view: sec.id, version: v() }) })),
+      ] : []),
+      ...(enabled("insights") ? [
+        { title: "Open Insights", hint: "Release stats, merge window, subsystem health, stable, security", keywords: "insights report statistics", run: () => state.openTab({ type: "insights", title: "Insights", version: v() }) },
+        ...visibleInsights.map((sec) => ({ title: `Insights: ${sec.label}`, hint: sec.hint || "", keywords: `insights ${sec.keywords || ""}`,
+          run: () => state.openTab({ type: "insights", title: `Insights · ${sec.label}`, view: sec.id, version: v() }) })),
+      ] : []),
       { title: "Show watch list", hint: "Files, symbols, Kconfig options and MAINTAINERS sections you follow", keywords: "watch follow notify bell changes", run: () => state.openTab({ type: "watch", title: "Watch list" }) },
       { title: "Watch this tab", hint: "The file of a code tab, the directory of an explorer, a Kconfig option, a MAINTAINERS section", keywords: "watch follow notify", run: async () => {
         const { toggleWatch } = await import("./views/watch/watch_runtime.js");
@@ -1584,57 +1597,59 @@ class KernelIdeApp {
         const r = await toggleBookmark(t);
         toast.success(r.added ? `Bookmarked ${r.record.data.label}` : `Bookmark ${r.record.data.label} removed`);
       } },
-      { title: "Open patch series", hint: "Files staged with ✎ Create patch → Add to series: patches, cover letter, recipients, mbox", keywords: "patch series format-patch mbox cover letter send", run: () => state.openTab({ type: "patch", title: "Patch series", version: state.getPatchDrafts()?.base || state.currentVersion }) },
+      ...(enabled("patch") ? [{ title: "Open patch series", hint: "Files staged with ✎ Create patch → Add to series: patches, cover letter, recipients, mbox", keywords: "patch series format-patch mbox cover letter send", run: () => state.openTab({ type: "patch", title: "Patch series", version: state.getPatchDrafts()?.base || state.currentVersion }) }] : []),
       { title: "Show parser status", hint: "Versions parsed and being parsed, database size, server caches", keywords: "ingest ingestion parser progress database status", run: () => state.openTab({ type: "status", title: "Parser status" }) },
       { title: "Keyboard shortcuts", hint: `List and rebind them (${shortcuts.label("help.shortcuts") || "?"})`, keywords: "keys keybindings hotkeys help rebind", run: () => showShortcutsOverlay() },
       { title: "Search text in files…", hint: "git grep over the revision (or type % in the palette)", keywords: "grep find code full-text search", run: () => state.openTab({ type: "search", title: "Search", version: v() }) },
       { title: "Select commit…", hint: "Tags and commits", keywords: "version checkout ref", run: () => document.getElementById("commit-picker-btn")?.click() },
       { title: "Open source treemap", hint: "Bytes / files per directory", keywords: "size disk usage", run: () => state.openTab({ type: "treemap", title: "Treemap: root", path: "", version: v() }) },
-      {
-        title: "Export compile_commands.json", hint: "clang compilation database (x86)", keywords: "clangd lsp download",
-        run: () => {
-          window.location.href = api.getCompileCommandsDownloadUrl(v(), "x86");
-          toast.info("Generating compile_commands.json…");
-        }
-      },
-      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => { const a = state.kconfigArch(); state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a }); } },
-      {
-        title: "Enable KConfig engine in a tab (#ifdef dimming)", hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor config engine",
-        run: () => {
-          // An engine resolves the configuration of one KConfig tab, so it needs one to belong to
-          const active = state.getActiveTab();
-          const target = active && active.type === "kconfig" && !state.isKconfigEngineOwner(active.id)
-            ? active
-            : state.kconfigTabs().find((t) => !state.isKconfigEngineOwner(t.id));
-          if (!target) {
-            toast.info(state.kconfigTabs().length ? "Every open KConfig tab already runs its engine" : "Open a KConfig tab to enable an engine");
-            return;
+      ...(enabled("kconfig") ? [
+        {
+          title: "Export compile_commands.json", hint: "clang compilation database (x86)", keywords: "clangd lsp download",
+          run: () => {
+            window.location.href = api.getCompileCommandsDownloadUrl(v(), "x86");
+            toast.info("Generating compile_commands.json…");
           }
-          // The tab shows what resolving its values changes before it takes the engine (§5.0)
-          state.requestKconfigEngine(target.id);
-        }
-      },
-      {
-        title: "Disable every KConfig engine", hint: `${state.kconfigEngineTabIds.length} running`, keywords: "ifdef dim config engine off",
-        run: () => {
-          const had = state.disableAllKconfigEngines();
-          toast.info(had.length ? `${had.length} KConfig engine(s) disabled (their configurations are kept)` : "No KConfig engine is running");
-        }
-      },
+        },
+        { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => { const a = state.kconfigArch(); state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a }); } },
+        {
+          title: "Enable KConfig engine in a tab (#ifdef dimming)", hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor config engine",
+          run: () => {
+            // An engine resolves the configuration of one KConfig tab, so it needs one to belong to
+            const active = state.getActiveTab();
+            const target = active && active.type === "kconfig" && !state.isKconfigEngineOwner(active.id)
+              ? active
+              : state.kconfigTabs().find((t) => !state.isKconfigEngineOwner(t.id));
+            if (!target) {
+              toast.info(state.kconfigTabs().length ? "Every open KConfig tab already runs its engine" : "Open a KConfig tab to enable an engine");
+              return;
+            }
+            // The tab shows what resolving its values changes before it takes the engine (§5.0)
+            state.requestKconfigEngine(target.id);
+          }
+        },
+        {
+          title: "Disable every KConfig engine", hint: `${state.kconfigEngineTabIds.length} running`, keywords: "ifdef dim config engine off",
+          run: () => {
+            const had = state.disableAllKconfigEngines();
+            toast.info(had.length ? `${had.length} KConfig engine(s) disabled (their configurations are kept)` : "No KConfig engine is running");
+          }
+        },
+      ] : []),
       { title: "Open repository explorer tab", hint: "Browse the tree of this revision", keywords: "files tree browse", run: () => state.openTab({ type: "explorer", title: `Explorer ${v()}`, path: "", version: v(), forceNew: true }) },
-      { title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) },
-      { title: "Open Mailing List & LKML search", hint: "Search patches and threads", keywords: "mail lkml lore patch thread", run: () => state.openTab({ type: "mail", title: "Mailing List" }) },
-      { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
-      { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },
-      { title: "Open Pahole struct layout inspector", hint: "Memory layout, cachelines & padding holes", keywords: "pahole struct layout memory cacheline hole padding", run: () => state.openTab({ type: "pahole", title: "struct task_struct", structName: "task_struct" }) },
-      { title: "Open Callgraph function explorer", hint: "Bidirectional callers and callees", keywords: "callgraph callers callees function graph", run: () => state.openTab({ type: "callgraph", title: "Callgraph: schedule", functionName: "schedule" }) },
-      { title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) },
+      ...(enabled("commits") ? [{ title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) }] : []),
+      ...(enabled("mail") ? [{ title: "Open Mailing List & LKML search", hint: "Search patches and threads", keywords: "mail lkml lore patch thread", run: () => state.openTab({ type: "mail", title: "Mailing List" }) }] : []),
+      ...(enabled("maintainers") ? [{ title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) }] : []),
+      ...(enabled("nodemap") ? [{ title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) }] : []),
+      ...(enabled("pahole") ? [{ title: "Open Pahole struct layout inspector", hint: "Memory layout, cachelines & padding holes", keywords: "pahole struct layout memory cacheline hole padding", run: () => state.openTab({ type: "pahole", title: "struct task_struct", structName: "task_struct" }) }] : []),
+      ...(enabled("callgraph") ? [{ title: "Open Callgraph function explorer", hint: "Bidirectional callers and callees", keywords: "callgraph callers callees function graph", run: () => state.openTab({ type: "callgraph", title: "Callgraph: schedule", functionName: "schedule" }) }] : []),
+      ...(enabled("docs") ? [{ title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) }] : []),
       { title: "Toggle file explorer", hint: "Sidebar", keywords: "sidebar tree collapse", run: () => this.toggleSidebar() },
     ];
     const tab = activeCode();
     if (tab) {
       commands.unshift(
-        { title: `Create patch from ${tab.path.split("/").pop()}…`, hint: "Edit & git format-patch", keywords: "patch edit", run: () => showPatchModal(tab.version || v(), tab.path) },
+        ...(enabled("patch") ? [{ title: `Create patch from ${tab.path.split("/").pop()}…`, hint: "Edit & git format-patch", keywords: "patch edit", run: () => showPatchModal(tab.version || v(), tab.path) }] : []),
         { title: "Symbol history at cursor line", hint: `${tab.path}:${tab.cursorLine || 1}`, keywords: "timeline versions", run: () => showSymbolHistoryModal(tab.version || v(), tab.path, tab.cursorLine || 1) },
       );
     }
@@ -1696,7 +1711,21 @@ class KernelIdeApp {
    * from the kernel, at the man-pages tag released on or before the explored kernel revision
    * (`/api/man/resolve`), else the newest tag.
    */
+  updateActivityBar(repo = state.activeRepo() || state.currentRepo) {
+    const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "man", "compare"];
+    for (const action of gated) {
+      const btn = document.querySelector(`.activity-btn[data-action="${action}"]`);
+      if (!btn) continue;
+      const tabType = action === "compare" ? "diff" : action;
+      btn.hidden = !isTabFeatureEnabled(repo, tabType);
+    }
+  }
+
   async openManIndex() {
+    if (!hasFeature(state.activeRepo(), "man")) {
+      toast.info("Man pages feature is disabled for this project");
+      return;
+    }
     const index = { manPage: "", manSec: "", manPath: "", manQuery: "", title: "Man pages" };
     if (isManPagesRepo(state.activeRepo())) {
       state.openTab({ type: "man", ...index, repo: state.activeRepo(), version: state.activeVersion(), kernelVersion: "", kernelRepo: "" });
@@ -1721,6 +1750,7 @@ class KernelIdeApp {
   }
 
   setupActivityBar() {
+    this.updateActivityBar(state.activeRepo());
     const buttons = document.querySelectorAll(".activity-btn");
 
     buttons.forEach((btn) => {
@@ -1729,7 +1759,14 @@ class KernelIdeApp {
 
         if (action === "explorer") {
           this.toggleSidebar();
-        } else if (action === "kconfig") {
+          return;
+        }
+        const tabType = (action === "compare" || action === "tools") ? "diff" : action;
+        if (!isTabFeatureEnabled(state.activeRepo(), tabType)) {
+          toast.info(`Feature '${action}' is disabled for this project`);
+          return;
+        }
+        if (action === "kconfig") {
           const a = state.kconfigArch();
           state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a });
         } else if (action === "nodemap") {

@@ -11,7 +11,7 @@ from core.DBLayout import (
     m_maintainer_file,
 )
 from pipeline.changesets import get_fid_for_path, get_fnid_for_path
-from pipeline.git_network import kernel_steps_apply
+from pipeline.git_network import feature_enabled
 from pipeline.state import MF, gp, logger
 
 
@@ -58,7 +58,7 @@ def processing_maintainer_files(version: str) -> None:
     against the paths new in this version. Nothing is parsed when neither exists. The matching is not cut
     short by the duration limit: a section matched against part of the tree only would stay incomplete.
     Skipped for a project that is not a kernel tree (`kernel_steps_apply()`)."""
-    if gp.VID == 0 or not kernel_steps_apply():
+    if gp.VID == 0 or not feature_enabled("maintainers"):
         return
     from parser.maintainer_ast import maintainer_store
 

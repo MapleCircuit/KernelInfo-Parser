@@ -7,9 +7,11 @@ from core.config import (
     LINUX_PROJECT,
     MANPAGES_PROJECT,
     MANPAGES_ROOT_COMMIT,
+    default_project_features,
     is_kernel_project,
     project_display_name,
     repository_project,
+    resolve_repo_features,
 )
 import os
 import subprocess as sp
@@ -28,7 +30,7 @@ from pipeline.state import MF, gp, logger
 
 
 
-_network_repo_cache: dict[tuple[str, str, str, str], tuple[int, int]] = {}
+_network_repo_cache: dict[tuple[str, str, str, str], tuple[int, int, dict[str, bool]]] = {}
 
 
 # repo_dir (absolute) -> project slug of its repositories[] entry (configured `project`, else by root commit)
@@ -61,6 +63,15 @@ def kernel_steps_apply() -> bool:
     return is_kernel_project(getattr(gp, "project_slug", None) or LINUX_PROJECT)
 
 
+def feature_enabled(feature: str) -> bool:
+    """True when `feature` is enabled for the active repository/project."""
+    features = getattr(gp, "project_features", None)
+    if isinstance(features, dict) and feature in features:
+        return bool(features[feature])
+    slug = getattr(gp, "project_slug", None) or LINUX_PROJECT
+    return default_project_features(slug).get(feature, kernel_steps_apply())
+
+
 def _next_id(db: Any, table: Any) -> int:
     """Allocate a primary key id for `table`, using `reserve_id_block` in distributed mode."""
     if getattr(G.TE, "distributed", False) or getattr(G, "distributed", False):
@@ -86,10 +97,11 @@ def resolve_git_network_and_repo(
     if project_slug is not None:
         cache_key = (abs_dir, repo_name or "", project_name or project_display_name(project_slug), project_slug)
         if cache_key in _network_repo_cache:
-            net_id, r_id = _network_repo_cache[cache_key]
+            net_id, r_id, features = _network_repo_cache[cache_key]
             gp.network_id = net_id
             gp.repo_id = r_id
             gp.project_slug = project_slug
+            gp.project_features = dict(features)
             return net_id, r_id
 
     git_dir = os.path.join(repo_dir, ".git") if os.path.isdir(os.path.join(repo_dir, ".git")) else repo_dir
@@ -118,10 +130,11 @@ def resolve_git_network_and_repo(
         project_name = project_display_name(project_slug)
     cache_key = (abs_dir, repo_name or "", project_name, project_slug)
     if cache_key in _network_repo_cache:
-        net_id, r_id = _network_repo_cache[cache_key]
+        net_id, r_id, features = _network_repo_cache[cache_key]
         gp.network_id = net_id
         gp.repo_id = r_id
         gp.project_slug = project_slug
+        gp.project_features = dict(features)
         return net_id, r_id
 
     if not repo_name:
@@ -178,10 +191,16 @@ def resolve_git_network_and_repo(
 
             db.insert(m_repository, (repo_id, network_id, repo_name, git_url, def_branch))
 
+    entry = None
+    with contextlib.suppress(Exception):
+        entry = get_repository(abs_dir)
+    features = resolve_repo_features(entry) if entry is not None else default_project_features(project_slug)
+
     gp.network_id = network_id
     gp.repo_id = repo_id
     gp.project_slug = project_slug
-    _network_repo_cache[cache_key] = (network_id, repo_id)
+    gp.project_features = dict(features)
+    _network_repo_cache[cache_key] = (network_id, repo_id, dict(features))
     return network_id, repo_id
 
 

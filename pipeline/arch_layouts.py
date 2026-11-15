@@ -7,7 +7,7 @@ import time
 from typing import Any
 from parser.arch_layout import compute_layout_rows, layout_digest
 from parser.make_eval import Tree
-from pipeline.git_network import kernel_steps_apply
+from pipeline.git_network import feature_enabled
 from pipeline.state import MF, gp, logger
 
 
@@ -30,7 +30,7 @@ def processing_arch_layouts(version: str) -> int:
     `layout_digest()`, its rows in m_arch_layout_entry); the version's m_arch_root rows point at it.
     Returns the number of layout rows written (0 when every layout already existed). Skipped for a project that
     is not a kernel tree (`kernel_steps_apply()`) and for a tree with neither a top Makefile nor an `arch/` file."""
-    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None) or not kernel_steps_apply():
+    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None) or not feature_enabled("kconfig"):
         return 0
     if "Makefile" not in gp.file_blob_hashes and not any(p.startswith("arch/") for p in gp.file_blob_hashes):
         return 0

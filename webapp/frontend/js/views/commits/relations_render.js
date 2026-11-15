@@ -63,7 +63,7 @@ const SECTIONS = [
 ];
 
 /** The Relations card body (H1, H2); "" when the commit has no relation at all. */
-export function relationsHtml(rel) {
+export function relationsHtml(rel, { showCve = true, showMail = true } = {}) {
   if (!rel) return "";
   const parts = [];
   for (const [key, title, help] of SECTIONS) {
@@ -77,14 +77,14 @@ export function relationsHtml(rel) {
     parts.push(`<div class="rel-section rel-stable"><div class="rel-title">Cc: stable</div><div class="rel-row">Marked for the stable releases${notes.length ? ` (<code>${escapeHtml(notes.join(", "))}</code>)` : ""}</div></div>`);
   }
   const cves = rel.cves || {};
-  if ((cves.fixes || []).length || (cves.introduced || []).length || (cves.fixes_upstream || []).length) {
+  if (showCve && ((cves.fixes || []).length || (cves.introduced || []).length || (cves.fixes_upstream || []).length)) {
     const link = (id) => `<a href="#" class="rel-cve" data-cve="${escapeHtml(id)}" title="Open in Insights · Security">${escapeHtml(id)}</a> <a href="https://www.cve.org/CVERecord?id=${encodeURIComponent(id)}" target="_blank" rel="noopener noreferrer" class="rel-ext" title="The record at cve.org">↗</a>`;
     parts.push(`<div class="rel-section rel-cve-section"><div class="rel-title">CVE</div>
       ${(cves.fixes || []).map((id) => `<div class="rel-row">Fixes ${link(id)}</div>`).join("")}
       ${(cves.fixes_upstream || []).map((id) => `<div class="rel-row">Backports the fix of ${link(id)}</div>`).join("")}
       ${(cves.introduced || []).map((id) => `<div class="rel-row">Introduced the bug of ${link(id)}</div>`).join("")}</div>`);
   }
-  if ((rel.links || []).length) {
+  if (showMail && (rel.links || []).length) {
     parts.push(`<div class="rel-section rel-links"><div class="rel-title">Link</div>${rel.links.slice(0, 5).map((m) => `<div class="rel-row"><a href="#" class="rel-mail" data-mid="${escapeHtml(m)}" title="Open the thread in the mailing list tab">&lt;${escapeHtml(m)}&gt;</a></div>`).join("")}</div>`);
   }
   return parts.join("");
