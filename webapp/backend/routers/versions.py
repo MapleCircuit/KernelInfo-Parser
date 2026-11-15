@@ -10,8 +10,9 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import cached_property
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
@@ -296,12 +297,19 @@ def _build_branches() -> dict[str, Any]:
     return {"total": len(branches), "branches": branches, "tag_views": tag_views}
 
 
-def _merged_tags(head: str) -> list[str] | None:
-    """Tags reachable from `head` (one walk of its history); None when Git failed, timed out or was cancelled."""
+def branch_source_of(name: str) -> str:
+    """Group prefix for a branch name (`stable/linux-6.6.y` -> `stable`, unprefixed -> `local`)."""
+    slash = name.find("/")
+    return name[:slash] if slash > 0 else "local"
+
+
+def _run_git_walk(args: list[str], stdin_text: str | None = None) -> list[str] | None:
+    """Run a cancellable Git traversal command; return stripped non-empty lines or None on failure/timeout."""
     try:
         proc = subprocess.Popen(
-            ["git", "for-each-ref", f"--merged={head}", "--format=%(refname:short)", "refs/tags"],
+            ["git", *args],
             cwd=str(get_repo_dir()),
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -311,7 +319,7 @@ def _merged_tags(head: str) -> list[str] | None:
     with _BRANCH_TAGS_LOCK:
         _RUNNING_WALKS.add(proc)
     try:
-        out, _ = proc.communicate(timeout=_BRANCH_WALK_TIMEOUT_S)
+        out, _ = proc.communicate(input=stdin_text, timeout=_BRANCH_WALK_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
@@ -324,11 +332,133 @@ def _merged_tags(head: str) -> list[str] | None:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def branch_tags(head: str) -> list[str] | None:
-    """Tags reachable from commit `head` of the active repository, cached per (repository, head).
+def _merged_tags(head: str) -> list[str] | None:
+    """Tags reachable from `head` (one walk of its history); None when Git failed, timed out or was cancelled."""
+    return _run_git_walk(["for-each-ref", f"--merged={head}", "--format=%(refname:short)", "refs/tags"])
 
-    Concurrent callers for the same head share one walk. A failed walk is not cached (None)."""
-    key = (str(get_repo_dir()), head)
+
+def _merged_tags_many(heads: list[str]) -> list[str] | None:
+    """Tags reachable from at least one commit in `heads` (chunked to stay within argv limits)."""
+    unique = sorted({h for h in heads if h})
+    if not unique:
+        return []
+    if len(unique) == 1:
+        return _merged_tags(unique[0])
+    tags: set[str] = set()
+    chunk_size = 200
+    for i in range(0, len(unique), chunk_size):
+        chunk = unique[i : i + chunk_size]
+        lines = _run_git_walk(["for-each-ref", *(f"--merged={h}" for h in chunk), "--format=%(refname:short)", "refs/tags"])
+        if lines is None:
+            return None
+        tags.update(lines)
+    return sorted(tags)
+
+
+def _tags_in_exclusive_roots(exclusive_roots: set[str], other_heads: list[str]) -> set[str] | None:
+    """Tags descending exclusively from `exclusive_roots` (reaching none of `other_heads` or foreign roots).
+
+    Captures historical tag-only release chains (e.g. Linux 0.11..2.4.0-prerelease in `history`) whose
+    tips are not referenced by any branch head yet belong to a source's disconnected DAG component.
+    """
+    tag_lines = _run_git_walk([
+        "for-each-ref",
+        "--format=%(refname:short) %(if)%(*objectname)%(then)%(*objecttype) %(*objectname)%(else)%(objecttype) %(objectname)%(end)",
+        "refs/tags",
+    ])
+    if tag_lines is None:
+        return None
+    oid_to_tags: dict[str, list[str]] = {}
+    for line in tag_lines:
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == "commit":
+            oid_to_tags.setdefault(parts[2], []).append(parts[0])
+    if not oid_to_tags:
+        return set()
+
+    stdin_data = "\n".join([*oid_to_tags.keys(), *(f"^{h}" for h in other_heads if h)]) + "\n"
+    dag_lines = _run_git_walk(
+        ["rev-list", "--stdin", "--boundary", "--parents", "--simplify-by-decoration"],
+        stdin_text=stdin_data,
+    )
+    if dag_lines is None:
+        return None
+
+    parents_of: dict[str, list[str] | None] = {}
+    for line in dag_lines:
+        parts = line.split()
+        if not parts:
+            continue
+        cid = parts[0]
+        if cid.startswith("-"):
+            parents_of[cid[1:]] = None  # crossed into `other_heads`: outside source's exclusive component
+        else:
+            parents_of[cid] = parts[1:]
+
+    in_component: dict[str, bool] = {}
+
+    def _belongs(start: str) -> bool:
+        if start in in_component:
+            return in_component[start]
+        stack: list[tuple[str, bool]] = [(start, False)]
+        visiting: set[str] = set()
+        while stack:
+            cid, expanded = stack.pop()
+            if cid in in_component:
+                continue
+            ps = parents_of.get(cid)
+            if ps is None:
+                in_component[cid] = False
+                continue
+            if not ps:
+                in_component[cid] = cid in exclusive_roots
+                continue
+            if expanded:
+                visiting.discard(cid)
+                in_component[cid] = all(in_component.get(p, False) for p in ps)
+                continue
+            if cid in visiting:
+                in_component[cid] = False
+                continue
+            visiting.add(cid)
+            stack.append((cid, True))
+            for p in ps:
+                if p not in in_component:
+                    stack.append((p, False))
+        return in_component.get(start, False)
+
+    matched: set[str] = set()
+    for oid, names in oid_to_tags.items():
+        if oid in parents_of and _belongs(oid):
+            matched.update(names)
+    return matched
+
+
+def _compute_source_tags(source_heads: list[str], other_heads: list[str]) -> list[str] | None:
+    """Tags belonging to a branch source: union of its branches plus any exclusive-root tag chains."""
+    merged = _merged_tags_many(source_heads)
+    if merged is None:
+        return None
+    tags = set(merged)
+    if other_heads and source_heads:
+        src_roots = _run_git_walk(["rev-list", "--max-parents=0", "--stdin"], stdin_text="\n".join(source_heads) + "\n")
+        if src_roots is None:
+            return None
+        other_roots = _run_git_walk(["rev-list", "--max-parents=0", "--stdin"], stdin_text="\n".join(other_heads) + "\n")
+        if other_roots is None:
+            return None
+        exclusive = set(src_roots) - set(other_roots)
+        if exclusive:
+            extra = _tags_in_exclusive_roots(exclusive, other_heads)
+            if extra is None:
+                return None
+            tags |= extra
+    return sorted(tags)
+
+
+def _cached_tag_walk(cache_token: str, compute: Callable[[], list[str] | None]) -> list[str] | None:
+    """Shared LRU + in-flight coalescing cache for branch and source tag walks."""
+    key = (str(get_repo_dir()), cache_token)
     with _BRANCH_TAGS_LOCK:
         tags = _BRANCH_TAGS_CACHE.get(key)
         if tags is not None:
@@ -341,7 +471,7 @@ def branch_tags(head: str) -> list[str] | None:
         if tags is not None:
             return tags  # computed by the walk this caller waited for
         try:
-            tags = _merged_tags(head)
+            tags = compute()
         finally:
             with _BRANCH_TAGS_LOCK:
                 if tags is not None:
@@ -350,6 +480,18 @@ def branch_tags(head: str) -> list[str] | None:
                         _BRANCH_TAGS_CACHE.popitem(last=False)
                 _BRANCH_TAGS_INFLIGHT.pop(key, None)
     return tags
+
+
+def branch_tags(head: str) -> list[str] | None:
+    """Tags reachable from commit `head` of the active repository, cached per (repository, head).
+
+    Concurrent callers for the same head share one walk. A failed walk is not cached (None)."""
+    return _cached_tag_walk(head, lambda: _merged_tags(head))
+
+
+def source_tags(source: str, source_heads: list[str], other_heads: list[str], heads_digest: str) -> list[str] | None:
+    """Tags belonging to all branches of `source` (and any exclusive disconnected history roots)."""
+    return _cached_tag_walk(f"source:{source}:{heads_digest}", lambda: _compute_source_tags(source_heads, other_heads))
 
 
 def cancel_branch_walks() -> None:
@@ -369,14 +511,47 @@ def _branch_head(branch: str) -> str | None:
 
 
 @router.get("/branch/tags")
-def get_branch_tags(branch: str = Query(..., min_length=1)) -> dict[str, Any]:
-    """Tag names reachable from `branch`: the releases that belong to that branch's history.
+def get_branch_tags(
+    branch: Annotated[str | None, Query(min_length=1)] = None,
+    source: Annotated[str | None, Query(min_length=1)] = None,
+) -> dict[str, Any]:
+    """Tag names reachable from `branch` or across a branch `source` (e.g. `history`, `stable`).
 
     This is what makes the header's **Branch** selector scope the Tag and RC dropdowns (§5.13 of
-    `webapp/API.md`): `v2.6.16.62` was tagged on `stable/linux-2.6.16.y` and is not reachable from
-    `master`, so it is listed for that branch only. `head` is the branch's current commit, which is
-    also the cache generation of the answer (a branch that moved returns a new head).
+    `webapp/API.md`): a single branch lists tags reachable from its tip, while a source combines all
+    branches under that prefix (plus any tag chains rooted exclusively in that source's DAG).
     """
+    if branch and branch.startswith("source:") and source is None:
+        source = branch[7:]
+        branch = None
+
+    if source is not None:
+        src = safe_rev(source, "source")
+        all_branches = get_branches().get("branches") or []
+        src_branches = [b for b in all_branches if branch_source_of(b["name"]) == src]
+        if not src_branches:
+            raise HTTPException(status_code=404, detail=f"Unknown branch source: {src}")
+        other_branches = [b for b in all_branches if branch_source_of(b["name"]) != src]
+        src_heads = sorted({h for b in src_branches if (h := b.get("commit_hash") or _branch_head(b["name"]))})
+        if not src_heads:
+            raise HTTPException(status_code=404, detail=f"Unknown branch source: {src}")
+        other_heads = sorted({h for b in other_branches if (h := b.get("commit_hash") or "")})
+        heads_digest = digest(dumps([src_heads, other_heads]))
+        tags = source_tags(src, src_heads, other_heads, heads_digest)
+        if tags is None:
+            raise HTTPException(status_code=503, detail=f"Could not list the tags of source {src}")
+        return {
+            "branch": f"source:{src}",
+            "source": src,
+            "head": heads_digest,
+            "branches": len(src_branches),
+            "total": len(tags),
+            "tags": tags,
+        }
+
+    if not branch:
+        raise HTTPException(status_code=400, detail="Provide branch or source")
+
     safe_rev(branch, "branch")
     head = _branch_head(branch)
     if not head:

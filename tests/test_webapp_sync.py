@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -458,6 +459,103 @@ class TestVersionCatalog(unittest.TestCase):
             legacy = endpoint(_request({"If-None-Match": f'W/"c1-{cur.gen}"'}), True, False)
             self.assertEqual(legacy.status_code, 200)
             self.assertEqual(json.loads(legacy.body)["total"], 300)
+
+
+class TestBranchSourceTags(unittest.TestCase):
+    """Branch source scope aggregation (`GET /api/branch/tags?source=...`)."""
+
+    def setUp(self) -> None:
+        versions_router._BRANCH_TAGS_CACHE.clear()
+        versions_router._BRANCH_TAGS_INFLIGHT.clear()
+
+    tearDown = setUp
+
+    def test_source_tags_include_all_branches_and_exclusive_history_tag_chains(self) -> None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        }
+
+        def run_git(repo_dir: str, *args: str, date: str = "2020-01-01T00:00:00Z") -> str:
+            res = subprocess.run(
+                ["git", *args],
+                cwd=repo_dir,
+                env={**env, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return res.stdout.strip()
+
+        def commit(repo_dir: str, fname: str, content: str, msg: str, tag: str = "") -> str:
+            with open(os.path.join(repo_dir, fname), "w", encoding="utf-8") as fh:
+                fh.write(content)
+            run_git(repo_dir, "add", fname)
+            run_git(repo_dir, "commit", "-m", msg)
+            if tag:
+                run_git(repo_dir, "tag", tag)
+            return run_git(repo_dir, "rev-parse", "HEAD")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_git(tmp, "init", "-b", "master")
+            c_root = commit(tmp, "README", "m0", "mainline root", "v2.6.12")
+            c_master = commit(tmp, "README", "m1", "mainline 3.0", "v3.0")
+
+            # Two stable branches anchored on mainline
+            run_git(tmp, "checkout", "-b", "stable/linux-3.0.y", c_master)
+            commit(tmp, "README", "3.0.1", "stable 3.0.1", "v3.0.1")
+            run_git(tmp, "checkout", "-b", "stable/linux-6.6.y", c_master)
+            commit(tmp, "README", "6.6", "stable 6.6", "v6.6")
+            commit(tmp, "README", "6.6.1", "stable 6.6.1", "v6.6.1")
+
+            # Disconnected history root #1: 0.01 -> history/0.10-fix-RCS, plus off-branch 0.99 chain
+            run_git(tmp, "checkout", "--orphan", "history/0.10-fix-RCS")
+            run_git(tmp, "rm", "-rf", ".")
+            c_001 = commit(tmp, "HIST", "0.01", "init 0.01", "0.01")
+            commit(tmp, "HIST", "0.10", "release 0.10", "0.10")
+            run_git(tmp, "checkout", "--detach", c_001)
+            commit(tmp, "HIST", "0.99", "release 0.99", "0.99")
+            commit(tmp, "HIST", "2.4pre", "2.4.0-prerelease", "2.4.0-prerelease")
+
+            # Disconnected history root #2: 2.4.0 -> history/2.4-stable -> history/master
+            run_git(tmp, "checkout", "--orphan", "history/2.4-stable")
+            run_git(tmp, "rm", "-rf", ".")
+            commit(tmp, "HIST2", "2.4.0", "release 2.4.0", "2.4.0")
+            c_241 = commit(tmp, "HIST2", "2.4.1", "release 2.4.1", "2.4.1")
+            run_git(tmp, "checkout", "-b", "history/master", c_241)
+            commit(tmp, "HIST2", "2.6.12rc1", "v2.6.12-rc1", "v2.6.12-rc1")
+            run_git(tmp, "checkout", "master")
+
+            all_branches = []
+            for bname in ("master", "stable/linux-3.0.y", "stable/linux-6.6.y", "history/0.10-fix-RCS", "history/2.4-stable", "history/master"):
+                sha = run_git(tmp, "rev-parse", bname)
+                all_branches.append({"name": bname, "commit_hash": sha, "is_default": bname == "master"})
+
+            with patch.object(versions_router, "get_repo_dir", return_value=Path(tmp)), \
+                    patch.object(versions_router, "get_branches", return_value={"total": len(all_branches), "branches": all_branches}):
+                hist_res = versions_router.get_branch_tags(source="history")
+                self.assertEqual(hist_res["source"], "history")
+                self.assertEqual(hist_res["branch"], "source:history")
+                self.assertEqual(
+                    hist_res["tags"],
+                    ["0.01", "0.10", "0.99", "2.4.0", "2.4.0-prerelease", "2.4.1", "v2.6.12-rc1"],
+                )
+                # `branch="source:history"` routes identically
+                self.assertEqual(versions_router.get_branch_tags("source:history")["tags"], hist_res["tags"])
+
+                stable_res = versions_router.get_branch_tags(source="stable")
+                self.assertEqual(stable_res["tags"], ["v2.6.12", "v3.0", "v3.0.1", "v6.6", "v6.6.1"])
+
+                with self.assertRaises(versions_router.HTTPException) as ctx_404:
+                    versions_router.get_branch_tags(source="unknown")
+                self.assertEqual(ctx_404.exception.status_code, 404)
+
+                with self.assertRaises(versions_router.HTTPException) as ctx_400:
+                    versions_router.get_branch_tags(source="--exec")
+                self.assertEqual(ctx_400.exception.status_code, 400)
 
 
 if __name__ == "__main__":

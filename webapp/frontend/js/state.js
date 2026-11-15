@@ -20,6 +20,22 @@ export function kconfigProfileKey(version, arch, configName = "") {
   return `${version}|${arch}${name ? `|${name}` : ""}`;
 }
 
+/** Branch-source scope identifier helpers (`source:<name>`), shared across header/pickers/watch. */
+export const SOURCE_SCOPE_PREFIX = "source:";
+export function isSourceScope(scope) {
+  return typeof scope === "string" && scope.startsWith(SOURCE_SCOPE_PREFIX);
+}
+export function sourceScopeValue(sourceName) {
+  return sourceName ? `${SOURCE_SCOPE_PREFIX}${sourceName}` : "";
+}
+export function sourceNameOfScope(scope) {
+  return isSourceScope(scope) ? scope.slice(SOURCE_SCOPE_PREFIX.length) : "";
+}
+export function formatBranchScopeLabel(scope) {
+  const src = sourceNameOfScope(scope);
+  return src ? `${src}/*` : String(scope || "");
+}
+
 /** Bare and CONFIG_ keys of a configuration ({FOO: "y"} -> {FOO: "y", CONFIG_FOO: "y"}). */
 function normalizeAssignments(values) {
   const normalized = {};

@@ -3,12 +3,13 @@
  */
 import { api } from "./api.js";
 import { syncManager } from "./sync.js";
-import { state } from "./state.js";
+import { state, formatBranchScopeLabel, isSourceScope, sourceNameOfScope } from "./state.js";
 import { urlSync } from "./url_sync.js";
 import { toast } from "./components/toast.js";
 import { TabsComponent } from "./components/tabs.js";
 import { contextMenu } from "./components/context_menu.js";
 import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
+import { branchPicker, branchSourceOf } from "./components/branch_picker.js";
 import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
 import { shortcuts } from "./utils/shortcuts.js";
@@ -48,16 +49,22 @@ import "./views/sections/all_sections.js";
 import { statusLine } from "./views/status/status_model.js";
 import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
 import "./routes.js";
-import { exportDocument, importRecords, mergeImport } from "./utils/user_records.js";
+import { exportDocument, importUserDataText } from "./utils/user_records.js";
 import { THEMES, applyTheme, savedTheme } from "./utils/theme.js";
 
 /** Settings → Export User Data (S06): every user record as a `kip-user` JSON document. */
 async function exportUserData() {
+  await localDB.ready;
+  if (!localDB.db) {
+    toast.error("Export failed: Local browser storage (IndexedDB) is unavailable");
+    return;
+  }
   const records = await localDB.userList();
   const blob = new Blob([JSON.stringify(exportDocument(records), null, 1)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = `kernelinfo-user-data-${new Date().toISOString().slice(0, 10)}.json`;
+  a.addEventListener("click", (e) => e.stopPropagation());
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -74,11 +81,8 @@ function importUserData() {
     const file = input.files?.[0];
     if (!file) return;
     try {
-      const incoming = importRecords(JSON.parse(await file.text()));
-      const existing = new Map((await localDB.userList()).map((r) => [r.key, r]));
-      const { put, skipped } = mergeImport(existing, incoming, "skip-existing");
-      for (const r of put) await localDB.userPut(r);
-      toast.success(`Imported ${put.length} user record${put.length === 1 ? "" : "s"}${skipped ? ` (${skipped} already here, kept)` : ""}`);
+      const { imported, skipped } = await importUserDataText(await file.text(), localDB);
+      toast.success(`Imported ${imported} user record${imported === 1 ? "" : "s"}${skipped ? ` (${skipped} already here, kept)` : ""}`);
     } catch (err) {
       toast.error(`Import failed: ${err.message}`);
     }
@@ -713,7 +717,7 @@ class KernelIdeApp {
               <div class="settings-metric-lbl">Tools</div>
             </div>
             <div class="settings-metric-card" title="Bookmarks, notes, tours and watches you made: not part of the offline cache, never pruned">
-              <div class="settings-metric-val">${userCount}</div>
+              <div class="settings-metric-val" id="settings-user-count">${userCount}</div>
               <div class="settings-metric-lbl">User data</div>
             </div>
           </div>
@@ -742,7 +746,7 @@ class KernelIdeApp {
               <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-export-user" title="Download your bookmarks, notes, tours and watches as JSON">
-              <span>⬇ Export User Data (${userCount})</span>
+              <span id="settings-export-user-label">⬇ Export User Data (${userCount})</span>
               <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-import-user" title="Add bookmarks, notes, tours and watches from an export (existing ones are kept)">
@@ -764,7 +768,24 @@ class KernelIdeApp {
 
     document.body.appendChild(popover);
 
+    let currentUserCount = userCount;
+    const refreshUserCount = async () => {
+      const counts = await localDB.getStoreCounts();
+      currentUserCount = counts.user || 0;
+      if (!popover.isConnected) return;
+      const metricEl = popover.querySelector("#settings-user-count");
+      if (metricEl) metricEl.textContent = String(currentUserCount);
+      const exportLabel = popover.querySelector("#settings-export-user-label");
+      if (exportLabel) exportLabel.textContent = `⬇ Export User Data (${currentUserCount})`;
+      const clearBtn = popover.querySelector("#btn-clear-user");
+      if (clearBtn) clearBtn.disabled = !currentUserCount;
+    };
+    const unsubUser = localDB.onUserChanged(() => {
+      if (popover.isConnected) refreshUserCount();
+    });
+
     const closePopover = () => {
+      unsubUser?.();
       popover.remove();
       document.removeEventListener("click", outsideClickHandler);
     };
@@ -913,7 +934,7 @@ class KernelIdeApp {
     popover.querySelector("#btn-export-user").onclick = () => exportUserData();
     popover.querySelector("#btn-import-user").onclick = () => importUserData();
     popover.querySelector("#btn-clear-user").onclick = async () => {
-      if (!confirm(`Delete your ${userCount} bookmarks, notes, tours and watches?\n\nThis cannot be undone (use Export User Data first to keep a copy).`)) return;
+      if (!confirm(`Delete your ${currentUserCount} bookmarks, notes, tours and watches?\n\nThis cannot be undone (use Export User Data first to keep a copy).`)) return;
       await localDB.userClear();
       toast.success("User data deleted");
       closePopover();
@@ -922,7 +943,7 @@ class KernelIdeApp {
     popover.querySelector("#btn-full-reset").onclick = async () => {
       const confirmed = confirm(
         "Are you sure you want to reset all local data?\n\nThis will wipe offline IndexedDB caches, clear tabs and local storage settings, and reload the application."
-        + (userCount ? `\n\nIt also deletes your ${userCount} bookmarks, notes, tours and watches. Cancel and use Export User Data first to keep them.` : "")
+        + (currentUserCount ? `\n\nIt also deletes your ${currentUserCount} bookmarks, notes, tours and watches. Cancel and use Export User Data first to keep them.` : "")
       );
       if (!confirmed) return;
 
@@ -973,7 +994,7 @@ class KernelIdeApp {
   async initVersionSelector() {
     const select = document.getElementById("version-select");
     const projSelect = document.getElementById("project-select");
-    const branchSelect = document.getElementById("branch-select");
+    const branchBtn = document.getElementById("branch-picker-btn");
     // The header shows the active tab's project; a later call (another tab activated) supersedes this one
     const seq = (this._headerSeq = (this._headerSeq || 0) + 1);
     const stale = () => seq !== this._headerSeq;
@@ -1007,18 +1028,35 @@ class KernelIdeApp {
     const client = api.forRepo(state.currentRepo);
 
     // 2. Branches: the selected one scopes the Tag and RC lists to the tags reachable from it
-    if (branchSelect) {
+    if (branchBtn) {
+      branchBtn.onclick = (e) => {
+        e.stopPropagation();
+        branchPicker.open(branchBtn, {
+          current: state.selectedBranch,
+          branches: this.branches || [],
+          tagViews: (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS,
+          onSelect: (val) => this.selectBranch(val),
+        });
+      };
       try {
         const bRes = await client.getBranches();
         if (stale()) return;
         this.branches = bRes.branches || [{ name: "master" }];
         this.tagViews = bRes.tag_views || (this.projects || []).find((p) => p.repo === state.currentRepo)?.tag_views || [];
         const isTagView = (scope) => !scope || scope.startsWith("view:") || (this.tagViews || []).some((v) => v.name === scope);
-        if (state.selectedBranch && !isTagView(state.selectedBranch) && !this.branches.some((b) => b.name === state.selectedBranch)) {
-          state.setSelectedBranch(""); // the stored scope is not a branch of this repository
+        const isSourceValid = (scope) => {
+          const src = sourceNameOfScope(scope);
+          return Boolean(src) && this.branches.some((b) => branchSourceOf(b.name).source === src);
+        };
+        if (
+          state.selectedBranch
+          && !isTagView(state.selectedBranch)
+          && !isSourceValid(state.selectedBranch)
+          && !this.branches.some((b) => b.name === state.selectedBranch)
+        ) {
+          state.setSelectedBranch(""); // the stored scope is not a branch or source of this repository
         }
         this.renderBranchSelector();
-        branchSelect.onchange = () => this.selectBranch(branchSelect.value);
       } catch (err) {
         console.warn("Could not load branches:", err);
       }
@@ -1081,6 +1119,7 @@ class KernelIdeApp {
     if (commitBtn) {
       commitBtn.onclick = (e) => {
         e.stopPropagation();
+        branchPicker.close();
         refPicker.open(commitBtn, {
           current: state.selectedVersion,
           scoped: true, // its tag search offers the releases of the selected branch (§5.13)
@@ -1174,33 +1213,39 @@ class KernelIdeApp {
     return 0;
   }
 
-  /** Branch dropdown: tag_views (e.g. "any branch") plus the repository's branches, the scope selected. */
+  /** Branch picker button: reflects the active tag_view, branch source, or scoped Git branch in the header. */
   renderBranchSelector() {
-    const branchSelect = document.getElementById("branch-select");
-    if (!branchSelect) return;
+    const branchBtn = document.getElementById("branch-picker-btn");
+    const branchLabel = document.getElementById("branch-picker-label");
     const scope = state.selectedBranch;
     const views = (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS;
-    const options = [
-      ...views.map((v, i) => ({ value: i === 0 ? "" : `view:${i}`, label: v.name })),
-      ...(this.branches || []).map((b) => ({ value: b.name, label: b.is_default ? `${b.name} (default)` : b.name })),
-    ];
-    branchSelect.innerHTML = options.map((o) =>
-      `<option value="${escapeAttr(o.value)}" ${o.value === scope ? "selected" : ""}>${escapeAttr(o.label)}</option>`
-    ).join("");
     const activeView = this.getActiveTagView();
-    branchSelect.title = activeView
-      ? `Tag layout: ${activeView.name} (regex grouped)`
-      : (scope ? `Tag and Release lists hold the releases of ${scope} only` : "Every tag of the repository; pick a branch to list only the releases on it");
+    const srcName = sourceNameOfScope(scope);
+    const displayLabel = activeView
+      ? activeView.name
+      : (srcName ? formatBranchScopeLabel(scope) : (scope || views[0]?.name || "\u2014 any branch \u2014"));
+    if (branchLabel) branchLabel.textContent = displayLabel;
+    if (branchBtn) {
+      branchBtn.title = activeView
+        ? `Tag layout: ${activeView.name} (regex grouped)\nClick to choose a branch source or tag layout`
+        : (srcName
+          ? `Tag and Release lists hold all releases in the ${srcName} source\nClick to choose another branch or source`
+          : (scope
+            ? `Tag and Release lists hold the releases of ${scope} only\nClick to choose another branch or source`
+            : "Every tag of the repository; pick a branch or source to list only its releases"));
+    }
   }
 
   /**
-   * Pick the branch or custom tag_view: custom tag_views lay out tags via regex rules, while real
-   * Git branches scope to tags reachable from them and fold sub-versions using the repository's tag view rules.
+   * Pick the branch, branch source, or custom tag_view: custom tag_views lay out tags via regex rules,
+   * while branch sources and real Git branches scope to tags belonging to them and fold sub-versions using
+   * the repository's primary tag view rules.
    */
   async selectBranch(name) {
     const branch = typeof name === "string" ? name.trim() : "";
     state.setSelectedBranch(branch);
-    if (branch && !branch.startsWith("view:")) {
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS;
+    if (branch && !branch.startsWith("view:") && !isSourceScope(branch) && !views.some((v) => v.name === branch)) {
       state.setSelectedVersion(branch, { rememberTag: false });
     }
     this.renderBranchSelector();
@@ -1210,8 +1255,8 @@ class KernelIdeApp {
   }
 
   /**
-   * Read tags reachable from `branch` into `state.branchTags`. If a custom tag_view is selected,
-   * no reachability filtering is applied (branchTags = null).
+   * Read tags reachable from `branch` (or belonging to a `source:...` scope) into `state.branchTags`.
+   * If a custom tag_view is selected, no reachability filtering is applied (branchTags = null).
    */
   async loadBranchScope(branch) {
     const b = typeof branch === "string" ? branch.trim() : "";
@@ -1219,19 +1264,20 @@ class KernelIdeApp {
       state.setBranchTags("", null);
       return;
     }
-    if (state.branchTagsFor === b) return; // already in hand for this branch
+    if (state.branchTagsFor === b) return; // already in hand for this branch/source
+    const scopeLabel = formatBranchScopeLabel(b);
     const select = document.getElementById("version-select");
-    if (select) select.title = `Reading the releases of ${b}\u2026`;
+    if (select) select.title = `Reading the releases of ${scopeLabel}\u2026`;
     try {
       const repo = state.currentRepo;
       const res = await api.forRepo(repo).getBranchTags(b);
       if (state.currentRepo !== repo) return; // the header moved to another project meanwhile
       state.setBranchTags(b, res?.tags || []);
     } catch (err) {
-      console.warn(`Could not list the tags of ${b}:`, err);
+      console.warn(`Could not list the tags of ${scopeLabel}:`, err);
       if (state.selectedBranch !== b) return;
       state.setBranchTags("", null);
-      toast.warning(`Could not list the tags of ${b}: every tag stays listed`);
+      toast.warning(`Could not list the tags of ${scopeLabel}: every tag stays listed`);
     }
   }
 
@@ -1390,7 +1436,7 @@ class KernelIdeApp {
       const groups = [
         { label: "Parsed", items: tags.filter((t) => t.indexed) },
         { label: "Git only (not parsed)", items: tags.filter((t) => !t.indexed) },
-        { label: `Not on ${branch}`, items: offBranch },
+        { label: isSourceScope(branch) ? `Not in ${formatBranchScopeLabel(branch)}` : `Not on ${branch}`, items: offBranch },
       ].filter((g) => g.items.length);
       groups.forEach((g) => {
         const parent = groups.length > 1 ? document.createElement("optgroup") : select;
@@ -1457,12 +1503,9 @@ class KernelIdeApp {
       }
     }
 
-    // The Branch dropdown shows what scopes these lists, not the explored revision: picking a branch
+    // The Branch picker shows what scopes these lists, not the explored revision: picking a branch
     // narrows them (and selects that branch head), picking a tag from them leaves the scope alone.
-    const branchSelect = document.getElementById("branch-select");
-    if (branchSelect && Array.from(branchSelect.options).some((o) => o.value === branch)) {
-      branchSelect.value = branch;
-    }
+    this.renderBranchSelector();
 
     const label = document.getElementById("commit-picker-label");
     const commitBtn = document.getElementById("commit-picker-btn");
@@ -1676,6 +1719,7 @@ class KernelIdeApp {
       { title: "Show parser status", hint: "Versions parsed and being parsed, database size, server caches", keywords: "ingest ingestion parser progress database status", run: () => state.openTab({ type: "status", title: "Parser status" }) },
       { title: "Keyboard shortcuts", hint: `List and rebind them (${shortcuts.label("help.shortcuts") || "?"})`, keywords: "keys keybindings hotkeys help rebind", run: () => showShortcutsOverlay() },
       { title: "Search text in files…", hint: "git grep over the revision (or type % in the palette)", keywords: "grep find code full-text search", run: () => state.openTab({ type: "search", title: "Search", version: v() }) },
+      { title: "Select branch…", hint: "Branch sources and tag layouts", keywords: "branch scope tag view source", run: () => document.getElementById("branch-picker-btn")?.click() },
       { title: "Select commit…", hint: "Tags and commits", keywords: "version checkout ref", run: () => document.getElementById("commit-picker-btn")?.click() },
       { title: "Open source treemap", hint: "Bytes / files per directory", keywords: "size disk usage", run: () => state.openTab({ type: "treemap", title: "Treemap: root", path: "", version: v() }) },
       ...(enabled("kconfig") ? [

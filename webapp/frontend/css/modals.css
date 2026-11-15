@@ -1067,10 +1067,6 @@
 .symhist-commit .symhist-commit-meta { color: var(--text-muted); white-space: nowrap; }
 
 /* Session Picker & Management Modal */
-.session-modal-backdrop {
-  z-index: 10500;
-}
-
 .session-modal-content {
   max-height: 80vh;
 }

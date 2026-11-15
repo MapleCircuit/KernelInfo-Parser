@@ -82,7 +82,8 @@ export async function importSessionText(text, onDone = null) {
   const fallback = state.activeRepo() || "";
   let known = [];
   try {
-    known = ((await api.getProjects?.())?.projects || []).flatMap((p) => [p.repo, p.slug].filter(Boolean));
+    const res = await api.getProjects?.(api.isConnected === false ? { timeoutMs: 1500 } : undefined);
+    known = (res?.projects || []).flatMap((p) => [p.repo, p.slug].filter(Boolean));
   } catch {
     // projects unavailable: keep the exported names
   }
@@ -114,8 +115,10 @@ export async function importSessionText(text, onDone = null) {
     if (imported.user.length) {
       const existing = new Map((await localDB.userList()).map((r) => [r.key, r]));
       const { put, skipped } = mergeImport(existing, importRecords(imported.user), "skip-existing");
-      for (const r of put) await localDB.userPut(r);
-      userNote = `, ${put.length} user records${skipped ? ` (${skipped} already here)` : ""}`;
+      let saved = 0;
+      for (const r of put) if (await localDB.userPut(r)) saved++;
+      const failed = put.length - saved;
+      userNote = `, ${saved} user record${saved === 1 ? "" : "s"}${skipped ? ` (${skipped} already here)` : ""}${failed ? ` (${failed} failed to save)` : ""}`;
     }
     toast.success(`Imported session “${name}”: ${tabCount} tabs, ${Object.keys(res.profiles).length} configurations written${userNote}`);
     onDone?.(created);

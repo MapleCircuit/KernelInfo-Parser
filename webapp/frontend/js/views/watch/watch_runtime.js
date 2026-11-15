@@ -4,7 +4,7 @@
  * the header bell's unread count. Imported once by app.js.
  */
 import { api } from "../../api.js";
-import { state } from "../../state.js";
+import { isSourceScope, state } from "../../state.js";
 import { localDB } from "../../db.js";
 import { toast } from "../../components/toast.js";
 import { makeRecord, userKey } from "../../utils/user_records.js";
@@ -23,9 +23,11 @@ export async function watchStates() {
   return new Map(recs.map((r) => [r.data.watch_key, r.data]));
 }
 
-/** The branch a new watch follows: the header's branch scope, else the mainline branch (a tag never moves). */
+/** The branch a new watch follows: the header's branch scope, else the mainline branch (a tag or source scope is not a single Git branch). */
 function defaultBranch() {
-  if (state.selectedBranch) return state.selectedBranch;
+  if (state.selectedBranch && !state.selectedBranch.startsWith("view:") && !isSourceScope(state.selectedBranch)) {
+    return state.selectedBranch;
+  }
   const stamps = api.versionStamps || {};
   return ["master", "main"].find((b) => b in stamps) || state.currentVersion || "master";
 }

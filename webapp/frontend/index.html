@@ -49,10 +49,11 @@
           <select id="project-select" style="max-width: 130px; font-size: 12px;">
             <option value="1">Linux Kernel</option>
           </select>
-          <label for="branch-select">Branch:</label>
-          <select id="branch-select" style="max-width: 150px; font-size: 12px;" title="Scope the Tag and Release lists to the releases on one branch or tag view">
-            <option value="">— any branch —</option>
-          </select>
+          <label for="branch-picker-btn">Branch:</label>
+          <button id="branch-picker-btn" class="branch-picker-btn" type="button" title="Scope the Tag and Release lists to the releases on one branch or tag view">
+            <span id="branch-picker-label">— any branch —</span>
+            <span class="branch-picker-caret">▾</span>
+          </button>
           <label for="version-select">Tag:</label>
           <select id="version-select" style="max-width: 130px; font-size: 12px;">
             <option value="v3.0">v3.0</option>

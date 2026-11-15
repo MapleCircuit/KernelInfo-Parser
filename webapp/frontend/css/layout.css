@@ -527,7 +527,8 @@
 }
 
 
-/* Commit picker button (header version selector) */
+/* Branch & Commit picker buttons (header version selector) */
+.branch-picker-btn,
 .commit-picker-btn {
   display: inline-flex;
   align-items: center;
@@ -547,6 +548,13 @@
   cursor: pointer;
 }
 
+.branch-picker-btn {
+  font-family: inherit;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.branch-picker-btn:hover,
 .commit-picker-btn:hover {
   background: var(--bg-hover);
   border-color: var(--border-color);
@@ -557,13 +565,16 @@
   font-weight: 600;
 }
 
+.branch-picker-btn #branch-picker-label,
 .commit-picker-btn #commit-picker-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.branch-picker-caret,
 .commit-picker-caret {
+  flex-shrink: 0;
   font-size: var(--fs-9, 9px);
   color: var(--text-muted);
 }
@@ -701,6 +712,56 @@
   border-top: 1px solid var(--border-color);
   font-size: var(--fs-10, 10px);
   color: var(--text-muted);
+}
+
+/* Branch picker breadcrumb & source rows inside .ref-picker */
+.branch-picker-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 6px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: var(--fs-11, 11px);
+}
+
+.branch-picker-back {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: var(--fs-11, 11px);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.branch-picker-back:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.branch-picker-crumb {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.branch-picker-count {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.branch-picker-prefix {
+  color: var(--text-muted);
+}
+
+.branch-picker-chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-12, 12px);
+}
+
+.branch-picker-scope {
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 2px;
 }
 
 /* Header search button (opens the Ctrl+K command palette) */
@@ -1018,6 +1079,7 @@
     max-width: 90px !important;
   }
 
+  .branch-picker-btn,
   .commit-picker-btn {
     max-width: 90px;
   }

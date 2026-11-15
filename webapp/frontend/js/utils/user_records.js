@@ -29,9 +29,18 @@ export function exportDocument(records, now = Date.now()) {
 
 /** Valid records of an export document (or a bare array); throws on another format. */
 export function importRecords(doc) {
+  if (!Array.isArray(doc) && doc && typeof doc === "object") {
+    if (doc.format === "kip-session") {
+      throw new Error("This is a session export — import it from Workspace Sessions → Import…");
+    }
+    if (doc.format === "kiptour") {
+      throw new Error("This is a code tour export — import it from the Bookmarks & Tours tab");
+    }
+  }
   const list = Array.isArray(doc) ? doc : doc?.format === EXPORT_FORMAT ? doc.records : null;
   if (!Array.isArray(list)) throw new Error("Not a KernelInfo user data export");
-  return list.filter((r) => r && typeof r === "object" && USER_KINDS.includes(r.kind) && typeof r.id === "string" && r.id && "data" in r)
+  return list
+    .filter((r) => r && typeof r === "object" && USER_KINDS.includes(r.kind) && typeof r.id === "string" && r.id && r.data && typeof r.data === "object" && !Array.isArray(r.data))
     .map((r) => ({ ...r, repo: r.repo || "", key: userKey(r.repo, r.kind, r.id) }));
 }
 
@@ -42,14 +51,46 @@ export function importRecords(doc) {
 export function mergeImport(existing, incoming, mode = "skip-existing", now = Date.now()) {
   const put = [];
   let skipped = 0;
+  const seen = new Set(existing.keys());
   for (const r of incoming) {
     if (mode === "copy") {
       put.push(makeRecord(r.kind, r.repo, r.data, { now, created: r.created_at ?? now }));
-    } else if (existing.has(r.key) && mode !== "overwrite") {
+    } else if (seen.has(r.key) && mode !== "overwrite") {
       skipped++;
     } else {
+      seen.add(r.key);
       put.push({ ...r, updated_at: r.updated_at ?? now, created_at: r.created_at ?? now });
     }
   }
   return { put, skipped };
+}
+
+/** Parse JSON text of a user data export and validate its records. */
+export function parseUserDataText(text) {
+  let doc;
+  try {
+    doc = JSON.parse(String(text || "").replace(/^\uFEFF/, ""));
+  } catch {
+    throw new Error("Not a valid JSON file");
+  }
+  const incoming = importRecords(doc);
+  const rawList = Array.isArray(doc) ? doc : doc.records;
+  if (rawList.length > 0 && incoming.length === 0) {
+    throw new Error("No valid user records found in this export");
+  }
+  return incoming;
+}
+
+/** Import a user data export JSON string into `db` (`localDB`); operates locally without network access. */
+export async function importUserDataText(text, db) {
+  const incoming = parseUserDataText(text);
+  await db.ready;
+  if ("db" in db && !db.db) throw new Error("Local browser storage (IndexedDB) is unavailable");
+  const existing = new Map((await db.userList()).map((r) => [r.key, r]));
+  const { put, skipped } = mergeImport(existing, incoming, "skip-existing");
+  for (const r of put) {
+    const ok = await db.userPut(r);
+    if (!ok) throw new Error("Could not save user data to local browser storage");
+  }
+  return { imported: put.length, skipped };
 }

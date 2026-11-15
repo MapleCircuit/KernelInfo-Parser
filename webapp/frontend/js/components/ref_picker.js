@@ -8,7 +8,7 @@
  */
 import { shortcuts } from "../utils/shortcuts.js";
 import { api } from "../api.js";
-import { state } from "../state.js";
+import { formatBranchScopeLabel, isSourceScope, state } from "../state.js";
 import { debounce } from "../utils/debounce.js";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
@@ -69,14 +69,16 @@ class RefPicker {
     this.scoped = Boolean(scoped);
     this.client = client || api;
 
-    const branch = this.scoped ? state.selectedBranch : "";
+    const branch = (this.scoped && state.selectedBranch && !state.selectedBranch.startsWith("view:"))
+      ? state.selectedBranch : "";
+    const scopeLabel = branch ? formatBranchScopeLabel(branch) : "";
     const rect = anchorEl.getBoundingClientRect();
     const pop = document.createElement("div");
     pop.className = "ref-picker";
     pop.style.top = `${rect.bottom + 6}px`;
     pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 448))}px`;
     pop.innerHTML = `
-      <input type="text" class="ref-picker-input" placeholder="${branch ? `Search a tag of ${escapeHtml(branch)}, commit hash, subject or author…` : "Search tag, commit hash, subject or author…"}" spellcheck="false" autocomplete="off" />
+      <input type="text" class="ref-picker-input" placeholder="${scopeLabel ? `Search a tag of ${escapeHtml(scopeLabel)}, commit hash, subject or author…` : "Search tag, commit hash, subject or author…"}" spellcheck="false" autocomplete="off" />
       <div class="ref-picker-list"><div class="ref-picker-empty">Loading…</div></div>
       <div class="ref-picker-footer">↑↓ navigate · Enter select · paste any SHA or ref name</div>
     `;
@@ -162,9 +164,11 @@ class RefPicker {
     }
 
     let lastKind = null;
-    const branch = this.scoped ? state.selectedBranch : "";
+    const branch = (this.scoped && state.selectedBranch && !state.selectedBranch.startsWith("view:"))
+      ? state.selectedBranch : "";
+    const scopeLabel = branch ? formatBranchScopeLabel(branch) : "";
     const sectionTitle = {
-      tag: branch ? `Release Tags on ${escapeHtml(branch)}` : "Release Tags",
+      tag: scopeLabel ? `Release Tags ${isSourceScope(branch) ? "in" : "on"} ${escapeHtml(scopeLabel)}` : "Release Tags",
       commit: "Commits",
       raw: "Revision",
     };

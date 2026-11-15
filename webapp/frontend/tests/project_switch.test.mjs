@@ -120,7 +120,8 @@ function makeActivityBtn(action) {
 
 const domIds = {
   "project-select": new SelectFake("select"),
-  "branch-select": new SelectFake("select"),
+  "branch-picker-btn": new FakeElement("button"),
+  "branch-picker-label": new FakeElement("span"),
   "version-select": new SelectFake("select"),
   "rc-select": new SelectFake("select"),
   "rc-select-label": new FakeElement("label"),
@@ -243,9 +244,11 @@ test("switchProject keeps the active tab unchanged while updating branch, tag an
     assert.equal(state.selectedVersion, "man-pages-6.9");
     assert.equal(domIds["project-select"].value, "man-pages");
     assert.deepEqual(
-      domIds["branch-select"].options.map((o) => o.value),
-      ["", "master", "man-pages-6.9"],
+      (app.branches || []).map((b) => b.name),
+      ["master", "man-pages-6.9"],
     );
+    assert.equal(domIds["branch-picker-label"].textContent, "— any branch —");
+    assert.equal(typeof domIds["branch-picker-btn"].onclick, "function");
     assert.deepEqual(
       domIds["version-select"].options.map((o) => o.value),
       ["man-pages-6.8", "man-pages-6.9"],

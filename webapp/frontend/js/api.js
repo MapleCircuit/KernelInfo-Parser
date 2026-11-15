@@ -439,6 +439,25 @@ class ApiClient {
     return stamp ? `${v}@${stamp}~` : v;
   }
 
+  /** Deterministic short hash of known stamps for every branch belonging to `source`. */
+  _sourceStamp(source) {
+    const src = String(source || "");
+    const prefix = src === "local" ? "" : `${src}/`;
+    const entries = Object.entries(this.versionStamps || {})
+      .filter(([k]) => (src === "local" ? !k.includes("/") : k.startsWith(prefix)))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (!entries.length) return "";
+    let h = 0x811c9dc5;
+    for (const [k, st] of entries) {
+      const s = `${k}=${st};`;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+    }
+    return (h >>> 0).toString(36);
+  }
+
   /**
    * Ingestion status of the active repository (`GET /api/system/ingest`, §4.1, G11): versions parsed and
    * being parsed, recent completions, database size, the server's tokens, jobs and caches. Always asked
@@ -491,6 +510,17 @@ class ApiClient {
   async getBranchTags(branch) {
     const b = typeof branch === "string" ? branch.trim() : "";
     if (!b) return { branch: "", total: 0, tags: [] };
+    if (b.startsWith("source:")) {
+      const src = b.slice(7);
+      const stamp = this._sourceStamp(src);
+      const cacheKey = stamp ? `branch_tags_src_${src}@${stamp}~` : `branch_tags_src_${src}`;
+      return this.request(
+        `/api/branch/tags?source=${encodeURIComponent(src)}`,
+        { timeoutMs: BRANCH_TAGS_TIMEOUT_MS },
+        "files",
+        cacheKey,
+      );
+    }
     return this.request(
       `/api/branch/tags?branch=${encodeURIComponent(b)}`,
       { timeoutMs: BRANCH_TAGS_TIMEOUT_MS },
