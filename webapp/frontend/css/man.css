@@ -32,12 +32,14 @@
 .man-mode .code-btn.active { z-index: 1; }
 .man-mode .code-btn:hover,
 .man-mode .code-btn:focus-visible { z-index: 2; }
+.man-view.man-in-index .man-mode,
+.man-view.man-in-index [data-act="width"] { display: none; }
 .man-linux { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; color: var(--text-secondary); }
 .man-linux a { color: var(--accent-blue); text-decoration: none; }
 .man-linux a:hover { text-decoration: underline; }
 .man-linux-label { color: var(--text-muted); }
-.man-ext { margin-left: auto; color: var(--text-secondary); text-decoration: none; }
-.man-ext:hover { color: var(--accent-blue); }
+.man-copy-link { margin-left: auto; }
+.man-copy-link[hidden] { display: none; }
 .man-muted { color: var(--text-muted); }
 
 .man-body {
@@ -64,6 +66,10 @@
   max-width: 980px;
   margin: 0 auto;
   padding: 6px 24px 0;
+}
+.man-view.man-narrow .man-mode-term {
+  max-width: 980px;
+  margin: 0 auto;
 }
 .man-web-head, .man-web-foot {
   display: flex;
@@ -132,10 +138,15 @@
 .man-empty { color: var(--text-muted); }
 
 /* ---------------------------------------------------------------- terminal mode (man(1)) */
-.man-mode-term { padding: 12px; }
+.man-mode-term {
+  padding: 12px;
+  box-sizing: border-box;
+}
 .man-term {
-  display: inline-block;
-  min-width: calc(var(--man-cols, 80) * 1ch + 32px);
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  overflow-x: auto;
   margin: 0;
   padding: 12px 16px;
   font-family: var(--font-mono);

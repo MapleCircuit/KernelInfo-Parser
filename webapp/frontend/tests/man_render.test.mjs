@@ -8,7 +8,7 @@ import fs from "node:fs";
 import "./helpers/dom_shim.mjs";
 import { manHeader, renderManTerm, renderManWeb, safeUrl } from "../js/views/man/man_render.js";
 import {
-  compareTags, groupIndex, indexSectionLabel, isManPagePath, linuxApiTab, linuxSymbolTab, man7Url, manTabFields, manTabTitle, newestTag, pageOfPath, parseManRef, sectionTitle,
+  compareTags, groupIndex, indexSectionLabel, isManPagePath, linuxApiTab, linuxSymbolTab, man7Url, manPageLink, manTabFields, manTabTitle, newestTag, pageOfPath, parseManRef, sectionTitle,
 } from "../js/views/man/man_model.js";
 import { hashRepo, tabRoute } from "../js/tab_routes.js";
 import "../js/routes.js";
@@ -27,7 +27,7 @@ globalThis.setTimeout = (...args) => {
   return t;
 };
 
-const { defaultManWidth, ManView } = await import("../js/views/man/man_view.js");
+const { defaultManWidth, ManView, measureTermCols } = await import("../js/views/man/man_view.js");
 
 const DOC = {
   format: 1,
@@ -130,6 +130,7 @@ test("terminal mode: header/footer lines, 7-column indent, 80-column justified f
   assert.match(html, /<a href="#" class="man-ref" data-man-ref="read" data-man-sec="2"><span class="mt-b">read<\/span><\/a>\(2\)/);
   assert.match(html, /<span class="mt-u">count<\/span>/);
   assert.equal(strip(renderManTerm(DOC, { width: 60 })).split("\n")[0].length, 60);
+  assert.equal(strip(renderManTerm(DOC, { width: 240 })).split("\n")[0].length, 240);
 });
 
 test("page paths, refs and section titles", () => {
@@ -241,9 +242,15 @@ test("web width defaults to full page and man-mode z-index stacks hover above ac
   const webRule = /\.man-web\s*\{([^}]*)\}/.exec(css)?.[1] || "";
   assert.ok(!/max-width\s*:/i.test(webRule), "default .man-web has no max-width restriction");
   assert.match(css, /\.man-view\.man-narrow\s+\.man-web\s*\{[^}]*max-width:\s*980px;[^}]*margin:\s*0 auto;/s);
+  assert.match(css, /\.man-view\.man-narrow\s+\.man-mode-term\s*\{[^}]*max-width:\s*980px;[^}]*margin:\s*0 auto;/s);
+  const termRule = /\.man-term\s*\{([^}]*)\}/.exec(css)?.[1] || "";
+  assert.match(termRule, /display:\s*block;/);
+  assert.match(termRule, /width:\s*100%;/);
+  assert.ok(!/min-width\s*:/i.test(termRule), "default .man-term fills its container without a fixed min-width");
   assert.match(css, /\.man-mode\s+\.code-btn\s*\{[^}]*position:\s*relative;\s*z-index:\s*0;/s);
   assert.match(css, /\.man-mode\s+\.code-btn\.active\s*\{[^}]*z-index:\s*1;/s);
   assert.match(css, /\.man-mode\s+\.code-btn:hover[^{]*\{[^}]*z-index:\s*2;/s);
+  assert.match(css, /\.man-view\.man-in-index\s+\.man-mode,\s*\.man-view\.man-in-index\s+\[data-act="width"\]\s*\{\s*display:\s*none;\s*\}/s);
 });
 
 function makeClassList(initial = []) {
@@ -258,7 +265,8 @@ function makeClassList(initial = []) {
 
 function makeFakeViewHost() {
   const indexBtn = { classList: makeClassList(), attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; } };
-  const widthBtn = { classList: makeClassList(), attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; } };
+  const modeEl = { hidden: false };
+  const widthBtn = { hidden: false, classList: makeClassList(), attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; } };
   const tocEl = { innerHTML: "" };
   const groupsEl = { innerHTML: "" };
   const countEl = { textContent: "" };
@@ -274,6 +282,7 @@ function makeFakeViewHost() {
       ".man-tag": tagEl,
       ".man-body": bodyEl,
       '.man-toolbar [data-act="index"]': indexBtn,
+      ".man-toolbar .man-mode": modeEl,
       '.man-toolbar [data-act="width"]': widthBtn,
     }[sel] || null),
   };
@@ -282,37 +291,50 @@ function makeFakeViewHost() {
     _html: "",
     set innerHTML(html) {
       this._html = html;
+      const rootClass = /<div class="([^"]*)"/.exec(html)?.[1] || "";
+      rootEl.classList = makeClassList(rootClass.split(/\s+/).filter(Boolean));
       const idxClass = /data-act="index"[^>]*class="([^"]*)"|class="([^"]*)"[^>]*data-act="index"/.exec(html);
       const cls = (idxClass?.[1] || idxClass?.[2] || "").split(/\s+/).filter(Boolean);
       indexBtn.classList = makeClassList(cls);
       const idxPressed = /data-act="index"[^>]*aria-pressed="(true|false)"/.exec(html)?.[1];
       if (idxPressed) indexBtn.attrs["aria-pressed"] = idxPressed;
+      modeEl.hidden = /<span class="man-mode"[^>]*\bhidden\b/.test(html);
+      widthBtn.hidden = /data-act="width"[^>]*\bhidden\b/.test(html);
     },
     get innerHTML() { return this._html; },
     firstElementChild: rootEl,
     querySelector: (sel) => rootEl.querySelector(sel),
     querySelectorAll: () => [],
   };
-  return { containerEl, rootEl, indexBtn, widthBtn, tocEl, countEl };
+  return { containerEl, rootEl, indexBtn, modeEl, widthBtn, tocEl, countEl };
 }
 
 test("ManView: index button lit on index, TOC shows category(section), width toggles 980px", () => {
   localStorage.removeItem("kip-man-width");
-  const { containerEl, rootEl, indexBtn, widthBtn, tocEl } = makeFakeViewHost();
+  const { containerEl, rootEl, indexBtn, modeEl, widthBtn, tocEl } = makeFakeViewHost();
   const view = new ManView();
   view.api = { getManTags: async () => ({ tags: [] }), getManIndex: async () => ({ pages: [] }), getManPage: async () => ({}) };
   view.load = () => {};
   const tab = { id: "t1", type: "man", repo: "man-pages", version: "man-pages-6.9" };
   view.render(containerEl, tab);
 
-  // Index button starts lit when tab is at the index, unlit on a page
+  // Index button starts lit and mode/width toggles are hidden when tab is at the index
   assert.equal(indexBtn.classList.contains("active"), true);
   assert.equal(indexBtn.getAttribute("aria-pressed"), "true");
+  assert.equal(rootEl.classList.contains("man-in-index"), true);
+  assert.equal(modeEl.hidden, true);
+  assert.equal(widthBtn.hidden, true);
   view.setIndexActive(false);
   assert.equal(indexBtn.classList.contains("active"), false);
   assert.equal(indexBtn.getAttribute("aria-pressed"), "false");
+  assert.equal(rootEl.classList.contains("man-in-index"), false);
+  assert.equal(modeEl.hidden, false);
+  assert.equal(widthBtn.hidden, false);
   view.setIndexActive(true);
   assert.equal(indexBtn.classList.contains("active"), true);
+  assert.equal(rootEl.classList.contains("man-in-index"), true);
+  assert.equal(modeEl.hidden, true);
+  assert.equal(widthBtn.hidden, true);
 
   // Index TOC renders "System calls(2)" instead of bare "2"
   view.index = [{ name: "read", section: "2", summary: "read from a file descriptor" }];
@@ -337,4 +359,75 @@ test("ManView: index button lit on index, TOC shows category(section), width tog
   assert.equal(view.tab.version, "man-pages-6.9");
 
   localStorage.removeItem("kip-man-width");
+});
+
+test("terminal mode width: measureTermCols and setWidth reflow terminal columns between full and 980px", () => {
+  localStorage.removeItem("kip-man-width");
+  const { containerEl, rootEl } = makeFakeViewHost();
+  const bodyEl = rootEl.querySelector(".man-body");
+  bodyEl.clientWidth = 1600;
+  bodyEl.closest = (sel) => (sel === ".man-view" ? rootEl : null);
+  const probe = { style: {}, textContent: "", getBoundingClientRect: () => ({ width: 160 }), remove() {} };
+  const prevDoc = globalThis.document;
+  globalThis.document = { createElement: () => probe };
+  bodyEl.appendChild = () => {};
+  try {
+    const fullCols = measureTermCols(bodyEl);
+    assert.ok(fullCols > 150, `expected >150 cols at 1600px, got ${fullCols}`);
+    rootEl.classList.add("man-narrow");
+    const narrowCols = measureTermCols(bodyEl);
+    assert.ok(narrowCols < fullCols && narrowCols >= 100 && narrowCols <= 125, `expected ~115 cols at 980px, got ${narrowCols}`);
+    rootEl.classList.remove("man-narrow");
+
+    const view = new ManView();
+    view.api = { getManTags: async () => ({ tags: [] }), getManIndex: async () => ({ pages: [] }), getManPage: async () => ({}) };
+    view.load = () => {};
+    view.render(containerEl, { id: "t3", type: "man", repo: "man-pages", version: "man-pages-6.9", manMode: "term", manPage: "read", manSec: "2" });
+    view.res = { name: "read", section: "2", doc: DOC };
+    view.renderPage();
+    assert.match(bodyEl.innerHTML, new RegExp(`--man-cols:${fullCols}`));
+    view.setWidth("980");
+    assert.match(bodyEl.innerHTML, new RegExp(`--man-cols:${narrowCols}`));
+    view.setWidth("full");
+    assert.match(bodyEl.innerHTML, new RegExp(`--man-cols:${fullCols}`));
+  } finally {
+    globalThis.document = prevDoc;
+    localStorage.removeItem("kip-man-width");
+  }
+});
+
+test("manPageLink builds a deep link to the current man page and version on this site", () => {
+  assert.equal(
+    manPageLink("https://kip.example/app/#tab=code", { repo: "man-pages", version: "man-pages-6.9", name: "read", section: "2" }),
+    "https://kip.example/app/#repo=man-pages&v=man-pages-6.9&tab=man&page=read&sec=2",
+  );
+  assert.equal(
+    manPageLink("https://kip.example/app/", { repo: "man-pages", version: "man-pages-6.9", path: "man2/read.2", mode: "term" }),
+    "https://kip.example/app/#repo=man-pages&v=man-pages-6.9&tab=man&path=man2%2Fread.2&mode=term",
+  );
+
+  const { containerEl, rootEl } = makeFakeViewHost();
+  const copyBtn = { hidden: true };
+  const titleEl = { innerHTML: "" };
+  const linuxEl = { innerHTML: "" };
+  const origQuery = rootEl.querySelector;
+  rootEl.querySelector = (sel) => ({
+    '[data-act="copy-link"]': copyBtn,
+    ".man-title": titleEl,
+    ".man-linux": linuxEl,
+  }[sel] || origQuery(sel));
+
+  const view = new ManView();
+  view.api = { getManTags: async () => ({ tags: [] }), getManIndex: async () => ({ pages: [] }), getManPage: async () => ({}) };
+  view.load = () => {};
+  view.render(containerEl, { id: "t4", type: "man", repo: "man-pages", version: "man-pages-6.9", manPage: "read", manSec: "2" });
+  view.setTitle("read(2)", { name: "read", section: "2" });
+  assert.equal(copyBtn.hidden, false);
+  view.res = { name: "read", section: "2" };
+  assert.equal(
+    view.pageLink("https://kip.example/"),
+    "https://kip.example/#repo=man-pages&v=man-pages-6.9&tab=man&page=read&sec=2",
+  );
+  view.setTitle("Man pages · man-pages-6.9");
+  assert.equal(copyBtn.hidden, true);
 });

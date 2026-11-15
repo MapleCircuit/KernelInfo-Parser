@@ -2535,7 +2535,7 @@ revision, and its pages link back into the kernel.
     it moves the tab's revision, `state.setVersion`, the header following while the tab is active); the **Web / Terminal** toggle
     (per tab in `manMode`, the last choice kept as the default in `localStorage` `kip-man-mode`, read and
     written in try/catch; the active button stacks above the inactive one and hovered/focused above both); the **↔ 980px** width toggle
-    (defaults to full-width Web pages, toggles `.man-narrow` to center `.man-web` at `max-width: 980px`, persisted in `manWidth` and `localStorage` `kip-man-width`); the **Linux** back-links of the page answer's `linux` block; *man7.org ↗*.
+    (defaults to full-width pages, toggles `.man-narrow` to center `.man-web` and `.man-mode-term` at `max-width: 980px`, reflowing Terminal mode to fit the measured column width on toggle and container resize, persisted in `manWidth` and `localStorage` `kip-man-width`; both **Web / Terminal** and **↔ 980px** are hidden via `.man-in-index` and `hidden` while on the index); the **Linux** back-links of the page answer's `linux` block; **🔗 Copy link** (hidden on the index, copies the deep link to the current man page on this repository and tag via `manPageLink` and `copyToClipboard`).
   - **Back-links**: `linux.syscall` (section 2 pages, shown and clickable in `linuxLinksHtml()` /
     `followLinuxLink()` only when `hasFeature(t.repo, "api")`) opens the Kernel API tab on
     `view=syscalls&arch=x86_64&sel=<name>` at the kernel revision (`kernelVersion`, else `linux.version`; the

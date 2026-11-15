@@ -394,7 +394,7 @@ function threePart(left, mid, right, width) {
  * without .TH}. Returns a `<pre class="man-term">` whose lines are plain text with style spans.
  */
 export function renderManTerm(doc, opts = {}) {
-  const width = Math.max(40, Math.min(200, Number(opts.width) || 80));
+  const width = Math.max(40, Math.min(500, Number(opts.width) || 80));
   const h = manHeader(doc, opts);
   const lines = [threePart(h.tag, h.manual, h.tag, width), ""];
   const secs = sectionsOf(doc);

@@ -62,6 +62,23 @@ export function man7Url(name, section) {
   return `https://man7.org/linux/man-pages/man${encodeURIComponent(s.charAt(0))}/${encodeURIComponent(name)}.${encodeURIComponent(s)}.html`;
 }
 
+/** Deep link to a man page at a specific repository and tag on this site. */
+export function manPageLink(baseHref, { repo = "", version = "", name = "", section = "", path = "", mode = "" } = {}) {
+  const params = new URLSearchParams();
+  if (repo) params.set("repo", repo);
+  if (version) params.set("v", version);
+  params.set("tab", "man");
+  if (path) {
+    params.set("path", path);
+  } else {
+    if (name) params.set("page", name);
+    if (section) params.set("sec", section);
+  }
+  if (mode === "term" || mode === "web") params.set("mode", mode);
+  const base = String(baseHref || "").split("#")[0];
+  return `${base}#${params.toString()}`;
+}
+
 /**
  * Index sections of `/api/man/{v}/index` pages: [{section, title, pages}] in section order, each list
  * sorted by name, keeping the pages whose name or summary hold every word of `filter`.
