@@ -89,6 +89,19 @@ function importUserData() {
 /** Per-browser UI preference: whether the left explorer sidebar is collapsed. */
 const SIDEBAR_COLLAPSED_KEY = "kernel_ide_sidebar_collapsed";
 
+const DEFAULT_TAG_VIEWS = [
+  {
+    name: "\u2014 any branch \u2014",
+    regex_rules: [
+      "^(v2\\.6\\.\\d+)([.-].*)$",
+      "^(v?(?!2\\.6\\.)\\d+\\.\\d+)((?:[.-]|[a-zA-Z]).*)$",
+      "^([a-zA-Z][a-zA-Z0-9_-]*?-v?\\d+\\.\\d+|[a-zA-Z][a-zA-Z0-9_-]*?(?=-v\\d+)|pre\\d+\\.\\d+|next)([.-].*)$"
+    ]
+  }
+];
+
+const isPrereleaseSuffix = (s) => /^-?(rc|pre|alpha|beta|test)/.test(s || "");
+
 class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
@@ -1036,15 +1049,17 @@ class KernelIdeApp {
       if (!valid(state.currentVersion)) state.currentVersion = fallback();
       if (!valid(state.selectedVersion)) state.selectedVersion = state.currentVersion;
 
-      // Picking a release selects its final tag (or its latest -rc when it was never released).
+      // Picking a release selects its final tag (or its latest sub-version when it was never released
+      // on its own or is absent from the active branch scope).
       // Selecting changes nothing on its own: **Apply** or **New Tab** act on the selection.
       select.onchange = (e) => {
         const base = e.target.value;
         if (!base || base.includes("object")) return;
-        let target = this.versionByName.has(base) ? base : null;
+        const scope = state.branchTags;
+        let target = (this.versionByName.has(base) && (!scope || scope.has(base))) ? base : null;
         if (!target) {
-          const subs = this.rcsByBase.get(base) || [];
-          target = subs[0]?.vname || base;
+          const subs = (this.rcsByBase.get(base) || []).filter((rc) => !scope || scope.has(rc.vname));
+          target = subs[0]?.vname || (this.versionByName.has(base) ? base : null) || (this.rcsByBase.get(base) || [])[0]?.vname || base;
         }
         if (target) state.setSelectedVersion(target);
       };
@@ -1103,15 +1118,7 @@ class KernelIdeApp {
 
   /** Active tag_view if current branch selection matches one, otherwise null for real Git branches. */
   getActiveTagView() {
-    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : [
-      {
-        name: "\u2014 any branch \u2014",
-        regex_rules: [
-          "^(v2\\.6\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$",
-          "^(v(?!2\\.6\\.)\\d+\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$"
-        ]
-      }
-    ];
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS;
     const branch = state.selectedBranch;
     if (branch === "" || branch === "view:0") return views[0];
     if (branch.startsWith("view:")) {
@@ -1123,7 +1130,15 @@ class KernelIdeApp {
     return null;
   }
 
-  /** Natural version comparison helper (e.g. 3.0.101 > 3.0.2, -rc7 > -rc1, .28 > .28-rc1). */
+  /** Effective tag_view for folding sub-versions: the selected tag_view, or the primary view on real branches. */
+  getEffectiveTagView() {
+    const active = this.getActiveTagView();
+    if (active) return active;
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS;
+    return views[0] || DEFAULT_TAG_VIEWS[0];
+  }
+
+  /** Natural version comparison helper (e.g. 3.0.101 > 3.0.2, -rc7 > -rc1, .28 > .28-rc1, 2.2.0 > 2.2.0pre1). */
   static naturalVersionCompare(a, b) {
     if (a === b) return 0;
     const ax = [], bx = [];
@@ -1132,11 +1147,11 @@ class KernelIdeApp {
     for (let i = 0; i < Math.max(ax.length, bx.length); i++) {
       const ai = ax[i], bi = bx[i];
       if (ai === undefined) {
-        if (bi && typeof bi[1] === "string" && bi[1].startsWith("-")) return 1;
+        if (bi && typeof bi[1] === "string" && /^(-|rc|pre|alpha|beta|test)/.test(bi[1])) return 1;
         return -1;
       }
       if (bi === undefined) {
-        if (ai && typeof ai[1] === "string" && ai[1].startsWith("-")) return -1;
+        if (ai && typeof ai[1] === "string" && /^(-|rc|pre|alpha|beta|test)/.test(ai[1])) return -1;
         return 1;
       }
       if (ai[0] !== bi[0]) return ai[0] - bi[0];
@@ -1150,15 +1165,7 @@ class KernelIdeApp {
     const branchSelect = document.getElementById("branch-select");
     if (!branchSelect) return;
     const scope = state.selectedBranch;
-    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : [
-      {
-        name: "\u2014 any branch \u2014",
-        regex_rules: [
-          "^(v2\\.6\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$",
-          "^(v(?!2\\.6\\.)\\d+\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$"
-        ]
-      }
-    ];
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : DEFAULT_TAG_VIEWS;
     const options = [
       ...views.map((v, i) => ({ value: i === 0 ? "" : `view:${i}`, label: v.name })),
       ...(this.branches || []).map((b) => ({ value: b.name, label: b.is_default ? `${b.name} (default)` : b.name })),
@@ -1174,7 +1181,7 @@ class KernelIdeApp {
 
   /**
    * Pick the branch or custom tag_view: custom tag_views lay out tags via regex rules, while real
-   * Git branches scope to tags reachable from them and preserve standard Git pre-release grouping.
+   * Git branches scope to tags reachable from them and fold sub-versions using the repository's tag view rules.
    */
   async selectBranch(name) {
     const branch = typeof name === "string" ? name.trim() : "";
@@ -1223,14 +1230,18 @@ class KernelIdeApp {
   }
 
   /**
-   * Parse a tag into base release and sub-version/RC suffix according to active tag_view regex rules,
-   * or standard Git pre-release pattern if on a real Git branch.
+   * Parse a tag into base release and sub-version/RC suffix according to the effective tag_view regex
+   * rules (active tag view, or the repository's primary tag view when a real Git branch is selected).
    */
   parseTagVersion(vname) {
-    const activeView = this.getActiveTagView();
-    if (activeView && Array.isArray(activeView.regex_rules) && activeView.regex_rules.length > 0) {
+    const effectiveView = this.getEffectiveTagView();
+    if (effectiveView && Array.isArray(effectiveView.regex_rules) && effectiveView.regex_rules.length > 0) {
       if (!this._regexCache) this._regexCache = new Map();
-      for (const rule of activeView.regex_rules) {
+      const baseRules = effectiveView.regex_rules;
+      const rules = effectiveView.name === DEFAULT_TAG_VIEWS[0].name
+        ? [...new Set([...baseRules, ...DEFAULT_TAG_VIEWS[0].regex_rules])]
+        : baseRules;
+      for (const rule of rules) {
         try {
           let re = this._regexCache.get(rule);
           if (!re) {
@@ -1253,7 +1264,7 @@ class KernelIdeApp {
     }
     const prefixed = this.prefixedRelease(vname);
     if (prefixed) return prefixed;
-    // Real Git branch: standard Git pre-release grouping (only -rc/-pre/etc are sub-versions)
+    // Fallback when no tag_view rules exist: standard Git pre-release grouping
     const m = /^(.*?)(-(?:rc|pre|alpha|beta)\d*)$/.exec(vname || "");
     if (m && m[1] && m[2]) {
       return { base: m[1], suffix: m[2], isSub: true };
@@ -1311,19 +1322,23 @@ class KernelIdeApp {
       }
     }
     // Sort sub-versions: stable point releases descending first, then RCs descending
-    const isRc = (s) => /^-(rc|pre|alpha|beta)/.test(s || "");
     for (const subs of this.rcsByBase.values()) {
       subs.sort((a, b) => {
-        const aIsRc = isRc(a.suffix);
-        const bIsRc = isRc(b.suffix);
+        const aIsRc = isPrereleaseSuffix(a.suffix);
+        const bIsRc = isPrereleaseSuffix(b.suffix);
         if (!aIsRc && bIsRc) return -1;
         if (aIsRc && !bIsRc) return 1;
         return KernelIdeApp.naturalVersionCompare(b.vname, a.vname);
       });
     }
-    // A release counts as parsed when its final tag, or any of its candidates, was parsed
+    // A release counts as parsed when its final tag, or any of its candidates, was parsed;
+    // synthetic bases are labeled "(rc only)" only when every folded tag is a pre-release
     for (const r of releases) {
-      if (r.rcOnly) r.indexed = (this.rcsByBase.get(r.vname) || []).some((rc) => rc.indexed);
+      if (r.rcOnly) {
+        const subs = this.rcsByBase.get(r.vname) || [];
+        r.indexed = subs.some((rc) => rc.indexed);
+        r.rcOnly = subs.length > 0 && subs.every((rc) => isPrereleaseSuffix(rc.suffix));
+      }
     }
     this.tagVersions = releases;
   }
@@ -1397,12 +1412,11 @@ class KernelIdeApp {
         const finalTag = this.versionByName.get(base);
         const finalListed = finalTag && (!scope || scope.has(base) || base === cur);
 
-        const isRc = (s) => /^-(rc|pre|alpha|beta)/.test(s || "");
-        const stables = rcs.filter((r) => !isRc(r.suffix));
-        const prereleases = rcs.filter((r) => isRc(r.suffix));
+        const stables = rcs.filter((r) => !isPrereleaseSuffix(r.suffix));
+        const prereleases = rcs.filter((r) => isPrereleaseSuffix(r.suffix));
         const formatSuffix = (suffix) => {
           if (!suffix) return "";
-          if (suffix.startsWith("-rc") || suffix.startsWith("-pre")) {
+          if (suffix.startsWith("-")) {
             return suffix.slice(1);
           }
           return suffix;
@@ -1972,6 +1986,8 @@ function describeUpdates(r) {
   return parts.join(", ");
 }
 
+export { DEFAULT_TAG_VIEWS, KernelIdeApp };
+
 // Bootstrap on DOM ready (boot.js imports this module, possibly after DOMContentLoaded fired)
 function startApp() {
   const app = new KernelIdeApp();
@@ -1979,8 +1995,10 @@ function startApp() {
     console.error("Critical failure during IDE initialization:", err);
   });
 }
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", startApp);
-} else {
-  startApp();
+if (typeof document !== "undefined" && !globalThis.__KIP_SKIP_AUTOSTART__) {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startApp);
+  } else {
+    startApp();
+  }
 }

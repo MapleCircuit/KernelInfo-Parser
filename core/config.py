@@ -826,12 +826,23 @@ DEFAULT_BRANCH_FILTER: dict[str, list[str]] = {
     "exclude": ["*rc*"],
 }
 
-DEFAULT_TAG_VIEWS: list[dict[str, Any]] = [
+_LEGACY_DEFAULT_TAG_VIEWS: list[dict[str, Any]] = [
     {
         "name": "— any branch —",
         "regex_rules": [
             r"^(v2\.6\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$",
             r"^(v(?!2\.6\.)\d+\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$",
+        ],
+    }
+]
+
+DEFAULT_TAG_VIEWS: list[dict[str, Any]] = [
+    {
+        "name": "— any branch —",
+        "regex_rules": [
+            r"^(v2\.6\.\d+)([.-].*)$",
+            r"^(v?(?!2\.6\.)\d+\.\d+)((?:[.-]|[a-zA-Z]).*)$",
+            r"^([a-zA-Z][a-zA-Z0-9_-]*?-v?\d+\.\d+|[a-zA-Z][a-zA-Z0-9_-]*?(?=-v\d+)|pre\d+\.\d+|next)([.-].*)$",
         ],
     }
 ]
@@ -1039,13 +1050,15 @@ def repo_feature_enabled(entry: dict[str, Any] | None, feature: str) -> bool:
 
 
 def _normalize_repo_entry_features(entry: dict[str, Any]) -> dict[str, Any]:
-    """Normalize `entry['features']` in place, omitting the key when empty."""
+    """Normalize `entry['features']` in place (omitting when empty) and upgrade legacy default `tag_views`."""
     if "features" in entry:
         normalized = normalize_feature_overrides(entry["features"])
         if normalized:
             entry["features"] = normalized
         else:
             entry.pop("features", None)
+    if entry.get("tag_views") == _LEGACY_DEFAULT_TAG_VIEWS:
+        entry["tag_views"] = copy.deepcopy(DEFAULT_TAG_VIEWS)
     return entry
 
 

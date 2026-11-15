@@ -451,8 +451,10 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(saved["repositories"][0]["branch_filter"], DEFAULT_BRANCH_FILTER)
 
     def test_tag_views_config_and_regex_rules(self) -> None:
-        """Verify DEFAULT_TAG_VIEWS regex rules partition Linux 2.6.x and 3.x+ tags correctly."""
+        """Verify DEFAULT_TAG_VIEWS regex rules partition Linux 2.6.x, 3.x+, historical, and next tags."""
+        import copy
         import re
+        from core.config import _LEGACY_DEFAULT_TAG_VIEWS, _normalize_repo_entry_features
 
         self.assertGreaterEqual(len(DEFAULT_TAG_VIEWS), 1)
         linux_view = DEFAULT_TAG_VIEWS[0]
@@ -474,6 +476,8 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(parse("v2.6.16.62"), ("v2.6.16", ".62", True))
         self.assertEqual(parse("v2.6.12-rc2"), ("v2.6.12", "-rc2", True))
         self.assertEqual(parse("v2.6.16.28-rc1"), ("v2.6.16", ".28-rc1", True))
+        self.assertEqual(parse("v2.6.0-test1"), ("v2.6.0", "-test1", True))
+        self.assertEqual(parse("v2.6.9-final"), ("v2.6.9", "-final", True))
 
         # Linux 3.x+ family: base is v<major>.<minor>
         self.assertEqual(parse("v3.0"), ("v3.0", "", False))
@@ -483,6 +487,23 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(parse("v6.6"), ("v6.6", "", False))
         self.assertEqual(parse("v6.6.1"), ("v6.6", ".1", True))
         self.assertEqual(parse("v6.6-rc1"), ("v6.6", "-rc1", True))
+
+        # Historical & non-master branch tags: base is <major>.<minor> or <prefix>
+        self.assertEqual(parse("2.4.0"), ("2.4", ".0", True))
+        self.assertEqual(parse("2.4.9.15"), ("2.4", ".9.15", True))
+        self.assertEqual(parse("2.2.0pre1"), ("2.2", ".0pre1", True))
+        self.assertEqual(parse("1.1.95"), ("1.1", ".95", True))
+        self.assertEqual(parse("1.0pre1"), ("1.0", "pre1", True))
+        self.assertEqual(parse("0.99.14a"), ("0.99", ".14a", True))
+        self.assertEqual(parse("0.96a-patch1"), ("0.96", "a-patch1", True))
+        self.assertEqual(parse("pre2.0.1"), ("pre2.0", ".1", True))
+        self.assertEqual(parse("lia64-v2.5.10"), ("lia64-v2.5", ".10", True))
+        self.assertEqual(parse("next-20261110"), ("next", "-20261110", True))
+
+        # Legacy DEFAULT_TAG_VIEWS are upgraded during repository entry normalization
+        entry = {"name": "linux", "tag_views": copy.deepcopy(_LEGACY_DEFAULT_TAG_VIEWS)}
+        _normalize_repo_entry_features(entry)
+        self.assertEqual(entry["tag_views"], DEFAULT_TAG_VIEWS)
 
 
 
