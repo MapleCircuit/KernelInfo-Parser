@@ -51,6 +51,7 @@ import { ManView } from "./views/man/man_view.js";
 import { newestTag } from "./views/man/man_model.js";
 import { KERNEL_FAMILY, familyOf, prefixedFinals, prefixedReleaseOf } from "./views/sections/release_order.js";
 import { PROJECT_MOVABLE_TABS, hasFeature, isManPagesRepo, isTabFeatureEnabled, manPagesRepo, setProjects } from "./utils/projects.js";
+import { canBeVersionlessTab, isAlwaysVersionlessTab } from "./tab_routes.js";
 import "./views/sections/all_sections.js";
 import { statusLine } from "./views/status/status_model.js";
 import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
@@ -1257,6 +1258,10 @@ class KernelIdeApp {
           }
           return;
         }
+        if (isAlwaysVersionlessTab(tab.type)) {
+          toast.info(`${tab.title} does not use a version tag — use New Tab to open ${shortRef(target)}`);
+          return;
+        }
         if (tab.version === target) {
           toast.info(`${tab.title} is already on ${shortRef(target)}`);
           return;
@@ -1631,17 +1636,25 @@ class KernelIdeApp {
     if (applyBtn) {
       const crossRepo = Boolean(activeTab) && state.repoOf(activeTab) !== headerRepo;
       const movableCrossRepo = crossRepo && Boolean(PROJECT_MOVABLE_TABS[activeTab.type] && isTabFeatureEnabled(headerRepo, activeTab.type));
-      const pending = Boolean(activeTab) && (crossRepo ? movableCrossRepo : activeTab.version !== cur);
+      const alwaysVersionless = Boolean(activeTab) && isAlwaysVersionlessTab(activeTab.type);
+      const tabVer = activeTab
+        ? (alwaysVersionless ? "" : (canBeVersionlessTab(activeTab.type) ? (activeTab.version || "") : (activeTab.version || state.currentVersion)))
+        : "";
+      const pending = Boolean(activeTab) && (crossRepo ? movableCrossRepo : (!alwaysVersionless && Boolean(cur) && tabVer !== cur));
       applyBtn.classList.toggle("pending", pending);
       applyBtn.title = !activeTab
         ? `Open ${shortRef(cur)} in a new tab`
         : crossRepo
           ? (movableCrossRepo
-            ? `Switch ${activeTab.title} to ${headerRepo} @ ${shortRef(cur)}`
+            ? `Switch ${activeTab.title} to ${headerRepo}${alwaysVersionless ? "" : ` @ ${shortRef(cur)}`}`
             : `${activeTab.title} belongs to ${state.repoOf(activeTab)} (use New Tab for ${headerRepo})`)
-          : (pending
-            ? `Switch ${activeTab.title} from ${shortRef(activeTab.version)} to ${shortRef(cur)}`
-            : `${activeTab.title} is already on ${shortRef(cur)}`);
+          : alwaysVersionless
+            ? `${activeTab.title} does not use a version tag`
+            : (pending
+              ? (tabVer
+                ? `Switch ${activeTab.title} from ${shortRef(tabVer)} to ${shortRef(cur)}`
+                : `Apply ${shortRef(cur)} to ${activeTab.title}`)
+              : `${activeTab.title} is already on ${shortRef(cur)}`);
     }
     const newTabBtn = document.getElementById("version-newtab-btn");
     if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
@@ -1789,7 +1802,7 @@ class KernelIdeApp {
           run: () => state.openTab({ type: "insights", title: `Insights · ${sec.label}`, view: sec.id, version: v() }) })),
       ] : []),
       ...(enabled("cve") ? [
-        { title: "Open CVEs", hint: "All Linux kernel CVEs & affected versions", keywords: "cve vulnerability security", run: () => state.openTab({ type: "cve", title: "CVEs", version: v() }) },
+        { title: "Open CVEs", hint: "All Linux kernel CVEs & affected versions", keywords: "cve vulnerability security", run: () => state.openTab({ type: "cve", title: "CVEs" }) },
       ] : []),
       { title: "Show watch list", hint: "Files, symbols, Kconfig options and MAINTAINERS sections you follow", keywords: "watch follow notify bell changes", run: () => state.openTab({ type: "watch", title: "Watch list" }) },
       { title: "Watch this tab", hint: "The file of a code tab, the directory of an explorer, a Kconfig option, a MAINTAINERS section", keywords: "watch follow notify", run: async () => {
@@ -1862,7 +1875,7 @@ class KernelIdeApp {
         },
       ] : []),
       { title: "Open repository explorer tab", hint: "Browse the tree of this revision", keywords: "files tree browse", run: () => state.openTab({ type: "explorer", title: `Explorer ${v()}`, path: "", version: v(), forceNew: true }) },
-      ...(enabled("commits") ? [{ title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) }] : []),
+      ...(enabled("commits") ? [{ title: "Open Git commits timeline", hint: "Commit history of the repository", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) }] : []),
       ...(enabled("mail") ? [{ title: "Open Mailing List & LKML search", hint: "Search patches and threads", keywords: "mail lkml lore patch thread", run: () => state.openTab({ type: "mail", title: "Mailing List" }) }] : []),
       ...(enabled("maintainers") ? [{ title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) }] : []),
       ...(enabled("nodemap") ? [{ title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) }] : []),
@@ -2007,13 +2020,13 @@ class KernelIdeApp {
         } else if (action === "commits") {
           state.openTab({ type: "commits", title: "Commits", ...tabTarget });
         } else if (action === "mail") {
-          state.openTab({ type: "mail", title: "Mailing List", ...tabTarget });
+          state.openTab({ type: "mail", title: "Mailing List", repo: targetRepo });
         } else if (action === "api") {
           state.openTab({ type: "api", title: "Kernel API", ...tabTarget });
         } else if (action === "insights") {
           state.openTab({ type: "insights", title: "Insights", ...tabTarget });
         } else if (action === "cve") {
-          state.openTab({ type: "cve", title: "CVEs", ...tabTarget });
+          state.openTab({ type: "cve", title: "CVEs", repo: targetRepo });
         } else if (action === "man") {
           this.openManIndex(targetRepo);
         } else if (action === "compare" || action === "tools") {

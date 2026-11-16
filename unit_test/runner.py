@@ -81,6 +81,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_rust_refs",
     "tests.test_webapp_release_index",
     "tests.test_webapp_commit_query",
+    "tests.test_webapp_versionless_commits",
     "tests.test_webapp_stable",
     "tests.test_webapp_insights",
     "tests.test_webapp_cve",

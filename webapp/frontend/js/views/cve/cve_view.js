@@ -9,6 +9,7 @@ import { toast } from "../../components/toast.js";
 import { VirtualList } from "../../components/virtual_list.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
+import { buildDeepLink } from "../../tab_routes.js";
 import { chipCounts, filterRows, formatChips, parseChips, toTsv } from "../sections/section_model.js";
 import { NOT_INGESTED_HTML, SETUP_HTML, renderCveDetailHtml, severityTag } from "./cve_render.js";
 
@@ -75,7 +76,7 @@ export class CveView {
     this.containerEl = containerEl;
     this.tabId = tabData.id;
     this.tab = tabData;
-    this.version = tabData.version || state.currentVersion;
+    this.version = tabData.version || "";
     this.checkedRelease = "";
 
     containerEl.innerHTML = `
@@ -249,7 +250,6 @@ export class CveView {
         title: `CVE · ${key}`,
         sel: key,
         cveVersion: this.tab.cveVersion || "",
-        version: this.version,
         forceNew: true,
       });
       return;
@@ -275,7 +275,7 @@ export class CveView {
     }
     if (seq !== this.detailSeq || !this.containerEl?.isConnected) return;
     el.innerHTML = renderCveDetailHtml(detail, {
-      release: release || this.version,
+      release: detail?.release_state?.release || "",
       showCopyLink: true,
       showCheckRelease: true,
       checkedRelease: release,
@@ -292,9 +292,7 @@ export class CveView {
       if (repo) p.set("repo", repo);
       p.set("tab", "cve");
       p.set("id", cveId);
-      const origin = typeof location !== "undefined" && location.origin && location.origin !== "null" ? `${location.origin}${location.pathname}` : "";
-      const link = `${origin}#${p.toString()}`;
-      copyToClipboard(link).then((ok) => {
+      copyToClipboard(buildDeepLink(p)).then((ok) => {
         if (ok) toast.success(`Copied link to ${cveId}`);
         else toast.error("Failed to copy link to clipboard");
       });
@@ -312,7 +310,7 @@ export class CveView {
         type: "code",
         title: path.split("/").pop(),
         path,
-        version: file.dataset.version || this.version,
+        version: file.dataset.version || this.version || state.activeVersion(),
         cursorLine: parseInt(file.dataset.line || "1", 10) || 1,
         forceNew: nt,
       });
@@ -324,7 +322,6 @@ export class CveView {
         title: `Commit ${hash.slice(0, 7)}`,
         commitId: hash,
         listCollapsed: true,
-        version: this.version,
         forceNew: nt,
       });
     } else if (symbol) {
@@ -334,7 +331,7 @@ export class CveView {
         title: `Search: ${symbol.dataset.symbol}`,
         query: symbol.dataset.symbol,
         word: true,
-        version: this.version,
+        version: this.version || state.activeVersion(),
         forceNew: nt,
       });
     }

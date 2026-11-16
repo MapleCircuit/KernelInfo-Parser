@@ -2,7 +2,7 @@
  * state.js - Reactive Global State Store.
  * Manages versions, multi-pane tabs, active tab, kconfig engines and the event bus.
  */
-import { tabRoute } from "./tab_routes.js";
+import { canBeVersionlessTab, isAlwaysVersionlessTab, tabRoute } from "./tab_routes.js";
 import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
 
@@ -283,6 +283,7 @@ class GlobalState {
    * reloads in that revision when it is next shown.
    */
   setVersion(version, tab = this.getActiveTab()) {
+    if (tab && isAlwaysVersionlessTab(tab.type)) return;
     const vStr = GlobalState.refOf(version);
     if (!vStr) return;
     const isActive = !tab || tab === this.getActiveTab();
@@ -302,6 +303,19 @@ class GlobalState {
     if (isActive) this.emit("version:changed", vStr);
     else this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
     this.saveState();
+  }
+
+  /** Remove a tab's version/tag when its type allows being tag-less (e.g. `commits`). */
+  clearTabVersion(tab = this.getActiveTab()) {
+    if (!tab || !canBeVersionlessTab(tab.type) || isAlwaysVersionlessTab(tab.type)) return false;
+    if (!tab.version) return false;
+    tab.version = "";
+    delete tab.scrollTop;
+    delete tab.scrollPositions;
+    if (tab === this.getActiveTab()) this.emit("version:changed", this.currentVersion);
+    else this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
+    this.saveState();
+    return true;
   }
 
   /** Repository of a tab (a tab recorded before tabs carried one belongs to the header's project). */
@@ -399,7 +413,8 @@ class GlobalState {
     if (!tab || !repo) return false;
     tab.repo = repo;
     const v = GlobalState.refOf(version);
-    if (v) tab.version = v;
+    if (isAlwaysVersionlessTab(tab.type)) tab.version = "";
+    else if (v) tab.version = v;
     // The tab re-opens at the top: its saved positions belong to the other repository (§5.28)
     delete tab.scrollTop;
     delete tab.scrollPositions;
@@ -411,9 +426,12 @@ class GlobalState {
       this._repoManualOverride = false;
       this._repoOverrideTabId = null;
       this.syncRepoFromActiveTab();
-      this.currentVersion = tab.version;
-      this.selectedVersion = tab.version;
-      if (tab.version && !/^[0-9a-f]{7,40}$/i.test(tab.version)) this.selectedVersionByRepo[repo] = tab.version;
+      const nextHeaderVer = tab.version || v;
+      if (nextHeaderVer) {
+        this.currentVersion = nextHeaderVer;
+        this.selectedVersion = nextHeaderVer;
+        if (!/^[0-9a-f]{7,40}$/i.test(nextHeaderVer)) this.selectedVersionByRepo[repo] = nextHeaderVer;
+      }
       this.emit("version:changed", this.currentVersion);
     } else {
       this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
@@ -957,7 +975,16 @@ class GlobalState {
           if (tabData[key] === "" || tabData[key] === 0 || tabData[key] === null || tabData[key] === false) delete existing[key];
           else existing[key] = tabData[key];
         }
-        if (nextVer) existing.version = nextVer;
+        if (isAlwaysVersionlessTab(existing.type)) existing.version = "";
+        else if (nextVer) existing.version = nextVer;
+      } else if (isAlwaysVersionlessTab(existing.type)) {
+        existing.version = "";
+      } else if (canBeVersionlessTab(existing.type) && tabData.version !== undefined) {
+        const nextCommitVer = GlobalState.refOf(tabData.version);
+        if (nextCommitVer !== (existing.version || "")) {
+          existing.version = nextCommitVer;
+          delete existing.scrollPositions;
+        }
       }
       if (tabData.cursorLine) {
         existing.cursorLine = tabData.cursorLine;
@@ -1025,8 +1052,13 @@ class GlobalState {
     } else {
       const id = "tab-" + Math.random().toString(36).substring(2, 9);
       // A tab opened from another one inherits that tab's revision, never the header selection; a tab of
-      // another project without one is left to pick its project's default (man_view.js: the newest tag)
-      const tabVer = GlobalState.refOf(tabData.version) || (repo === this.activeRepo() ? this.activeVersion() : "");
+      // another project without one is left to pick its project's default (man_view.js: the newest tag).
+      // Versionless tab types stay empty; optionally-versionless tabs (`commits`) stay tag-less unless given one.
+      const tabVer = isAlwaysVersionlessTab(tabData.type)
+        ? ""
+        : (canBeVersionlessTab(tabData.type)
+          ? GlobalState.refOf(tabData.version)
+          : (GlobalState.refOf(tabData.version) || (repo === this.activeRepo() ? this.activeVersion() : "")));
       const newTab = {
         id,
         ...tabData,
@@ -1128,7 +1160,9 @@ class GlobalState {
     const tab = { ...tabData };
     // Tab ids are unique per session, not globally: a duplicate of the source session may be open here
     if (this.findTab(tab.id)) tab.id = `tab-${Math.random().toString(36).substring(2, 9)}`;
-    if (!GlobalState.refOf(tab.version)) tab.version = this.currentVersion;
+    if (isAlwaysVersionlessTab(tab.type)) tab.version = "";
+    else if (canBeVersionlessTab(tab.type)) tab.version = GlobalState.refOf(tab.version);
+    else if (!GlobalState.refOf(tab.version)) tab.version = this.currentVersion;
 
     const kc = payload.kconfig || null;
     const profileKey = kc?.profileKey || (tab.type === "kconfig" ? this.kconfigProfileKeyOf(tab) : "");
@@ -1217,7 +1251,9 @@ class GlobalState {
       sessionData.panes.forEach((p) => {
         if (Array.isArray(p.tabs)) {
           p.tabs.forEach((t) => {
-            if (!GlobalState.refOf(t.version)) t.version = "v3.0";
+            if (isAlwaysVersionlessTab(t.type)) t.version = "";
+            else if (canBeVersionlessTab(t.type)) t.version = GlobalState.refOf(t.version);
+            else if (!GlobalState.refOf(t.version)) t.version = "v3.0";
             // A tab saved before tabs carried their repository belongs to the session's project
             if (!t.repo && this.currentRepo) t.repo = this.currentRepo;
           });

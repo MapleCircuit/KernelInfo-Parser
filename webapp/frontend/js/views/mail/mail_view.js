@@ -16,6 +16,7 @@ import { escapeHtml } from "../../components/modal.js";
 import { toast } from "../../components/toast.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
+import { buildDeepLink } from "../../tab_routes.js";
 
 const STATUS_COLORS = {
   A: "var(--accent-green)",
@@ -877,6 +878,8 @@ export class MailView {
             <span>·</span>
             <a href="${escapeHtml(threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0)))}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org ↗</a>
             <span>·</span>
+            <button class="code-btn mail-copy-link-btn" type="button" data-act="copy-thread-link" title="Copy versionless deep link to this thread">🔗 Copy link</button>
+            <span>·</span>
             <span class="mail-merged-badge pending" id="mail-merged-badge" title="Looking for the commits this thread became">Merged: …</span>
             ${seriesMessages(messages).some((m) => m.is_patch) ? `<span>·</span><button class="code-btn mail-try-series" type="button" title="Apply the newest version of this series to a revision, in memory">Try the series…</button>` : ""}
           </div>
@@ -887,6 +890,20 @@ export class MailView {
         <div class="mail-messages-container" id="mail-cards-list"></div>
       </div>
     `;
+
+    const copyThreadBtn = container.querySelector('[data-act="copy-thread-link"]');
+    if (copyThreadBtn) {
+      copyThreadBtn.onclick = async () => {
+        const p = new URLSearchParams();
+        const repo = this.api?.repo || state.repoOf(state.findTab(this.tabId)) || state.activeRepo();
+        if (repo) p.set("repo", repo);
+        p.set("tab", "mail");
+        if (threadData.tid) p.set("tid", String(threadData.tid));
+        if (targetMid) p.set("mid", String(targetMid));
+        if (await copyToClipboard(buildDeepLink(p))) toast.success("Copied link to mailing list thread");
+        else toast.error("Failed to copy link to clipboard");
+      };
+    }
 
     const trySeries = container.querySelector(".mail-try-series");
     if (trySeries) {
@@ -1020,6 +1037,7 @@ export class MailView {
               <button class="mail-mode-btn" data-mode="raw">Raw</button>
             </div>
             <button class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
+            <button class="code-btn mail-action-btn" data-act="copy-link" title="Copy versionless deep link to this message">🔗 Link</button>
             <button class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
             ${msgSummary.is_patch && !/^\s*re\s*:/i.test(msgSummary.subject || "") ? `<button class="code-btn mail-action-btn" data-act="try" title="Apply this patch to a revision, in memory">Try on revision…</button>` : ""}
             <a href="${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>
@@ -1110,6 +1128,22 @@ export class MailView {
         } else {
           toast.error("No raw content available to copy");
         }
+      };
+    }
+
+    const copyLinkBtn = card.querySelector('[data-act="copy-link"]');
+    if (copyLinkBtn) {
+      copyLinkBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const mid = msgSummary.message_id || msgSummary.num;
+        const p = new URLSearchParams();
+        const repo = this.api?.repo || state.repoOf(state.findTab(this.tabId)) || state.activeRepo();
+        if (repo) p.set("repo", repo);
+        p.set("tab", "mail");
+        if (this.activeThreadId) p.set("tid", String(this.activeThreadId));
+        if (mid) p.set("mid", String(mid));
+        if (await copyToClipboard(buildDeepLink(p))) toast.success("Copied link to message");
+        else toast.error("Failed to copy link to clipboard");
       };
     }
 

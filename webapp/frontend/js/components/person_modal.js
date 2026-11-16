@@ -168,7 +168,7 @@ export async function showPersonModal(version, personIdentifier) {
           type: "commits",
           title: `Commits: ${name}`,
           query: name || email,
-          version: currentVersion
+          version: version || ""
         });
       };
     }
@@ -208,7 +208,7 @@ export async function showPersonModal(version, personIdentifier) {
           type: "commits",
           title: `Commits: ${personIdentifier}`,
           query: String(personIdentifier),
-          version: currentVersion
+          version: version || ""
         });
       };
     }

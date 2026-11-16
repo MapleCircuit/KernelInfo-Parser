@@ -14,6 +14,16 @@ router = APIRouter(prefix="/api", tags=["commits"])
 git_service = GitService()
 
 
+@router.get("/commits/list", dependencies=[Depends(require_feature("commits"))])
+def get_commits_unversioned(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    q: str = Query(""),
+) -> dict[str, Any]:
+    """Indexed commits of the repository matching `q`, newest first (versionless)."""
+    return git_service.get_commits("", page, limit, q)
+
+
 @router.get("/commits/{version_name}/list", dependencies=[Depends(require_feature("commits"))])
 def get_commits(
     version_name: str,
@@ -25,16 +35,34 @@ def get_commits(
     return git_service.get_commits(version_name, page, limit, q)
 
 
+@router.get("/commits/detail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_commit_unversioned(commit_id_or_hash: str) -> dict[str, Any]:
+    """Commit details, files and multi-contributor trailers (versionless)."""
+    return git_service.get_commit_detail(commit_id_or_hash)
+
+
 @router.get("/commits/{version_name}/detail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits"))])
 def get_commit(version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
     """Commit details, files and multi-contributor trailers."""
     return git_service.get_commit_detail(commit_id_or_hash)
 
 
+@router.post("/commits/resolve_mail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits", "mail"))])
+def resolve_commit_mail_unversioned(commit_id_or_hash: str) -> dict[str, Any]:
+    """On-demand resolution of a commit against the mailing list archive (versionless)."""
+    return git_service.resolve_commit_mail(commit_id_or_hash)
+
+
 @router.post("/commits/{version_name}/resolve_mail/{commit_id_or_hash}", dependencies=[Depends(require_feature("commits", "mail"))])
 def resolve_commit_mail(version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
     """On-demand resolution of a commit against the mailing list archive."""
     return git_service.resolve_commit_mail(commit_id_or_hash)
+
+
+@router.get("/commits/diff/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_commit_diff_unversioned(commit_hash: str, context: int = Query(3, ge=0, le=20)) -> dict[str, Any]:
+    """Structured diff of one commit against its first parent (versionless)."""
+    return git_service.get_commit_diff(commit_hash, context)
 
 
 @router.get("/commits/{version_name}/diff/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
@@ -61,6 +89,16 @@ def get_file_history(version_name: str, path: str, limit: int = Query(50, ge=1, 
     return git_service.get_file_history(version_name, path, limit)
 
 
+@router.get("/commits/timeline", dependencies=[Depends(require_feature("commits"))])
+def get_commit_timeline_unversioned(
+    limit: int = Query(100, ge=1, le=250),
+    direction: str = Query("past"),
+    cursor_id: int | None = Query(None),
+) -> dict[str, Any]:
+    """Commit timeline from the latest commits in the repository (versionless)."""
+    return git_service.get_commit_timeline("", limit=limit, direction=direction, cursor_id=cursor_id)
+
+
 @router.get("/commits/{version_name}/timeline", dependencies=[Depends(require_feature("commits"))])
 def get_commit_timeline(
     version_name: str,
@@ -72,12 +110,22 @@ def get_commit_timeline(
     return git_service.get_commit_timeline(version_name, limit=limit, direction=direction, cursor_id=cursor_id)
 
 
-@router.get("/commits/{version_name}/search", dependencies=[Depends(require_feature("commits"))])
-def search_commits(version_name: str, q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
-    """Commit search by hash prefix, subject or author (at least two characters)."""
+def _search_commits(version_name: str, q: str, limit: int) -> dict[str, Any]:
     if len(q.strip()) < 2:
         return {"version": version_name, "page": 1, "limit": limit, "total": 0, "commits": []}
     return git_service.get_commits(version_name, page=1, limit=limit, query=q)
+
+
+@router.get("/commits/search", dependencies=[Depends(require_feature("commits"))])
+def search_commits_unversioned(q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    """Commit search by hash prefix, subject or author (versionless)."""
+    return _search_commits("", q, limit)
+
+
+@router.get("/commits/{version_name}/search", dependencies=[Depends(require_feature("commits"))])
+def search_commits(version_name: str, q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    """Commit search by hash prefix, subject or author (at least two characters)."""
+    return _search_commits(version_name, q, limit)
 
 
 @router.post("/version/{version_name}/patch/series", dependencies=[Depends(require_feature("patch"))])
@@ -121,10 +169,7 @@ def _building(state: dict[str, Any], what: str) -> JSONResponse:
     return JSONResponse(body, status_code=202, headers=NO_STORE)
 
 
-@router.get("/commits/{version_name}/released/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
-def get_released(version_name: str, commit_hash: str) -> Any:
-    """First tag and release containing a commit (H3): {commit, first_tag, first_release, first_stable,
-    released} or {released: false, branches}. 202 while the release index is first built."""
+def _released_one(commit_hash: str) -> Any:
     info = release_service.first_containing(_hash(commit_hash))
     if not info.get("indexed") and not info.get("released"):
         return _building(release_service.ensure_release_index(), "release")
@@ -133,9 +178,20 @@ def get_released(version_name: str, commit_hash: str) -> Any:
     return body if info.get("released") else JSONResponse(body, headers=NO_STORE)
 
 
-@router.post("/commits/{version_name}/released", dependencies=[Depends(require_feature("commits"))])
-def post_released(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
-    """Batched first releases (timeline cards, popovers): {results: {hash: {...}}, index: {state}}."""
+@router.get("/commits/released/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_released_unversioned(commit_hash: str) -> Any:
+    """First tag and release containing a commit (versionless)."""
+    return _released_one(commit_hash)
+
+
+@router.get("/commits/{version_name}/released/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_released(version_name: str, commit_hash: str) -> Any:
+    """First tag and release containing a commit (H3): {commit, first_tag, first_release, first_stable,
+    released} or {released: false, branches}. 202 while the release index is first built."""
+    return _released_one(commit_hash)
+
+
+def _released_batch(payload: dict[str, Any]) -> Any:
     hashes = _hashes(payload)
     state = release_service.ensure_release_index()
     if state.get("state") != "done":
@@ -148,6 +204,18 @@ def post_released(version_name: str, payload: dict[str, Any] = Body(...)) -> Any
             continue
         results[h] = {k: info.get(k) for k in ("sha", "first_tag", "first_release", "first_stable", "released")}
     return JSONResponse({"results": results, "index": {"state": "done"}}, headers=NO_STORE)
+
+
+@router.post("/commits/released", dependencies=[Depends(require_feature("commits"))])
+def post_released_unversioned(payload: dict[str, Any] = Body(...)) -> Any:
+    """Batched first releases (versionless)."""
+    return _released_batch(payload)
+
+
+@router.post("/commits/{version_name}/released", dependencies=[Depends(require_feature("commits"))])
+def post_released(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """Batched first releases (timeline cards, popovers): {results: {hash: {...}}, index: {state}}."""
+    return _released_batch(payload)
 
 
 def _enrich(relations: dict[str, Any]) -> dict[str, Any]:
@@ -175,12 +243,7 @@ def _enrich(relations: dict[str, Any]) -> dict[str, Any]:
     return relations
 
 
-@router.get("/commits/{version_name}/relations/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
-def get_relations(version_name: str, commit_hash: str) -> Any:
-    """What a commit fixes and what fixed it, reverts, backports, Cc: stable and mail links (H1, H2):
-    m_commit_relation for ingested commits, else the commit relation index (webapp/API.md section 2.16),
-    enriched with subjects, authors and first releases. 202 while the index is first built; no-store
-    while it refreshes."""
+def _relations_one(commit_hash: str) -> Any:
     rel = commit_relations.relations(_hash(commit_hash))
     if rel.get("state") != "done":
         return _building(rel, "relations")
@@ -200,11 +263,22 @@ def get_relations(version_name: str, commit_hash: str) -> Any:
     return JSONResponse(body, headers=NO_STORE) if body.get("refreshing") else body
 
 
-@router.post("/commits/{version_name}/relations", dependencies=[Depends(require_feature("commits"))])
-def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
-    """Relation counts of many commits (timeline chips): {results: {hash: {fixed_by, reverted_by,
-    backports, fixes, stable_cc}}}. Ingested commits are counted in the database; the others in the
-    relation index (202 while it is first built and no commit could be answered)."""
+@router.get("/commits/relations/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_relations_unversioned(commit_hash: str) -> Any:
+    """Commit relations without a version path segment."""
+    return _relations_one(commit_hash)
+
+
+@router.get("/commits/{version_name}/relations/{commit_hash}", dependencies=[Depends(require_feature("commits"))])
+def get_relations(version_name: str, commit_hash: str) -> Any:
+    """What a commit fixes and what fixed it, reverts, backports, Cc: stable and mail links (H1, H2):
+    m_commit_relation for ingested commits, else the commit relation index (webapp/API.md section 2.16),
+    enriched with subjects, authors and first releases. 202 while the index is first built; no-store
+    while it refreshes."""
+    return _relations_one(commit_hash)
+
+
+def _relations_batch(payload: dict[str, Any]) -> Any:
     hashes = _hashes(payload)
     full_of = {h: (h if len(h) == 40 else release_service.resolve_sha(h)) for h in hashes}
     found, missing = commit_relations.relation_counts([f for f in full_of.values() if f])
@@ -222,6 +296,42 @@ def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> An
                     results[h]["stable_cc"] = bool(r["stable_cc"])
     return JSONResponse({"results": results}, headers=NO_STORE)
 
+
+@router.post("/commits/relations", dependencies=[Depends(require_feature("commits"))])
+def post_relations_unversioned(payload: dict[str, Any] = Body(...)) -> Any:
+    """Relation counts of many commits (versionless)."""
+    return _relations_batch(payload)
+
+
+@router.post("/commits/{version_name}/relations", dependencies=[Depends(require_feature("commits"))])
+def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """Relation counts of many commits (timeline chips): {results: {hash: {fixed_by, reverted_by,
+    backports, fixes, stable_cc}}}. Ingested commits are counted in the database; the others in the
+    relation index (202 while it is first built and no commit could be answered)."""
+    return _relations_batch(payload)
+
+
+@router.get("/commits/query", dependencies=[Depends(require_feature("commits"))])
+def query_commits_unversioned(
+    path: Annotated[list[str] | None, Query(description="Touched path or glob (repeatable, at most 8): fs/ext4, *.h, !drivers/")] = None,
+    author: Annotated[str, Query(description="Author name or email (text)")] = "",
+    committer: Annotated[str, Query(description="Committer name or email (text)")] = "",
+    role: Annotated[list[str] | None, Query(description="Trailer filter role:value (reviewer, acked, tested, reported, suggested, signed, codev, cc, fixes, link)")] = None,
+    since: Annotated[str, Query(description="YYYY-MM-DD")] = "",
+    until: Annotated[str, Query(description="YYYY-MM-DD")] = "",
+    range: Annotated[str, Query(description="<rev>..<rev>")] = "",  # noqa: A002 - the documented parameter name
+    release: Annotated[str, Query(description="A release tag: its cycle (previous release..tag)")] = "",
+    merges: Annotated[str, Query(description="only | none | all")] = "",
+    section: Annotated[str, Query(description="MAINTAINERS section id or name: its F:/X: patterns")] = "",
+    text: Annotated[str, Query(description="Subject or message text")] = "",
+    page: Annotated[int, Query(ge=1)] = 1,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    """Structured commit query run with git log defaulting to the latest branch (versionless)."""
+    from webapp.backend.services.commit_query import query_commits as run_query
+    return run_query("", paths=path, author=author, committer=committer, roles=role, since=since,
+                     until=until, range_=range, release=release, merges=merges, section=section, text=text,
+                     page=page, limit=limit)
 
 
 @router.get("/commits/{version_name}/query", dependencies=[Depends(require_feature("commits"))])

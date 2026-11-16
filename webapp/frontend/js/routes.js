@@ -39,6 +39,7 @@ registerTabRoute("search", {
 // ---------------------------------------------------------------- watch list (§5.36)
 registerTabRoute("watch", {
   badge: "[Y]",
+  versionless: true,
   keys: [],
   fromHash: () => ({ title: "Watch list" }),
   toHash: () => {},
@@ -48,6 +49,7 @@ registerTabRoute("watch", {
 // ---------------------------------------------------------------- bookmarks & tours (§5.35); t=<tour> imports a shared tour once
 registerTabRoute("bookmarks", {
   badge: "[B]",
+  versionless: true,
   keys: [],
   fromHash: (params) => ({ title: "Bookmarks", importTour: params.get("t") || "" }),
   toHash: () => {},
@@ -66,6 +68,7 @@ registerTabRoute("patch", {
 // ---------------------------------------------------------------- parser status (§5.37)
 registerTabRoute("status", {
   badge: "[I]",
+  versionless: true,
   keys: [],
   fromHash: () => ({ title: "Parser status" }),
   toHash: () => {},
@@ -121,6 +124,7 @@ registerTabRoute("man", {
 // ---------------------------------------------------------------- independent CVE tab
 registerTabRoute("cve", {
   badge: "[V]",
+  versionless: true,
   keys: ["sel", "query", "filter", "cveVersion", "listCollapsed"],
   fromHash: (params) => {
     const sel = params.get("id") || params.get("sel") || params.get("cve") || "";

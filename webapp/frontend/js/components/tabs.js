@@ -4,7 +4,7 @@
  * two sessions, & drag-out), the tab right-click menu (elevate into a browser tab of its own, push
  * to another session), and delegates active tab rendering to domain views.
  */
-import { tabRoute } from "../tab_routes.js";
+import { canBeVersionlessTab, isAlwaysVersionlessTab, tabRoute } from "../tab_routes.js";
 import { state } from "../state.js";
 import { sessionManager } from "../session_manager.js";
 import { shortRef } from "./ref_picker.js";
@@ -140,10 +140,16 @@ export class TabsComponent {
         titleSpan.className = "tab-title";
         titleSpan.textContent = tab.title;
 
-        // Version badge if different from global
-        const verSpan = document.createElement("span");
-        verSpan.className = "tab-version";
-        verSpan.textContent = shortRef(tab.version || state.currentVersion);
+        // Version badge when this tab carries a revision (versionless tabs omit it)
+        const tabVer = isAlwaysVersionlessTab(tab.type)
+          ? ""
+          : (canBeVersionlessTab(tab.type) ? (tab.version || "") : (tab.version || state.currentVersion));
+        let verSpan = null;
+        if (tabVer) {
+          verSpan = document.createElement("span");
+          verSpan.className = "tab-version";
+          verSpan.textContent = shortRef(tabVer);
+        }
 
         // Project badge: a tab of another project than the linux kernel names it (§5.18)
         const badge = projectBadge(tab.repo || state.currentRepo);
@@ -169,7 +175,7 @@ export class TabsComponent {
         tabEl.appendChild(iconSpan);
         if (projSpan) tabEl.appendChild(projSpan);
         tabEl.appendChild(titleSpan);
-        tabEl.appendChild(verSpan);
+        if (verSpan) tabEl.appendChild(verSpan);
         tabEl.appendChild(closeBtn);
 
         tabEl.addEventListener("click", () => {
@@ -598,7 +604,8 @@ export class TabsComponent {
         onOpenInNewWindow: () => this.elevateTabToNewWindow({ ...tab }, paneId),
         onPushToSession: (session) => this.pushTabToSession(tab, paneId, session),
         onApplyCurrentTag: () => this.applyCurrentTagToTab(tab),
-        onGetTabTag: () => this.getTabTag(tab)
+        onGetTabTag: () => this.getTabTag(tab),
+        onClearTag: () => this.clearTabTag(tab),
       });
     });
   }
@@ -611,6 +618,10 @@ export class TabsComponent {
     const target = state.selectedVersion;
     const live = state.findTab(tab?.id);
     if (!target || !live) return;
+    if (isAlwaysVersionlessTab(live.type)) {
+      toast.info(`${live.title} does not use a version tag`);
+      return;
+    }
     if (state.currentRepo && state.repoOf(live) !== state.currentRepo) {
       toast.info(`${live.title} belongs to ${state.repoOf(live)} (header Project is ${state.currentRepo})`);
       return;
@@ -625,8 +636,17 @@ export class TabsComponent {
   /** Select this tab's revision in the header (§5.24.5); no tab is switched. */
   getTabTag(tab) {
     const live = state.findTab(tab?.id);
-    const ref = live?.version || state.currentVersion;
+    if (!live || isAlwaysVersionlessTab(live.type)) return;
+    const ref = canBeVersionlessTab(live.type) ? (live.version || "") : (live.version || state.currentVersion);
+    if (!ref) return;
     if (state.setSelectedVersion(ref)) toast.info(`Header revision set to ${shortRef(ref)}`);
+  }
+
+  /** Clear the tag on a tab whose type allows being tag-less (`commits`). */
+  clearTabTag(tab) {
+    const live = state.findTab(tab?.id);
+    if (!live) return;
+    if (state.clearTabVersion(live)) toast.info(`${live.title} is now tag-less`);
   }
 
   /**

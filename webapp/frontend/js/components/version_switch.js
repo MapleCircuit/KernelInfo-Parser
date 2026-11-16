@@ -13,6 +13,7 @@
  * prompt.
  */
 import { state, kconfigProfileKey } from "../state.js";
+import { isAlwaysVersionlessTab } from "../tab_routes.js";
 import { openModal, escapeHtml } from "./modal.js";
 
 /**
@@ -23,7 +24,7 @@ export async function requestVersionSwitch(target, tab = state.getActiveTab()) {
   const ref = typeof target === "string" ? target.trim() : "";
   if (!ref) return false;
   state.setSelectedVersion(ref);
-  if (!tab || tab.version === ref) return false;
+  if (!tab || isAlwaysVersionlessTab(tab.type) || tab.version === ref) return false;
   if (tab.type === "kconfig") {
     const plan = kconfigCarryPlan(tab, ref);
     if (!(await confirmKconfigVersionSwitch(tab, ref, plan))) return false;

@@ -13,6 +13,7 @@ import { copyToClipboard } from "../../utils/clipboard.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { hasFeature } from "../../utils/projects.js";
+import { buildDeepLink } from "../../tab_routes.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -129,7 +130,7 @@ export class CommitsView {
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
     this.tabId = tabData.id || null;
-    this.currentVersion = tabData.version || state.currentVersion;
+    this.currentVersion = tabData.version || "";
     // The tab is the whole truth: a tab without a search or a selection shows none, whatever
     // this view showed before
     this.selectedCommitId = tabData.commitId || null;
@@ -468,7 +469,6 @@ export class CommitsView {
             title: `Commit ${hashShort}`,
             commitId: c.commit_hash || c.commit_id,
             listCollapsed: true,
-            version: this.currentVersion,
             forceNew: true
           });
         }
@@ -599,7 +599,7 @@ export class CommitsView {
   /** "+"/context lines open the file at the commit; "-" lines open it at the parent with the removed lines marked. */
   openChange(diff, file, side, line, forceNew) {
     const removedSide = side === "-" || file.status === "D";
-    const commitTarget = diff?.commit_hash || this.selectedCommitId || this.currentVersion;
+    const commitTarget = diff?.commit_hash || this.selectedCommitId || this.currentVersion || state.activeVersion();
     const version = removedSide ? (diff?.parent_hash || `${commitTarget}~1`) : commitTarget;
     if (!version) {
       toast.info("This line has no previous version (root commit).");
@@ -796,7 +796,7 @@ export class CommitsView {
       e.preventDefault();
       const hash = link.dataset.inspect;
       if (forceNew || e.ctrlKey || e.metaKey) {
-        state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, version: this.currentVersion, forceNew: true });
+        state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, forceNew: true });
       } else if (!this.selectLoadedCommit(hash)) {
         this.selectedCommitId = hash;
         this.inspectCommit(hash);
@@ -806,7 +806,7 @@ export class CommitsView {
     const cve = e.target.closest(".rel-cve[data-cve]");
     if (cve && hasFeature(this.api?.repo, "cve")) {
       e.preventDefault();
-      state.openTab({ type: "cve", title: `CVE · ${cve.dataset.cve}`, sel: cve.dataset.cve, version: this.currentVersion, forceNew: forceNew || e.ctrlKey || e.metaKey });
+      state.openTab({ type: "cve", title: `CVE · ${cve.dataset.cve}`, sel: cve.dataset.cve, forceNew: forceNew || e.ctrlKey || e.metaKey });
       return true;
     }
     const mail = e.target.closest(".rel-mail[data-mid]");
@@ -876,9 +876,12 @@ export class CommitsView {
             <div><strong>Hash:</strong> ${hashHtml(c.commit_hash)}</div>
             <div class="commit-release" id="commit-release-badge"><span class="release-badge pending">First released in …</span></div>
             ${c.lore_url ? `<div><a href="${escapeHtml(c.lore_url)}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
-            <div style="margin-top:8px;">
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
               <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
                 🔍 Explore Files at this Commit (${escapeHtml(c.commit_hash.slice(0, 8))})
+              </button>
+              <button class="code-btn" id="btn-copy-commit-link" style="font-size:11px;padding:4px 10px;" title="Copy versionless deep link to this commit">
+                🔗 Copy link
               </button>
             </div>
           </div>
@@ -1003,6 +1006,20 @@ export class CommitsView {
         };
       }
 
+      const copyCommitLinkBtn = detailEl.querySelector("#btn-copy-commit-link");
+      if (copyCommitLinkBtn && c.commit_hash) {
+        copyCommitLinkBtn.onclick = async () => {
+          const p = new URLSearchParams();
+          const repo = this.api?.repo || state.repoOf(state.findTab(this.tabId)) || state.activeRepo();
+          if (repo) p.set("repo", repo);
+          p.set("tab", "commits");
+          p.set("cid", c.commit_hash);
+          p.set("lc", "1");
+          if (await copyToClipboard(buildDeepLink(p))) toast.success(`Copied link to commit ${c.commit_hash.slice(0, 12)}`);
+          else toast.error("Failed to copy link to clipboard");
+        };
+      }
+
       detailEl.querySelectorAll(".commit-contributor-item").forEach((item) => {
         item.onmouseenter = () => { item.style.background = "rgba(255,255,255,0.08)"; };
         item.onmouseleave = () => { item.style.background = "var(--bg-tertiary)"; };
@@ -1016,7 +1033,7 @@ export class CommitsView {
 
       // Jump to file
       detailEl.querySelectorAll(".commit-file-link").forEach((link) => {
-        const fileVer = link.dataset.status === "D" ? `${c.commit_hash}~1` : (c.commit_hash || this.currentVersion);
+        const fileVer = link.dataset.status === "D" ? `${c.commit_hash}~1` : (c.commit_hash || this.currentVersion || state.activeVersion());
         link.onclick = () => {
           state.syncVersionFromTab(fileVer);
           state.setSelectedVersion(fileVer);

@@ -1413,7 +1413,6 @@ export class VirtualEditor {
                 query: this.currentFilePath,
                 sel: single,
                 listCollapsed: false,
-                version: this.currentVersion,
               });
             };
             this.updateToolbarOverflow();

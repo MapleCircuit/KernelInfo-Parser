@@ -254,7 +254,7 @@ class CommandPalette {
           icon: "🛡️",
           title: cveId,
           detail: "Open in CVE tab",
-          run: (nt) => state.openTab({ type: "cve", title: `CVE · ${cveId}`, sel: cveId, version, forceNew: Boolean(nt) }),
+          run: (nt) => state.openTab({ type: "cve", title: `CVE · ${cveId}`, sel: cveId, forceNew: Boolean(nt) }),
         });
       }
       const wantFiles = mode === "";

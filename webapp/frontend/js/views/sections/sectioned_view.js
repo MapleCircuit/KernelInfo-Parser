@@ -370,7 +370,7 @@ export class SectionedView {
     } else if (commit) {
       e.preventDefault();
       const hash = commit.dataset.commit;
-      state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, version: this.version, forceNew: nt });
+      state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, forceNew: nt });
     } else if (symbol) {
       e.preventDefault();
       state.openTab({ type: "search", title: `Search: ${symbol.dataset.symbol}`, query: symbol.dataset.symbol, word: true, version: this.version, forceNew: nt });

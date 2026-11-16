@@ -571,16 +571,27 @@ class GitService:
             "formatted_patch": formatted,
         }
 
-    def get_commits(self, version_name: str, page: int = 1, limit: int = 50, query: str = "") -> dict[str, Any]:
+    def get_commits(self, version_name: str = "", page: int = 1, limit: int = 50, query: str = "") -> dict[str, Any]:
         """Search the indexed commits of the request's repository (its Git network), newest first."""
         # limit and the page's offset are bound straight into SQL LIMIT/OFFSET
         limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
         off = max(0, min((max(1, int(page)) - 1) * limit, MAX_COMMIT_OFFSET))
         now_ts = int(time.time())
+        v_clean = (version_name or "").strip()
         with get_reader() as reader:
-            vid, vname = get_version_info(reader, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            if v_clean:
+                vid, vname = get_version_info(reader, v_clean)
+                if vid is None:
+                    if is_safe_rev(v_clean) or _HEX_REF.fullmatch(v_clean.lower()):
+                        _, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{v_clean}^{{commit}}"], timeout=5)
+                        if rc == 0:
+                            vname = v_clean
+                        else:
+                            raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+                    else:
+                        raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            else:
+                vname = ""
             network_id = get_active_network_id(reader)
             if network_id is None:
                 return {"version": vname, "page": page, "limit": limit, "offset": off, "total": 0, "commits": []}
@@ -1048,14 +1059,67 @@ class GitService:
             "truncated": truncated or any(f["truncated"] for f in files),
         }
 
+    def _git_timeline_fallback(
+        self, rev: str, version_label: str, limit: int, direction: str, now_ts: int, fmt_date: Any,
+    ) -> dict[str, Any] | None:
+        """Build a commit timeline directly from Git when the anchor revision is unparsed."""
+        if not (is_safe_rev(rev) or _HEX_REF.fullmatch(rev.lower())):
+            return None
+        try:
+            out, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], timeout=5)
+            if rc != 0 or not out.strip():
+                return None
+            git_sha = out.strip()
+            g_out, _, g_rc = self.run_git(
+                ["log", f"-n{limit}", "--format=%H%x00%an%x00%ae%x00%at%x00%s", git_sha],
+                timeout=10,
+            )
+            if g_rc != 0 or not g_out.strip():
+                return None
+            git_commits = []
+            for line in g_out.strip().splitlines():
+                parts = line.split("\x00")
+                if len(parts) < 5:
+                    continue
+                adate = int(parts[3]) if parts[3].isdigit() else 0
+                if adate > now_ts:
+                    continue
+                name = parts[1] or "Unknown"
+                email = parts[2] or ""
+                git_commits.append({
+                    "commit_id": parts[0],
+                    "commit_hash": parts[0],
+                    "author_date": adate,
+                    "author_date_iso": fmt_date(adate),
+                    "subject": parts[4],
+                    "author": {"person_id": 0, "name": name, "email": email},
+                    "author_name": name,
+                    "author_email": email,
+                    "files_count": 0,
+                })
+            if not git_commits:
+                return None
+            return {
+                "version": version_label,
+                "direction": (direction or "past").lower().strip(),
+                "has_past": len(git_commits) >= limit,
+                "has_future": False,
+                "next_past_cursor": None,
+                "next_future_cursor": None,
+                "timeline": git_commits,
+            }
+        except Exception as e:
+            logger.debug("Failed to resolve unparsed git timeline for %s: %s", rev, e)
+            return None
+
     def get_commit_timeline(
         self,
-        version_name: str,
+        version_name: str = "",
         limit: int = 100,
         direction: str = "past",
         cursor_id: int | None = None,
     ) -> dict[str, Any]:
-        """Retrieve structured commit timeline starting from the version tag anchor, supporting past and future exploration."""
+        """Retrieve structured commit timeline starting from the version tag anchor (or HEAD/latest when empty), supporting past and future exploration."""
         import datetime
 
         limit = max(1, min(int(limit or 100), 250))
@@ -1067,11 +1131,15 @@ class GitService:
                 return ""
 
         now_ts = int(time.time())
+        v_clean = (version_name or "").strip()
 
         with get_reader() as reader:
-            vid, vname = get_version_info(reader, version_name)
-            if vid is None:
-                vid, vname = get_version_info(reader, "v3.0")
+            if v_clean:
+                vid, vname = get_version_info(reader, v_clean)
+                if vid is None:
+                    vid, vname = get_version_info(reader, "v3.0")
+            else:
+                vid, vname = None, ""
             # Commit ids are global: every query below stays inside the repository's Git network
             network_id = get_active_network_id(reader)
             if network_id is None:
@@ -1087,49 +1155,10 @@ class GitService:
                 )
 
             if not anchor_row:
-                # Check if version_name resolves directly in Git as an unparsed commit or branch
-                if is_safe_rev(version_name) or _HEX_REF.fullmatch(version_name.lower()):
-                    try:
-                        out, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{version_name}^{{commit}}"], timeout=5)
-                        if rc == 0 and out.strip():
-                            git_sha = out.strip()
-                            g_out, _, g_rc = self.run_git(
-                                ["log", f"-n{limit}", "--format=%H%x00%an%x00%ae%x00%at%x00%s", git_sha],
-                                timeout=10,
-                            )
-                            if g_rc == 0 and g_out.strip():
-                                git_commits = []
-                                for line in g_out.strip().splitlines():
-                                    parts = line.split("\x00")
-                                    if len(parts) >= 5:
-                                        adate = int(parts[3]) if parts[3].isdigit() else 0
-                                        if adate > now_ts:
-                                            continue
-                                        name = parts[1] or "Unknown"
-                                        email = parts[2] or ""
-                                        git_commits.append({
-                                            "commit_id": parts[0],
-                                            "commit_hash": parts[0],
-                                            "author_date": adate,
-                                            "author_date_iso": _format_date(adate),
-                                            "subject": parts[4],
-                                            "author": {"person_id": 0, "name": name, "email": email},
-                                            "author_name": name,
-                                            "author_email": email,
-                                            "files_count": 0,
-                                        })
-                                if git_commits:
-                                    return {
-                                        "version": version_name,
-                                        "direction": (direction or "past").lower().strip(),
-                                        "has_past": len(git_commits) >= limit,
-                                        "has_future": False,
-                                        "next_past_cursor": None,
-                                        "next_future_cursor": None,
-                                        "timeline": git_commits,
-                                    }
-                    except Exception as e:
-                        logger.debug("Failed to resolve unparsed git timeline for %s: %s", version_name, e)
+                if v_clean:
+                    git_res = self._git_timeline_fallback(v_clean, v_clean, limit, direction, now_ts, _format_date)
+                    if git_res is not None:
+                        return git_res
 
                 # Find closest commit or latest tag commit (strictly not beyond current date)
                 anchor_row = reader.select_one(
@@ -1140,9 +1169,14 @@ class GitService:
                     as_dict=True,
                 )
 
+                if not anchor_row and not v_clean:
+                    git_res = self._git_timeline_fallback("HEAD", "", limit, direction, now_ts, _format_date)
+                    if git_res is not None:
+                        return git_res
+
             if not anchor_row:
                 return {
-                    "version": version_name,
+                    "version": vname,
                     "direction": direction,
                     "timeline": [],
                 }

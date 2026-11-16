@@ -92,8 +92,15 @@ def section_pathspecs(version_name: str, section: str) -> list[str]:
     from webapp.backend.services import release_service as rs
     from webapp.backend.services.insights_service import _load_maintainers
 
-    rev = rs.latest_info()["sha"] if version_name == rs.LATEST_RELEASE else version_name
-    sha = rev if version_name == rs.LATEST_RELEASE else rs.tag_commits().get(version_name)
+    if not version_name or version_name == rs.LATEST_RELEASE:
+        try:
+            rev = rs.latest_info()["sha"]
+        except HTTPException:
+            rev = _resolve("HEAD", "revision")
+        sha = rev
+    else:
+        rev = version_name
+        sha = rs.tag_commits().get(version_name)
     sections, _matcher = _load_maintainers(rev, sha)
     sec = str(section).strip()
     match = next((s for s in sections if (s.sec_id is not None and str(s.sec_id) == sec) or s.name == sec), None)
@@ -181,7 +188,13 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
             range_desc = f"{release} cycle"
     else:
         from webapp.backend.services.release_service import LATEST_RELEASE, latest_info
-        start = [latest_info()["sha"]] if version_name == LATEST_RELEASE else [_resolve(version_name, "revision")]
+        if not version_name or version_name == LATEST_RELEASE:
+            try:
+                start = [latest_info()["sha"]]
+            except HTTPException:
+                start = [_resolve("HEAD", "revision")]
+        else:
+            start = [_resolve(version_name, "revision")]
     args = build_log_args(start=start, paths=specs, author=author, committer=committer, roles=role_list,
                           since=since, until=until, merges="" if merges == "all" else merges, text=text,
                           skip=(page - 1) * limit, limit=limit)

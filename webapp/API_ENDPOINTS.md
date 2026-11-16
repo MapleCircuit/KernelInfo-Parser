@@ -1417,7 +1417,7 @@ index from the whole registry (`build_identity_index`, `parser/git_ast/identity.
 
 *(Feature-gated per endpoint in `webapp/backend/routers/commits.py`: commit list/detail/diff/blame/history/timeline/search/range/files/tree-stats/patch-preview require `"commits"`; `resolve_mail` requires `"commits"` and `"mail"`; `patch/series` and `patch/create` require `"patch"`; disabled features return `403 Forbidden`.)*
 
-#### `GET /api/commits/{version_name}/list`
+#### `GET /api/commits/{version_name}/list` · `GET /api/commits/list`
 Search the indexed commits of the request's repository, newest first (the Commits view's search; its
 unfiltered list is the timeline below).
 - **Repository scoping**: commit ids are global, so the query is restricted to the repository's Git network
@@ -1428,7 +1428,7 @@ unfiltered list is the timeline below).
   for. If `q` names an unparsed commit hash or prefix not in `m_commit`, results fall back to querying the Git
   CLI directly.
 - **Parameters**:
-  - `version_name` (path): Revision (must resolve, else 404).
+  - `version_name` (path, optional via `/api/commits/list`): Revision (must resolve in the database or Git, else 404; omitted on `/api/commits/list`).
   - `page` (query): Page number (1 or more, default 1).
   - `limit` (query): Commits per page (1-500, default 50). Bound again in the service, which also clamps the
     derived `OFFSET` (`MAX_COMMIT_PAGE`, `MAX_COMMIT_OFFSET`), since both are bound straight into SQL.
@@ -1456,7 +1456,7 @@ unfiltered list is the timeline below).
 }
 ```
 
-#### `GET /api/commits/{version_name}/detail/{commit_id_or_hash}`
+#### `GET /api/commits/{version_name}/detail/{commit_id_or_hash}` · `GET /api/commits/detail/{commit_id_or_hash}`
 Retrieve detailed metadata for a commit, including multi-contributor trailers and modified files.
 - **Unparsed commits & Git fallback**: When a commit hash or reference is not found in `m_commit`, the service
   falls back to inspecting the Git repository directly (`git log`, `git show`, `git diff-tree`), parsing
@@ -1519,7 +1519,7 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
 }
 ```
 
-#### `POST /api/commits/{version_name}/resolve_mail/{commit_id_or_hash}`
+#### `POST /api/commits/{version_name}/resolve_mail/{commit_id_or_hash}` · `POST /api/commits/resolve_mail/{commit_id_or_hash}`
 Execute on-demand live resolution of a Git commit against the Public-Inbox / LKML archive without pre-indexed
 database writes.
 - **Parameters**:
@@ -1554,15 +1554,15 @@ database writes.
 }
 ```
 
-#### `GET /api/commits/{version_name}/timeline`
+#### `GET /api/commits/{version_name}/timeline` · `GET /api/commits/timeline`
 Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version
-commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward
+commit (or from the repository's newest indexed commit / `HEAD` when called without `version_name`). Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward
 into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered
 around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous
 (<0.002s) execution. Every query stays inside the repository's Git network (see the list above), so two
 repositories of one database never interleave. Future-dated commits (`author_date > now`) are excluded from
 default timelines to omit corrupt timestamps. If `version_name` names an unparsed revision or branch outside
-`m_commit`, the timeline reads commits directly from Git (skipping any with timestamps beyond the current
+`m_commit` (or when `m_commit` is empty on the versionless route), the timeline reads commits directly from Git (skipping any with timestamps beyond the current
 date).
 - **Parameters**:
   - `version_name` (path): Kernel version string, branch, or commit SHA.
@@ -1593,7 +1593,7 @@ date).
 }
 ```
 
-#### `GET /api/commits/{version_name}/search`
+#### `GET /api/commits/{version_name}/search` · `GET /api/commits/search`
 Fast full-text search across commit subjects, messages, author names, and hashes.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -1617,7 +1617,7 @@ Fast full-text search across commit subjects, messages, author names, and hashes
 }
 ```
 
-#### `GET /api/commits/{version_name}/diff/{commit_hash}`
+#### `GET /api/commits/{version_name}/diff/{commit_hash}` · `GET /api/commits/diff/{commit_hash}`
 Structured unified diff of one commit against its **first parent** (root commits diff against the empty tree;
 merges show what the merge brought into the first-parent line). Read straight from Git (`git diff -M
 -U<context> <parent> <commit>`), so it works for any commit in the repository, parsed or not.
@@ -1791,7 +1791,7 @@ virtual editor modifications.
 
 ---
 
-#### `GET /api/commits/{version_name}/released/{commit_hash}` · `POST /api/commits/{version_name}/released`
+#### `GET /api/commits/{version_name}/released/{commit_hash}` · `POST /api/commits/{version_name}/released` · `GET /api/commits/released/{commit_hash}` · `POST /api/commits/released`
 First tag and release containing a commit (H3, release index §2.17). `commit_hash`: 7–40 hex characters (else
 400).
 - **Response**: `{"commit": "<40 hex>", "first_tag": "v3.1-rc6", "first_release": "v3.1", "first_stable":
@@ -1801,7 +1801,7 @@ First tag and release containing a commit (H3, release index §2.17). `commit_ha
 - **Batched form**: `POST` with `{"hashes": [...]}` (1–200) answers `{"results": {hash: {sha, first_tag,
   first_release, first_stable, released}}, "index": {"state": "done"}}` (`no-store`).
 
-#### `GET /api/commits/{version_name}/relations/{commit_hash}` · `POST /api/commits/{version_name}/relations`
+#### `GET /api/commits/{version_name}/relations/{commit_hash}` · `POST /api/commits/{version_name}/relations` · `GET /api/commits/relations/{commit_hash}` · `POST /api/commits/relations`
 What a commit fixes and what fixed it, reverts, backports, `Cc: stable` and mail links (H1, H2; §2.16:
 `m_commit_relation` for ingested commits, `source: "db"`, else the commit relation index, `source: "index"`),
 each related commit enriched with `subject`, `author`, `email`, `date` (one `git log --no-walk`), `released`
@@ -1816,9 +1816,9 @@ each related commit enriched with `subject`, `author`, `email`, `date` (one `git
   (`db_counts()`), the others from the SQLite index (202 only when it is building and the database answered
   none).
 
-#### `GET /api/commits/{version_name}/query`
+#### `GET /api/commits/{version_name}/query` · `GET /api/commits/query`
 Structured commit query run with `git log` (H8, `webapp/backend/services/commit_query.py`), newest first, from
-the revision (or a range / release cycle). Every argument is built on the server from validated values: paths
+the revision (defaulting to the repository's default branch / `HEAD` when called without `version_name`, or a range / release cycle). Every argument is built on the server from validated values: paths
 through the text-search pathspec validator (§2.1.3, glob magic added on the server); names, trailer values and
 text length-capped (100), single-line and escaped for POSIX ERE (they match as text, after `--author=` /
 `--committer=` / `--grep=`; `-i` throughout); dates `YYYY-MM-DD`; revisions through `safe_rev`, resolved to

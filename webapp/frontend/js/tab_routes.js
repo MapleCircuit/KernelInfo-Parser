@@ -17,6 +17,8 @@
  * DOM-free and dependency-free (imported by state.js).
  */
 const ROUTES = new Map();
+const ALWAYS_VERSIONLESS_TABS = new Set(["mail", "cve", "watch", "bookmarks", "status"]);
+const OPTIONAL_VERSIONLESS_TABS = new Set(["commits"]);
 
 export function registerTabRoute(type, route) {
   ROUTES.set(type, { keys: [], ...route });
@@ -24,6 +26,24 @@ export function registerTabRoute(type, route) {
 
 export function tabRoute(type) {
   return ROUTES.get(type) || null;
+}
+
+/** True for tab types that never carry a repository version/tag. */
+export function isAlwaysVersionlessTab(type) {
+  return ALWAYS_VERSIONLESS_TABS.has(type) || Boolean(tabRoute(type)?.versionless);
+}
+
+/** True for tab types that may exist without a repository version/tag. */
+export function canBeVersionlessTab(type) {
+  return isAlwaysVersionlessTab(type) || OPTIONAL_VERSIONLESS_TABS.has(type);
+}
+
+/** Build a shareable deep-link URL from URLSearchParams. */
+export function buildDeepLink(params) {
+  const origin = typeof location !== "undefined" && location.origin && location.origin !== "null"
+    ? `${location.origin}${location.pathname}`
+    : "";
+  return `${origin}#${params.toString()}`;
 }
 
 /** Every key registered routes keep on their tabs (for history snapshots). */

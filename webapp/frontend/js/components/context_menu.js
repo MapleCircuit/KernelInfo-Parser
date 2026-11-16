@@ -19,6 +19,7 @@ import { openDefinition } from "../utils/definition_picker.js";
 import { blameBeforeTarget } from "../views/code_view/blame_options.js";
 import { referenceMenuItems } from "./file_references.js";
 import { hasFeature } from "../utils/projects.js";
+import { canBeVersionlessTab, isAlwaysVersionlessTab } from "../tab_routes.js";
 
 class ContextMenu {
   constructor() {
@@ -957,7 +958,6 @@ class ContextMenu {
               title: `Commit ${full.slice(0, 7)}`,
               commitId: full,
               listCollapsed: true,
-              version: v,
               forceNew: true
             });
           }
@@ -982,32 +982,48 @@ class ContextMenu {
    * Right-click menu of a tab in the tabstrip (§5.24.5). The actions themselves are handed in by
    * `TabsComponent`, which owns tab transfers; this only lays out the menu and the session list.
    */
-  showTabMenu(x, y, { tab, onOpenInNewWindow, onPushToSession, onApplyCurrentTag, onGetTabTag }) {
+  showTabMenu(x, y, { tab, onOpenInNewWindow, onPushToSession, onApplyCurrentTag, onGetTabTag, onClearTag }) {
     const sessions = sessionManager
       .getSessionsIndex()
       .filter((s) => s.id !== sessionManager.activeSessionId);
 
     // Header selection vs. this tab's own revision (§5.24.5): either side can be copied to the other
     const selected = state.selectedVersion || "";
-    const tabRef = tab.version || state.currentVersion || "";
+    const alwaysVersionless = isAlwaysVersionlessTab(tab.type);
+    const canClear = canBeVersionlessTab(tab.type) && !alwaysVersionless && Boolean(tab.version);
+    const tabRef = alwaysVersionless
+      ? ""
+      : (canBeVersionlessTab(tab.type) ? (tab.version || "") : (tab.version || state.currentVersion || ""));
     const otherRepo = Boolean(state.currentRepo) && state.repoOf(tab) !== state.currentRepo;
     const same = !selected || !tabRef || selected === tabRef;
+    const applyDisabled = alwaysVersionless || otherRepo || !selected || (Boolean(tabRef) && selected === tabRef);
+    const applyShortcut = alwaysVersionless
+      ? "versionless"
+      : (otherRepo ? "other project" : (tabRef && selected === tabRef ? "already on it" : ""));
+    const getDisabled = alwaysVersionless || !tabRef || selected === tabRef;
+    const getShortcut = alwaysVersionless || !tabRef ? "no tag" : (same ? "already selected" : "");
 
     const items = [
       {
-        label: `Apply Current Tag${selected ? ` (${shortRef(selected)})` : ""}`,
+        label: `Apply Current Tag${selected && !alwaysVersionless ? ` (${shortRef(selected)})` : ""}`,
         icon: "⤓",
-        shortcut: otherRepo ? "other project" : (same ? "already on it" : ""),
-        disabled: otherRepo || same,
+        shortcut: applyShortcut,
+        disabled: applyDisabled,
         onClick: () => onApplyCurrentTag && onApplyCurrentTag()
       },
       {
         label: `Get Tab Tag${tabRef ? ` (${shortRef(tabRef)})` : ""}`,
         icon: "⤒",
-        shortcut: same ? "already selected" : "",
-        disabled: same,
+        shortcut: getShortcut,
+        disabled: getDisabled,
         onClick: () => onGetTabTag && onGetTabTag()
       },
+      ...(canClear ? [{
+        label: "Clear Tag (Make Tag-less)",
+        icon: "🏷️",
+        shortcut: shortRef(tabRef),
+        onClick: () => onClearTag && onClearTag()
+      }] : []),
       { separator: true },
       {
         label: "Open on New Browser Tab",
@@ -1356,8 +1372,7 @@ class ContextMenu {
         type: "commits",
         title: `Commit ${shortHash}`,
         commitId: commitHash,
-        listCollapsed: true,
-        version: v
+        listCollapsed: true
       });
       backdrop.remove();
     };
@@ -1370,7 +1385,6 @@ class ContextMenu {
           title: `Commit ${shortHash}`,
           commitId: commitHash,
           listCollapsed: true,
-          version: v,
           forceNew: true
         });
       }

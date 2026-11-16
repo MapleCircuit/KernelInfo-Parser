@@ -191,7 +191,6 @@ export async function showFileHistoryModal(version, filePath) {
         state.openTab({
           type: "commits",
           title: "Commits",
-          version: version,
           commitId: hash,
           listCollapsed: true,
           forceNew: true,

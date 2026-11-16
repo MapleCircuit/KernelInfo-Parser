@@ -17,7 +17,7 @@
  * pane would discard the view that reported it.
  */
 import { state } from "./state.js";
-import { hashRepo, routeKeys, tabRoute } from "./tab_routes.js";
+import { canBeVersionlessTab, hashRepo, isAlwaysVersionlessTab, routeKeys, tabRoute } from "./tab_routes.js";
 import { isTabFeatureEnabled } from "./utils/projects.js";
 
 /** Compare rename searches from `rn=<similarity>:<directory>` entries (applied in order; empty dir = whole tree). */
@@ -215,7 +215,8 @@ class UrlSynchronizer {
         }
         if (savedTab.title) liveTab.title = savedTab.title;
         if (savedTab.repo) liveTab.repo = savedTab.repo;
-        if (savedTab.version) liveTab.version = savedTab.version;
+        if (savedTab.version !== undefined) liveTab.version = savedTab.version;
+        else delete liveTab.version;
       }
     }
 
@@ -260,7 +261,10 @@ class UrlSynchronizer {
    */
   getNavKey(tab) {
     if (!tab) return "";
-    const v = `${state.repoOf(tab)}@${tab.version || state.currentVersion || ""}`;
+    const tabVer = isAlwaysVersionlessTab(tab.type)
+      ? ""
+      : (canBeVersionlessTab(tab.type) ? (tab.version || "") : (tab.version || state.currentVersion || ""));
+    const v = `${state.repoOf(tab)}@${tabVer}`;
     const route = tabRoute(tab.type);
     if (route?.navKey) return `${v}:${tab.type}:${route.navKey(tab)}`;
     switch (tab.type) {
@@ -395,7 +399,7 @@ class UrlSynchronizer {
       const open = (data) => state.openTab({ ...(repo ? { repo } : {}), ...data });
 
       // Restoring a revision from the hash selects it in the header; the tab opened below carries it
-      if (v) state.setSelectedVersion(v);
+      if (v && !isAlwaysVersionlessTab(tabType)) state.setSelectedVersion(v);
 
       const targetRepo = repo || state.activeRepo();
       if (tabType !== "explorer" && !isTabFeatureEnabled(targetRepo, tabType)) {
@@ -407,7 +411,8 @@ class UrlSynchronizer {
       const route = tabRoute(tabType);
       if (route?.fromHash) {
         const fields = route.fromHash(params, ver);
-        open({ type: tabType, ...fields, version: fields.version || ver });
+        const routeVer = isAlwaysVersionlessTab(tabType) ? "" : (fields.version || ver);
+        open({ type: tabType, ...fields, version: routeVer });
       } else if (tabType === "code" && file) {
         // "⇄ Diff" of the file (§5.21): dv/dp = the other file, ds=1 swapped sides, dm=split layout.
         // A link without dv addresses the plain file, so a reused tab drops its diff.
@@ -463,7 +468,7 @@ class UrlSynchronizer {
           filter: params.get("f") || "all",
           listMode: params.get("mode") === "tree" ? "tree" : "search",
           listCollapsed: params.get("lc") === "1",
-          version: ver
+          version: ""
         });
       } else if (tabType === "diff" && params.get("mode") === "api") {
         // API mode (A6): k = kinds, st = statuses, q = filter, arch
@@ -506,7 +511,7 @@ class UrlSynchronizer {
           listCollapsed: params.get("lc") === "1",
           queryHelp: params.get("help") === "1",
           query,
-          version: ver
+          version: v || ""
         });
       } else if (tabType === "maintainers") {
         // Every field is given (empty when absent), so a reused tab takes exactly what the link addresses
@@ -567,7 +572,10 @@ class UrlSynchronizer {
     // The project the tab belongs to, always: a shared link opens in it (§5.26)
     const repo = state.repoOf(activeTab);
     if (repo) params.set("repo", repo);
-    params.set("v", activeTab.version || state.currentVersion);
+    const tabVer = isAlwaysVersionlessTab(activeTab.type)
+      ? ""
+      : (canBeVersionlessTab(activeTab.type) ? (activeTab.version || "") : (activeTab.version || state.currentVersion));
+    if (tabVer) params.set("v", tabVer);
     params.set("tab", activeTab.type);
 
     if (activeTab.type === "code" && activeTab.path) {
