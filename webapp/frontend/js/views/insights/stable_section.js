@@ -11,17 +11,20 @@ import { hasFeature } from "../../utils/projects.js";
 const REASON = { "cc-stable": "Cc: stable", fixes: "Fixes a commit of the series" };
 
 registerInsightsSection({
-  id: "stable", label: "Stable", order: 50, releaseScoped: true, keywords: "stable backport missing cc",
+  id: "stable", label: "Stable", order: 50, keywords: "stable backport missing cc",
   visible: (repo) => hasFeature(repo, "stable"),
   hint: "Mainline fixes marked for a stable series that it does not carry",
   emptyText: "Every marked commit has a backport in this series.",
-  async releaseOptions(ctx) {
-    const res = await (ctx.api || api).getInsights(ctx.version, "stable/series", { cacheKey: null });
-    return (res?.series || []).map((s) => s.series);
-  },
   async fetchList(ctx) {
-    const res = await (ctx.api || api).getInsights(ctx.version, `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`, ctx);
-    if (!res?.available) return { rows: [], note: res?.reason || "no stable history" };
+    if (!ctx.release) return { rows: [], emptyText: "No release tag found for this revision." };
+    const res = await (ctx.api || api).getInsights(ctx.version || ctx.release, `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`, ctx);
+    if (!res?.available) {
+      return {
+        rows: [],
+        emptyText: "Stable backport tracking is not available for this release.",
+        note: res?.reason || "no stable history",
+      };
+    }
     return {
       rows: res.candidates, total: res.total,
       note: `${res.candidates_checked.toLocaleString("en-US")} marked commits checked against ${res.stable_tags} tags up to ${res.last_stable}`,

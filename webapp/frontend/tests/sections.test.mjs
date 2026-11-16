@@ -34,12 +34,15 @@ test("filtering and chips", () => {
 
 test("section deep links round trip", () => {
   const route = tabRoute("insights");
-  const tab = { view: "stable", release: "v3.0", query: "iommu", filter: "cc-stable", sel: "abc", listCollapsed: true };
+  const tab = { view: "stable", query: "iommu", filter: "cc-stable", sel: "abc", listCollapsed: true };
   const params = new URLSearchParams();
   route.toHash(tab, params);
-  assert.equal(params.toString(), "view=stable&r=v3.0&q=iommu&f=cc-stable&sel=abc&lc=1");
+  assert.equal(params.toString(), "view=stable&q=iommu&f=cc-stable&sel=abc&lc=1");
   const back = route.fromHash(params);
-  for (const k of ["view", "release", "query", "filter", "sel", "listCollapsed"]) assert.equal(back[k], tab[k]);
+  for (const k of ["view", "query", "filter", "sel", "listCollapsed"]) assert.equal(back[k], tab[k]);
+  // Legacy deep link with r= but without v= preserves version for backward compatibility
+  assert.equal(route.fromHash(new URLSearchParams("view=stable&r=v3.0")).version, "v3.0");
+  assert.equal(route.fromHash(new URLSearchParams("v=v6.6&view=stable&r=v3.0")).version, undefined);
   assert.deepEqual(sectionStateFromParams(new URLSearchParams("arch=arm")).arch, "arm");
   const p2 = new URLSearchParams();
   sectionParamsFromState({ view: "syscalls", arch: "x86_64" }, p2);

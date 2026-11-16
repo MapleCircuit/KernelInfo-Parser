@@ -582,6 +582,218 @@ def branches_containing(sha: str, limit: int = 20) -> list[str]:
     return names[:limit]
 
 
+def _pick_best_tag(candidates: list[str]) -> str | None:
+    if not candidates:
+        return None
+    return max(candidates, key=lambda t: (bool((parse_tag(t) or {}).get("final")), release_key(t)))
+
+
+def nearest_ancestor_tag(sha: str) -> str | None:
+    """Newest release tag reachable as an ancestor of `sha`, or None when none exists."""
+    full = sha if _FULL_SHA.match(sha or "") else resolve_sha(sha)
+    if not full:
+        return None
+    tags = tag_commits()
+    if not tags:
+        return None
+    exact = [t for t, t_sha in tags.items() if t_sha == full]
+    if exact:
+        return _pick_best_tag(exact)
+
+    # 1. Fast backward walk via `git describe` restricted to this repository's tag family pattern(s)
+    families = {family_of(t) for t in tags}
+    if KERNEL_FAMILY in families:
+        match_args = ["--match", "v[0-9]*"]
+    else:
+        match_args = []
+        for fam in sorted(f for f in families if f)[:8]:
+            match_args.extend(["--match", f"{fam}[0-9]*"])
+    if match_args:
+        desc = _git(["describe", "--tags", "--abbrev=0", *match_args, full], timeout=10)
+        cand = parse_describe(desc or "")
+        if cand and cand in tags:
+            return cand
+
+    # 2. Fallback: first-parent decorated history (skips non-release tags)
+    deco = _git(["log", "--first-parent", "--decorate=short", "--simplify-by-decoration", "--format=%D", "-n", "100", full], timeout=10) or ""
+    for line in deco.splitlines():
+        found = [part[5:].strip() for part in line.split(", ") if part.startswith("tag: ") and part[5:].strip() in tags]
+        if found:
+            return _pick_best_tag(found)
+
+    # 3. Fallback: binary search mainline final releases, then check later tags in that series/next cycle
+    finals = [t for t in releases("mainline") if parse_tag(t)["final"]]
+    lo, hi, best_idx = 0, len(finals) - 1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _is_ancestor(tags[finals[mid]], full):
+            best_idx = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best_idx >= 0:
+        base = finals[best_idx]
+        base_key = release_key(base)
+        next_final_key = release_key(finals[best_idx + 1]) if best_idx + 1 < len(finals) else None
+        cand_tags = [
+            t for t in tags
+            if release_key(t) >= base_key and (next_final_key is None or release_key(t) < next_final_key)
+        ]
+        matched = [t for t in sorted(cand_tags, key=release_key, reverse=True) if _is_ancestor(tags[t], full)]
+        if matched:
+            return matched[0]
+        return base
+
+    # Repo may only have pre-release tags before any final tag
+    for t in reversed(releases("all")):
+        if _is_ancestor(tags[t], full):
+            return t
+    return None
+
+
+def _series_tag_for(tag: str | None, tags: dict[str, str]) -> str | None:
+    if not tag:
+        return None
+    p = parse_tag(tag)
+    if not p:
+        return None
+    if p["kind"] == "next":
+        return tag
+    if p["family"] != KERNEL_FAMILY:
+        hits = [t for t in tags if (q := parse_tag(t)) is not None and q["final"] and q["series"] == p["series"]]
+        if hits:
+            return min(hits)
+    return series_name(p["series"])
+
+
+def _final_for(tag: str | None, tags: dict[str, str]) -> str | None:
+    if not tag:
+        return None
+    p = parse_tag(tag)
+    if not p:
+        return None
+    if p["final"]:
+        return tag
+    if p["kind"] == "stable":
+        s = _series_tag_for(tag, tags)
+        return s if s in tags else None
+    return final_of(tag, set(tags))
+
+
+def _safe_latest_info() -> dict[str, Any] | None:
+    try:
+        return latest_info()
+    except HTTPException:
+        return None
+
+
+def _is_in_latest_cycle(sha: str, info: dict[str, Any] | None, tags: dict[str, str]) -> bool:
+    if not info:
+        return False
+    latest_sha = info.get("sha")
+    if not latest_sha or not _is_ancestor(sha, latest_sha):
+        return False
+    prev_sha = info.get("prev_sha")
+    if prev_sha and (sha == prev_sha or not _is_ancestor(prev_sha, sha)):
+        return False
+    prev_name = info.get("prev")
+    prev_key = release_key(prev_name) if prev_name else None
+    for t, t_sha in tags.items():
+        if (prev_key is None or release_key(t) > prev_key) and _is_ancestor(sha, t_sha):
+            return False
+    return True
+
+
+def resolve_release_tag(rev: str) -> dict[str, Any]:
+    """Resolve a tag, 'latest', branch, or commit SHA to its release tag context for Insights."""
+    if rev == LATEST_RELEASE:
+        info = latest_info()
+        tags = tag_commits()
+        tag = nearest_ancestor_tag(info["sha"]) or info["prev"]
+        return {
+            "rev": rev,
+            "sha": info["sha"],
+            "tag": tag,
+            "exact": True,
+            "latest": True,
+            "source": "latest",
+            "final": None,
+            "series": _series_tag_for(info["prev"] or tag, tags),
+        }
+
+    tags = tag_commits()
+    if rev in tags:
+        sha = tags[rev]
+        final = _final_for(rev, tags)
+        is_latest = False
+        if final is None and (parse_tag(rev) or {}).get("pre"):
+            info = _safe_latest_info()
+            if info and _is_ancestor(sha, info["sha"]) and (not info["prev_sha"] or _is_ancestor(info["prev_sha"], sha)):
+                is_latest = True
+        return {
+            "rev": rev,
+            "sha": sha,
+            "tag": rev,
+            "exact": True,
+            "latest": is_latest,
+            "source": "tag",
+            "final": final,
+            "series": _series_tag_for(rev, tags),
+        }
+
+    sha = resolve_sha(rev)
+    if not sha:
+        raise HTTPException(status_code=404, detail=f"Unknown revision: {rev}")
+
+    exact_tags = [t for t, t_sha in tags.items() if t_sha == sha]
+    if exact_tags:
+        tag = _pick_best_tag(exact_tags)
+        final = _final_for(tag, tags)
+        is_latest = False
+        if final is None and tag and (parse_tag(tag) or {}).get("pre"):
+            info = _safe_latest_info()
+            if info and _is_ancestor(sha, info["sha"]) and (not info["prev_sha"] or _is_ancestor(info["prev_sha"], sha)):
+                is_latest = True
+        return {
+            "rev": rev,
+            "sha": sha,
+            "tag": tag,
+            "exact": False,
+            "latest": is_latest,
+            "source": "exact_sha",
+            "final": final,
+            "series": _series_tag_for(tag, tags),
+        }
+
+    cont = first_containing(sha, allow_slow=False)
+    if cont.get("released"):
+        tag = cont.get("first_release") or cont.get("first_tag") or cont.get("first_stable")
+        return {
+            "rev": rev,
+            "sha": sha,
+            "tag": tag,
+            "exact": False,
+            "latest": False,
+            "source": "release_index",
+            "final": _final_for(tag, tags),
+            "series": _series_tag_for(tag, tags),
+        }
+
+    tag = nearest_ancestor_tag(sha)
+    info = _safe_latest_info()
+    is_latest = _is_in_latest_cycle(sha, info, tags)
+    return {
+        "rev": rev,
+        "sha": sha,
+        "tag": tag,
+        "exact": False,
+        "latest": is_latest,
+        "source": "ancestor" if tag else "none",
+        "final": _final_for(tag, tags),
+        "series": _series_tag_for(tag, tags),
+    }
+
+
 # --------------------------------------------------------------------------- per-release commit pass
 
 _PASS_DISK = DiskCache("release-commits", max_bytes=512 << 20)

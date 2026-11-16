@@ -6,15 +6,15 @@
  * filter chips with counts, a windowed list (VirtualList) and a detail pane, with the collapsible list
  * rail of the other list views (`lc=1`) and a download menu. Each feature only provides a section:
  *
- *   { id, label, releaseScoped, archScoped,
- *     fetchList(ctx) -> {rows, total?, note?, truncated?, summaryHtml?},   // ctx: {version, release, arch, api, signal, onProgress}
+ *   { id, label, archScoped,
+ *     fetchList(ctx) -> {rows, total?, note?, emptyText?, truncated?, summaryHtml?},   // ctx: {version, arch, api, signal, onProgress}
  *     rowKey(row), rowHtml(row), rowText?(row), rowHeight?,
  *     chips?: [{id, label, test(row)}],
  *     detailHtml?(row, ctx) | fetchDetail?(ctx, key, row) + detailHtml(detail, ctx),
  *     onDetailClick?(event, ctx) -> bool, downloads?: [{label, ext, build(rows, ctx)}],
- *     releaseOptions?(ctx) -> [names], emptyText? }
+ *     emptyText? }
  *
- * The section, its release / ARCH, the search, the chips, the selection and the folded rail are the
+ * The section, its ARCH, the search, the chips, the selection and the folded rail are the
  * tab's state and its address (`#tab=api&view=…&q=…&f=…&sel=…`, §5.26). Lists answered 202 by a
  * background job show its progress (§2.15).
  */
@@ -40,6 +40,7 @@ export class SectionedView {
     this.list = null;
     this.rows = [];
     this.filtered = [];
+    this.renderSeq = 0;
     this.listSeq = 0;
     this.detailSeq = 0;
     this.abort = null;
@@ -66,7 +67,7 @@ export class SectionedView {
       toggleState[t.stateKey] = Boolean(this.tab?.[t.stateKey]);
     }
     return {
-      version: this.version, release: this.tab.release || "", arch: this.tab.arch || "",
+      version: this.version, arch: this.tab.arch || "",
       window: this.tab.window || this.section?.windowDefault || 0,
       ...toggleState,
       // The client of this tab's repository: every request a section makes names it (§5.18)
@@ -78,7 +79,7 @@ export class SectionedView {
     if (!this.containerEl?.isConnected) return;
     // updateTabState writes the tab and announces the change (the URL follows, §5.26); assigning first
     // would make it see nothing new
-    state.updateTabState(this.tabId, patch, { replace: !("view" in patch || "sel" in patch || "release" in patch || "arch" in patch) });
+    state.updateTabState(this.tabId, patch, { replace: !("view" in patch || "sel" in patch || "arch" in patch) });
     for (const [k, v] of Object.entries(patch)) {
       if (v === null || v === undefined || v === "" || v === false) delete this.tab[k];
       else this.tab[k] = v;
@@ -93,6 +94,11 @@ export class SectionedView {
   }
 
   async render(containerEl, tabData) {
+    const rseq = ++this.renderSeq;
+    this.abort?.abort();
+    this.rows = [];
+    this.filtered = [];
+    this.result = null;
     this.containerEl = containerEl;
     this.tabId = tabData.id;
     this.tab = tabData;
@@ -112,7 +118,7 @@ export class SectionedView {
           <div class="sv-head">
             <div class="sv-sections" role="tablist">${visible.map((s) => `<button type="button" role="tab" class="sv-pill${s.id === sec.id ? " active" : ""}" data-section="${escapeHtml(s.id)}" aria-selected="${s.id === sec.id}">${escapeHtml(s.label)}</button>`).join("")}</div>
             <div class="sv-controls">
-              <select class="sv-release" title="Release" hidden></select>
+              <span class="sv-tag info sv-detected" hidden></span>
               <select class="sv-arch" title="ARCH" hidden></select>
               <select class="sv-window" title="Window" hidden></select>
               <input type="search" class="sv-search" placeholder="Filter…" spellcheck="false" aria-label="Filter the list" />
@@ -170,6 +176,9 @@ export class SectionedView {
       onSelect: (row, i, { forceNew } = {}) => this.selectRow(row, forceNew),
     });
     await this.setupPickers();
+    if (rseq !== this.renderSeq || !this.containerEl?.isConnected) return;
+    await this.prepareRender?.();
+    if (rseq !== this.renderSeq || !this.containerEl?.isConnected) return;
     if (tabData.listCollapsed && tabData.sel && !sec.needsListForDetail) {
       // A folded list is not fetched: only the selection's detail is shown
       this.showDetail(null, tabData.sel);
@@ -180,9 +189,7 @@ export class SectionedView {
 
   async setupPickers() {
     const sec = this.section;
-    const relSel = this.containerEl.querySelector(".sv-release");
     const archSel = this.containerEl.querySelector(".sv-arch");
-    relSel.hidden = !sec.releaseScoped;
     const winSel = this.containerEl.querySelector(".sv-window");
     winSel.hidden = !sec.windowOptions;
     if (sec.windowOptions) {
@@ -217,27 +224,10 @@ export class SectionedView {
       };
     }
     archSel.hidden = !sec.archScoped;
-    if (sec.releaseScoped) {
-      let names = [];
-      try {
-        names = sec.releaseOptions ? await sec.releaseOptions(this.ctx()) : await this.defaultReleases();
-      } catch {
-        names = [];
-      }
-      if (!this.tab.release || !names.includes(this.tab.release)) {
-        const own = names.includes(this.version) ? this.version : names[0];
-        if (own) this.tab.release = own;
-      }
-      relSel.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}" ${n === this.tab.release ? "selected" : ""}>${escapeHtml(n)}</option>`).join("");
-      relSel.onchange = () => {
-        this.persist({ release: relSel.value, sel: "" });
-        this.loadList();
-      };
-    }
     if (sec.archScoped) {
       let targets = [];
       try {
-        targets = (await this.api.getKconfigPresets(this.version))?.targets || [];
+        targets = (await (this.api || api).getKconfigPresets(this.version))?.targets || [];
       } catch {
         targets = [];
       }
@@ -254,7 +244,7 @@ export class SectionedView {
 
   /** Final mainline releases of the repository, newest first. */
   async defaultReleases() {
-    const res = await this.api.getVersionsCached(true);
+    const res = await (this.api || api).getVersionsCached(true);
     const names = (res?.versions || []).map((v) => v.vname || v).filter((n) => typeof n === "string" && isFinalRelease(n));
     return [...new Set(names)].sort((a, b) => (releaseKey(b) > releaseKey(a) ? 1 : releaseKey(b) < releaseKey(a) ? -1 : 0));
   }
@@ -282,6 +272,9 @@ export class SectionedView {
     const seq = ++this.listSeq;
     this.abort?.abort();
     this.abort = new AbortController();
+    this.rows = [];
+    this.filtered = [];
+    this.result = null;
     const sec = this.section;
     this.setStatus("Loading…");
     let res;
@@ -323,7 +316,7 @@ export class SectionedView {
     const r = this.result || {};
     const total = r.total ?? this.rows.length;
     const shown = this.filtered.length === this.rows.length ? `${this.rows.length.toLocaleString("en-US")}` : `${this.filtered.length.toLocaleString("en-US")} of ${this.rows.length.toLocaleString("en-US")}`;
-    const empty = sec.emptyText || "Nothing to show.";
+    const empty = r.emptyText || sec.emptyText || "Nothing to show.";
     this.setStatus(this.rows.length || total
       ? `${shown}${total > this.rows.length ? ` (of ${total.toLocaleString("en-US")})` : ""}${r.truncated ? " · truncated" : ""}${r.note ? ` · ${r.note}` : ""}`
       : `${empty}${r.note ? ` · ${r.note}` : ""}`);
@@ -332,7 +325,7 @@ export class SectionedView {
   selectRow(row, forceNew = false) {
     const key = String(this.section.rowKey(row));
     if (forceNew) {
-      state.openTab({ type: this.type, title: this.tab.title, view: this.section.id, sel: key, release: this.tab.release, arch: this.tab.arch, version: this.version, forceNew: true });
+      state.openTab({ type: this.type, title: this.tab.title, view: this.section.id, sel: key, arch: this.tab.arch, version: this.version, forceNew: true });
       return;
     }
     this.persist({ sel: key });
@@ -390,7 +383,8 @@ export class SectionedView {
       label: `${d.label} (.${d.ext})`, icon: "⬇",
       onClick: () => {
         const text = d.build(this.filtered, this.ctx());
-        downloadText(`${this.type}-${sec.id}-${String(this.tab.release || this.version).replace(/[^A-Za-z0-9._-]/g, "_")}.${d.ext}`, text,
+        const rel = this.ctx().release || this.version;
+        downloadText(`${this.type}-${sec.id}-${String(rel).replace(/[^A-Za-z0-9._-]/g, "_")}.${d.ext}`, text,
           d.ext === "json" ? "application/json" : "text/plain");
         toast.success(`Downloaded ${this.filtered.length} rows`);
       },

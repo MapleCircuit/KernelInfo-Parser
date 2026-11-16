@@ -8,7 +8,6 @@ import { escapeHtml } from "../../components/modal.js";
 import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
 import { hasFeature } from "../../utils/projects.js";
-import { parseTag as parseTagVersion } from "../sections/release_order.js";
 import {
   BASIS,
   NOT_INGESTED_HTML,
@@ -20,25 +19,16 @@ import {
 } from "../cve/cve_render.js";
 
 registerInsightsSection({
-  id: "security", label: "Security", order: 60, releaseScoped: true, keywords: "cve vulnerability security",
+  id: "security", label: "Security", order: 60, keywords: "cve vulnerability security",
   visible: (repo) => hasFeature(repo, "cve"),
   hint: "Linux kernel CVEs affecting a release, or fixed in it",
   emptyText: "No CVE record affects this release or is fixed in it.",
-  async releaseOptions(ctx) {
-    // Mainline releases plus the stable updates: a stable tag carries backported fixes
-    const res = await (ctx.api || api).getVersionsCached(true);
-    return (res?.versions || [])
-      .map((v) => v.vname || v)
-      .filter((n) => /^v\d+\.\d+(\.\d+)*$/.test(n) || Boolean(parseTagVersion(n) && !parseTagVersion(n).pre))
-      .reverse();
-  },
   async fetchList(ctx) {
+    if (!ctx.release) return { rows: [], emptyText: "No release tag found for this revision." };
     const res = await (ctx.api || api).getInsights(ctx.release, "cves", ctx);
     if (res?.configured === false || res?.ingested === false) {
-      this._setup = true;
       return { rows: [], note: res?.configured === false ? "not configured" : "not ingested", summaryHtml: res?.configured === false ? SETUP_HTML : NOT_INGESTED_HTML };
     }
-    this._setup = false;
     const c = res.counts || {};
     const source = res.layout === "vulns" ? "vulns.git" : "CVE list";
     return {

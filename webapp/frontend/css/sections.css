@@ -13,9 +13,11 @@
 .sv-pill { padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-secondary); cursor: pointer; font-size: 12px; }
 .sv-pill.active { border-color: var(--accent-blue); color: var(--accent-blue); background: rgba(88, 166, 255, 0.12); }
 .sv-controls { display: flex; gap: 6px; align-items: center; }
-.sv-search, .sv-release, .sv-arch, .sv-window {
+.sv-search, .sv-arch, .sv-window {
   padding: 4px 8px; background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;
 }
+.sv-detected { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sv-detected[hidden] { display: none; }
 .sv-search { flex: 1; min-width: 80px; }
 .sv-toggles { display: flex; gap: 4px; align-items: center; flex: none; }
 .sv-toggles[hidden] { display: none; }

@@ -18,7 +18,7 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L263-L271]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L272-L314]
   - 2.6. Frontend & Service Architectural Invariants [L315-L367]
-- 2B. Backend Domain & Infrastructure Services [L368-L978]
+- 2B. Backend Domain & Infrastructure Services [L368-L984]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L370-L449]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L450-L482]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L483-L512]
@@ -29,19 +29,19 @@ ES-Module IDE frontend.
   - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L709-L736]
   - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L737-L765]
   - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L766-L816]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L817-L862]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L863-L880]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L881-L930]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L931-L978]
-- 3. Database Schema & Underlying Tables [L979-L993]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L994-L999]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1000-L1005]
-- 6. Using the Services from Python [L1006-L1023]
-- 7. Configuration & Execution [L1024-L1109]
-  - 7.1. Configuration Precedence & Resolution [L1026-L1074]
-  - 7.2. Starting the Server [L1075-L1109]
-- 8. Error Handling, Status Codes & Resilience [L1110-L1141]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1123-L1141]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L817-L868]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L869-L886]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L887-L936]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L937-L984]
+- 3. Database Schema & Underlying Tables [L985-L999]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1000-L1005]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1006-L1011]
+- 6. Using the Services from Python [L1012-L1029]
+- 7. Configuration & Execution [L1030-L1115]
+  - 7.1. Configuration Precedence & Resolution [L1032-L1080]
+  - 7.2. Starting the Server [L1081-L1115]
+- 8. Error Handling, Status Codes & Resilience [L1116-L1147]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1129-L1147]
 <!-- toc:end -->
 
 ---
@@ -854,6 +854,12 @@ Shared answers about releases, from Git:
   milliseconds. The answer is `{first_tag, first_release (the release a candidate leads to, once tagged),
   first_stable, released}`; a commit on no release chain answers `released: false` with up to 20 branches
   containing it. Answers with a tag are cached permanently.
+- **Revision-to-tag resolution** (`resolve_release_tag(rev)`, `nearest_ancestor_tag(sha)`): resolves a tag,
+  `latest`, branch, or commit SHA to `{rev, sha, tag, exact, latest, source, final, series}` for Insights
+  without blocking on unbuilt indexes — checking exact tag-commit matches first, then `first_containing()`
+  (`allow_slow=False`), and falling back to `nearest_ancestor_tag()` (`git describe --tags --abbrev=0` scoped
+  to the repository's tag family, decorated first-parent history, or binary search over final releases) plus
+  unreleased default-branch cycle detection (`latest`).
 - **Per-release passes**: `release_commits(tag)` (`git log --no-merges <prev>..<tag>`: author, committer,
   date, subject, contributor trailers via `git_commit_parser.iter_trailers` / `CommitRole` — the parser's own
   reading, so name-less and bare-address trailers count as in `m_bridge_commit_person`; `PASS_FORMAT` 3 —

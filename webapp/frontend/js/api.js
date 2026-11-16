@@ -42,6 +42,7 @@ class ApiClient {
     this._scoped = new Map();
     this._versionsInFlight = new Map();
     this._versionsMemo = new Map();
+    this._insightsResolveMemo = new Map();
     // Called with (X-KIP-Sync header, repository of the request) of every API response (js/sync.js)
     this.onSyncHeader = null;
     // Called with the parsed JSON body of GET /api/sync (js/sync.js)
@@ -431,6 +432,22 @@ class ApiClient {
   async getCveDetail(cveId, release = "", reqOpts = {}) {
     const q = release ? `?release=${encodeURIComponent(release)}` : "";
     return this.request(`/api/cve/${encodeURIComponent(cveId)}${q}`, reqOpts);
+  }
+
+  /**
+   * Resolve a revision (tag, 'latest', branch, or commit SHA) to its release tag context for Insights.
+   * Permanent answers (exact tags, exact tag commits, or indexed release membership) are memoized in memory.
+   */
+  async resolveInsightsTag(rev, { signal = null } = {}) {
+    const ver = this._sanitizeVer(rev);
+    const memoKey = `${this.repo || ""}|${ver}`;
+    const hit = this._insightsResolveMemo?.get(memoKey);
+    if (hit) return hit;
+    const { data } = await this._fetchJson(`/api/insights/resolve?rev=${encodeURIComponent(ver)}`, { signal });
+    if (data && data.final && (data.exact || data.source === "exact_sha" || data.source === "release_index")) {
+      this._insightsResolveMemo?.set(memoKey, data);
+    }
+    return data;
   }
 
   /**

@@ -17,9 +17,14 @@ const date = (t) => (t ? new Date(t * 1000).toISOString().slice(0, 10) : "");
 const ROLE_LABEL = { authors: "Authors", reviewers: "Reviewed-by", testers: "Tested-by", reporters: "Reported-by", ackers: "Acked-by", signers: "Signed-off-by", first: "First-timers" };
 
 // ------------------------------------------------------------------ H6 release stats
-async function withLatestReleases(ctx) {
-  const names = (await ctx.view?.defaultReleases?.()) || [];
-  return ["latest", ...names.filter((x) => x !== "latest")];
+const _sectionState = new WeakMap();
+function sectionSlot(sec, ctx) {
+  const key = ctx?.view && typeof ctx.view === "object" ? ctx.view : sec;
+  let bySec = _sectionState.get(key);
+  if (!bySec) _sectionState.set(key, (bySec = new Map()));
+  let slot = bySec.get(sec.id);
+  if (!slot) bySec.set(sec.id, (slot = {}));
+  return slot;
 }
 
 function targetRev(ctx, reportRev) {
@@ -27,14 +32,15 @@ function targetRev(ctx, reportRev) {
 }
 
 registerInsightsSection({
-  id: "release-stats", label: "Release stats", order: 10, releaseScoped: true, keywords: "statistics contributors employers authors",
+  id: "release-stats", label: "Release stats", order: 10, keywords: "statistics contributors employers authors",
   visible: (repo) => hasFeature(repo, "commits"),
   hint: "Commits, contributors, first-timers, reviewers and employers of a release",
-  releaseOptions: withLatestReleases,
   emptyText: "No commits in this release cycle yet.",
   async fetchList(ctx) {
+    if (!ctx.release) return { rows: [], emptyText: "No release tag found for this revision." };
     const r = await (ctx.api || api).getInsights(ctx.release, "release-stats", { ...ctx, cacheKey: `rstats2_${ctx.release}`, networkFirst: ctx.release === "latest" });
-    this._targetRev = r.branch || r.head || ctx.release;
+    const slot = sectionSlot(this, ctx);
+    slot.targetRev = r.branch || r.head || ctx.release;
     const rows = [];
     for (const [role, list] of Object.entries(r.top || {})) {
       list.forEach((p, i) => rows.push({ role, rank: i + 1, ...p, key: `${role}:${p.email || p.person}` }));
@@ -44,8 +50,12 @@ registerInsightsSection({
     let trend = "";
     try {
       const all = (await ctx.view?.defaultReleases?.()) || [];
-      const idx = all.indexOf(ctx.release);
-      const start = idx >= 0 ? idx : 0;
+      let start = 0;
+      if (ctx.release !== "latest") {
+        const idx = all.indexOf(ctx.release);
+        start = idx >= 0 ? idx : all.findIndex((t) => compareReleases(t, ctx.release) <= 0);
+        if (start < 0) start = all.length;
+      }
       const window = all.slice(start, start + 12).reverse();
       if (window.length) {
         const series = await (ctx.api || api).request(`/api/insights/release-stats/series?${window.map((t) => `tag=${encodeURIComponent(t)}`).join("&")}`);
@@ -60,7 +70,6 @@ registerInsightsSection({
       [r.days == null ? "—" : `${r.days} d`, "since " + (r.prev || "?")], [`+${n(r.lines_added)} −${n(r.lines_removed)}`, "lines", `${n(r.files_changed)} files`],
       [n(r.rc_count), "release candidates"],
     ]) + `<div class="sv-sub">Employers (by commits)</div>${hbarsHtml((r.employers || []).slice(0, 12).map((e) => ({ label: e.org, value: e.commits, title: `${e.authors} authors` })))}${trend}`;
-    this._last = r;
     const endLabel = r.branch ? `${r.branch} (unreleased)` : r.release;
     const source = r.release === "latest"
       ? "unreleased cycle · computed from Git"
@@ -76,7 +85,7 @@ registerInsightsSection({
     <p><a href="#" data-profile="${escapeHtml(r.email || r.person)}">Developer profile</a> ·
        <a href="#" data-query="${escapeHtml(`${r.role === "authors" || r.role === "first" ? `author:${r.email}` : `${{ reviewers: "reviewer", testers: "tested", reporters: "reported", ackers: "acked", signers: "signed" }[r.role]}:${r.email}`} in:${ctx.release}`)}">Their commits in ${escapeHtml(ctx.release)}</a></p>`,
   onDetailClick(e, ctx) {
-    const rev = targetRev(ctx, this._targetRev);
+    const rev = targetRev(ctx, sectionSlot(this, ctx).targetRev);
     const prof = e.target.closest("[data-profile]");
     if (prof) {
       e.preventDefault();
@@ -148,7 +157,7 @@ function renderMergeChart(chart, selectedPull) {
 }
 
 registerInsightsSection({
-  id: "merge-window", label: "Merge window", order: 20, releaseScoped: true, keywords: "pulls merge window rc1 maintainers",
+  id: "merge-window", label: "Merge window", order: 20, keywords: "pulls merge window rc1 maintainers",
   visible: (repo) => {
     if (!hasFeature(repo, "commits")) return false;
     const ins = repoInsights(repo);
@@ -158,21 +167,31 @@ registerInsightsSection({
     return (hasFeature(repo, "kconfig") || hasFeature(repo, "maintainers") || hasFeature(repo, "mail") || explicit) && ins?.merge_window !== false;
   },
   hint: "The pulls merged for a release, day by day",
-  releaseOptions: withLatestReleases,
   emptyText: "No merge pulls in this cycle yet.",
   async fetchList(ctx) {
+    if (!ctx.release) {
+      const tag = ctx.resolved?.tag;
+      return {
+        rows: [],
+        emptyText: tag
+          ? "A merge window belongs to a final release (vX.Y), not an -rc or stable tag."
+          : "No release tag found for this revision.",
+        note: tag ? `${tag} has no final release tag` : "",
+      };
+    }
     const r = await (ctx.api || api).getInsights(ctx.release, "merge-window", { ...ctx, cacheKey: `mwin_${ctx.release}`, networkFirst: ctx.release === "latest" });
-    this._targetRev = r.branch || r.head || ctx.release;
+    const slot = sectionSlot(this, ctx);
+    slot.targetRev = r.branch || r.head || ctx.release;
     const pts = (r.totals?.by_day || []).map((d) => ({ x: d.day, value: d.commits, label: `day ${d.day}` }));
     const dayVals = [...pts.map((d) => d.x), ...(r.pulls || []).filter((p) => p.day != null).map((p) => Math.trunc(p.day))];
-    this._chart = pts.length ? {
+    slot.chart = pts.length ? {
       pts,
       x0: Math.min(0, ...dayVals),
       x1: Math.max(0, ...dayVals),
       rc1Marker: r.rc1_day != null ? { x: r.rc1_day, label: r.rc1 } : null,
     } : null;
     const summaryHtml = kpiHtml([[n(r.totals?.pulls), "pulls"], [n(r.totals?.commits), "commits pulled"], [n(r.totals?.before_rc1), "before rc1"], [r.rc1_day == null ? "—" : `day ${r.rc1_day}`, r.rc1 || "rc1"]])
-      + `<div class="sv-chart-wrap">${renderMergeChart(this._chart, null)}</div>`;
+      + `<div class="sv-chart-wrap">${renderMergeChart(slot.chart, null)}</div>`;
     const endLabel = r.branch ? `${r.branch} (unreleased)` : r.release;
     const source = r.release === "latest" ? "unreleased cycle · computed from Git" : (r.source === "database" ? "from the parser's release statistics" : "computed from Git");
     return { rows: r.pulls || [], summaryHtml, note: `${r.prev || "?"}..${endLabel} · ${source}` };
@@ -209,11 +228,12 @@ registerInsightsSection({
     ${p.body ? `<h3>Tag message</h3><pre>${escapeHtml(p.body)}</pre>` : ""}`,
   afterDetail(_el, pull, ctx) {
     const wrap = ctx.view?.containerEl?.querySelector(".sv-chart-wrap");
-    if (wrap && this._chart) wrap.innerHTML = renderMergeChart(this._chart, pull);
+    const chart = sectionSlot(this, ctx).chart;
+    if (wrap && chart) wrap.innerHTML = renderMergeChart(chart, pull);
   },
   onDetailClick(e, ctx) {
     const nt = ctx.forceNew || e.ctrlKey || e.metaKey;
-    const rev = targetRev(ctx, this._targetRev);
+    const rev = targetRev(ctx, sectionSlot(this, ctx).targetRev);
     const q = e.target.closest("[data-query]");
     if (q) {
       e.preventDefault();
@@ -244,21 +264,22 @@ registerInsightsSection({
 const FLAG = { orphan_active: "orphan but active", silent_maintainers: "silent maintainers", single_author: "single author", no_review: "no review", no_activity: "no activity" };
 
 registerInsightsSection({
-  id: "subsystems", label: "Subsystem health", order: 30, releaseScoped: true, keywords: "maintainers health review bus factor orphan",
+  id: "subsystems", label: "Subsystem health", order: 30, keywords: "maintainers health review bus factor orphan",
   visible: (repo) => hasFeature(repo, "maintainers"),
   hint: "Review coverage, bus factor and maintainer activity of every MAINTAINERS section",
-  releaseOptions: withLatestReleases,
   emptyText: "No MAINTAINERS sections found.",
   windowOptions: [1, 2, 3, 4, 6, 8, 12], windowDefault: 4, windowLabel: (w) => `${w} release${w > 1 ? "s" : ""}`,
   async fetchList(ctx) {
+    if (!ctx.release) return { rows: [], emptyText: "No release tag found for this revision." };
     const r = await (ctx.api || api).getInsights(ctx.release, `subsystems?window=${ctx.window || 4}`, { ...ctx, cacheKey: `health_${ctx.release}_${ctx.window || 4}`, networkFirst: ctx.release === "latest" });
-    this._targetRev = r.branch || r.head || ctx.release;
-    this._window = r.window;
+    const slot = sectionSlot(this, ctx);
+    slot.targetRev = r.branch || r.head || ctx.release;
+    slot.window = r.window;
     const flagged = {};
     for (const s of r.sections) for (const f of s.flags) flagged[f] = (flagged[f] || 0) + 1;
-    const endLabel = r.branch ? `${r.branch} (unreleased)` : r.window[r.window.length - 1];
+    const endLabel = r.branch ? `${r.branch} (unreleased)` : r.window?.[r.window.length - 1];
     return {
-      rows: r.sections, note: `${r.window[0]}..${endLabel}`,
+      rows: r.sections, note: r.window?.length ? `${r.window[0]}..${endLabel}` : "",
       summaryHtml: kpiHtml([[n(r.sections.length), "sections"], ...Object.entries(FLAG).map(([k, l]) => [n(flagged[k] || 0), l])])
     };
   },
@@ -267,7 +288,7 @@ registerInsightsSection({
   rowHtml: (s) => `<span class="sv-row-main">${escapeHtml(s.name)}</span>${s.flags.slice(0, 2).map((f) => `<span class="sv-tag ${f === "no_activity" ? "info" : "warn"}">${escapeHtml(FLAG[f])}</span>`).join("")}<span class="sv-row-sub">${n(s.commits)} · ${(s.review_coverage * 100).toFixed(0)}%</span>`,
   chips: Object.entries(FLAG).map(([id, label]) => ({ id, label, test: (s) => s.flags.includes(id) })),
   detailHtml(s, ctx) {
-    const win = this._window || [];
+    const win = sectionSlot(this, ctx).window || [];
     const openMaint = s.sec_id != null ? `<a href="#" data-section="${escapeHtml(s.sec_id)}">Open in Maintainers</a> · ` : "";
     const secFilter = s.sec_id != null ? `section:${s.sec_id}` : `section:${JSON.stringify(String(s.name || ""))}`;
     return `<h2>${escapeHtml(s.name)}</h2>
@@ -285,7 +306,7 @@ registerInsightsSection({
   },
   onDetailClick(e, ctx) {
     const nt = ctx.forceNew || e.ctrlKey || e.metaKey;
-    const rev = targetRev(ctx, this._targetRev);
+    const rev = targetRev(ctx, sectionSlot(this, ctx).targetRev);
     const sec = e.target.closest("[data-section]");
     if (sec) {
       e.preventDefault();

@@ -26,6 +26,16 @@ def job_answer(state: dict[str, Any], shape=None) -> Any:
     return JSONResponse(body, status_code=202, headers=NO_STORE)
 
 
+@router.get("/resolve")
+def resolve_insights_tag(
+    rev: Annotated[str, Query(description="Release tag, 'latest', branch, or commit SHA")],
+) -> JSONResponse:
+    """Resolve a revision (tag, branch, or commit SHA) to the current release tag for Insights."""
+    from webapp.backend.services.release_service import resolve_release_tag
+    safe_rev(rev, "rev")
+    return JSONResponse(resolve_release_tag(rev), headers=NO_STORE)
+
+
 @router.get("/{version_name}/stable/series", dependencies=[Depends(require_feature("stable"))])
 def get_stable_series(version_name: str) -> dict[str, Any]:
     """Releases that have stable tags (H2): [{series, stable_tags, last}], newest first."""

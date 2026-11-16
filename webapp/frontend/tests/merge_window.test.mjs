@@ -15,8 +15,10 @@ globalThis.setTimeout = (...args) => {
   return t;
 };
 
-const { insightsSections } = await import("../js/views/insights/insights_view.js");
+const { InsightsView, insightsSections, resolveSectionRelease } = await import("../js/views/insights/insights_view.js");
 const { isGenericRef, mergeRowTag, repoNameFromUrl } = await import("../js/views/insights/release_sections.js");
+await import("../js/views/insights/stable_section.js");
+await import("../js/views/insights/security_section.js");
 const { setProjects } = await import("../js/utils/projects.js");
 
 const mwSection = () => insightsSections().find((s) => s.id === "merge-window");
@@ -122,24 +124,56 @@ test("merge-window afterDetail highlights selected pull in sv-chart", async () =
   assert.ok(!detailHtml.includes("data-section"));
 });
 
-test("insights release-scoped sections expose latest, bypass cache on latest, and route links to resolved branch", async () => {
+test("insights sections resolve header tags, commits, and latest without sv-release", async () => {
   const { state } = await import("../js/state.js");
   const realOpenTab = state.openTab;
   const opened = [];
   state.openTab = (tab) => opened.push(tab);
   try {
-    for (const id of ["release-stats", "merge-window", "subsystems"]) {
+    for (const id of ["release-stats", "merge-window", "subsystems", "stable", "security"]) {
       const sec = insightsSections().find((s) => s.id === id);
-      const opts = await sec.releaseOptions({ view: { defaultReleases: async () => ["v7.3", "v7.2"] } });
-      assert.deepEqual(opts, ["latest", "v7.3", "v7.2"], id);
+      assert.equal(Boolean(sec.releaseScoped), false, `${id} should not set releaseScoped`);
+      assert.equal(sec.releaseOptions, undefined, `${id} should not define releaseOptions`);
     }
+
+    // resolveSectionRelease across tags, commits, -rc, stable updates, and latest
+    const exactFinal = { rev: "v7.3", tag: "v7.3", exact: true, latest: false, final: "v7.3", series: "v7.3" };
+    assert.equal(resolveSectionRelease("release-stats", exactFinal), "v7.3");
+    assert.equal(resolveSectionRelease("merge-window", exactFinal), "v7.3");
+    assert.equal(resolveSectionRelease("stable", exactFinal), "v7.3");
+    assert.equal(resolveSectionRelease("security", exactFinal), "v7.3");
+
+    const stableTag = { rev: "v3.0.5", tag: "v3.0.5", exact: true, latest: false, final: "v3.0", series: "v3.0" };
+    assert.equal(resolveSectionRelease("release-stats", stableTag), "v3.0.5");
+    assert.equal(resolveSectionRelease("merge-window", stableTag), "v3.0");
+    assert.equal(resolveSectionRelease("stable", stableTag), "v3.0");
+    assert.equal(resolveSectionRelease("security", stableTag), "v3.0.5");
+
+    const unreleasedRc = { rev: "v7.4-rc2", tag: "v7.4-rc2", exact: true, latest: true, final: null, series: "v7.4" };
+    assert.equal(resolveSectionRelease("release-stats", unreleasedRc), "v7.4-rc2");
+    assert.equal(resolveSectionRelease("merge-window", unreleasedRc), "latest");
+    assert.equal(resolveSectionRelease("subsystems", unreleasedRc), "v7.4-rc2");
+    assert.equal(resolveSectionRelease("security", unreleasedRc), "v7.4-rc2");
+
+    const commitInRelease = { rev: "a".repeat(40), tag: "v3.0", exact: false, latest: false, final: "v3.0", series: "v3.0" };
+    for (const id of ["release-stats", "merge-window", "subsystems", "stable", "security"]) {
+      assert.equal(resolveSectionRelease(id, commitInRelease), "v3.0", id);
+    }
+
+    const unreleasedCommit = { rev: "b".repeat(40), tag: "v7.3", exact: false, latest: true, final: "v7.3", series: "v7.3" };
+    assert.equal(resolveSectionRelease("release-stats", unreleasedCommit), "latest");
+    assert.equal(resolveSectionRelease("merge-window", unreleasedCommit), "latest");
+    assert.equal(resolveSectionRelease("subsystems", unreleasedCommit), "latest");
+    assert.equal(resolveSectionRelease("stable", unreleasedCommit), "v7.3");
+    assert.equal(resolveSectionRelease("security", unreleasedCommit), "v7.3");
 
     const statsSec = insightsSections().find((s) => s.id === "release-stats");
     let capturedOpts = null;
     const seriesUrls = [];
+    const latestView = { version: "master", defaultReleases: async () => ["v7.3", "v7.2"] };
     const statsRes = await statsSec.fetchList({
       release: "latest",
-      view: { defaultReleases: async () => ["v7.3", "v7.2"] },
+      view: latestView,
       api: {
         async getInsights(_ver, _path, opts) {
           capturedOpts = opts;
@@ -161,10 +195,27 @@ test("insights release-scoped sections expose latest, bypass cache on latest, an
     assert.ok(statsRes.note.includes("v7.3..master (unreleased)"));
     assert.ok(seriesUrls[0].includes("tag=v7.2") && seriesUrls[0].includes("tag=v7.3"));
 
+    // Trend sparkline for a non-final tag (v3.0.5) in another view does not overwrite latestView's targetRev
+    const oldSeriesUrls = [];
+    await statsSec.fetchList({
+      release: "v3.0.5",
+      view: { version: "v3.0.5", defaultReleases: async () => ["v7.3", "v7.2", "v3.1", "v3.0", "v2.6.39"] },
+      api: {
+        async getInsights() {
+          return { release: "v3.0.5", prev: "v3.0.4", source: "git", commits: 3, merges: 0, authors: 1, first_time_authors: null, files_changed: 1, lines_added: 1, lines_removed: 0, days: 2, rc_count: 0, top: { authors: [] }, first_timers: [], employers: [] };
+        },
+        async request(url) {
+          oldSeriesUrls.push(url);
+          return { series: [{ release: "v2.6.39", commits: 50 }, { release: "v3.0", commits: 80 }] };
+        },
+      },
+    });
+    assert.ok(oldSeriesUrls[0].includes("tag=v3.0") && !oldSeriesUrls[0].includes("tag=v7.3"));
+
     statsSec.onDetailClick({
       preventDefault() {},
       target: { closest: (sel) => (sel === "[data-query]" ? { dataset: { query: "author:a@example.com in:latest" } } : null) },
-    }, { release: "latest", view: { version: "v7.3" } });
+    }, { release: "latest", view: latestView });
     assert.equal(opened.at(-1).version, "master");
     assert.equal(opened.at(-1).query, "author:a@example.com in:latest");
 
@@ -180,6 +231,18 @@ test("insights release-scoped sections expose latest, bypass cache on latest, an
     });
     assert.equal(mwRes.note, "v7.3..master (unreleased) · unreleased cycle · computed from Git");
 
+    const mwUnavailable = await mwSec.fetchList({ release: "", resolved: { tag: "v3.1-rc1" } });
+    assert.deepEqual(mwUnavailable.rows, []);
+    assert.ok(mwUnavailable.emptyText.includes("final release"));
+
+    const stableSec = insightsSections().find((s) => s.id === "stable");
+    const stableUnavail = await stableSec.fetchList({
+      version: "v3.1",
+      release: "v3.1",
+      api: { async getInsights() { return { available: false, reason: "The repository has no stable tags of v3.1.y", candidates: [] }; } },
+    });
+    assert.ok(stableUnavail.emptyText.includes("not available"));
+
     const subSec = insightsSections().find((s) => s.id === "subsystems");
     assert.equal(subSec.rowKey({ sec_id: null, name: "ALPHA" }), "ALPHA");
     assert.equal(subSec.rowKey({ sec_id: 7, name: "ALPHA" }), "7");
@@ -189,6 +252,63 @@ test("insights release-scoped sections expose latest, bypass cache on latest, an
     }, { release: "latest" });
     assert.ok(!subDetail.includes("data-section"));
     assert.ok(subDetail.includes('section:&quot;ALPHA DRIVERS&quot; in:latest'));
+
+    // InsightsView renders without .sv-release and autodetects tag when version is a commit
+    const mk = (tag = "div") => {
+      const el = document.createElement(tag);
+      el.clientHeight = 400;
+      el.setAttribute ??= () => {};
+      el.removeAttribute ??= () => {};
+      return el;
+    };
+    const listEl = mk("div");
+    const vlEls = { ".vl-viewport": mk("div"), ".vl-spacer": mk("div"), ".vl-rows": mk("div") };
+    listEl.querySelector = (sel) => vlEls[sel] || null;
+    const els = {
+      ".sv-container": mk("div"), ".sv-sections": mk("div"), ".sv-detected": mk("span"),
+      ".sv-arch": mk("select"), ".sv-window": mk("select"), ".sv-search": mk("input"),
+      ".sv-toggles": mk("span"), ".sv-chips": mk("div"), ".sv-download": mk("button"),
+      ".sv-collapse": mk("button"), ".sv-rail": mk("button"), ".sv-detail": mk("div"),
+      ".sv-list": listEl, ".sv-status": mk("div"), ".sv-summary": mk("div"),
+    };
+    const containerEl = {
+      isConnected: true,
+      _html: "",
+      set innerHTML(v) { this._html = v; },
+      get innerHTML() { return this._html; },
+      querySelector: (sel) => els[sel] || null,
+      querySelectorAll: () => [],
+    };
+    const calls = { resolved: [], insights: [] };
+    const view = new InsightsView();
+    view.api = {
+      async resolveInsightsTag(rev) {
+        calls.resolved.push(rev);
+        if (rev === "abcdef123456") {
+          return { rev, sha: "a".repeat(40), tag: "v3.0", exact: false, latest: false, source: "release_index", final: "v3.0", series: "v3.0" };
+        }
+        return { rev, sha: "b".repeat(40), tag: rev, exact: true, latest: false, source: "tag", final: rev, series: rev };
+      },
+      async getInsights(ver, path) {
+        calls.insights.push({ ver, path });
+        return { release: ver, prev: "v2.6.39", source: "database", commits: 10, merges: 2, authors: 3, first_time_authors: 1, files_changed: 5, lines_added: 20, lines_removed: 4, days: 60, rc_count: 7, top: { authors: [] }, first_timers: [], employers: [] };
+      },
+      async getVersionsCached() { return { versions: ["v3.0", "v2.6.39"] }; },
+      async request() { return { series: [] }; },
+    };
+    const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
+    await view.render(containerEl, { id: "tab-ins-1", type: "insights", view: "release-stats", version: "abcdef123456" });
+    await flush();
+    assert.ok(!containerEl.innerHTML.includes("sv-release"));
+    assert.deepEqual(calls.resolved, ["abcdef123456"]);
+    assert.equal(calls.insights[0].ver, "v3.0");
+    assert.equal(els[".sv-detected"].hidden, false);
+    assert.equal(els[".sv-detected"].textContent, "tag: v3.0");
+
+    await view.render(containerEl, { id: "tab-ins-1", type: "insights", view: "release-stats", version: "v3.0" });
+    await flush();
+    assert.equal(els[".sv-detected"].hidden, true);
+    view.dispose();
   } finally {
     state.openTab = realOpenTab;
   }

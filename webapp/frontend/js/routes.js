@@ -73,18 +73,19 @@ registerTabRoute("status", {
 });
 
 // ---------------------------------------------------------------- Kernel API and Insights tabs (§5.29, §5.30)
-const SECTION_KEYS = ["view", "query", "filter", "sel", "arch", "release", "window", "listCollapsed"];
+const SECTION_KEYS = ["view", "query", "filter", "sel", "arch", "window", "listCollapsed"];
 for (const [type, title, badge] of [["api", "Kernel API", "[A]"], ["insights", "Insights", "[N]"]]) {
   registerTabRoute(type, {
     badge,
     keys: SECTION_KEYS,
     fromHash: (params) => {
       const st = sectionStateFromParams(params);
-      return { title: `${title}${st.view ? ` · ${st.view}` : ""}`, ...st };
+      const legacyRel = type === "insights" && !params.get("v") ? params.get("r") || "" : "";
+      return { title: `${title}${st.view ? ` · ${st.view}` : ""}`, ...st, ...(legacyRel ? { version: legacyRel } : {}) };
     },
     toHash: (tab, params) => sectionParamsFromState(tab, params),
-    // The section, the selection, the release and the ARCH are navigation; the filter and chips replace the entry
-    navKey: (tab) => `${tab.view || ""}:${tab.sel || ""}:${tab.release || ""}:${tab.arch || ""}:${tab.window || ""}`,
+    // The section, the selection and the ARCH are navigation; the filter and chips replace the entry
+    navKey: (tab) => `${tab.view || ""}:${tab.sel || ""}:${tab.arch || ""}:${tab.window || ""}`,
   });
 }
 

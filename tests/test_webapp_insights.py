@@ -896,3 +896,127 @@ F:\t*/
             self.assertEqual(info2["prev"], "v7.3")
             self.assertEqual(info2["rc1"], "v7.4-rc1")
             self.assertEqual(info2["rc_count"], 1)
+
+    def test_resolve_release_tag_autodetects_commits_and_branches(self) -> None:
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from fastapi.testclient import TestClient
+        from webapp.backend.app import create_app
+
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git is not installed")
+        tmp = Path(tempfile.mkdtemp(prefix="ki_resolve_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        def g(*args: str) -> str:
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "GIT_AUTHOR_NAME": "Linus", "GIT_AUTHOR_EMAIL": "linus@example.com",
+                "GIT_COMMITTER_NAME": "Linus", "GIT_COMMITTER_EMAIL": "linus@example.com",
+                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+            }
+            return subprocess.run(["git", "-C", str(tmp), *args], check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+        g("init", "-q", "-b", "master")
+        (tmp / "f").write_text("1\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "init")
+        c_v1 = g("rev-parse", "HEAD")
+        g("tag", "v1.0")
+
+        (tmp / "f").write_text("2\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "for v1.1-rc1")
+        c_mid = g("rev-parse", "HEAD")
+        (tmp / "f").write_text("3\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "v1.1-rc1")
+        g("tag", "v1.1-rc1")
+        (tmp / "f").write_text("4\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "v1.1")
+        g("tag", "v1.1")
+
+        # Stable branch off v1.0
+        g("checkout", "-q", "-b", "linux-1.0.y", "v1.0")
+        (tmp / "f").write_text("1.1\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "stable backport")
+        c_stable_mid = g("rev-parse", "HEAD")
+        g("tag", "v1.0.1")
+        (tmp / "f").write_text("1.2\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "untagged stable tip")
+        c_stable_tip = g("rev-parse", "HEAD")
+
+        # Unreleased work on master after v1.1
+        g("checkout", "-q", "master")
+        (tmp / "f").write_text("5\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "post-1.1 unreleased")
+        c_unrel = g("rev-parse", "HEAD")
+
+        repo_meta = {"name": tmp.name, "repo_dir": str(tmp), "default_branch": "master"}
+        with mock.patch.object(rs, "get_repo_dir", lambda: tmp), \
+             mock.patch("webapp.backend.config.get_active_repository", lambda: repo_meta), \
+             mock.patch("webapp.backend.services.release_service.get_active_repo_name", lambda: tmp.name), \
+             mock.patch("webapp.backend.services.release_service.db_covers_all", return_value=False), \
+             mock.patch("webapp.backend.services.release_service.release_lookup", return_value={
+                 c_mid: {"mainline": "v1.1-rc1", "stable": None},
+                 c_stable_mid: {"mainline": None, "stable": "v1.0.1"},
+             }), \
+             mock.patch("webapp.backend.services.release_service.ensure_release_index", return_value={"state": "done"}):
+            rs.clear_caches()
+            self.addCleanup(rs.clear_caches)
+
+            # Exact tag & stable tag
+            self.assertEqual(rs.resolve_release_tag("v1.1")["tag"], "v1.1")
+            self.assertTrue(rs.resolve_release_tag("v1.1")["exact"])
+            res_stable_tag = rs.resolve_release_tag("v1.0.1")
+            self.assertEqual(res_stable_tag["final"], "v1.0")
+            self.assertEqual(res_stable_tag["series"], "v1.0")
+
+            # Commit pointing directly to v1.0
+            res_exact_sha = rs.resolve_release_tag(c_v1)
+            self.assertEqual(res_exact_sha["tag"], "v1.0")
+            self.assertEqual(res_exact_sha["source"], "exact_sha")
+            self.assertFalse(res_exact_sha["exact"])
+
+            # Released commit between v1.0 and v1.1-rc1 resolves to v1.1
+            res_mid = rs.resolve_release_tag(c_mid)
+            self.assertEqual(res_mid["tag"], "v1.1")
+            self.assertEqual(res_mid["final"], "v1.1")
+            self.assertFalse(res_mid["latest"])
+            self.assertEqual(res_mid["source"], "release_index")
+
+            # Commit on stable branch between v1.0 and v1.0.1 resolves to v1.0.1 (series v1.0)
+            res_st = rs.resolve_release_tag(c_stable_mid)
+            self.assertEqual(res_st["tag"], "v1.0.1")
+            self.assertEqual(res_st["final"], "v1.0")
+            self.assertEqual(res_st["series"], "v1.0")
+
+            # Untagged commit on stable branch falls back to nearest ancestor tag v1.0.1, not latest
+            res_st_tip = rs.resolve_release_tag(c_stable_tip)
+            self.assertEqual(res_st_tip["tag"], "v1.0.1")
+            self.assertFalse(res_st_tip["latest"])
+            self.assertEqual(res_st_tip["source"], "ancestor")
+
+            # Unreleased commit / master branch on default branch marks latest=True and detects v1.1
+            res_unrel = rs.resolve_release_tag(c_unrel[:10])
+            self.assertEqual(res_unrel["tag"], "v1.1")
+            self.assertTrue(res_unrel["latest"])
+            self.assertEqual(res_unrel["source"], "ancestor")
+            res_master = rs.resolve_release_tag("master")
+            self.assertEqual(res_master["tag"], "v1.1")
+            self.assertTrue(res_master["latest"])
+
+            # HTTP endpoint test
+            client = TestClient(create_app())
+            r_ok = client.get(f"/api/insights/resolve?rev={c_mid}")
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertEqual(r_ok.json()["tag"], "v1.1")
+            r_bad = client.get("/api/insights/resolve?rev=deadbeefcafe")
+            self.assertEqual(r_bad.status_code, 404)

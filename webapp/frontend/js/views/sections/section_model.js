@@ -49,7 +49,6 @@ export function sectionStateFromParams(params) {
     filter: params.get("f") || "",
     sel: params.get("sel") || "",
     arch: params.get("arch") || "",
-    release: params.get("r") || "",
     window: parseInt(params.get("w") || "0", 10) || 0,
     listCollapsed: params.get("lc") === "1",
   };
@@ -57,7 +56,6 @@ export function sectionStateFromParams(params) {
 
 export function sectionParamsFromState(tab, params) {
   if (tab.view) params.set("view", tab.view);
-  if (tab.release) params.set("r", tab.release);
   if (tab.arch) params.set("arch", tab.arch);
   if (tab.window) params.set("w", String(tab.window));
   if (tab.query) params.set("q", tab.query);
