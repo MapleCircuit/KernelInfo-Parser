@@ -17,6 +17,11 @@
   padding: 4px 8px; background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;
 }
 .sv-search { flex: 1; min-width: 80px; }
+.sv-toggles { display: flex; gap: 4px; align-items: center; flex: none; }
+.sv-toggles[hidden] { display: none; }
+.sv-toggle { padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-primary); color: var(--text-secondary); cursor: pointer; font-size: 12px; line-height: 1.2; }
+.sv-toggle:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.sv-toggle.active { border-color: var(--accent-blue); color: var(--accent-blue); background: rgba(88, 166, 255, 0.12); }
 .sv-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .sv-chips:empty { display: none; }
 .sv-chip { padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border-color); background: none; color: var(--text-secondary); cursor: pointer; font-size: 11px; }
@@ -38,6 +43,7 @@
 .sv-detail { padding: 14px 18px 32px; font-size: 13px; }
 .sv-empty { color: var(--text-muted); padding: 16px 0; }
 .sv-row-main { overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.sv-row-muted { color: var(--text-muted); }
 .sv-row-sub { color: var(--text-muted); font-size: 11px; flex: none; font-family: var(--font-mono, monospace); }
 .sv-tag { font-size: 10px; padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; flex: none; }
 .sv-tag.ok { color: var(--accent-green); } .sv-tag.warn { color: var(--accent-yellow); } .sv-tag.bad { color: var(--accent-red); } .sv-tag.info { color: var(--accent-cyan); }

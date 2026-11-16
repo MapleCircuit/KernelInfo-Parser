@@ -20,6 +20,8 @@ class TestInsightsHelpers(unittest.TestCase):
         self.assertEqual(ins.parse_pull("Merge branch 'for_linus' of git://x.org/a.git"), {"ref": "for_linus", "url": "git://x.org/a.git"})
         self.assertEqual(ins.parse_pull("Merge git://git.kernel.org/pub/scm/linux/kernel/git/x/y"), {"ref": "", "url": "git://git.kernel.org/pub/scm/linux/kernel/git/x/y"})
         self.assertEqual(ins.parse_pull("Merge branch 'akpm'"), {"ref": "akpm", "url": ""})
+        self.assertEqual(ins.parse_pull("Merge tag 'edac_urgent_for_v7.3_rc3'"), {"ref": "edac_urgent_for_v7.3_rc3", "url": ""})
+        self.assertEqual(ins.parse_pull("Merge remote-tracking branch 'for-linus'"), {"ref": "for-linus", "url": ""})
         self.assertEqual(ins.parse_pull("Revert x"), {"ref": "", "url": ""})
 
     def test_tree_matching(self) -> None:
@@ -355,3 +357,251 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
         with __import__("unittest").mock.patch.object(ins, "_maintainer_data", return_value=(secs, matcher)), \
                 __import__("unittest").mock.patch.object(ins, "health_from_db", return_value=None):
             self.assertEqual(ins.compute_subsystem_health("v1.2", 2)["source"], "git")
+
+
+class TestMergeWindowSectionResolution(unittest.TestCase):
+    """Merge-window subsystem resolution via T: tree, changed files/directories, and maintainer."""
+
+    @staticmethod
+    def _build_resolver():
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+
+        raw = """Maintainers List
+----------------
+
+DRM DRIVERS
+M:\tDave Airlie <airlied@linux.ie>
+S:\tMaintained
+T:\tgit git://anongit.freedesktop.org/drm/drm
+F:\tdrivers/gpu/drm/
+
+DRM DRIVERS FOR AMD RADEON AND AMDGPU
+M:\tAlex Deucher <alexander.deucher@amd.com>
+S:\tMaintained
+F:\tdrivers/gpu/drm/amd/
+
+EDAC
+M:\tBorislav Petkov (AMD) <bp@alien8.de>
+S:\tMaintained
+T:\tgit git://git.kernel.org/pub/scm/linux/kernel/git/ras/ras.git
+F:\tdrivers/edac/
+
+RAS INFRASTRUCTURE
+M:\tBorislav Petkov (AMD) <bp@alien8.de>
+S:\tMaintained
+T:\tgit git://git.kernel.org/pub/scm/linux/kernel/git/ras/ras.git
+F:\tdrivers/ras/
+
+UNIQUE MAINT SUBSYSTEM
+M:\tSolo Maintainer <solo@kernel.org>
+S:\tMaintained
+F:\tdrivers/solo/
+
+KBUILD
+M:\tMichal Marek <mmarek@suse.cz>
+S:\tMaintained
+F:\tscripts/Makefile*
+
+THE REST
+M:\tLinus Torvalds <torvalds@linux-foundation.org>
+S:\tBuried alive in reporters
+F:\t*
+F:\t*/
+"""
+        sections = MaintainerParser(raw).parse()
+        for i, s in enumerate(sections, start=1):
+            s.sec_id = i
+        return ins._PullSectionResolver(sections, MaintainerMatcher(sections))
+
+    def test_directory_and_maintainer_resolution(self) -> None:
+        r = self._build_resolver()
+        # 1. Unique T: tree wins directly
+        sec = r.resolve(
+            url="git://anongit.freedesktop.org/drm/drm", ref="drm-next", subject="Merge tag 'drm-next' of ...",
+            sender="Dave Airlie", body="", committer="Linus Torvalds", committer_email="", changed_paths=[],
+        )
+        self.assertEqual(sec["name"], "DRM DRIVERS")
+
+        # 2. Shared T: tree (ras.git) disambiguated by changed files + tag
+        sec = r.resolve(
+            url="git://git.kernel.org/pub/scm/linux/kernel/git/ras/ras.git",
+            ref="edac_urgent_for_v7.3_rc3",
+            subject="Merge tag 'edac_urgent_for_v7.3_rc3' of git://git.kernel.org/pub/scm/linux/kernel/git/ras/ras.git",
+            sender="Borislav Petkov", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=["drivers/edac/edac_mc.c"],
+        )
+        self.assertEqual(sec["name"], "EDAC")
+
+        # 3. Missing T: URL resolved via changed files
+        sec = r.resolve(
+            url="", ref="edac_urgent_for_v7.3_rc3",
+            subject="Merge tag 'edac_urgent_for_v7.3_rc3'",
+            sender="", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=["drivers/edac/edac_mc.c", "MAINTAINERS"],
+        )
+        self.assertEqual(sec["name"], "EDAC")
+
+        # 4. Overlapping directories: maintainer breaks tie in favor of child AMD section over parent DRM DRIVERS
+        sec = r.resolve(
+            url="", ref="amdgpu-fixes", subject="Merge branch 'amdgpu-fixes'",
+            sender="Alex Deucher", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=["drivers/gpu/drm/amd/amdgpu/gfx.c"],
+        )
+        self.assertEqual(sec["name"], "DRM DRIVERS FOR AMD RADEON AND AMDGPU")
+
+        # 5. Maintainer fallback when no files matched
+        sec = r.resolve(
+            url="", ref="solo-fixes", subject="Merge branch 'solo-fixes'",
+            sender="Solo Maintainer", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=[],
+        )
+        self.assertEqual(sec["name"], "UNIQUE MAINT SUBSYSTEM")
+
+        # 6. Multi-section maintainer without changed files disambiguated by merge tag
+        sec = r.resolve(
+            url="", ref="edac_urgent_for_v7.3_rc3", subject="Merge tag 'edac_urgent_for_v7.3_rc3'",
+            sender="Borislav Petkov", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=[],
+        )
+        self.assertEqual(sec["name"], "EDAC")
+
+        # 7. Generic ref ("for-linus") uses git URL repo segment ("kbuild-2.6") for keyword disambiguation
+        toks = r._ref_tokens("for-linus", "Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/mmarek/kbuild-2.6",
+                             "git://git.kernel.org/pub/scm/linux/kernel/git/mmarek/kbuild-2.6")
+        self.assertIn("kbuild", toks)
+        self.assertNotIn("linus", toks)
+        sec = r.resolve(
+            url="git://git.kernel.org/pub/scm/linux/kernel/git/mmarek/kbuild-2.6",
+            ref="for-linus",
+            subject="Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/mmarek/kbuild-2.6",
+            sender="Michal Marek", body="", committer="Linus Torvalds", committer_email="",
+            changed_paths=[],
+        )
+        self.assertEqual(sec["name"], "KBUILD")
+
+    def test_compute_merge_window_git_maintainers_fallback(self) -> None:
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git is not installed")
+        from tests.test_commit_relations import git
+
+        tmp = Path(tempfile.mkdtemp(prefix="mw-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        g = lambda *a: git(tmp, *a)  # noqa: E731
+        maint = (
+            "Maintainers List\n----------------\n\n"
+            "EDAC\nM:\tBorislav Petkov <bp@alien8.de>\nS:\tMaintained\nF:\tdrivers/edac/\n\n"
+            "THE REST\nM:\tLinus <l@x.org>\nS:\tBuried alive\nF:\t*\nF:\t*/\n"
+        )
+        g("init", "-q", "-b", "master")
+        (tmp / "MAINTAINERS").write_text(maint)
+        (tmp / "drivers/edac").mkdir(parents=True)
+        (tmp / "drivers/edac/mc.c").write_text("int x;\n")
+        g("add", "-A")
+        g("-c", "user.name=Linus", "-c", "user.email=l@x.org", "commit", "-q", "-m", "init")
+        g("tag", "v7.2")
+
+        g("checkout", "-q", "-b", "edac")
+        (tmp / "drivers/edac/mc.c").write_text("int x = 1;\n")
+        g("add", "-A")
+        g("-c", "user.name=Borislav Petkov", "-c", "user.email=bp@alien8.de", "commit", "-q", "-m", "edac: fix")
+        g("checkout", "-q", "master")
+        g("-c", "user.name=Linus", "-c", "user.email=l@x.org", "merge", "-q", "--no-ff", "-m",
+          "Merge tag 'edac_urgent_for_v7.3_rc3'\n\nPull EDAC fix from Borislav Petkov:\n  fix\n", "edac")
+        g("tag", "v7.3")
+
+        with mock.patch.object(rs, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
+             mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
+            rs._TAGS_CACHE.clear()
+            self.addCleanup(rs._TAGS_CACHE.clear)
+            res = ins.compute_merge_window("v7.3")
+        self.assertEqual(len(res["pulls"]), 1)
+        pull = res["pulls"][0]
+        self.assertEqual(pull["ref"], "edac_urgent_for_v7.3_rc3")
+        self.assertEqual(pull["sender"], "Borislav Petkov")
+        self.assertEqual(pull["section"], {"sec_id": None, "name": "EDAC"})
+
+    def test_sender_variants_and_parent_tip_fallback(self) -> None:
+        self.assertEqual(ins._sender("Pul tty fixes from Greg Kroah-Hartman:\n"), "Greg Kroah-Hartman")
+        self.assertEqual(ins._sender("Pull NTB bugfixes frfom Jon Mason:\n"), "Jon Mason")
+        self.assertEqual(ins._sender("Pull execve update Kees Cook:\n"), "Kees Cook")
+        self.assertEqual(ins._sender("Merge fixes from Andrew Morton:\n"), "Andrew Morton")
+        self.assertEqual(ins._sender("Misc fixes for this merge window from Sasha Levin that were posted for rc1\n"), "Sasha Levin")
+        self.assertEqual(ins._sender("* 'for_linus' of git://git.kernel.org/pub/scm/linux/kernel/git/jwessel/linux-2.6-kgdb:\n"), "")
+
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git is not installed")
+
+        tmp = Path(tempfile.mkdtemp(prefix="mw-sender-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        def g_as(name: str, email: str, *args: str) -> str:
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
+                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+            }
+            return subprocess.run(["git", "-C", str(tmp), *args], check=True, capture_output=True, text=True, env=env).stdout
+
+        g_as("Linus Torvalds", "torvalds@example.com", "init", "-q", "-b", "master")
+        (tmp / "MAINTAINERS").write_text(
+            "Maintainers List\n----------------\n\n"
+            "KGDB\nM:\tJason Wessel <jason.wessel@windriver.com>\n"
+            "T:\tgit git://git.kernel.org/pub/scm/linux/kernel/git/jwessel/linux-2.6-kgdb\nF:\tkernel/debug/\n\n"
+            "VFS\nM:\tAl Viro <viro@zeniv.linux.org.uk>\n"
+            "T:\tgit git://git.kernel.org/pub/scm/linux/kernel/git/viro/vfs-2.6\nF:\tfs/\n"
+        )
+        (tmp / "kernel/debug").mkdir(parents=True)
+        (tmp / "kernel/debug/core.c").write_text("int a;\n")
+        (tmp / "fs").mkdir(parents=True)
+        (tmp / "fs/namei.c").write_text("int b;\n")
+        g_as("Linus Torvalds", "torvalds@example.com", "add", "-A")
+        g_as("Linus Torvalds", "torvalds@example.com", "commit", "-q", "-m", "init")
+        g_as("Linus Torvalds", "torvalds@example.com", "tag", "v2.6.39")
+
+        g_as("Jason Wessel", "jason.wessel@windriver.com", "checkout", "-q", "-b", "kgdb")
+        (tmp / "kernel/debug/core.c").write_text("int a = 1;\n")
+        g_as("Jason Wessel", "jason.wessel@windriver.com", "add", "-A")
+        g_as("Jason Wessel", "jason.wessel@windriver.com", "commit", "-q", "-m", "kgdb: fix")
+        g_as("Linus Torvalds", "torvalds@example.com", "checkout", "-q", "master")
+        g_as("Linus Torvalds", "torvalds@example.com", "merge", "-q", "--no-ff", "-m",
+             "Merge branch 'for_linus' of git://git.kernel.org/pub/scm/linux/kernel/git/jwessel/linux-2.6-kgdb\n\n"
+             "* 'for_linus' of git://git.kernel.org/pub/scm/linux/kernel/git/jwessel/linux-2.6-kgdb:\n  kgdb: fix\n",
+             "kgdb")
+
+        g_as("Linus Torvalds", "torvalds@example.com", "checkout", "-q", "-b", "vfs")
+        (tmp / "fs/namei.c").write_text("int b = 1;\n")
+        g_as("Linus Torvalds", "torvalds@example.com", "add", "-A")
+        g_as("Linus Torvalds", "torvalds@example.com", "commit", "-q", "-m", "vfs: amended by Linus")
+        g_as("Linus Torvalds", "torvalds@example.com", "checkout", "-q", "master")
+        g_as("Linus Torvalds", "torvalds@example.com", "merge", "-q", "--no-ff", "-m",
+             "Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/viro/vfs-2.6\n\n"
+             "* 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/viro/vfs-2.6:\n  vfs: amended\n",
+             "vfs")
+        g_as("Linus Torvalds", "torvalds@example.com", "tag", "v3.0")
+
+        with mock.patch.object(rs, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
+             mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
+            rs._TAGS_CACHE.clear()
+            self.addCleanup(rs._TAGS_CACHE.clear)
+            res = ins.compute_merge_window("v3.0")
+        by_ref = {pl["source_url"].rsplit("/", 1)[-1]: pl for pl in res["pulls"]}
+        self.assertEqual(by_ref["linux-2.6-kgdb"]["sender"], "Jason Wessel")
+        self.assertEqual(by_ref["linux-2.6-kgdb"]["section"], {"sec_id": None, "name": "KGDB"})
+        self.assertEqual(by_ref["vfs-2.6"]["sender"], "Al Viro")
+        self.assertEqual(by_ref["vfs-2.6"]["section"], {"sec_id": None, "name": "VFS"})

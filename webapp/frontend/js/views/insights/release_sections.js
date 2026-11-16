@@ -78,6 +78,52 @@ registerInsightsSection({
 });
 
 // ------------------------------------------------------------------ H5 merge window
+const GENERIC_REF_WORDS = new Set([
+  "for", "to", "from", "of", "in", "on", "the", "and",
+  "linus", "torvalds", "upstream", "misc", "linux", "next",
+  "master", "main", "head", "devel", "dev", "work",
+  "branch", "branches", "tag", "tags", "pull", "pulls", "request", "merge",
+  "fixes", "fix", "urgent", "updates", "update", "changes", "change", "cleanup", "cleanups",
+  "stable", "testing", "current", "baseline",
+]);
+
+export function isGenericRef(ref) {
+  const s = String(ref || "").trim();
+  if (!s) return true;
+  const tokens = s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.every((t) => GENERIC_REF_WORDS.has(t) || /^v?\d+$/.test(t) || /^rc\d*$/.test(t));
+}
+
+export function repoNameFromUrl(url) {
+  const clean = String(url || "").trim().replace(/[?#].*$/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+  if (!clean) return "";
+  const parts = clean.split("/").filter(Boolean);
+  if (!parts.length) return "";
+  const last = parts[parts.length - 1];
+  if (/^(?:linux|linux-2\.6|kernel)$/i.test(last) && parts.length >= 2) {
+    return `${parts[parts.length - 2]}/${last}`;
+  }
+  return last;
+}
+
+export function mergeRowTag(p) {
+  const ref = String(p?.ref || "").trim();
+  const repo = repoNameFromUrl(p?.source_url);
+  if (ref && (!isGenericRef(ref) || !repo)) return ref;
+  return repo || ref || "";
+}
+
+function renderMergeChart(chart, selectedPull) {
+  if (!chart) return "";
+  const markers = chart.rc1Marker ? [chart.rc1Marker] : [];
+  let highlightX = null;
+  if (selectedPull && selectedPull.day != null) {
+    highlightX = Math.trunc(selectedPull.day);
+    markers.push({ x: selectedPull.day, label: `d${selectedPull.day}`, color: "var(--accent-green)", dash: "", width: 1.5, y: 26 });
+  }
+  return barChartSvg(chart.pts, { markers, highlightX, unit: " commits", x0: chart.x0, x1: chart.x1 });
+}
+
 registerInsightsSection({
   id: "merge-window", label: "Merge window", order: 20, releaseScoped: true, keywords: "pulls merge window rc1 maintainers",
   visible: (repo) => hasFeature(repo, "commits") && !isManPagesRepo(repo) && (hasFeature(repo, "kconfig") || hasFeature(repo, "maintainers") || hasFeature(repo, "mail")),
@@ -85,13 +131,30 @@ registerInsightsSection({
   async fetchList(ctx) {
     const r = await (ctx.api || api).getInsights(ctx.release, "merge-window", { ...ctx, cacheKey: `mwin_${ctx.release}` });
     const pts = (r.totals?.by_day || []).map((d) => ({ x: d.day, value: d.commits, label: `day ${d.day}` }));
+    const dayVals = [...pts.map((d) => d.x), ...(r.pulls || []).filter((p) => p.day != null).map((p) => Math.trunc(p.day))];
+    this._chart = pts.length ? {
+      pts,
+      x0: Math.min(0, ...dayVals),
+      x1: Math.max(0, ...dayVals),
+      rc1Marker: r.rc1_day != null ? { x: r.rc1_day, label: r.rc1 } : null,
+    } : null;
     const summaryHtml = kpiHtml([[n(r.totals?.pulls), "pulls"], [n(r.totals?.commits), "commits pulled"], [n(r.totals?.before_rc1), "before rc1"], [r.rc1_day == null ? "—" : `day ${r.rc1_day}`, r.rc1 || "rc1"]])
-      + barChartSvg(pts, { markers: r.rc1_day != null ? [{ x: r.rc1_day, label: r.rc1 }] : [], unit: " commits", x0: 0 });
+      + `<div class="sv-chart-wrap">${renderMergeChart(this._chart, null)}</div>`;
     return { rows: r.pulls || [], summaryHtml, note: `${r.prev || "?"}..${r.release}` };
   },
   rowKey: (p) => p.merge,
   rowText: (p) => `${p.subject} ${p.source_url} ${p.ref} ${p.sender} ${p.section?.name || ""}`,
-  rowHtml: (p) => `<span class="sv-row-sub">d${p.day ?? "?"}</span><span class="sv-row-main">${escapeHtml(p.sender || p.ref || p.subject)}</span>${p.section ? `<span class="sv-tag info">${escapeHtml(p.section.name.slice(0, 24))}</span>` : ""}<span class="sv-row-sub">${n(p.commits)}</span>`,
+  toggles: [{ id: "sender", label: "Sender", title: "Show the pull sender in the list", stateKey: "showSender" }],
+  rowHtml: (p, ctx = {}) => {
+    const tag = mergeRowTag(p);
+    const showSender = Boolean(ctx?.showSender);
+    const label = tag || p.subject || p.sender;
+    const sender = p.sender && p.sender !== label ? p.sender : "";
+    return `<span class="sv-row-sub">d${p.day ?? "?"}</span>`
+      + `<span class="sv-row-main" title="${escapeHtml(p.subject || label)}">${showSender && sender ? `${escapeHtml(sender)} <span class="sv-row-muted">· ${escapeHtml(label)}</span>` : escapeHtml(label)}</span>`
+      + `${p.section ? `<span class="sv-tag info">${escapeHtml(p.section.name.slice(0, 24))}</span>` : ""}`
+      + `<span class="sv-row-sub">${n(p.commits)}</span>`;
+  },
   chips: [
     { id: "before", label: "before rc1", test: (p) => !p.after_rc1 },
     { id: "after", label: "after rc1", test: (p) => p.after_rc1 },
@@ -103,11 +166,15 @@ registerInsightsSection({
       <dt>Source</dt><dd>${escapeHtml(p.source_url || "local branch")} ${p.ref ? `<code>${escapeHtml(p.ref)}</code>` : ""}</dd>
       ${p.sender ? `<dt>Sender</dt><dd>${escapeHtml(p.sender)}</dd>` : ""}
       <dt>Commits</dt><dd>${n(p.commits)} — <a href="#" data-query="${escapeHtml(`range:${p.parents[0]}..${p.parents[1]}`)}">list them</a></dd>
-      ${p.section && hasFeature(ctx.view?.repo(), "maintainers") ? `<dt>Subsystem</dt><dd><a href="#" data-section="${escapeHtml(p.section.sec_id)}">${escapeHtml(p.section.name)}</a></dd>` : ""}
+      ${p.section && hasFeature(ctx.view?.repo(), "maintainers") ? `<dt>Subsystem</dt><dd>${p.section.sec_id != null ? `<a href="#" data-section="${escapeHtml(p.section.sec_id)}">${escapeHtml(p.section.name)}</a>` : escapeHtml(p.section.name)}</dd>` : ""}
       ${p.thread && hasFeature(ctx.view?.repo(), "mail") ? `<dt>Pull request</dt><dd><a href="#" data-mid="${escapeHtml(p.thread.message_id)}" data-tid="${p.thread.thread_id}">[GIT PULL] thread</a></dd>` : ""}
     </dl>
     ${p.dirs?.length ? `<h3>Top directories</h3>${hbarsHtml(p.dirs.map((d) => ({ label: d.dir, value: d.percent })), { max: 100, format: (v) => `${v}%` })}` : ""}
     ${p.body ? `<h3>Tag message</h3><pre>${escapeHtml(p.body)}</pre>` : ""}`,
+  afterDetail(_el, pull, ctx) {
+    const wrap = ctx.view?.containerEl?.querySelector(".sv-chart-wrap");
+    if (wrap && this._chart) wrap.innerHTML = renderMergeChart(this._chart, pull);
+  },
   onDetailClick(e, ctx) {
     const nt = ctx.forceNew || e.ctrlKey || e.metaKey;
     const q = e.target.closest("[data-query]");

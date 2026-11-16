@@ -28,6 +28,7 @@ from webapp.backend.services.jobs import jobs
 logger = logging.getLogger(__name__)
 
 REPORT_FORMAT = 2  # 2: source, first-timers only for mainline, identities once per commit
+MW_FORMAT = 5  # merge-window: 5 resolves sender across body variants, parent tip committers, and tree fallbacks
 HEALTH_FORMAT = 3  # subsystem health: 3 carries `source` (database or git)
 _DISK = DiskCache("insights", max_bytes=256 << 20)
 _DOMAINS_FILE = Path(__file__).resolve().parents[1] / "data" / "email_domains.json"
@@ -420,7 +421,7 @@ def release_stats_series(tags: list[str]) -> list[dict[str, Any]]:
 _PULL_RE = (
     re.compile(r"^Merge (?:tag|branch) '([^']+)' of (\S+)"),
     re.compile(r"^Merge (?:branch )?(?:'([^']+)' )?(?:of )?((?:git|https?|ssh)://\S+)"),
-    re.compile(r"^Merge branch '([^']+)'(?: into \S+)?$"),
+    re.compile(r"^Merge (?:remote-tracking )?(?:tag|branch) '([^']+)'(?: into \S+)?$"),
 )
 
 
@@ -492,6 +493,322 @@ def match_tree(trees: dict[str, dict[str, Any]], url: str) -> dict[str, Any] | N
     return trees.get(norm) or (trees.get(f"owner:{owner_of(norm)}") if owner_of(norm) else None)
 
 
+_REF_STOPWORDS = frozenset({
+    "for", "to", "from", "of", "in", "on", "linus", "torvalds", "upstream", "misc", "linux", "next",
+    "urgent", "fixes", "fix", "updates", "update", "changes", "change", "cleanup", "cleanups",
+    "master", "main", "head", "devel", "dev", "work", "tag", "tags", "branch", "branches",
+    "merge", "pull", "pulls", "request", "the", "and", "stable", "testing", "current", "baseline",
+})
+_SEC_STOPWORDS = frozenset({
+    "driver", "drivers", "subsystem", "support", "linux", "kernel", "the", "and", "for", "with", "common", "core",
+})
+_SIGNED_OFF_RE = re.compile(r"^Signed-off-by:\s*(.+?)\s*(?:<([^>\n]+)>)?\s*$", re.M | re.I)
+
+
+def _norm_person_name(name: str) -> str:
+    from parser.git_ast.identity import clean_name
+    from parser.maintainer_ast.maintainer_types import clean_identity_text
+
+    return clean_name(clean_identity_text(name)).casefold()
+
+
+def _strip_paren_name(name: str) -> str:
+    return re.sub(r"\s*\([^)]*\)\s*$", "", name or "").strip()
+
+
+def _split_sender_identity(text: str) -> tuple[str, str]:
+    raw = (text or "").strip()
+    m = re.search(r"<([^>]+)>", raw)
+    email = m.group(1).strip().lower() if m else ""
+    name = re.sub(r"\s*<[^>]*>", "", raw).strip()
+    return name, email
+
+
+def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]:
+    """Load MAINTAINERS sections and matcher for `tag`, falling back to `git show <sha>:MAINTAINERS` when unparsed."""
+    sections: list[Any] = []
+    matcher: Any = None
+    try:
+        from webapp.backend.services.maintainer_service import MaintainerService
+        sections, matcher = MaintainerService().get_maintainer_data(tag)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("MAINTAINERS DB lookup of %s unavailable: %s", tag, exc)
+    if not sections:
+        rev = sha or tag
+        try:
+            from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+            from parser.maintainer_ast.maintainer_parser import MaintainerParser
+            text = _git(["show", f"{rev}:MAINTAINERS"], timeout=30)
+            if text.strip():
+                sections = MaintainerParser(text).parse()
+                matcher = MaintainerMatcher(sections)
+        except Exception as exc:  # noqa: BLE001 - repository may lack MAINTAINERS
+            logger.debug("MAINTAINERS git fallback of %s unavailable: %s", tag, exc)
+    return sections, matcher
+
+
+class _PullSectionResolver:
+    """Resolve a merge pull request's MAINTAINERS section via T: tree URL, changed files/dirs, and maintainer."""
+
+    def __init__(self, sections: list[Any], matcher: Any) -> None:
+        from parser.maintainer_ast.maintainer_types import MaintainerRole
+
+        self.matcher = matcher
+        self.sections = [s for s in sections if s.name != "THE REST"]
+        self.by_name: dict[str, Any] = {s.name: s for s in self.sections}
+        self.tree_map: dict[str, list[Any]] = defaultdict(list)
+        self.owner_trees: dict[str, set[str]] = defaultdict(set)
+        self.owner_secs: dict[str, list[Any]] = defaultdict(list)
+        self.maint_email: dict[str, dict[str, int]] = defaultdict(dict)
+        self.maint_name: dict[str, dict[str, int]] = defaultdict(dict)
+        self.sec_tokens: dict[str, set[str]] = {}
+
+        for sec in self.sections:
+            self.sec_tokens[sec.name] = {
+                tok for tok in re.split(r"[^a-z0-9]+", sec.name.lower())
+                if len(tok) >= 2 and tok not in _SEC_STOPWORDS
+            }
+            for tree in re.split(r"[\n;]", sec.scm_tree or ""):
+                tree = re.sub(r"^git\s+", "", tree.strip())
+                url = (tree.split()[0] if tree else "").rstrip(",.;")
+                if "://" not in url:
+                    continue
+                norm = normalize_url(url)
+                if sec not in self.tree_map[norm]:
+                    self.tree_map[norm].append(sec)
+                own = owner_of(norm)
+                if own:
+                    self.owner_trees[own].add(norm)
+                    if sec not in self.owner_secs[own]:
+                        self.owner_secs[own].append(sec)
+            for member in sec.members:
+                weight = 2 if member.role == MaintainerRole.MAINTAINER else 1
+                email = (member.email or "").strip().lower()
+                if email:
+                    prev = self.maint_email[email].get(sec.name, 0)
+                    if weight > prev:
+                        self.maint_email[email][sec.name] = weight
+                for candidate_name in (member.name, _strip_paren_name(member.name)):
+                    norm_n = _norm_person_name(candidate_name)
+                    if norm_n:
+                        prev = self.maint_name[norm_n].get(sec.name, 0)
+                        if weight > prev:
+                            self.maint_name[norm_n][sec.name] = weight
+
+    def tree_candidates(self, url: str) -> list[Any]:
+        if not url:
+            return []
+        norm = normalize_url(url)
+        if norm in self.tree_map:
+            return list(self.tree_map[norm])
+        own = owner_of(norm)
+        if own and len(self.owner_trees.get(own, ())) == 1:
+            return list(self.owner_secs.get(own, ()))
+        return []
+
+    def maintainer_weights(self, people: list[tuple[str, str]]) -> dict[str, int]:
+        weights: dict[str, int] = {}
+        for raw_name, raw_email in people:
+            name_part, embedded_email = _split_sender_identity(raw_name)
+            email = (raw_email or embedded_email).strip().lower()
+            if email and email in self.maint_email:
+                for sec_name, w in self.maint_email[email].items():
+                    weights[sec_name] = max(weights.get(sec_name, 0), w)
+            for cand in (name_part, _strip_paren_name(name_part)):
+                norm_n = _norm_person_name(cand)
+                if norm_n and norm_n in self.maint_name:
+                    for sec_name, w in self.maint_name[norm_n].items():
+                        weights[sec_name] = max(weights.get(sec_name, 0), w)
+        return weights
+
+    @staticmethod
+    def _ref_tokens(ref: str, subject: str, url: str = "") -> set[str]:
+        parts = [ref or subject or ""]
+        if url:
+            repo_seg = url.strip().rstrip("/").rsplit("/", 1)[-1]
+            if repo_seg.lower().endswith(".git"):
+                repo_seg = repo_seg[:-4]
+            if repo_seg and repo_seg.lower() not in ("linux", "linux-2.6", "kernel"):
+                parts.append(repo_seg)
+        out = set()
+        for src in parts:
+            for tok in re.split(r"[^a-z0-9]+", src.lower()):
+                if len(tok) < 2 or tok in _REF_STOPWORDS or tok.isdigit():
+                    continue
+                if re.fullmatch(r"v?\d+|rc\d*", tok):
+                    continue
+                out.add(tok)
+        return out
+
+    @staticmethod
+    def _pattern_specificity(sec: Any, paths: list[str]) -> int:
+        from parser.maintainer_ast.maintainer_types import PatternType
+
+        best = 0
+        for pat in sec.patterns:
+            if pat.pat_type != PatternType.FILE:
+                continue
+            raw = pat.pattern.strip().lstrip("/")
+            if not raw or raw in ("*", "*/"):
+                continue
+            prefix = raw.split("*", 1)[0].split("?", 1)[0]
+            if not prefix:
+                continue
+            if any(p.startswith(prefix) or p == raw for p in paths):
+                best = max(best, len(prefix))
+        return best
+
+    def resolve(
+        self,
+        *,
+        url: str,
+        ref: str,
+        subject: str,
+        sender: str,
+        sender_email: str = "",
+        body: str,
+        committer: str,
+        committer_email: str,
+        changed_paths: list[str],
+    ) -> dict[str, Any] | None:
+        if not self.sections:
+            return None
+        tree_cands = self.tree_candidates(url)
+        if len(tree_cands) == 1:
+            s = tree_cands[0]
+            return {"sec_id": s.sec_id, "name": s.name}
+
+        # Collect candidate people (pull sender, non-Linus committer on local merges, tag Signed-off-by)
+        people: list[tuple[str, str]] = []
+        if sender and "linus torvalds" not in sender.lower():
+            people.append((sender, sender_email))
+        if not url and committer and "linus torvalds" not in committer.lower():
+            people.append((committer, committer_email))
+        if not people:
+            for sob_name, sob_email in _SIGNED_OFF_RE.findall(body or ""):
+                if "linus torvalds" not in sob_name.lower():
+                    people.append((sob_name, sob_email))
+        maint_w = self.maintainer_weights(people)
+
+        file_counts: Counter = Counter()
+        if self.matcher and changed_paths:
+            for path in changed_paths:
+                for s in self.matcher.match_file(path):
+                    if s.name != "THE REST":
+                        file_counts[s.name] += 1
+
+        ref_toks = self._ref_tokens(ref, subject, url)
+        ref_overlap = {
+            name: len(ref_toks & toks)
+            for name, toks in self.sec_tokens.items()
+            if ref_toks & toks
+        }
+        tree_names = {s.name for s in tree_cands}
+
+        if file_counts:
+            pool_names = set(file_counts)
+            if tree_names and (tree_names & pool_names):
+                pool_names &= tree_names
+            max_files = max(file_counts[n] for n in pool_names)
+
+            def score(name: str) -> tuple[int, int, int, int, int, int]:
+                fc = file_counts[name]
+                mw = maint_w.get(name, 0)
+                # Prefer a maintainer's own section over a broader unmaintained umbrella when it covers >= 50% of files
+                maint_match = 1 if (mw > 0 and fc * 2 >= max_files) else 0
+                return (
+                    1 if name in tree_names else 0,
+                    maint_match,
+                    fc,
+                    mw,
+                    ref_overlap.get(name, 0),
+                    self._pattern_specificity(self.by_name[name], changed_paths),
+                )
+
+            best_name = max(pool_names, key=score)
+            s = self.by_name[best_name]
+            return {"sec_id": s.sec_id, "name": s.name}
+
+        # No file matches: resolve from unique maintainer or maintainer + tag/tree disambiguation
+        if tree_cands:
+            best = max(
+                tree_cands,
+                key=lambda s: (maint_w.get(s.name, 0), ref_overlap.get(s.name, 0)),
+            )
+            return {"sec_id": best.sec_id, "name": best.name}
+
+        maint_only = [self.by_name[n] for n, w in maint_w.items() if w >= 2 and n in self.by_name]
+        if len(maint_only) == 1:
+            s = maint_only[0]
+            return {"sec_id": s.sec_id, "name": s.name}
+        if len(maint_only) > 1:
+            scored = [(ref_overlap.get(s.name, 0), s) for s in maint_only]
+            top_ov = max(ov for ov, _ in scored)
+            if top_ov > 0:
+                winners = [s for ov, s in scored if ov == top_ov]
+                if len(winners) == 1:
+                    return {"sec_id": winners[0].sec_id, "name": winners[0].name}
+        return None
+
+
+def _changed_files(parent_sha: str, merge_sha: str, limit: int = 2000) -> list[str]:
+    try:
+        out = _git(["diff", "--name-only", parent_sha, merge_sha], timeout=60)
+        return [line.strip() for line in out.splitlines() if line.strip()][:limit]
+    except RuntimeError:
+        return []
+
+
+def _parent_committers(shas: list[str]) -> dict[str, tuple[str, str]]:
+    """Batch-fetch `sha -> (committer_name, committer_email)` for second-parent tips of merges."""
+    unique = [s for s in dict.fromkeys(shas) if _FULL.match(s)]
+    out_map: dict[str, tuple[str, str]] = {}
+    for i in range(0, len(unique), 500):
+        chunk = unique[i:i + 500]
+        try:
+            out = _git(["log", "--no-walk=unsorted", "--format=%H%x1f%cn%x1f%ce", *chunk], timeout=60)
+        except RuntimeError:
+            continue
+        for line in out.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) >= 3 and _FULL.match(parts[0].strip()):
+                out_map[parts[0].strip()] = (parts[1].strip(), parts[2].strip().lower())
+    return out_map
+
+
+def _fallback_sender(
+    body_sender: str,
+    *,
+    p2_name: str,
+    p2_email: str,
+    committer: str,
+    url: str,
+    body: str,
+    tree_cands: list[Any],
+) -> tuple[str, str]:
+    """Resolve pull sender from commit message body, second-parent committer, tag trailers, tree maintainers, or merger."""
+    if body_sender:
+        return body_sender, ""
+    if p2_name and (not url or p2_name != committer):
+        return p2_name, p2_email
+    if url:
+        for sob_name, sob_email in _SIGNED_OFF_RE.findall(body or ""):
+            if sob_name.strip() and sob_name.strip() != committer:
+                return sob_name.strip(), sob_email.strip().lower()
+        from parser.maintainer_ast.maintainer_types import MaintainerRole
+
+        maintainers = [
+            (member.name, (member.email or "").strip().lower())
+            for sec in tree_cands
+            for member in getattr(sec, "members", ())
+            if member.role == MaintainerRole.MAINTAINER and getattr(member, "name", "")
+        ]
+        unique_names = list(dict.fromkeys(name for name, _ in maintainers))
+        if len(unique_names) == 1:
+            return maintainers[0]
+    return (p2_name or committer), p2_email
+
+
 def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str, Any]:
     prev, sha = rs.range_of(tag)
     merges = rs.merges_now(tag)
@@ -501,18 +818,28 @@ def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str
     prev_name = rs.previous(tag)
     start = int(rs._git(["log", "-1", "--format=%ct", prev], timeout=10).strip()) if prev else 0
     rc1_at = int(rs._git(["log", "-1", "--format=%ct", tags[rc1]], timeout=10).strip()) if rc1 else None
-    trees = _tree_index(tag)
-    from webapp.backend.services.commit_facts import commit_ids
-    ids = commit_ids([m["sha"] for m in merges])
-    threads = _pull_threads(list(ids.values()))
-    pulls = []
-    total = len(merges)
-    for i, m in enumerate(merges):
-        if progress and i % 20 == 0:
-            progress(i, total, "pulls")
+    sections, matcher = _load_maintainers(tag, sha)
+    resolver = _PullSectionResolver(sections, matcher)
+    parsed_merges: list[tuple[dict[str, Any], list[str], dict[str, str], str]] = []
+    need_p2: list[str] = []
+    for m in merges:
         parents = [x for x in m["parents"] if _FULL.match(x)]
         if len(parents) < 2:
             continue
+        pull = parse_pull(m["subject"])
+        body_sender = _sender(m["body"])
+        parsed_merges.append((m, parents, pull, body_sender))
+        if not body_sender:
+            need_p2.append(parents[1])
+    p2_committers = _parent_committers(need_p2) if need_p2 else {}
+    from webapp.backend.services.commit_facts import commit_ids
+    ids = commit_ids([m["sha"] for m, _, _, _ in parsed_merges])
+    threads = _pull_threads(list(ids.values()))
+    pulls = []
+    total = len(parsed_merges)
+    for i, (m, parents, pull, body_sender) in enumerate(parsed_merges):
+        if progress and i % 20 == 0:
+            progress(i, total, "pulls")
         count = int((_git(["rev-list", "--count", "--no-merges", parents[1], f"^{parents[0]}"], timeout=60) or "0").strip() or 0)
         dirs = []
         try:
@@ -522,14 +849,40 @@ def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str
                     dirs.append({"dir": d.strip(), "percent": float(pct)})
         except RuntimeError:
             pass
-        pull = parse_pull(m["subject"])
-        sec = match_tree(trees, pull["url"]) if pull["url"] else None
+        tree_cands = resolver.tree_candidates(pull["url"]) if pull["url"] else []
+        p2_name, p2_email = p2_committers.get(parents[1], ("", ""))
+        sender, sender_email = _fallback_sender(
+            body_sender,
+            p2_name=p2_name,
+            p2_email=p2_email,
+            committer=m["committer"],
+            url=pull["url"],
+            body=m["body"],
+            tree_cands=tree_cands,
+        )
+        if len(tree_cands) == 1:
+            sec = {"sec_id": tree_cands[0].sec_id, "name": tree_cands[0].name}
+        else:
+            paths = _changed_files(parents[0], m["sha"]) if resolver.sections else []
+            if not paths and dirs:
+                paths = [d["dir"] for d in dirs]
+            sec = resolver.resolve(
+                url=pull["url"],
+                ref=pull["ref"],
+                subject=m["subject"],
+                sender=sender,
+                sender_email=sender_email,
+                body=m["body"],
+                committer=m["committer"],
+                committer_email=m.get("committer_email", ""),
+                changed_paths=paths,
+            )
         day = round((m["date"] - start) / 86400, 1) if start else None
         thread = threads.get(ids.get(m["sha"]))
         pulls.append({
             "merge": m["sha"], "parents": parents, "date": m["date"], "day": day,
             "after_rc1": bool(rc1_at and m["date"] > rc1_at), "subject": m["subject"],
-            "source_url": pull["url"], "ref": pull["ref"], "sender": m["committer"] if not pull["url"] else _sender(m["body"]),
+            "source_url": pull["url"], "ref": pull["ref"], "sender": sender,
             "commits": count, "dirs": dirs, "section": sec, "thread": thread, "body": m["body"][:3000],
         })
     by_day: Counter = Counter()
@@ -546,11 +899,21 @@ def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str
 
 
 def _sender(body: str) -> str:
-    m = re.search(r"Pull (.+?) (?:updates|fixes|changes)? ?from (.+?):", body or "")
-    if m:
-        return m.group(2).strip()
-    m = re.search(r"^Pull .* from ([^:\n]+)", body or "", re.M)
-    return m.group(1).strip() if m else ""
+    text = body or ""
+    for pat in (
+        r"^(?:Pull|Pul|Pyll)\b.*?\b(?:from|frfom|friom|fromm|fro)[,\s]+([^:\n]+?)\s*:",
+        r"^Pull\s+.+?\b(?:updates?|fixes|changes?)\s+([A-Z][^:\n]+?):",
+        r"^(?:Pull|Merge)\b[^:\n]*\bfrom\s+([A-Z][^:\n.]{2,60}?)(?::|\.\s*$|\s+that\b|\s*$)",
+    ):
+        m = re.search(pat, text, re.M)
+        if m:
+            return m.group(1).strip().rstrip(".")
+    first_line = text.splitlines()[0] if text else ""
+    if not first_line.lstrip().startswith("* "):
+        m = re.search(r"\bfrom\s+([A-Z][a-zA-Z.-]+(?:\s+[A-Z][a-zA-Z.-]+){1,3})(?:\s*:|\s+that\s+were|\s*$)", first_line)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 def _pull_threads(commit_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -578,7 +941,7 @@ def merge_window(tag: str, wait: float = 0.0) -> dict[str, Any]:
     if not rs.parse_tag(tag)["final"]:
         raise HTTPException(status_code=400, detail="A merge window belongs to a release (vX.Y, <prefix>X.Y), not to an -rc or a stable update.")
     sha = rs.tag_commits()[tag]
-    ck = f"{get_active_repo_name()}|mw|{REPORT_FORMAT}|{sha}"
+    ck = f"{get_active_repo_name()}|mw|{MW_FORMAT}|{sha}"
     return _job(f"insights:{ck}", lambda p: compute_merge_window(tag, p), ck, wait)
 
 

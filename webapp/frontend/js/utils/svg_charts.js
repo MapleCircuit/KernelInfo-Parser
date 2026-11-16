@@ -7,10 +7,11 @@ function esc(s) {
 }
 
 /**
- * Vertical bars of `points` [{x, value, label?}] over an x domain [x0, x1]; `markers` [{x, label}] draw
- * dashed vertical lines (the -rc1 of a merge window).
+ * Vertical bars of `points` [{x, value, label?}] over an x domain [x0, x1]; `markers`
+ * [{x, label, color?, dash?, width?, y?}] draw vertical lines (e.g. -rc1 and selected pull), and
+ * `highlightX` highlights the bar at that x coordinate.
  */
-export function barChartSvg(points, { width = 560, height = 140, x0 = null, x1 = null, markers = [], unit = "" } = {}) {
+export function barChartSvg(points, { width = 560, height = 140, x0 = null, x1 = null, markers = [], highlightX = null, unit = "" } = {}) {
   if (!points.length) return "";
   const xs = points.map((p) => p.x);
   const lo = x0 ?? Math.min(...xs);
@@ -25,11 +26,20 @@ export function barChartSvg(points, { width = 560, height = 140, x0 = null, x1 =
   const bars = points.map((p) => {
     const bh = (p.value / max) * h;
     const x = padL + ((p.x - lo) / span) * w;
-    return `<rect x="${x.toFixed(1)}" y="${(6 + h - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="var(--accent-blue)"><title>${esc(p.label ?? p.x)}: ${p.value}${esc(unit)}</title></rect>`;
+    const active = highlightX !== null && p.x === highlightX;
+    const fill = active ? "var(--accent-green)" : "var(--accent-blue)";
+    return `<rect data-x="${esc(p.x)}"${active ? ' class="sv-bar-active"' : ""} x="${x.toFixed(1)}" y="${(6 + h - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="${fill}"><title>${esc(p.label ?? p.x)}: ${p.value}${esc(unit)}</title></rect>`;
   }).join("");
   const marks = markers.map((m) => {
     const x = padL + ((m.x - lo) / span) * w;
-    return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="4" y2="${6 + h}" stroke="var(--accent-orange)" stroke-dasharray="3 3"/><text x="${(x + 3).toFixed(1)}" y="14" fill="var(--accent-orange)" font-size="10">${esc(m.label)}</text>`;
+    const color = esc(m.color || "var(--accent-orange)");
+    const dash = m.dash === "" ? "" : ` stroke-dasharray="${esc(m.dash || "3 3")}"`;
+    const sw = m.width ? ` stroke-width="${esc(m.width)}"` : "";
+    const rightSide = x > padL + w * 0.78;
+    const lx = rightSide ? x - 3 : x + 3;
+    const anchor = rightSide ? ' text-anchor="end"' : "";
+    const ly = m.y ?? 14;
+    return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="4" y2="${6 + h}" stroke="${color}"${dash}${sw}/><text x="${lx.toFixed(1)}" y="${ly}" fill="${color}" font-size="10"${anchor}>${esc(m.label)}</text>`;
   }).join("");
   const axis = `<line x1="${padL}" x2="${padL + w}" y1="${6 + h}" y2="${6 + h}" stroke="var(--border-color)"/>`
     + `<text x="${padL - 4}" y="14" fill="var(--text-muted)" font-size="10" text-anchor="end">${max}</text>`

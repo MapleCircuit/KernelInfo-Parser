@@ -61,9 +61,14 @@ export class SectionedView {
   }
 
   ctx(extra = {}) {
+    const toggleState = {};
+    for (const t of this.section?.toggles || []) {
+      toggleState[t.stateKey] = Boolean(this.tab?.[t.stateKey]);
+    }
     return {
       version: this.version, release: this.tab.release || "", arch: this.tab.arch || "",
       window: this.tab.window || this.section?.windowDefault || 0,
+      ...toggleState,
       // The client of this tab's repository: every request a section makes names it (§5.18)
       view: this, api: this.api, signal: this.abort?.signal, ...extra,
     };
@@ -111,6 +116,7 @@ export class SectionedView {
               <select class="sv-arch" title="ARCH" hidden></select>
               <select class="sv-window" title="Window" hidden></select>
               <input type="search" class="sv-search" placeholder="Filter…" spellcheck="false" aria-label="Filter the list" />
+              <span class="sv-toggles" hidden></span>
               <button type="button" class="code-btn sv-download" title="Download the filtered list">⬇</button>
               <button type="button" class="collapse-btn sv-collapse" title="Collapse the list" aria-label="Collapse the list">${COLLAPSE_ICON}</button>
             </div>
@@ -155,7 +161,7 @@ export class SectionedView {
     });
     this.list = new VirtualList(containerEl.querySelector(".sv-list"), {
       rowHeight: sec.rowHeight || 30,
-      renderRow: (row) => sec.rowHtml(row),
+      renderRow: (row) => sec.rowHtml(row, this.ctx()),
       rowKey: (row) => String(sec.rowKey(row)),
       label: sec.label,
       onSelect: (row, i, { forceNew } = {}) => this.selectRow(row, forceNew),
@@ -183,6 +189,28 @@ export class SectionedView {
         const n = parseInt(winSel.value, 10);
         this.persist({ window: n === (sec.windowDefault || sec.windowOptions[0]) ? null : n, sel: "" });
         this.loadList();
+      };
+    }
+    const togglesEl = this.containerEl.querySelector(".sv-toggles");
+    const toggles = sec.toggles || [];
+    togglesEl.hidden = !toggles.length;
+    if (toggles.length) {
+      const renderToggles = () => {
+        togglesEl.innerHTML = toggles.map((t) => {
+          const on = Boolean(this.tab[t.stateKey]);
+          return `<button type="button" class="sv-toggle${on ? " active" : ""}" data-toggle="${escapeHtml(t.id)}" aria-pressed="${on}" title="${escapeHtml(t.title || t.label)}">${escapeHtml(t.label)}</button>`;
+        }).join("");
+      };
+      renderToggles();
+      togglesEl.onclick = (e) => {
+        const b = e.target.closest("[data-toggle]");
+        if (!b) return;
+        const t = toggles.find((x) => x.id === b.dataset.toggle);
+        if (!t) return;
+        const next = !this.tab[t.stateKey];
+        this.persist({ [t.stateKey]: next || null });
+        renderToggles();
+        this.list.paint();
       };
     }
     archSel.hidden = !sec.archScoped;
