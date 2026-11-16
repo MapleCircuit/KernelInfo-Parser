@@ -197,6 +197,7 @@ class SessionManager {
 
         case "session:closed": {
           if (msg.sessionId === this.activeSessionId) {
+            this.unpinSessionFromWindow({ flush: false });
             this.emit("session:closed_remotely", msg.sessionId);
           }
           if (this.dropRemoteEnginesOf((eng) => eng.sessionId === msg.sessionId)) {
@@ -578,8 +579,10 @@ class SessionManager {
     name = "",
     repo = "",
     version = "v3.0",
+    selectedVersion = null,
     selectedBranch = "",
     splitMode = "single",
+    activePaneId = null,
     panes = null,
     pin = false,
     // A session created around tabs that already exist (drag-out, duplication) keeps the engines
@@ -594,13 +597,14 @@ class SessionManager {
     const id = `sess_${timestampPart}_${randomPart}`;
     const sessionName = name.trim() || `Session ${this.getSessionsIndex().length + 1}`;
 
+    const defaultTabId = `tab-${Math.random().toString(36).substring(2, 9)}`;
     const defaultPanes = panes || [
       {
         id: "pane-1",
-        activeTabId: "tab-default",
+        activeTabId: defaultTabId,
         tabs: [
           {
-            id: `tab-${Math.random().toString(36).substring(2, 9)}`,
+            id: defaultTabId,
             type: "code",
             title: "sched.c",
             version: version || "v3.0",
@@ -619,10 +623,10 @@ class SessionManager {
       updatedAt: Date.now(),
       repo,
       version,
-      selectedVersion: version,
+      selectedVersion: selectedVersion || version,
       selectedBranch,
       splitMode,
-      activePaneId: "pane-1",
+      activePaneId: activePaneId || defaultPanes[0]?.id || "pane-1",
       panes: defaultPanes,
       kconfigEngineTabIds: [...kconfigEngineTabIds],
       kconfigEngineProfiles: { ...kconfigEngineProfiles }
@@ -637,6 +641,7 @@ class SessionManager {
 
     // Update index
     const index = this.getSessionsIndex();
+    const allTabs = defaultPanes.flatMap((p) => p.tabs || []);
     index.unshift({
       id,
       name: sessionName,
@@ -644,8 +649,8 @@ class SessionManager {
       updatedAt: sessionState.updatedAt,
       repo,
       version,
-      tabCount: defaultPanes.reduce((sum, p) => sum + (p.tabs?.length || 0), 0),
-      previewTabs: defaultPanes.flatMap((p) => p.tabs || []).map((t) => ({ type: t.type, title: t.title }))
+      tabCount: allTabs.length,
+      previewTabs: allTabs.slice(0, 5).map((t) => ({ type: t.type, title: t.title }))
     });
     this.saveSessionsIndex(index);
 
@@ -704,7 +709,10 @@ class SessionManager {
       name: dupName,
       repo: orig.repo,
       version: orig.version,
+      selectedVersion: orig.selectedVersion || orig.version,
+      selectedBranch: orig.selectedBranch || "",
       splitMode: orig.splitMode,
+      activePaneId: orig.activePaneId || null,
       panes,
       pin: false,
       kconfigEngineTabIds: engineTabIds,

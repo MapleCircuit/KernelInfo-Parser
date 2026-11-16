@@ -127,7 +127,8 @@
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  width: 220px;
+  width: 268px;
+  max-width: calc(100vw - 16px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
@@ -145,6 +146,22 @@
   gap: 2px;
 }
 
+.session-menu-section-label {
+  padding: 4px 12px 2px;
+  font-size: var(--fs-10, 10px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.session-quick-switch-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .session-menu-item {
   display: flex;
   align-items: center;
@@ -160,9 +177,45 @@
   transition: var(--transition-fast);
 }
 
+.session-menu-icon {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+
+.session-menu-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-menu-meta {
+  flex-shrink: 0;
+  font-size: var(--fs-10, 10px);
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+.session-menu-meta.is-live {
+  color: var(--accent-yellow);
+}
+
 .session-menu-item:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+.session-menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.session-menu-item:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
 }
 
 .session-menu-item.danger {

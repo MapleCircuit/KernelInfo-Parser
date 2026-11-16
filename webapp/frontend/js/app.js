@@ -19,7 +19,12 @@ import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
 import { localDB } from "./db.js";
 import { escapeHtml } from "./components/modal.js";
 import { sessionManager } from "./session_manager.js";
-import { showSessionPickerModal } from "./components/session_modal.js";
+import {
+  showSessionPickerModal,
+  getQuickSwitchSessions,
+  openWorkspaceSession,
+  openWorkspaceSessionInNewTab
+} from "./components/session_modal.js";
 
 // View Renderers
 import { VirtualEditor } from "./views/code_view/virtual_editor.js";
@@ -361,7 +366,15 @@ class KernelIdeApp {
     };
     updateLabel();
 
+    const closeDropdown = () => {
+      const existingMenu = container?.querySelector(".session-dropdown-menu");
+      if (!existingMenu) return;
+      if (typeof existingMenu._closeMenu === "function") existingMenu._closeMenu();
+      else existingMenu.remove();
+    };
+
     state.subscribe("session:adopted", async () => {
+      closeDropdown();
       updateLabel();
       // The adopted session's active tab may belong to another project: the header lists its revisions
       if (this.headerRepo !== undefined && this.headerRepo !== state.currentRepo) await this.initVersionSelector();
@@ -383,6 +396,7 @@ class KernelIdeApp {
     });
 
     state.subscribe("session:taken_over", () => {
+      closeDropdown();
       updateLabel();
       toast.info("This session was opened in another window; it continues there. Choose a session to carry on here.");
       showSessionPickerModal({ allowClose: false });
@@ -390,6 +404,7 @@ class KernelIdeApp {
 
     state.subscribe("session:closed", (closedSid) => {
       if (closedSid === state.currentSessionId || !state.currentSessionId) {
+        closeDropdown();
         updateLabel();
         const index = sessionManager.getSessionsIndex();
         if (index.length === 1 && !sessionManager.isSessionActiveInOtherWindow(index[0].id)) {
@@ -410,10 +425,47 @@ class KernelIdeApp {
       e.stopPropagation();
       const existingMenu = container.querySelector(".session-dropdown-menu");
       if (existingMenu) {
-        if (typeof existingMenu._closeMenu === "function") existingMenu._closeMenu();
-        else existingMenu.remove();
+        closeDropdown();
         return;
       }
+
+      const { sessions: quickSessions, hiddenCount } = getQuickSwitchSessions();
+      const quickItemsHtml = quickSessions.map((s) => {
+        const isOtherActive = sessionManager.isSessionActiveInOtherWindow(s.id);
+        const icon = isOtherActive ? "🟢" : "💤";
+        const tabCount = Number.isFinite(s.tabCount) ? s.tabCount : 0;
+        const ref = s.version ? shortRef(s.version) : "";
+        const metaLabel = isOtherActive
+          ? "open"
+          : [ref, `${tabCount}t`].filter(Boolean).join(" · ");
+        const tooltipParts = [
+          s.name || s.id,
+          ref || "v3.0",
+          s.repo || "",
+          `${tabCount} tab${tabCount === 1 ? "" : "s"}`
+        ].filter(Boolean);
+        const tooltip = isOtherActive
+          ? `${tooltipParts.join(" · ")} — Open in another tab; click to take it over, middle-click for new browser tab`
+          : `${tooltipParts.join(" · ")} — Middle-click to open in new browser tab`;
+        return `
+          <button type="button" class="session-menu-item session-quick-switch-item" data-session-id="${escapeHtml(s.id)}" title="${escapeHtml(tooltip)}">
+            <span class="session-menu-icon">${icon}</span>
+            <span class="session-menu-name">${escapeHtml(s.name || s.id)}</span>
+            ${metaLabel ? `<span class="session-menu-meta${isOtherActive ? " is-live" : ""}">${escapeHtml(metaLabel)}</span>` : ""}
+          </button>
+        `;
+      }).join("");
+
+      const quickSectionHtml = quickSessions.length > 0
+        ? `
+          <div class="session-menu-section-label">Switch to session</div>
+          <div class="session-quick-switch-list">${quickItemsHtml}</div>
+          <div class="session-menu-divider"></div>
+        `
+        : "";
+
+      const hasCurrent = Boolean(state.currentSessionId);
+      const disabledAttr = hasCurrent ? "" : " disabled";
 
       const menu = document.createElement("div");
       menu.className = "session-dropdown-menu";
@@ -427,38 +479,82 @@ class KernelIdeApp {
           </div>
         </div>
         <div class="session-menu-divider"></div>
+        ${quickSectionHtml}
         <button type="button" class="session-menu-item" id="session-action-switch">
-          <span>🗂</span> Switch Session…
+          <span class="session-menu-icon">🗂</span>
+          <span class="session-menu-name">Switch Session…</span>
+          ${hiddenCount > 0 ? `<span class="session-menu-meta">+${hiddenCount} more</span>` : ""}
         </button>
         <button type="button" class="session-menu-item" id="session-action-new">
-          <span>➕</span> New Session…
+          <span class="session-menu-icon">➕</span>
+          <span class="session-menu-name">New Session…</span>
         </button>
-        <button type="button" class="session-menu-item" id="session-action-duplicate">
-          <span>⧉</span> Duplicate Session…
+        <button type="button" class="session-menu-item" id="session-action-duplicate"${disabledAttr}>
+          <span class="session-menu-icon">⧉</span>
+          <span class="session-menu-name">Duplicate Session…</span>
         </button>
-        <button type="button" class="session-menu-item" id="session-action-rename">
-          <span>✏️</span> Rename Session…
+        <button type="button" class="session-menu-item" id="session-action-rename"${disabledAttr}>
+          <span class="session-menu-icon">✏️</span>
+          <span class="session-menu-name">Rename Session…</span>
         </button>
         <div class="session-menu-divider"></div>
-        <button type="button" class="session-menu-item danger" id="session-action-close">
-          <span>🗑</span> Close Session
+        <button type="button" class="session-menu-item danger" id="session-action-close"${disabledAttr}>
+          <span class="session-menu-icon">🗑</span>
+          <span class="session-menu-name">Close Session</span>
         </button>
       `;
 
       container.appendChild(menu);
+      if (typeof menu.getBoundingClientRect === "function" && typeof window !== "undefined" && window.innerWidth) {
+        const rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth - 8) {
+          menu.style.left = "auto";
+          menu.style.right = "0";
+        }
+      }
 
+      let closed = false;
       const closeMenu = () => {
+        if (closed) return;
+        closed = true;
         menu.remove();
-        document.removeEventListener("click", outsideClick);
+        document.removeEventListener("click", outsideClick, true);
+        document.removeEventListener("keydown", onKeyDown);
       };
       menu._closeMenu = closeMenu;
 
       const outsideClick = (ev) => {
-        if (!menu.contains(ev.target) && ev.target !== btn) {
+        if (!menu.contains(ev.target) && !btn.contains(ev.target)) {
           closeMenu();
         }
       };
-      setTimeout(() => document.addEventListener("click", outsideClick), 10);
+      const onKeyDown = (ev) => {
+        if (ev.key === "Escape") closeMenu();
+      };
+      setTimeout(() => {
+        if (closed) return;
+        document.addEventListener("click", outsideClick, true);
+        document.addEventListener("keydown", onKeyDown);
+      }, 0);
+
+      menu.querySelectorAll(".session-quick-switch-item").forEach((itemBtn) => {
+        itemBtn.addEventListener("mousedown", (ev) => {
+          if (ev.button === 1) ev.preventDefault();
+        });
+        itemBtn.addEventListener("click", () => {
+          const sid = itemBtn.dataset?.sessionId;
+          closeMenu();
+          if (sid) openWorkspaceSession(sid);
+        });
+        itemBtn.addEventListener("auxclick", (ev) => {
+          if (ev.button !== 1) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          const sid = itemBtn.dataset?.sessionId;
+          closeMenu();
+          if (sid) openWorkspaceSessionInNewTab(sid);
+        });
+      });
 
       menu.querySelector("#session-action-switch")?.addEventListener("click", () => {
         closeMenu();
@@ -492,21 +588,26 @@ class KernelIdeApp {
 
       menu.querySelector("#session-action-rename")?.addEventListener("click", () => {
         closeMenu();
+        if (!state.currentSessionId) return;
         const currentName = state.currentSessionName || "Session";
         const newName = prompt("Rename session:", currentName);
-        if (!newName || newName.trim() === currentName) return;
-        sessionManager.renameSession(state.currentSessionId, newName.trim());
-        state.currentSessionName = newName.trim();
-        updateLabel();
-        toast.success("Renamed session to '" + newName.trim() + "'");
+        const trimmed = newName?.trim();
+        if (!trimmed || trimmed === currentName) return;
+        if (sessionManager.renameSession(state.currentSessionId, trimmed)) {
+          state.currentSessionName = trimmed;
+          updateLabel();
+          toast.success("Renamed session to '" + trimmed + "'");
+        }
       });
 
       menu.querySelector("#session-action-close")?.addEventListener("click", () => {
         closeMenu();
+        if (!state.currentSessionId) return;
         const name = state.currentSessionName || "this session";
         if (confirm("Are you sure you want to close '" + name + "'? The session will be deleted from your saved workspaces.")) {
           const sid = state.currentSessionId;
           sessionManager.deleteSession(sid); // unpins this window from it
+          state.cancelPendingSave();
           state.currentSessionId = null;
           state.currentSessionName = "";
           updateLabel();

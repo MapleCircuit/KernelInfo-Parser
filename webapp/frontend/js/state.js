@@ -160,6 +160,9 @@ class GlobalState {
 
     sessionManager.subscribe("session:closed_remotely", (sid) => {
       if (sid === this.currentSessionId) {
+        this.cancelPendingSave();
+        this.currentSessionId = null;
+        this.currentSessionName = "";
         this.emit("session:closed", sid);
       }
     });

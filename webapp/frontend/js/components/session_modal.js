@@ -21,6 +21,70 @@ function formatRelativeTime(timestamp) {
   return `${diffDay}d ago`;
 }
 
+export const MAX_QUICK_SWITCH_SESSIONS = 8;
+
+/**
+ * Other saved sessions ordered most-recently-updated first, capped for the header quick-switch menu.
+ */
+export function getQuickSwitchSessions(
+  currentSessionId = state.currentSessionId || sessionManager.activeSessionId,
+  limit = MAX_QUICK_SWITCH_SESSIONS
+) {
+  const max = Math.max(0, Number.isFinite(limit) ? Math.floor(limit) : MAX_QUICK_SWITCH_SESSIONS);
+  const others = sessionManager
+    .getSessionsIndex()
+    .filter((s) => s && s.id && s.id !== currentSessionId)
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  const sessions = others.slice(0, max);
+  return {
+    sessions,
+    totalOther: others.length,
+    hiddenCount: Math.max(0, others.length - sessions.length)
+  };
+}
+
+/**
+ * Load and adopt a saved session into this window, notifying if it was taken over from another window.
+ */
+export function openWorkspaceSession(sid, { onSelect = null } = {}) {
+  if (!sid) return false;
+  const item = sessionManager.getSessionMeta(sid);
+  const takenOver = sessionManager.isSessionActiveInOtherWindow(sid);
+  const sessionData = sessionManager.loadSession(sid);
+  if (!sessionData) {
+    toast.warning(`Session '${item?.name || sid}' is no longer available.`);
+    return false;
+  }
+  state.adoptSession(sessionData);
+  if (takenOver) {
+    toast.info(`'${item?.name || sessionData.name || sid}' was open in another window; that window was signed out of it.`);
+  }
+  if (onSelect) onSelect(sid);
+  return true;
+}
+
+/**
+ * Open a saved session in a new browser tab via `?session=<id>`.
+ */
+export function openWorkspaceSessionInNewTab(sid) {
+  if (!sid) return false;
+  const item = sessionManager.getSessionMeta(sid);
+  if (!sessionManager.hasSession(sid)) {
+    toast.warning(`Session '${item?.name || sid}' is no longer available.`);
+    return false;
+  }
+  const basePath = (typeof window !== "undefined" && window.location?.pathname) || "/";
+  const url = `${basePath}?session=${encodeURIComponent(sid)}`;
+  const win = typeof window !== "undefined" && typeof window.open === "function"
+    ? window.open(url, "_blank")
+    : null;
+  if (!win) {
+    toast.warning("Popup blocked — allow popups to open the session in a new browser tab.");
+    return false;
+  }
+  return true;
+}
+
 export function showSessionPickerModal({ allowClose = false, onSelect = null } = {}) {
   // If a modal is already open, don't duplicate
   const existing = document.getElementById("session-picker-modal");
@@ -153,16 +217,10 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
     // out of it on the spot and shows this picker, so neither window saves over the other. Nothing
     // is lost — that window's session is still in the list, and **Duplicate** opens a copy instead.
     const openSession = (sid) => {
-      const item = sessions.find((s) => s.id === sid);
-      const takenOver = sessionManager.isSessionActiveInOtherWindow(sid);
-      const sessionData = sessionManager.loadSession(sid);
-      if (sessionData) {
-        state.adoptSession(sessionData);
+      if (openWorkspaceSession(sid, { onSelect })) {
         backdrop.remove();
-        if (takenOver) {
-          toast.info(`'${item?.name || sessionData.name || sid}' was open in another window; that window was signed out of it.`);
-        }
-        if (onSelect) onSelect(sid);
+      } else {
+        renderModalContent();
       }
     };
 
@@ -216,13 +274,21 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
         const item = sessions.find((s) => s.id === sid);
         const name = item?.name || "this session";
         if (confirm(`Are you sure you want to delete session '${name}'? This cannot be undone.`)) {
+          const wasCurrent = sid === state.currentSessionId;
           sessionManager.deleteSession(sid);
+          if (wasCurrent) {
+            state.cancelPendingSave();
+            state.currentSessionId = null;
+            state.currentSessionName = "";
+            allowClose = false;
+          }
           const remaining = sessionManager.getSessionsIndex();
           if (!allowClose && remaining.length === 1 && !sessionManager.isSessionActiveInOtherWindow(remaining[0].id)) {
             openSession(remaining[0].id);
             return;
           }
           renderModalContent();
+          if (wasCurrent) state.emit("session:closed", sid);
         }
       };
     });
