@@ -3,7 +3,7 @@
  */
 import { progressLabel } from "../../utils/job_poll.js";
 import { releaseBadgeHtml, relationChipsHtml, relationsCount, relationsHtml } from "./relations_render.js";
-import { KEY_HELP, completeKey, isStructured, parseCommitQuery, queryParams, removeToken } from "./commit_query.js";
+import { KEY_HELP, completeKey, isStructured, parseCommitQuery, queryHelpHtml, queryParams, removeToken } from "./commit_query.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
@@ -17,6 +17,11 @@ import { hasFeature } from "../../utils/projects.js";
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
 const AUTO_EXPAND_ROWS = 120;
+const EMPTY_DETAIL_HTML = `
+  <div style="color:var(--text-muted);padding-top:40px;text-align:center;">
+    Select a commit from the timeline to view message, trailers, touched files, and diff.
+  </div>`;
+let nextDatalistId = 0;
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -99,6 +104,7 @@ function attachHashCopy(rootEl, onContext) {
 
 export class CommitsView {
   constructor() {
+    this.api = api;
     this.tabId = null;
     this.currentVersion = "v3.0";
     this.commits = [];
@@ -115,6 +121,9 @@ export class CommitsView {
     this.isLoadingBottom = false;
     this.listCollapsed = false;
     this.listLoaded = false;
+    this.showingQueryHelp = false;
+    this._debouncedSearch = null;
+    this._datalistId = `commit-query-keys-${++nextDatalistId}`;
   }
 
   async render(containerEl, tabData) {
@@ -127,6 +136,8 @@ export class CommitsView {
     this.currentQuery = tabData.query || "";
     this.listCollapsed = Boolean(tabData.listCollapsed);
     this.listLoaded = false;
+    this.showingQueryHelp = Boolean(tabData.queryHelp);
+    this._debouncedSearch?.cancel?.();
 
     containerEl.innerHTML = `
       <div class="commits-view-container${this.listCollapsed ? " list-collapsed" : ""}">
@@ -139,9 +150,9 @@ export class CommitsView {
         <!-- Commits List Column -->
         <div class="commits-list-col">
           <div class="commits-search-bar" style="display:flex;gap:6px;">
-            <input type="text" id="commit-search-input" placeholder="Search subject, author, hash… or path:fs/ext4 in:v3.0 reviewer:name" style="flex:1;" list="commit-query-keys" />
-            <datalist id="commit-query-keys"></datalist>
-            <button type="button" class="code-btn commit-query-help" id="btn-commit-query-help" title="Query keys (path:, author:, reviewer:, since:, in:, merges:, section: …)">?</button>
+            <input type="text" id="commit-search-input" placeholder="Search subject, author, hash… or path:fs/ext4 in:v3.0 reviewer:name" style="flex:1;" list="${escapeHtml(this._datalistId)}" />
+            <datalist id="${escapeHtml(this._datalistId)}"></datalist>
+            <button type="button" class="code-btn commit-query-help" id="btn-commit-query-help" aria-pressed="false" title="Show commit search guide (keys, modes, and examples)">?</button>
             <button type="button" class="collapse-btn" id="btn-commits-collapse" title="Collapse the commit list" aria-label="Collapse the commit list">${COLLAPSE_ICON}</button>
           </div>
           <div class="commit-query-chips" id="commit-query-chips" hidden></div>
@@ -151,11 +162,7 @@ export class CommitsView {
         </div>
 
         <!-- Commit Detail Column -->
-        <div class="commit-detail-col" id="commit-detail-container">
-          <div style="color:var(--text-muted);padding-top:40px;text-align:center;">
-            Select a commit from the timeline to view message, trailers, touched files, and diff.
-          </div>
-        </div>
+        <div class="commit-detail-col" id="commit-detail-container">${EMPTY_DETAIL_HTML}</div>
       </div>
     `;
 
@@ -170,9 +177,12 @@ export class CommitsView {
       });
     });
 
-    // Release badge and Relations card links (H1-H3)
+    // Release badge, Relations card links (H1-H3), and Commit Search Guide panel actions
     const detailContainer = containerEl.querySelector("#commit-detail-container");
-    detailContainer.addEventListener("click", (e) => this.onFactsClick(e));
+    detailContainer.addEventListener("click", (e) => {
+      if (this.onQueryHelpClick(e)) return;
+      this.onFactsClick(e);
+    });
     detailContainer.addEventListener("auxclick", (e) => {
       if (e.button === 1 && this.onFactsClick(e, true)) e.preventDefault();
     });
@@ -189,20 +199,23 @@ export class CommitsView {
       this.persistTabState({ query: q });
       this.loadCommits(q, true);
     }, 250);
+    this._debouncedSearch = debouncedSearch;
     searchInput.oninput = () => {
       this.renderQueryChips(searchInput.value);
       this.updateKeyCompletions(searchInput);
       debouncedSearch(searchInput.value.trim());
     };
     this.renderQueryChips(searchInput.value);
-    containerEl.querySelector("#btn-commit-query-help").onclick = (e) => this.showQueryHelp(e.currentTarget);
+    containerEl.querySelector("#btn-commit-query-help").onclick = () => this.toggleQueryHelp();
     containerEl.querySelector("#commit-query-chips").addEventListener("click", (e) => {
       const x = e.target.closest("[data-token]");
       if (!x) return;
       // Removing a chip refines the list at once, and the URL reproduces the query (q=)
+      debouncedSearch.cancel();
       const next = removeToken(searchInput.value, parseInt(x.dataset.token, 10));
       searchInput.value = next;
       this.renderQueryChips(next);
+      this.updateKeyCompletions(searchInput);
       this.persistTabState({ query: next.trim() });
       this.loadCommits(next.trim(), true);
     });
@@ -210,7 +223,12 @@ export class CommitsView {
     // The selected commit is what the reader came for: its detail is requested first (and at high
     // fetch priority) and the list or search loads beside it, so neither waits for the other. A
     // folded list is not loaded at all until it is unfolded.
-    const detail = this.selectedCommitId ? this.inspectCommit(this.selectedCommitId) : null;
+    let detail = null;
+    if (this.showingQueryHelp) {
+      this.showQueryHelp({ persist: false });
+    } else if (this.selectedCommitId) {
+      detail = this.inspectCommit(this.selectedCommitId);
+    }
     const list = this.listCollapsed ? null : this.loadCommits(this.currentQuery, true);
     await Promise.all([list, detail]);
   }
@@ -250,6 +268,8 @@ export class CommitsView {
       this.hasFuture = false;
       this.nextPastCursor = null;
       this.nextFutureCursor = null;
+      this.isLoadingTop = false;
+      this.isLoadingBottom = false;
       listContainer.innerHTML = `<div style="padding:16px;color:var(--text-muted);">Loading commits...</div>`;
     }
 
@@ -285,6 +305,7 @@ export class CommitsView {
 
   async loadMoreTop() {
     if (this.isLoadingTop || !this.hasFuture || this.currentQuery) return;
+    const token = this._listToken;
     this.isLoadingTop = true;
     const topBtn = this.containerEl.querySelector("#btn-load-more-top");
     if (topBtn) {
@@ -298,6 +319,7 @@ export class CommitsView {
 
     try {
       const res = await this.api.getCommitTimeline(this.currentVersion, 50, "future", this.nextFutureCursor);
+      if (token !== this._listToken) return;
       const newCommits = [...(res.timeline || [])].reverse();
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       const fresh = newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash));
@@ -310,6 +332,7 @@ export class CommitsView {
       this.renderCommitList();
       listContainer.scrollTop = prevScrollTop + (listContainer.scrollHeight - prevScrollHeight);
     } catch (e) {
+      if (token !== this._listToken) return;
       console.error("Failed to load more commits (top):", e);
       this.isLoadingTop = false;
       if (topBtn) {
@@ -317,12 +340,13 @@ export class CommitsView {
         topBtn.disabled = false;
       }
     } finally {
-      this.isLoadingTop = false;
+      if (token === this._listToken) this.isLoadingTop = false;
     }
   }
 
   async loadMoreBottom() {
     if (this.isLoadingBottom) return;
+    const token = this._listToken;
     this.isLoadingBottom = true;
     const bottomBtn = this.containerEl.querySelector("#btn-load-more-bottom");
     if (bottomBtn) {
@@ -333,18 +357,23 @@ export class CommitsView {
     try {
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       if (this.currentQuery && isStructured(this.currentQuery)) {
-        this.currentPage += 1;
-        const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
+        const nextPage = this.currentPage + 1;
+        const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), nextPage, 50));
+        if (token !== this._listToken) return;
+        this.currentPage = nextPage;
         this.commits.push(...(res.commits || []).filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = Boolean(res.has_more);
       } else if (this.currentQuery) {
-        this.currentPage += 1;
-        const res = await this.api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
+        const nextPage = this.currentPage + 1;
+        const res = await this.api.getCommits(this.currentVersion, nextPage, 50, this.currentQuery);
+        if (token !== this._listToken) return;
+        this.currentPage = nextPage;
         const newCommits = res.commits || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = newCommits.length === 50;
       } else {
         const res = await this.api.getCommitTimeline(this.currentVersion, 50, "past", this.nextPastCursor);
+        if (token !== this._listToken) return;
         const newCommits = res.timeline || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasPast = Boolean(res.has_past);
@@ -354,6 +383,7 @@ export class CommitsView {
       this.isLoadingBottom = false;
       this.renderCommitList();
     } catch (e) {
+      if (token !== this._listToken) return;
       console.error("Failed to load more commits (bottom):", e);
       this.isLoadingBottom = false;
       if (bottomBtn) {
@@ -361,7 +391,7 @@ export class CommitsView {
         bottomBtn.disabled = false;
       }
     } finally {
-      this.isLoadingBottom = false;
+      if (token === this._listToken) this.isLoadingBottom = false;
     }
   }
 
@@ -392,7 +422,9 @@ export class CommitsView {
 
     this.commits.forEach((c) => {
       const card = document.createElement("div");
-      card.className = `commit-card ${c.commit_id === this.selectedCommitId || c.commit_hash === this.selectedCommitId ? "active" : ""}`;
+      const isSelected = Boolean(this.selectedCommitId)
+        && (c.commit_id === this.selectedCommitId || c.commit_hash === this.selectedCommitId);
+      card.className = `commit-card ${isSelected ? "active" : ""}`;
 
       const dateStr = c.author_date ? new Date(c.author_date * 1000).toISOString().split("T")[0] : "";
       const hashShort = (c.commit_hash || "0000000").substring(0, 7);
@@ -475,9 +507,11 @@ export class CommitsView {
     panel.innerHTML = `<div class="cdiff-status">Loading diff…</div>`;
     try {
       const diff = await this.api.getCommitDiff(this.currentVersion, commitHash);
+      if (!panel.isConnected) return;
       panel.dataset.loaded = commitHash;
       this.renderCommitDiff(panel, diff);
     } catch (e) {
+      if (!panel.isConnected) return;
       panel.innerHTML = `<div class="cdiff-status" style="color:var(--accent-red);">Failed to load diff: ${escapeHtml(e.message)}</div>`;
     }
     panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -615,7 +649,7 @@ export class CommitsView {
 
   /** Key suggestions while the last word is a known key's prefix (the input's datalist). */
   updateKeyCompletions(input) {
-    const list = this.containerEl?.querySelector("#commit-query-keys");
+    const list = this.containerEl?.querySelector(`#${this._datalistId}`) || this.containerEl?.querySelector("datalist");
     if (!list) return;
     const words = input.value.split(/\s+/);
     const last = words.pop() || "";
@@ -623,14 +657,95 @@ export class CommitsView {
     list.innerHTML = completeKey(last).map((k) => `<option value="${escapeHtml(head + k)}"></option>`).join("");
   }
 
-  showQueryHelp(anchor) {
-    const items = Object.entries(KEY_HELP).map(([k, h]) => ({ label: `${k}: — ${h}`, icon: "⌕", onClick: () => {
-      const input = this.containerEl.querySelector("#commit-search-input");
-      input.value = `${input.value.trim()} ${k}:`.trim();
-      input.focus();
-    } }));
-    const r = anchor.getBoundingClientRect();
-    contextMenu.renderMenu(r.left, r.bottom + 4, { header: { title: "Query keys", sub: "Unknown keys stay free text; plain text searches subjects and messages" }, items });
+  setQueryHelpActive(active) {
+    this.showingQueryHelp = Boolean(active);
+    const btn = this.containerEl?.querySelector("#btn-commit-query-help");
+    if (btn) {
+      btn.classList.toggle("active", this.showingQueryHelp);
+      btn.setAttribute("aria-pressed", String(this.showingQueryHelp));
+    }
+  }
+
+  toggleQueryHelp() {
+    if (this.showingQueryHelp) this.hideQueryHelp();
+    else this.showQueryHelp();
+  }
+
+  showQueryHelp({ persist = true } = {}) {
+    const detailEl = this.containerEl?.querySelector("#commit-detail-container");
+    if (!detailEl) return;
+    this._detailToken = (this._detailToken || 0) + 1;
+    this.factsAbort?.abort();
+    this.setQueryHelpActive(true);
+    const selected = this.selectedCommitId
+      ? this.commits.find((c) => c.commit_id === this.selectedCommitId || c.commit_hash === this.selectedCommitId)
+      : null;
+    const hash = selected?.commit_hash
+      || (typeof this.selectedCommitId === "string" && /^[0-9a-f]{7,40}$/i.test(this.selectedCommitId) ? this.selectedCommitId : "");
+    detailEl.innerHTML = queryHelpHtml({
+      hasSelectedCommit: Boolean(this.selectedCommitId),
+      selectedCommitLabel: hash ? hash.slice(0, 8) : "",
+    });
+    detailEl.scrollTop = 0;
+    if (persist) this.persistTabState({ queryHelp: true });
+  }
+
+  hideQueryHelp({ persist = true } = {}) {
+    this.setQueryHelpActive(false);
+    if (persist) this.persistTabState({ queryHelp: undefined });
+    if (this.selectedCommitId) {
+      this.inspectCommit(this.selectedCommitId);
+      return;
+    }
+    const detailEl = this.containerEl?.querySelector("#commit-detail-container");
+    if (detailEl) detailEl.innerHTML = EMPTY_DETAIL_HTML;
+  }
+
+  onQueryHelpClick(e) {
+    if (e.target.closest(".cq-help-close")) {
+      e.preventDefault();
+      this.hideQueryHelp();
+      return true;
+    }
+    const keyBtn = e.target.closest("[data-insert-key]");
+    if (keyBtn) {
+      e.preventDefault();
+      this.insertQueryKey(keyBtn.dataset.insertKey);
+      return true;
+    }
+    const exBtn = e.target.closest("[data-example]");
+    if (exBtn) {
+      e.preventDefault();
+      this.applyQueryExample(exBtn.dataset.example);
+      return true;
+    }
+    return false;
+  }
+
+  insertQueryKey(key) {
+    const input = this.containerEl?.querySelector("#commit-search-input");
+    if (!input) return;
+    const cur = input.value.trimEnd();
+    input.value = cur ? `${cur} ${key}` : key;
+    this.renderQueryChips(input.value);
+    this.updateKeyCompletions(input);
+    input.focus();
+    if (typeof input.setSelectionRange === "function") {
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+    }
+  }
+
+  applyQueryExample(query) {
+    const input = this.containerEl?.querySelector("#commit-search-input");
+    if (!input) return;
+    const q = String(query || "").trim();
+    this._debouncedSearch?.cancel?.();
+    input.value = q;
+    this.renderQueryChips(q);
+    this.updateKeyCompletions(input);
+    this.persistTabState({ query: q });
+    this.loadCommits(q, true);
   }
 
   /** Release badge (H3) and Relations card (H1/H2) of the inspected commit; `token` drops stale answers. */
@@ -738,6 +853,7 @@ export class CommitsView {
   }
 
   async inspectCommit(commitIdOrHash) {
+    this.setQueryHelpActive(false);
     const detailEl = this.containerEl.querySelector("#commit-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading commit details...</div>`;
     // Only the latest selection renders: a commit clicked while another is loading wins
@@ -748,7 +864,7 @@ export class CommitsView {
       if (token !== this._detailToken) return;
       // The commit on screen is recorded on the tab by its hash, never by the integer
       // commit_id: a shared link has to survive a database rebuild (§5.26)
-      this.persistTabState({ commitId: c.commit_hash || String(commitIdOrHash) });
+      this.persistTabState({ commitId: c.commit_hash || String(commitIdOrHash), queryHelp: undefined });
       const dateStr = c.author_date ? new Date(c.author_date * 1000).toUTCString() : "";
 
       detailEl.innerHTML = `
@@ -929,6 +1045,7 @@ export class CommitsView {
       });
     } catch (e) {
       if (token !== this._detailToken) return;
+      this.persistTabState({ queryHelp: undefined });
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
@@ -1032,6 +1149,13 @@ export class CommitsView {
         });
       };
     });
+  }
+
+  dispose() {
+    this.factsAbort?.abort();
+    this._debouncedSearch?.cancel?.();
+    clearTimeout(this.chipTimer);
+    this.containerEl = null;
   }
 }
 

@@ -938,7 +938,7 @@ class GlobalState {
       // Reopened onto something else (another symbol, message, commit, search...): the positions
       // it was left at belong to what it showed before (§5.28)
       const NAV_KEYS = ["cursorLine", "symbol", "threadId", "messageId", "query", "listMode", "filter", "commitId",
-        "versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
+        "queryHelp", "versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
         "manStatuses", "manSection", "manQuery",
         "section", "secId", "person", "role", "sort", "structName", "functionName"];
       // An empty value ("", 0, null) addresses the same thing as an absent one
@@ -1002,6 +1002,10 @@ class GlobalState {
       if (tabData.listCollapsed !== undefined) {
         if (tabData.listCollapsed) existing.listCollapsed = true;
         else delete existing.listCollapsed;
+      }
+      if (tabData.queryHelp !== undefined) {
+        if (tabData.queryHelp) existing.queryHelp = true;
+        else delete existing.queryHelp;
       }
       if (tabData.type === "maintainers") {
         // A Maintainers deep link: its section, selection and developer filters (empty = cleared)

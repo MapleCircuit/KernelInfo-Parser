@@ -382,6 +382,7 @@ export class DiffView {
       }, 200);
     };
     container.querySelector(".api-diff-download").onclick = (e) => {
+      e.stopPropagation();
       const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
       const r = e.currentTarget.getBoundingClientRect();
       const base = `api-${String(this.versionA).replace(/[^A-Za-z0-9._-]/g, "_")}-${String(this.versionB).replace(/[^A-Za-z0-9._-]/g, "_")}`;

@@ -192,7 +192,7 @@ class UrlSynchronizer {
     const NAV_PROPS = [
       "title", "path", "cursorLine", "lineEnd", "blame", "blameOpts", "structName", "functionName",
       "query", "filter", "symbol", "arch", "configName", "commitId",
-      "listCollapsed", "threadId", "messageId", "listMode", "section",
+      "listCollapsed", "queryHelp", "threadId", "messageId", "listMode", "section",
       "secId", "person", "role", "sort", "versionA", "versionB", "mode",
       "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches", "apiKinds", "apiStatuses", "apiQuery", "apiArch",
       ...routeKeys()
@@ -273,7 +273,7 @@ class UrlSynchronizer {
       case "explorer":
         return `${v}:${tab.type}:${tab.path || ""}`;
       case "commits":
-        return `${v}:${tab.type}:${tab.commitId || ""}`;
+        return `${v}:${tab.type}:${tab.commitId || ""}:${tab.queryHelp ? 1 : 0}`;
       case "mail":
         return `${v}:${tab.type}:${tab.threadId || 0}:${tab.messageId || ""}`;
       case "kconfig":
@@ -328,6 +328,7 @@ class UrlSynchronizer {
           configName: t.configName,
           commitId: t.commitId,
           listCollapsed: t.listCollapsed,
+          queryHelp: t.queryHelp,
           threadId: t.threadId,
           messageId: t.messageId,
           listMode: t.listMode,
@@ -503,6 +504,7 @@ class UrlSynchronizer {
           title: "Commits",
           commitId: params.get("cid") || "",
           listCollapsed: params.get("lc") === "1",
+          queryHelp: params.get("help") === "1",
           query,
           version: ver
         });
@@ -632,6 +634,7 @@ class UrlSynchronizer {
       if (activeTab.commitId) params.set("cid", activeTab.commitId);
       if (activeTab.query) params.set("q", activeTab.query);
       if (activeTab.listCollapsed) params.set("lc", "1");
+      if (activeTab.queryHelp) params.set("help", "1");
     } else if (activeTab.type === "maintainers") {
       if (activeTab.section && activeTab.section !== "subsystems") params.set("view", activeTab.section);
       if (activeTab.secId) params.set("sec", activeTab.secId);

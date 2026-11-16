@@ -420,6 +420,7 @@
 
 /* Structured query chips (H8, webapp/API.md §5.12) */
 .commit-query-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
+.commit-query-chips[hidden] { display: none; }
 .cq-chip {
   display: inline-flex; align-items: center; gap: 3px; padding: 1px 2px 1px 7px; border-radius: 10px; font-size: 11px;
   background: rgba(88, 166, 255, 0.12); border: 1px solid var(--accent-blue); color: var(--text-primary);
@@ -430,3 +431,165 @@
 .cq-chip button { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 12px; padding: 0 4px; }
 .cq-chip button:hover { color: var(--accent-red); }
 .commit-query-help { padding: 2px 8px; }
+
+/* In-pane Commit Search Guide (#commit-query-help-panel) */
+.cq-help-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 920px;
+}
+.cq-help-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.cq-help-subtitle {
+  margin-top: 4px;
+  font-size: var(--fs-12, 12px);
+  color: var(--text-secondary);
+}
+.cq-help-subtitle code,
+.cq-help-mode-desc code,
+.cq-help-list code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-11, 11px);
+  background: var(--bg-tertiary);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent-blue);
+}
+.cq-help-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  margin-left: 8px;
+  color: var(--text-muted);
+}
+.cq-help-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: var(--fs-12, 12px);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.cq-help-mode-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+.cq-help-badge {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-10, 10px);
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+.cq-help-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cq-help-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.cq-help-group-title {
+  font-size: var(--fs-11, 11px);
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.cq-help-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cq-help-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 5px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  font-size: var(--fs-11, 11px);
+}
+.cq-help-key-col {
+  flex: 0 0 185px;
+  min-width: 0;
+}
+.cq-help-key-btn {
+  background: rgba(88, 166, 255, 0.12);
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-radius: 4px;
+  color: var(--accent-blue);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-11, 11px);
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+  text-align: left;
+}
+.cq-help-key-btn:hover {
+  background: rgba(88, 166, 255, 0.22);
+  border-color: var(--accent-blue);
+}
+.cq-help-desc-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+.cq-help-inline-ex {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-10, 10px);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.cq-help-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cq-help-example {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--fs-11, 11px);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+.cq-help-example:hover {
+  border-color: var(--accent-blue);
+  background: var(--bg-hover);
+}
+.cq-help-example code {
+  font-family: var(--font-mono, monospace);
+  color: var(--accent-blue);
+}

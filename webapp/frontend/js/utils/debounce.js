@@ -3,11 +3,18 @@
  */
 export function debounce(fn, delayMs = 250) {
   let timer = null;
-  return function (...args) {
+  const debounced = function (...args) {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
-      fn.apply(this, args);
       timer = null;
+      fn.apply(this, args);
     }, delayMs);
   };
+  debounced.cancel = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return debounced;
 }

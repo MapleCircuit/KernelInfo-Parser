@@ -23,8 +23,13 @@ import { hasFeature } from "../utils/projects.js";
 class ContextMenu {
   constructor() {
     this.menuEl = null;
+    this._justOpened = false;
+    this._openSeq = 0;
 
-    document.addEventListener("click", () => this.hide());
+    document.addEventListener("click", () => {
+      if (this._justOpened) return;
+      this.hide();
+    });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") this.hide();
     });
@@ -32,6 +37,7 @@ class ContextMenu {
   }
 
   hide() {
+    this._justOpened = false;
     if (this.menuEl) {
       this.menuEl.remove();
       this.menuEl = null;
@@ -46,6 +52,13 @@ class ContextMenu {
    */
   renderMenu(x, y, { header, items }) {
     this.hide();
+    // Ignore the bubbling click event that opened this menu if a caller did not stopPropagation()
+    const seq = ++this._openSeq;
+    this._justOpened = true;
+    const clearGuard = setTimeout(() => {
+      if (this._openSeq === seq) this._justOpened = false;
+    }, 0);
+    clearGuard?.unref?.();
 
     this.menuEl = document.createElement("div");
     this.menuEl.className = "context-menu";

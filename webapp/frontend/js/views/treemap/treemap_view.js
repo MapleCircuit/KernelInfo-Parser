@@ -134,7 +134,10 @@ export class TreemapView {
 
     // Build overlay (K4): the engine this tab colors by (session-local, not in the URL)
     this.engineTabId = tabData.buildEngineTabId && state.hasEngine(tabData.buildEngineTabId) ? tabData.buildEngineTabId : "";
-    containerEl.querySelector(".treemap-build-btn").onclick = (e) => this.showEnginePicker(e.currentTarget);
+    containerEl.querySelector(".treemap-build-btn").onclick = (e) => {
+      e.stopPropagation();
+      this.showEnginePicker(e.currentTarget);
+    };
     this.updateBuildButton();
     this.offEngine?.();
     let reloadTimer = null;

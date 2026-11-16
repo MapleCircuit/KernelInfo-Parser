@@ -151,7 +151,10 @@ export class SectionedView {
       this.persist({ filter: formatChips(chips) });
       this.applyFilter();
     });
-    containerEl.querySelector(".sv-download").onclick = (e) => this.showDownloads(e.currentTarget);
+    containerEl.querySelector(".sv-download").onclick = (e) => {
+      e.stopPropagation();
+      this.showDownloads(e.currentTarget);
+    };
     containerEl.querySelector(".sv-collapse").onclick = () => this.setCollapsed(true);
     containerEl.querySelector(".sv-rail").onclick = () => this.setCollapsed(false);
     const detail = containerEl.querySelector(".sv-detail");
