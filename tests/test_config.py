@@ -731,5 +731,183 @@ class TestProjectFeatureConfig(unittest.TestCase):
         self.assertNotIn("features", loaded["repositories"][1])
 
 
+class TestProjectInsightsConfig(unittest.TestCase):
+    """Canonical per-project Insights definitions, autodetection, overrides, and pruning."""
+
+    def setUp(self) -> None:
+        reset_config()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        reset_config()
+        self.tmp.cleanup()
+
+    def test_insights_defs_and_defaults(self) -> None:
+        from core.config import (
+            DEFAULT_KERNEL_INSIGHTS,
+            DEFAULT_MANPAGES_INSIGHTS,
+            PROJECT_INSIGHTS_DEFS,
+            PROJECT_INSIGHTS_KEYS,
+            default_project_insights,
+        )
+
+        self.assertEqual(len(PROJECT_INSIGHTS_DEFS), 10)
+        self.assertEqual(len(PROJECT_INSIGHTS_KEYS), 10)
+        self.assertTrue(DEFAULT_KERNEL_INSIGHTS["merge_window"])
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["lead_mergers"], ["Linus Torvalds"])
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["maintainers_file"], "MAINTAINERS")
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["catchall_section"], "THE REST")
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["generic_repo_names"], ["linux", "linux-2.6", "kernel"])
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["generic_ref_words"], ["linus", "torvalds", "linux", "next"])
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["milestone_rc"], 1)
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["orphan_min_commits"], 5)
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["health_min_commits"], 10)
+        self.assertEqual(DEFAULT_KERNEL_INSIGHTS["no_review_threshold"], 0.10)
+
+        self.assertFalse(DEFAULT_MANPAGES_INSIGHTS["merge_window"])
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["lead_mergers"], [])
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["maintainers_file"], "")
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["catchall_section"], "")
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["generic_repo_names"], ["man-pages"])
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["generic_ref_words"], ["man", "pages", "next"])
+        self.assertEqual(DEFAULT_MANPAGES_INSIGHTS["milestone_rc"], 0)
+
+        self.assertEqual(default_project_insights("linux"), DEFAULT_KERNEL_INSIGHTS)
+        self.assertEqual(default_project_insights(None), DEFAULT_KERNEL_INSIGHTS)
+        self.assertEqual(default_project_insights("man-pages"), DEFAULT_MANPAGES_INSIGHTS)
+
+    def test_custom_project_insights_defaults(self) -> None:
+        from core.config import default_project_insights
+
+        custom = default_project_insights(
+            "custom-tool",
+            {"name": "custom-tool", "git_url": "https://example.org/git/custom-tool.git"},
+        )
+        self.assertEqual(custom["lead_mergers"], [])
+        self.assertEqual(custom["generic_repo_names"], ["custom-tool"])
+        self.assertEqual(custom["generic_ref_words"], ["custom-tool", "next"])
+        self.assertTrue(custom["merge_window"])
+        self.assertEqual(custom["maintainers_file"], "MAINTAINERS")
+
+    def test_normalize_insights_overrides(self) -> None:
+        from core.config import normalize_insights_overrides
+
+        self.assertEqual(normalize_insights_overrides(None), {})
+        self.assertEqual(normalize_insights_overrides(["lead_mergers"]), {})
+
+        normalized = normalize_insights_overrides({
+            "merge_window": "false",
+            "lead_mergers": "Alice, Bob",
+            "maintainers_file": "  DOCS/MAINTAINERS  ",
+            "milestone_rc": "2",
+            "orphan_min_commits": -5,  # invalid (< 0) -> dropped
+            "health_min_commits": 15,
+            "no_review_threshold": "0.25",
+            "unknown_key": "ignored",
+        })
+        self.assertEqual(normalized["merge_window"], False)
+        self.assertEqual(normalized["lead_mergers"], ["Alice", "Bob"])
+        self.assertEqual(normalized["maintainers_file"], "DOCS/MAINTAINERS")
+        self.assertEqual(normalized["milestone_rc"], 2)
+        self.assertNotIn("orphan_min_commits", normalized)
+        self.assertEqual(normalized["health_min_commits"], 15)
+        self.assertEqual(normalized["no_review_threshold"], 0.25)
+        self.assertNotIn("unknown_key", normalized)
+
+    def test_resolve_and_prune_insights(self) -> None:
+        from core.config import (
+            DEFAULT_KERNEL_INSIGHTS,
+            prune_default_insights_overrides,
+            resolve_repo_insights,
+        )
+
+        entry = {"project": "linux", "insights": {"milestone_rc": 2, "merge_window": True}}
+        resolved = resolve_repo_insights(entry)
+        self.assertEqual(resolved["milestone_rc"], 2)
+        self.assertTrue(resolved["merge_window"])
+        self.assertEqual(resolved["maintainers_file"], DEFAULT_KERNEL_INSIGHTS["maintainers_file"])
+
+        # Prune keeps only milestone_rc since merge_window=True is the default
+        pruned = prune_default_insights_overrides("linux", {"milestone_rc": 2, "merge_window": True})
+        self.assertEqual(pruned, {"milestone_rc": 2})
+
+    def test_detect_repository_insights(self) -> None:
+        from core.config import detect_repository_insights
+
+        repo_path = self.root / "myrepo"
+        _make_git_repo(repo_path, commits=2)
+
+        # Add a MAINTAINERS file with THE REST
+        maint = repo_path / "MAINTAINERS"
+        maint.write_text("THE REST\nM: Alice <alice@example.org>\n")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Alice", "GIT_AUTHOR_EMAIL": "a@a", "GIT_COMMITTER_NAME": "Alice", "GIT_COMMITTER_EMAIL": "a@a"}
+        subprocess.run(["git", "-C", str(repo_path), "add", "MAINTAINERS"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo_path), "commit", "-q", "-m", "add maintainers"], check=True, env=env)
+
+        # Add a branch and merge it with committer Alice
+        subprocess.run(["git", "-C", str(repo_path), "checkout", "-q", "-b", "feature"], check=True, env=env)
+        (repo_path / "feat.txt").write_text("feat\n")
+        subprocess.run(["git", "-C", str(repo_path), "add", "feat.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo_path), "commit", "-q", "-m", "feature commit"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo_path), "checkout", "-q", "main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo_path), "merge", "--no-ff", "-q", "feature", "-m", "merge feature"], check=True, env=env)
+
+        # Add a pre-release tag
+        subprocess.run(["git", "-C", str(repo_path), "tag", "v1.0-rc1"], check=True, env=env)
+
+        detected = detect_repository_insights(repo_path, project_slug="myrepo", default_branch="main")
+        self.assertEqual(detected["maintainers_file"], "MAINTAINERS")
+        self.assertEqual(detected["catchall_section"], "THE REST")
+        self.assertEqual(detected["milestone_rc"], 1)
+        self.assertTrue(detected["merge_window"])
+        self.assertEqual(detected["lead_mergers"], ["Alice"])
+
+    def test_insights_sparse_in_detect_and_normalized_in_merge_and_load(self) -> None:
+        from core.config import (
+            OPTIONAL_REPOSITORY_KEYS,
+            REPOSITORY_KEYS,
+            _merge_repositories,
+            _missing_repo_keys,
+            detect_repository,
+            load_config,
+        )
+
+        self.assertIn("insights", REPOSITORY_KEYS)
+        self.assertIn("insights", OPTIONAL_REPOSITORY_KEYS)
+
+        repo_path = self.root / "linux"
+        _make_git_repo(repo_path, commits=2)
+        entry = detect_repository(repo_path)
+        self.assertNotIn("insights", entry)
+        self.assertEqual(_missing_repo_keys(entry), [])
+
+        merged, _ = _merge_repositories(
+            [
+                {**entry, "insights": {"milestone_rc": 3, "invalid": True}},
+                {**entry, "path": str(repo_path), "insights": {"invalid": True}},
+            ],
+            [repo_path],
+        )
+        self.assertEqual(merged[0]["insights"], {"milestone_rc": 3})
+        self.assertNotIn("insights", merged[1])
+
+        cfg_path = self.root / "config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "repositories": [
+                        {"name": "linux", "path": "repos/linux", "project": "linux", "insights": {"milestone_rc": 2}},
+                        {"name": "empty", "path": "repos/empty", "project": "linux", "insights": {}},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_config(cfg_path)
+        self.assertEqual(loaded["repositories"][0]["insights"], {"milestone_rc": 2})
+        self.assertNotIn("insights", loaded["repositories"][1])
+
+
 if __name__ == "__main__":
     unittest.main()

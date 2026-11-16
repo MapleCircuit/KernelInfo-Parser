@@ -14,6 +14,7 @@ Each backfill takes a database driver (`db`) and returns a summary dict with a `
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
 
@@ -757,3 +758,14 @@ def backfill_mailing_list(
         return {"state": "done", "commits": len(target_commits), "rows": sent, "seconds": progress.seconds}
 
     return guarded("Backfill mailing list", db, run)
+
+
+def backfill_insights(db: Any, repo_dir: str, repo_id: int, from_ref: str | None = None) -> dict[str, Any]:
+    """Backfill merge-window pulls and subsystem health metrics for release segments."""
+
+    def run() -> dict[str, Any]:
+        from parser.git_ast import release_stats
+
+        return release_stats.ingest_insights(db, Path(repo_dir), repo_id, from_tag=from_ref)
+
+    return guarded("Backfill insights", db, run)

@@ -262,8 +262,9 @@ REPOSITORY_KEYS = (
     "branches",
     "tag_views",
     "features",
+    "insights",
 )
-OPTIONAL_REPOSITORY_KEYS = frozenset({"features"})
+OPTIONAL_REPOSITORY_KEYS = frozenset({"features", "insights"})
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
@@ -1049,14 +1050,331 @@ def repo_feature_enabled(entry: dict[str, Any] | None, feature: str) -> bool:
     return bool(resolve_repo_features(entry).get(feature, False))
 
 
+PROJECT_INSIGHTS_DEFS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "merge_window",
+        "type": "bool",
+        "label": "Merge Window",
+        "kernel": True,
+        "man_pages": False,
+        "description": "Show Merge Window sub-tab and analyze first-parent merge pulls",
+    },
+    {
+        "key": "lead_mergers",
+        "type": "list",
+        "label": "Lead Mergers",
+        "kernel": ["Linus Torvalds"],
+        "man_pages": [],
+        "description": "Top-level trunk integrators excluded when attributing pull request senders",
+    },
+    {
+        "key": "maintainers_file",
+        "type": "str",
+        "label": "Maintainers File",
+        "kernel": "MAINTAINERS",
+        "man_pages": "",
+        "description": "Repository-relative path to the MAINTAINERS file for subsystem attribution",
+    },
+    {
+        "key": "catchall_section",
+        "type": "str",
+        "label": "Catch-all Section",
+        "kernel": "THE REST",
+        "man_pages": "",
+        "description": "Umbrella MAINTAINERS section excluded from subsystem health and pull matching",
+    },
+    {
+        "key": "generic_repo_names",
+        "type": "list",
+        "label": "Generic Repo Names",
+        "kernel": ["linux", "linux-2.6", "kernel"],
+        "man_pages": ["man-pages"],
+        "description": "Repository basenames ignored as generic when extracting subsystem tokens from pull URLs",
+    },
+    {
+        "key": "generic_ref_words",
+        "type": "list",
+        "label": "Generic Ref Words",
+        "kernel": ["linus", "torvalds", "linux", "next"],
+        "man_pages": ["man", "pages", "next"],
+        "description": "Project-specific ref stopwords treated as generic branch/tag names in pull requests",
+    },
+    {
+        "key": "milestone_rc",
+        "type": "int",
+        "label": "Merge Window RC",
+        "kernel": 1,
+        "man_pages": 0,
+        "description": "Pre-release candidate number marking merge window closure (1 for -rc1, 0 to disable)",
+    },
+    {
+        "key": "orphan_min_commits",
+        "type": "int",
+        "label": "Orphan Active Min",
+        "kernel": 5,
+        "man_pages": 5,
+        "description": "Minimum commits in window to flag an Orphan/Obsolete section as orphan_active",
+    },
+    {
+        "key": "health_min_commits",
+        "type": "int",
+        "label": "Health Flag Min",
+        "kernel": 10,
+        "man_pages": 10,
+        "description": "Minimum commits in window to evaluate single_author and no_review flags",
+    },
+    {
+        "key": "no_review_threshold",
+        "type": "float",
+        "label": "No-Review Threshold",
+        "kernel": 0.10,
+        "man_pages": 0.10,
+        "description": "Review coverage ratio below which a section is flagged no_review (0.0 to 1.0)",
+    },
+)
+PROJECT_INSIGHTS_KEYS: tuple[str, ...] = tuple(d["key"] for d in PROJECT_INSIGHTS_DEFS)
+_PROJECT_INSIGHTS_KEY_SET: frozenset[str] = frozenset(PROJECT_INSIGHTS_KEYS)
+_PROJECT_INSIGHTS_DEF_BY_KEY: dict[str, dict[str, Any]] = {d["key"]: d for d in PROJECT_INSIGHTS_DEFS}
+DEFAULT_KERNEL_INSIGHTS: dict[str, Any] = {d["key"]: copy.deepcopy(d["kernel"]) for d in PROJECT_INSIGHTS_DEFS}
+DEFAULT_MANPAGES_INSIGHTS: dict[str, Any] = {d["key"]: copy.deepcopy(d["man_pages"]) for d in PROJECT_INSIGHTS_DEFS}
+
+
+def default_project_insights(slug: str | None, entry: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return a copy of the default Insights configuration for project `slug`."""
+    if not is_kernel_project(slug):
+        return copy.deepcopy(DEFAULT_MANPAGES_INSIGHTS)
+    clean_slug = str(slug or "").strip()
+    if not clean_slug or clean_slug == LINUX_PROJECT:
+        return copy.deepcopy(DEFAULT_KERNEL_INSIGHTS)
+
+    cfg = copy.deepcopy(DEFAULT_KERNEL_INSIGHTS)
+    low_slug = clean_slug.lower()
+    names = [low_slug]
+    if isinstance(entry, Mapping):
+        name = str(entry.get("name") or "").strip().lower()
+        if name and name not in names:
+            names.append(name)
+        git_url = str(entry.get("git_url") or "").strip().rstrip("/")
+        if git_url:
+            base = Path(git_url).name
+            if base.endswith(".git"):
+                base = base[:-4]
+            base = base.strip().lower()
+            if base and base not in names:
+                names.append(base)
+    cfg["generic_repo_names"] = names
+    ref_words = [low_slug]
+    if "next" not in ref_words:
+        ref_words.append("next")
+    cfg["generic_ref_words"] = ref_words
+    cfg["lead_mergers"] = []
+    return cfg
+
+
+def normalize_insights_overrides(raw: Any) -> dict[str, Any]:
+    """Validate and normalize a repository's Insights override mapping, dropping invalid entries."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        logger.warning("Ignoring invalid repository insights override (expected dict, got %s)", type(raw).__name__)
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, val in raw.items():
+        if not isinstance(key, str) or key not in _PROJECT_INSIGHTS_KEY_SET:
+            logger.warning("Ignoring unknown repository insights key %r", key)
+            continue
+        spec = _PROJECT_INSIGHTS_DEF_BY_KEY[key]
+        expected_type = spec["type"]
+        if expected_type == "bool":
+            if isinstance(val, bool):
+                normalized[key] = val
+            elif isinstance(val, (int, float)) and val in (0, 1):
+                normalized[key] = bool(val)
+            elif isinstance(val, str) and val.strip().lower() in ("true", "1", "yes", "on"):
+                normalized[key] = True
+            elif isinstance(val, str) and val.strip().lower() in ("false", "0", "no", "off"):
+                normalized[key] = False
+            else:
+                logger.warning("Ignoring non-boolean value %r for repository insights %r", val, key)
+        elif expected_type == "list":
+            if isinstance(val, (list, tuple)):
+                items = [str(x).strip() for x in val if isinstance(x, (str, int, float)) and str(x).strip()]
+                normalized[key] = items
+            elif isinstance(val, str):
+                items = [s.strip() for s in val.split(",") if s.strip()]
+                normalized[key] = items
+            else:
+                logger.warning("Ignoring invalid list value %r for repository insights %r", val, key)
+        elif expected_type == "str":
+            if isinstance(val, str):
+                normalized[key] = val.strip()
+            else:
+                logger.warning("Ignoring non-string value %r for repository insights %r", val, key)
+        elif expected_type == "int":
+            try:
+                if isinstance(val, bool):
+                    raise ValueError("bool is not int")
+                iv = int(val)
+                if iv < 0:
+                    raise ValueError("must be >= 0")
+                normalized[key] = iv
+            except (ValueError, TypeError):
+                logger.warning("Ignoring invalid integer value %r for repository insights %r", val, key)
+        elif expected_type == "float":
+            try:
+                if isinstance(val, bool):
+                    raise ValueError("bool is not float")
+                fv = float(val)
+                if not (0.0 <= fv <= 1.0):
+                    raise ValueError("must be in 0.0..1.0")
+                normalized[key] = round(fv, 4)
+            except (ValueError, TypeError):
+                logger.warning("Ignoring invalid float value %r for repository insights %r", val, key)
+    return normalized
+
+
+def resolve_repo_insights(entry: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Merge default project insights for `entry` with any valid `entry['insights']` overrides."""
+    slug = repository_project(entry) if isinstance(entry, Mapping) else None
+    insights = default_project_insights(slug, entry)
+    if isinstance(entry, Mapping) and "insights" in entry and entry["insights"] is not None:
+        insights.update(normalize_insights_overrides(entry["insights"]))
+    return insights
+
+
+def prune_default_insights_overrides(
+    slug: str | None, overrides: Mapping[str, Any] | None, entry: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return only keys in `normalize_insights_overrides(overrides)` that differ from `default_project_insights(slug, entry)`."""
+    defaults = default_project_insights(slug, entry)
+    normalized = normalize_insights_overrides(overrides)
+    return {k: v for k, v in normalized.items() if v != defaults.get(k)}
+
+
+def detect_repository_insights(
+    repo: Path,
+    project_slug: str | None = None,
+    default_branch: str | None = None,
+    git_url: str | None = None,
+) -> dict[str, Any]:
+    """Autodetect optimal Insights settings for the git repository at `repo`."""
+    repo = Path(repo)
+    branch = default_branch or (detect_default_branch(repo) if repo.exists() and is_git_repository(repo) else None) or "HEAD"
+    root_commit = detect_root_commit(repo, branch) if repo.exists() and is_git_repository(repo) else ""
+    url = git_url if git_url is not None else (_git_out(repo, "config", "--get", "remote.origin.url") if repo.exists() and is_git_repository(repo) else "")
+    effective_slug = project_slug or (
+        MANPAGES_PROJECT
+        if is_manpages_repository(repo.name, url, root_commit)
+        else (LINUX_PROJECT if root_commit == LINUX_ROOT_COMMIT else repo.name)
+    )
+    base = default_project_insights(effective_slug, {"name": repo.name, "project": effective_slug, "git_url": url})
+
+    if repo.exists() and is_git_repository(repo):
+        # 1. Check tags
+        tag_out = _git_out(repo, "tag", "-l")
+        tags = [t.strip() for t in tag_out.splitlines() if t.strip()]
+        if tags:
+            has_pre_rc = any(re.search(r"-(?:rc|pre)\d+$", t, re.I) for t in tags)
+            base["milestone_rc"] = 1 if has_pre_rc else 0
+        else:
+            base["milestone_rc"] = 1 if effective_slug == LINUX_PROJECT else 0
+
+        # 2. Check MAINTAINERS file in branch
+        maint_text = _git_out(repo, "show", f"{branch}:MAINTAINERS")
+        if maint_text.strip():
+            base["maintainers_file"] = "MAINTAINERS"
+            base["catchall_section"] = "THE REST" if "THE REST" in maint_text else ""
+        elif effective_slug != LINUX_PROJECT:
+            base["maintainers_file"] = ""
+            base["catchall_section"] = ""
+
+        # 3. Inspect first-parent history on branch
+        log_out = _git_out(repo, "log", "--first-parent", "-n", "200", "--format=%P%x1f%cn", branch)
+        lines = [line.strip() for line in log_out.splitlines() if line.strip()]
+        if lines:
+            total_commits = len(lines)
+            merge_commits = 0
+            committer_counts: dict[str, int] = {}
+            for line in lines:
+                parts = line.split("\x1f", 1)
+                parents = parts[0].strip().split()
+                committer = parts[1].strip() if len(parts) > 1 else ""
+                if len(parents) >= 2:
+                    merge_commits += 1
+                    if committer and committer.lower() != "github":
+                        committer_counts[committer] = committer_counts.get(committer, 0) + 1
+
+            if merge_commits > 0 or (effective_slug == LINUX_PROJECT and total_commits <= 1):
+                base["merge_window"] = True
+            else:
+                base["merge_window"] = False
+
+            if merge_commits > 0:
+                thresh = max(1, int(merge_commits * 0.25))
+                sorted_committers = [
+                    name for name, count in sorted(committer_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                    if count >= thresh
+                ]
+                if effective_slug == LINUX_PROJECT:
+                    has_linus = any("linus" in c.lower() for c in committer_counts.keys())
+                    if merge_commits < 3 or has_linus:
+                        base["lead_mergers"] = ["Linus Torvalds"]
+                    elif sorted_committers:
+                        base["lead_mergers"] = sorted_committers
+                    else:
+                        base["lead_mergers"] = []
+                else:
+                    base["lead_mergers"] = sorted_committers
+            elif effective_slug == LINUX_PROJECT:
+                base["lead_mergers"] = ["Linus Torvalds"]
+            else:
+                base["lead_mergers"] = []
+
+        # 4. Build generic_repo_names and generic_ref_words
+        if effective_slug == LINUX_PROJECT:
+            base["generic_repo_names"] = ["linux", "linux-2.6", "kernel"]
+            base["generic_ref_words"] = ["linus", "torvalds", "linux", "next"]
+        elif effective_slug == MANPAGES_PROJECT:
+            base["generic_repo_names"] = ["man-pages"]
+            base["generic_ref_words"] = ["man", "pages", "next"]
+        else:
+            url_base = ""
+            if url:
+                ub = Path(url.rstrip("/")).name
+                if ub.endswith(".git"):
+                    ub = ub[:-4]
+                url_base = ub.strip().lower()
+            names = []
+            for candidate in (repo.name.lower(), effective_slug.lower(), url_base):
+                if candidate and candidate not in names:
+                    names.append(candidate)
+            base["generic_repo_names"] = names
+
+            tokens: list[str] = []
+            for src in list(base["generic_repo_names"]) + list(base["lead_mergers"]) + ["next"]:
+                words = re.findall(r"[a-z0-9]+", str(src).lower())
+                for w in words:
+                    if len(w) >= 2 and w not in tokens:
+                        tokens.append(w)
+            base["generic_ref_words"] = tokens
+
+    return normalize_insights_overrides(base)
+
+
 def _normalize_repo_entry_features(entry: dict[str, Any]) -> dict[str, Any]:
-    """Normalize `entry['features']` in place (omitting when empty) and upgrade legacy default `tag_views`."""
+    """Normalize `entry['features']` and `entry['insights']` in place (omitting when empty) and upgrade legacy default `tag_views`."""
     if "features" in entry:
         normalized = normalize_feature_overrides(entry["features"])
         if normalized:
             entry["features"] = normalized
         else:
             entry.pop("features", None)
+    if "insights" in entry:
+        normalized_ins = normalize_insights_overrides(entry["insights"])
+        if normalized_ins:
+            entry["insights"] = normalized_ins
+        else:
+            entry.pop("insights", None)
     if entry.get("tag_views") == _LEGACY_DEFAULT_TAG_VIEWS:
         entry["tag_views"] = copy.deepcopy(DEFAULT_TAG_VIEWS)
     return entry

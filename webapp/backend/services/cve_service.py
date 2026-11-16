@@ -38,6 +38,7 @@ from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and
     parse_record,
     version_status,
 )
+from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services import release_service as rs
 from webapp.backend.services.disk_cache import DiskCache
@@ -50,6 +51,7 @@ SOURCE_TTL = 60.0
 _FULL = re.compile(r"^[0-9a-f]{40}$")
 
 _DISK = DiskCache("cve-index", max_bytes=256 << 20, max_entries=6)
+_PREFETCH_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
 _SOURCE: dict[str, Any] = {"checked": 0.0, "row": None}
 _MEM: dict[str, Any] = {"built_at": None, "records": {}}
 _LOCK = threading.Lock()
@@ -189,13 +191,25 @@ class Context:
 
     def __init__(self, release: str) -> None:
         self.release = release
-        self.p = rs.parse_tag(release)
+        self._rkeys: dict[str, Any] = {}
+        self._ptags: dict[str, Any] = {}
+        self.p = self.parse_tag(release)
         self.version = release[1:] if release.startswith("v") else release
-        self.key = rs.release_key(release)
-        self.base_key = rs.release_key(rs.series_name(self.p["series"])) if self.p else None
+        self.key = self.release_key(release)
+        self.base_key = self.release_key(rs.series_name(self.p["series"])) if self.p else None
         self._tags: dict[str, dict[str, Any] | None] = {}
         self._full: dict[str, str | None] = {}
         self._backports_complete: bool | None = None
+
+    def release_key(self, tag: str) -> Any:
+        if tag not in self._rkeys:
+            self._rkeys[tag] = rs.release_key(tag)
+        return self._rkeys[tag]
+
+    def parse_tag(self, tag: str) -> Any:
+        if tag not in self._ptags:
+            self._ptags[tag] = rs.parse_tag(tag)
+        return self._ptags[tag]
 
     def full(self, sha: str | None) -> str | None:
         if not sha:
@@ -210,16 +224,36 @@ class Context:
         """Load the first tags of many SHAs at once (a report reads ~100k of them). Abbreviated ones are
         resolved first from m_cve_commit_hash (one query; the parser resolves them at CVE ingestion), so
         full() runs `git rev-parse` only for prefixes the database does not hold."""
+        src = source()
+        cache_token = (src["built_at"] if src else 0, rs.release_token())
+        cached_entry = _PREFETCH_CACHE.get(cache_token)
+        if cached_entry is None:
+            cached_full: dict[str, str | None] = {}
+            cached_tags: dict[str, dict[str, Any] | None] = {}
+            _PREFETCH_CACHE[cache_token] = (cached_full, cached_tags)
+        else:
+            cached_full, cached_tags = cached_entry
+
+        self._full.update(cached_full)
+        self._tags.update(cached_tags)
+
         shas = list(dict.fromkeys(s for s in shas if s))
         short = [s for s in shas if not _FULL.match(s) and _HEXSHA.match(s) and s not in self._full]
         if short:
-            self._full.update(stored_prefixes(short))
+            resolved_short = stored_prefixes(short)
+            self._full.update(resolved_short)
+            cached_full.update(resolved_short)
         shas = [self._full.get(s, s) if not _FULL.match(s) else s for s in shas]
         want = [s for s in dict.fromkeys(shas) if s and _FULL.match(s) and s not in self._tags]
-        found = rs.release_lookup(want)
-        for s in want:
-            hit = found.get(s)
-            self._tags[s] = hit if hit and (hit.get("mainline") or hit.get("stable")) else None
+        if want:
+            found = rs.release_lookup(want)
+            new_tags: dict[str, dict[str, Any] | None] = {}
+            for s in want:
+                hit = found.get(s)
+                entry = hit if hit and (hit.get("mainline") or hit.get("stable")) else None
+                self._tags[s] = entry
+                new_tags[s] = entry
+            cached_tags.update(new_tags)
 
     def tags(self, sha: str | None) -> dict[str, Any] | None:
         full = self.full(sha)
@@ -236,10 +270,10 @@ class Context:
             return False
         m, s = t.get("mainline"), t.get("stable")
         if not self.p["stable"]:
-            return bool(m) and rs.release_key(m) <= self.key
-        if m and rs.release_key(m) <= self.base_key:
+            return bool(m) and self.release_key(m) <= self.key
+        if m and self.release_key(m) <= self.base_key:
             return True
-        q = rs.parse_tag(s) if s else None
+        q = self.parse_tag(s) if s else None
         return bool(q) and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]
 
     def applies(self, fix: str) -> bool:
@@ -249,7 +283,7 @@ class Context:
             return True
         if t.get("mainline"):
             return True
-        q = rs.parse_tag(t["stable"]) if t.get("stable") else None
+        q = self.parse_tag(t["stable"]) if t.get("stable") else None
         return bool(self.p and self.p["stable"] and q and q["series"] == self.p["series"])
 
     def first_here(self, sha: str | None) -> bool:
@@ -262,7 +296,7 @@ class Context:
             return False
         if self.p["stable"] or self.p["pre"]:
             return first == self.release
-        q = rs.parse_tag(first)
+        q = self.parse_tag(first)
         return bool(q) and not q["stable"] and q["series"] == self.p["series"]
 
     def _backport_tags(self) -> list[str]:
@@ -270,10 +304,10 @@ class Context:
         for a stable release, its series' stable tags up to it."""
         out = []
         for t in rs.tag_commits():
-            q = rs.parse_tag(t)
+            q = self.parse_tag(t)
             if not q or not self.p:
                 continue
-            if not q["stable"] and rs.release_key(t) <= self.key:
+            if not q["stable"] and self.release_key(t) <= self.key:
                 out.append(t)
             elif self.p["stable"] and q["stable"] and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]:
                 out.append(t)
@@ -387,7 +421,7 @@ def release_report(release: str, progress: Callable | None = None) -> dict[str, 
     counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
     counts["fixed_here"] = sum(1 for r in rows if r["fixed_here"])
     return {"release": release, "head": src["head"], "layout": src["layout"], "kinds": kinds(all_recs),
-            "cves": rows, "counts": counts}
+            "cves": rows, "counts": counts, "source": "database" if rs.db_covers_all() else "git"}
 
 
 def report(release: str, wait: float = 0.0) -> dict[str, Any]:

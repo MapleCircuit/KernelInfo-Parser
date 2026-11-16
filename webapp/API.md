@@ -824,7 +824,7 @@ Shared answers about releases, from Git:
 - **Every project** (the request's repository, `X-KI-Repo`): `tag_commits()` keeps `release_tag_names()` of the
   repository's tags — the kernel scheme's (`vX.Y…`, `next-YYYYMMDD`) when it has any, else every
   `<prefix>X.Y[.Z][-rcN]` release (`man-pages-6.9`, `foo-1.2.3`), the prefix being the tag's family with chains
-  of its own (`parser/git_ast/GIT_API.md` §7). A man-pages or any other tagged repository therefore has a
+  of its own (`parser/git_ast/GIT_API.md` §7) — and caches each tag's commit unix timestamp for `tag_dates()`. A man-pages or any other tagged repository therefore has a
   release index, release statistics and release reports like the kernel; the cache index's ranges come from
   `release_ranges()` (the previous tag of each chain), as the parser's.
 - **Previous release** (`previous`): `v3.1 → v3.0`, `v3.1-rc1 → v3.0`, `v3.1-rc2 → v3.1-rc1`, `v3.0.5 →

@@ -429,6 +429,12 @@ def arg_handling() -> argparse.Namespace:
         help="Execute public-inbox mailing list resolution across commit range into m_commit_email, then exit (core/API.md section 12)",
     )
     parser.add_argument(
+        "--backfill-insights",
+        dest="backfill_insights",
+        action="store_true",
+        help="Backfill pre-computed merge-window pulls (m_release_pull) and subsystem health summaries (m_release_section_health) for release segments.",
+    )
+    parser.add_argument(
         "--no-backfill",
         dest="no_backfill",
         action="store_true",

@@ -10,7 +10,14 @@ let PROJECTS = [];
 export const projectSlug = (p) => String((p && (p.project || p.slug)) || "");
 
 export function setProjects(list) {
-  PROJECTS = Array.isArray(list) ? list.filter((p) => p && p.repo) : [];
+  PROJECTS = Array.isArray(list)
+    ? list
+        .filter((p) => p && p.repo)
+        .map((p) => ({
+          ...p,
+          insights: p.insights && typeof p.insights === "object" ? { ...p.insights } : null,
+        }))
+    : [];
 }
 
 export function projects() {
@@ -60,6 +67,73 @@ export const DEFAULT_MANPAGES_FEATURES = Object.freeze({
   compare: true,
 });
 
+export const DEFAULT_KERNEL_INSIGHTS = Object.freeze({
+  merge_window: true,
+  lead_mergers: Object.freeze(["Linus Torvalds"]),
+  maintainers_file: "MAINTAINERS",
+  catchall_section: "THE REST",
+  generic_repo_names: Object.freeze(["linux", "linux-2.6", "kernel"]),
+  generic_ref_words: Object.freeze(["linus", "torvalds", "linux", "next"]),
+  milestone_rc: 1,
+  orphan_min_commits: 5,
+  health_min_commits: 10,
+  no_review_threshold: 0.10,
+});
+
+export const DEFAULT_MANPAGES_INSIGHTS = Object.freeze({
+  merge_window: false,
+  lead_mergers: Object.freeze([]),
+  maintainers_file: "",
+  catchall_section: "",
+  generic_repo_names: Object.freeze(["man-pages"]),
+  generic_ref_words: Object.freeze(["man", "pages", "next"]),
+  milestone_rc: 0,
+  orphan_min_commits: 5,
+  health_min_commits: 10,
+  no_review_threshold: 0.10,
+});
+
+export function defaultProjectInsights(slug, entry = null) {
+  const s = String(slug || "").trim();
+  if (s === "man-pages") {
+    return {
+      ...DEFAULT_MANPAGES_INSIGHTS,
+      lead_mergers: [...DEFAULT_MANPAGES_INSIGHTS.lead_mergers],
+      generic_repo_names: [...DEFAULT_MANPAGES_INSIGHTS.generic_repo_names],
+      generic_ref_words: [...DEFAULT_MANPAGES_INSIGHTS.generic_ref_words],
+    };
+  }
+  if (!s || s === "linux") {
+    return {
+      ...DEFAULT_KERNEL_INSIGHTS,
+      lead_mergers: [...DEFAULT_KERNEL_INSIGHTS.lead_mergers],
+      generic_repo_names: [...DEFAULT_KERNEL_INSIGHTS.generic_repo_names],
+      generic_ref_words: [...DEFAULT_KERNEL_INSIGHTS.generic_ref_words],
+    };
+  }
+  const lowSlug = s.toLowerCase();
+  const repoNames = [lowSlug];
+  if (entry) {
+    const name = String(entry.name || entry.repo || "").trim().toLowerCase();
+    if (name && !repoNames.includes(name)) repoNames.push(name);
+    const gitUrl = String(entry.git_url || "").trim().replace(/\/+$/, "");
+    if (gitUrl) {
+      let base = gitUrl.split("/").pop() || "";
+      if (base.endsWith(".git")) base = base.slice(0, -4);
+      base = base.trim().toLowerCase();
+      if (base && !repoNames.includes(base)) repoNames.push(base);
+    }
+  }
+  const refWords = [lowSlug];
+  if (!refWords.includes("next")) refWords.push("next");
+  return {
+    ...DEFAULT_KERNEL_INSIGHTS,
+    lead_mergers: [],
+    generic_repo_names: repoNames,
+    generic_ref_words: refWords,
+  };
+}
+
 export const TAB_FEATURE = Object.freeze({
   kconfig: "kconfig",
   api: "api",
@@ -78,6 +152,14 @@ export const TAB_FEATURE = Object.freeze({
 export function repoFeatures(repo) {
   const base = isManPagesRepo(repo) ? DEFAULT_MANPAGES_FEATURES : DEFAULT_KERNEL_FEATURES;
   const overrides = projectOf(repo)?.features;
+  return overrides && typeof overrides === "object" ? { ...base, ...overrides } : { ...base };
+}
+
+export function repoInsights(repo) {
+  const p = projectOf(repo);
+  const slug = p ? projectSlug(p) : (repo === "man-pages" ? "man-pages" : "linux");
+  const base = defaultProjectInsights(slug, p);
+  const overrides = p?.insights;
   return overrides && typeof overrides === "object" ? { ...base, ...overrides } : { ...base };
 }
 

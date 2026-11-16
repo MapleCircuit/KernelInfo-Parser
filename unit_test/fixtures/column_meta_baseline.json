@@ -1304,6 +1304,92 @@
    2
   ]
  },
+ "m_release_pull": {
+  "binary": [
+   2,
+   3,
+   4
+  ],
+  "est_bytes": [
+   4,
+   2,
+   20,
+   20,
+   20,
+   8,
+   4,
+   257,
+   257,
+   257,
+   130,
+   4,
+   257,
+   512,
+   512,
+   2
+  ],
+  "has_auto_increment": false,
+  "large": [
+   13,
+   14
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   15
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_release_section_health": {
+  "binary": [
+   8
+  ],
+  "est_bytes": [
+   4,
+   257,
+   4,
+   66,
+   4,
+   4,
+   2048,
+   2048,
+   20,
+   2
+  ],
+  "has_auto_increment": false,
+  "large": [
+   6,
+   7
+  ],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   8,
+   9
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
  "m_release_segment": {
   "binary": [
    3,

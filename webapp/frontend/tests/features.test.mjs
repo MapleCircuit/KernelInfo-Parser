@@ -21,11 +21,14 @@ globalThis.setTimeout = (...args) => {
 
 const {
   DEFAULT_KERNEL_FEATURES,
+  DEFAULT_KERNEL_INSIGHTS,
   DEFAULT_MANPAGES_FEATURES,
+  DEFAULT_MANPAGES_INSIGHTS,
   hasFeature,
   isTabFeatureEnabled,
   manPagesRepo,
   repoFeatures,
+  repoInsights,
   setProjects,
   tabTypeFeature,
 } = await import("../js/utils/projects.js");
@@ -61,6 +64,36 @@ test("repoFeatures and hasFeature merge per-project overrides over defaults", ()
   assert.equal(hasFeature("man-pages", "api"), false);
   assert.equal(hasFeature("man-pages", "man"), true);
   assert.equal(hasFeature("unknown-repo", "kconfig"), true);
+});
+
+test("repoInsights merges per-project overrides and custom project defaults", () => {
+  setProjects([
+    { repo: "linux", project: "linux", available: true, insights: { milestone_rc: 2 } },
+    { repo: "man-pages", project: "man-pages", available: true },
+    { repo: "custom-tool", project: "custom-tool", available: true, git_url: "https://example.org/git/custom-tool.git" },
+  ]);
+
+  assert.equal(DEFAULT_KERNEL_INSIGHTS.merge_window, true);
+  assert.equal(DEFAULT_KERNEL_INSIGHTS.milestone_rc, 1);
+  assert.deepEqual(DEFAULT_KERNEL_INSIGHTS.lead_mergers, ["Linus Torvalds"]);
+  assert.equal(DEFAULT_MANPAGES_INSIGHTS.merge_window, false);
+  assert.equal(DEFAULT_MANPAGES_INSIGHTS.milestone_rc, 0);
+
+  const linuxIns = repoInsights("linux");
+  assert.equal(linuxIns.milestone_rc, 2);
+  assert.equal(linuxIns.merge_window, true);
+  assert.deepEqual(linuxIns.lead_mergers, ["Linus Torvalds"]);
+
+  const manIns = repoInsights("man-pages");
+  assert.equal(manIns.merge_window, false);
+  assert.equal(manIns.milestone_rc, 0);
+  assert.deepEqual(manIns.lead_mergers, []);
+
+  const customIns = repoInsights("custom-tool");
+  assert.equal(customIns.merge_window, true);
+  assert.deepEqual(customIns.lead_mergers, []);
+  assert.deepEqual(customIns.generic_repo_names, ["custom-tool"]);
+  assert.deepEqual(customIns.generic_ref_words, ["custom-tool", "next"]);
 });
 
 test("manPagesRepo only selects a man-pages repo with man feature enabled", () => {

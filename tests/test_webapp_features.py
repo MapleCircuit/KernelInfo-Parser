@@ -9,7 +9,14 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from core.config import DEFAULT_KERNEL_FEATURES, DEFAULT_MANPAGES_FEATURES, PROJECT_FEATURE_KEYS
+from core.config import (
+    DEFAULT_KERNEL_FEATURES,
+    DEFAULT_KERNEL_INSIGHTS,
+    DEFAULT_MANPAGES_FEATURES,
+    DEFAULT_MANPAGES_INSIGHTS,
+    PROJECT_FEATURE_KEYS,
+    PROJECT_INSIGHTS_KEYS,
+)
 from webapp.backend import config as backend_config
 from webapp.backend.routers import (
     commits,
@@ -84,6 +91,7 @@ class TestWebappFeatureGating(unittest.TestCase):
             "project": "linux",
             "path": str(self.linux_dir),
             "features": {"kconfig": False, "docs": False},
+            "insights": {"milestone_rc": 3},
         })
         self.repos[1]["features"] = {"kconfig": True}
 
@@ -100,6 +108,21 @@ class TestWebappFeatureGating(unittest.TestCase):
 
         expected_custom = {**DEFAULT_KERNEL_FEATURES, "kconfig": False, "docs": False}
         self.assertEqual(by_name["custom-kernel"]["features"], expected_custom)
+
+        self.assertEqual(set(by_name["linux"]["insights"].keys()), set(PROJECT_INSIGHTS_KEYS))
+        self.assertEqual(by_name["linux"]["insights"], DEFAULT_KERNEL_INSIGHTS)
+        self.assertEqual(by_name["man-pages"]["insights"], DEFAULT_MANPAGES_INSIGHTS)
+        self.assertEqual(by_name["custom-kernel"]["insights"]["milestone_rc"], 3)
+
+    def test_config_insights_helpers(self) -> None:
+        self.assertEqual(backend_config.get_active_insights_config(), DEFAULT_KERNEL_INSIGHTS)
+        token = backend_config.set_active_repository("man-pages")
+        try:
+            self.assertEqual(backend_config.get_active_insights_config(), DEFAULT_MANPAGES_INSIGHTS)
+            custom_entry = {"project": "linux", "insights": {"milestone_rc": 5}}
+            self.assertEqual(backend_config.get_active_insights_config(custom_entry)["milestone_rc"], 5)
+        finally:
+            backend_config.reset_active_repository(token)
 
     def test_config_feature_helpers(self) -> None:
         token = backend_config.set_active_repository("man-pages")

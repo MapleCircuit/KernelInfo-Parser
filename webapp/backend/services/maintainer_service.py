@@ -608,14 +608,28 @@ class MaintainerService:
 
             person_id = person["person_id"]
             pid_to_key, key_members = self._identity_index(reader)
-            alias_ids = key_members.get(pid_to_key.get(int(person_id), ""), [int(person_id)])
+            alias_ids = list(key_members.get(pid_to_key.get(int(person_id), ""), [int(person_id)]))
+
+            vid, vname = get_version_info(reader, version_name)
+            sec_ids, credit_ids = self._version_scope(reader, vid, vname)
+
+            p_email = safe_decode(person["email"]) or ""
+            if not stripped_id.isdigit() and p_email:
+                same_email_pids = [
+                    int(pid)
+                    for pid in reader.select_values(
+                        "m_maintainer_person", "person_id", {"email": p_email}, order_by=["person_id"]
+                    )
+                ]
+                for ep in same_email_pids:
+                    for aid in key_members.get(pid_to_key.get(ep, ""), [ep]):
+                        if aid not in alias_ids:
+                            alias_ids.append(aid)
+
             alias_emails = [
                 safe_decode(v)
                 for v in reader.select_values("m_maintainer_person", "email", {"person_id": alias_ids}, order_by=["person_id"])
             ]
-
-            vid, vname = get_version_info(reader, version_name)
-            sec_ids, credit_ids = self._version_scope(reader, vid, vname)
 
             # Maintained sections
             seen_sec_names = set()
@@ -641,13 +655,29 @@ class MaintainerService:
                 })
             sections.sort(key=lambda s: s["name"].lower())
 
-            # CREDITS entry (newest revision across aliases)
+            # CREDITS entry (newest revision across aliases, falling back to same-email person rows)
             credit = reader.select_one(
                 "m_credits_entry",
                 ["web_page", "pgp_key", "description", "snail_mail"],
                 {"person_id": alias_ids, "credit_id": _ids(credit_ids)},
                 order_by=["-credit_id"],
             )
+            if credit is None:
+                valid_emails = [e for e in ([safe_decode(person["email"])] + alias_emails) if e]
+                if valid_emails:
+                    email_pids = [
+                        int(pid)
+                        for pid in reader.select_values(
+                            "m_maintainer_person", "person_id", {"email": valid_emails}
+                        )
+                    ]
+                    if email_pids:
+                        credit = reader.select_one(
+                            "m_credits_entry",
+                            ["web_page", "pgp_key", "description", "snail_mail"],
+                            {"person_id": email_pids, "credit_id": _ids(credit_ids)},
+                            order_by=["-credit_id"],
+                        )
 
             p_dict = {
                 "person_id": person_id,

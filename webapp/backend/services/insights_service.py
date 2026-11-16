@@ -6,6 +6,7 @@ cached on disk per (repository, release commit, parameters): a released tag neve
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -20,12 +21,16 @@ from fastapi import HTTPException
 from db_engine.spec import Agg, Join, NotExists, Value, gt
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.release_order import release_ranges
-from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
+from webapp.backend.config import RepoScopedCache, get_active_insights_config, get_active_repo_name, get_repo_dir
 from webapp.backend.services import release_service as rs
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
 
 logger = logging.getLogger(__name__)
+
+
+def _insights_cfg() -> dict[str, Any]:
+    return get_active_insights_config()
 
 REPORT_FORMAT = 2  # 2: source, first-timers only for mainline, identities once per commit
 MW_FORMAT = 5  # merge-window: 5 resolves sender across body variants, parent tip committers, and tree fallbacks
@@ -138,6 +143,10 @@ def _top(counter: Counter, names: dict[str, tuple[str, str]], total: int) -> lis
              "share": round(n / total, 4) if total else 0} for k, n in top]
 
 
+def _text(value: Any) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value or "")
+
+
 def _tag_meta(tag: str, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """{prev, days, rc_count} of a release: tag metadata, read from Git (milliseconds)."""
     if tag == rs.LATEST_RELEASE:
@@ -158,14 +167,94 @@ def _tag_meta(tag: str, *, latest: dict[str, Any] | None = None) -> dict[str, An
     tags = rs.tag_commits()
     days = None
     if prev_name:
-        try:
-            at = {t: int((rs._git(["log", "-1", "--format=%ct", tags[t]]) or "").strip()) for t in (tag, prev_name)}
-            days = round((at[tag] - at[prev_name]) / 86400)
-        except (ValueError, KeyError):
-            days = None
+        td = rs.tag_dates()
+        if tag in td and prev_name in td and td[tag] and td[prev_name]:
+            days = round((td[tag] - td[prev_name]) / 86400)
+        else:
+            try:
+                at = {t: int((rs._git(["log", "-1", "--format=%ct", tags[t]]) or "").strip()) for t in (tag, prev_name)}
+                days = round((at[tag] - at[prev_name]) / 86400)
+            except (ValueError, KeyError):
+                days = None
     series = rs.parse_tag(tag)["series"]
     rc_count = sum(1 for t in tags if (p := rs.parse_tag(t)) and p["series"] == series and p["pre"])
     return {"prev": prev_name, "days": days, "rc_count": rc_count}
+
+
+def _db_authors_before(tag_or_prev: str | None, family: str) -> set[str] | None:
+    """When tag_or_prev is a release tag, checks if m_release_segment covers all mainline release tags of
+    family at or before tag_or_prev at release_stats.FORMAT. If so, returns prior author identities from DB."""
+    if not tag_or_prev:
+        return set()
+    tags = rs.tag_commits()
+    if tag_or_prev not in tags:
+        return None
+    target_key = rs.release_key(tag_or_prev)
+    prior_tags = [
+        t for t in rs.releases("mainline")
+        if (p := rs.parse_tag(t)) and p["family"] == family and rs.release_key(t) <= target_key
+    ]
+    if not prior_tags:
+        return set()
+    try:
+        from parser.git_ast import release_stats
+        from webapp.backend.database.helpers import get_active_repo_id
+        from webapp.backend.database.pool import get_reader
+        from webapp.backend.services.maintainer_service import MaintainerService
+
+        with get_reader() as cur:
+            repo_id = get_active_repo_id(cur)
+            stored_rows = cur.select_rows(
+                "m_release_segment",
+                ["segment_id", "tag", "tag_hash", "chain", "format"],
+                {"repo_id": repo_id, "tag": prior_tags},
+            )
+            stored_by_tag: dict[str, Any] = {_text(r["tag"]): r for r in stored_rows}
+            sids: list[int] = []
+            for t in prior_tags:
+                row = stored_by_tag.get(t)
+                if not row:
+                    return None
+                if int(row["chain"]) != release_stats.CHAIN_MAINLINE:
+                    return None
+                if int(row["format"]) != release_stats.FORMAT:
+                    return None
+                if bytes(row["tag_hash"]).hex() != tags.get(t):
+                    return None
+                sids.append(int(row["segment_id"]))
+
+            pids: set[int] = set()
+            for i in range(0, len(sids), 1000):
+                chunk = sids[i:i + 1000]
+                first_rows = cur.select_rows(
+                    "m_person_first_release",
+                    ["person_id"],
+                    {"repo_id": repo_id, "segment_id": chunk},
+                )
+                for fr in first_rows:
+                    pids.add(int(fr["person_id"]))
+
+            if not pids:
+                return set()
+
+            pid_to_key, _ = MaintainerService._identity_index(cur)
+            missing = [p for p in pids if p not in pid_to_key]
+            missing_persons: dict[int, tuple[str, str]] = {}
+            for i in range(0, len(missing), 1000):
+                part = missing[i:i + 1000]
+                for pr in cur.select_rows("m_maintainer_person", ["person_id", "name", "email"], {"person_id": part}):
+                    missing_persons[int(pr["person_id"])] = (_text(pr["name"]), _text(pr["email"]))
+
+            prior_author_keys: set[str] = set()
+            for p in pids:
+                if p in pid_to_key:
+                    prior_author_keys.add(pid_to_key[p])
+                elif p in missing_persons:
+                    prior_author_keys.add(identity(*missing_persons[p]))
+            return prior_author_keys
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("DB author history before %s unavailable: %s", tag_or_prev, exc)
+        return None
 
 
 def _report(tag: str, source: str, *, commits: int, merges: int, diffstat: tuple[int | None, int, int],
@@ -223,7 +312,16 @@ def compute_release_stats(tag: str, progress: Callable | None = None, *, latest:
     m_files = re.search(r"(\d+) files? changed", stat)
     m_add = re.search(r"(\d+) insertions?", stat)
     m_del = re.search(r"(\d+) deletions?", stat)
-    first_seen = author_first_seen(progress, family, head=first_head) if mainline else {}
+    prior_authors: set[str] | None = None
+    first_seen: dict[str, int] = {}
+    if mainline:
+        prev_tag = info["prev"] if info is not None else rs.previous(tag)
+        prior_authors = _db_authors_before(prev_tag, family) if prev_tag else set()
+        if prior_authors is None:
+            if info is not None and info.get("prev_sha"):
+                first_seen = author_first_seen(progress, family, head=info["prev_sha"])
+            else:
+                first_seen = author_first_seen(progress, family, head=first_head)
     names: dict[str, tuple[str, str]] = {}
     authors: Counter = Counter()
     roles = {k: Counter() for k in _ROLE_NAMES.values()}
@@ -248,7 +346,15 @@ def compute_release_stats(tag: str, progress: Callable | None = None, *, latest:
                     continue  # the author's own sign-off; an identity once per commit
                 seen.add(k)
                 roles[role][k] += 1
-    first_timers = [k for k, t in earliest.items() if k in first_seen and first_seen[k] >= t] if mainline else None
+    if mainline:
+        if prior_authors is not None:
+            first_timers = [k for k in authors if k not in prior_authors]
+        elif info is not None and info.get("prev_sha"):
+            first_timers = [k for k in earliest if k not in first_seen or first_seen[k] >= earliest[k]]
+        else:
+            first_timers = [k for k, t in earliest.items() if k in first_seen and first_seen[k] >= t]
+    else:
+        first_timers = None
     return _report(tag, "git", commits=len(commits), merges=merges,
                    diffstat=(int(m_files.group(1)) if m_files else None, int(m_add.group(1)) if m_add else 0,
                              int(m_del.group(1)) if m_del else 0),
@@ -407,10 +513,6 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
                    authors=authors, roles=roles, names=names, employers=employers, first_timers=first_timers)
 
 
-def _text(value: Any) -> str:
-    return value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value or "")
-
-
 def _check_release(tag: str) -> None:
     if tag == rs.LATEST_RELEASE:
         rs.latest_info()
@@ -449,13 +551,16 @@ def release_stats_series(tags: list[str]) -> list[dict[str, Any]]:
     for tag in tags[:40]:
         if tag not in rs.tag_commits():
             continue
-        hit = db_release_stats(tag) if rs.parse_tag(tag) else None
+        ck = _stats_key(tag)
+        hit = _DISK.get(ck)
+        if hit is None and rs.parse_tag(tag):
+            hit = db_release_stats(tag)
+            if hit is not None:
+                _DISK.put(ck, hit)
         if hit is None:
-            hit = _DISK.get(_stats_key(tag))
-            if hit is None:
-                release_stats(tag)
-                out.append({"release": tag, "pending": True})
-                continue
+            release_stats(tag)
+            out.append({"release": tag, "pending": True})
+            continue
         out.append({"release": tag, "commits": hit["commits"], "authors": hit["authors"],
                     "first_time_authors": hit["first_time_authors"], "days": hit["days"]})
     return out
@@ -573,6 +678,9 @@ def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]
     """Load MAINTAINERS sections and matcher for `tag`, falling back to `git show <sha>:MAINTAINERS` when unparsed."""
     from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
     from parser.maintainer_ast.maintainer_parser import MaintainerParser
+    maint_file = str(_insights_cfg().get("maintainers_file", "MAINTAINERS") or "").strip()
+    if not maint_file:
+        return [], MaintainerMatcher([])
     sections: list[Any] = []
     matcher: Any = None
     try:
@@ -583,7 +691,7 @@ def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]
     if not sections:
         rev = sha or tag
         try:
-            text = _git(["show", f"{rev}:MAINTAINERS"], timeout=30)
+            text = _git(["show", f"{rev}:{maint_file}"], timeout=30)
             if text.strip():
                 sections = MaintainerParser(text).parse()
                 matcher = MaintainerMatcher(sections)
@@ -597,11 +705,17 @@ def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]
 class _PullSectionResolver:
     """Resolve a merge pull request's MAINTAINERS section via T: tree URL, changed files/dirs, and maintainer."""
 
-    def __init__(self, sections: list[Any], matcher: Any) -> None:
+    def __init__(self, sections: list[Any], matcher: Any, insights_cfg: dict[str, Any] | None = None) -> None:
         from parser.maintainer_ast.maintainer_types import MaintainerRole
 
+        cfg = insights_cfg if insights_cfg is not None else _insights_cfg()
+        self.catchall_section = str(cfg.get("catchall_section", "THE REST") or "")
+        self.lead_mergers = [m.strip().lower() for m in (cfg.get("lead_mergers") or []) if m and str(m).strip()]
+        self.generic_repo_names = {str(n).strip().lower() for n in (cfg.get("generic_repo_names") or ("linux", "linux-2.6", "kernel")) if n}
+        self.ref_stopwords = set(_REF_STOPWORDS) | {str(w).strip().lower() for w in (cfg.get("generic_ref_words") or ()) if w}
+
         self.matcher = matcher
-        self.sections = [s for s in sections if s.name != "THE REST"]
+        self.sections = [s for s in sections if not self.catchall_section or s.name != self.catchall_section]
         self.by_name: dict[str, Any] = {s.name: s for s in self.sections}
         self.tree_map: dict[str, list[Any]] = defaultdict(list)
         self.owner_trees: dict[str, set[str]] = defaultdict(set)
@@ -668,19 +782,43 @@ class _PullSectionResolver:
                         weights[sec_name] = max(weights.get(sec_name, 0), w)
         return weights
 
-    @staticmethod
-    def _ref_tokens(ref: str, subject: str, url: str = "") -> set[str]:
+    def _is_lead_merger(self, name: str) -> bool:
+        if not name:
+            return False
+        n = name.lower()
+        return any(lm in n for lm in self.lead_mergers)
+
+    def _ref_tokens(
+        *args: Any,
+        generic_repo_names: set[str] | None = None,
+        ref_stopwords: set[str] | None = None,
+        **kwargs: Any,
+    ) -> set[str]:
+        if args and isinstance(args[0], _PullSectionResolver):
+            self = args[0]
+            ref = args[1] if len(args) > 1 else kwargs.get("ref", "")
+            subject = args[2] if len(args) > 2 else kwargs.get("subject", "")
+            url = args[3] if len(args) > 3 else kwargs.get("url", "")
+            gen_names = self.generic_repo_names if generic_repo_names is None else generic_repo_names
+            stopwords = self.ref_stopwords if ref_stopwords is None else ref_stopwords
+        else:
+            ref = args[0] if len(args) > 0 else kwargs.get("ref", "")
+            subject = args[1] if len(args) > 1 else kwargs.get("subject", "")
+            url = args[2] if len(args) > 2 else kwargs.get("url", "")
+            gen_names = {"linux", "linux-2.6", "kernel"} if generic_repo_names is None else generic_repo_names
+            stopwords = set(_REF_STOPWORDS) if ref_stopwords is None else ref_stopwords
+
         parts = [ref or subject or ""]
         if url:
             repo_seg = url.strip().rstrip("/").rsplit("/", 1)[-1]
             if repo_seg.lower().endswith(".git"):
                 repo_seg = repo_seg[:-4]
-            if repo_seg and repo_seg.lower() not in ("linux", "linux-2.6", "kernel"):
+            if repo_seg and repo_seg.lower() not in gen_names:
                 parts.append(repo_seg)
         out = set()
         for src in parts:
             for tok in re.split(r"[^a-z0-9]+", src.lower()):
-                if len(tok) < 2 or tok in _REF_STOPWORDS or tok.isdigit():
+                if len(tok) < 2 or tok in stopwords or tok.isdigit():
                     continue
                 if re.fullmatch(r"v?\d+|rc\d*", tok):
                     continue
@@ -725,15 +863,15 @@ class _PullSectionResolver:
             s = tree_cands[0]
             return {"sec_id": s.sec_id, "name": s.name}
 
-        # Collect candidate people (pull sender, non-Linus committer on local merges, tag Signed-off-by)
+        # Collect candidate people (pull sender, non-lead merger on local merges, tag Signed-off-by)
         people: list[tuple[str, str]] = []
-        if sender and "linus torvalds" not in sender.lower():
+        if sender and not self._is_lead_merger(sender):
             people.append((sender, sender_email))
-        if not url and committer and "linus torvalds" not in committer.lower():
+        if not url and committer and not self._is_lead_merger(committer):
             people.append((committer, committer_email))
         if not people:
             for sob_name, sob_email in _SIGNED_OFF_RE.findall(body or ""):
-                if "linus torvalds" not in sob_name.lower():
+                if not self._is_lead_merger(sob_name):
                     people.append((sob_name, sob_email))
         maint_w = self.maintainer_weights(people)
 
@@ -741,7 +879,7 @@ class _PullSectionResolver:
         if self.matcher and changed_paths:
             for path in changed_paths:
                 for s in self.matcher.match_file(path):
-                    if s.name != "THE REST":
+                    if not self.catchall_section or s.name != self.catchall_section:
                         file_counts[s.name] += 1
 
         ref_toks = self._ref_tokens(ref, subject, url)
@@ -856,6 +994,123 @@ def _fallback_sender(
     return (p2_name or committer), p2_email
 
 
+def _batch_pull_commit_counts(
+    parsed_merges: list[tuple[dict[str, Any], list[str], dict[str, str], str]],
+    span: list[str],
+    prev: str | None,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    try:
+        out = rs._git(["rev-list", "--parents", *span], timeout=60)
+        if not out:
+            return counts
+        parents_map: dict[str, list[str]] = {}
+        non_merges: set[str] = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            c = parts[0]
+            ps = parts[1:]
+            parents_map[c] = ps
+            if len(ps) < 2:
+                non_merges.add(c)
+
+        mainline_seen: set[str] = set()
+        if prev:
+            mainline_seen.add(prev)
+        curr: str | None = span[0]
+        while curr and curr in parents_map:
+            mainline_seen.add(curr)
+            ps = parents_map[curr]
+            curr = ps[0] if ps else None
+
+        chronological = sorted(parsed_merges, key=lambda item: item[0]["date"])
+
+        for m, parents, _, _ in chronological:
+            p0, p1 = parents[0], parents[1]
+            m_sha = m["sha"]
+            if p1 in mainline_seen:
+                counts[m_sha] = 0
+                mainline_seen.add(m_sha)
+                continue
+
+            queue = [p1]
+            visited = {p1}
+            pull_non_merges = 0
+            fallback = False
+
+            while queue:
+                node = queue.pop(0)
+                if node in mainline_seen:
+                    continue
+                if node in non_merges:
+                    pull_non_merges += 1
+                node_parents = parents_map.get(node)
+                if node_parents is None:
+                    if prev is not None and node != prev:
+                        fallback = True
+                        break
+                    continue
+                for pr in node_parents:
+                    if pr not in visited:
+                        visited.add(pr)
+                        queue.append(pr)
+
+            if fallback:
+                c_str = rs._git(["rev-list", "--count", "--no-merges", p1, f"^{p0}"], timeout=60)
+                try:
+                    counts[m_sha] = int((c_str or "0").strip() or 0)
+                except ValueError:
+                    counts[m_sha] = 0
+            else:
+                counts[m_sha] = pull_non_merges
+
+            mainline_seen.add(m_sha)
+            mainline_seen.update(visited)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("batch pull commit counts failed: %s", exc)
+    return counts
+
+
+def _batch_pull_dirstats(span: list[str]) -> dict[str, list[dict[str, Any]]]:
+    batch_dirs: dict[str, list[dict[str, Any]]] = {}
+    try:
+        out = rs._git(["log", "--first-parent", "--merges", "-m", "--dirstat=files,3,cumulative", "--format=%x1e%H", *span], timeout=60)
+        for chunk in (out or "").split("\x1e"):
+            lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            sha = lines[0]
+            dirs: list[dict[str, Any]] = []
+            for line in lines[1:9]:
+                pct, _, d = line.partition("% ")
+                if d:
+                    try:
+                        dirs.append({"dir": d.strip(), "percent": float(pct)})
+                    except ValueError:
+                        pass
+            batch_dirs[sha] = dirs
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("batch pull dirstats failed: %s", exc)
+    return batch_dirs
+
+
+def _batch_pull_changed_files(span: list[str]) -> dict[str, list[str]]:
+    batch_files: dict[str, list[str]] = {}
+    try:
+        out = rs._git(["log", "--first-parent", "--merges", "-m", "--no-renames", "--format=%x1e%H", "--name-only", *span], timeout=60)
+        for chunk in (out or "").split("\x1e"):
+            lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            sha = lines[0]
+            batch_files[sha] = lines[1:]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("batch pull changed files failed: %s", exc)
+    return batch_files
+
+
 def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     info = (latest or rs.latest_info()) if tag == rs.LATEST_RELEASE else None
     if info is not None:
@@ -870,14 +1125,22 @@ def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: 
         merges = rs.merges_now(tag)
         tags = rs.tag_commits()
         p = rs.parse_tag(tag)
-        rc1 = next((t for t in tags if (q := rs.parse_tag(t)) and q["series"] == p["series"] and q["pre"] == 1), None)
+        milestone_rc = int(_insights_cfg().get("milestone_rc", 1))
+        rc1 = next((t for t in tags if (q := rs.parse_tag(t)) and q["series"] == p["series"] and q["pre"] == milestone_rc), None) if milestone_rc > 0 else None
         rc1_sha = tags.get(rc1) if rc1 else None
         prev_name = rs.previous(tag)
         maint_rev = tag
-    start_s = (rs._git(["log", "-1", "--format=%ct", prev], timeout=10) or "").strip() if prev else ""
-    start = int(start_s) if start_s.isdigit() else 0
-    rc1_s = (rs._git(["log", "-1", "--format=%ct", rc1_sha], timeout=10) or "").strip() if rc1_sha else ""
-    rc1_at = int(rc1_s) if rc1_s.isdigit() else None
+    td = rs.tag_dates()
+    if prev_name and prev_name in td and td[prev_name]:
+        start = td[prev_name]
+    else:
+        start_s = (rs._git(["log", "-1", "--format=%ct", prev], timeout=10) or "").strip() if prev else ""
+        start = int(start_s) if start_s.isdigit() else 0
+    if rc1 and rc1 in td and td[rc1]:
+        rc1_at = td[rc1]
+    else:
+        rc1_s = (rs._git(["log", "-1", "--format=%ct", rc1_sha], timeout=10) or "").strip() if rc1_sha else ""
+        rc1_at = int(rc1_s) if rc1_s.isdigit() else None
     sections, matcher = _load_maintainers(maint_rev, sha)
     resolver = _PullSectionResolver(sections, matcher)
     parsed_merges: list[tuple[dict[str, Any], list[str], dict[str, str], str]] = []
@@ -895,20 +1158,35 @@ def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: 
     from webapp.backend.services.commit_facts import commit_ids
     ids = commit_ids([m["sha"] for m, _, _, _ in parsed_merges])
     threads = _pull_threads(list(ids.values()))
+
+    span = [sha] + ([f"^{prev}"] if prev else [])
+    batch_counts: dict[str, int] = {}
+    batch_dirs: dict[str, list[dict[str, Any]]] = {}
+    batch_files: dict[str, list[str]] = {}
+    if len(parsed_merges) >= 2:
+        batch_counts = _batch_pull_commit_counts(parsed_merges, span, prev)
+        batch_dirs = _batch_pull_dirstats(span)
+        if resolver.sections and any(len(resolver.tree_candidates(pull["url"]) if pull["url"] else []) != 1 for _, _, pull, _ in parsed_merges):
+            batch_files = _batch_pull_changed_files(span)
+
     pulls = []
     total = len(parsed_merges)
     for i, (m, parents, pull, body_sender) in enumerate(parsed_merges):
         if progress and i % 20 == 0:
             progress(i, total, "pulls")
-        count = int((_git(["rev-list", "--count", "--no-merges", parents[1], f"^{parents[0]}"], timeout=60) or "0").strip() or 0)
-        dirs = []
-        try:
-            for line in _git(["diff", "--dirstat=files,3,cumulative", parents[0], m["sha"]], timeout=60).splitlines()[:8]:
-                pct, _, d = line.strip().partition("% ")
-                if d:
-                    dirs.append({"dir": d.strip(), "percent": float(pct)})
-        except RuntimeError:
-            pass
+        count = batch_counts.get(m["sha"])
+        if count is None:
+            count = int((_git(["rev-list", "--count", "--no-merges", parents[1], f"^{parents[0]}"], timeout=60) or "0").strip() or 0)
+        dirs = batch_dirs.get(m["sha"])
+        if dirs is None:
+            dirs = []
+            try:
+                for line in _git(["diff", "--dirstat=files,3,cumulative", parents[0], m["sha"]], timeout=60).splitlines()[:8]:
+                    pct, _, d = line.strip().partition("% ")
+                    if d:
+                        dirs.append({"dir": d.strip(), "percent": float(pct)})
+            except RuntimeError:
+                pass
         tree_cands = resolver.tree_candidates(pull["url"]) if pull["url"] else []
         p2_name, p2_email = p2_committers.get(parents[1], ("", ""))
         sender, sender_email = _fallback_sender(
@@ -923,7 +1201,10 @@ def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: 
         if len(tree_cands) == 1:
             sec = {"sec_id": tree_cands[0].sec_id, "name": tree_cands[0].name}
         else:
-            paths = _changed_files(parents[0], m["sha"]) if resolver.sections else []
+            if m["sha"] in batch_files:
+                paths = batch_files[m["sha"]]
+            else:
+                paths = _changed_files(parents[0], m["sha"]) if resolver.sections else []
             if not paths and dirs:
                 paths = [d["dir"] for d in dirs]
             sec = resolver.resolve(
@@ -950,7 +1231,7 @@ def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: 
         if pl["day"] is not None:
             by_day[int(pl["day"])] += pl["commits"]
     out = {
-        "release": tag, "prev": prev_name, "rc1": rc1, "rc1_day": round((rc1_at - start) / 86400, 1) if rc1_at and start else None,
+        "release": tag, "prev": prev_name, "source": "git", "rc1": rc1, "rc1_day": round((rc1_at - start) / 86400, 1) if rc1_at and start else None,
         "pulls": pulls,
         "totals": {"pulls": len(pulls), "commits": sum(x["commits"] for x in pulls),
                    "before_rc1": sum(1 for x in pulls if not x["after_rc1"]),
@@ -960,6 +1241,144 @@ def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: 
         out["branch"] = info["branch"]
         out["head"] = info["sha"]
     return out
+
+
+def db_merge_window(tag: str) -> dict[str, Any] | None:
+    """The merge-window report from m_release_pull (read only), or None when unparsed or format differs."""
+    if tag == rs.LATEST_RELEASE:
+        return None
+    try:
+        from webapp.backend.database.helpers import get_active_repo_id
+        from webapp.backend.database.pool import get_reader
+
+        tags = rs.tag_commits()
+        prev_name = rs.previous(tag)
+        with get_reader() as cur:
+            repo_id = get_active_repo_id(cur)
+            seg = cur.select_one(
+                "m_release_segment",
+                ["segment_id", "tag_hash", "diff_base_tag"],
+                {"repo_id": repo_id, "tag": tag},
+            )
+            if not seg:
+                return None
+            if bytes(seg["tag_hash"]).hex() != tags.get(tag):
+                return None
+            if _text(seg["diff_base_tag"]) != (prev_name or ""):
+                return None
+            segment_id = int(seg["segment_id"])
+            rows = cur.select_rows(
+                "m_release_pull",
+                ["pull_idx", "merge_hash", "p1_hash", "p2_hash", "merge_date", "commits", "subject",
+                 "source_url", "ref_name", "sender", "sec_id", "sec_name", "dirs_json", "body", "format"],
+                {"segment_id": segment_id},
+                order_by=["pull_idx"],
+            )
+            if not rows or any(int(r["format"]) != MW_FORMAT for r in rows):
+                return None
+
+            td = rs.tag_dates()
+            if prev_name and prev_name in td and td[prev_name]:
+                start = td[prev_name]
+            else:
+                prev_sha = tags.get(prev_name) if prev_name else None
+                start_s = (rs._git(["log", "-1", "--format=%ct", prev_sha], timeout=10) or "").strip() if prev_sha else ""
+                start = int(start_s) if start_s.isdigit() else 0
+
+            milestone_rc = int(_insights_cfg().get("milestone_rc", 1))
+            p = rs.parse_tag(tag)
+            rc1 = next((t for t in tags if (q := rs.parse_tag(t)) and q["series"] == p["series"] and q["pre"] == milestone_rc), None) if milestone_rc > 0 else None
+            rc1_sha = tags.get(rc1) if rc1 else None
+            if rc1 and rc1 in td and td[rc1]:
+                rc1_at = td[rc1]
+            else:
+                rc1_s = (rs._git(["log", "-1", "--format=%ct", rc1_sha], timeout=10) or "").strip() if rc1_sha else ""
+                rc1_at = int(rc1_s) if rc1_s.isdigit() else None
+
+            if len(rows) == 1 and (int(rows[0]["pull_idx"]) == 65535 or bytes(rows[0]["merge_hash"]) == b"\x00" * 20):
+                pulls = []
+            else:
+                from webapp.backend.services.commit_facts import commit_ids
+                cids = commit_ids([bytes(r["merge_hash"]).hex() for r in rows])
+                threads = _pull_threads(list(cids.values()))
+
+                sec_name_to_id: dict[str, int] = {}
+                if any(_text(r["sec_name"]) and int(r["sec_id"] or 0) == 0 for r in rows):
+                    try:
+                        if cur.row_exists("m_git_ref", {"repo_id": repo_id, "ref_name": tag}):
+                            from webapp.backend.services.maintainer_service import MaintainerService
+                            m_sections, _ = MaintainerService().get_maintainer_data(tag)
+                            sec_name_to_id = {s.name: s.sec_id for s in m_sections if getattr(s, "sec_id", None) is not None}
+                    except Exception:
+                        pass
+
+                pulls = []
+                for r in rows:
+                    m_sha = bytes(r["merge_hash"]).hex()
+                    p1_sha = bytes(r["p1_hash"]).hex()
+                    p2_sha = bytes(r["p2_hash"]).hex()
+                    m_date = int(r["merge_date"])
+                    dirs_raw = _text(r["dirs_json"])
+                    dirs = []
+                    parents = [p1_sha, p2_sha]
+                    if dirs_raw:
+                        try:
+                            parsed_dirs = json.loads(dirs_raw)
+                            if isinstance(parsed_dirs, dict):
+                                dirs = parsed_dirs.get("dirs") or []
+                                if parsed_dirs.get("parents"):
+                                    parents = parsed_dirs["parents"]
+                            elif isinstance(parsed_dirs, list):
+                                dirs = parsed_dirs
+                        except Exception:
+                            pass
+                    sec_name = _text(r["sec_name"])
+                    sec_id = int(r["sec_id"] or 0)
+                    if not sec_id and sec_name in sec_name_to_id:
+                        sec_id = sec_name_to_id[sec_name]
+                    sec = {"sec_id": sec_id or None, "name": sec_name} if sec_name else None
+                    day = round((m_date - start) / 86400, 1) if start else None
+                    after_rc1 = bool(rc1_at and m_date > rc1_at)
+                    thread = threads.get(cids.get(m_sha))
+                    pulls.append({
+                        "merge": m_sha,
+                        "parents": parents,
+                        "date": m_date,
+                        "day": day,
+                        "after_rc1": after_rc1,
+                        "subject": _text(r["subject"]),
+                        "source_url": _text(r["source_url"]),
+                        "ref": _text(r["ref_name"]),
+                        "sender": _text(r["sender"]),
+                        "commits": int(r["commits"]),
+                        "dirs": dirs,
+                        "section": sec,
+                        "thread": thread,
+                        "body": _text(r["body"])[:3000] if r["body"] else "",
+                    })
+
+            by_day: Counter = Counter()
+            for pl in pulls:
+                if pl["day"] is not None:
+                    by_day[int(pl["day"])] += pl["commits"]
+
+            return {
+                "release": tag,
+                "prev": prev_name,
+                "source": "database",
+                "rc1": rc1,
+                "rc1_day": round((rc1_at - start) / 86400, 1) if rc1_at and start else None,
+                "pulls": pulls,
+                "totals": {
+                    "pulls": len(pulls),
+                    "commits": sum(x["commits"] for x in pulls),
+                    "before_rc1": sum(1 for x in pulls if not x["after_rc1"]),
+                    "by_day": [{"day": d, "commits": by_day[d]} for d in sorted(by_day)],
+                },
+            }
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("db_merge_window of %s failed: %s", tag, exc)
+        return None
 
 
 def _sender(body: str) -> str:
@@ -1008,6 +1427,9 @@ def merge_window(tag: str, wait: float = 0.0) -> dict[str, Any]:
         return _job(f"insights:{ck}", lambda p, _info=info: compute_merge_window(tag, p, latest=_info), ck, wait)
     if not rs.parse_tag(tag)["final"]:
         raise HTTPException(status_code=400, detail="A merge window belongs to a release (vX.Y, <prefix>X.Y), not to an -rc or a stable update.")
+    hit = db_merge_window(tag)
+    if hit is not None:
+        return {"state": "done", "result": hit}
     sha = rs.tag_commits()[tag]
     ck = f"{get_active_repo_name()}|mw|{MW_FORMAT}|{sha}"
     return _job(f"insights:{ck}", lambda p: compute_merge_window(tag, p), ck, wait)
@@ -1028,16 +1450,20 @@ def bus_factor(counts: list[int]) -> int:
     return len(counts)
 
 
-def flags_for(sec: dict[str, Any]) -> list[str]:
+def flags_for(sec: dict[str, Any], insights_cfg: dict[str, Any] | None = None) -> list[str]:
+    cfg = insights_cfg if insights_cfg is not None else _insights_cfg()
+    orphan_min = int(cfg.get("orphan_min_commits", 5))
+    health_min = int(cfg.get("health_min_commits", 10))
+    no_rev_thresh = float(cfg.get("no_review_threshold", 0.10))
     f = []
     status = (sec.get("status") or "").lower()
     if sec["commits"] == 0:
         f.append("no_activity")
-    if status.startswith(("orphan", "obsolete")) and sec["commits"] >= 5:
+    if status.startswith(("orphan", "obsolete")) and sec["commits"] >= orphan_min:
         f.append("orphan_active")
-    if sec["commits"] >= 10 and sec["bus_factor"] == 1:
+    if sec["commits"] >= health_min and sec["bus_factor"] == 1:
         f.append("single_author")
-    if sec["commits"] >= 10 and sec["review_coverage"] < 0.10:
+    if sec["commits"] >= health_min and sec["review_coverage"] < no_rev_thresh:
         f.append("no_review")
     if sec["commits"] and sec["maintainers"] and not any(m.get("last_active") for m in sec["maintainers"]):
         f.append("silent_maintainers")
@@ -1066,9 +1492,31 @@ def _health_window(tag: str, window: int, *, latest: dict[str, Any] | None = Non
     return finals[-window:]
 
 
+def _section_pattern_hash(sec: Any) -> bytes:
+    pats = getattr(sec, "patterns", ()) or ()
+    tokens = sorted(
+        f"{int(getattr(p, 'pat_type', 0))}:{str(getattr(p, 'pattern', '')).strip().lstrip('/')}"
+        for p in pats
+    )
+    return hashlib.sha1("\n".join(tokens).encode("utf-8")).digest()
+
+
+def _sections_manifest_hash(sections: list[Any], catchall: str = "THE REST") -> bytes:
+    parts = []
+    for s in sections:
+        if catchall and s.name == catchall:
+            continue
+        pat_h = _section_pattern_hash(s).hex()
+        status = getattr(s, "status", "") or ""
+        parts.append(f"{s.name}\x1f{status}\x1f{pat_h}")
+    parts.sort()
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).digest()
+
+
 def _aggregate_health(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                       commits: Callable[[str], Any], file_secs: dict[str, list[str]] | None = None,
-                      progress: Callable | None = None) -> dict[str, Any]:
+                      progress: Callable | None = None,
+                      precomputed: dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]] | None = None) -> dict[str, Any]:
     """The report rows from each release's commits ({date, author, email, trailers, files}); shared by the Git
     and database paths, so both build exactly the same rows. `file_secs` may hold the sections of some paths
     already (path -> section names, THE REST left out); the others are matched with MAINTAINERS."""
@@ -1078,14 +1526,29 @@ def _aggregate_health(tag: str, tags: list[str], sections: list[Any], matcher: A
     per_release: dict[str, Counter] = defaultdict(Counter)
     reviewed: Counter = Counter()
     file_secs = dict(file_secs or {})
+    catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
     for ti, t in enumerate(tags):
         if progress:
             progress(ti, len(tags), f"commits of {t}")
+        if precomputed and t in precomputed:
+            t_data = precomputed[t]
+            for sec_name, (sec_commits, sec_reviewed, auth_dict, act_dict) in t_data.items():
+                if catchall and sec_name == catchall:
+                    continue
+                for auth, c_cnt in auth_dict.items():
+                    author_counts[sec_name][auth] += c_cnt
+                per_release[sec_name][t] += sec_commits
+                reviewed[sec_name] += sec_reviewed
+                for k, ts in act_dict.items():
+                    if ts > people[sec_name].get(k, 0):
+                        people[sec_name][k] = ts
+            continue
+
         for c in commits(t):
             secs: set[str] = set()
             for f in c["files"]:
                 if f not in file_secs:
-                    file_secs[f] = [s.name for s in matcher.match_file(f) if s.name != "THE REST"]
+                    file_secs[f] = [s.name for s in matcher.match_file(f) if not catchall or s.name != catchall]
                 secs.update(file_secs[f])
             if not secs:
                 continue
@@ -1104,7 +1567,7 @@ def _aggregate_health(tag: str, tags: list[str], sections: list[Any], matcher: A
     out = []
     for sec in sections:
         name = sec.name
-        if name == "THE REST":
+        if catchall and name == catchall:
             continue
         counts = author_counts.get(name, Counter())
         n = sum(counts.values())
@@ -1149,12 +1612,171 @@ def compute_subsystem_health(tag: str, window: int, progress: Callable | None = 
         if hit is not None:
             return hit
 
+    # Even when latest is in tags or some tags are uncovered, check DB coverage for non-latest tags
+    db_precomputed: dict[str, dict[str, Any]] = {}
+    db_commits: dict[str, list[dict[str, Any]]] = {}
+    db_file_secs: dict[str, list[str]] = {}
+    non_latest = [t for t in tags if t != rs.LATEST_RELEASE]
+    if non_latest:
+        try:
+            from parser.git_ast import release_stats
+            from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
+            from webapp.backend.database.pool import get_reader
+
+            catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
+            active_sections = [s for s in sections if not catchall or s.name != catchall]
+            sec_pat_hashes = {s.name: _section_pattern_hash(s) for s in active_sections}
+            manifest_hash = _sections_manifest_hash(sections, catchall)
+            tc = rs.tag_commits()
+
+            with get_reader() as cur:
+                repo_id = get_active_repo_id(cur)
+                network_id = get_active_network_id(cur)
+                unanswered: list[str] = []
+                for t in non_latest:
+                    if t not in tc:
+                        continue
+                    prev = rs.previous(t)
+                    seg = cur.select_one(
+                        "m_release_segment",
+                        ["segment_id", "tag_hash", "diff_base_tag", "format"],
+                        {"repo_id": repo_id, "tag": t},
+                    )
+                    if (
+                        not seg
+                        or int(seg["format"]) != release_stats.FORMAT
+                        or bytes(seg["tag_hash"]).hex() != tc.get(t)
+                        or _text(seg["diff_base_tag"]) != (prev or "")
+                    ):
+                        unanswered.append(t)
+                        continue
+                    try:
+                        h_rows = cur.select_rows(
+                            "m_release_section_health",
+                            ["sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
+                            {"segment_id": int(seg["segment_id"])},
+                        )
+                    except Exception:
+                        h_rows = None
+                    if not h_rows or any(int(r["format"]) != HEALTH_FORMAT for r in h_rows):
+                        unanswered.append(t)
+                        continue
+                    sentinel = next((r for r in h_rows if _text(r["sec_name"]) == ""), None)
+                    if sentinel is None:
+                        unanswered.append(t)
+                        continue
+                    sentinel_pat = bytes(sentinel["pat_hash"])
+                    by_name = {_text(r["sec_name"]): r for r in h_rows if _text(r["sec_name"]) != ""}
+                    valid = True
+                    for s in active_sections:
+                        if s.name in by_name:
+                            if bytes(by_name[s.name]["pat_hash"]) != sec_pat_hashes[s.name]:
+                                valid = False
+                                break
+                        else:
+                            if sentinel_pat != manifest_hash:
+                                valid = False
+                                break
+                    if not valid:
+                        unanswered.append(t)
+                        continue
+                    t_data: dict[str, Any] = {}
+                    for sec_n, r in by_name.items():
+                        t_data[sec_n] = (
+                            int(r["commits"]),
+                            int(r["reviewed_commits"]),
+                            json.loads(_text(r["authors_json"]) or "{}"),
+                            json.loads(_text(r["activity_json"]) or "{}"),
+                        )
+                    db_precomputed[t] = t_data
+
+                # For unanswered non-latest tags, try health_coverage
+                if unanswered and network_id is not None:
+                    cov = health_coverage(cur, unanswered)
+                    if cov is not None:
+                        names: dict[int, str] = {}
+                        fnids_seen: set[int] = set()
+                        for t in unanswered:
+                            segs = cov[t]
+                            source, joins, where = _release_commit_source(network_id, repo_id, segs)
+                            fetched_rows = cur.select_rows(
+                                source,
+                                {"commit_id": "c.commit_id", "author_date": "c.author_date", "committer_date": "c.committer_date",
+                                 "name": "p.name", "email": "p.email"},
+                                where,
+                                joins=[*joins, Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left")],
+                            )
+                            fetched = sorted(fetched_rows, key=lambda r: (int(r["committer_date"] or 0), int(r["commit_id"])), reverse=True)
+                            c_dict = {int(r["commit_id"]): {"date": int(r["author_date"] or 0), "author": safe_decode(r["name"]) or "",
+                                                             "email": (safe_decode(r["email"]) or "").lower(), "trailers": {}, "fnids": set()}
+                                      for r in fetched}
+                            ids = sorted(c_dict)
+                            for i in range(0, len(ids), HEALTH_CHUNK):
+                                part = ids[i:i + HEALTH_CHUNK]
+                                for r in cur.select_rows("m_commit_file", ["commit_id", "fnid", "old_fnid"], {"commit_id": part}):
+                                    c = c_dict[int(r["commit_id"])]
+                                    for f in (int(r["fnid"] or 0), int(r["old_fnid"] or 0)):
+                                        if f > 0:
+                                            c["fnids"].add(f)
+                                roles = [int(x) for x in HEALTH_ROLES]
+                                for r in cur.select_rows(
+                                    ("m_bridge_commit_person", "b"),
+                                    {"commit_id": "b.commit_id", "role_type": "b.role_type", "name": "p.name", "email": "p.email"},
+                                    {"b.commit_id": part, "b.role_type": roles},
+                                    joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "b.person_id"})],
+                                ):
+                                    role = HEALTH_ROLES[CommitRole(int(r["role_type"]))]
+                                    c_dict[int(r["commit_id"])]["trailers"].setdefault(role, []).append(
+                                        [safe_decode(r["name"]) or "", (safe_decode(r["email"]) or "").lower()])
+                            db_commits[t] = list(c_dict.values())
+                            for c in db_commits[t]:
+                                fnids_seen |= c["fnids"]
+
+                        missing = sorted(fnids_seen)
+                        for i in range(0, len(missing), HEALTH_CHUNK):
+                            part = missing[i:i + HEALTH_CHUNK]
+                            names.update({
+                                int(r["fnid"]): safe_decode(r["fname"])
+                                for r in cur.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part})
+                            })
+                        sec_name = {s.sec_id: s.name for s in sections if (not catchall or s.name != catchall) and isinstance(s.sec_id, int)}
+                        sec_ids = sorted(sec_name)
+                        if sec_ids:
+                            try:
+                                for i in range(0, len(missing), HEALTH_CHUNK):
+                                    part = missing[i:i + HEALTH_CHUNK]
+                                    for r in cur.select_rows("m_maintainer_file", ["fnid", "sec_id"], {"fnid": part, "sec_id": sec_ids}):
+                                        path = names.get(int(r["fnid"]))
+                                        if path is not None:
+                                            db_file_secs.setdefault(path, []).append(sec_name[int(r["sec_id"])])
+                            except Exception:
+                                pass
+                        for t, rows in db_commits.items():
+                            for c in rows:
+                                c["files"] = sorted(names[f] for f in c.pop("fnids") if f in names)
+        except Exception as exc:
+            logger.debug("partial DB health lookup failed: %s", exc)
+
     def _commits(t: str) -> list[dict[str, Any]]:
+        if t in db_commits:
+            return db_commits[t]
         if t == rs.LATEST_RELEASE and info is not None:
             return rs.release_commits_now(t, range_override=(info["prev_sha"], info["sha"]))
         return _release_pass(t)
 
-    report = {**_aggregate_health(tag, tags, sections, matcher, _commits, progress=progress), "source": "git"}
+    report = {
+        **_aggregate_health(
+            tag,
+            tags,
+            sections,
+            matcher,
+            _commits,
+            file_secs=db_file_secs,
+            progress=progress,
+            precomputed=db_precomputed,
+        ),
+        "source": "git",
+    }
     if info is not None:
         report["branch"] = info["branch"]
         report["head"] = info["sha"]
@@ -1201,23 +1823,106 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                    progress: Callable | None = None) -> dict[str, Any] | None:
     """The report from the database (read only), or None when it does not cover the window (health_coverage()).
 
-    Commits of each release's segments without a second parent (`git log --no-merges`), their authors, their
-    m_commit_file paths, new and old name (`--no-renames` lists both sides of a rename) and their trailers
-    (m_bridge_commit_person: reviewed, acked, signed-off, tested), HEALTH_CHUNK commits per query. A path's
-    sections come from m_maintainer_file for the tag's sections when it has rows there (files of the tag's
-    tree), else from MAINTAINERS like the Git path (files no longer in the tree)."""
+    Pre-computed rows from m_release_section_health are read directly when format and pattern hashes match.
+    Other releases are read via m_commit, m_commit_file, and m_bridge_commit_person."""
+    from parser.git_ast import release_stats
     from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
     from webapp.backend.database.pool import get_reader
+
+    catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
+    active_sections = [s for s in sections if not catchall or s.name != catchall]
+    sec_pat_hashes = {s.name: _section_pattern_hash(s) for s in active_sections}
+    manifest_hash = _sections_manifest_hash(sections, catchall)
+    tc = rs.tag_commits()
+
+    precomputed: dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]] = {}
+    unanswered_tags: list[str] = []
+
     with get_reader() as cur:
-        cov = health_coverage(cur, tags)
+        repo_id = get_active_repo_id(cur)
+        network_id = get_active_network_id(cur)
+        if repo_id is None:
+            return None
+
+        # Check m_release_section_health for each tag in tags
+        for t in tags:
+            if t == rs.LATEST_RELEASE or t not in tc:
+                unanswered_tags.append(t)
+                continue
+            prev = rs.previous(t)
+            seg = cur.select_one(
+                "m_release_segment",
+                ["segment_id", "tag_hash", "diff_base_tag", "format"],
+                {"repo_id": repo_id, "tag": t},
+            )
+            if (
+                not seg
+                or int(seg["format"]) != release_stats.FORMAT
+                or bytes(seg["tag_hash"]).hex() != tc.get(t)
+                or _text(seg["diff_base_tag"]) != (prev or "")
+            ):
+                unanswered_tags.append(t)
+                continue
+
+            try:
+                health_rows = cur.select_rows(
+                    "m_release_section_health",
+                    ["sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
+                    {"segment_id": int(seg["segment_id"])},
+                )
+            except Exception:
+                health_rows = None
+            if not health_rows or any(int(r["format"]) != HEALTH_FORMAT for r in health_rows):
+                unanswered_tags.append(t)
+                continue
+
+            sentinel = next((r for r in health_rows if _text(r["sec_name"]) == ""), None)
+            if sentinel is None:
+                unanswered_tags.append(t)
+                continue
+
+            sentinel_pat = bytes(sentinel["pat_hash"])
+            by_name = {_text(r["sec_name"]): r for r in health_rows if _text(r["sec_name"]) != ""}
+            valid = True
+            for s in active_sections:
+                if s.name in by_name:
+                    if bytes(by_name[s.name]["pat_hash"]) != sec_pat_hashes[s.name]:
+                        valid = False
+                        break
+                else:
+                    if sentinel_pat != manifest_hash:
+                        valid = False
+                        break
+
+            if not valid:
+                unanswered_tags.append(t)
+                continue
+
+            t_data: dict[str, tuple[int, int, dict[str, int], dict[str, int]]] = {}
+            for sec_n, r in by_name.items():
+                c_num = int(r["commits"])
+                rev_num = int(r["reviewed_commits"])
+                auth_dict = json.loads(_text(r["authors_json"]) or "{}")
+                act_dict = json.loads(_text(r["activity_json"]) or "{}")
+                t_data[sec_n] = (c_num, rev_num, auth_dict, act_dict)
+            precomputed[t] = t_data
+
+        if not unanswered_tags:
+            report = _aggregate_health(tag, tags, sections, matcher, lambda t: [], progress=progress, precomputed=precomputed)
+            return {**report, "source": "database"}
+
+        if network_id is None:
+            return None
+
+        # Try health_coverage for unanswered tags
+        cov = health_coverage(cur, unanswered_tags)
         if cov is None:
             return None
-        network_id = get_active_network_id(cur)
-        repo_id = get_active_repo_id(cur)
+
         names: dict[int, str] = {}
         by_tag: dict[str, list[dict[str, Any]]] = {}
         fnids_seen: set[int] = set()
-        for t in tags:
+        for t in unanswered_tags:
             segs = cov[t]
             source, joins, where = _release_commit_source(network_id, repo_id, segs)
             fetched_rows = cur.select_rows(
@@ -1227,8 +1932,6 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                 where,
                 joins=[*joins, Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"}, "left")],
             )
-            # In `git log` order (newest commit first; the parser registers parents before children), so ties
-            # among top authors break the same way as on the Git path
             fetched = sorted(fetched_rows, key=lambda r: (int(r["committer_date"] or 0), int(r["commit_id"])), reverse=True)
             commits = {int(r["commit_id"]): {"date": int(r["author_date"] or 0), "author": safe_decode(r["name"]) or "",
                                              "email": (safe_decode(r["email"]) or "").lower(), "trailers": {}, "fnids": set()}
@@ -1256,6 +1959,7 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                 fnids_seen |= c["fnids"]
             if progress:
                 progress(tags.index(t), len(tags), f"database: commits of {t}")
+
         missing = sorted(fnids_seen)
         for i in range(0, len(missing), HEALTH_CHUNK):
             part = missing[i:i + HEALTH_CHUNK]
@@ -1263,8 +1967,7 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                 int(r["fnid"]): safe_decode(r["fname"])
                 for r in cur.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part})
             })
-        # Sections of the tag's tree files from D01's mapping (THE REST left out)
-        sec_name = {s.sec_id: s.name for s in sections if s.name != "THE REST" and isinstance(s.sec_id, int)}
+        sec_name = {s.sec_id: s.name for s in sections if (not catchall or s.name != catchall) and isinstance(s.sec_id, int)}
         file_secs: dict[str, list[str]] = {}
         sec_ids = sorted(sec_name)
         if sec_ids:
@@ -1278,11 +1981,13 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
             except Exception as exc:  # noqa: BLE001 - MAINTAINERS matches every path
                 logger.debug("m_maintainer_file unavailable: %s", exc)
                 file_secs = {}
-    for t, rows in by_tag.items():
-        for c in rows:
-            c["files"] = sorted(names[f] for f in c.pop("fnids") if f in names)
-    report = _aggregate_health(tag, tags, sections, matcher, lambda t: by_tag[t], file_secs, progress)
-    return {**report, "source": "database"}
+
+        for t, rows in by_tag.items():
+            for c in rows:
+                c["files"] = sorted(names[f] for f in c.pop("fnids") if f in names)
+
+        report = _aggregate_health(tag, tags, sections, matcher, lambda t: by_tag.get(t, []), file_secs, progress, precomputed=precomputed)
+        return {**report, "source": "database"}
 
 
 def subsystem_health(tag: str, window: int = 4, wait: float = 0.0) -> dict[str, Any]:

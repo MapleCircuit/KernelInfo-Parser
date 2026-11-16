@@ -25,23 +25,23 @@ agents.
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L848-L870]
   - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L871-L891]
 - 6. End-to-End Inter-Module Execution Lifecycle [L892-L1039]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1040-L1398]
-  - 7.1. Unified Configuration Hierarchy [L1042-L1135]
-  - 7.1.1. Repository Auto-Detection & Selection [L1136-L1201]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1202-L1252]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1253-L1297]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1298-L1398]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1399-L1650]
-  - 8.1. High-Level Architecture [L1401-L1444]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1445-L1470]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1471-L1650]
-- 9. CVE List Ingestion (`parser/cve/`) [L1651-L1684]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1685-L1745]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1746-L1880]
-  - 11.1. Architecture & Roles [L1752-L1807]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1808-L1848]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1849-L1880]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1881-L1918]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1040-L1404]
+  - 7.1. Unified Configuration Hierarchy [L1042-L1141]
+  - 7.1.1. Repository Auto-Detection & Selection [L1142-L1207]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1208-L1258]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1259-L1303]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1304-L1404]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1405-L1656]
+  - 8.1. High-Level Architecture [L1407-L1450]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1451-L1476]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1477-L1656]
+- 9. CVE List Ingestion (`parser/cve/`) [L1657-L1690]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1691-L1752]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1753-L1887]
+  - 11.1. Architecture & Roles [L1759-L1814]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1815-L1855]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1856-L1887]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1888-L1927]
 <!-- toc:end -->
 
 ---
@@ -534,7 +534,7 @@ For authoritative table definitions, primary keys, indexes, and the full relatio
 - **Git Commit DAG & Lineage** (Tables 21–25, 30–33, 43, 60, 63–64): `m_commit`, `m_bridge_commit_person`, `m_commit_file`, `m_bridge_commit_tag`, `m_moved_tag`, `m_git_network`, `m_repository`, `m_git_ref`, `m_commit_parent`, `m_commit_email`, `m_commit_release`, `m_commit_relation`, `m_commit_link`.
 - **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`.
 - **Ingestion State, Watermarks & Checkpoints** (Tables 29, 35, 40–41, 47, 55–58): `m_db_instance`, `m_ingest_state`, `m_ingest_watermark`, `m_ingest_blob`, `m_checkpoint_base`, `m_table_sequence`, `m_ingest_id_range`, `m_parse_node`, `m_parse_task`. Table 58 `m_parse_task` coordinates distributed secondary work: `(task_id, network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name, base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg)`, with unique key `(network_id, ref_name)`.
-- **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`.
+- **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59, 66–67): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`, `m_release_pull`, `m_release_section_health`.
 - **CVE Catalogs & Tracking** (Tables 49–51, 62, 65): `m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_commit_hash`, `m_cve_file`. Table 65 `m_cve_file` maps CVE records to affected kernel source and header file paths: `(cve_id, file_path)`, indexed by `file_path`.
 
 > [!NOTE]
@@ -1092,9 +1092,12 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `root_commit`, `start_ref` (default: `detect_start_ref()`), `enabled`, `branch_filter` (`{"include": ["*"],
     "exclude": ["*rc*"]}`), `branches` (persisted list of active branch short names), `tag_views` (custom
     branch dropdown view entries configuring regex grouping rules for tag layouts, defaulting to
-    `DEFAULT_TAG_VIEWS`), optionally `"default": true`, and optionally `"features"` (sparse `{key: bool}`
+    `DEFAULT_TAG_VIEWS`), optionally `"default": true`, optionally `"features"` (sparse `{key: bool}`
     map overriding project defaults for keys in `PROJECT_FEATURE_KEYS`, omitted when empty via
-    `OPTIONAL_REPOSITORY_KEYS` / `_normalize_repo_entry_features()`).
+    `OPTIONAL_REPOSITORY_KEYS` / `_normalize_repo_entry_features()`), and optionally `"insights"` (sparse
+    per-repository override map for keys in `PROJECT_INSIGHTS_KEYS`: `merge_window`, `lead_mergers`,
+    `maintainers_file`, `catchall_section`, `generic_repo_names`, `generic_ref_words`, `milestone_rc`,
+    `orphan_min_commits`, `health_min_commits`, `no_review_threshold`; omitted when empty).
   - `"logging"`: File logging configuration (`core/logging_setup.py`), disabled by default, with two target
     sub-sections:
     - `"parser"`: `enabled` (default `false`), `dir` (default `""`, relative to `REPO_ROOT`), `file` (default
@@ -1126,10 +1129,13 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   `update_repository_branches(name_or_path, write=True)`, `project_display_name(slug)`,
   `is_kernel_project(slug)`, `repository_project(entry)`, `is_manpages_repository(name, git_url, root_commit)`,
   `default_project_features(slug)`, `normalize_feature_overrides(raw)`, `resolve_repo_features(entry)`,
-  `prune_default_feature_overrides(slug, overrides)`, `repo_feature_enabled(entry, feature)`.
+  `prune_default_feature_overrides(slug, overrides)`, `repo_feature_enabled(entry, feature)`,
+  `default_project_insights(slug, entry=None)`, `normalize_insights_overrides(raw)`, `resolve_repo_insights(entry)`,
+  `prune_default_insights_overrides(slug, overrides, entry=None)`, `detect_repository_insights(repo, project_slug=None, default_branch=None, git_url=None)`.
   Constants: `DEFAULT_CONFIG`, `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`,
   `OPTIONAL_REPOSITORY_KEYS`, `PROJECT_FEATURE_DEFS`, `PROJECT_FEATURE_KEYS`, `DEFAULT_KERNEL_FEATURES`,
-  `DEFAULT_MANPAGES_FEATURES`, `VALID_LOG_LEVELS`, `VALID_WEBAPP_REQUEST_MODES`, `LINUX_PROJECT`,
+  `DEFAULT_MANPAGES_FEATURES`, `PROJECT_INSIGHTS_DEFS`, `PROJECT_INSIGHTS_KEYS`, `DEFAULT_KERNEL_INSIGHTS`,
+  `DEFAULT_MANPAGES_INSIGHTS`, `VALID_LOG_LEVELS`, `VALID_WEBAPP_REQUEST_MODES`, `LINUX_PROJECT`,
   `MANPAGES_PROJECT`, `PROJECT_DISPLAY_NAMES`, `NON_KERNEL_PROJECTS`, `MANPAGES_ROOT_COMMIT`,
   `MANPAGES_BRANCH_FILTER`, `MANPAGES_TAG_VIEWS`.
 
@@ -1277,7 +1283,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     - **Clean partial runs** (`C`): lists the `interrupted` versions (`DBSnapshot.cleanable_versions()`, one per network and commit; on a highlighted interrupted row it first asks `This version` / `All interrupted (N)` / `Cancel`), shows a preview naming the database and each version (`Clean` / `Cancel`, default `Cancel`), and requires `CLEAN` typed exactly. `clean_versions(db, versions)` then re-reads each version's state row and skips it when it is no longer `INGEST_PARSING` or its worker heartbeats again, runs `ingest_state.clean_interrupted_version()` for the rest, reports the method or error per version, and the snapshot reloads. `in_progress` and `legacy` versions are never cleaned.
   - **Git helpers (`core/tui/git_ops.py`)**: `list_version_tags(repo, include_pre_releases=True)` (release tags matching the kernel `VERSION_TAG_RE`, else, in a repository without any, its prefixed releases from `release_order.release_tag_names()` in `release_key()` order (`man-pages-X.Y[.Z][-rcN]`, `foo-1.2.3`); kernel tags use `git tag --sort=v:refname` with `-rc`/`-pre` version-sort suffixes, `-tree` tags excluded), `list_remotes()`, `add_remote()` / `remove_remote()` (validated by `is_valid_remote_name()` and `is_valid_remote_url()`, which accepts only `https://` and `git://` URLs), `clone_command()` / `fetch_command(repo, remote=None)` (argv builders; `remote=None` fetches `--all`, always with `--tags`), `DEFAULT_LINUX_URL` (torvalds tree), `DEFAULT_MANPAGES_URL` (Linux man-pages, `DEFAULT_MANPAGES_DIRNAME` `man-pages`), `DEFAULT_CVE_URL` (CVE Program `cvelistV5`) / `KERNEL_CVE_URL` (kernel CNA `vulns.git`) with `DEFAULT_CVE_DIRNAME`, `is_valid_repo_dirname()` / `repo_dirname_from_url()` (directory names for clones under `workspace.repos_dir`), and `STANDARD_REMOTES` (`stable`, `linux-next`, `net`, `net-next`, `tip`, `mm`, `bpf-next`, `rt-devel`, `rust`). `git_env()` sets `GIT_TERMINAL_PROMPT=0` so git never prompts on the terminal curses owns.
   - **Streaming process view (`core/tui/process_view.py`)**: `run_streaming_command(stdscr, argv, title, cwd=None, env=None, wait_for_key=True)` runs a child (stdin `/dev/null`, stdout and stderr merged into a pipe, own session), reads it on a thread, and repaints the last lines every 100 ms (`stdscr.timeout(100)`, restored to blocking on return). A carriage return makes the next text replace the current line, so git progress counters update in place. `Esc`/`c` asks `Keep Running` / `Stop`; `Stop` terminates (then kills after 5 s). It returns `ProcessResult(returncode, cancelled, lines, error)` (`ok` when the exit code is 0 and it was not cancelled) and, with `wait_for_key`, waits for a key on a success/failure footer.
-  - `RepositoriesScreen`, `RepoDetailScreen`, & `RepoFeaturesScreen` (`core/tui/screens/repos.py`): Scans `workspace.repos_dir`, manages repository entries, allows interactive multi-select branch checklists, customizes start refs, and manages tag view regex rules (`DEFAULT_TAG_VIEWS`). `RepositoriesScreen` remembers the highlighted repository (`view_state["repositories"]`); `RepoDetailScreen` remembers, per repository path (`view_state["repo_detail:<path>"]`), the focused list and the highlighted branch and tag-rule rows when saving, and restores them on the next visit. The rows between the buttons and the status bar show the full text of the highlighted tag rule (`Rule [<view>]: <regex>`, wrapped). A saved `project` or `default_branch` (an empty string included) is shown as saved; the repository name and `master` only fill a missing key. The last remaining tag rule cannot be deleted, because an empty `tag_views` list means `DEFAULT_TAG_VIEWS` to every reader. `F` or the `Features…` button opens `RepoFeaturesScreen`, which lists every entry in `PROJECT_FEATURE_DEFS` with its effective state, project default (`DEFAULT_KERNEL_FEATURES` / `DEFAULT_MANPAGES_FEATURES`), override marker, and wrapped description; `Space`/`Enter` toggles a feature, `R` resets all overrides to defaults, `S`/Apply passes pruned non-default overrides (`prune_default_feature_overrides()`) back to `RepoDetailScreen` (omitting `"features"` on the repository dict when empty), and `Esc`/`Cancel` confirms before discarding unsaved draft overrides. `Esc` / `Cancel` in `RepoDetailScreen` with unsaved edits asks for confirmation before discarding.
+  - `RepositoriesScreen`, `RepoDetailScreen`, `RepoFeaturesScreen`, & `RepoInsightsScreen` (`core/tui/screens/repos.py`): Scans `workspace.repos_dir`, manages repository entries, allows interactive multi-select branch checklists, customizes start refs, and manages tag view regex rules (`DEFAULT_TAG_VIEWS`). `RepositoriesScreen` remembers the highlighted repository (`view_state["repositories"]`); `RepoDetailScreen` remembers, per repository path (`view_state["repo_detail:<path>"]`), the focused list and the highlighted branch and tag-rule rows when saving, and restores them on the next visit. The rows between the buttons and the status bar show the full text of the highlighted tag rule (`Rule [<view>]: <regex>`, wrapped). A saved `project` or `default_branch` (an empty string included) is shown as saved; the repository name and `master` only fill a missing key. The last remaining tag rule cannot be deleted, because an empty `tag_views` list means `DEFAULT_TAG_VIEWS` to every reader. `F` or the `Features…` button opens `RepoFeaturesScreen`, which lists every entry in `PROJECT_FEATURE_DEFS` with its effective state, project default (`DEFAULT_KERNEL_FEATURES` / `DEFAULT_MANPAGES_FEATURES`), override marker, and wrapped description; `Space`/`Enter` toggles a feature, `R` resets all overrides to defaults, `S`/Apply passes pruned non-default overrides (`prune_default_feature_overrides()`) back to `RepoDetailScreen` (omitting `"features"` on the repository dict when empty), and `Esc`/`Cancel` confirms before discarding unsaved draft overrides. `I` or the `Insights…` button opens `RepoInsightsScreen`, which lists every entry in `PROJECT_INSIGHTS_DEFS` with its current value, project default (`default_project_insights()`), and override marker; `Space`/`E` edits the highlighted setting (toggling booleans or prompting via `ModalTextInputDialog` with validation), `A` runs `detect_repository_insights()` to populate optimal settings autodetected from the repository's Git tags, `MAINTAINERS` file, and first-parent merge history, `R` resets all overrides to defaults, `Enter`/`D` applies pruned overrides (`prune_default_insights_overrides()`, omitting `"insights"` when empty), and `Esc` confirms before discarding unsaved draft edits. `Esc` / `Cancel` in `RepoDetailScreen` with unsaved edits asks for confirmation before discarding.
   - `DatabaseSSHScreen` (`core/tui/screens/database_ssh.py`): Configures database connection parameters (host, port, user, password, unix_socket) and SSH tunnel port forwarding credentials. The forward destination fields are labelled `DB Host @SSH` / `DB Port @SSH` (`ssh_tunnel.remote_host` / `remote_port`: the address the SSH server connects to, `127.0.0.1` when MariaDB runs on the SSH host). With the tunnel enabled and the database `Port` different from the SSH `Local Port` (a `0` local port included), saving shows a "Port Mismatch" confirmation (`Save Anyway` / `Cancel`); `Cancel` keeps the screen open with nothing committed. Saving first validates the port inputs (`Port`, `SSH Port`, `DB Port @SSH`: 1-65535; `Local Port`: 0-65535) and reports invalid ones in an "Invalid Value" dialog without committing; `ssh_tunnel.enabled` is read with `core.config._coerce_bool`. `Esc` with unsaved edits asks before discarding.
   - `ParserDistributedScreen` (`core/tui/screens/parser_dist.py`): Configures TableEngine, memory limits, hugepages, local cache (`cache.engine` via `available_cache_engines()` / `get_cache_engine()` alias normalisation, and `cache.dir`), and distributed worker identification (`worker_id`, `role`, `delegate_stable`). The distributed fields are stored under `parser.distributed`; a key present there (an empty `worker_id` included) is shown as saved, and the flat `parser.<key>` value seeds the form only when the key is absent; with neither, the form shows the parser defaults (empty `worker_id`, i.e. `<role>:<hostname>:<pid>`, and `delegate_stable` on). `Memory Mode` offers `normal`, `low` and `very_low` (`normalize_memory_mode()` in `core/config.py` maps the aliases `compact` and `very-low` to `very_low` and any other value to `normal`, at config load and in `main.py`). When the terminal has room right of the form (≥ 87 columns), a side panel shows help for the focused field from `HELP_TOPICS` (Table Engine, Memory Mode, Max TE Table, Cache Engine, Cache Directory, Distributed; an overview for other fields); `F1`, or `?` outside a text field, shows the same topic in a dialog.
   - `CVEMailingListScreen` (`core/tui/screens/cve_ml.py`): Configures local CVE catalog clone paths and public-inbox mailing list storage and daemon tunnels.
@@ -1735,6 +1741,7 @@ history with Git.
   every tag be summarized again once (~9 minutes on the reference clone), which fills the table on existing
   databases. On the reference clone: 5,761 release tags summarized from scratch in ~530 s (1.53M
   `m_release_person` rows, 44.6k first releases); a run with nothing new costs ~0.2 s.
+- **Pre-computed Merge Window & Subsystem Health** (`ingest_insights()`, `m_release_pull` §4 row 66, `m_release_section_health` §4 row 67): for every final mainline release segment (`parse_tag(tag)["final"]`), `ingest_insights()` summarizes first-parent merge pulls (`MW_FORMAT` 5; sentinel row `pull_idx = 65535` when a release has no pulls) into `m_release_pull` and per-section commit, review-coverage, author-count, and last-activity summaries (`HEALTH_FORMAT` 3; pattern hash `section_pattern_hash()` per section plus a manifest sentinel row `sec_name = ""`) into `m_release_section_health`, using the repository's resolved `insights` configuration (`resolve_repo_insights()`). The webapp reads these tables directly (`db_merge_window()`, `health_from_db()`).
 - **Reading** (the webapp's Release stats, `webapp/API_ENDPOINTS.md` §4.10, which falls back to Git for a release these
   rows do not cover): a release's figures are its segments' sums — the segments of `range_base..tag` on its
   chain; contributors folded into identities with the webapp's `_identity_index` and employers mapped from the
@@ -1902,6 +1909,8 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 | `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, staging cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference`. |
 
 | `--backfill-cve-files` | `m_cve_file` (§4 row 65) | Populates affected source and header file paths for CVE records from parsed `m_cve.data`. |
+
+| `--backfill-insights [--from <ref>]` | `m_release_pull`, `m_release_section_health` (§4 rows 66-67) | Summarizes merge-window pulls and per-section subsystem health for final mainline release segments of the repository (`release_stats.ingest_insights()`), resumable via `--from`. |
 
 | `--backfill-mailing-list [--ml-range <range>]` | `m_commit_email` (§4 row 43) | Executes the 6-tier public-inbox resolution waterfall across the specified commit range (or `HEAD~100..HEAD`) via `standalone_resolve_mailing_list()`, populating `m_commit_email` with thread mappings, patch series numbers, and match tiers. |
 

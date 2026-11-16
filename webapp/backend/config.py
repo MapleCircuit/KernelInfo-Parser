@@ -24,6 +24,7 @@ from core.config import (
     get_webapp_config,
     repo_feature_enabled,
     resolve_repo_features,
+    resolve_repo_insights,
     resolve_repo_path,
 )
 
@@ -68,6 +69,11 @@ def is_manpages_entry(repo: dict[str, Any] | None) -> bool:
 def get_active_features() -> dict[str, bool]:
     """Resolved feature flags for the current request's repository."""
     return resolve_repo_features(get_active_repository())
+
+
+def get_active_insights_config(repo_entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolved Insights configuration for repo_entry (or the current request's repository)."""
+    return resolve_repo_insights(repo_entry if repo_entry is not None else get_active_repository())
 
 
 def is_feature_enabled(feature: str, repo: dict[str, Any] | None = None) -> bool:

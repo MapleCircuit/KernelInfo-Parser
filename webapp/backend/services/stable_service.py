@@ -82,15 +82,23 @@ def annotation_applies(annotation: str, series: str) -> bool:
 
 def _tag_dates(tags: dict[str, str], names: list[str]) -> dict[str, int]:
     """Commit time (%ct) of each named tag's commit, with one `git log --no-walk`."""
-    shas = sorted({tags[n] for n in names if n in tags})
-    dates: dict[str, int] = {}
-    for i in range(0, len(shas), 500):
-        out = release_service._git(["log", "--no-walk=unsorted", "--format=%H %ct", *shas[i:i + 500]], timeout=60) or ""
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].isdigit():
-                dates[parts[0]] = int(parts[1])
-    return {n: dates[tags[n]] for n in names if tags.get(n) in dates}
+    cached = release_service.tag_dates()
+    dates: dict[str, int] = {n: cached[n] for n in names if n in cached and cached[n]}
+    missing = [n for n in names if n not in dates and n in tags]
+    if missing:
+        shas = sorted({tags[n] for n in missing})
+        sha_dates: dict[str, int] = {}
+        for i in range(0, len(shas), 500):
+            out = release_service._git(["log", "--no-walk=unsorted", "--format=%H %ct", *shas[i:i + 500]], timeout=60) or ""
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    sha_dates[parts[0]] = int(parts[1])
+        for n in missing:
+            sha = tags.get(n)
+            if sha in sha_dates:
+                dates[n] = sha_dates[sha]
+    return {n: dates[n] for n in names if n in dates}
 
 
 def series_scope(series: str) -> dict[str, Any]:
@@ -379,6 +387,33 @@ def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, A
                 ):
                     if int(r["segment_id"]) in stable_sids:
                         backported.add(bytes(r["target_hash"]))
+
+            p8_to_cands: dict[str, list[bytes]] = {}
+            for c in cand:
+                p8_to_cands.setdefault(c.hex()[:8], []).append(c)
+
+            for r in cur.select_rows(
+                ("m_commit_relation", "r"),
+                {"target_prefix": "r.target_prefix", "segment_id": "cr.segment_id"},
+                {"r.kind": k_up, "r.target_hash": zero, "c.network_id": network_id},
+                joins=[
+                    Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}),
+                    Join(("m_commit_release", "cr"), {
+                        "cr.repo_id": Value(repo_id), "cr.commit_hash": "c.commit_hash",
+                        "cr.chain": Value(release_service.DB_CHAIN_STABLE),
+                    }),
+                ],
+            ):
+                if int(r["segment_id"]) in stable_sids:
+                    pre = _textv(r["target_prefix"]).lower()
+                    if pre:
+                        matching = (
+                            [c for c in p8_to_cands.get(pre[:8], ()) if c.hex().startswith(pre)]
+                            if len(pre) >= 8
+                            else [c for c in cand if c.hex().startswith(pre)]
+                        )
+                        for c in matching:
+                            backported.add(c)
     except Exception as exc:  # noqa: BLE001 - the SQLite path answers
         logger.warning("stable report for %s from the database failed: %s", series, exc)
         return None

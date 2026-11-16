@@ -204,7 +204,7 @@ def _release_db() -> SQLiteDB:
     """In-memory SQLite database holding the tables of the release statistics, with a known person (7)."""
     db = SQLiteDB(":memory:", foreign_keys=False)
     db.create_table([D.m_maintainer_person, D.m_release_segment, D.m_release_person, D.m_person_first_release,
-                     D.m_commit_release])
+                     D.m_commit_release, D.m_release_pull, D.m_release_section_health])
     db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(7, "Ann B", "ann@x.org")], on_conflict="ignore")
     return db
 
@@ -371,6 +371,99 @@ class TestIngest(unittest.TestCase):
                                    joins=self.tag_join("r")), [("v3.0",)])
         held = {h for (h,) in self.rows("m_commit_release", ["commit_hash"], {"chain": rst.CHAIN_MAINLINE})}
         self.assertEqual({bytes.fromhex(x) for x in self.git("rev-list", "v3.1").split()}, held)
+
+    def test_ingest_insights_populated_and_incremental(self) -> None:
+        summary = rst.ingest(self.db, self.dir, repo_id=1, workers=2)
+        self.assertEqual(summary["state"], "updated")
+
+        # Verify m_release_pull was populated
+        pull_rows = [tuple(r) for r in self.db.select_rows(
+            ("m_release_pull", "p"), ["s.tag", "p.pull_idx", "p.commits", "p.subject", "p.format"],
+            joins=self.tag_join("p"),
+        )]
+        pull_by_tag = {t: (idx, c, subj, fmt) for t, idx, c, subj, fmt in pull_rows}
+
+        # v3.0 has 0 merges -> sentinel row
+        self.assertEqual(pull_by_tag["v3.0"], (rst.EMPTY_PULL_IDX, 0, "", rst.MW_FORMAT))
+
+        # v3.1 has 1 merge -> pull_idx 0, commits 1, subject "Merge branch 'side'"
+        self.assertEqual(pull_by_tag["v3.1"], (0, 1, "Merge branch 'side'", rst.MW_FORMAT))
+
+        # Verify m_release_section_health has sentinel rows for v3.0 and v3.1
+        health_rows = [tuple(r) for r in self.db.select_rows(
+            ("m_release_section_health", "h"), ["s.tag", "h.sec_name", "h.format"],
+            joins=self.tag_join("h"),
+        )]
+        health_tags = {t for t, sec_name, fmt in health_rows if sec_name == "" and fmt == rst.HEALTH_FORMAT}
+        self.assertIn("v3.0", health_tags)
+        self.assertIn("v3.1", health_tags)
+
+        # Incremental check: re-running ingest_insights returns current
+        again = rst.ingest_insights(self.db, self.dir, repo_id=1)
+        self.assertEqual(again["state"], "current")
+        self.assertEqual(again["segments"], 0)
+
+    def test_ingest_insights_with_maintainers(self) -> None:
+        self.git("checkout", "-q", "master")
+        maint_content = "NETWORKING\nM: Ann B <ann@x.org>\nS: Maintained\nF: a.c\n"
+        self.commit("Ann B", "ann@x.org", "Add MAINTAINERS", "MAINTAINERS", maint_content)
+        self.commit("Neo N", "neo@n.org", "net fix\n\nReviewed-by: Cy D <cy@y.org>", "a.c", "1\n2\n3\n4\n")
+        self.git("tag", "v3.2")
+
+        summary = rst.ingest(self.db, self.dir, repo_id=1, workers=2)
+        self.assertEqual(summary["state"], "updated")
+
+        seg_row = self.db.select_one("m_release_segment", ["segment_id"], {"repo_id": 1, "tag": "v3.2"})
+        self.assertIsNotNone(seg_row)
+        sid = int(seg_row[0])
+
+        rows = [tuple(r) for r in self.db.select_rows(
+            "m_release_section_health",
+            ["sec_name", "status", "commits", "reviewed_commits", "format"],
+            {"segment_id": sid},
+        )]
+        rows_by_name = {name: (st, c, rc, fmt) for name, st, c, rc, fmt in rows}
+        self.assertIn("", rows_by_name)  # Sentinel row
+        self.assertIn("NETWORKING", rows_by_name)
+        self.assertEqual(rows_by_name["NETWORKING"], ("Maintained", 1, 1, rst.HEALTH_FORMAT))
+
+        # Check incremental after maintainers ingestion
+        self.assertEqual(rst.ingest_insights(self.db, self.dir, repo_id=1)["state"], "current")
+
+
+class TestInsightsHelpers(unittest.TestCase):
+    def test_hash_helpers(self) -> None:
+        from parser.maintainer_ast.maintainer_types import MaintainerSection, PatternRule, PatternType
+
+        sec = MaintainerSection(name="NETWORKING", status="Maintained")
+        sec.patterns = [
+            PatternRule(pat_type=PatternType.FILE, pattern="drivers/net/"),
+            PatternRule(pat_type=PatternType.FILE, pattern="net/"),
+        ]
+        h1 = rst.section_pattern_hash(sec)
+        self.assertEqual(len(h1), 20)
+
+        sec2 = MaintainerSection(name="NETWORKING", status="Maintained")
+        sec2.patterns = [
+            PatternRule(pat_type=PatternType.FILE, pattern="/net/"),
+            PatternRule(pat_type=PatternType.FILE, pattern="drivers/net/"),
+        ]
+        self.assertEqual(rst.section_pattern_hash(sec2), h1)
+
+        m_hash = rst.sections_manifest_hash([sec, sec2], catchall_section="THE REST")
+        self.assertEqual(len(m_hash), 20)
+
+    def test_write_release_pulls_and_health(self) -> None:
+        db = _release_db()
+        n = rst.write_release_pulls(db, segment_id=42, pulls=[])
+        self.assertEqual(n, 1)
+        rows = [tuple(r) for r in db.select_rows("m_release_pull", ["segment_id", "pull_idx", "format"], {"segment_id": 42})]
+        self.assertEqual(rows, [(42, rst.EMPTY_PULL_IDX, rst.MW_FORMAT)])
+
+        n_h = rst.write_release_section_health(db, segment_id=42, sections=[], sec_stats={})
+        self.assertEqual(n_h, 1)
+        h_rows = [tuple(r) for r in db.select_rows("m_release_section_health", ["segment_id", "sec_name", "format"], {"segment_id": 42})]
+        self.assertEqual(h_rows, [(42, "", rst.HEALTH_FORMAT)])
 
 
 if __name__ == "__main__":

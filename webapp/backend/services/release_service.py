@@ -97,9 +97,11 @@ def tag_commits(refresh: bool = False) -> dict[str, str]:
         if hit is not None:
             return hit
     with _TAGS_LOCK:
-        out = _git(["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(objecttype)%09%(*objectname)%09%(*objecttype)",
+        out = _git(["for-each-ref",
+                    "--format=%(refname:short)%09%(objectname)%09%(objecttype)%09%(*objectname)%09%(*objecttype)%09%(committerdate:unix)%09%(*committerdate:unix)",
                     "refs/tags"], timeout=30)
         tags: dict[str, str] = {}
+        raw_dates: dict[str, int] = {}
         for line in (out or "").splitlines():
             parts = line.split("\t")
             if len(parts) < 5:
@@ -109,11 +111,25 @@ def tag_commits(refresh: bool = False) -> dict[str, str]:
             # Only tags of commits are releases (v2.6.11 tags a tree: history starts at v2.6.12-rc2)
             if kind == "commit" and parse_tag(name) is not None and _FULL_SHA.match(sha):
                 tags[name] = sha
+                ts_raw = parts[6] if peeled and len(parts) > 6 and parts[6].strip() else (parts[5] if len(parts) > 5 and parts[5].strip() else "")
+                try:
+                    raw_dates[name] = int(ts_raw)
+                except (ValueError, TypeError):
+                    raw_dates[name] = 0
         # The kernel scheme's tags when the repository has any, else every prefixed release (man-pages-X.Y, foo-1.2)
         tags = {name: tags[name] for name in release_tag_names(tags)}
+        dates = {name: raw_dates.get(name, 0) for name in tags}
         if out is not None:
             _TAGS_CACHE["tags"] = tags
+            _TAGS_CACHE["dates"] = dates
         return tags
+
+
+def tag_dates() -> dict[str, int]:
+    """Release tags -> their unix commit timestamp. Cached alongside tag_commits()."""
+    if "dates" not in _TAGS_CACHE:
+        tag_commits(refresh=True)
+    return dict(_TAGS_CACHE.get("dates") or {})
 
 
 def releases(kind: str = "all") -> list[str]:
@@ -185,7 +201,15 @@ def latest_info() -> dict[str, Any]:
         and (prev_key is None or release_key(t) > prev_key)
         and _is_ancestor(tags[t], sha)
     ]
-    rc1 = next((t for t in post_rcs if parse_tag(t)["pre"] == 1), None)
+    try:
+        from webapp.backend.config import get_active_insights_config
+        milestone_rc = int(get_active_insights_config().get("milestone_rc", 1))
+    except Exception:
+        milestone_rc = 1
+    if milestone_rc > 0:
+        rc1 = next((t for t in post_rcs if parse_tag(t)["pre"] == milestone_rc), None)
+    else:
+        rc1 = None
     info = {
         "branch": branch,
         "sha": sha,

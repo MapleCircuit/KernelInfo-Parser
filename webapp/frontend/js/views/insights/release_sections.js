@@ -10,7 +10,7 @@ import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
 import { compareReleases } from "../sections/release_order.js";
 import { barChartSvg, hbarsHtml, kpiHtml, sparklineSvg } from "../../utils/svg_charts.js";
-import { hasFeature, isManPagesRepo } from "../../utils/projects.js";
+import { hasFeature, isManPagesRepo, projectOf, repoInsights } from "../../utils/projects.js";
 
 const n = (x) => (x == null ? "—" : Number(x).toLocaleString("en-US"));
 const date = (t) => (t ? new Date(t * 1000).toISOString().slice(0, 10) : "");
@@ -106,30 +106,34 @@ const GENERIC_REF_WORDS = new Set([
   "stable", "testing", "current", "baseline",
 ]);
 
-export function isGenericRef(ref) {
+export function isGenericRef(ref, repo = "") {
   const s = String(ref || "").trim();
   if (!s) return true;
+  const words = new Set(GENERIC_REF_WORDS);
+  const extra = (repoInsights(repo)?.generic_ref_words || []).map((w) => String(w).toLowerCase());
+  for (const w of extra) words.add(w);
   const tokens = s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return tokens.every((t) => GENERIC_REF_WORDS.has(t) || /^v?\d+$/.test(t) || /^rc\d*$/.test(t));
+  return tokens.every((t) => words.has(t) || /^v?\d+$/.test(t) || /^rc\d*$/.test(t));
 }
 
-export function repoNameFromUrl(url) {
+export function repoNameFromUrl(url, repo = "") {
   const clean = String(url || "").trim().replace(/[?#].*$/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
   if (!clean) return "";
   const parts = clean.split("/").filter(Boolean);
   if (!parts.length) return "";
   const last = parts[parts.length - 1];
-  if (/^(?:linux|linux-2\.6|kernel)$/i.test(last) && parts.length >= 2) {
+  const genericNames = new Set((repoInsights(repo)?.generic_repo_names || ["linux", "linux-2.6", "kernel"]).map((n) => String(n).toLowerCase()));
+  if (genericNames.has(last.toLowerCase()) && parts.length >= 2) {
     return `${parts[parts.length - 2]}/${last}`;
   }
   return last;
 }
 
-export function mergeRowTag(p) {
+export function mergeRowTag(p, repo = "") {
   const ref = String(p?.ref || "").trim();
-  const repo = repoNameFromUrl(p?.source_url);
-  if (ref && (!isGenericRef(ref) || !repo)) return ref;
-  return repo || ref || "";
+  const repoName = repoNameFromUrl(p?.source_url, repo);
+  if (ref && (!isGenericRef(ref, repo) || !repoName)) return ref;
+  return repoName || ref || "";
 }
 
 function renderMergeChart(chart, selectedPull) {
@@ -145,7 +149,14 @@ function renderMergeChart(chart, selectedPull) {
 
 registerInsightsSection({
   id: "merge-window", label: "Merge window", order: 20, releaseScoped: true, keywords: "pulls merge window rc1 maintainers",
-  visible: (repo) => hasFeature(repo, "commits") && !isManPagesRepo(repo) && (hasFeature(repo, "kconfig") || hasFeature(repo, "maintainers") || hasFeature(repo, "mail")),
+  visible: (repo) => {
+    if (!hasFeature(repo, "commits")) return false;
+    const ins = repoInsights(repo);
+    if (ins?.merge_window === false) return false;
+    const p = projectOf(repo);
+    const explicit = p?.insights && typeof p.insights.merge_window === "boolean" ? p.insights.merge_window : false;
+    return (hasFeature(repo, "kconfig") || hasFeature(repo, "maintainers") || hasFeature(repo, "mail") || explicit) && ins?.merge_window !== false;
+  },
   hint: "The pulls merged for a release, day by day",
   releaseOptions: withLatestReleases,
   emptyText: "No merge pulls in this cycle yet.",
@@ -163,13 +174,15 @@ registerInsightsSection({
     const summaryHtml = kpiHtml([[n(r.totals?.pulls), "pulls"], [n(r.totals?.commits), "commits pulled"], [n(r.totals?.before_rc1), "before rc1"], [r.rc1_day == null ? "—" : `day ${r.rc1_day}`, r.rc1 || "rc1"]])
       + `<div class="sv-chart-wrap">${renderMergeChart(this._chart, null)}</div>`;
     const endLabel = r.branch ? `${r.branch} (unreleased)` : r.release;
-    return { rows: r.pulls || [], summaryHtml, note: `${r.prev || "?"}..${endLabel}` };
+    const source = r.release === "latest" ? "unreleased cycle · computed from Git" : (r.source === "database" ? "from the parser's release statistics" : "computed from Git");
+    return { rows: r.pulls || [], summaryHtml, note: `${r.prev || "?"}..${endLabel} · ${source}` };
   },
   rowKey: (p) => p.merge,
   rowText: (p) => `${p.subject} ${p.source_url} ${p.ref} ${p.sender} ${p.section?.name || ""}`,
   toggles: [{ id: "sender", label: "Sender", title: "Show the pull sender in the list", stateKey: "showSender" }],
   rowHtml: (p, ctx = {}) => {
-    const tag = mergeRowTag(p);
+    const repo = ctx?.view?.repo?.() || "";
+    const tag = mergeRowTag(p, repo);
     const showSender = Boolean(ctx?.showSender);
     const label = tag || p.subject || p.sender;
     const sender = p.sender && p.sender !== label ? p.sender : "";

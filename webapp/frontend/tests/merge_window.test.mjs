@@ -17,6 +17,7 @@ globalThis.setTimeout = (...args) => {
 
 const { insightsSections } = await import("../js/views/insights/insights_view.js");
 const { isGenericRef, mergeRowTag, repoNameFromUrl } = await import("../js/views/insights/release_sections.js");
+const { setProjects } = await import("../js/utils/projects.js");
 
 const mwSection = () => insightsSections().find((s) => s.id === "merge-window");
 
@@ -177,7 +178,7 @@ test("insights release-scoped sections expose latest, bypass cache on latest, an
         },
       },
     });
-    assert.equal(mwRes.note, "v7.3..master (unreleased)");
+    assert.equal(mwRes.note, "v7.3..master (unreleased) · unreleased cycle · computed from Git");
 
     const subSec = insightsSections().find((s) => s.id === "subsystems");
     assert.equal(subSec.rowKey({ sec_id: null, name: "ALPHA" }), "ALPHA");
@@ -191,4 +192,59 @@ test("insights release-scoped sections expose latest, bypass cache on latest, an
   } finally {
     state.openTab = realOpenTab;
   }
+});
+
+test("project-specific isGenericRef, repoNameFromUrl, and mergeRowTag respect repoInsights configuration", () => {
+  setProjects([
+    {
+      repo: "my-project",
+      project: "my-project",
+      available: true,
+      insights: {
+        generic_ref_words: ["customref", "mysync"],
+        generic_repo_names: ["custom-repo", "custom-core"],
+      },
+    },
+  ]);
+
+  // Project-specific generic ref words
+  assert.equal(isGenericRef("customref", "my-project"), true);
+  assert.equal(isGenericRef("mysync", "my-project"), true);
+  assert.equal(isGenericRef("customref", "linux"), false);
+
+  // Project-specific generic repo names
+  assert.equal(
+    repoNameFromUrl("https://git.example.org/team/custom-repo.git", "my-project"),
+    "team/custom-repo"
+  );
+  assert.equal(
+    repoNameFromUrl("https://git.example.org/team/custom-core.git", "my-project"),
+    "team/custom-core"
+  );
+  assert.equal(
+    repoNameFromUrl("https://git.example.org/team/custom-repo.git", "linux"),
+    "custom-repo"
+  );
+
+  // mergeRowTag with project-specific settings
+  assert.equal(
+    mergeRowTag(
+      {
+        ref: "customref",
+        source_url: "https://git.example.org/team/custom-repo.git",
+      },
+      "my-project"
+    ),
+    "team/custom-repo"
+  );
+  assert.equal(
+    mergeRowTag(
+      {
+        ref: "customref",
+        source_url: "https://git.example.org/team/custom-repo.git",
+      },
+      "linux"
+    ),
+    "customref"
+  );
 });

@@ -69,6 +69,10 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             storage_dir = getattr(args, "ml_storage_dir", None)
             summary = backfills.backfill_mailing_list(db, str(MF.repo_dir), commit_range, storage_dir)
             logger.info(f"[Backfill mailing list] {summary}")
+        if getattr(args, "backfill_insights", False):
+            requested = True
+            summary = backfills.backfill_insights(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
+            logger.info(f"[Backfill insights] {summary}")
     return requested
 
 

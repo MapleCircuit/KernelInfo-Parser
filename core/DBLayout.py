@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 66 core relational database tables used across the parser
+This module defines the 68 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
@@ -81,7 +81,9 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
                       diff_base_tag, files_changed, lines_added, lines_removed, format)  -- release ranges
      ├── m_release_person (segment_id, person_id, role_type, commits)     -- contributors per range
      ├── m_person_first_release (repo_id, person_id, segment_id)        -- first mainline release authored in
-     └── m_commit_release (repo_id, commit_hash, chain, segment_id)      -- first segment of each commit, per chain
+     ├── m_commit_release (repo_id, commit_hash, chain, segment_id)      -- first segment of each commit, per chain
+     ├── m_release_pull (segment_id, pull_idx, merge_hash, p1_hash, p2_hash, merge_date, commits, subject, source_url, ref_name, sender, sec_id, sec_name, dirs_json, body, format)
+     └── m_release_section_health (segment_id, sec_name, sec_id, status, commits, reviewed_commits, authors_json, activity_json, pat_hash, format)
 
 8. Maintainers & Credits Subsystem:
    m_maintainer_section (sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id, patchwork, bug_url,
@@ -1835,6 +1837,69 @@ m_cve_file = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 66. m_release_pull (table_id=66): Release Merge-Window Pull Requests
+#     Merge-window pull requests merged by Linus Torvalds during a release cycle.
+# -----------------------------------------------------------------------------
+m_release_pull = Table(
+    table_id=66,
+    table_name="m_release_pull",
+    columns=(
+        ("segment_id", INT()),
+        ("pull_idx", SMALLINT(unsigned=True)),
+        ("merge_hash", BIN(20)),
+        ("p1_hash", BIN(20)),
+        ("p2_hash", BIN(20)),
+        ("merge_date", BIGINT()),
+        ("commits", INT(unsigned=True)),
+        ("subject", VARCHAR(255, default='')),
+        ("source_url", VARCHAR(255, default='')),
+        ("ref_name", VARCHAR(255, default='')),
+        ("sender", VARCHAR(128, default='')),
+        ("sec_id", INT(default=0)),
+        ("sec_name", VARCHAR(255, default='')),
+        ("dirs_json", TEXT(null=True)),
+        ("body", TEXT(null=True)),
+        ("format", SMALLINT(unsigned=True, default=1)),
+    ),
+    primary=("segment_id", "pull_idx"),
+    foreign=(("segment_id", "m_release_segment", "segment_id"),),
+    indexes=(("release_pull_merge_idx", ("merge_hash",)),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 67. m_release_section_health (table_id=67): Release Subsystem Health Metrics
+#     Subsystem and MAINTAINERS section health metrics and review stats per release.
+# -----------------------------------------------------------------------------
+m_release_section_health = Table(
+    table_id=67,
+    table_name="m_release_section_health",
+    columns=(
+        ("segment_id", INT()),
+        ("sec_name", VARCHAR(255, bin_collation=True)),
+        ("sec_id", INT(default=0)),
+        ("status", VARCHAR(64, default='')),
+        ("commits", INT(unsigned=True, default=0)),
+        ("reviewed_commits", INT(unsigned=True, default=0)),
+        ("authors_json", MEDIUMTEXT(null=True)),
+        ("activity_json", MEDIUMTEXT(null=True)),
+        ("pat_hash", BIN(20)),
+        ("format", SMALLINT(unsigned=True, default=1)),
+    ),
+    primary=("segment_id", "sec_name"),
+    foreign=(("segment_id", "m_release_segment", "segment_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -1904,19 +1969,21 @@ TABLES: tuple[Table, ...] = (
     m_commit_relation,     # 63
     m_commit_link,         # 64
     m_cve_file,            # 65
+    m_release_pull,        # 66
+    m_release_section_health, # 67
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 66 schema tables.
+    """Initialize and populate gp.Table_Array with all 68 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 66 Table schema objects.
+        Immutable tuple of all 68 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

@@ -5,6 +5,7 @@ Provides:
 - RepoDetailScreen: Detail view editing project name, default branch, start ref, git URL,
   interactive branch selection with pattern filtering, and tag view regex rules.
 - RepoFeaturesScreen: Per-repository feature overrides editor against project defaults.
+- RepoInsightsScreen: Per-repository Insights settings and autodetection editor.
 """
 
 from __future__ import annotations
@@ -19,16 +20,21 @@ from typing import Any, Callable, List, Optional, Set, Tuple
 from core.config import (
     DEFAULT_TAG_VIEWS,
     PROJECT_FEATURE_DEFS,
+    PROJECT_INSIGHTS_DEFS,
     REPO_ROOT,
     _merge_repositories,
     default_project_features,
+    default_project_insights,
     detect_repository,
+    detect_repository_insights,
     find_repository_branches,
     find_repository_dirs,
     get_repos_dir,
     is_git_repository,
     normalize_feature_overrides,
+    normalize_insights_overrides,
     prune_default_feature_overrides,
+    prune_default_insights_overrides,
     repository_project,
     resolve_repo_path,
 )
@@ -599,13 +605,16 @@ class RepoDetailScreen(BaseScreen):
 
         # Per-repository feature overrides
         self.feature_overrides: dict[str, bool] = normalize_feature_overrides(self.repo_entry.get("features"))
+        # Per-repository insights overrides
+        self.insights_overrides: dict[str, Any] = normalize_insights_overrides(self.repo_entry.get("insights"))
 
         # Action Buttons
         self.save_btn = Button(y=19, x=2, label="Save (S)", on_click=self.save_changes)
         self.test_btn = Button(y=19, x=15, label="Test (T)", on_click=self.test_repo_settings)
         self.features_btn = Button(y=19, x=28, label=self._features_button_label(), on_click=self.open_features_screen)
-        self.reset_tags_btn = Button(y=19, x=45, label="Reset Tags (R)", on_click=self.reset_tag_views_to_presets)
-        self.cancel_btn = Button(y=19, x=64, label="Cancel (Esc)", on_click=self.on_esc)
+        self.insights_btn = Button(y=19, x=38, label=self._insights_button_label(), on_click=self.open_insights_screen)
+        self.reset_tags_btn = Button(y=19, x=50, label="Reset Tags (R)", on_click=self.reset_tag_views_to_presets)
+        self.cancel_btn = Button(y=19, x=68, label="Cancel (Esc)", on_click=self.on_esc)
 
         self.status_bar = StatusBar(
             shortcuts=[
@@ -615,6 +624,7 @@ class RepoDetailScreen(BaseScreen):
                 ("Space", "Toggle"),
                 ("Enter/A/D", "Edit/Add/Del Rule"),
                 ("F", "Features"),
+                ("I", "Insights"),
                 ("T", "Test"),
                 ("S", "Save"),
                 ("R", "Reset Tags"),
@@ -635,6 +645,7 @@ class RepoDetailScreen(BaseScreen):
             self.save_btn,
             self.test_btn,
             self.features_btn,
+            self.insights_btn,
             self.reset_tags_btn,
             self.cancel_btn,
         ]
@@ -710,6 +721,46 @@ class RepoDetailScreen(BaseScreen):
             self.app.push_screen(screen)
         return screen
 
+    def _pruned_insights_overrides(self) -> dict[str, Any]:
+        """Return Insights overrides that differ from the effective project's defaults."""
+        return prune_default_insights_overrides(self._effective_project_slug(), self.insights_overrides, self.repo_entry)
+
+    def _insights_button_label(self) -> str:
+        """Return the Insights button label, showing custom override count when non-empty."""
+        count = len(self._pruned_insights_overrides())
+        return f"Insights: {count} (I)" if count > 0 else "Insights (I)"
+
+    def _update_insights_button_label(self) -> None:
+        """Refresh the Insights button label and width to match current overrides."""
+        label = self._insights_button_label()
+        self.insights_btn.label = label
+        self.insights_btn.width = len(label) + 4
+
+    def _apply_insights_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply updated Insights overrides from RepoInsightsScreen."""
+        self.insights_overrides = prune_default_insights_overrides(self._effective_project_slug(), overrides, self.repo_entry)
+        self._update_insights_button_label()
+        count = len(self.insights_overrides)
+        if count:
+            self.status_bar.set_message(f"Updated Insights overrides ({count} custom).", color=PAIR_SUCCESS)
+        else:
+            self.status_bar.set_message("Insights set to project defaults.", color=PAIR_SUCCESS)
+
+    def open_insights_screen(self) -> RepoInsightsScreen:
+        """Open the per-repository Insights settings sub-screen."""
+        screen = RepoInsightsScreen(
+            self.stdscr,
+            self.app,
+            repo_name=str(self.repo_entry.get("name") or self._effective_project_slug()),
+            project_slug=self._effective_project_slug(),
+            repo_entry=self.repo_entry,
+            overrides=self.insights_overrides,
+            on_apply=self._apply_insights_overrides,
+        )
+        if self.app is not None and hasattr(self.app, "push_screen"):
+            self.app.push_screen(screen)
+        return screen
+
     def _get_form_snapshot(self) -> dict[str, Any]:
         """Capture every editable value for unsaved-change detection."""
         return {
@@ -720,6 +771,7 @@ class RepoDetailScreen(BaseScreen):
             "branches": sorted(self.selected_branches),
             "tag_views": copy.deepcopy(self.tag_views),
             "features": self._pruned_feature_overrides(),
+            "insights": self._pruned_insights_overrides(),
         }
 
     def has_unsaved_changes(self) -> bool:
@@ -919,6 +971,13 @@ class RepoDetailScreen(BaseScreen):
             self.repo_entry.pop("features", None)
         self.feature_overrides = pruned_features
         self._update_features_button_label()
+        pruned_insights = self._pruned_insights_overrides()
+        if pruned_insights:
+            self.repo_entry["insights"] = pruned_insights
+        else:
+            self.repo_entry.pop("insights", None)
+        self.insights_overrides = pruned_insights
+        self._update_insights_button_label()
         self._initial_snapshot = self._get_form_snapshot()
         self._remember_view_state()
 
@@ -1004,13 +1063,15 @@ class RepoDetailScreen(BaseScreen):
             self.save_btn.y = btn_y
             self.test_btn.y = btn_y
             self.features_btn.y = btn_y
+            self.insights_btn.y = btn_y
             self.reset_tags_btn.y = btn_y
             self.cancel_btn.y = btn_y
 
             self.status_bar.y = max_y - 1
 
         self._update_features_button_label()
-        buttons = [self.save_btn, self.test_btn, self.features_btn, self.reset_tags_btn, self.cancel_btn]
+        self._update_insights_button_label()
+        buttons = [self.save_btn, self.test_btn, self.features_btn, self.insights_btn, self.reset_tags_btn, self.cancel_btn]
         avail = max(1, max_x - 3)
         total_w = sum(len(b.label) + 4 for b in buttons)
         gap = 2 if total_w + 2 * (len(buttons) - 1) <= avail else 1
@@ -1115,6 +1176,9 @@ class RepoDetailScreen(BaseScreen):
                 return True
             if ch in (ord("F"), ord("f")):
                 self.open_features_screen()
+                return True
+            if ch in (ord("I"), ord("i")):
+                self.open_insights_screen()
                 return True
             if ch in (ord("R"), ord("r")):
                 self.reset_tag_views_to_presets()
@@ -1358,6 +1422,367 @@ class RepoFeaturesScreen(BaseScreen):
         if isinstance(focused, Button) and ch in (10, 13, curses.KEY_ENTER, ord(" ")):
             return focused.handle_key(ch)
 
+        if ch in (ord("r"), ord("R")):
+            self.reset_defaults()
+            return True
+        if ch in (ord("d"), ord("D")):
+            self.apply_and_back()
+            return True
+        if ch == curses.KEY_UP:
+            self.focus_prev()
+            return True
+        if ch == curses.KEY_DOWN:
+            self.focus_next()
+            return True
+
+        return super().handle_key(ch)
+
+
+class RepoInsightsScreen(BaseScreen):
+    """Per-repository Insights configuration and autodetection editor against project defaults."""
+
+    def __init__(
+        self,
+        stdscr: Any,
+        app: Any = None,
+        repo_name: str = "",
+        project_slug: str = "linux",
+        repo_entry: Optional[dict[str, Any]] = None,
+        overrides: Optional[dict[str, Any]] = None,
+        on_apply: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
+        super().__init__(stdscr, app)
+        self.project_slug = project_slug or "linux"
+        self.repo_name = repo_name or self.project_slug
+        self.repo_entry = repo_entry or {}
+        self.defaults: dict[str, Any] = default_project_insights(self.project_slug, self.repo_entry)
+        self.draft_overrides: dict[str, Any] = prune_default_insights_overrides(
+            self.project_slug, overrides, self.repo_entry
+        )
+        self._initial_overrides: dict[str, Any] = copy.deepcopy(self.draft_overrides)
+        self.on_apply = on_apply
+        self._last_yx: Tuple[int, int] = (0, 0)
+
+        self.insights_list = ScrollableList(
+            y=2,
+            x=2,
+            height=15,
+            width=76,
+            items=list(PROJECT_INSIGHTS_DEFS),
+            title="Insights Settings ([Space/E] Edit, [A] Auto-Detect, [R] Reset)",
+            render_item_func=self._render_insight_item,
+        )
+
+        self.done_btn = Button(y=21, x=2, label="Done (Enter/D)", on_click=self.apply_and_back)
+        self.autodetect_btn = Button(y=21, x=20, label="Auto-Detect (A)", on_click=self.autodetect_optimal)
+        self.reset_btn = Button(y=21, x=40, label="Reset Defaults (R)", on_click=self.reset_defaults)
+        self.cancel_btn = Button(y=21, x=62, label="Cancel (Esc)", on_click=self.on_esc)
+
+        self.status_bar = StatusBar(
+            shortcuts=[
+                ("↑/↓", "Setting"),
+                ("Space/E", "Edit"),
+                ("A", "Auto-Detect"),
+                ("R", "Reset"),
+                ("Enter/D", "Apply"),
+                ("Esc", "Cancel"),
+            ],
+            y=23,
+        )
+
+        self.widgets = [
+            self.insights_list,
+            self.done_btn,
+            self.autodetect_btn,
+            self.reset_btn,
+            self.cancel_btn,
+        ]
+        self.focus_widget(0)
+
+    @staticmethod
+    def _format_value(val: Any, val_type: str) -> str:
+        if val_type == "bool":
+            return "On" if val else "Off"
+        if val_type == "list":
+            if isinstance(val, (list, tuple)):
+                return ", ".join(str(x) for x in val) if val else "(none)"
+            return str(val) if val else "(none)"
+        if val_type == "float":
+            try:
+                return f"{float(val):.2f}"
+            except (ValueError, TypeError):
+                return str(val)
+        if val_type == "int":
+            return str(val)
+        if val_type == "str":
+            return str(val) if val else "(none)"
+        return str(val)
+
+    def _render_insight_item(self, item: dict[str, Any]) -> str:
+        """Render one insight setting row with label, current value, default, and override marker."""
+        key = item["key"]
+        label = item["label"]
+        itype = item["type"]
+        default_val = self.defaults.get(key)
+        default_str = self._format_value(default_val, itype)
+        if key in self.draft_overrides:
+            val = self.draft_overrides[key]
+            tag = "[override]"
+        else:
+            val = default_val
+            tag = "[default]"
+        val_str = self._format_value(val, itype)
+        if len(val_str) > 20:
+            val_str = val_str[:17] + "..."
+        if len(default_str) > 16:
+            default_str = default_str[:13] + "..."
+        return f"{label:<20} | Value: {val_str:<20} | Def: {default_str:<16} {tag}"
+
+    def edit_selected_setting(self) -> bool:
+        """Edit or toggle the currently selected Insight setting."""
+        item = self.insights_list.get_selected()
+        if item is None:
+            return False
+        key = item["key"]
+        label = item["label"]
+        itype = item["type"]
+        default_val = self.defaults.get(key)
+        current_val = self.draft_overrides.get(key, default_val)
+
+        if itype == "bool":
+            new_val = not bool(current_val)
+            if new_val == bool(default_val):
+                self.draft_overrides.pop(key, None)
+            else:
+                self.draft_overrides[key] = new_val
+            return True
+
+        if itype == "list":
+            cur_list = current_val if isinstance(current_val, (list, tuple)) else []
+            default_str = ", ".join(str(x) for x in cur_list)
+            res = ModalTextInputDialog(
+                self.stdscr,
+                title=f"Edit {label}",
+                prompt="Comma-separated items:",
+                default_val=default_str,
+            ).show()
+            if res is not None:
+                new_list = [s.strip() for s in res.split(",") if s.strip()]
+                def_list = default_val if isinstance(default_val, (list, tuple)) else []
+                if new_list == def_list:
+                    self.draft_overrides.pop(key, None)
+                else:
+                    self.draft_overrides[key] = new_list
+            return True
+
+        if itype == "str":
+            default_str = str(current_val if current_val is not None else "")
+            res = ModalTextInputDialog(
+                self.stdscr,
+                title=f"Edit {label}",
+                prompt="String value:",
+                default_val=default_str,
+            ).show()
+            if res is not None:
+                new_str = res.strip()
+                def_str = str(default_val or "").strip()
+                if new_str == def_str:
+                    self.draft_overrides.pop(key, None)
+                else:
+                    self.draft_overrides[key] = new_str
+            return True
+
+        if itype == "int":
+            default_str = str(current_val if current_val is not None else default_val)
+            res = ModalTextInputDialog(
+                self.stdscr,
+                title=f"Edit {label}",
+                prompt="Integer (>= 0):",
+                default_val=default_str,
+            ).show()
+            if res is not None:
+                try:
+                    iv = int(res.strip())
+                    if iv < 0:
+                        raise ValueError()
+                    if iv == int(default_val):
+                        self.draft_overrides.pop(key, None)
+                    else:
+                        self.draft_overrides[key] = iv
+                except ValueError:
+                    self.status_bar.set_message(
+                        f"Invalid integer value for {label} (must be >= 0).", color=PAIR_ERROR
+                    )
+            return True
+
+        if itype == "float":
+            default_str = f"{float(current_val):.2f}" if current_val is not None else f"{float(default_val):.2f}"
+            res = ModalTextInputDialog(
+                self.stdscr,
+                title=f"Edit {label}",
+                prompt="Float (0.0 to 1.0):",
+                default_val=default_str,
+            ).show()
+            if res is not None:
+                try:
+                    fv = float(res.strip())
+                    if not (0.0 <= fv <= 1.0):
+                        raise ValueError()
+                    rfv = round(fv, 4)
+                    rdef = round(float(default_val), 4)
+                    if rfv == rdef:
+                        self.draft_overrides.pop(key, None)
+                    else:
+                        self.draft_overrides[key] = rfv
+                except ValueError:
+                    self.status_bar.set_message(
+                        f"Invalid float value for {label} (must be between 0.0 and 1.0).", color=PAIR_ERROR
+                    )
+            return True
+
+        return False
+
+    def autodetect_optimal(self) -> None:
+        """Autodetect optimal Insights settings for this repository and prune against defaults."""
+        repo_path = resolve_repo_path(self.repo_entry) if self.repo_entry else Path(self.repo_name)
+        detected = detect_repository_insights(
+            repo_path,
+            project_slug=self.project_slug,
+            default_branch=self.repo_entry.get("default_branch"),
+            git_url=self.repo_entry.get("git_url"),
+        )
+        self.draft_overrides = prune_default_insights_overrides(
+            self.project_slug, detected, self.repo_entry
+        )
+        self.status_bar.set_message("Auto-detected optimal Insights settings for this repository.", color=PAIR_SUCCESS)
+
+    def reset_defaults(self) -> None:
+        """Clear all Insights overrides so every setting uses defaults."""
+        self.draft_overrides.clear()
+        self.status_bar.set_message("Reset all Insights settings to defaults.", color=PAIR_SUCCESS)
+
+    def apply_and_back(self) -> None:
+        """Apply pruned Insights overrides via callback and return to RepoDetailScreen."""
+        pruned = prune_default_insights_overrides(self.project_slug, self.draft_overrides, self.repo_entry)
+        if callable(self.on_apply):
+            self.on_apply(pruned)
+        if self.app is not None and hasattr(self.app, "pop_screen"):
+            self.app.pop_screen()
+
+    def on_esc(self) -> bool:
+        """Return to RepoDetailScreen, confirming first if draft overrides changed."""
+        if self.draft_overrides != self._initial_overrides:
+            choice = safe_modal_dialog(
+                self.stdscr,
+                title="Unsaved Insights Changes",
+                message="Discard unsaved Insights changes?",
+                buttons=["Discard", "Cancel"],
+                default_button=1,
+            )
+            if choice != "Discard":
+                return True
+        if self.app is not None and hasattr(self.app, "pop_screen"):
+            self.app.pop_screen()
+        return True
+
+    def _selected_description_lines(self, width: int, max_lines: int) -> list[str]:
+        """Wrap the highlighted Insight setting's description into at most `max_lines` rows."""
+        item = self.insights_list.get_selected()
+        if item is None or width <= 0 or max_lines <= 0:
+            return []
+        text = f"{item['label']} ({item['key']}, type: {item['type']}): {item['description']}"
+        lines = [text[i : i + width] for i in range(0, len(text), width)] or [""]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1][:-1] + "…"
+        return lines
+
+    def draw(self) -> None:
+        """Render the per-repository Insights settings screen."""
+        self.clear()
+        max_y, max_x = self.get_maxyx()
+
+        if (max_y, max_x) != self._last_yx:
+            self._last_yx = (max_y, max_x)
+            list_h = max(5, max_y - 8)
+            self.insights_list.y = 2
+            self.insights_list.x = 2
+            self.insights_list.height = list_h
+            self.insights_list.width = max(30, max_x - 4)
+
+            btn_y = max(9, max_y - 3)
+            buttons = [self.done_btn, self.autodetect_btn, self.reset_btn, self.cancel_btn]
+            avail = max(1, max_x - 3)
+            total_w = sum(len(b.label) + 4 for b in buttons)
+            gap = 2 if total_w + 2 * (len(buttons) - 1) <= avail else 1
+            cur_x = 2
+            for b in buttons:
+                b.y = btn_y
+                b.x = cur_x
+                cur_x += len(b.label) + 4 + gap
+
+            self.status_bar.y = max_y - 1
+
+        header_text = f" Insights Settings: {self.repo_name} (project: {self.project_slug}) "
+        self.safe_addstr(
+            0,
+            max(2, (max_x - len(header_text)) // 2),
+            header_text,
+            get_color(PAIR_HEADER) | curses.A_BOLD,
+        )
+
+        for widget in self.widgets:
+            if hasattr(widget, "draw"):
+                widget.draw(self.stdscr)
+
+        desc_top = self.insights_list.y + self.insights_list.height + 1
+        desc_rows = max(0, self.done_btn.y - desc_top)
+        for i, line in enumerate(self._selected_description_lines(max(1, max_x - 4), desc_rows)):
+            self.safe_addstr(desc_top + i, 2, line, get_color(PAIR_MUTED))
+
+        self.status_bar.draw(self.stdscr)
+        self.refresh()
+
+    def handle_key(self, ch: int) -> bool:
+        """Handle navigation, editing, autodetection, reset, apply, and cancel keys."""
+        if ch == 27:  # Esc
+            return self.on_esc()
+        if ch == 9:  # Tab
+            self.focus_next()
+            return True
+        if ch in (curses.KEY_BTAB, 353):  # Shift-Tab
+            self.focus_prev()
+            return True
+
+        focused = self.get_focused_widget()
+
+        if focused is self.insights_list:
+            if ch in (ord(" "), ord("e"), ord("E")):
+                self.edit_selected_setting()
+                return True
+            if ch in (10, 13, curses.KEY_ENTER):
+                self.apply_and_back()
+                return True
+            if ch in (curses.KEY_UP, curses.KEY_DOWN):
+                idx = focused.get_selected_index()
+                if ch == curses.KEY_UP:
+                    if focused.items and idx > 0:
+                        focused.select_prev()
+                    else:
+                        self.focus_prev()
+                else:
+                    if focused.items and idx < len(focused.items) - 1:
+                        focused.select_next()
+                    else:
+                        self.focus_next()
+                return True
+
+        if isinstance(focused, Button) and ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            return focused.handle_key(ch)
+
+        if ch in (ord("a"), ord("A")):
+            self.autodetect_optimal()
+            return True
         if ch in (ord("r"), ord("R")):
             self.reset_defaults()
             return True

@@ -157,6 +157,120 @@ class TestReleaseStatsSources(unittest.TestCase):
         self.assertEqual(ins._release_range("man-pages-6.00")["tags"], {"man-pages-6.00": None})
         self.assertEqual(ins._health_window("man-pages-6.01", 4), ["man-pages-6.00", "man-pages-6.01"])
 
+    def test_fast_db_authors_before(self) -> None:
+        from unittest import mock
+        # v3.0 has author Ann B; prior segments up to v3.0 are in DB
+        prior = ins._db_authors_before("v3.0", "")
+        self.assertIsNotNone(prior)
+        self.assertIn(ins.identity("Ann B", "ann@x.org"), prior)
+
+        # compute_release_stats for v3.1 should use prior authors without calling author_first_seen
+        with mock.patch.object(ins, "author_first_seen", side_effect=AssertionError("author_first_seen should not be called")):
+            stats = ins.compute_release_stats("v3.1")
+        self.assertEqual(stats["commits"], 4)
+        first_names = sorted(p["person"] for p in stats["first_timers"])
+        self.assertEqual(first_names, ["Cy D", "Neo N"])
+
+    def test_db_merge_window(self) -> None:
+        import json
+        try:
+            self.db.create_table([D.m_release_pull])
+        except Exception:
+            pass
+        self.db.delete_rows("m_release_pull", None, all_rows=True)
+        git_mw = ins.compute_merge_window("v3.1")
+        self.assertEqual(git_mw["source"], "git")
+        self.assertEqual(len(git_mw["pulls"]), 1)
+        p = git_mw["pulls"][0]
+
+        # Insert matching row into m_release_pull for v3.1's segment
+        seg = self.db.select_one("m_release_segment", ["segment_id"], {"tag": "v3.1"})
+        self.assertIsNotNone(seg)
+        sid = int(seg[0])
+
+        self.db.insert_rows(
+            "m_release_pull",
+            ["segment_id", "pull_idx", "merge_hash", "p1_hash", "p2_hash", "merge_date", "commits",
+             "subject", "source_url", "ref_name", "sender", "sec_id", "sec_name", "dirs_json", "body", "format"],
+            [(
+                sid, 0, bytes.fromhex(p["merge"]), bytes.fromhex(p["parents"][0]), bytes.fromhex(p["parents"][1]),
+                p["date"], p["commits"], p["subject"], p["source_url"] or "", p["ref"] or "", p["sender"] or "",
+                p["section"]["sec_id"] if p["section"] and p["section"]["sec_id"] else 0,
+                p["section"]["name"] if p["section"] else "",
+                json.dumps(p["dirs"]) if p["dirs"] else None,
+                p["body"], ins.MW_FORMAT,
+            )],
+        )
+
+        db_mw = ins.db_merge_window("v3.1")
+        self.assertIsNotNone(db_mw)
+        self.assertEqual(db_mw["source"], "database")
+        self.assertEqual(db_mw["release"], "v3.1")
+        self.assertEqual(db_mw["totals"], git_mw["totals"])
+        self.assertEqual(len(db_mw["pulls"]), len(git_mw["pulls"]))
+        self.assertEqual(db_mw["pulls"][0]["merge"], git_mw["pulls"][0]["merge"])
+        self.assertEqual(db_mw["pulls"][0]["commits"], git_mw["pulls"][0]["commits"])
+
+        # Test merge_window returns db_merge_window result
+        mw_state = ins.merge_window("v3.1")
+        self.assertEqual(mw_state["state"], "done")
+        self.assertEqual(mw_state["result"]["source"], "database")
+
+    def test_health_from_db_and_m_release_section_health(self) -> None:
+        import json
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+
+        try:
+            self.db.create_table([D.m_release_section_health])
+        except Exception:
+            pass
+        self.db.delete_rows("m_release_section_health", None, all_rows=True)
+        raw_maint = (
+            "FOO SUBSYSTEM\n"
+            "M:\tAnn B <ann@x.org>\n"
+            "S:\tMaintained\n"
+            "F:\ta.c\n\n"
+            "THE REST\n"
+            "M:\tLinus <torvalds@l.org>\n"
+            "S:\tBuried\n"
+            "F:\t*\n"
+        )
+        sections = MaintainerParser(raw_maint).parse()
+        for i, s in enumerate(sections, start=1):
+            s.sec_id = i
+        matcher = MaintainerMatcher(sections)
+
+        foo_sec = sections[0]
+        pat_hash = ins._section_pattern_hash(foo_sec)
+        manifest_hash = ins._sections_manifest_hash(sections, "THE REST")
+
+        seg = self.db.select_one("m_release_segment", ["segment_id"], {"tag": "v3.1"})
+        self.assertIsNotNone(seg)
+        sid = int(seg[0])
+
+        authors_dict = {ins.identity("Ann B", "ann@x.org"): 3}
+        activity_dict = {ins.identity("Ann B", "ann@x.org"): 12345678}
+        self.db.insert_rows(
+            "m_release_section_health",
+            ["segment_id", "sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
+            [
+                (sid, foo_sec.name, foo_sec.sec_id, foo_sec.status, 3, 2, json.dumps(authors_dict), json.dumps(activity_dict), pat_hash, ins.HEALTH_FORMAT),
+                (sid, "", 0, "", 0, 0, None, None, manifest_hash, ins.HEALTH_FORMAT),
+            ],
+        )
+
+        res = ins.health_from_db("v3.1", ["v3.1"], sections, matcher)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["source"], "database")
+        self.assertEqual(res["release"], "v3.1")
+        self.assertEqual(len(res["sections"]), 1)
+        sec_out = res["sections"][0]
+        self.assertEqual(sec_out["name"], "FOO SUBSYSTEM")
+        self.assertEqual(sec_out["commits"], 3)
+        self.assertEqual(sec_out["review_coverage"], round(2 / 3, 4))
+        self.assertEqual(sec_out["top_authors"][0]["identity"], ins.identity("Ann B", "ann@x.org"))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -362,6 +476,13 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
 class TestMergeWindowSectionResolution(unittest.TestCase):
     """Merge-window subsystem resolution via T: tree, changed files/directories, and maintainer."""
 
+    def setUp(self) -> None:
+        from db_engine import MockDB
+        from tests.db_fixtures import patch_reader
+        p = patch_reader(MockDB(use_global=False))
+        p.start()
+        self.addCleanup(p.stop)
+
     @staticmethod
     def _build_resolver():
         from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
@@ -480,6 +601,73 @@ F:\t*/
         )
         self.assertEqual(sec["name"], "KBUILD")
 
+    def test_project_specific_insights_config(self) -> None:
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+
+        raw = (
+            "DRM DRIVERS\n"
+            "M:\tDave Airlie <airlied@linux.ie>\n"
+            "S:\tMaintained\n"
+            "T:\tgit git://anongit.freedesktop.org/drm/drm\n"
+            "F:\tdrivers/gpu/drm/\n\n"
+            "CUSTOM CATCHALL\n"
+            "M:\tLead Maintainer <lead@example.org>\n"
+            "S:\tBuried\n"
+            "F:\t*\n\n"
+            "THE REST\n"
+            "M:\tOther <other@example.org>\n"
+            "S:\tBuried\n"
+            "F:\t*\n"
+        )
+        sections = MaintainerParser(raw).parse()
+        for i, s in enumerate(sections, start=1):
+            s.sec_id = i
+
+        cfg = {
+            "lead_mergers": ["Dave Airlie", "Lead Maintainer"],
+            "catchall_section": "CUSTOM CATCHALL",
+            "generic_repo_names": ["custom-kernel", "my-tree"],
+            "generic_ref_words": ["customnext", "myfixes"],
+            "milestone_rc": 2,
+            "orphan_min_commits": 2,
+            "health_min_commits": 4,
+            "no_review_threshold": 0.25,
+        }
+        r = ins._PullSectionResolver(sections, MaintainerMatcher(sections), insights_cfg=cfg)
+        self.assertEqual(r.catchall_section, "CUSTOM CATCHALL")
+        self.assertIn("dave airlie", r.lead_mergers)
+        self.assertIn("custom-kernel", r.generic_repo_names)
+        self.assertIn("customnext", r.ref_stopwords)
+        # Verify CUSTOM CATCHALL was filtered out, while THE REST was kept
+        sec_names = [s.name for s in r.sections]
+        self.assertNotIn("CUSTOM CATCHALL", sec_names)
+        self.assertIn("THE REST", sec_names)
+
+        # Lead merger Dave Airlie is excluded from candidate people
+        self.assertTrue(r._is_lead_merger("Dave Airlie"))
+        self.assertTrue(r._is_lead_merger("Lead Maintainer"))
+        self.assertFalse(r._is_lead_merger("Linus Torvalds"))
+
+        # _ref_tokens ignores generic repo name
+        toks = r._ref_tokens("myfixes", "Merge branch 'myfixes' of git://x.org/custom-kernel.git", "git://x.org/custom-kernel.git")
+        self.assertNotIn("myfixes", toks)
+        self.assertNotIn("custom-kernel", toks)
+
+        # flags_for with custom config
+        flags = ins.flags_for({
+            "commits": 2, "status": "Orphan", "bus_factor": 1, "review_coverage": 0.20,
+            "maintainers": [],
+        }, insights_cfg=cfg)
+        self.assertIn("orphan_active", flags)  # >= orphan_min (2)
+        self.assertNotIn("no_review", flags)  # commits (2) < health_min (4)
+
+        flags2 = ins.flags_for({
+            "commits": 5, "status": "Maintained", "bus_factor": 1, "review_coverage": 0.20,
+            "maintainers": [],
+        }, insights_cfg=cfg)
+        self.assertIn("no_review", flags2)  # commits >= 4 and 0.20 < 0.25
+
     def test_compute_merge_window_git_maintainers_fallback(self) -> None:
         import shutil
         import tempfile
@@ -518,6 +706,7 @@ F:\t*/
              mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
              mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
              mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.commit_facts.commit_ids", return_value={}), \
              mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
             rs._TAGS_CACHE.clear()
             self.addCleanup(rs._TAGS_CACHE.clear)
@@ -596,6 +785,7 @@ F:\t*/
              mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
              mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
              mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.commit_facts.commit_ids", return_value={}), \
              mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
             rs._TAGS_CACHE.clear()
             self.addCleanup(rs._TAGS_CACHE.clear)
@@ -657,6 +847,7 @@ F:\t*/
              mock.patch("webapp.backend.config.get_active_repository", lambda: repo_meta), \
              mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
              mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.commit_facts.commit_ids", return_value={}), \
              mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
             rs.clear_caches()
             self.addCleanup(rs.clear_caches)

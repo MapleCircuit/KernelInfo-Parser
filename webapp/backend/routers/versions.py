@@ -23,6 +23,7 @@ from core.config import (
     detect_default_branch,
     matches_branch_filter,
     resolve_repo_features,
+    resolve_repo_insights,
 )
 from parser.git_ast.release_order import PREFIXED_SERIES, PREFIXED_TAG_RE, parse_tag, release_key
 from webapp.backend.config import (
@@ -178,6 +179,7 @@ def projects_catalog() -> list[dict[str, Any]]:
             "active": False,
             "tag_views": repo.get("tag_views") or copy.deepcopy(default_views),
             "features": resolve_repo_features(repo),
+            "insights": resolve_repo_insights(repo),
         })
     return projects
 

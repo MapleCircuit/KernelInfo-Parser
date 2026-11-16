@@ -8,6 +8,7 @@ import { escapeHtml } from "../../components/modal.js";
 import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
 import { hasFeature } from "../../utils/projects.js";
+import { parseTag as parseTagVersion } from "../sections/release_order.js";
 
 const SETUP = `<h2>CVE records are not configured</h2>
 <p>The Security section reads CVE records from a local git clone, either the CVE Program's list (every CNA; the Linux kernel's records are picked out) or the kernel CNA's own repository:</p>
@@ -53,7 +54,10 @@ registerInsightsSection({
   async releaseOptions(ctx) {
     // Mainline releases plus the stable updates: a stable tag carries backported fixes
     const res = await (ctx.api || api).getVersionsCached(true);
-    return (res?.versions || []).map((v) => v.vname || v).filter((n) => /^v\d+\.\d+(\.\d+)*$/.test(n)).reverse();
+    return (res?.versions || [])
+      .map((v) => v.vname || v)
+      .filter((n) => /^v\d+\.\d+(\.\d+)*$/.test(n) || Boolean(parseTagVersion(n) && !parseTagVersion(n).pre))
+      .reverse();
   },
   async fetchList(ctx) {
     const res = await (ctx.api || api).getInsights(ctx.release, "cves", ctx);

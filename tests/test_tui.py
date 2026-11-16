@@ -18,9 +18,9 @@ from core.tui.theme import (
     safe_addstr,
     draw_box,
 )
-from core.config import PROJECT_FEATURE_DEFS
+from core.config import PROJECT_FEATURE_DEFS, PROJECT_INSIGHTS_DEFS
 from core.tui.screens.base import BaseScreen
-from core.tui.screens.repos import RepoDetailScreen, RepoFeaturesScreen
+from core.tui.screens.repos import RepoDetailScreen, RepoFeaturesScreen, RepoInsightsScreen
 from core.tui.widgets import (
     TextInput,
     Checkbox,
@@ -577,6 +577,145 @@ class TestRepoFeaturesTui(unittest.TestCase):
             rendered = "\n".join(args[2] for op, args, _ in win.calls if op == "addstr")
             self.assertIn("Features: linux (project: linux)", rendered)
             self.assertIn("Kconfig Engine", rendered)
+
+
+class TestRepoInsightsTui(unittest.TestCase):
+    """Test per-project Insights configuration, editing, autodetection, and reset in RepoDetailScreen and RepoInsightsScreen."""
+
+    def test_repo_insights_button_label_and_open_screen(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "branches": ["master"]}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+
+        self.assertFalse(detail.has_unsaved_changes())
+        self.assertEqual(detail.insights_btn.label, "Insights (I)")
+
+        # Move focus off TextInput so 'i' triggers Insights shortcut
+        detail.focus_widget(detail.widgets.index(detail.branch_list))
+        self.assertTrue(detail.handle_key(ord("i")))
+        self.assertEqual(len(app.screen_stack), 2)
+        ins_screen = app.screen_stack[-1]
+        self.assertIsInstance(ins_screen, RepoInsightsScreen)
+
+        # Toggle 'merge_window' (key at index 0)
+        mw_idx = next(i for i, d in enumerate(PROJECT_INSIGHTS_DEFS) if d["key"] == "merge_window")
+        ins_screen.insights_list.set_selected(mw_idx)
+        self.assertIn("[default]", ins_screen._render_insight_item(PROJECT_INSIGHTS_DEFS[mw_idx]))
+        self.assertTrue(ins_screen.handle_key(ord(" ")))
+        self.assertIn("[override]", ins_screen._render_insight_item(PROJECT_INSIGHTS_DEFS[mw_idx]))
+
+        # Apply with 'd'
+        self.assertTrue(ins_screen.handle_key(ord("d")))
+        self.assertEqual(len(app.screen_stack), 1)
+        self.assertTrue(detail.has_unsaved_changes())
+        self.assertEqual(detail.insights_btn.label, "Insights: 1 (I)")
+
+        detail.save_changes()
+        self.assertTrue(app.is_dirty)
+        self.assertEqual(entry.get("insights"), {"merge_window": False})
+
+    def test_repo_insights_edit_types(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "branches": ["master"]}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+        ins_screen = detail.open_insights_screen()
+
+        # 1. Edit int: milestone_rc
+        rc_idx = next(i for i, d in enumerate(PROJECT_INSIGHTS_DEFS) if d["key"] == "milestone_rc")
+        ins_screen.insights_list.set_selected(rc_idx)
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="2"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertEqual(ins_screen.draft_overrides.get("milestone_rc"), 2)
+
+        # Invalid int (< 0) -> status bar error
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="-1"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertIn("Invalid integer", ins_screen.status_bar.message)
+        self.assertEqual(ins_screen.draft_overrides.get("milestone_rc"), 2)
+
+        # 2. Edit float: no_review_threshold
+        flt_idx = next(i for i, d in enumerate(PROJECT_INSIGHTS_DEFS) if d["key"] == "no_review_threshold")
+        ins_screen.insights_list.set_selected(flt_idx)
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="0.25"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertEqual(ins_screen.draft_overrides.get("no_review_threshold"), 0.25)
+
+        # Invalid float (> 1.0) -> status bar error
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="1.5"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertIn("Invalid float", ins_screen.status_bar.message)
+
+        # 3. Edit list: lead_mergers
+        lm_idx = next(i for i, d in enumerate(PROJECT_INSIGHTS_DEFS) if d["key"] == "lead_mergers")
+        ins_screen.insights_list.set_selected(lm_idx)
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="Alice, Bob"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertEqual(ins_screen.draft_overrides.get("lead_mergers"), ["Alice", "Bob"])
+
+        # 4. Edit str: maintainers_file
+        mf_idx = next(i for i, d in enumerate(PROJECT_INSIGHTS_DEFS) if d["key"] == "maintainers_file")
+        ins_screen.insights_list.set_selected(mf_idx)
+        with patch("core.tui.screens.repos.ModalTextInputDialog.show", return_value="DOCS/MAINTAINERS"):
+            self.assertTrue(ins_screen.edit_selected_setting())
+        self.assertEqual(ins_screen.draft_overrides.get("maintainers_file"), "DOCS/MAINTAINERS")
+
+    def test_repo_insights_autodetect_hotkey(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "branches": ["master"]}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        ins_screen = detail.open_insights_screen()
+
+        with patch(
+            "core.tui.screens.repos.detect_repository_insights",
+            return_value={"merge_window": False, "milestone_rc": 0},
+        ):
+            self.assertTrue(ins_screen.handle_key(ord("a")))
+        self.assertIn("Auto-detected optimal Insights", ins_screen.status_bar.message)
+        self.assertEqual(ins_screen.draft_overrides, {"merge_window": False, "milestone_rc": 0})
+
+    def test_repo_insights_reset_defaults_and_esc_modal(self) -> None:
+        win = MockCursesWindow(24, 80)
+        app = _DummyApp()
+        entry = {"name": "linux", "project": "linux", "insights": {"milestone_rc": 3}}
+        detail = RepoDetailScreen(win, app=app, repo_entry=entry)
+        app.push_screen(detail)
+        ins_screen = detail.open_insights_screen()
+
+        # Reset defaults with 'r'
+        self.assertTrue(ins_screen.handle_key(ord("r")))
+        self.assertEqual(ins_screen.draft_overrides, {})
+        self.assertIn("Reset all Insights settings to defaults", ins_screen.status_bar.message)
+
+        # Esc with Cancel keeps screen open
+        with patch("core.tui.screens.repos.safe_modal_dialog", return_value="Cancel"):
+            self.assertTrue(ins_screen.handle_key(27))
+            self.assertEqual(len(app.screen_stack), 2)
+
+        # Esc with Discard pops screen
+        with patch("core.tui.screens.repos.safe_modal_dialog", return_value="Discard"):
+            self.assertTrue(ins_screen.handle_key(27))
+            self.assertEqual(len(app.screen_stack), 1)
+
+    def test_draw_and_resize(self) -> None:
+        for rows, cols in [(24, 80), (40, 120)]:
+            win = MockCursesWindow(rows, cols)
+            entry = {"name": "linux", "project": "linux", "insights": {"milestone_rc": 2}}
+            detail = RepoDetailScreen(win, repo_entry=entry)
+            detail.draw()
+            self.assertTrue(len(win.calls) > 0)
+
+            ins_screen = detail.open_insights_screen()
+            ins_screen.draw()
+            self.assertTrue(len(win.calls) > 0)
+
+            rendered = "\n".join(args[2] for op, args, _ in win.calls if op == "addstr")
+            self.assertIn("Insights Settings: linux (project: linux)", rendered)
+            self.assertIn("Merge Window", rendered)
 
 
 if __name__ == "__main__":

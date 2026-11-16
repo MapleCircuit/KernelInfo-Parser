@@ -145,3 +145,21 @@ def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | N
             f"({summary['persons_added']} new person(s))."
         ))
     return summary
+
+
+def processing_insights(repo_path: str, repo_id: int, from_tag: str | None = None) -> dict[str, Any] | None:
+    """Ingest pre-computed Merge Window pull and Subsystem Health summaries for release segments
+    (parser/git_ast/release_stats.py)."""
+    if not feature_enabled("insights"):
+        logger.debug("[Insights] Skipped: 'insights' feature is disabled.")
+        return None
+    from parser.git_ast import release_stats
+    try:
+        with G.DB() as db:
+            if db is None:
+                return None
+            return release_stats.ingest_insights(db, Path(repo_path), repo_id, from_tag=from_tag)
+    except Exception as exc:  # noqa: BLE001 - insights never block parsing
+        logger.warning(COLOR.yellow(f"[Insights] Ingesting insights for {repo_path} failed: {exc}"))
+        return {"state": "error", "error": str(exc)}
+
