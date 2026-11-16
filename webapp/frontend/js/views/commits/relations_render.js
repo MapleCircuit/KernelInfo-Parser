@@ -78,7 +78,7 @@ export function relationsHtml(rel, { showCve = true, showMail = true } = {}) {
   }
   const cves = rel.cves || {};
   if (showCve && ((cves.fixes || []).length || (cves.introduced || []).length || (cves.fixes_upstream || []).length)) {
-    const link = (id) => `<a href="#" class="rel-cve" data-cve="${escapeHtml(id)}" title="Open in Insights · Security">${escapeHtml(id)}</a> <a href="https://www.cve.org/CVERecord?id=${encodeURIComponent(id)}" target="_blank" rel="noopener noreferrer" class="rel-ext" title="The record at cve.org">↗</a>`;
+    const link = (id) => `<a href="#" class="rel-cve" data-cve="${escapeHtml(id)}" title="Open in CVE tab">${escapeHtml(id)}</a> <a href="https://www.cve.org/CVERecord?id=${encodeURIComponent(id)}" target="_blank" rel="noopener noreferrer" class="rel-ext" title="The record at cve.org">↗</a>`;
     parts.push(`<div class="rel-section rel-cve-section"><div class="rel-title">CVE</div>
       ${(cves.fixes || []).map((id) => `<div class="rel-row">Fixes ${link(id)}</div>`).join("")}
       ${(cves.fixes_upstream || []).map((id) => `<div class="rel-row">Backports the fix of ${link(id)}</div>`).join("")}

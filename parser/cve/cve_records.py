@@ -329,3 +329,86 @@ def record_commits(rec: dict[str, Any]) -> list[tuple[str, int]]:
             if HEXSHA.match(sha) and (sha, role) not in out:
                 out.append((sha, role))
     return out
+
+
+def summarize_versions(rec: dict[str, Any]) -> dict[str, Any]:
+    """Pure human-readable version summary from `entries` and `ranges` (no git, no release_index).
+
+    Returns {"text": str, "affected": list[str], "fixed": list[str], "unfixed": bool}.
+    """
+    entries = rec.get("entries") or []
+    ranges = rec.get("ranges") or []
+    affected: list[str] = []
+    fixed: list[str] = []
+    unfixed = False
+    has_versions = False
+
+    for e in entries:
+        versions = e.get("versions") or []
+        if versions:
+            has_versions = True
+        if e.get("default") == "affected":
+            intro: str | None = None
+            mainline_fix: str | None = None
+            for item in versions:
+                st = item.get("status")
+                ver = str(item.get("version") or "")
+                if st == "affected":
+                    if intro is None and ver and ver != "0":
+                        intro = ver
+                    if item.get("lessThanOrEqual") == "*":
+                        unfixed = True
+                elif st == "unaffected":
+                    if ver == "0" and "lessThan" in item and intro is None:
+                        intro = str(item["lessThan"])
+                    lte = item.get("lessThanOrEqual")
+                    if lte == "*":
+                        if mainline_fix is None and ver:
+                            mainline_fix = ver
+                        if ver:
+                            fixed.append(ver)
+                    elif lte and str(lte).endswith(".*") and ver:
+                        fixed.append(ver)
+            if mainline_fix:
+                affected.append(f"{intro}–<{mainline_fix}" if intro else f"< {mainline_fix}")
+            else:
+                unfixed = True
+                affected.append(f">= {intro}" if intro else "all versions")
+        else:
+            for item in versions:
+                if item.get("status") != "affected":
+                    continue
+                lo = str(item.get("version") or "")
+                if "lessThan" in item:
+                    lt = str(item["lessThan"])
+                    fixed.append(lt)
+                    affected.append(f"< {lt}" if lo in ("", "0") else f"{lo}–<{lt}")
+                elif "lessThanOrEqual" in item:
+                    pat = str(item["lessThanOrEqual"])
+                    if pat == "*":
+                        unfixed = True
+                        affected.append(f">= {lo}" if lo not in ("", "0") else "all versions")
+                    elif lo in ("", "0"):
+                        affected.append(f"<= {pat}")
+                    else:
+                        affected.append(f"{lo}–{pat}")
+                elif lo:
+                    affected.append(lo)
+
+    if not has_versions and not any(e.get("default") == "affected" for e in entries):
+        if any(r.get("fixed") is None for r in ranges):
+            unfixed = True
+
+    affected = list(dict.fromkeys(affected))
+    fixed = list(dict.fromkeys(fixed))
+
+    if affected:
+        text = ", ".join(affected[:4]) + (f" (+{len(affected) - 4} more)" if len(affected) > 4 else "")
+    elif fixed:
+        text = "fixed in " + ", ".join(fixed[:4])
+    elif ranges:
+        text = "git range (unfixed)" if unfixed else f"{len(ranges)} commit range(s)"
+    else:
+        text = "unspecified"
+
+    return {"text": text, "affected": affected, "fixed": fixed, "unfixed": unfixed}

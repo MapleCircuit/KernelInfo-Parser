@@ -46,6 +46,7 @@ import { WatchView } from "./views/watch/watch_view.js";
 import { initWatchRuntime } from "./views/watch/watch_runtime.js";
 import { KernelApiView, apiSections } from "./views/kernel_api/kernel_api_view.js";
 import { InsightsView, insightsSections } from "./views/insights/insights_view.js";
+import { CveView } from "./views/cve/cve_view.js";
 import { ManView } from "./views/man/man_view.js";
 import { newestTag } from "./views/man/man_model.js";
 import { KERNEL_FAMILY, familyOf, prefixedFinals, prefixedReleaseOf } from "./views/sections/release_order.js";
@@ -136,6 +137,7 @@ class KernelIdeApp {
       watch: () => new WatchView(),
       api: () => new KernelApiView(),
       insights: () => new InsightsView(),
+      cve: () => new CveView(),
       man: () => new ManView()
     };
   }
@@ -1786,6 +1788,9 @@ class KernelIdeApp {
         ...visibleInsights.map((sec) => ({ title: `Insights: ${sec.label}`, hint: sec.hint || "", keywords: `insights ${sec.keywords || ""}`,
           run: () => state.openTab({ type: "insights", title: `Insights · ${sec.label}`, view: sec.id, version: v() }) })),
       ] : []),
+      ...(enabled("cve") ? [
+        { title: "Open CVEs", hint: "All Linux kernel CVEs & affected versions", keywords: "cve vulnerability security", run: () => state.openTab({ type: "cve", title: "CVEs", version: v() }) },
+      ] : []),
       { title: "Show watch list", hint: "Files, symbols, Kconfig options and MAINTAINERS sections you follow", keywords: "watch follow notify bell changes", run: () => state.openTab({ type: "watch", title: "Watch list" }) },
       { title: "Watch this tab", hint: "The file of a code tab, the directory of an explorer, a Kconfig option, a MAINTAINERS section", keywords: "watch follow notify", run: async () => {
         const { toggleWatch } = await import("./views/watch/watch_runtime.js");
@@ -1932,7 +1937,7 @@ class KernelIdeApp {
    * (`/api/man/resolve`), else the newest tag.
    */
   updateActivityBar(repo = state.currentRepo || state.activeRepo()) {
-    const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "man", "compare"];
+    const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "cve", "man", "compare"];
     for (const action of gated) {
       const btn = document.querySelector(`.activity-btn[data-action="${action}"]`);
       if (!btn) continue;
@@ -2007,6 +2012,8 @@ class KernelIdeApp {
           state.openTab({ type: "api", title: "Kernel API", ...tabTarget });
         } else if (action === "insights") {
           state.openTab({ type: "insights", title: "Insights", ...tabTarget });
+        } else if (action === "cve") {
+          state.openTab({ type: "cve", title: "CVEs", ...tabTarget });
         } else if (action === "man") {
           this.openManIndex(targetRepo);
         } else if (action === "compare" || action === "tools") {

@@ -247,6 +247,16 @@ class CommandPalette {
       items = this.commandProvider().slice(0, 8).map((c) => ({ section: "Suggested commands", icon: "›", title: c.title, detail: c.hint || "", run: c.run }));
     } else {
       const repo = state.activeRepo();
+      if (mode === "" && /^CVE-\d{4}-\d{4,}$/i.test(query) && hasFeature(repo, "cve")) {
+        const cveId = query.toUpperCase();
+        items.push({
+          section: "CVE",
+          icon: "🛡️",
+          title: cveId,
+          detail: "Open in CVE tab",
+          run: (nt) => state.openTab({ type: "cve", title: `CVE · ${cveId}`, sel: cveId, version, forceNew: Boolean(nt) }),
+        });
+      }
       const wantFiles = mode === "";
       const wantSymbols = mode === "" || mode === "$";
       const wantKconfig = hasFeature(repo, "kconfig") && (mode === "" || mode === "?");

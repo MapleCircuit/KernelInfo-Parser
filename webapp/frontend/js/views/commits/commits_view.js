@@ -806,7 +806,7 @@ export class CommitsView {
     const cve = e.target.closest(".rel-cve[data-cve]");
     if (cve && hasFeature(this.api?.repo, "cve")) {
       e.preventDefault();
-      state.openTab({ type: "insights", title: "Insights · Security", view: "security", sel: cve.dataset.cve, version: this.currentVersion, forceNew: forceNew || e.ctrlKey || e.metaKey });
+      state.openTab({ type: "cve", title: `CVE · ${cve.dataset.cve}`, sel: cve.dataset.cve, version: this.currentVersion, forceNew: forceNew || e.ctrlKey || e.metaKey });
       return true;
     }
     const mail = e.target.closest(".rel-mail[data-mid]");

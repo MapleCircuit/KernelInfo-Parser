@@ -142,6 +142,7 @@ export const TAB_FEATURE = Object.freeze({
   commits: "commits",
   mail: "mail",
   insights: "insights",
+  cve: "cve",
   man: "man",
   pahole: "pahole",
   callgraph: "callgraph",

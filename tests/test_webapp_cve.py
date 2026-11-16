@@ -218,12 +218,14 @@ class TestCveFromDatabase(unittest.TestCase):
         self.patch = patch.object(cs, "get_reader", reader)
         self.patch.start()
         cs._SOURCE.update(checked=0.0, row=None)
-        cs._MEM.update(built_at=None, records={})
+        cs._MEM.update(built_at=None, head=None, records={})
+        cs._CATALOG.update(built_at=None, head=None, rows=[])
 
     def tearDown(self) -> None:
         self.patch.stop()
         cs._SOURCE.update(checked=0.0, row=None)
-        cs._MEM.update(built_at=None, records={})
+        cs._MEM.update(built_at=None, head=None, records={})
+        cs._CATALOG.update(built_at=None, head=None, rows=[])
 
     def test_status_and_records(self) -> None:
         st = cs.status()
@@ -278,10 +280,6 @@ class TestCveFromDatabase(unittest.TestCase):
         self.assertEqual(cs.for_commit(FIX)["fixes"], [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStoredPrefixes(unittest.TestCase):
     def test_no_rev_parse_for_a_stored_prefix(self) -> None:
         from unittest import mock
@@ -293,3 +291,223 @@ class TestStoredPrefixes(unittest.TestCase):
             ctx.prefetch([full[:12], "cd" * 20])
             self.assertEqual(ctx.full(full[:12]), full)
         rev_parse.assert_not_called()
+
+
+class TestSummarizeVersions(unittest.TestCase):
+    def test_cna_mixed_entries(self) -> None:
+        rec = cs.parse_record(cna_record("CVE-2024-12345"))
+        s = cs.summarize_versions(rec)
+        self.assertEqual(s["affected"], ["5.4.262–<5.4.269", "6.5–<6.8"])
+        self.assertEqual(s["fixed"], ["5.4.269", "6.6.17", "6.8"])
+        self.assertFalse(s["unfixed"])
+        self.assertEqual(s["text"], "5.4.262–<5.4.269, 6.5–<6.8")
+
+    def test_default_affected_unfixed_and_all_versions(self) -> None:
+        rec_intro = {
+            "entries": [{"default": "affected", "versions": [
+                {"version": "0", "lessThan": "6.1", "status": "unaffected"},
+                {"version": "6.1", "status": "affected"},
+            ]}],
+            "ranges": [],
+        }
+        s1 = cs.summarize_versions(rec_intro)
+        self.assertEqual(s1, {"text": ">= 6.1", "affected": [">= 6.1"], "fixed": [], "unfixed": True})
+
+        rec_all = {"entries": [{"default": "affected", "versions": []}], "ranges": []}
+        s2 = cs.summarize_versions(rec_all)
+        self.assertEqual(s2, {"text": "all versions", "affected": ["all versions"], "fixed": [], "unfixed": True})
+
+        # Mainline fix in entries overrides ranges with fixed=None
+        rec_mainline_fixed = {
+            "entries": [{"default": "affected", "versions": [
+                {"version": "6.4", "status": "affected"},
+                {"version": "6.8", "lessThanOrEqual": "*", "status": "unaffected"},
+            ]}],
+            "ranges": [{"introduced": INTRO, "fixed": None}],
+        }
+        s3 = cs.summarize_versions(rec_mainline_fixed)
+        self.assertFalse(s3["unfixed"])
+        self.assertEqual(s3["affected"], ["6.4–<6.8"])
+        self.assertEqual(s3["fixed"], ["6.8"])
+
+    def test_non_default_affected_variants_and_truncation(self) -> None:
+        rec = {
+            "entries": [{"default": "unaffected", "versions": [
+                {"version": "0", "lessThan": "4.8.3", "status": "affected"},
+                {"version": "0", "lessThanOrEqual": "6.0.6", "status": "affected"},
+                {"version": "5.10", "lessThanOrEqual": "5.10.*", "status": "affected"},
+                {"version": "6.1", "status": "affected"},
+                {"version": "6.5", "lessThanOrEqual": "*", "status": "affected"},
+            ]}],
+            "ranges": [],
+        }
+        s = cs.summarize_versions(rec)
+        self.assertEqual(s["affected"], ["< 4.8.3", "<= 6.0.6", "5.10–5.10.*", "6.1", ">= 6.5"])
+        self.assertEqual(s["fixed"], ["4.8.3"])
+        self.assertTrue(s["unfixed"])
+        self.assertEqual(s["text"], "< 4.8.3, <= 6.0.6, 5.10–5.10.*, 6.1 (+1 more)")
+
+    def test_commit_text_and_ranges_only(self) -> None:
+        # commit with description bound
+        commit_rec = cs.parse_record(other_record(
+            "CVE-2016-5195",
+            "Race condition in the Linux kernel before 4.8.3",
+            [f"https://github.com/torvalds/linux/commit/{FIX}"],
+        ))
+        self.assertEqual(cs.summarize_versions(commit_rec), {
+            "text": "< 4.8.3", "affected": ["< 4.8.3"], "fixed": ["4.8.3"], "unfixed": False,
+        })
+
+        # text without bound -> unspecified
+        text_rec = {"kind": "text", "entries": [], "ranges": []}
+        self.assertEqual(cs.summarize_versions(text_rec), {
+            "text": "unspecified", "affected": [], "fixed": [], "unfixed": False,
+        })
+
+        # ranges only: fixed vs unfixed
+        self.assertEqual(cs.summarize_versions({"entries": [], "ranges": [{"introduced": INTRO, "fixed": FIX}]}), {
+            "text": "1 commit range(s)", "affected": [], "fixed": [], "unfixed": False,
+        })
+        self.assertEqual(cs.summarize_versions({"entries": [], "ranges": [{"introduced": INTRO, "fixed": None}]}), {
+            "text": "git range (unfixed)", "affected": [], "fixed": [], "unfixed": True,
+        })
+
+
+class TestCveCatalogAndEndpoints(unittest.TestCase):
+    def setUp(self) -> None:
+        import zlib
+        self.cna_fixed = cs.parse_record(cna_record("CVE-2024-0002"))
+        self.cna_fixed["cwes"] = ["CWE-416"]
+        self.cna_unfixed = {
+            "id": "CVE-2025-0001", "kind": "cna", "title": "mm: unfixed bug",
+            "description": "Unfixed issue", "published": "2025-01-01", "updated": "2025-01-01",
+            "ranges": [{"introduced": INTRO, "fixed": None, "files": ["mm/slub.c"]}],
+            "entries": [{"default": "affected", "versions": [
+                {"version": "0", "lessThan": "6.10", "status": "unaffected"},
+                {"version": "6.10", "status": "affected"},
+            ]}],
+            "files": ["mm/slub.c"], "references": [], "cvss": {"score": 5.5, "severity": "MEDIUM"},
+            "kev": None, "exploitation": None, "cwes": ["CWE-476"],
+        }
+        self.commit_rec = cs.parse_record(other_record(
+            "CVE-2016-5195", "Dirty COW in the Linux kernel before 4.8.3",
+            [f"https://github.com/torvalds/linux/commit/{FIX[:12]}"],
+        ))
+        self.text_rec = cs.parse_record(other_record(
+            "CVE-2014-3180", "In kernel/compat.c in the Linux kernel before 3.17", [],
+        ))
+
+        self.db = MockDB(use_global=False)
+        self.db.insert_rows("m_cve_source", ["name", "layout", "head", "format", "records", "built_at"],
+                            [("cvelistV5", "cvelist", bytes.fromhex("e" * 40), cs.RECORD_FORMAT, 4, 1700000000)])
+        self.db.insert_rows(
+            "m_cve",
+            ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
+            [(r["id"], 0, 0, 0, 0, 0, "", "", zlib.compress(json.dumps(r).encode()))
+             for r in (self.cna_fixed, self.cna_unfixed, self.commit_rec, self.text_rec)],
+        )
+        self.patch = patch.object(cs, "get_reader", lambda: self.db.reader())
+        self.patch.start()
+        cs._SOURCE.update(checked=0.0, row=None)
+        cs._MEM.update(built_at=None, head=None, records={})
+        cs._CATALOG.update(built_at=None, head=None, rows=[])
+
+    def tearDown(self) -> None:
+        self.patch.stop()
+        cs._SOURCE.update(checked=0.0, row=None)
+        cs._MEM.update(built_at=None, head=None, records={})
+        cs._CATALOG.update(built_at=None, head=None, rows=[])
+
+    def test_catalog_ingested_filtering_and_pagination(self) -> None:
+        res = cs.catalog()
+        self.assertTrue(res["configured"])
+        self.assertTrue(res["ingested"])
+        self.assertEqual(res["total"], 4)
+        self.assertEqual(res["counts"], {
+            "total": 4, "cna": 2, "commit": 1, "text": 1, "kev": 2, "high": 3, "unfixed": 1,
+        })
+        self.assertEqual([c["id"] for c in res["cves"]],
+                         ["CVE-2025-0001", "CVE-2024-0002", "CVE-2016-5195", "CVE-2014-3180"])
+        self.assertEqual(res["cves"][1]["versions"], "5.4.262–<5.4.269, 6.5–<6.8")
+        self.assertEqual(res["cves"][1]["cwes"], ["CWE-416"])
+        self.assertEqual(res["cves"][1]["files"], ["net/core/x.c"])
+
+        # kind filter
+        self.assertEqual([c["id"] for c in cs.catalog(kind="commit")["cves"]], ["CVE-2016-5195"])
+        # q filter (multi-word across fields: cwe + file)
+        self.assertEqual([c["id"] for c in cs.catalog(q="cwe-476 slub.c")["cves"]], ["CVE-2025-0001"])
+        # version filter (pure tuple math, with/without v)
+        self.assertEqual([c["id"] for c in cs.catalog(version="v6.6")["cves"]], ["CVE-2024-0002"])
+        self.assertEqual([c["id"] for c in cs.catalog(version="6.11")["cves"]], ["CVE-2025-0001"])
+        self.assertEqual(cs.catalog(version="not-a-version")["total"], 0)
+        # pagination preserves total and full counts
+        page = cs.catalog(offset=1, limit=2)
+        self.assertEqual(page["total"], 4)
+        self.assertEqual([c["id"] for c in page["cves"]], ["CVE-2024-0002", "CVE-2016-5195"])
+
+    def test_catalog_uningested(self) -> None:
+        self.db.delete_rows("m_cve_source", None, all_rows=True)
+        with patch("parser.cve.cve_ingest.repo_dir", lambda raw=None: Path("/srv/cves")):
+            res = cs.catalog()
+        self.assertEqual(res, {
+            "configured": True, "ingested": False, "total": 0,
+            "counts": {"total": 0, "cna": 0, "commit": 0, "text": 0, "kev": 0, "high": 0, "unfixed": 0},
+            "cves": [],
+        })
+
+    def test_head_change_at_same_built_at_reloads(self) -> None:
+        self.assertEqual(len(cs.records()), 4)
+        self.db.delete_rows("m_cve", {"cve_id": "CVE-2014-3180"})
+        self.db.delete_rows("m_cve_source", None, all_rows=True)
+        self.db.insert_rows("m_cve_source", ["name", "layout", "head", "format", "records", "built_at"],
+                            [("cvelistV5", "cvelist", bytes.fromhex("f" * 40), cs.RECORD_FORMAT, 3, 1700000000)])
+        cs._SOURCE.update(checked=0.0, row=None)
+        self.assertEqual(len(cs.records()), 3)
+        self.assertEqual(cs.catalog()["total"], 3)
+
+    def test_record_includes_version_summary(self) -> None:
+        with patch("webapp.backend.services.commit_facts.git_facts", return_value={}), \
+                patch("webapp.backend.services.commit_facts.release_badges", return_value={}), \
+                patch.object(cs.rs, "release_lookup", return_value={}):
+            detail = cs.record("CVE-2024-0002")
+        self.assertIn("version_summary", detail)
+        self.assertEqual(detail["version_summary"]["affected"], ["5.4.262–<5.4.269", "6.5–<6.8"])
+
+    def test_router_list_before_detail_and_feature_gate(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from webapp.backend.routers import cve as cve_router
+
+        app = FastAPI()
+        app.include_router(cve_router.router)
+        client = TestClient(app)
+
+        with patch("webapp.backend.config.repo_feature_enabled", return_value=True):
+            r_list = client.get("/api/cve/list?kind=cna&limit=1")
+            self.assertEqual(r_list.status_code, 200)
+            body = r_list.json()
+            self.assertEqual(body["total"], 2)
+            self.assertEqual(len(body["cves"]), 1)
+
+            r_bad_id = client.get("/api/cve/not-a-cve")
+            self.assertEqual(r_bad_id.status_code, 400)
+
+        with patch("webapp.backend.config.repo_feature_enabled", return_value=False):
+            r_disabled = client.get("/api/cve/list")
+            self.assertEqual(r_disabled.status_code, 403)
+
+    def test_release_report_includes_cwes(self) -> None:
+        with patch.object(cs.rs, "parse_tag", return_value={"pre": False, "stable": 0, "series": (6, 6)}), \
+                patch.object(cs.rs, "release_key", return_value=(6, 6)), \
+                patch.object(cs.rs, "series_name", return_value="v6.6"), \
+                patch.object(cs.rs, "release_token", return_value="tok"), \
+                patch.object(cs.rs, "release_lookup", return_value={}), \
+                patch.object(cs.rs, "db_covers_all", return_value=False):
+            rep = cs.release_report("v6.6")
+        by_id = {r["id"]: r for r in rep["cves"]}
+        self.assertEqual(by_id["CVE-2024-0002"]["cwes"], ["CWE-416"])
+        self.assertNotIn("CVE-2025-0001", by_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,9 +33,11 @@ from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and
     RECORD_FORMAT,
     ROLE_FIX,
     ROLE_INTRODUCED,
+    _VERSION_TEXT,
     description_bound,
     kernel_commits,
     parse_record,
+    summarize_versions,
     version_status,
 )
 from webapp.backend.config import RepoScopedCache
@@ -46,14 +48,15 @@ from webapp.backend.services.jobs import jobs
 
 logger = logging.getLogger(__name__)
 
-REPORT_FORMAT = 3
+REPORT_FORMAT = 4
 SOURCE_TTL = 60.0
 _FULL = re.compile(r"^[0-9a-f]{40}$")
 
 _DISK = DiskCache("cve-index", max_bytes=256 << 20, max_entries=6)
 _PREFETCH_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
 _SOURCE: dict[str, Any] = {"checked": 0.0, "row": None}
-_MEM: dict[str, Any] = {"built_at": None, "records": {}}
+_MEM: dict[str, Any] = {"built_at": None, "head": None, "records": {}}
+_CATALOG: dict[str, Any] = {"built_at": None, "head": None, "rows": []}
 _LOCK = threading.Lock()
 
 
@@ -98,8 +101,9 @@ def records() -> dict[str, dict[str, Any]]:
     src = source()
     if src is None:
         return {}
+    key = (src["built_at"], src["head"])
     with _LOCK:
-        if _MEM["built_at"] == src["built_at"]:
+        if (_MEM["built_at"], _MEM["head"]) == key:
             return _MEM["records"]
     out: dict[str, dict[str, Any]] = {}
     started = time.time()
@@ -110,8 +114,107 @@ def records() -> dict[str, dict[str, Any]]:
                 out[_text(r["cve_id"])] = rec
     logger.info("Loaded %d CVE records in %.1f s", len(out), time.time() - started)
     with _LOCK:
-        _MEM.update(built_at=src["built_at"], records=out)
+        _MEM.update(built_at=src["built_at"], head=src["head"], records=out)
     return out
+
+
+def catalog_rows() -> list[dict[str, Any]]:
+    """Cached, id-descending summary rows for all ingested CVE records."""
+    src = source()
+    if src is None:
+        return []
+    key = (src["built_at"], src["head"])
+    with _LOCK:
+        if (_CATALOG["built_at"], _CATALOG["head"]) == key:
+            return _CATALOG["rows"]
+    all_recs = records()
+    rows: list[dict[str, Any]] = []
+    for rec in all_recs.values():
+        cvss = rec.get("cvss") or {}
+        summary = summarize_versions(rec)
+        rows.append({
+            "id": rec["id"],
+            "title": rec.get("title") or (rec.get("description") or "")[:160],
+            "kind": rec.get("kind", ""),
+            "published": rec.get("published", ""),
+            "score": cvss.get("score"),
+            "severity": cvss.get("severity") or "",
+            "kev": rec.get("kev"),
+            "cwes": rec.get("cwes") or [],
+            "versions": summary["text"],
+            "affected_ranges": summary["affected"],
+            "fixed_versions": summary["fixed"],
+            "unfixed": summary["unfixed"],
+            "files": (rec.get("files") or [])[:5],
+        })
+    rows.sort(key=lambda r: r["id"], reverse=True)
+    with _LOCK:
+        _CATALOG.update(built_at=src["built_at"], head=src["head"], rows=rows)
+    return rows
+
+
+def catalog(q: str = "", kind: str = "", version: str = "", offset: int = 0, limit: int = 50000) -> dict[str, Any]:
+    """Filterable, paginated CVE catalog built purely from ingested records (no git, no release_index)."""
+    src = source()
+    if src is None:
+        from parser.cve.cve_ingest import repo_dir
+        return {
+            "configured": repo_dir() is not None,
+            "ingested": False,
+            "total": 0,
+            "counts": {"total": 0, "cna": 0, "commit": 0, "text": 0, "kev": 0, "high": 0, "unfixed": 0},
+            "cves": [],
+        }
+    rows = catalog_rows()
+    counts = {
+        "total": len(rows),
+        "cna": sum(1 for r in rows if r["kind"] == "cna"),
+        "commit": sum(1 for r in rows if r["kind"] == "commit"),
+        "text": sum(1 for r in rows if r["kind"] == "text"),
+        "kev": sum(1 for r in rows if r["kev"]),
+        "high": sum(1 for r in rows if r["score"] is not None and r["score"] >= 7),
+        "unfixed": sum(1 for r in rows if r["unfixed"]),
+    }
+    filtered = rows
+    if kind:
+        filtered = [r for r in filtered if r["kind"] == kind]
+    ver = version.strip()
+    if ver:
+        if ver[0] in ("v", "V"):
+            ver = ver[1:]
+        if not _VERSION_TEXT.fullmatch(ver):
+            filtered = []
+        else:
+            all_recs = records()
+            filtered = [
+                r for r in filtered
+                if version_status((all_recs.get(r["id"]) or {}).get("entries") or [], ver) == "affected"
+            ]
+    terms = q.strip().lower().split()
+    if terms and filtered:
+        filtered = [
+            r for r in filtered
+            if all(
+                t in " ".join([
+                    r["id"],
+                    r["title"],
+                    r["severity"],
+                    " ".join(r["cwes"]),
+                    r["versions"],
+                    " ".join(r["files"]),
+                ]).lower()
+                for t in terms
+            )
+        ]
+    return {
+        "configured": True,
+        "ingested": True,
+        "head": src["head"],
+        "layout": src["layout"],
+        "total": len(filtered),
+        "counts": counts,
+        "cves": filtered[offset:offset + limit],
+    }
 
 
 def kinds(recs: dict[str, dict[str, Any]]) -> dict[str, int]:
@@ -416,7 +519,8 @@ def release_report(release: str, progress: Callable | None = None) -> dict[str, 
         rows.append({"id": rec["id"], "title": rec["title"] or rec["description"][:160], "state": state, "basis": basis,
                      "kind": rec["kind"], "published": rec["published"], "fixes": fixes[:4],
                      "fixed_here": state == "fixed" and any(ctx.first_here(f) for f in fixes),
-                     "score": cvss.get("score"), "severity": cvss.get("severity") or "", "kev": rec.get("kev")})
+                     "score": cvss.get("score"), "severity": cvss.get("severity") or "", "kev": rec.get("kev"),
+                     "cwes": rec.get("cwes") or []})
     rows.sort(key=lambda r: r["id"], reverse=True)
     counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
     counts["fixed_here"] = sum(1 for r in rows if r["fixed_here"])
@@ -502,7 +606,8 @@ def record(cve_id: str, release: str = "") -> dict[str, Any]:
         if r.get("fixed") in inferred:
             item["inferred_introduced"] = [describe(s) for s in inferred[r["fixed"]]]
         ranges.append(item)
-    out = {**rec, "ranges": ranges, "url": f"https://www.cve.org/CVERecord?id={cve_id}"}
+    out = {**rec, "ranges": ranges, "version_summary": summarize_versions(rec),
+           "url": f"https://www.cve.org/CVERecord?id={cve_id}"}
     if ctx is not None:
         state, basis = affects(rec, release, ctx)
         out["release_state"] = {"release": release, "state": state, "basis": basis}

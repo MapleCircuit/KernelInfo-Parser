@@ -116,3 +116,28 @@ registerTabRoute("man", {
   // index filter replace the entry
   navKey: (tab) => `${tab.manPath || ""}:${tab.manPage || ""}:${tab.manSec || ""}`,
 });
+
+// ---------------------------------------------------------------- independent CVE tab
+registerTabRoute("cve", {
+  badge: "[V]",
+  keys: ["sel", "query", "filter", "cveVersion", "listCollapsed"],
+  fromHash: (params) => {
+    const sel = params.get("id") || params.get("sel") || params.get("cve") || "";
+    return {
+      sel,
+      query: params.get("q") || "",
+      filter: params.get("f") || "",
+      cveVersion: params.get("ver") || "",
+      listCollapsed: hashBool(params, "lc"),
+      title: sel ? `CVE · ${sel}` : "CVEs",
+    };
+  },
+  toHash: (tab, params) => {
+    setIf(params, "id", tab.sel);
+    setIf(params, "ver", tab.cveVersion);
+    setIf(params, "q", tab.query);
+    setIf(params, "f", tab.filter);
+    setIf(params, "lc", tab.listCollapsed);
+  },
+  navKey: (tab) => `${tab.sel || ""}:${tab.cveVersion || ""}`,
+});

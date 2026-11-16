@@ -122,7 +122,9 @@ test("isTabFeatureEnabled enforces tab feature mapping and man cross-repo rule",
   assert.equal(isTabFeatureEnabled("linux", "api"), true);
   assert.equal(isTabFeatureEnabled("linux", "kconfig"), false);
   assert.equal(isTabFeatureEnabled("linux", "man"), true);
+  assert.equal(isTabFeatureEnabled("linux", "cve"), true);
   assert.equal(isTabFeatureEnabled("man-pages", "api"), false);
+  assert.equal(isTabFeatureEnabled("man-pages", "cve"), false);
   assert.equal(isTabFeatureEnabled("man-pages", "man"), true);
 
   // Without a man-pages repo, man tab is disabled on linux even if linux.features.man is true

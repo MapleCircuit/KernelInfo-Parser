@@ -78,3 +78,28 @@
 .dev-line { margin: 6px 0; padding: 4px 0; border-top: 1px solid var(--border-color); }
 .dev-match { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 2px 0 2px 12px; font-size: 12px; }
 .dev-match a { color: var(--accent-blue); text-decoration: none; }
+
+/* Independent CVE tab */
+.cve-version-input {
+  width: 145px; flex: none; padding: 4px 8px;
+  background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;
+}
+.cve-ver-badge { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cve-meta-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.cve-copy-btn, .cve-check-release-btn {
+  padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border-color);
+  background: var(--bg-secondary); color: var(--text-secondary); cursor: pointer; font-size: 11px;
+}
+.cve-copy-btn:hover, .cve-check-release-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.cve-version-summary {
+  margin: 10px 0; padding: 8px 12px; background: var(--bg-secondary);
+  border: 1px solid var(--border-color); border-radius: 4px;
+}
+.cve-version-summary h3 { margin: 0 0 6px; display: flex; align-items: center; gap: 6px; }
+.cve-version-summary-text { margin: 4px 0 6px; font-size: 12px; color: var(--text-secondary); }
+.cve-check-release-form { display: flex; gap: 6px; align-items: center; margin: 8px 0 12px; }
+.cve-check-release-input {
+  width: 210px; padding: 3px 8px; background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;
+}

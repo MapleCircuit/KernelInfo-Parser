@@ -895,7 +895,7 @@ export class VirtualEditor {
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
             <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
-            <span id="file-security-badge" class="code-security-badge" style="display:none;"${cveOn ? "" : " hidden"} title="Security Insights"></span>
+            <span id="file-security-badge" class="code-security-badge" style="display:none;"${cveOn ? "" : " hidden"} title="CVEs"></span>
             <span id="file-subsystem" class="code-subsystem-chip" style="display:none;"${maintOn ? "" : " hidden"} title="Subsystem"></span>
             <span id="file-last-changed" class="code-last-changed" style="display:none;"${commitsOn ? "" : " hidden"} title="Click to view full commit history"></span>
             <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"${kconfigOn ? "" : " hidden"}></button>
@@ -1404,12 +1404,15 @@ export class VirtualEditor {
           if (total > 0) {
             badge.style.display = "inline-flex";
             badge.innerHTML = `🛡️ ${total} CVE${total === 1 ? "" : "s"}`;
-            badge.title = `${total} CVE${total === 1 ? "" : "s"} associated with ${this.currentFilePath} (click to view Security Insights)`;
+            badge.title = `${total} CVE${total === 1 ? "" : "s"} associated with ${this.currentFilePath} (click to view in CVE tab)`;
             badge.onclick = () => {
+              const single = cveRes?.cves?.length === 1 ? cveRes.cves[0].cve_id : "";
               state.openTab({
-                type: "insights",
-                title: "Insights · Security",
-                view: "security",
+                type: "cve",
+                title: single ? `CVE · ${single}` : "CVEs",
+                query: this.currentFilePath,
+                sel: single,
+                listCollapsed: false,
                 version: this.currentVersion,
               });
             };

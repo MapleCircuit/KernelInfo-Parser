@@ -416,6 +416,23 @@ class ApiClient {
     return this.request(`/api/cve/file?${q}`, {}, "tools", `cve_file_${this._vk(ver)}_${filePath}`);
   }
 
+  /** Fast, release-independent catalog of all ingested CVEs (`GET /api/cve/list`). */
+  async getCveList(opts = {}, reqOpts = {}) {
+    const params = new URLSearchParams();
+    if (opts.q) params.set("q", opts.q);
+    if (opts.kind) params.set("kind", opts.kind);
+    if (opts.version) params.set("version", opts.version);
+    params.set("offset", String(opts.offset ?? 0));
+    params.set("limit", String(opts.limit ?? 50000));
+    return this.request(`/api/cve/list?${params.toString()}`, reqOpts);
+  }
+
+  /** Full CVE record with optional single-release evaluation (`GET /api/cve/{cve_id}`). */
+  async getCveDetail(cveId, release = "", reqOpts = {}) {
+    const q = release ? `?release=${encodeURIComponent(release)}` : "";
+    return this.request(`/api/cve/${encodeURIComponent(cveId)}${q}`, reqOpts);
+  }
+
   /**
    * An Insights report (`GET /api/insights/{v}/<path>`, §4.10): polls while its background job runs
    * (202, §2.15). `cacheKey` (optional) keeps the final body in the `tools` store.

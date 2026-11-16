@@ -27,6 +27,18 @@ def get_cve_file(
     return cve_service.cves_for_file(version, file_path)
 
 
+@router.get("/list")
+def get_cve_list(
+    q: str = "",
+    kind: Annotated[str, Query(pattern="^(|cna|commit|text)$")] = "",
+    version: Annotated[str, Query(max_length=64)] = "",
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=50000)] = 50000,
+) -> dict[str, Any]:
+    """Filterable, paginated catalog of all ingested kernel CVE records."""
+    return cve_service.catalog(q=q, kind=kind, version=version, offset=offset, limit=limit)
+
+
 @router.get("/{cve_id}")
 def get_cve(cve_id: str, release: Annotated[str, Query(max_length=64)] = "") -> dict[str, Any]:
     """One CVE: description, severity, introducing/fixing commit ranges with subjects and releases, version
