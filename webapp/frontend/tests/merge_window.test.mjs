@@ -120,3 +120,75 @@ test("merge-window afterDetail highlights selected pull in sv-chart", async () =
   assert.ok(detailHtml.includes("<dt>Subsystem</dt><dd>EDAC</dd>"));
   assert.ok(!detailHtml.includes("data-section"));
 });
+
+test("insights release-scoped sections expose latest, bypass cache on latest, and route links to resolved branch", async () => {
+  const { state } = await import("../js/state.js");
+  const realOpenTab = state.openTab;
+  const opened = [];
+  state.openTab = (tab) => opened.push(tab);
+  try {
+    for (const id of ["release-stats", "merge-window", "subsystems"]) {
+      const sec = insightsSections().find((s) => s.id === id);
+      const opts = await sec.releaseOptions({ view: { defaultReleases: async () => ["v7.3", "v7.2"] } });
+      assert.deepEqual(opts, ["latest", "v7.3", "v7.2"], id);
+    }
+
+    const statsSec = insightsSections().find((s) => s.id === "release-stats");
+    let capturedOpts = null;
+    const seriesUrls = [];
+    const statsRes = await statsSec.fetchList({
+      release: "latest",
+      view: { defaultReleases: async () => ["v7.3", "v7.2"] },
+      api: {
+        async getInsights(_ver, _path, opts) {
+          capturedOpts = opts;
+          return {
+            release: "latest", prev: "v7.3", branch: "master", head: "a".repeat(40),
+            source: "git", commits: 5, merges: 1, authors: 2, first_time_authors: 1,
+            files_changed: 3, lines_added: 10, lines_removed: 2, days: 4, rc_count: 0,
+            top: { authors: [{ person: "Alice", email: "a@example.com", count: 5, share: 1 }] },
+            first_timers: [], employers: [],
+          };
+        },
+        async request(url) {
+          seriesUrls.push(url);
+          return { series: [{ release: "v7.2", commits: 100 }, { release: "v7.3", commits: 120 }] };
+        },
+      },
+    });
+    assert.equal(capturedOpts.networkFirst, true);
+    assert.ok(statsRes.note.includes("v7.3..master (unreleased)"));
+    assert.ok(seriesUrls[0].includes("tag=v7.2") && seriesUrls[0].includes("tag=v7.3"));
+
+    statsSec.onDetailClick({
+      preventDefault() {},
+      target: { closest: (sel) => (sel === "[data-query]" ? { dataset: { query: "author:a@example.com in:latest" } } : null) },
+    }, { release: "latest", view: { version: "v7.3" } });
+    assert.equal(opened.at(-1).version, "master");
+    assert.equal(opened.at(-1).query, "author:a@example.com in:latest");
+
+    const mwSec = insightsSections().find((s) => s.id === "merge-window");
+    const mwRes = await mwSec.fetchList({
+      release: "latest",
+      api: {
+        async getInsights(_ver, _path, opts) {
+          assert.equal(opts.networkFirst, true);
+          return { release: "latest", prev: "v7.3", branch: "master", head: "b".repeat(40), rc1: null, rc1_day: null, pulls: [], totals: { pulls: 0, commits: 0, before_rc1: 0, by_day: [] } };
+        },
+      },
+    });
+    assert.equal(mwRes.note, "v7.3..master (unreleased)");
+
+    const subSec = insightsSections().find((s) => s.id === "subsystems");
+    assert.equal(subSec.rowKey({ sec_id: null, name: "ALPHA" }), "ALPHA");
+    assert.equal(subSec.rowKey({ sec_id: 7, name: "ALPHA" }), "7");
+    const subDetail = subSec.detailHtml({
+      sec_id: null, name: "ALPHA DRIVERS", status: "Supported", commits: 2, per_release: [1, 1],
+      authors: 1, bus_factor: 1, review_coverage: 0.5, flags: [], maintainers: [], top_authors: [],
+    }, { release: "latest" });
+    assert.ok(!subDetail.includes("data-section"));
+    assert.ok(subDetail.includes('section:&quot;ALPHA DRIVERS&quot; in:latest'));
+  } finally {
+    state.openTab = realOpenTab;
+  }
+});

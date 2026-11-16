@@ -85,6 +85,8 @@ def _git(args: list[str], timeout: float = 60.0) -> str | None:
 
 _TAGS_CACHE: RepoScopedCache = RepoScopedCache()
 _TAGS_LOCK = threading.Lock()
+LATEST_RELEASE = "latest"
+_LATEST_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
 
 
 def tag_commits(refresh: bool = False) -> dict[str, str]:
@@ -121,12 +123,93 @@ def releases(kind: str = "all") -> list[str]:
     return sorted(names, key=release_key)
 
 
+def _is_ancestor(ancestor_sha: str, desc_sha: str) -> bool:
+    return ancestor_sha == desc_sha or _git(["merge-base", "--is-ancestor", ancestor_sha, desc_sha], timeout=10) is not None
+
+
+def latest_branch() -> str:
+    """Default branch name of the active repository that resolves to a commit, else 'HEAD'."""
+    from core.config import detect_default_branch
+    from webapp.backend.config import get_active_repository
+
+    repo = get_active_repository()
+    configured = (repo.get("default_branch") or "").strip()
+    candidates: list[str] = []
+    if configured:
+        candidates.append(configured)
+        if "/" not in configured:
+            candidates.append(f"origin/{configured}")
+    try:
+        detected = detect_default_branch(get_repo_dir())
+        if detected and detected not in candidates:
+            candidates.append(detected)
+    except Exception:  # noqa: BLE001
+        pass
+    for fb in ("master", "main", "origin/master", "origin/main", "HEAD"):
+        if fb not in candidates:
+            candidates.append(fb)
+    for cand in candidates:
+        if resolve_sha(cand):
+            return cand
+    return ""
+
+
+def latest_info() -> dict[str, Any]:
+    """Current unreleased cycle ('latest'): {branch, sha, prev, prev_sha, rc1, rc1_sha, rc_count}."""
+    branch = latest_branch()
+    sha = resolve_sha(branch) if branch else None
+    if not sha:
+        raise HTTPException(status_code=404, detail="Repository has no commits yet.")
+    tags = tag_commits()
+    cached = _LATEST_CACHE.get("latest")
+    if cached is not None and cached[0] is tags and cached[1] == branch and cached[2] == sha:
+        return dict(cached[3])
+    mainline = releases("mainline")
+    finals = [t for t in mainline if parse_tag(t)["final"]]
+    prev_name = None
+    for t in reversed(finals):
+        if _is_ancestor(tags[t], sha):
+            prev_name = t
+            break
+    prev_sha = tags.get(prev_name) if prev_name else None
+    if prev_name:
+        prev_family = parse_tag(prev_name)["family"]
+    elif mainline:
+        prev_family = parse_tag(mainline[0])["family"]
+    else:
+        prev_family = KERNEL_FAMILY
+    prev_key = release_key(prev_name) if prev_name else None
+    post_rcs = [
+        t for t in mainline
+        if (p := parse_tag(t)) and p["pre"] and p["family"] == prev_family
+        and (prev_key is None or release_key(t) > prev_key)
+        and _is_ancestor(tags[t], sha)
+    ]
+    rc1 = next((t for t in post_rcs if parse_tag(t)["pre"] == 1), None)
+    info = {
+        "branch": branch,
+        "sha": sha,
+        "prev": prev_name,
+        "prev_sha": prev_sha,
+        "rc1": rc1,
+        "rc1_sha": tags.get(rc1) if rc1 else None,
+        "rc_count": len(post_rcs),
+    }
+    _LATEST_CACHE["latest"] = (tags, branch, sha, info)
+    return dict(info)
+
+
 def previous(tag: str) -> str | None:
+    if tag == LATEST_RELEASE:
+        return latest_info()["prev"]
     return previous_in(tag, list(tag_commits()))
 
 
 def range_of(tag: str) -> tuple[str | None, str]:
     """(commit of the previous release or None, commit of `tag`); 404 for an unknown release tag."""
+    if tag == LATEST_RELEASE:
+        info = latest_info()
+        return info["prev_sha"], info["sha"]
     tags = tag_commits()
     sha = tags.get(tag)
     if not sha:
@@ -546,10 +629,15 @@ def release_commits(tag: str, *, wait: float = 0.0) -> dict[str, Any]:
     return state
 
 
-def release_commits_now(tag: str, progress: Callable[..., None] | None = None) -> list[dict[str, Any]]:
+def release_commits_now(
+    tag: str,
+    progress: Callable[..., None] | None = None,
+    *,
+    range_override: tuple[str | None, str] | None = None,
+) -> list[dict[str, Any]]:
     """`release_commits` computed in the calling thread (for reports that already run as a job: a job
     waiting on queued jobs could starve the worker pool); same disk cache entry."""
-    prev, sha = range_of(tag)
+    prev, sha = range_override if range_override is not None else range_of(tag)
     key = _pass_key(sha, prev, "commits")
     hit = _PASS_DISK.get(key)
     if hit is not None:
@@ -559,9 +647,9 @@ def release_commits_now(tag: str, progress: Callable[..., None] | None = None) -
     return result
 
 
-def merges_now(tag: str) -> list[dict[str, Any]]:
+def merges_now(tag: str, *, range_override: tuple[str | None, str] | None = None) -> list[dict[str, Any]]:
     """`merges` computed in the calling thread (see release_commits_now)."""
-    prev, sha = range_of(tag)
+    prev, sha = range_override if range_override is not None else range_of(tag)
     key = _pass_key(sha, prev, "merges")
     hit = _PASS_DISK.get(key)
     if hit is not None:
@@ -615,6 +703,7 @@ def clear_caches() -> None:
     database coverage are stale. Containment answers are only cached once a tag contains the commit (tags
     never move), so they stay valid."""
     _TAGS_CACHE.clear()
+    _LATEST_CACHE.clear()
     _DB_COVERAGE.clear()
 
 

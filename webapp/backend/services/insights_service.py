@@ -93,13 +93,14 @@ def _release_pass(tag: str) -> list[dict[str, Any]]:
 
 # ------------------------------------------------------------------------------- first-time authors
 
-def author_first_seen(progress: Callable | None = None, family: str = rs.KERNEL_FAMILY) -> dict[str, int]:
+def author_first_seen(progress: Callable | None = None, family: str = rs.KERNEL_FAMILY, *, head: str | None = None) -> dict[str, int]:
     """identity -> time of its first commit on the mainline chain of a tag family (`""`: the kernel scheme; one
     pass over history, cached per head)."""
-    releases = [t for t in rs.releases("mainline") if rs.family_of(t) == family]
-    if not releases:
-        return {}
-    head = rs.tag_commits()[releases[-1]]
+    if head is None:
+        releases = [t for t in rs.releases("mainline") if rs.family_of(t) == family]
+        if not releases:
+            return {}
+        head = rs.tag_commits()[releases[-1]]
     cache_key = f"{get_active_repo_name()}|first-seen|{REPORT_FORMAT}|{head}"
     hit = _DISK.get(cache_key)
     if hit is not None:
@@ -137,8 +138,22 @@ def _top(counter: Counter, names: dict[str, tuple[str, str]], total: int) -> lis
              "share": round(n / total, 4) if total else 0} for k, n in top]
 
 
-def _tag_meta(tag: str) -> dict[str, Any]:
+def _tag_meta(tag: str, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """{prev, days, rc_count} of a release: tag metadata, read from Git (milliseconds)."""
+    if tag == rs.LATEST_RELEASE:
+        info = latest or rs.latest_info()
+        prev_name = info["prev"]
+        prev_sha = info["prev_sha"]
+        head_sha = info["sha"]
+        days = None
+        if prev_sha:
+            try:
+                at_head = int((rs._git(["log", "-1", "--format=%ct", head_sha]) or "").strip())
+                at_prev = int((rs._git(["log", "-1", "--format=%ct", prev_sha]) or "").strip())
+                days = round((at_head - at_prev) / 86400)
+            except (ValueError, KeyError):
+                days = None
+        return {"prev": prev_name, "days": days, "rc_count": info["rc_count"]}
     prev_name = rs.previous(tag)
     tags = rs.tag_commits()
     days = None
@@ -155,12 +170,13 @@ def _tag_meta(tag: str) -> dict[str, Any]:
 
 def _report(tag: str, source: str, *, commits: int, merges: int, diffstat: tuple[int | None, int, int],
             authors: Counter, roles: dict[str, Counter], names: dict[str, tuple[str, str]],
-            employers: dict[str, dict[str, Any]], first_timers: list[str] | None) -> dict[str, Any]:
+            employers: dict[str, dict[str, Any]], first_timers: list[str] | None,
+            latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """The release stats answer (webapp/API.md section 4.10) from identity-level counts of either source.
     first_timers None: not applicable (a stable update's commits are backports of mainline commits)."""
-    meta = _tag_meta(tag)
+    meta = _tag_meta(tag, latest=latest)
     files, added, removed = diffstat
-    return {
+    out = {
         "release": tag, "prev": meta["prev"], "source": source, "commits": commits, "merges": merges, "authors": len(authors),
         "first_time_authors": None if first_timers is None else len(first_timers),
         "first_timers": [{"person": names[k][0], "email": names[k][1], "commits": authors[k]}
@@ -173,25 +189,41 @@ def _report(tag: str, source: str, *, commits: int, merges: int, diffstat: tuple
         "employers": sorted(({"org": o, "commits": v["commits"], "authors": len(v["authors"])} for o, v in employers.items()),
                             key=lambda e: (-e["commits"], e["org"]))[:40],
     }
+    if tag == rs.LATEST_RELEASE:
+        info = latest or rs.latest_info()
+        out["branch"] = info["branch"]
+        out["head"] = info["sha"]
+    return out
 
 
 def _new_employers() -> dict[str, dict[str, Any]]:
     return defaultdict(lambda: {"commits": 0, "authors": set()})
 
 
-def compute_release_stats(tag: str, progress: Callable | None = None) -> dict[str, Any]:
+def compute_release_stats(tag: str, progress: Callable | None = None, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """Release stats from Git: the release's commit pass, `git rev-list --count --merges`, `git diff --shortstat`."""
-    prev, sha = rs.range_of(tag)
-    commits = _release_pass(tag)
+    info = (latest or rs.latest_info()) if tag == rs.LATEST_RELEASE else None
+    if info is not None:
+        prev, sha = info["prev_sha"], info["sha"]
+        commits = rs.release_commits_now(tag, range_override=(prev, sha))
+        mainline = True
+        ml = rs.releases("mainline")
+        family = rs.family_of(info["prev"]) if info["prev"] else (rs.family_of(ml[0]) if ml else rs.KERNEL_FAMILY)
+        first_head: str | None = sha
+    else:
+        prev, sha = rs.range_of(tag)
+        commits = _release_pass(tag)
+        p = rs.parse_tag(tag)
+        mainline = p["kind"] == "mainline"
+        family = p["family"]
+        first_head = None
     rng = [sha] + ([f"^{prev}"] if prev else [])
     merges = int((_git(["rev-list", "--count", "--merges", *rng]) or "0").strip() or 0)
     stat = _git(["diff", "--shortstat", prev, sha]) if prev else ""
     m_files = re.search(r"(\d+) files? changed", stat)
     m_add = re.search(r"(\d+) insertions?", stat)
     m_del = re.search(r"(\d+) deletions?", stat)
-    p = rs.parse_tag(tag)
-    mainline = p["kind"] == "mainline"
-    first_seen = author_first_seen(progress, p["family"]) if mainline else {}
+    first_seen = author_first_seen(progress, family, head=first_head) if mainline else {}
     names: dict[str, tuple[str, str]] = {}
     authors: Counter = Counter()
     roles = {k: Counter() for k in _ROLE_NAMES.values()}
@@ -220,7 +252,8 @@ def compute_release_stats(tag: str, progress: Callable | None = None) -> dict[st
     return _report(tag, "git", commits=len(commits), merges=merges,
                    diffstat=(int(m_files.group(1)) if m_files else None, int(m_add.group(1)) if m_add else 0,
                              int(m_del.group(1)) if m_del else 0),
-                   authors=authors, roles=roles, names=names, employers=employers, first_timers=first_timers)
+                   authors=authors, roles=roles, names=names, employers=employers, first_timers=first_timers,
+                   latest=info)
 
 
 def _release_range(tag: str) -> dict[str, Any] | None:
@@ -262,6 +295,8 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
     """Release stats from the parser's release statistics (read only), or None when they do not cover
     the release: tables missing, repository never parsed, a tag of the range not summarized, or summarized
     against other commits, bases or another format than Git and the parser agree on now."""
+    if tag == rs.LATEST_RELEASE:
+        return None
     from parser.git_ast.release_stats import FORMAT
     rng = _release_range(tag)
     if rng is None:
@@ -377,12 +412,18 @@ def _text(value: Any) -> str:
 
 
 def _check_release(tag: str) -> None:
+    if tag == rs.LATEST_RELEASE:
+        rs.latest_info()
+        return
     p = rs.parse_tag(tag)
     if p is None or tag not in rs.tag_commits():
         raise HTTPException(status_code=404, detail=f"Not a release of this repository: {tag}")
 
 
-def _stats_key(tag: str) -> str:
+def _stats_key(tag: str, *, latest: dict[str, Any] | None = None) -> str:
+    if tag == rs.LATEST_RELEASE:
+        info = latest or rs.latest_info()
+        return f"{get_active_repo_name()}|stats|{REPORT_FORMAT}|latest|{info['prev_sha'] or '-'}|{info['sha']}|{info['rc_count']}"
     return f"{get_active_repo_name()}|stats|{REPORT_FORMAT}|{rs.tag_commits()[tag]}"
 
 
@@ -390,6 +431,10 @@ def release_stats(tag: str, wait: float = 0.0) -> dict[str, Any]:
     """Job state of a release's stats: from the parser's tables when they cover it (answered at once),
     else the Git job (202 while it builds, cached on disk per tag commit)."""
     _check_release(tag)
+    if tag == rs.LATEST_RELEASE:
+        info = rs.latest_info()
+        ck = _stats_key(tag, latest=info)
+        return _job(f"insights:{ck}", lambda p, _info=info: compute_release_stats(tag, p, latest=_info), ck, wait)
     hit = db_release_stats(tag)
     if hit is not None:
         return {"state": "done", "result": hit}
@@ -526,6 +571,8 @@ def _split_sender_identity(text: str) -> tuple[str, str]:
 
 def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]:
     """Load MAINTAINERS sections and matcher for `tag`, falling back to `git show <sha>:MAINTAINERS` when unparsed."""
+    from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+    from parser.maintainer_ast.maintainer_parser import MaintainerParser
     sections: list[Any] = []
     matcher: Any = None
     try:
@@ -536,14 +583,14 @@ def _load_maintainers(tag: str, sha: str | None = None) -> tuple[list[Any], Any]
     if not sections:
         rev = sha or tag
         try:
-            from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
-            from parser.maintainer_ast.maintainer_parser import MaintainerParser
             text = _git(["show", f"{rev}:MAINTAINERS"], timeout=30)
             if text.strip():
                 sections = MaintainerParser(text).parse()
                 matcher = MaintainerMatcher(sections)
         except Exception as exc:  # noqa: BLE001 - repository may lack MAINTAINERS
             logger.debug("MAINTAINERS git fallback of %s unavailable: %s", tag, exc)
+    if matcher is None:
+        matcher = MaintainerMatcher([])
     return sections, matcher
 
 
@@ -809,16 +856,29 @@ def _fallback_sender(
     return (p2_name or committer), p2_email
 
 
-def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str, Any]:
-    prev, sha = rs.range_of(tag)
-    merges = rs.merges_now(tag)
-    tags = rs.tag_commits()
-    p = rs.parse_tag(tag)
-    rc1 = next((t for t in tags if (q := rs.parse_tag(t)) and q["series"] == p["series"] and q["pre"] == 1), None)
-    prev_name = rs.previous(tag)
-    start = int(rs._git(["log", "-1", "--format=%ct", prev], timeout=10).strip()) if prev else 0
-    rc1_at = int(rs._git(["log", "-1", "--format=%ct", tags[rc1]], timeout=10).strip()) if rc1 else None
-    sections, matcher = _load_maintainers(tag, sha)
+def compute_merge_window(tag: str, progress: Callable | None = None, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
+    info = (latest or rs.latest_info()) if tag == rs.LATEST_RELEASE else None
+    if info is not None:
+        prev, sha = info["prev_sha"], info["sha"]
+        merges = rs.merges_now(tag, range_override=(prev, sha))
+        rc1 = info["rc1"]
+        rc1_sha = info["rc1_sha"]
+        prev_name = info["prev"]
+        maint_rev = sha
+    else:
+        prev, sha = rs.range_of(tag)
+        merges = rs.merges_now(tag)
+        tags = rs.tag_commits()
+        p = rs.parse_tag(tag)
+        rc1 = next((t for t in tags if (q := rs.parse_tag(t)) and q["series"] == p["series"] and q["pre"] == 1), None)
+        rc1_sha = tags.get(rc1) if rc1 else None
+        prev_name = rs.previous(tag)
+        maint_rev = tag
+    start_s = (rs._git(["log", "-1", "--format=%ct", prev], timeout=10) or "").strip() if prev else ""
+    start = int(start_s) if start_s.isdigit() else 0
+    rc1_s = (rs._git(["log", "-1", "--format=%ct", rc1_sha], timeout=10) or "").strip() if rc1_sha else ""
+    rc1_at = int(rc1_s) if rc1_s.isdigit() else None
+    sections, matcher = _load_maintainers(maint_rev, sha)
     resolver = _PullSectionResolver(sections, matcher)
     parsed_merges: list[tuple[dict[str, Any], list[str], dict[str, str], str]] = []
     need_p2: list[str] = []
@@ -889,13 +949,17 @@ def compute_merge_window(tag: str, progress: Callable | None = None) -> dict[str
     for pl in pulls:
         if pl["day"] is not None:
             by_day[int(pl["day"])] += pl["commits"]
-    return {
+    out = {
         "release": tag, "prev": prev_name, "rc1": rc1, "rc1_day": round((rc1_at - start) / 86400, 1) if rc1_at and start else None,
         "pulls": pulls,
         "totals": {"pulls": len(pulls), "commits": sum(x["commits"] for x in pulls),
                    "before_rc1": sum(1 for x in pulls if not x["after_rc1"]),
                    "by_day": [{"day": d, "commits": by_day[d]} for d in sorted(by_day)]},
     }
+    if info is not None:
+        out["branch"] = info["branch"]
+        out["head"] = info["sha"]
+    return out
 
 
 def _sender(body: str) -> str:
@@ -938,6 +1002,10 @@ def _pull_threads(commit_ids: list[int]) -> dict[int, dict[str, Any]]:
 
 def merge_window(tag: str, wait: float = 0.0) -> dict[str, Any]:
     _check_release(tag)
+    if tag == rs.LATEST_RELEASE:
+        info = rs.latest_info()
+        ck = f"{get_active_repo_name()}|mw|{MW_FORMAT}|latest|{info['prev_sha'] or '-'}|{info['sha']}|{info['rc1'] or '-'}"
+        return _job(f"insights:{ck}", lambda p, _info=info: compute_merge_window(tag, p, latest=_info), ck, wait)
     if not rs.parse_tag(tag)["final"]:
         raise HTTPException(status_code=400, detail="A merge window belongs to a release (vX.Y, <prefix>X.Y), not to an -rc or a stable update.")
     sha = rs.tag_commits()[tag]
@@ -981,7 +1049,17 @@ HEALTH_ROLES = {CommitRole.REVIEWED_BY: "reviewed_by", CommitRole.ACKED_BY: "ack
 HEALTH_CHUNK = 2000
 
 
-def _health_window(tag: str, window: int) -> list[str]:
+def _health_window(tag: str, window: int, *, latest: dict[str, Any] | None = None) -> list[str]:
+    if tag == rs.LATEST_RELEASE:
+        info = latest or rs.latest_info()
+        prev = info["prev"]
+        if not prev:
+            return [rs.LATEST_RELEASE]
+        family = rs.family_of(prev)
+        finals = [t for t in rs.releases("mainline") if (p := rs.parse_tag(t))["final"] and p["family"] == family
+                  and rs.release_key(t) <= rs.release_key(prev)]
+        prev_tags = finals[-(window - 1):] if window > 1 else []
+        return [*prev_tags, rs.LATEST_RELEASE]
     family = rs.family_of(tag)
     finals = [t for t in rs.releases("mainline") if (p := rs.parse_tag(t))["final"] and p["family"] == family
               and rs.release_key(t) <= rs.release_key(tag)]
@@ -1050,27 +1128,37 @@ def _aggregate_health(tag: str, tags: list[str], sections: list[Any], matcher: A
     return {"release": tag, "window": tags, "sections": out}
 
 
-def _maintainer_data(tag: str) -> tuple[list[Any], Any]:
-    from webapp.backend.services.maintainer_service import MaintainerService
-    try:
-        return MaintainerService().get_maintainer_data(tag)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"MAINTAINERS of {tag} unavailable: {exc}") from exc
+def _maintainer_data(tag: str, *, sha: str | None = None) -> tuple[list[Any], Any]:
+    resolved_sha = sha or (rs.latest_info()["sha"] if tag == rs.LATEST_RELEASE else rs.tag_commits().get(tag))
+    rev = resolved_sha if tag == rs.LATEST_RELEASE else tag
+    return _load_maintainers(rev, resolved_sha)
 
 
-def compute_subsystem_health(tag: str, window: int, progress: Callable | None = None) -> dict[str, Any]:
+def compute_subsystem_health(tag: str, window: int, progress: Callable | None = None, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """The subsystem-health report: from the database when it covers every release of the window
     (health_from_db()), else one `git log --name-only` pass per release (`source: "git"`)."""
-    tags = _health_window(tag, window)
-    sections, matcher = _maintainer_data(tag)
-    try:
-        hit = health_from_db(tag, tags, sections, matcher, progress)
-    except Exception as exc:  # noqa: BLE001 - Git answers
-        logger.warning("subsystem health of %s from the database failed: %s", tag, exc)
-        hit = None
-    if hit is not None:
-        return hit
-    return {**_aggregate_health(tag, tags, sections, matcher, _release_pass, progress=progress), "source": "git"}
+    info = (latest or rs.latest_info()) if tag == rs.LATEST_RELEASE else None
+    tags = _health_window(tag, window, latest=info)
+    sections, matcher = _maintainer_data(tag, sha=info["sha"]) if info is not None else _maintainer_data(tag)
+    if rs.LATEST_RELEASE not in tags:
+        try:
+            hit = health_from_db(tag, tags, sections, matcher, progress)
+        except Exception as exc:  # noqa: BLE001 - Git answers
+            logger.warning("subsystem health of %s from the database failed: %s", tag, exc)
+            hit = None
+        if hit is not None:
+            return hit
+
+    def _commits(t: str) -> list[dict[str, Any]]:
+        if t == rs.LATEST_RELEASE and info is not None:
+            return rs.release_commits_now(t, range_override=(info["prev_sha"], info["sha"]))
+        return _release_pass(t)
+
+    report = {**_aggregate_health(tag, tags, sections, matcher, _commits, progress=progress), "source": "git"}
+    if info is not None:
+        report["branch"] = info["branch"]
+        report["head"] = info["sha"]
+    return report
 
 
 def health_coverage(cur: Any, tags: list[str]) -> dict[str, list[int]] | None:
@@ -1089,6 +1177,8 @@ def health_coverage(cur: Any, tags: list[str]) -> dict[str, list[int]] | None:
         return None
     out: dict[str, list[int]] = {}
     for t in tags:
+        if t == rs.LATEST_RELEASE:
+            return None
         prev = rs.previous(t)
         segs = rs.walk_segments(prev, t) if prev else None
         if not segs or _ingest_chain(cur, network_id, tc[prev], tc[t]) is None:
@@ -1198,6 +1288,10 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
 def subsystem_health(tag: str, window: int = 4, wait: float = 0.0) -> dict[str, Any]:
     _check_release(tag)
     window = max(1, min(int(window), 12))
+    if tag == rs.LATEST_RELEASE:
+        info = rs.latest_info()
+        ck = f"{get_active_repo_name()}|health|{HEALTH_FORMAT}|latest|{info['prev_sha'] or '-'}|{info['sha']}|{window}|{rs.release_token()}"
+        return _job(f"insights:{ck}", lambda p, _info=info: compute_subsystem_health(tag, window, p, latest=_info), ck, wait)
     sha = rs.tag_commits()[tag]
     # The release membership token separates a report built from the database from one built from Git
     ck = f"{get_active_repo_name()}|health|{HEALTH_FORMAT}|{sha}|{window}|{rs.release_token()}"

@@ -420,10 +420,10 @@ class ApiClient {
    * An Insights report (`GET /api/insights/{v}/<path>`, §4.10): polls while its background job runs
    * (202, §2.15). `cacheKey` (optional) keeps the final body in the `tools` store.
    */
-  async getInsights(version, path, { onProgress = null, signal = null, cacheKey = null } = {}) {
+  async getInsights(version, path, { onProgress = null, signal = null, cacheKey = null, networkFirst = false } = {}) {
     const ver = this._sanitizeVer(version);
     return this.requestJob(`/api/insights/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
-      cacheStore: cacheKey ? "tools" : null, cacheKey });
+      cacheStore: cacheKey ? "tools" : null, cacheKey, networkFirst });
   }
 
   /** A Kernel API catalog (`GET /api/kapi/{v}/<path>`, §4.9), polling while its job runs. */

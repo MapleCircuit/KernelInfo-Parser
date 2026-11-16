@@ -605,3 +605,103 @@ F:\t*/
         self.assertEqual(by_ref["linux-2.6-kgdb"]["section"], {"sec_id": None, "name": "KGDB"})
         self.assertEqual(by_ref["vfs-2.6"]["sender"], "Al Viro")
         self.assertEqual(by_ref["vfs-2.6"]["section"], {"sec_id": None, "name": "VFS"})
+
+    def test_latest_release_tracks_unreleased_merge_window_and_post_release_stats(self) -> None:
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from webapp.backend.services import commit_query as cq
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git is not installed")
+        tmp = Path(tempfile.mkdtemp(prefix="ki_latest_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        def g_as(name: str, email: str, *args: str) -> str:
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
+                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+            }
+            return subprocess.run(["git", "-C", str(tmp), *args], check=True, capture_output=True, text=True, env=env).stdout
+
+        g_as("Linus Torvalds", "torvalds@example.com", "init", "-q", "-b", "master")
+        (tmp / "MAINTAINERS").write_text(
+            "Maintainers List\n----------------\n\n"
+            "KGDB\nM:\tJason Wessel <jason.wessel@windriver.com>\nF:\tkernel/debug/\n"
+        )
+        (tmp / "kernel/debug").mkdir(parents=True)
+        (tmp / "kernel/debug/core.c").write_text("int a;\n")
+        g_as("Linus Torvalds", "torvalds@example.com", "add", "-A")
+        g_as("Linus Torvalds", "torvalds@example.com", "commit", "-q", "-m", "v7.3 base")
+        g_as("Linus Torvalds", "torvalds@example.com", "tag", "v7.3")
+
+        # Post-release merge window pull by a brand-new contributor
+        g_as("New Dev", "newdev@example.com", "checkout", "-q", "-b", "kgdb")
+        (tmp / "kernel/debug/core.c").write_text("int a = 1;\n")
+        g_as("New Dev", "newdev@example.com", "add", "-A")
+        g_as("New Dev", "newdev@example.com", "commit", "-q", "-m", "kgdb: post-7.3 fix")
+        g_as("Linus Torvalds", "torvalds@example.com", "checkout", "-q", "master")
+        g_as("Linus Torvalds", "torvalds@example.com", "merge", "-q", "--no-ff", "-m",
+             "Merge tag 'kgdb-for-7.4' of git://git.kernel.org/pub/scm/linux/kernel/git/jwessel/kgdb\n\n"
+             "* tag 'kgdb-for-7.4':\n  kgdb: post-7.3 fix\n",
+             "kgdb")
+        tip_before_rc1 = g_as("Linus Torvalds", "torvalds@example.com", "rev-parse", "HEAD").strip()
+
+        repo_meta = {"name": tmp.name, "repo_dir": str(tmp), "default_branch": "master"}
+        with mock.patch.object(rs, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
+             mock.patch.object(cq, "get_repo_dir", lambda: tmp), \
+             mock.patch("webapp.backend.config.get_active_repository", lambda: repo_meta), \
+             mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
+             mock.patch.object(ins, "_DISK", _NoDisk()), \
+             mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data", side_effect=RuntimeError("unparsed")):
+            rs.clear_caches()
+            self.addCleanup(rs.clear_caches)
+            info = rs.latest_info()
+            self.assertEqual(info["branch"], "master")
+            self.assertEqual(info["sha"], tip_before_rc1)
+            self.assertEqual(info["prev"], "v7.3")
+            self.assertIsNone(info["rc1"])
+            self.assertEqual(info["rc_count"], 0)
+            self.assertEqual(rs.previous("latest"), "v7.3")
+
+            stats = ins.compute_release_stats("latest")
+            self.assertEqual(stats["release"], "latest")
+            self.assertEqual(stats["prev"], "v7.3")
+            self.assertEqual(stats["branch"], "master")
+            self.assertEqual(stats["head"], tip_before_rc1)
+            self.assertEqual(stats["commits"], 1)
+            self.assertEqual(stats["merges"], 1)
+            self.assertEqual(stats["first_time_authors"], 1)
+            self.assertEqual(stats["first_timers"][0]["email"], "newdev@example.com")
+
+            mw = ins.compute_merge_window("latest")
+            self.assertEqual(mw["release"], "latest")
+            self.assertEqual(mw["prev"], "v7.3")
+            self.assertEqual(mw["branch"], "master")
+            self.assertIsNone(mw["rc1"])
+            self.assertEqual(mw["totals"]["pulls"], 1)
+            self.assertEqual(mw["pulls"][0]["section"], {"sec_id": None, "name": "KGDB"})
+            self.assertFalse(mw["pulls"][0]["after_rc1"])
+
+            health = ins.compute_subsystem_health("latest", window=2)
+            self.assertEqual(health["release"], "latest")
+            self.assertEqual(health["branch"], "master")
+            self.assertEqual(health["window"], ["v7.3", "latest"])
+            kgdb = next(s for s in health["sections"] if s["name"] == "KGDB")
+            self.assertEqual(kgdb["per_release"], [1, 1])
+
+            res = cq.query_commits("master", release="latest", section="KGDB")
+            self.assertIn("v7.3..master (unreleased)", res["range"])
+            self.assertEqual([c["subject"] for c in res["commits"]], ["kgdb: post-7.3 fix"])
+
+            # Tag v7.4-rc1 later in the cycle and verify post-rc1 tracking
+            g_as("Linus Torvalds", "torvalds@example.com", "tag", "v7.4-rc1")
+            rs.clear_caches()
+            info2 = rs.latest_info()
+            self.assertEqual(info2["prev"], "v7.3")
+            self.assertEqual(info2["rc1"], "v7.4-rc1")
+            self.assertEqual(info2["rc_count"], 1)

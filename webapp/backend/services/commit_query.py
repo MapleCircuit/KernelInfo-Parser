@@ -89,10 +89,14 @@ def parse_roles(roles: list[str] | None) -> list[tuple[str, str]]:
 def section_pathspecs(version_name: str, section: str) -> list[str]:
     """F: (include) and X: (exclude) patterns of a MAINTAINERS section as validated path filters."""
     from parser.maintainer_ast.maintainer_types import PatternType
-    from webapp.backend.services.maintainer_service import MaintainerService
-    sections, _matcher = MaintainerService().get_maintainer_data(version_name)
+    from webapp.backend.services import release_service as rs
+    from webapp.backend.services.insights_service import _load_maintainers
+
+    rev = rs.latest_info()["sha"] if version_name == rs.LATEST_RELEASE else version_name
+    sha = rev if version_name == rs.LATEST_RELEASE else rs.tag_commits().get(version_name)
+    sections, _matcher = _load_maintainers(rev, sha)
     sec = str(section).strip()
-    match = next((s for s in sections if str(s.sec_id) == sec or s.name == sec), None)
+    match = next((s for s in sections if (s.sec_id is not None and str(s.sec_id) == sec) or s.name == sec), None)
     if match is None:
         raise HTTPException(status_code=404, detail=f"Unknown MAINTAINERS section: {section}")
     specs = []
@@ -166,13 +170,18 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
         start = [_resolve(b.lstrip("."), "range end"), f"^{_resolve(a, 'range start')}"]
         range_desc = f"{a}..{b.lstrip('.')}"
     elif release:
-        from webapp.backend.services.release_service import range_of
+        from webapp.backend.services.release_service import LATEST_RELEASE, latest_info, range_of
         safe_rev(release, "release")
         prev, sha = range_of(release)
         start = [sha] + ([f"^{prev}"] if prev else [])
-        range_desc = f"{release} cycle"
+        if release == LATEST_RELEASE:
+            info = latest_info()
+            range_desc = f"{info['prev'] or 'start'}..{info['branch']} (unreleased)"
+        else:
+            range_desc = f"{release} cycle"
     else:
-        start = [_resolve(version_name, "revision")]
+        from webapp.backend.services.release_service import LATEST_RELEASE, latest_info
+        start = [latest_info()["sha"]] if version_name == LATEST_RELEASE else [_resolve(version_name, "revision")]
     args = build_log_args(start=start, paths=specs, author=author, committer=committer, roles=role_list,
                           since=since, until=until, merges="" if merges == "all" else merges, text=text,
                           skip=(page - 1) * limit, limit=limit)

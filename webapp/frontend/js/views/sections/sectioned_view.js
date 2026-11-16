@@ -320,7 +320,10 @@ export class SectionedView {
     const r = this.result || {};
     const total = r.total ?? this.rows.length;
     const shown = this.filtered.length === this.rows.length ? `${this.rows.length.toLocaleString("en-US")}` : `${this.filtered.length.toLocaleString("en-US")} of ${this.rows.length.toLocaleString("en-US")}`;
-    this.setStatus(this.rows.length || total ? `${shown}${total > this.rows.length ? ` (of ${total.toLocaleString("en-US")})` : ""}${r.truncated ? " · truncated" : ""}${r.note ? ` · ${r.note}` : ""}` : (sec.emptyText || "Nothing to show."));
+    const empty = sec.emptyText || "Nothing to show.";
+    this.setStatus(this.rows.length || total
+      ? `${shown}${total > this.rows.length ? ` (of ${total.toLocaleString("en-US")})` : ""}${r.truncated ? " · truncated" : ""}${r.note ? ` · ${r.note}` : ""}`
+      : `${empty}${r.note ? ` · ${r.note}` : ""}`);
   }
 
   selectRow(row, forceNew = false) {
