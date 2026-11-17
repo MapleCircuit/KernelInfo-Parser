@@ -143,6 +143,7 @@ def drop_familyless_blob_facts(db: Any) -> bool:
 # missing-table check; its backfill refills it (plans/database/README.md rule 2).
 _DERIVED_LAYOUT_MARKERS: tuple[tuple[str, str, bool, str], ...] = (
     ("m_maintainer_file", "maintainers_blob_id", True, "keyed by MAINTAINERS blob; refill with --backfill-maintainer-files"),
+    ("m_cve_release_state", "max_segment_id", False, "no segment watermark; release CVE verdicts are re-evaluated at start"),
 )
 
 

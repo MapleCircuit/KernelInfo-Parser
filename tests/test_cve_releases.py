@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -397,6 +398,51 @@ class TestCveReleases(unittest.TestCase):
         rst.ingest(self.db, self.krepo, repo_id=1)
         self.assertEqual(self.db.count_rows("m_cve_release", {"segment_id": old_sid}), 0)
         self.assertEqual(self.db.count_rows("m_cve_release_state", {"segment_id": old_sid}), 0)
+
+    def _db_reports(self) -> dict[str, Any]:
+        self._reset_webapp_caches()
+        return {tag: cs.db_release_report(tag)["cves"] for tag in ("v3.0", "v3.1-rc1", "v3.1", "v3.0.1")}
+
+    def _sid(self, tag: str) -> int:
+        return int(self.db.select_one("m_release_segment", ["segment_id"], {"repo_id": 1, "tag": tag})[0])
+
+    def test_interrupted_first_build_resumes_without_reevaluating_built_segments(self) -> None:
+        crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        expected = self._db_reports()
+        # An interrupted first build leaves the last segments (holding the fixing commits) without verdicts
+        for tag in ("v3.1-rc1", "v3.1"):
+            self.db.delete_rows("m_cve_release", {"segment_id": self._sid(tag)})
+            self.db.delete_rows("m_cve_release_state", {"segment_id": self._sid(tag)})
+        with patch.object(crl, "_write_segment_incremental", side_effect=AssertionError("built segments re-evaluated")):
+            res = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual((res["incremental"], res["full"]), (0, 2))
+        self.assertEqual(self._db_reports(), expected)
+
+    def test_segments_added_after_a_verdict_reevaluate_their_cves(self) -> None:
+        crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        expected = self._db_reports()
+        # Verdicts evaluated before v3.1-rc1 / v3.1 existed must pick up the CVEs whose commits they contain
+        older = max(self._sid("v3.0"), self._sid("v3.0.1"))
+        newer = [self._sid("v3.1-rc1"), self._sid("v3.1")]
+        self.assertGreater(min(newer), older)
+        for tag in ("v3.0", "v3.0.1"):
+            self.db.update_rows("m_cve_release_state", {"max_segment_id": older}, {"segment_id": self._sid(tag)})
+        res = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual((res["incremental"], res["full"]), (2, 0))
+        self.assertEqual(self._db_reports(), expected)
+        top = max(older, *newer)
+        self.assertEqual(
+            {int(r[0]) for r in self.db.select_rows("m_cve_release_state", ["max_segment_id"], {"repo_id": 1})}, {top}
+        )
+        again = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual(again["state"], "current")
+
+    def test_git_commit_messages_large_batch_does_not_deadlock(self) -> None:
+        # Request and response both exceed the OS pipe buffer (64 KiB); a write-all-then-read loop hangs here.
+        shas = [self.c_fix1, self.c_fix2] * 4000
+        msgs = crl._git_commit_messages(self.krepo, shas)
+        self.assertEqual(set(msgs), {self.c_fix1, self.c_fix2})
+        self.assertIn("Fixes: " + self.c_intro[:12], msgs[self.c_fix1])
 
     def test_processing_cve_list_pull_and_cli_flags(self) -> None:
         from contextlib import contextmanager

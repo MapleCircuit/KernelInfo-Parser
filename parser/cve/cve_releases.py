@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import zlib
 from collections import defaultdict
@@ -314,11 +315,23 @@ def _git_commit_messages(repo: Path, shas: list[str]) -> dict[str, str]:
     )
     payload = "".join(f"{s}\n" for s in shas if _FULL.match(s)).encode("ascii")
     assert proc.stdin is not None and proc.stdout is not None
-    try:
-        proc.stdin.write(payload)
-        proc.stdin.close()
-    except OSError:
-        pass
+    stdin = proc.stdin
+
+    def _feed() -> None:
+        # Fed from a thread: writing the whole payload before draining stdout deadlocks once
+        # git's output fills the pipe buffer (git stops reading stdin while its stdout is full).
+        try:
+            stdin.write(payload)
+        except OSError:
+            pass
+        finally:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
+    feeder = threading.Thread(target=_feed, name="cve-cat-file-feed", daemon=True)
+    feeder.start()
     out: dict[str, str] = {}
     while True:
         header = proc.stdout.readline()
@@ -343,6 +356,7 @@ def _git_commit_messages(repo: Path, shas: list[str]) -> dict[str, str]:
         proc.stdout.close()
     except OSError:
         pass
+    feeder.join(timeout=30)
     proc.wait(timeout=30)
     return out
 
@@ -692,6 +706,20 @@ def cve_ids_for_segments(db: Any, repo_id: int, segment_ids: list[int]) -> list[
     return sorted(out)
 
 
+def _cve_ids_since(db: Any, repo_id: int, segment_ids: list[int], watermarks: Iterable[int]) -> dict[int, set[str]]:
+    """For each watermark, the CVE IDs whose commits lie in a segment of `segment_ids` above it (one band query per watermark)."""
+    out: dict[int, set[str]] = {}
+    acc: set[str] = set()
+    upper: int | None = None
+    for wm in sorted(set(watermarks), reverse=True):
+        band = [sid for sid in segment_ids if sid > wm and (upper is None or sid <= upper)]
+        if band:
+            acc.update(cve_ids_for_segments(db, repo_id, band))
+        out[wm] = set(acc)
+        upper = wm
+    return out
+
+
 def _process_workers() -> int:
     return max(1, min(os.cpu_count() or 4, 8) - 1)
 
@@ -718,18 +746,15 @@ def _worker_eval(item: tuple[int, str]) -> tuple[int, list[tuple[str, int, int, 
     return seg_id, rows
 
 
-def _write_segment_full(
-    db: Any,
-    repo_id: int,
-    seg: dict[str, Any],
-    src: dict[str, Any],
-    rows: list[tuple[str, int, int, int]],
-    built_at: int,
-) -> None:
-    seg_id = seg["segment_id"]
-    rel_rows = [(seg_id, cid, st_id, b_id, fh) for cid, st_id, b_id, fh in rows]
-    state_row = (
-        seg_id,
+_STATE_COLUMNS = [
+    "segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at", "max_segment_id",
+]
+
+
+def _state_row(repo_id: int, seg: dict[str, Any], src: dict[str, Any], built_at: int, max_sid: int) -> tuple:
+    """`m_cve_release_state` row (`_STATE_COLUMNS` order) of `seg` evaluated at `src["head"]` against segments up to `max_sid`."""
+    return (
+        seg["segment_id"],
         repo_id,
         bytes.fromhex(seg["tag_hash"]),
         bytes.fromhex(src["head"]),
@@ -737,7 +762,22 @@ def _write_segment_full(
         src["format"],
         CVE_RELEASE_FORMAT,
         built_at,
+        max_sid,
     )
+
+
+def _write_segment_full(
+    db: Any,
+    repo_id: int,
+    seg: dict[str, Any],
+    src: dict[str, Any],
+    rows: list[tuple[str, int, int, int]],
+    built_at: int,
+    max_sid: int,
+) -> None:
+    seg_id = seg["segment_id"]
+    rel_rows = [(seg_id, cid, st_id, b_id, fh) for cid, st_id, b_id, fh in rows]
+    state_row = _state_row(repo_id, seg, src, built_at, max_sid)
     with db.transaction():
         db.delete_rows("m_cve_release", {"segment_id": seg_id})
         for i in range(0, len(rel_rows), _INSERT_CHUNK):
@@ -749,7 +789,7 @@ def _write_segment_full(
             )
         db.insert_rows(
             "m_cve_release_state",
-            ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
+            _STATE_COLUMNS,
             [state_row],
             on_conflict="update",
         )
@@ -763,19 +803,11 @@ def _write_segment_incremental(
     diff_ids: list[str],
     rows: list[tuple[str, int, int, int]],
     built_at: int,
+    max_sid: int,
 ) -> None:
     seg_id = seg["segment_id"]
     rel_rows = [(seg_id, cid, st_id, b_id, fh) for cid, st_id, b_id, fh in rows]
-    state_row = (
-        seg_id,
-        repo_id,
-        bytes.fromhex(seg["tag_hash"]),
-        bytes.fromhex(src["head"]),
-        src["layout"],
-        src["format"],
-        CVE_RELEASE_FORMAT,
-        built_at,
-    )
+    state_row = _state_row(repo_id, seg, src, built_at, max_sid)
     with db.transaction():
         for i in range(0, len(diff_ids), _CVE_BATCH):
             db.delete_rows("m_cve_release", {"segment_id": seg_id, "cve_id": diff_ids[i:i + _CVE_BATCH]})
@@ -788,7 +820,7 @@ def _write_segment_incremental(
             )
         db.insert_rows(
             "m_cve_release_state",
-            ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
+            _STATE_COLUMNS,
             [state_row],
             on_conflict="update",
         )
@@ -840,6 +872,8 @@ def sync(
     for r in seg_rows:
         tag = _text(r["tag"])
         segments.append({"segment_id": int(r["segment_id"]), "tag": tag, "tag_hash": _hex(r["tag_hash"])})
+    all_sids = [s["segment_id"] for s in segments]
+    max_sid = max(all_sids)
     segments.sort(key=lambda s: release_key(s["tag"]))
     if from_tag:
         from_key = release_key(from_tag)
@@ -849,7 +883,7 @@ def sync(
 
     state_rows = db.select_rows(
         "m_cve_release_state",
-        ["segment_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format"],
+        ["segment_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "max_segment_id"],
         {"repo_id": repo_id},
         as_dict=True,
     )
@@ -860,17 +894,17 @@ def sync(
             "cve_layout": _text(r["cve_layout"]),
             "cve_format": int(r["cve_format"]),
             "rel_format": int(r["rel_format"]),
+            "max_segment_id": int(r["max_segment_id"] or 0),
         }
         for r in state_rows
     }
 
     extra_set: set[str] = set(extra_cve_ids or ())
-    new_sids = [s["segment_id"] for s in segments if s["segment_id"] not in states]
-    if new_sids and states:
-        extra_set.update(cve_ids_for_segments(db, repo_id, new_sids))
 
     full_segs: list[dict[str, Any]] = []
-    inc_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    # (old cve_head, max_segment_id of the stored verdicts when segments were added since, else None) -> segments
+    inc_groups: dict[tuple[str, int | None], list[dict[str, Any]]] = defaultdict(list)
+    compatible_segs: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     for seg in segments:
         st = states.get(seg["segment_id"])
@@ -885,24 +919,35 @@ def sync(
         if not compatible:
             full_segs.append(seg)
             continue
-        if st["cve_head"] == src["head"] and not extra_set:
+        compatible_segs.append((seg, st))
+
+    # Segments added after a stored verdict was evaluated (segment_id above its max_segment_id) can change it for
+    # the CVEs whose commits they contain. Segments that merely lack a state (an interrupted first build) do not:
+    # the stored verdicts already saw them.
+    new_seg_ids = _cve_ids_since(
+        db, repo_id, all_sids, {st["max_segment_id"] for _, st in compatible_segs if st["max_segment_id"] < max_sid}
+    )
+    for seg, st in compatible_segs:
+        lag = st["max_segment_id"] if st["max_segment_id"] < max_sid else None
+        if st["cve_head"] == src["head"] and not extra_set and not (lag is not None and new_seg_ids.get(lag)):
             continue
-        inc_groups[st["cve_head"]].append(seg)
+        inc_groups[(st["cve_head"], lag)].append(seg)
 
     # Resolve diff CVE IDs per distinct old `cve_head`; any group whose diff cannot be computed falls back to full.
     inc_plans: list[tuple[list[dict[str, Any]], list[str]]] = []
     root = LAYOUTS.get(src["layout"])
-    for old_head, grp_segs in inc_groups.items():
+    for (old_head, lag), grp_segs in inc_groups.items():
+        extra = extra_set | (new_seg_ids.get(lag, set()) if lag is not None else set())
         if old_head == src["head"]:
-            inc_plans.append((grp_segs, sorted(extra_set)))
+            inc_plans.append((grp_segs, sorted(extra)))
         elif prev_head and old_head == prev_head and changed_ids is not None:
-            inc_plans.append((grp_segs, sorted(set(changed_ids) | extra_set)))
+            inc_plans.append((grp_segs, sorted(set(changed_ids) | extra)))
         elif cve_repo is not None and root:
             paths = changed_paths(cve_repo, old_head, src["head"], root)
             if paths is None:
                 full_segs.extend(grp_segs)
             else:
-                inc_plans.append((grp_segs, sorted(set(_ids_of(paths)) | extra_set)))
+                inc_plans.append((grp_segs, sorted(set(_ids_of(paths)) | extra)))
         else:
             full_segs.extend(grp_segs)
 
@@ -912,28 +957,29 @@ def sync(
     built_at = int(time.time())
     inc_count = 0
     full_count = 0
+    inc_total = sum(len(g) for g, _ in inc_plans)
+    if inc_total:
+        n_ids = len({cid for _, ids in inc_plans for cid in ids})
+        logger.info(f"[CVE Releases] {inc_total} release segment(s) to refresh incrementally ({n_ids} changed CVE(s)).")
+    last_log = time.time()
+
+    def _tick(kind: str, done: int, total: int, tag: str, rows: int) -> None:
+        nonlocal last_log
+        if progress and done % 25 == 0:
+            progress(done, total, tag)
+        if time.time() - last_log > 20:
+            logger.info(f"[CVE Releases] {kind} {done}/{total} ({tag}: {rows} CVE verdict(s))")
+            last_log = time.time()
 
     for grp_segs, diff_ids in inc_plans:
         if not diff_ids:
             # Head changed without touching any kernel CVE IDs (e.g. non-kernel CVEs in cvelistV5)
-            state_rows_out = [
-                (
-                    s["segment_id"],
-                    repo_id,
-                    bytes.fromhex(s["tag_hash"]),
-                    bytes.fromhex(src["head"]),
-                    src["layout"],
-                    src["format"],
-                    CVE_RELEASE_FORMAT,
-                    built_at,
-                )
-                for s in grp_segs
-            ]
+            state_rows_out = [_state_row(repo_id, s, src, built_at, max_sid) for s in grp_segs]
             with db.transaction():
                 for i in range(0, len(state_rows_out), _INSERT_CHUNK):
                     db.insert_rows(
                         "m_cve_release_state",
-                        ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
+                        _STATE_COLUMNS,
                         state_rows_out[i:i + _INSERT_CHUNK],
                         on_conflict="update",
                     )
@@ -954,12 +1000,16 @@ def sync(
             rows = evaluate_segment_records(
                 s["tag"], diff_recs, lookup, parsed_tags=ptags, release_keys=rkeys
             )
-            _write_segment_incremental(db, repo_id, s, src, diff_ids, rows, built_at)
+            _write_segment_incremental(db, repo_id, s, src, diff_ids, rows, built_at, max_sid)
             inc_count += 1
+            _tick("incremental", inc_count, inc_total, s["tag"], len(rows))
 
     if full_segs:
         full_segs.sort(key=lambda s: release_key(s["tag"]))
         all_recs = _load_records(db)
+        logger.info(
+            f"[CVE Releases] {len(full_segs)} release segment(s) to evaluate in full against {len(all_recs)} CVE record(s)."
+        )
         lookup = build_lookup_data(db, repo_id, all_recs, kernel_repo=kernel_repo)
         all_tags = {s["tag"] for s in full_segs}
         for tags_entry in lookup["sha_tags"].values():
@@ -972,6 +1022,7 @@ def sync(
 
         seg_by_id = {s["segment_id"]: s for s in full_segs}
         total = len(full_segs)
+        written: set[int] = set()
         use_pool = total >= 4 and len(all_recs) >= 200 and _process_workers() > 1
         if use_pool:
             try:
@@ -982,22 +1033,23 @@ def sync(
                     initargs=(all_recs, lookup, ptags, rkeys),
                 ) as pool:
                     for seg_id, rows in pool.map(_worker_eval, items):
-                        _write_segment_full(db, repo_id, seg_by_id[seg_id], src, rows, built_at)
+                        _write_segment_full(db, repo_id, seg_by_id[seg_id], src, rows, built_at, max_sid)
+                        written.add(seg_id)
                         full_count += 1
-                        if progress and full_count % 25 == 0:
-                            progress(full_count, total, seg_by_id[seg_id]["tag"])
+                        _tick("full", full_count, total, seg_by_id[seg_id]["tag"], len(rows))
             except (BrokenProcessPool, OSError, PermissionError):
                 use_pool = False
 
         if not use_pool:
             for s in full_segs:
+                if s["segment_id"] in written:
+                    continue
                 rows = evaluate_segment_records(
                     s["tag"], all_recs, lookup, parsed_tags=ptags, release_keys=rkeys
                 )
-                _write_segment_full(db, repo_id, s, src, rows, built_at)
+                _write_segment_full(db, repo_id, s, src, rows, built_at, max_sid)
                 full_count += 1
-                if progress and full_count % 25 == 0:
-                    progress(full_count, total, s["tag"])
+                _tick("full", full_count, total, s["tag"], len(rows))
 
     elapsed = round(time.time() - started, 1)
     logger.info(

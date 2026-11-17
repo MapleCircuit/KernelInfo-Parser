@@ -78,7 +78,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
            ├── m_cve_file (cve_id, file_path)                     -- affected kernel source and header files
            └── m_cve_release (segment_id, cve_id, state, basis, fixed_here)  -- pre-evaluated release verdicts
    m_cve_commit_hash (repo_id, prefix, commit_hash)               -- abbreviated CVE hashes resolved
-   m_cve_release_state (segment_id, repo_id, tag_hash, cve_head, cve_layout, cve_format, rel_format, built_at)  -- last CVE head per segment
+   m_cve_release_state (segment_id, repo_id, tag_hash, cve_head, cve_layout, cve_format, rel_format, built_at, max_segment_id)  -- last CVE head per segment
    m_release_segment (segment_id, repo_id, tag, tag_hash, chain, base_tag, base_hash, commits, merges,
                       diff_base_tag, files_changed, lines_added, lines_removed, format)  -- release ranges
      ├── m_release_person (segment_id, person_id, role_type, commits)     -- contributors per range
@@ -1905,6 +1905,8 @@ m_release_section_health = Table(
 # 68. m_cve_release_state (table_id=68): Pre-Evaluated Release CVE Sync State
 #     Tracks the last CVE list HEAD (cve_head), layout, and formats evaluated for each release segment
 #     (parser/cve/cve_releases.py), allowing incremental re-evaluation of only newly changed CVEs.
+#     max_segment_id is the repository's highest m_release_segment.segment_id when the verdicts were evaluated:
+#     only segments above it are new to the stored verdicts (an interrupted first build resumes without re-evaluation).
 # -----------------------------------------------------------------------------
 m_cve_release_state = Table(
     table_id=68,
@@ -1918,6 +1920,7 @@ m_cve_release_state = Table(
         ("cve_format", SMALLINT(unsigned=True)),
         ("rel_format", SMALLINT(unsigned=True)),
         ("built_at", BIGINT()),
+        ("max_segment_id", INT()),
     ),
     primary=("segment_id",),
     foreign=(

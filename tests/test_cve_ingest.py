@@ -209,8 +209,8 @@ class TestCommitPrefixes(unittest.TestCase):
         db.insert_rows("m_cve", ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
                        [("CVE-1", 1, 0, 0, 0, 0, "p", "t", b"")])
         db.insert_rows("m_cve_release", ["segment_id", "cve_id", "state", "basis", "fixed_here"], [(1, "CVE-1", 1, 1, 0)])
-        db.insert_rows("m_cve_release_state", ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
-                       [(1, 7, b"\x01" * 20, b"\x02" * 20, "cvelist", 4, 1, 100)])
+        db.insert_rows("m_cve_release_state", ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at", "max_segment_id"],
+                       [(1, 7, b"\x01" * 20, b"\x02" * 20, "cvelist", 4, 1, 100, 1)])
         ci.write(db, {"state": "full", "records": {}, "name": "x", "layout": "cvelist", "head": "ab" * 20})
         self.assertEqual(db.count_rows("m_cve_commit_hash"), 0)
         self.assertEqual(db.count_rows("m_cve_file"), 0)

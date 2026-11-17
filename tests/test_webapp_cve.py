@@ -522,8 +522,8 @@ class TestCveCatalogAndEndpoints(unittest.TestCase):
         )
         self.db.insert_rows(
             "m_cve_release_state",
-            ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
-            [(10, 1, bytes.fromhex(tag_sha), bytes.fromhex("e" * 40), "cvelist", cs.RECORD_FORMAT, cs.CVE_RELEASE_FORMAT, 1700000001)],
+            ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at", "max_segment_id"],
+            [(10, 1, bytes.fromhex(tag_sha), bytes.fromhex("e" * 40), "cvelist", cs.RECORD_FORMAT, cs.CVE_RELEASE_FORMAT, 1700000001, 10)],
         )
         self.db.insert_rows(
             "m_cve_release",
