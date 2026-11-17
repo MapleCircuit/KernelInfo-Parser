@@ -9,7 +9,8 @@
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { escapeHtml } from "../../components/modal.js";
-import { HoverIntent, hoverSettings, hoverable, kindLabel } from "./hover_model.js";
+import { HoverIntent, hoverCacheKey, hoverSettings, hoverable, kindLabel } from "./hover_model.js";
+import { formatScopeCard, isScopeFile, scopeActions, scopeDeclTarget, scopeOf, scopeTypeTarget } from "./scope_model.js";
 
 export { HoverIntent, hoverSettings, hoverable, kindLabel };
 
@@ -36,7 +37,7 @@ export class HoverCard {
       }
       this.intent.suppress(false);
       const el = e.target.closest?.(".ast-token");
-      if (el && hoverable(el)) this.intent.rest(el);
+      if (el && hoverable(el, { shortNames: isScopeFile(this.view.currentFilePath) })) this.intent.rest(el);
       else this.intent.leave();
     });
     container.addEventListener("mouseleave", () => this.intent.leave());
@@ -66,7 +67,9 @@ export class HoverCard {
     const name = el.dataset.name || el.textContent;
     const v = this.view.currentVersion;
     const ctx = state.definitionContext(this.view.engineTabId ?? null);
-    const key = `${v}|${ctx.arch}|${this.view.currentFilePath}|${name}`;
+    // C files send the token's position: a local variable, parameter or field resolves in its scope
+    const pos = this.view.tokenPos ? this.view.tokenPos(el) : {};
+    const key = hoverCacheKey(v, ctx.arch, this.view.currentFilePath, name, pos);
     this.renderCard(el, { name, loading: true });
     let data = this.cache.get(key);
     if (!data) {
@@ -78,7 +81,7 @@ export class HoverCard {
       this.abort = new AbortController();
       this.lastFetch = performance.now();
       try {
-        data = await (this.view.api || api).getSymbolHover(v, name, ctx.arch, this.view.currentFilePath, this.abort.signal);
+        data = await (this.view.api || api).getSymbolHover(v, name, ctx.arch, this.view.currentFilePath, this.abort.signal, pos);
         this.cache.set(key, data);
       } catch (err) {
         if (err?.name === "AbortError") return;
@@ -87,19 +90,23 @@ export class HoverCard {
       }
     }
     if (this.intent.shown !== el) return;
-    this.renderCard(el, { name, data, value: data?.kind === "kconfig" ? ctx.assignments?.[data.kconfig?.name] ?? (ctx.strict ? "n" : undefined) : undefined, engine: ctx.engineTabId });
+    this.renderCard(el, { name, data, pos, value: data?.kind === "kconfig" ? ctx.assignments?.[data.kconfig?.name] ?? (ctx.strict ? "n" : undefined) : undefined, engine: ctx.engineTabId });
   }
 
-  renderCard(el, { name, loading = false, error = "", data = null, value, engine }) {
+  renderCard(el, { name, loading = false, error = "", data = null, value, engine, pos = {} }) {
     this.removeCard(false);
     const card = document.createElement("div");
     card.className = "hover-card";
     card.setAttribute("role", "tooltip");
     let html = "";
+    const scope = data?.found ? scopeOf(data) : null;
     if (loading) html = `<div class="hc-head"><code>${escapeHtml(name)}</code></div><div class="hc-muted">Loading…</div>`;
     else if (error) html = `<div class="hc-head"><code>${escapeHtml(name)}</code></div><div class="hc-muted">${escapeHtml(error)}</div>`;
     else if (!data?.found) html = `<div class="hc-head"><code>${escapeHtml(name)}</code></div><div class="hc-muted">No definition in this revision</div>`;
-    else if (data.kind === "kconfig") {
+    else if (scope) {
+      html = formatScopeCard(scope, { name, signature: data.signature || "" });
+      card.classList.add("hover-card-scope");
+    } else if (data.kind === "kconfig") {
       const k = data.kconfig || {};
       html = `<div class="hc-head"><span class="hc-kind">Kconfig ${escapeHtml(k.type || "")}</span><code>CONFIG_${escapeHtml(k.name || "")}</code></div>
         ${k.prompt ? `<div class="hc-prompt">${escapeHtml(k.prompt)}</div>` : ""}
@@ -119,7 +126,9 @@ export class HoverCard {
           ${doc.params && doc.params.length ? `<ul class="hc-params">${doc.params.slice(0, 6).map((p) => `<li><code>${p.name && p.name.startsWith("@") ? "" : "@"}${escapeHtml(p.name || "")}</code> ${escapeHtml(p.text || "")}</li>`).join("")}</ul>` : ""}` : ""}
         <div class="hc-loc">${escapeHtml(data.file)}:${data.line}${data.definitions > 1 ? ` <span class="hc-muted">(+${data.definitions - 1} other definition${data.definitions > 2 ? "s" : ""})</span>` : ""}</div>`;
     }
-    if (data?.found) {
+    if (scope) {
+      html += `<div class="hc-actions">${scopeActions(scope)}</div>`;
+    } else if (data?.found) {
       html += `<div class="hc-actions"><button type="button" data-hc="def">Go to definition</button><button type="button" data-hc="refs">References</button><button type="button" data-hc="hist">History</button></div>`;
     }
     card.innerHTML = html;
@@ -134,21 +143,48 @@ export class HoverCard {
     card.addEventListener("mouseenter", () => this.intent.enterCard());
     card.addEventListener("mouseleave", () => this.intent.leaveCard());
     card.addEventListener("click", (e) => {
+      const link = e.target.closest("[data-goto-file]");
+      if (link) {
+        e.preventDefault();
+        this.intent.hide();
+        this.goTo(link.dataset.gotoFile, parseInt(link.dataset.gotoLine || "1", 10) || 1);
+        return;
+      }
       const act = e.target.closest("[data-hc]")?.dataset.hc;
-      if (act) this.act(act, name, data);
+      if (act) this.act(act, name, data, pos);
     });
     this.cardEl = card;
   }
 
-  async act(act, name, data) {
+  /** Open `file`:`line` of this revision (in place when it is this file). */
+  async goTo(file, line) {
+    const { openCodeLocation } = await import("../../utils/definition_picker.js");
+    if (file === this.view.currentFilePath && this.view.revealLine) this.view.revealLine(line);
+    else openCodeLocation(this.view.currentVersion, file, line, { repo: this.view.api?.repo || "" });
+  }
+
+  async act(act, name, data, pos = {}) {
     const v = this.view.currentVersion;
+    const scope = data?.found ? scopeOf(data) : null;
     this.intent.hide();
     const { contextMenu } = await import("../../components/context_menu.js");
     if (act === "def") {
       const { openDefinition } = await import("../../utils/definition_picker.js");
-      openDefinition(v, name, { fromFile: this.view.currentFilePath });
+      openDefinition(v, name, { fromFile: this.view.currentFilePath, ...pos });
+    } else if (act === "decl") {
+      const t = scopeDeclTarget(scope);
+      if (t) this.goTo(t.file, t.line);
+    } else if (act === "typedef") {
+      const t = scopeTypeTarget(scope);
+      if (t?.file) this.goTo(t.file, t.line);
+      else if (t?.name) {
+        const { openDefinition } = await import("../../utils/definition_picker.js");
+        openDefinition(v, t.name, { fromFile: this.view.currentFilePath, kind: "type" });
+      }
+    } else if (act === "hl") {
+      this.view.occurrences?.set(scope, name);
     } else if (act === "refs") {
-      const xref = await (this.view.api || api).getSymbolXref(v, name, 250);
+      const xref = await (this.view.api || api).getSymbolXref(v, name, 250, undefined, pos.line ? { fromFile: this.view.currentFilePath, ...pos } : {});
       contextMenu.showXrefModal(name, xref, v);
     } else if (act === "hist") {
       const m = await import("../../components/symbol_history_modal.js");

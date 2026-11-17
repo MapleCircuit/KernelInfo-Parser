@@ -109,10 +109,18 @@ const KIND_LABEL = {
 };
 export const kindLabel = (kind) => KIND_LABEL[kind] || String(kind || "symbol").replace(/^C_|^CPPro_/, "").replace(/_/g, " ");
 
-/** Whether a token can have a card (not comments, includes or preprocessor structure). */
-export function hoverable(el) {
+/**
+ * Whether a token can have a card (not comments, includes or preprocessor structure). One-character names
+ * (`i`, `p`) only with `shortNames` (C files, where they resolve as local variables, §5.6).
+ */
+export function hoverable(el, { shortNames = false } = {}) {
   if (!el || el.classList.contains("tok-comment") || el.classList.contains("ast-include")) return false;
   if (SKIP_TYPES.has(el.dataset.typeId || "")) return false;
   const name = el.dataset.name || el.textContent || "";
-  return /^[A-Za-z_]\w*$/.test(name) && name.length > 1;
+  return /^[A-Za-z_]\w*$/.test(name) && (name.length > 1 || shortNames);
+}
+
+/** Cache key of a hover card: the token's position joins it when the request carries one (local results). */
+export function hoverCacheKey(version, arch, file, name, pos = null) {
+  return `${version}|${arch}|${file}|${name}${pos?.line ? `|${pos.line}:${pos.col || 0}` : ""}`;
 }

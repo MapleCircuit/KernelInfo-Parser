@@ -97,6 +97,8 @@ DEFAULT_MODULES = [
     "tests.test_webapp_hover",
     "tests.test_webapp_source_index",
     "tests.test_facts_ingest",
+    "tests.test_c_scope",
+    "tests.test_webapp_scope",
     "tests.test_man_ast",
     "tests.test_webapp_man",
     "tests.test_kapi_facts",

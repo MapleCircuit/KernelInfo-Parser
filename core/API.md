@@ -1372,7 +1372,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     layout is looked up by `layout_digest()` and only a new one writes its `m_arch_layout_entry` rows.
   - Step 6.9 (`processing_source_facts`, `parser/facts_ingest.py`) extracts the per-blob facts `m_blob_facts` lacks (or holds in an older format)
     for the version's files across all 6 fact families:
-    - family 1 (`source_facts.FAMILY`): functions, calls, member calls and ops tables of `.c`/`.h` blobs (`parser/source_facts.py`, `source_facts.FACTS_FORMAT`);
+    - family 1 (`source_facts.FAMILY`): functions (with their declared return types), calls, member calls and ops tables of `.c`/`.h` blobs (`parser/source_facts.py`, `source_facts.FACTS_FORMAT` 2; rows of format 1, whose `d` rows lack the return type, are replaced at the next ingest or by `--backfill-facts`, and the webapp reads both formats meanwhile, `source_facts.READABLE_FORMATS`);
     - family 2 (`kapi_facts.FAMILY`): Kernel API macros of `.c`/`.h`/`.S` blobs (`parser/kapi_facts.py`, `kapi_facts.KAPI_FORMAT`);
     - family 3 (`include_facts.FAMILY`): `#include` directives of `.c`/`.h`/`.S` blobs (`parser/include_facts.py`, `include_facts.FORMAT`);
     - family 4 (`kconfig_definitions.FAMILY`): symbol, menu, and choice definitions of Kconfig blobs (`parser/kconfig_ast/kconfig_definitions.py`, `kconfig_definitions.FORMAT`);

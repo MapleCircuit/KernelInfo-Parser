@@ -70,6 +70,7 @@ class TestFactsIngest(unittest.TestCase):
         self.assertEqual(sorted(reads), ["arch/x/lib/memcpy.S", "include/b.h", "lib/c.c"], "a stored blob is not read again")
         self.assertEqual(stored(conn)[(C, CALLS)][0], sf.FACTS_FORMAT, "a row of an older format is replaced")
         self.assertEqual(sf.decode(stored(conn)[(C, CALLS)][1])["c"], [[0, "a", 1]])
+        self.assertEqual(sf.decode(stored(conn)[(C, CALLS)][1])["d"], [["c", 1, 1, 0, "void"]], "format 2: return types")
         self.assertEqual(sf.decode(stored(conn)[(B, CALLS)][1])["d"][0][0], "B")
         self.assertEqual(stored(conn)[(B, KAPI)], (kf.KAPI_FORMAT, b""), "a file without Kernel API macros is stored empty")
         self.assertNotIn((D, CALLS), stored(conn), "no call facts for assembly")
@@ -166,6 +167,7 @@ class TestNewFamilies(unittest.TestCase):
         self.assertEqual(len(res), 2)
         rust_data = res[0][1]
         rust_f1 = rf.decode(rust_data[CALLS])
+        self.assertTrue(rust_f1["d"] and all(len(row) == 5 and row[4] == "" for row in rust_f1["d"]))
         self.assertTrue(any(t[0] == "Driver" for t in rust_f1.get("t", [])))
         rust_f2 = kf.decode(rust_data[KAPI])
         symbols = [item[0] for item in rust_f2.get("x", [])]
@@ -177,7 +179,7 @@ class TestNewFamilies(unittest.TestCase):
 
         asm_data = res[1][1]
         asm_f1 = sf.decode(asm_data[CALLS])
-        self.assertEqual(asm_f1["d"][0][0], "my_entry")
+        self.assertEqual(asm_f1["d"][0], ["my_entry", 2, 4, 0, ""], "format 2 rows: no return type for assembly")
         self.assertEqual(asm_f1["c"][0][1], "my_helper")
         asm_f3 = inc.decode(asm_data[INC])
         self.assertIn(("arch_def.h", True), asm_f3)

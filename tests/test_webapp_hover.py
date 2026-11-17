@@ -83,5 +83,55 @@ class TestHover(unittest.TestCase):
         self.assertEqual(sig_method, "    fn init(&self) -> bool;")
 
 
+class TestPositionAwareHover(unittest.TestCase):
+    """Router hover/detail/xref with `from_file`+`line`+`col` resolve the local scope; without `line` the global path runs."""
+
+    def setUp(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from tests import test_webapp_scope as ts
+        from webapp.backend.routers import symbols as router
+        from webapp.backend.services import hover_service as hs
+        from webapp.backend.services import scope_service as sc
+        self.ts, self.router, self.hs = ts, router, hs
+        case = ts._ScopeCase("setUp")
+        case.setUp()
+        self.addCleanup(case.loaded.stop)
+        self.case = case
+        self.src = case.sources[ts.SYSCALL]
+        self.global_hover = MagicMock(return_value={"global": True})
+        for p in (patch.object(sc, "scope_service", case.svc),
+                  patch.object(hs.hover_service, "hover", self.global_hover)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def hover(self, name: str, line: int, nth: int = 0) -> dict:
+        col = self.ts._col(self.src, line, name, nth)
+        return self.router.get_symbol_hover("v3.0", name, "x86_64", self.ts.SYSCALL, line, col)
+
+    def test_dev_local_card(self) -> None:
+        card = self.hover("dev", 98)
+        self.assertEqual((card["kind"], card["signature"], card["line"]), ("local", "struct pci_dev *dev", 89))
+        self.assertEqual([u["line"] for u in card["scope"]["uses"]], [89, 98, 99, 107, 116, 125, 134])
+        self.global_hover.assert_not_called()
+
+    def test_byte_and_word(self) -> None:
+        byte = self.hover("byte", 104)
+        self.assertEqual(byte["signature"], "u8 byte")
+        self.assertEqual(byte["scope"]["access"], "w")
+        self.assertEqual(self.hover("word", 113)["signature"], "u16 word")
+
+    def test_detail_and_xref_positioned(self) -> None:
+        col = self.ts._col(self.src, 98, "dev")
+        detail = self.router.get_symbol_detail("v3.0", "dev", "x86_64", self.ts.SYSCALL, 98, col)
+        self.assertEqual(detail["line_s"], 89)
+        xref = self.router.get_symbol_xref("v3.0", "dev", None, "x86_64", self.ts.SYSCALL, 98, col)
+        self.assertEqual(xref["definition"]["line_s"], 89)
+
+    def test_without_line_takes_global_path(self) -> None:
+        out = self.router.get_symbol_hover("v3.0", "dev", "x86_64", self.ts.SYSCALL)
+        self.assertEqual(out, {"global": True})
+        self.global_hover.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

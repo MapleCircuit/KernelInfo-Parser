@@ -429,6 +429,21 @@
   letter-spacing: 0.3px;
 }
 
+/* XRef reference badges; a local variable's uses carry their access (§5.6) */
+.xref-badge {
+  font-size: 10px;
+  background: var(--bg-tertiary);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+}
+.xref-badge.xref-acc-decl { color: var(--accent-purple); }
+.xref-badge.xref-acc-r { color: var(--accent-blue); }
+.xref-badge.xref-acc-w { color: var(--accent-orange); }
+.xref-badge.xref-acc-rw { color: var(--accent-red); }
+.xref-badge.xref-acc-addr { color: var(--accent-green); }
+
 /* 7. Include Symbols Popover */
 .include-symbols-popover {
   position: fixed;

@@ -751,36 +751,31 @@
       },
       {
         "ast_id": "$ast_134",
-        "name": "",
+        "name": "old",
         "type_id": "37 (C_unsigned)"
       },
       {
         "ast_id": "$ast_135",
         "name": "old",
-        "type_id": "37 (C_unsigned)"
+        "type_id": "62 (C_DeclRefExpr)"
       },
       {
         "ast_id": "$ast_136",
         "name": "old",
-        "type_id": "62 (C_DeclRefExpr)"
-      },
-      {
-        "ast_id": "$ast_137",
-        "name": "old",
         "type_id": "54 (C_ReturnStmt)"
       },
       {
-        "ast_id": "$ast_138",
+        "ast_id": "$ast_137",
         "name": "{}",
         "type_id": "46 (C_CompoundStmt)"
       },
       {
-        "ast_id": "$ast_139",
+        "ast_id": "$ast_138",
         "name": "sys_personality",
         "type_id": "147 (C_SyscallDef)"
       },
       {
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "name": "EXPORT_SYMBOL",
         "type_id": "20 (C_functionproto)"
       }
@@ -999,28 +994,28 @@
       {
         "tag_id": "$tag_30",
         "hash": "hex:5badb25720f53faae86e1fe8d091e2916dd71f39c4c8b8b4c48655809d8e85fa",
-        "ast_id": "$ast_139",
+        "ast_id": "$ast_138",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_31",
         "hash": "hex:cd2cb3cd7228b719825f0a265de9cdbbdbd253ad9b2964c3866da3a5c799959d",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_32",
         "hash": "hex:60a26022c47e3f321c365963d86c0e53d4bd3916ee68ec03c37507af1ccda5b1",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_33",
         "hash": "hex:79887399f7b4ff49f10c19d54e50995a7e4bd8e1ba74c203257a47f74ab9e428",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "hl_s": 0,
         "hl_l": 0
       }
@@ -1546,7 +1541,7 @@
         "char_s": 1,
         "line_e": 9,
         "char_e": 2,
-        "ast_id": "$ast_139"
+        "ast_id": "$ast_138"
       },
       {
         "map_id": "$tag_31",
@@ -1554,7 +1549,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 37,
-        "ast_id": "$ast_140"
+        "ast_id": "$ast_139"
       },
       {
         "map_id": "$tag_32",
@@ -1562,7 +1557,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 39,
-        "ast_id": "$ast_140"
+        "ast_id": "$ast_139"
       },
       {
         "map_id": "$tag_33",
@@ -1570,7 +1565,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 34,
-        "ast_id": "$ast_140"
+        "ast_id": "$ast_139"
       }
     ],
     "m_git_ref": [
@@ -1647,7 +1642,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_30",
-        "ast_id": "$ast_139",
+        "ast_id": "$ast_138",
         "name": "sys_personality",
         "type_id": "147 (C_SyscallDef)",
         "linkage": 5,
@@ -1657,7 +1652,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_31",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "name": "register_exec_domain",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1667,7 +1662,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_32",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "name": "unregister_exec_domain",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1677,7 +1672,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_33",
-        "ast_id": "$ast_140",
+        "ast_id": "$ast_139",
         "name": "__set_personality",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1852,7 +1847,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_30",
-        "ast_id": "$ast_135",
+        "ast_id": "$ast_134",
         "target_fnid": 0,
         "role": "5 (DeclRef)",
         "line": 189,

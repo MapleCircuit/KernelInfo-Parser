@@ -11,9 +11,12 @@ import unittest
 from typing import Any
 
 from core.globalstuff import (
+    ASTT,
     G,
+    SymbolLinkage,
     T_C,
 )
+from core.SymbolRows import symbol_view_rows
 from core.GreatProcessor import GreatProcessor
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
@@ -33,7 +36,7 @@ from core.DBLayout import (
 from db_engine import MockDB
 from table_engine import TECachedDB
 from parser.c_ast.c_ast import c_ast_parse
-from parser.c_ast.cursor_tree import clear_tu_caches
+from parser.c_ast.cursor_tree import clear_tu_caches, split_syscall_macro
 from core.config import get_default_repo_path
 from unit_test.harness import (
     FeatureRegistry,
@@ -449,6 +452,143 @@ class Test_CParserCornerCases(BaseCParserTestCase):
             }
             snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
             assert_snapshot_matches(self, "c_ast", "assembly_file", snapshot)
+
+
+# Spelling of the m_ast_container roles a function signature uses (render_type below)
+_ROLE_WORDS = {
+    ASTT.C_void: "void", ASTT.C_unsigned: "unsigned", ASTT.C_signed: "signed", ASTT.C_char: "char",
+    ASTT.C_short: "short", ASTT.C_int: "int", ASTT.C_long: "long", ASTT.C_longlong: "long long",
+    ASTT.C_pointer: "*", ASTT.C_Qconst: "const", ASTT.C_Qvolatile: "volatile",
+}
+
+
+class Test_CParserSyscallSignature(BaseCParserTestCase):
+    """SYSCALL_DEFINE<n> definitions carry a `long` return type and typed parameters (drivers/pci/syscall.c, v3.0).
+
+    Function rows: m_ast (name = sys_<name>, type_id = C_SyscallDef) -> m_ast_container priority 0 = return type,
+    1..N = parameters (m_ast name = parameter name), N+1 = C_CompoundStmt body; m_symbol_def records the definition.
+    """
+
+    FILE_PATH = "drivers/pci/syscall.c"
+    VERSION = "v3.0"
+    FULL_TREE = "/dev/shm/kip_v30_golden_cache"  # tests/test_cast_golden.py (ensure_golden_tree)
+
+    def _parse(self, tree_dir: str | None) -> dict[str, Any]:
+        self.gp.Version_Name = self.VERSION
+        self.gp.VID = 1
+        self.gp.Old_VID = 0
+        if tree_dir is None:
+            try:
+                self.prepare_c_file(self.VERSION, self.FILE_PATH)
+            except (subprocess.CalledProcessError, OSError) as exc:
+                self.skipTest(f"{self.VERSION}:{self.FILE_PATH} unavailable: {exc}")
+        else:
+            self.mf.version_dict[self.VERSION] = tree_dir
+        try:
+            cs = ChangeSet(f"A\t{self.FILE_PATH}")
+            cs.gp = self.gp
+            cs.mf = self.mf
+            cs.current_vid = 1
+            G.CURRENT_PARSING_FILE = self.FILE_PATH
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
+            stage_file_prelude(cs, self.gp)
+            c_ast_parse(cs)
+            self.assertTrue(cs.execute(), "ChangeSet execution must succeed")
+            self.te.commit_all()
+        finally:
+            if tree_dir is not None:
+                # The shared kernel tree must survive tearDown's clear_all_version()
+                self.mf.version_dict.pop(self.VERSION, None)
+        return MockDB.store
+
+    @staticmethod
+    def _describe(store: dict[str, Any], fn_ast_id: int) -> tuple[str, list[tuple[str, str, list[tuple[str, str]]]]]:
+        """(return type, [(param name, param type, attributes)]) rendered from the m_ast / m_ast_container rows."""
+        ast = {r[0]: r for r in store["m_ast"].values()}
+        children: dict[int, list[tuple[Any, ...]]] = {}
+        for r in store["m_ast_container"].values():
+            children.setdefault(r[0], []).append(r)
+        attrs: dict[int, list[tuple[str, str]]] = {}
+        for r in store.get("m_ast_attribute", {}).values():
+            attrs.setdefault(r[0], []).append((r[2], r[3]))
+
+        def render_type(role: int, ref: int) -> str:
+            if not ref:
+                return _ROLE_WORDS.get(role, str(role))
+            name, type_id = ast[ref][1], ast[ref][2]
+            if type_id == ASTT.C_Compound and not name:
+                return " ".join(render_type(c[2], c[3]) for c in sorted(children.get(ref, ()), key=lambda c: c[1]))
+            if role == ASTT.C_struct:
+                return f"struct {name}"
+            return name
+
+        rows = sorted(children[fn_ast_id], key=lambda c: c[1])
+        ret = render_type(rows[0][2], rows[0][3])
+        params = []
+        for _ast_id, _prio, _role, ref in rows[1:]:
+            p_name, p_type = ast[ref][1], ast[ref][2]
+            if p_type == ASTT.C_CompoundStmt:
+                continue
+            p_rows = sorted(children.get(ref, ()), key=lambda c: c[1])
+            p_str = " ".join(render_type(c[2], c[3]) for c in p_rows) if p_rows else _ROLE_WORDS.get(p_type, str(p_type))
+            params.append((p_name, p_str, attrs.get(ref, [])))
+        return ret, params
+
+    def _assert_syscalls(self, store: dict[str, Any]) -> None:
+        defs = {r[4]: r for r in symbol_view_rows(store, "m_symbol_def") if r[5] == ASTT.C_SyscallDef}
+        self.assertEqual(sorted(defs), ["sys_pciconfig_read", "sys_pciconfig_write"])
+        self.assertEqual((defs["sys_pciconfig_read"][7], defs["sys_pciconfig_read"][8]), (16, 84))
+        self.assertEqual((defs["sys_pciconfig_write"][7], defs["sys_pciconfig_write"][8]), (86, 136))
+        expected_params = [
+            ("bus", "unsigned long", []),
+            ("dfn", "unsigned long", []),
+            ("off", "unsigned long", []),
+            ("len", "unsigned long", []),
+            ("buf", "void *", [("user", "")]),
+        ]
+        ast = {r[0]: r for r in store["m_ast"].values()}
+        for name, row in defs.items():
+            fn_ast_id = row[3]
+            self.assertEqual(ast[fn_ast_id][1:], (name, ASTT.C_SyscallDef))
+            self.assertEqual(row[6], SymbolLinkage.MacroOrKernelDef)
+            ret, params = self._describe(store, fn_ast_id)
+            self.assertEqual(ret, "long", name)
+            self.assertEqual(params, expected_params, name)
+        # No definition is named after a macro argument (full mode used to name the function after `buf`)
+        names = {r[4] for r in symbol_view_rows(store, "m_symbol_def")}
+        self.assertFalse(names & {"buf", "SYSCALL_DEFINE5", "pciconfig_read", "pciconfig_write"})
+
+    def test_01_split_syscall_macro(self) -> None:
+        """The pure splitter returns the syscall name and `(type words, name)` pairs with offsets."""
+        text = "SYSCALL_DEFINE3(open, const char __user *, filename, /* flags */ int, flags,\n\tint, mode)\n{"
+        parsed = split_syscall_macro(text)
+        self.assertIsNotNone(parsed)
+        macro_off, is_compat, (name, name_off), params = parsed
+        self.assertEqual((macro_off, is_compat, name, text[name_off:name_off + 4]), (0, False, "open", "open"))
+        self.assertEqual([([w for w, _ in t], p) for t, (p, _o) in params],
+                         [(["const", "char", "__user", "*"], "filename"), (["int"], "flags"), (["int"], "mode")])
+        self.assertEqual(text[params[2][1][1]:params[2][1][1] + 4], "mode")
+        self.assertEqual(split_syscall_macro("COMPAT_SYSCALL_DEFINE0(restart_syscall)")[1:3], (True, ("restart_syscall", 23)))
+        paren = split_syscall_macro("SYSCALL_DEFINE(pread64)(unsigned int fd, char __user *buf,\n\tloff_t pos)\n{")
+        self.assertEqual((paren[2][0], [([w for w, _ in t], p) for t, (p, _o) in paren[3]]),
+                         ("pread64", [(["unsigned", "int"], "fd"), (["char", "__user", "*"], "buf"), (["loff_t"], "pos")]))
+        self.assertEqual(split_syscall_macro("SYSCALL_DEFINE(x)(void)")[3], [])
+        self.assertIsNone(split_syscall_macro("SYSCALL_DEFINE2(x, int, a)"))  # count disagrees with <n>
+        self.assertIsNone(split_syscall_macro("SYSCALL_DEFINE1(x, int, a"))  # unbalanced
+
+    @test_feature("c_ast_syscall_signature_isolated")
+    def test_02_syscall_signature_isolated(self) -> None:
+        """Isolated parse (no kernel headers): sys_pciconfig_read/write with long return and typed parameters."""
+        with test_step("Parse drivers/pci/syscall.c without headers and check both syscall signatures"):
+            self._assert_syscalls(self._parse(None))
+
+    @test_feature("c_ast_syscall_signature_full")
+    def test_03_syscall_signature_full(self) -> None:
+        """Full-tree parse (macro expanded by libclang): same definitions, return type and parameters."""
+        if not os.path.exists(os.path.join(self.FULL_TREE, "Makefile")):
+            self.skipTest(f"{self.FULL_TREE} not extracted (run tests.test_cast_golden first)")
+        with test_step("Parse drivers/pci/syscall.c against the v3.0 tree and check both syscall signatures"):
+            self._assert_syscalls(self._parse(self.FULL_TREE))
 
 
 if __name__ == "__main__":

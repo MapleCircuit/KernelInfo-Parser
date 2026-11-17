@@ -75,3 +75,27 @@ export function byteColToCharIdx(byteToCharMap, byteCol) {
   }
   return byteToCharMap[col];
 }
+
+/**
+ * Inverse of byteColToCharIdx: the 1-based UTF-8 byte column of the 0-based JS character index `charIdx`
+ * of `lineText` (what the backend's `col` request parameters expect).
+ *
+ * @param {string} lineText - The line text.
+ * @param {number} charIdx - 0-based JS character index (clamped to the line).
+ * @returns {number} 1-based byte column.
+ */
+export function charIdxToByteCol(lineText, charIdx) {
+  const text = typeof lineText === "string" ? lineText : "";
+  const end = Math.max(0, Math.min(Math.floor(Number(charIdx) || 0), text.length));
+  let bytes = 0;
+  for (let i = 0; i < end; i++) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes + 1;
+}

@@ -857,28 +857,68 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/search?${q}`);
   }
 
+  /**
+   * Query parameters + cache-key suffix of a token's position (local-scope resolution, §5.6): `line` and the
+   * 1-based byte `col` of the token in `from_file`, plus `kind` ("type": type definitions rank first).
+   */
+  _positionParams(params, { line = null, col = null, kind = null } = {}) {
+    let key = "";
+    if (line) {
+      params.set("line", line);
+      key += `_L${line}`;
+      if (col) {
+        params.set("col", col);
+        key += `:${col}`;
+      }
+    }
+    if (kind) {
+      params.set("kind", kind);
+      key += `_k${kind}`;
+    }
+    return key;
+  }
+
   /** Definition of a symbol; per-architecture definitions are ranked for `arch` (the KConfig engine's ARCH). */
   /** `fromFile`: the file the symbol is used in; definitions its #include chain reaches win. */
-  async getSymbolDetail(version, symbolName, arch = state.definitionContext().arch, fromFile = null) {
+  /** `pos`: `{line, col}` of the token in `fromFile` (a local variable resolves to its declaration), `kind`. */
+  async getSymbolDetail(version, symbolName, arch = state.definitionContext().arch, fromFile = null, pos = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     if (fromFile) params.set("from_file", fromFile);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}`);
+    const posKey = this._positionParams(params, fromFile ? pos || {} : { kind: pos?.kind });
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
   }
 
   /** Hover card of a symbol (G04): kind, signature, definition, kernel-doc or Kconfig summary; cached like detail. */
-  async getSymbolHover(version, symbolName, arch, fromFile = null, signal = null) {
+  async getSymbolHover(version, symbolName, arch, fromFile = null, signal = null, pos = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     if (fromFile) params.set("from_file", fromFile);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/hover/${encodeURIComponent(symbolName)}?${params}`, signal ? { signal } : {}, "symbols", `hover1_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}`);
+    const posKey = fromFile ? this._positionParams(params, { line: pos?.line, col: pos?.col }) : "";
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/hover/${encodeURIComponent(symbolName)}?${params}`, signal ? { signal } : {}, "symbols", `hover1_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
   }
 
-  async getSymbolXref(version, symbolName, limit = null, arch = state.definitionContext().arch) {
+  /** Cross-references; `opts`: `{fromFile, line, col}` (a local variable lists its in-scope uses). */
+  async getSymbolXref(version, symbolName, limit = null, arch = state.definitionContext().arch, opts = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     if (limit) params.set("limit", limit);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/xref/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `xref2_${this._vk(ver)}_${arch}_${symbolName}_${limit || 'all'}`);
+    const fromFile = opts?.fromFile || null;
+    if (fromFile) params.set("from_file", fromFile);
+    const posKey = fromFile ? this._positionParams(params, { line: opts.line, col: opts.col }) : "";
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/xref/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `xref2_${this._vk(ver)}_${arch}_${symbolName}_${limit || 'all'}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
+  }
+
+  /**
+   * Local-scope model of the token at `line`:`col` (1-based byte column, optional) of `path` (C files): ScopeInfo
+   * (`{found: false}` when it is no variable or field the scope model knows).
+   */
+  async getSymbolScope(version, path, line, col, name, arch = state.definitionContext().arch, signal = null) {
+    const ver = this._sanitizeVer(version);
+    // `col` is optional: without it the backend takes the single use of `name` on that line
+    const params = new URLSearchParams({ path, line, name, arch });
+    if (col) params.set("col", col);
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/scope?${params}`, signal ? { signal } : {}, "symbols", `scope1_${this._vk(ver)}_${arch}_${path}_${line}:${col || 0}_${name}`);
   }
 
   /** Kbuild build condition of each path for an ARCH (expressions evaluated by build_condition.js). */

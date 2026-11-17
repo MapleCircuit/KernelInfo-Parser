@@ -51,7 +51,7 @@ def extract(text: str, masked: str | None = None) -> dict[str, list[Any]]:
 
     Returns:
         dict with:
-            "d": [[name, line_s, line_e, flags], ...]
+            "d": [[name, line_s, line_e, flags, return_type], ...]  (return_type "": not read)
             "c": []
             "m": []
             "t": [[trait, type, line, 0, [[method, method, line], ...]], ...]
@@ -131,7 +131,7 @@ def extract(text: str, masked: str | None = None) -> dict[str, list[Any]]:
                         j = (semicolon + 1) if semicolon >= 0 else fn_match.end()
 
                     methods.append([fn_name, fn_name, fn_line_s])
-                    d_items.append([fn_name, fn_line_s, fn_line_e, 0])
+                    d_items.append([fn_name, fn_line_s, fn_line_e, 0, ""])
                 else:
                     j += 1
             else:
@@ -155,7 +155,7 @@ def extract(text: str, masked: str | None = None) -> dict[str, list[Any]]:
             fn_line_e = line_num_of(fn_close)
         else:
             fn_line_e = fn_line_s
-        d_items.append([fn_name, fn_line_s, fn_line_e, 0])
+        d_items.append([fn_name, fn_line_s, fn_line_e, 0, ""])
 
     d_items.sort(key=lambda d: (d[1], d[2]))
     t_items.sort(key=lambda t: t[2])

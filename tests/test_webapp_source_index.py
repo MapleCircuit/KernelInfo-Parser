@@ -103,13 +103,14 @@ class TestFacts(unittest.TestCase):
 
     def test_functions_and_scope(self) -> None:
         d = defs_of(self.f)
-        self.assertEqual(d["helper"][1:], [7, 12, sf.F_STATIC])
-        self.assertEqual(d["setup"][1:], [14, 20, 0], "annotations after the parameters are skipped")
-        self.assertEqual(d["sys_open"][3], 0, "SYSCALL_DEFINEn(open, ...) defines sys_open")
+        self.assertEqual(d["helper"][1:], [7, 12, sf.F_STATIC, "int"])
+        self.assertEqual(d["setup"][1:], [14, 20, 0, "int"], "annotations after the parameters are skipped")
+        self.assertEqual(d["sys_open"][3:], [0, "long"], "SYSCALL_DEFINEn(open, ...) defines sys_open")
         self.assertEqual(d["twice"][3], sf.F_STATIC, "a head written twice under #ifdef/#else")
         self.assertNotIn("LIMIT", d, "a constant macro calls nothing")
         self.assertEqual(d["pr_fmt"][3], sf.F_MACRO_FN)
         self.assertEqual(d["current_task"][3], sf.F_MACRO_OBJ, "an object-like macro that calls something")
+        self.assertEqual(d["pr_fmt"][4], "", "macros have no return type")
 
     def test_calls_members_and_noise(self) -> None:
         self.assertEqual(calls_of(self.f, "helper"), [("do_work", 11)], "keywords, sizeof and strings are not calls")
@@ -172,6 +173,71 @@ static struct file_operations const extra_ops = {
         self.assertEqual(entries.get("write"), "extra_write")
 
 
+RETURN_TYPES_C = """\
+struct pci_dev *pci_get_bus_and_slot(unsigned int bus, unsigned int devfn)
+{
+	return NULL;
+}
+
+static int
+foo(void)
+{
+	return 0;
+}
+
+static inline unsigned long __must_check bar(const void __user *p, unsigned long n)
+{
+	return n;
+}
+
+SYSCALL_DEFINE5(pciconfig_read, unsigned long, bus, unsigned long, dfn,
+		unsigned long, off, unsigned long, len, void __user *, buf)
+{
+	return 0;
+}
+
+module_init(foo)
+asmlinkage NORET_TYPE void __attribute__((noreturn)) do_exit(long code)
+{
+}
+
+BPF_CALL_2(bpf_lookup, struct bpf_map *, map, void *, key)
+{
+	return 0;
+}
+"""
+
+
+class TestReturnTypes(unittest.TestCase):
+    """`d` rows carry the declared return type (format 2), from the logic `c_scope.parse_signature` shares."""
+
+    def test_return_types(self) -> None:
+        d = defs_of(sf.extract(RETURN_TYPES_C))
+        self.assertEqual(sf.FACTS_FORMAT, 2)
+        self.assertEqual({name: row[4] for name, row in d.items()}, {
+            "pci_get_bus_and_slot": "struct pci_dev *", "foo": "int", "bar": "unsigned long",
+            "sys_pciconfig_read": "long", "do_exit": "void", "bpf_lookup": "u64"})
+        self.assertEqual(d["foo"][1], 7, "the line of the name in a multi-line head")
+
+    def test_shared_with_parse_signature(self) -> None:
+        from parser.c_ast.c_scope import parse_signature
+        for head, want in (("struct pci_dev *pci_get_bus_and_slot(unsigned int bus, unsigned int devfn)", "struct pci_dev *"),
+                           ("static int\nfoo(void)", "int"),
+                           ("static inline unsigned long __must_check foo(int a)", "unsigned long"),
+                           (("SYSCALL_DEFINE5(pciconfig_read, unsigned long, bus, unsigned long, dfn, unsigned long, off, "
+                             "unsigned long, len, void __user *, buf)"), "long")):
+            found = sf.function_name(sf.mask(head))
+            self.assertEqual(sf.return_type(sf.mask(head), found[1]), want)
+            self.assertEqual(parse_signature(head)["return_type"], want)
+
+    def test_type_text(self) -> None:
+        self.assertEqual(sf.type_text(["struct", "pci_dev", "*"]), "struct pci_dev *")
+        self.assertEqual(sf.type_text(["const", "char", "*", "const"]), "const char *const")
+        self.assertEqual(sf.type_text(["char", "*", "*"]), "char **")
+        self.assertEqual(sf.type_text(["void", "(", "*", ")", "(", "int", ",", "long", ")"]), "void (*)(int, long)")
+        self.assertEqual(sf.type_text(["int", "[", "4", "]"]), "int [4]")
+
+
 class TestFactStore(unittest.TestCase):
     CACHE_ENGINE = "ram"   # pinned: the developer's config.json must not pick the engine under test
 
@@ -195,6 +261,14 @@ class TestFactStore(unittest.TestCase):
         self.assertEqual(self.store.count(), 2)
         self.assertGreater(self.store.prune(1), 0)
         self.assertLess(self.store.count(), 2)
+
+
+    def test_older_formats_are_discarded(self) -> None:
+        older = si.FactStore(fmt=sf.FACTS_FORMAT - 1)
+        older.put_many([("a" * 40, {"d": [["f", 1, 2, 0]], "c": [], "m": [], "t": []})])
+        self.assertEqual(self.store.retire_older(), 1)
+        self.assertEqual(self.store.retire_older(), 0, "nothing left to discard")
+        self.assertEqual(older.count(), 0)
 
 
 class TestFactStoreSQLite(TestFactStore):
@@ -261,6 +335,36 @@ class TestRevisionIndex(unittest.TestCase):
         self.assertIn(("inner_read", "fs/ops.c", "file_operations.nested.read"), indirect)
         self.assertEqual(self.names(idx.callers(idx.nodes_named("arr_read1")[0], indirect=True)), [("vfs_read", "fs/ops.c", "file_operations.read")])
 
+    def test_return_types(self) -> None:
+        idx = self.idx
+        self.assertEqual(idx.return_type("vfs_read"), ["ssize_t"])
+        self.assertEqual(idx.return_type("helper"), ["void"], "both static helpers return void")
+        self.assertEqual(idx.return_type("asm_only"), [], "no definition")
+        self.assertEqual([d["return_type"] for d in idx.definitions(idx.nodes_named("shared")[0])], ["void"])
+
+    def test_format_1_facts_have_unknown_return_types(self) -> None:
+        """Stored rows of format 1 (four-element `d` rows) still assemble; their return types are unknown."""
+        files, load = load_from(SOURCES)
+
+        def load_v1(shas):
+            out = {}
+            for sha, facts in load(shas).items():
+                old = dict(facts)
+                old["d"] = [row[:4] for row in facts["d"]]
+                if sha == files[0][1]:  # kernel/a.c stays format 2
+                    old = facts
+                out[sha] = old
+            return out
+
+        idx = si.RevisionIndex("0" * 40, files, load_v1)
+        self.assertEqual(idx.summary()["calls"], self.idx.summary()["calls"])
+        self.assertEqual(idx.return_type("shared"), [])
+        self.assertEqual(idx.definitions(idx.nodes_named("shared")[0])[0]["return_type"], None)
+        self.assertEqual(idx.return_type("entry"), ["void"], "a format 2 file in the same revision")
+        back = si.RevisionIndex.from_bytes(idx.to_bytes())
+        self.assertEqual(back.return_type("entry"), ["void"])
+        self.assertEqual(back.return_type("shared"), [])
+
     def test_saved_form_round_trip(self) -> None:
         idx = self.idx
         back = si.RevisionIndex.from_bytes(idx.to_bytes())
@@ -273,7 +377,35 @@ class TestRevisionIndex(unittest.TestCase):
         self.assertEqual(back.struct_report("file_operations"), idx.struct_report("file_operations"))
         self.assertEqual(back.uses_of("foo_write"), idx.uses_of("foo_write"))
         self.assertEqual(back.nodes_named("helper"), idx.nodes_named("helper"))
+        self.assertEqual(back.return_type("vfs_read"), ["ssize_t"])
         self.assertIsNone(si.RevisionIndex.from_bytes(b"not an index"))
+
+
+class TestDatabaseFacts(unittest.TestCase):
+    """The parser's `m_blob_facts` rows of family 1 are read in format 1 and 2 (no whole-tree re-extraction)."""
+
+    def setUp(self) -> None:
+        from core.DBLayout import m_blob_facts
+        from tests.db_fixtures import make_db, patch_reader
+        self.v1, self.v2, self.other = "1" * 40, "2" * 40, "3" * 40
+        old = sf.extract("void a(void) { b(); }\n")
+        old["d"] = [row[:4] for row in old["d"]]
+        rows = [{"blob_hash": bytes.fromhex(self.v1), "family": sf.FAMILY, "format": 1, "data": sf.encode(old)},
+                {"blob_hash": bytes.fromhex(self.v2), "family": sf.FAMILY, "format": 2,
+                 "data": sf.encode(sf.extract("int c(void) { return d(); }\n"))},
+                {"blob_hash": bytes.fromhex(self.other), "family": sf.FAMILY, "format": 0, "data": sf.encode(None)}]
+        self.db = make_db("sqlite", tables=[m_blob_facts], rows={"m_blob_facts": rows})
+        patcher = patch_reader(self.db)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_readable_formats(self) -> None:
+        shas = [self.v1, self.v2, self.other]
+        self.assertEqual(si.db_has(shas), {self.v1, self.v2}, "format 1 rows count, unknown formats do not")
+        facts = si.db_facts(shas)
+        self.assertEqual(facts[self.v1]["d"][0][:4], ["a", 1, 1, 0])
+        self.assertEqual(facts[self.v2]["d"][0][4], "int")
+        self.assertEqual(si.db_has(shas, sf.FAMILY, 2), {self.v2}, "an explicit single format")
 
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")

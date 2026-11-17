@@ -15,7 +15,8 @@ import { includeSymbolsPopover } from "./include_symbols_popover.js";
 import { showSymbolHistoryModal, showKconfigHistoryModal } from "./symbol_history_modal.js";
 import { showPatchModal } from "./patch_modal.js";
 import { showFileHistoryModal } from "./file_history_modal.js";
-import { openDefinition } from "../utils/definition_picker.js";
+import { openCodeLocation, openDefinition } from "../utils/definition_picker.js";
+import { scopeOf, scopeTypeTarget, scopeXrefTitle, xrefBadge } from "../views/code_view/scope_model.js";
 import { blameBeforeTarget } from "../views/code_view/blame_options.js";
 import { referenceMenuItems } from "./file_references.js";
 import { hasFeature } from "../utils/projects.js";
@@ -49,7 +50,8 @@ class ContextMenu {
    * Generic structured menu renderer.
    * @param {number} x Client X coordinate
    * @param {number} y Client Y coordinate
-   * @param {Object} menuConfig Configuration { header?: { title, sub }, items: Array<{ label, icon, shortcut, onClick, disabled, danger, separator }> }
+   * @param {Object} menuConfig Configuration { header?: { title, sub }, items: Array<{ label, icon, shortcut, onClick, disabled, danger, separator, when }> }
+   * An item with `when` (a Promise) stays hidden until it resolves truthy, and is dropped otherwise.
    */
   renderMenu(x, y, { header, items }) {
     this.hide();
@@ -91,6 +93,15 @@ class ContextMenu {
       `;
 
       if (item.title) row.title = item.title;
+      if (item.when) {
+        row.style.display = "none";
+        Promise.resolve(item.when).then((ok) => {
+          if (!ok) return row.remove();
+          if (!row.isConnected) return;
+          row.style.display = "";
+          this.clampMenu();
+        }, () => row.remove());
+      }
       if (!item.disabled) {
         row.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -113,7 +124,14 @@ class ContextMenu {
     });
 
     document.body.appendChild(this.menuEl);
+    this._menuAnchor = { x, y };
+    this.clampMenu();
+  }
 
+  /** Keep the open menu inside the viewport (again when an item appears later). */
+  clampMenu() {
+    if (!this.menuEl || !this._menuAnchor) return;
+    const { x, y } = this._menuAnchor;
     // Dynamic viewport boundary clamping
     const rect = this.menuEl.getBoundingClientRect();
     const pad = 8;
@@ -139,10 +157,73 @@ class ContextMenu {
     if (!tokenData?.name) return;
     const v = tokenData.version || state.currentVersion;
     try {
-      const xref = await api.getSymbolXref(v, tokenData.name, 250);
+      const xref = await api.getSymbolXref(v, tokenData.name, 250, undefined, this.positionOpts(tokenData));
       this.showXrefModal(tokenData.name, xref, v);
     } catch (err) {
       toast.error(`XRef lookup failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Position of a code-view token (`line` + 1-based byte `col`, set for C files only) as the symbol requests
+   * take it, with the file it is in: `{fromFile, line, col}`, or `{}` when the token carries no column.
+   */
+  positionOpts(tokenData) {
+    if (!tokenData?.col || !tokenData.filePath) return {};
+    return { fromFile: tokenData.filePath, line: tokenData.line, col: tokenData.col };
+  }
+
+  /** ScopeInfo of a positioned token (the editor's pending lookup, else one of its own), or null. */
+  scopeOfToken(tokenData) {
+    if (!tokenData?.col) return Promise.resolve(null);
+    if (!tokenData._scope) {
+      const v = tokenData.version || state.currentVersion;
+      const pending = tokenData.scope || api.getSymbolScope(v, tokenData.filePath, tokenData.line, tokenData.col, tokenData.name);
+      tokenData._scope = Promise.resolve(pending).then(scopeOf, () => null);
+    }
+    return tokenData._scope;
+  }
+
+  /**
+   * Menu items of a local variable, parameter or field (shown once its scope resolves): *Go to Type
+   * Definition* and *Highlight Usages*.
+   */
+  scopeMenuItems(tokenData, v) {
+    if (!tokenData?.col) return [];
+    const scope = this.scopeOfToken(tokenData);
+    const items = [{
+      label: "Go to Type Definition",
+      icon: "🧬",
+      when: scope.then((sc) => Boolean(scopeTypeTarget(sc))),
+      onClick: async () => {
+        const t = scopeTypeTarget(await scope);
+        if (t?.file) openCodeLocation(v, t.file, t.line);
+        else if (t?.name && !(await openDefinition(v, t.name, { fromFile: tokenData.filePath, kind: "type" }))) toast.info(`No definition found for ${t.name}`);
+      },
+    }];
+    if (typeof tokenData.highlight === "function") {
+      items.push({
+        label: "Highlight Usages",
+        icon: "🖍",
+        when: scope.then((sc) => Boolean(sc?.uses?.length)),
+        onClick: async () => tokenData.highlight(await scope),
+      });
+    }
+    return items;
+  }
+
+  /** Go to Definition of a token: a positioned one resolves locally (declaration in its scope) first. */
+  async goToDefinition(tokenData, v, { forceNew = false } = {}) {
+    const name = tokenData.name;
+    const pos = this.positionOpts(tokenData);
+    try {
+      if (await openDefinition(v, name, { forceNew, fromFile: tokenData.filePath, line: pos.line, col: pos.col })) {
+        toast.success(`Jumped to definition of ${name}`);
+      } else {
+        toast.info(`No definition found for ${name}`);
+      }
+    } catch (err) {
+      toast.error(`Lookup failed: ${err.message}`);
     }
   }
 
@@ -257,15 +338,7 @@ class ContextMenu {
       } catch (_) {}
       this.openKconfigViewer(tokenName, v, options);
     } else {
-      try {
-        if (await openDefinition(v, tokenName, { forceNew: options?.forceNew, fromFile: tokenData.filePath })) {
-          toast.success(`Jumped to definition of ${tokenName}`);
-        } else {
-          toast.info(`No definition found for ${tokenName}`);
-        }
-      } catch (err) {
-        toast.error(`Lookup failed: ${err.message}`);
-      }
+      await this.goToDefinition(tokenData, v, { forceNew: Boolean(options?.forceNew) });
     }
   }
 
@@ -364,30 +437,14 @@ class ContextMenu {
         label: "Go to Definition",
         icon: "🎯",
         shortcut: shortcuts.label("code.goToDefinition"),
-        onClick: async () => {
-          try {
-            if (await openDefinition(v, tokenName, { fromFile: tokenData.filePath })) {
-              toast.success(`Jumped to definition of ${tokenName}`);
-            } else {
-              toast.info(`No definition found for ${tokenName}`);
-            }
-          } catch (err) {
-            toast.error(`Lookup failed: ${err.message}`);
-          }
-        }
+        onClick: () => this.goToDefinition(tokenData, v)
       });
+      items.push(...this.scopeMenuItems(tokenData, v));
       items.push({
         label: "Find References / XRef",
         icon: "🔗",
         shortcut: shortcuts.label("code.findReferences"),
-        onClick: async () => {
-          try {
-            const xref = await api.getSymbolXref(v, tokenName, 250);
-            this.showXrefModal(tokenName, xref, v);
-          } catch (err) {
-            toast.error(`XRef lookup failed: ${err.message}`);
-          }
-        }
+        onClick: () => this.findReferences({ ...tokenData, version: v })
       });
       if (/^[A-Za-z_]\w*$/.test(tokenName || "")) {
         items.push({
@@ -572,30 +629,14 @@ class ContextMenu {
           label: "Go to Definition",
           icon: "🎯",
           shortcut: shortcuts.label("code.goToDefinition"),
-          onClick: async () => {
-            try {
-              if (await openDefinition(v, token.name, { fromFile: filePath })) {
-                toast.success(`Jumped to definition of ${token.name}`);
-              } else {
-                toast.info(`No definition found for ${token.name}`);
-              }
-            } catch (err) {
-              toast.error(`Lookup failed: ${err.message}`);
-            }
-          }
+          onClick: () => this.goToDefinition({ ...token, filePath: token.filePath || filePath }, v)
         });
+        items.push(...this.scopeMenuItems(token, v));
         items.push({
           label: "Find References / XRef",
           icon: "🔗",
           shortcut: shortcuts.label("code.findReferences"),
-          onClick: async () => {
-            try {
-              const xref = await api.getSymbolXref(v, token.name, 250);
-              this.showXrefModal(token.name, xref, v);
-            } catch (err) {
-              toast.error(`XRef lookup failed: ${err.message}`);
-            }
-          }
+          onClick: () => this.findReferences({ ...token, filePath: token.filePath || filePath, version: v })
         });
       }
 
@@ -1411,6 +1452,9 @@ class ContextMenu {
     // A definition outside this revision's tree sits at no path here, so it can be neither shown nor jumped to
     const defs = allDefs.filter((d) => d && d.file);
     const refs = (xref && (xref.references || [])) || [];
+    // A local variable, parameter or field (§5.6): its in-scope uses, each with its access
+    const scope = scopeOf(xref);
+    const title = scope ? scopeXrefTitle(scope, name) : `Cross-References: ${name}`;
     const noDefsNote = xref && xref.definition_unindexed
       ? "Defined in other indexed revisions, but this revision's copy of the file was never parsed &mdash; the usages below still apply."
       : "No direct definition indexed for this symbol.";
@@ -1437,9 +1481,9 @@ class ContextMenu {
           <div class="palette-item xref-item" data-path="${this.escapeHtml(r.file)}" data-line="${r.line}">
             <div>
               <div style="font-weight:500;color:var(--text-primary);">${this.escapeHtml(r.caller || r.file)}</div>
-              <div class="palette-item-desc">${this.escapeHtml(r.file)}:${r.line}</div>
+              <div class="palette-item-desc">${this.escapeHtml(r.file)}:${r.line}${r.char_s ? `:${Number(r.char_s) || ""}` : ""}</div>
             </div>
-            <span style="font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-family:var(--font-mono);color:var(--accent-blue);">${this.escapeHtml(r.type || "Call")}</span>
+            <span class="xref-badge ${xrefBadge(r).cls}">${this.escapeHtml(xrefBadge(r).label)}</span>
           </div>
         `).join("")
       : `<div style="color:var(--text-muted);padding:10px 0;">
@@ -1448,15 +1492,15 @@ class ContextMenu {
 
     box.innerHTML = `
       <div style="padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:bold;color:var(--accent-blue);">Cross-References: ${this.escapeHtml(name)}</span>
+        <span style="font-weight:bold;color:var(--accent-blue);">${this.escapeHtml(title)}</span>
         <button id="close-xref-btn" style="color:var(--text-muted);font-size:18px;background:none;border:none;cursor:pointer;padding:0 4px;">&times;</button>
       </div>
 
       <div style="max-height:420px;overflow-y:auto;padding:12px 16px;">
-        <div class="settings-section-title">Definition${defs.length > 1 ? `s (${defs.length})` : ""}</div>
+        <div class="settings-section-title">${scope ? "Declaration" : `Definition${defs.length > 1 ? `s (${defs.length})` : ""}`}</div>
         ${defsHtml}
 
-        <div class="settings-section-title" style="margin-top:8px;">References &amp; Usages (${refs.length})</div>
+        <div class="settings-section-title" style="margin-top:8px;">${scope ? "Uses in scope" : "References &amp; Usages"} (${refs.length})</div>
         <div class="xref-list">
           ${refsHtml}
         </div>
@@ -1470,13 +1514,8 @@ class ContextMenu {
 
     box.querySelectorAll(".xref-def-card, .xref-item").forEach((el) => {
       el.onclick = () => {
-        state.openTab({
-          type: "code",
-          title: el.dataset.path.split("/").pop(),
-          path: el.dataset.path,
-          cursorLine: parseInt(el.dataset.line || "1", 10),
-          version
-        });
+        // A line of the active code tab's own file is revealed in place
+        openCodeLocation(version, el.dataset.path, parseInt(el.dataset.line || "1", 10));
         backdrop.remove();
       };
       el.addEventListener("auxclick", (e) => {

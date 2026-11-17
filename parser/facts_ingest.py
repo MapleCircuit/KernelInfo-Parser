@@ -102,7 +102,7 @@ def extract_asm_calls(text: str) -> dict[str, list[Any]]:
         if m_start:
             sym_name = m_start.group(1)
             cur_func_idx = len(d_items)
-            d_items.append([sym_name, ln, ln, 0])
+            d_items.append([sym_name, ln, ln, 0, ""])
             continue
 
         m_end = _ASM_END_MACRO.match(line)
@@ -118,7 +118,7 @@ def extract_asm_calls(text: str) -> dict[str, list[Any]]:
             if not sym_name.isdigit() and not sym_name.startswith((".L", "L")):
                 if cur_func_idx is None:
                     cur_func_idx = len(d_items)
-                    d_items.append([sym_name, ln, ln, 0])
+                    d_items.append([sym_name, ln, ln, 0, ""])
             continue
 
         m_call = _ASM_CALL.match(line)

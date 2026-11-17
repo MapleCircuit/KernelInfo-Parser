@@ -35,6 +35,8 @@ import { isTextTarget } from "../../utils/shortcuts.js";
 import { buildDiffRows, pairDiffRows, showDiffPicker, diffSideLabel } from "./file_diff.js";
 import { patchedFileDiff } from "../mail/patch_try.js";
 import { HoverCard } from "./hover_card.js";
+import { OccurrenceHighlighter } from "./occurrences.js";
+import { isScopeFile, tokenPosition, textOffsetOf, tokenColumn } from "./scope_model.js";
 import { localDB } from "../../db.js";
 import { relocate } from "../bookmarks/bookmark_model.js";
 import { referenceCount } from "../../components/file_references.js";
@@ -61,6 +63,8 @@ export class VirtualEditor {
     this.blameView = new BlameView();
     // Find in file (§5.21): searches the whole buffer, not just the rendered rows
     this.findBar = new FindBar(this);
+    // Usages of the local variable / parameter / field last clicked (§5.21), re-applied on every render
+    this.occurrences = new OccurrenceHighlighter(this);
     // Outline, sticky scroll and the breadcrumb's current definition (G03, §5.21)
     this.outline = new OutlinePanel(this);
     this.showBlame = false;
@@ -606,11 +610,20 @@ export class VirtualEditor {
     const text = sel ? sel.toString().trim() : "";
     if (text && sel.anchorNode && this.linesContainer.contains(sel.anchorNode) && /^(struct\s+|union\s+)?[a-zA-Z_]\w*$/.test(text)) {
       const row = sel.anchorNode.parentElement?.closest(".code-row");
+      const name = text.replace(/^(struct|union)\s+/, "").trim();
+      const line = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
+      let col = null;
+      const cell = sel.anchorNode.parentElement?.closest(".code-text");
+      if (cell && sel.rangeCount && !this.fileDiff && isScopeFile(this.currentFilePath)) {
+        const r = sel.getRangeAt(0);
+        const before = r.startContainer.nodeType === 3 ? textOffsetOf(cell, r.startContainer) : -1;
+        if (before >= 0) col = tokenColumn(cell.textContent || "", before + r.startOffset, name);
+      }
       return {
-        name: text.replace(/^(struct|union)\s+/, "").trim(), header: "", isInclude: false, ast_id: 0,
+        name, header: "", isInclude: false, ast_id: 0,
         type_id: text.startsWith("struct ") ? 28 : (text.startsWith("union ") ? 34 : 0),
         version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
-        line: row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1,
+        line, ...(col ? { col } : {}),
       };
     }
     const span = this.hoverTokenEl;
@@ -619,12 +632,14 @@ export class VirtualEditor {
     const row = span.closest(".code-row");
     const typeId = parseInt(span.dataset.typeId || "0", 10);
     const name = (span.dataset.name || span.textContent || "").trim();
+    const { col } = this.tokenPos(span);
     return {
       name, header: span.dataset.header || "",
       isInclude: span.classList.contains("ast-include") || typeId === 78 || name.includes(".h"),
       ast_id: parseInt(span.dataset.astId || "0", 10), type_id: typeId, typeClass: span.className || "",
       version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
       line: row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1,
+      ...(col ? { col } : {}),
     };
   }
 
@@ -642,6 +657,22 @@ export class VirtualEditor {
     this.viewportEl.scrollTop = Math.max(0, (row - 4) * rowH);
     if (select) this.selectLines(line, line);
     else this.updateVisibleLines();
+  }
+
+  /** Go to `line` of this file in place (a declaration or definition in the same file): scroll, select, flash. */
+  revealLine(line) {
+    if (!line) return;
+    this.occurrences.flash(line);
+    this.scrollToLine(line, { select: true });
+  }
+
+  /**
+   * `{line, col}` (1-based byte column) of a token span for the local-scope lookups of C files (§5.6), or {}
+   * for other files and diffs, so requests carry no position and behave as before.
+   */
+  tokenPos(span) {
+    if (this.fileDiff || !isScopeFile(this.currentFilePath)) return {};
+    return tokenPosition(span) || {};
   }
 
   /**
@@ -677,6 +708,7 @@ export class VirtualEditor {
 
   dispose() {
     unregisterView(this.tabId, this);
+    this.occurrences.dispose();
     this.hoverCard?.dispose();
     this.hoverCard = null;
     this.unsubBookmarks?.();
@@ -839,6 +871,7 @@ export class VirtualEditor {
     this.resolveEngineSelection();
     this.currentFilePath = tabData.path;
     this.currentVersion = tabData.version || state.currentVersion;
+    this.occurrences.sync();
     this.targetCursorLine = tabData.cursorLine || 1;
     // Selected line range (G06): cursorLine..lineEnd, highlighted and addressed by line=a-b
     this.targetLineEnd = Math.max(this.targetCursorLine, Number(tabData.lineEnd) || 0);
@@ -1080,11 +1113,18 @@ export class VirtualEditor {
     this.blameView.attachListeners(this.linesContainer);
 
     // Token click listener for context menu
+    this.occurrences.attach();
     this.linesContainer.addEventListener("click", (e) => {
       const tokenSpan = e.target.closest(".ast-token");
+      // A click elsewhere in the code clears the usage highlight (a token re-resolves it below)
+      if (!tokenSpan) {
+        this.occurrences.clear();
+        return;
+      }
       if (tokenSpan) {
         // Prevent clicks on comments or structural directives
         if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "87" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
+          this.occurrences.clear();
           return;
         }
 
@@ -1096,6 +1136,9 @@ export class VirtualEditor {
         const name = tokenSpan.dataset.name || tokenSpan.textContent;
         const header = tokenSpan.dataset.header || "";
         const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
+        const { col } = this.tokenPos(tokenSpan);
+        // A local variable, parameter or field highlights its usages; the menu adds its scope actions
+        const scope = isInclude ? (this.occurrences.clear(), null) : this.occurrences.fromToken(tokenSpan);
 
         contextMenu.show(e.clientX, e.clientY, {
           name,
@@ -1106,7 +1149,8 @@ export class VirtualEditor {
           version: this.currentVersion,
           filePath: this.currentFilePath,
           ftype: this.currentFtype,
-          line: lineNo
+          line: lineNo,
+          ...(col ? { col, scope, highlight: (s) => this.occurrences.set(s, name) } : {}),
         });
       }
     });
@@ -1131,6 +1175,7 @@ export class VirtualEditor {
         const header = tokenSpan.dataset.header || "";
         const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
 
+        const { col } = this.tokenPos(tokenSpan);
         contextMenu.executeDefaultAction({
           name,
           header,
@@ -1140,7 +1185,8 @@ export class VirtualEditor {
           version: this.currentVersion,
           filePath: this.currentFilePath,
           ftype: this.currentFtype,
-          line: lineNo
+          line: lineNo,
+          ...(col ? { col } : {}),
         }, { forceNew: true });
       }
     });
@@ -1216,6 +1262,7 @@ export class VirtualEditor {
         const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
         const header = tokenSpan.dataset.header || "";
         const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
+        const { col } = tokenSpan.classList.contains("ast-token") ? this.tokenPos(tokenSpan) : {};
         tokenData = {
           name,
           header,
@@ -1226,7 +1273,8 @@ export class VirtualEditor {
           version: this.currentVersion,
           filePath: this.currentFilePath,
           ftype: this.currentFtype,
-          line: lineNo
+          line: lineNo,
+          ...(col && !isInclude ? { col, highlight: (s) => this.occurrences.set(s, name) } : {}),
         };
       }
 
@@ -1880,6 +1928,7 @@ export class VirtualEditor {
     }
     this.linesContainer.innerHTML = html;
     this.findBar.decorate(this.linesContainer);
+    this.occurrences.decorate(this.linesContainer);
   }
 
   /** Minimap of the diff rows: text lengths, and a red/green (amber: changed pair) bar per change. */
@@ -1953,6 +2002,7 @@ export class VirtualEditor {
 
     this.linesContainer.innerHTML = html;
     this.findBar.decorate(this.linesContainer);
+    this.occurrences.decorate(this.linesContainer);
   }
 
   /** Remember where this tab is scrolled to, so selecting it again comes back to that position. */

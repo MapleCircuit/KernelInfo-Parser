@@ -981,3 +981,28 @@ mark.find-match.current {
   font-size: 0.85em;
   opacity: 0.8;
 }
+
+/* Usages of a local variable, parameter or field (§5.21): one style per access; theme accents keep them
+   legible in every theme */
+mark.occ-mark { color: inherit; border-radius: 2px; background: color-mix(in srgb, var(--accent-blue) 22%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-blue) 45%, transparent); }
+mark.occ-decl { background: color-mix(in srgb, var(--accent-purple) 24%, transparent); box-shadow: 0 0 0 1px var(--accent-purple); font-weight: 600; }
+mark.occ-r { background: color-mix(in srgb, var(--accent-blue) 22%, transparent); }
+mark.occ-w { background: color-mix(in srgb, var(--accent-orange) 28%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-orange) 60%, transparent); }
+mark.occ-rw { background: color-mix(in srgb, var(--accent-orange) 22%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-red) 55%, transparent); text-decoration: underline dotted color-mix(in srgb, var(--accent-red) 80%, transparent); }
+mark.occ-addr { background: color-mix(in srgb, var(--accent-green) 22%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-green) 55%, transparent); }
+/* A line revealed in place (a declaration in the same file) */
+@keyframes kip-line-flash { from { background: color-mix(in srgb, var(--accent-yellow) 40%, transparent); } }
+.code-row.line-flash { animation: kip-line-flash 1.2s ease-out; }
+/* Hover card of a local variable, parameter or field */
+.hover-card .hc-kind-scope { color: var(--accent-cyan); }
+.hover-card .hc-type, .hover-card .hc-member, .hover-card .hc-lines { color: var(--text-secondary); }
+.hover-card .hc-link { color: var(--accent-blue); text-decoration: none; cursor: pointer; }
+.hover-card .hc-link:hover { text-decoration: underline; }
+.hover-card .hc-inferred { margin: 0; padding-left: 16px; color: var(--text-secondary); font-size: var(--fs-11, 11px); }
+.hover-card .hc-agree { color: var(--accent-green); font-weight: 600; }
+.hover-card .hc-disagree { color: var(--accent-red); font-weight: 600; }
+.hover-card .hc-access { font-size: var(--fs-11, 11px); font-weight: 600; }
+.hover-card .hc-acc-r { color: var(--accent-blue); }
+.hover-card .hc-acc-w, .hover-card .hc-acc-rw { color: var(--accent-orange); }
+.hover-card .hc-acc-addr { color: var(--accent-green); }
+.hover-card .hc-acc-decl { color: var(--accent-purple); }

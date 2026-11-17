@@ -15,7 +15,9 @@ memory. It is content-addressed, so it covers every revision, git-only ones incl
   disk cache (`source-index-rev`, ~25 MB for v3.0, at most `webapp.source_index.revisions`, default 8) and read back
   in about a second, so a restart does not assemble it again; the two most recently used stay in memory.
 
-Nodes are functions and macros, by name. A static function or a macro defined in a `.c` file is a node of its own per
+Nodes are functions and macros, by name, each definition with its return type when the facts give one
+(`return_type(name)`; facts of format 1, still read from the database until the parser replaces them, have none).
+A static function or a macro defined in a `.c` file is a node of its own per
 file, and the calls made in that file bind to it; every other definition of a name (global functions, header inlines and
 macros, the per-architecture variants of a function) shares one node, so a node can have several definitions. Callees
 with no definition (assembly, generated code) are nodes without definitions. Calls through struct members
@@ -41,6 +43,7 @@ from parser.source_facts import (
     EMPTY,
     FACTS_FORMAT,
     FAMILY,
+    READABLE_FORMATS,
     F_MACRO_FN,
     F_MACRO_OBJ,
     F_STATIC,
@@ -58,7 +61,7 @@ from webapp.backend.services.jobs import jobs
 
 logger = logging.getLogger(__name__)
 
-FORMAT = 2
+FORMAT = 3  # 3: definitions carry their return type
 SUFFIXES = (".c", ".h")
 MAX_REVISIONS = 2
 CHUNK = 48
@@ -104,6 +107,17 @@ class FactStore:
 
     def space(self) -> CacheSpace:
         return get_cache_engine().open(NAMESPACE, f"{self.name}-v{self.fmt}", STORES)
+
+    def retire_older(self) -> int:
+        """Discard the spaces of this store's older formats (never read again); returns how many were dropped."""
+        engine = get_cache_engine()
+        dropped = 0
+        for old in range(1, self.fmt):
+            name = f"{self.name}-v{old}"
+            if engine.exists(NAMESPACE, name):
+                engine.open(NAMESPACE, name, STORES).discard()
+                dropped += 1
+        return dropped
 
     def _facts(self):
         return self.space().store("facts")
@@ -170,16 +184,22 @@ fact_store = FactStore()
 
 # ------------------------------------------------------------------------------------- the parser's facts
 
-def _db_rows(shas: list[str], with_data: bool, family: int = FAMILY, fmt: int = FACTS_FORMAT) -> Iterator[dict[str, Any]]:
+Formats = int | tuple[int, ...]
+
+
+def _db_rows(shas: list[str], with_data: bool, family: int = FAMILY, fmt: Formats = READABLE_FORMATS) -> Iterator[dict[str, Any]]:
     cols = ["blob_hash", "data"] if with_data else ["blob_hash"]
+    formats = list(fmt) if isinstance(fmt, tuple) else fmt
     with get_reader() as reader:
         for i in range(0, len(shas), 500):
             part = [bytes.fromhex(s) for s in shas[i:i + 500]]
-            yield from reader.select_rows("m_blob_facts", cols, {"family": family, "format": fmt, "blob_hash": part})
+            yield from reader.select_rows("m_blob_facts", cols, {"family": family, "format": formats, "blob_hash": part})
 
 
-def db_has(shas: list[str], family: int = FAMILY, fmt: int = FACTS_FORMAT) -> set[str]:
-    """The blobs whose facts of the family the parser stored (m_blob_facts, current format); empty without a database."""
+def db_has(shas: list[str], family: int = FAMILY, fmt: Formats = READABLE_FORMATS) -> set[str]:
+    """The blobs whose facts of the family the parser stored (m_blob_facts) in a readable format (`fmt`: one format
+    or a tuple; the call facts default to `source_facts.READABLE_FORMATS`, so format 1 rows, without return types,
+    still count); empty without a database."""
     try:
         return {bytes(r["blob_hash"]).hex() for r in _db_rows(shas, False, family, fmt)}
     except Exception as exc:  # noqa: BLE001 - no database, or a database without the table
@@ -187,7 +207,7 @@ def db_has(shas: list[str], family: int = FAMILY, fmt: int = FACTS_FORMAT) -> se
         return set()
 
 
-def db_facts(shas: list[str], family: int = FAMILY, fmt: int = FACTS_FORMAT,
+def db_facts(shas: list[str], family: int = FAMILY, fmt: Formats = READABLE_FORMATS,
              decoder: Callable[[Any], Any] = decode) -> dict[str, Any]:
     """Facts of the family the parser stored for these blobs."""
     out: dict[str, Any] = {}
@@ -359,14 +379,24 @@ class RevisionIndex:
         self._allowed: dict[str, bytearray] = {}
         self._table_entries: dict[int, list[int]] | None = None
         per_file: list[array | None] = [None] * len(files)
+        self.rtypes: list[str] = [""]      # return type id -> text ("" unknown)
+        rtype_ids: dict[str, int] = {"": 0}
         d_node, d_file, d_line_s, d_line_e, d_flags = array("i"), array("i"), array("i"), array("i"), array("i")
+        d_rtype = array("i")
 
         for fid, path, f in self._batches(files, load):
             if not f:
                 continue
             local_scope = path.endswith(".c")
             nodes = array("i")
-            for name, line_s, line_e, flags in f["d"]:
+            for row in f["d"]:
+                name, line_s, line_e, flags = row[0], row[1], row[2], row[3]
+                rtype = row[4] if len(row) > 4 and isinstance(row[4], str) else ""  # format 1 rows: unknown
+                rid = rtype_ids.get(rtype)
+                if rid is None:
+                    rid = rtype_ids[rtype] = len(self.rtypes)
+                    self.rtypes.append(rtype)
+                d_rtype.append(rid)
                 local = local_scope and bool(flags & (F_STATIC | _MACRO))
                 node = self._node(name, fid if local else -1)
                 d_node.append(node)
@@ -378,9 +408,9 @@ class RevisionIndex:
             per_file[fid] = nodes
             if progress and fid % 2000 == 0:
                 progress(fid, 2 * len(files), "definitions")
-        self.def_off, self.def_file, self.def_line_s, self.def_line_e, self.def_flags = _csr(
-            len(self.node_name), d_node, d_file, d_line_s, d_line_e, d_flags)
-        del d_node, d_file, d_line_s, d_line_e, d_flags
+        self.def_off, self.def_file, self.def_line_s, self.def_line_e, self.def_flags, self.def_rtype = _csr(
+            len(self.node_name), d_node, d_file, d_line_s, d_line_e, d_flags, d_rtype)
+        del d_node, d_file, d_line_s, d_line_e, d_flags, d_rtype, rtype_ids
 
         src, dst, site_path, site_line = array("i"), array("i"), array("i"), array("i")
         self.member_calls: dict[int, list[tuple[int, int, int]]] = {}       # caller -> [(field id, path id, line)]
@@ -518,8 +548,22 @@ class RevisionIndex:
         if node + 1 >= len(self.def_off):
             return []
         return [{"path": self.paths[self.def_file[j]], "line": self.def_line_s[j], "line_e": self.def_line_e[j],
-                 "static": bool(self.def_flags[j] & F_STATIC), "macro": bool(self.def_flags[j] & _MACRO)}
+                 "static": bool(self.def_flags[j] & F_STATIC), "macro": bool(self.def_flags[j] & _MACRO),
+                 "return_type": self.rtypes[self.def_rtype[j]] or None}
                 for j in self._def_range(node)]
+
+    def return_type(self, name: str) -> list[str]:
+        """The distinct return types the function definitions of a name declare (every node of the name, in
+        definition order); empty for macros and for definitions read from facts without return types."""
+        out: list[str] = []
+        for node in self.nodes_named(name):
+            if node + 1 >= len(self.def_off):
+                continue
+            for j in self._def_range(node):
+                rtype = self.rtypes[self.def_rtype[j]]
+                if rtype and not self.def_flags[j] & _MACRO and rtype not in out:
+                    out.append(rtype)
+        return out
 
     # -- ARCH
     def allowed(self, arch_key: str, test: Callable[[str], bool]) -> bytearray:
@@ -622,7 +666,7 @@ class RevisionIndex:
 
     # -- persistence: zlib of a JSON header line, the names and paths (NUL-separated), then raw int32 arrays
     _ARRAYS = ("node_name", "node_file", "_global", "def_off", "def_file", "def_line_s", "def_line_e", "def_flags",
-               "out_off", "out_dst", "out_path", "out_line", "in_off", "in_src", "in_path", "in_line", "_sorted")
+               "def_rtype", "out_off", "out_dst", "out_path", "out_line", "in_off", "in_src", "in_path", "in_line", "_sorted")
 
     @staticmethod
     def _flatten(groups: dict[int, list[tuple[int, int, int]]]) -> tuple[array, ...]:
@@ -645,10 +689,12 @@ class RevisionIndex:
                 cols[f"{prefix}{j}"] = array("i", (r[j] for r in rows))
         names = "\0".join(self.names).encode("utf-8", "surrogatepass")
         paths = "\0".join(self.paths).encode("utf-8", "surrogatepass")
+        rtypes = "\0".join(self.rtypes).encode("utf-8", "surrogatepass")
         header = {"format": FORMAT, "facts": FACTS_FORMAT, "sha": self.sha, "built_at": self.built_at, "calls": self.calls,
                   "n_names": len(self.names), "n_paths": len(self.paths), "names": len(names), "paths": len(paths),
+                  "n_rtypes": len(self.rtypes), "rtypes": len(rtypes),
                   "arrays": [[name, len(arr)] for name, arr in cols.items()], "byteorder": sys.byteorder}
-        parts = [json.dumps(header, separators=(",", ":")).encode() + b"\n", names, paths]
+        parts = [json.dumps(header, separators=(",", ":")).encode() + b"\n", names, paths, rtypes]
         parts.extend(arr.tobytes() for arr in cols.values())
         return zlib.compress(b"".join(parts), 1)
 
@@ -668,6 +714,8 @@ class RevisionIndex:
         pos += header["names"]
         paths = raw[pos:pos + header["paths"]].decode("utf-8", "surrogatepass")
         pos += header["paths"]
+        rtypes = raw[pos:pos + header["rtypes"]].decode("utf-8", "surrogatepass")
+        pos += header["rtypes"]
         cols: dict[str, array] = {}
         for name, n in header["arrays"]:
             arr = array("i")
@@ -682,6 +730,7 @@ class RevisionIndex:
         self.calls = header["calls"]
         self.names = names.split("\0") if header["n_names"] else []
         self.paths = paths.split("\0") if header["n_paths"] else []
+        self.rtypes = rtypes.split("\0") if header["n_rtypes"] else [""]
         for name in cls._ARRAYS:
             setattr(self, name, cols[name])
         self.member_calls = cls._group(cols, "mc")
@@ -759,6 +808,10 @@ def build_revision(sha: str, progress: Callable | None = None, workers: int | No
     files = revision_files(sha)
     blobs = list(dict.fromkeys(b for _p, b in files))
     in_db = db_has(blobs)
+    try:
+        fact_store.retire_older()
+    except CacheError as exc:
+        logger.debug("source index: older facts stores not discarded: %s", exc)
     missing = fact_store.missing([b for b in blobs if b not in in_db])
     if missing:
         settings = _settings()
@@ -782,6 +835,12 @@ def _remember(key: str, idx: RevisionIndex) -> None:
         _REVISIONS.move_to_end(key)
         while len(_REVISIONS) > MAX_REVISIONS:
             _REVISIONS.popitem(last=False)
+
+
+def loaded_revision(sha: str) -> RevisionIndex | None:
+    """The revision's index when it is already assembled in memory, else None (never starts a build)."""
+    with _LOCK:
+        return _REVISIONS.get(_key(sha))
 
 
 def revision_state(sha: str, wait: float = 0.0) -> dict[str, Any]:

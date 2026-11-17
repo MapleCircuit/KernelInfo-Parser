@@ -538,6 +538,95 @@ def get_decl_type(ast_type: int) -> int:
         case _:
             return ast_type + 1
 
+
+_SYSCALL_MACRO_RE = re.compile(r"\b(COMPAT_)?SYSCALL_DEFINE(\d?)\s*\(")
+_SYSCALL_MACRO_NAME_RE = re.compile(r"^(?:COMPAT_)?SYSCALL_DEFINE\d?$")
+_SIG_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\S")
+_SIG_IDENT_RE = re.compile(r"[A-Za-z_]\w*$")
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _split_paren_group(clean: str, pos: int) -> tuple[list[list[tuple[str, int]]], int] | None:
+    """Top-level comma-separated `(word, offset)` lists of the parenthesized group opened just before `pos`."""
+    depth = 1
+    args: list[list[tuple[str, int]]] = [[]]
+    for tm in _SIG_TOKEN_RE.finditer(clean, pos):
+        tok = tm.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth == 0:
+                return args, tm.end()
+        elif tok == "," and depth == 1:
+            args.append([])
+            continue
+        args[-1].append((tok, tm.start()))
+    return None
+
+
+def split_syscall_macro(text: str) -> tuple[int, bool, tuple[str, int], list[tuple[list[tuple[str, int]], tuple[str, int]]]] | None:
+    """Split a syscall definition macro invocation (pure).
+
+    Handles `SYSCALL_DEFINE<n>(name, type, arg, ...)` / `COMPAT_SYSCALL_DEFINE<n>(...)` and the
+    `SYSCALL_DEFINE(name)(type arg, ...)` form used for syscalls with 64-bit arguments. Returns
+    `(macro_offset, is_compat, (name, offset), [(type_words, (param, offset)), ...])` with the character offsets of
+    every word in `text` (`type_words` is a list of `(word, offset)`), or None when `text` holds no well-formed
+    invocation (unbalanced parentheses, a parameter count that disagrees with `<n>`, or a parameter name that is not
+    a single identifier).
+    """
+    clean = _C_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    m = _SYSCALL_MACRO_RE.search(clean)
+    if not m:
+        return None
+    group = _split_paren_group(clean, m.end())
+    if group is None or len(group[0][0]) != 1 or not _SIG_IDENT_RE.match(group[0][0][0][0]):
+        return None
+    args, end = group
+    params = []
+    if m.group(2):
+        n_params = int(m.group(2))
+        if len(args) != 1 + 2 * n_params:
+            return None
+        for i in range(n_params):
+            type_words, name_words = args[1 + 2 * i], args[2 + 2 * i]
+            if not type_words or len(name_words) != 1 or not _SIG_IDENT_RE.match(name_words[0][0]):
+                return None
+            params.append((type_words, name_words[0]))
+        return m.start(), bool(m.group(1)), args[0][0], params
+    # SYSCALL_DEFINE(name)(type arg, ...): a regular parameter list follows the name
+    if len(args) != 1:
+        return None
+    lst = re.compile(r"\s*\(").match(clean, end)
+    plist = _split_paren_group(clean, lst.end()) if lst else None
+    if plist is None:
+        return None
+    decls = plist[0]
+    if decls == [[]] or (len(decls) == 1 and [w for w, _ in decls[0]] == ["void"]):
+        return m.start(), bool(m.group(1)), args[0][0], params
+    for decl in decls:
+        if len(decl) < 2 or not _SIG_IDENT_RE.match(decl[-1][0]):
+            return None
+        params.append((decl[:-1], decl[-1]))
+    return m.start(), bool(m.group(1)), args[0][0], params
+
+
+# Type words of a syscall parameter: (ASTT, closes the type segment), mirroring `C_Type.keyword_parse`
+_SYSCALL_TYPE_KEYWORDS = {
+    "void": (ASTT.C_void, False),
+    "unsigned": (ASTT.C_unsigned, False),
+    "signed": (ASTT.C_signed, False),
+    "char": (ASTT.C_char, True),
+    "short": (ASTT.C_short, True),
+    "int": (ASTT.C_int, True),
+    "long": (ASTT.C_long, True),
+    "_Bool": (ASTT.C_bool, True),
+    "bool": (ASTT.C_bool, True),
+    "float": (ASTT.C_float, True),
+    "double": (ASTT.C_double, True),
+}
+_SYSCALL_TAG_KEYWORDS = {"struct": ASTT.C_struct, "union": ASTT.C_union, "enum": ASTT.C_enum}
+
 _CLEAN_TYPE_CACHE: dict[str, str] = {}
 
 
@@ -2092,6 +2181,7 @@ class C_Type(Ast):
         self.in_bitfield: bool = False
         self.bitfield_tokens: list[str] = []
         self.bitfield_width: str = ""
+        self.syscall_name: str = ""
 
     def _parse_attribute_tokens(self) -> None:
         tokens = getattr(self, "_current_attr_tokens", None)
@@ -2785,6 +2875,165 @@ class C_Type(Ast):
             case AST_KIND.literal:
                 self.exec_literal(token, cursor)
 
+    def _normalize_syscall_macro(self) -> bool:
+        """Rewrite a `SYSCALL_DEFINE<n>` / `COMPAT_SYSCALL_DEFINE<n>` definition into a regular function shape.
+
+        The macro's tokens carry no usable declarator structure (isolated mode sees one argument per macro
+        argument, full mode sees the expanded `sys_*` FUNCTION_DECL whose tokens all map to the invocation), so
+        the signature is rebuilt from the source text: the return type is `long` (`asmlinkage long sys_<name>`),
+        the macro name becomes the C_functionproto declarator, and each `type, name` argument pair becomes a
+        parameter node in a fresh `Zone_Type.Function_Args`. Typedef / struct names of the parameters resolve to
+        their foreign headers through the matching PARM_DECL cursor when libclang expanded the macro. Returns False
+        (leaving the node untouched) when the node is not a well-formed syscall invocation.
+        """
+        first = next((tok for ts in self.typedata for tok in ts.content), None)
+        if first is None or not _SYSCALL_MACRO_NAME_RE.match(first.code or ""):
+            return False
+        rawfile = getattr(G, "CURRENT_RAWFILE", None)
+        if not rawfile:
+            return False
+        s_l, s_c = self.extent.line_pos[0], self.extent.char_pos[0]
+        text = Line(self.extent).cc(rawfile).code
+        parsed = split_syscall_macro(text)
+        if parsed is None:
+            return False
+        macro_off, is_compat, (sys_raw, _name_off), params = parsed
+        if text[macro_off:macro_off + len(first.code)] != first.code:
+            return False
+
+        def pos(off: int) -> tuple[int, int]:
+            nl = text.rfind("\n", 0, off)
+            if nl < 0:
+                return s_l, s_c + off
+            return s_l + text.count("\n", 0, off), off - nl
+
+        def mk(word: str, off: int, asttype: int) -> TypeToken:
+            tok = TypeToken(None, asttype)
+            tok.code = word
+            line, col = pos(off)
+            tok.extent = Line(line, line, col, col + len(word))
+            return tok
+
+        parm_cursors: list[Any] = []
+        if self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.FUNCTION_DECL:
+            try:
+                parm_cursors = [k for k in self.cursor.get_children() if k.kind == cc.CursorKind.PARM_DECL]
+            except ValueError:  # cindex raises ValueError on cursor kinds unknown to the bindings
+                parm_cursors = []
+        if len(parm_cursors) != len(params):
+            parm_cursors = []
+        cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
+
+        def type_segments(type_words: list[tuple[str, int]], parm_cursor: Any) -> tuple[list[TypeSegment], list[tuple[str, str]]] | None:
+            segs: list[TypeSegment] = []
+            attrs: list[tuple[str, str]] = []
+            cur = TypeSegment()
+            tag_type = None
+
+            def flush() -> None:
+                nonlocal cur
+                if cur.content or cur.cqual != CQual.Empty:
+                    segs.append(cur)
+                cur = TypeSegment()
+
+            def named(word: str, off: int, asttype: int) -> TypeToken:
+                tok = mk(word, off, asttype)
+                if parm_cursor is not None:
+                    f_file, f_name = resolve_cursor_foreign_info(word, parm_cursor, cur_f)
+                    if f_file and f_name == word:
+                        tok.foreign_file, tok.foreign_name = f_file, f_name
+                return tok
+
+            for word, off in type_words:
+                if tag_type is not None:
+                    if not _SIG_IDENT_RE.match(word):
+                        return None
+                    cur.append(named(word, off, tag_type))
+                    flush()
+                    tag_type = None
+                elif word in ("const", "__const", "__const__", "volatile", "__volatile", "__volatile__"):
+                    flag, q_type = (CQual.const, ASTT.C_Qconst) if "const" in word else (CQual.volatile, ASTT.C_Qvolatile)
+                    if flag in cur.cqual:
+                        flush()
+                    cur.cqual = cur.cqual | flag
+                    cur.cqual_content.append(mk(word, off, q_type))
+                elif word in _SYSCALL_TAG_KEYWORDS:
+                    tag_type = _SYSCALL_TAG_KEYWORDS[word]
+                    cur.append(mk(word, off, tag_type))
+                elif word == "*":
+                    cur.append(mk(word, off, ASTT.C_pointer))
+                    flush()
+                elif word in _SYSCALL_TYPE_KEYWORDS:
+                    asttype, closes = _SYSCALL_TYPE_KEYWORDS[word]
+                    prev = cur.content[-1] if cur.content else (segs[-1].content[-1] if segs and segs[-1].content else None)
+                    prev_t = getattr(prev, "type", None)
+                    if word == "int" and prev_t in (ASTT.C_long, ASTT.C_longlong, ASTT.C_short):
+                        flush()
+                        continue
+                    if word in ("long", "double") and prev is not None and prev_t == ASTT.C_long:
+                        prev.type = ASTT.C_longlong if word == "long" else ASTT.C_longdouble
+                        flush()
+                        continue
+                    cur.append(mk(word, off, asttype))
+                    if closes:
+                        flush()
+                elif word in _KNOWN_KERNEL_ATTRIBUTES:
+                    attr = (word.lstrip("_") or word)[:64]
+                    if (attr, "") not in attrs:
+                        attrs.append((attr, ""))
+                elif word in _PARAM_KERNEL_ATTRIBUTES or not _SIG_IDENT_RE.match(word):
+                    return None
+                else:
+                    cur.append(named(word, off, ASTT.C_SCtypedef))
+                    flush()
+            if tag_type is not None:
+                return None
+            flush()
+            return segs, attrs
+
+        param_nodes: list[C_Type] = []
+        for idx, (type_words, (p_name, p_off)) in enumerate(params):
+            typed = type_segments(type_words, parm_cursors[idx] if parm_cursors else None)
+            if typed is None:
+                return False
+            segs, attrs = typed
+            if not segs:
+                return False
+            name_seg = TypeSegment()
+            name_seg.append(mk(p_name, p_off, 0))
+            segs.append(name_seg)
+
+            s_line, s_col = pos(type_words[0][1])
+            e_line, e_col = pos(p_off)
+            node = C_Type(Line(s_line, e_line, s_col, e_col + len(p_name)), end_mode=End_Mode.Comma)
+            node.name = p_name
+            node.typedata = segs
+            node.attributes = attrs
+            node.need_processing = False
+            param_nodes.append(node)
+
+        macro_tok = mk(first.code, macro_off, ASTT.C_functionproto)
+        macro_tok.is_definition = any(z.zone_type == Zone_Type.Compound_Stmt for z in self.zones)
+        ret_seg = TypeSegment()
+        ret_seg.append(mk("long", macro_off, ASTT.C_long))
+        name_seg = TypeSegment()
+        name_seg.append(macro_tok)
+        self.typedata = [ret_seg, name_seg]
+        self.content = TypeSegment()
+        self.has_functionproto = True
+        self.syscall_name = sys_raw if sys_raw.startswith(("sys_", "compat_sys_")) else ("compat_sys_" if is_compat else "sys_") + sys_raw
+
+        args_zone = Zone(Zone_Type.Function_Args)
+        args_zone.children = list(param_nodes)
+        args_zone.completed = True
+        if param_nodes:
+            args_zone.extent = Line(param_nodes[0].extent.line_pos[0], param_nodes[-1].extent.line_pos[1], param_nodes[0].extent.char_pos[0], param_nodes[-1].extent.char_pos[1])
+        kept = [z for z in self.zones if z.zone_type != Zone_Type.Function_Args]
+        body_idx = next((i for i, z in enumerate(kept) if z.zone_type == Zone_Type.Compound_Stmt), len(kept))
+        kept.insert(body_idx, args_zone)
+        self.zones = kept
+        return True
+
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         if self.content:
             self.swap_out()
@@ -3250,6 +3499,9 @@ class C_Type(Ast):
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
             return
 
+        # 0. SYSCALL_DEFINE* / COMPAT_SYSCALL_DEFINE* definitions take a regular function shape
+        self._normalize_syscall_macro()
+
         # 1. Process Child Zones by Category
         has_fn_args = any(z.zone_type == Zone_Type.Function_Args for z in self.zones)
         if (
@@ -3388,7 +3640,10 @@ class C_Type(Ast):
                         ast_staging_name = safe_item_name
                         ast_staging_type = decl_type
                         is_syscall = safe_item_name.startswith("SYSCALL_DEFINE") or safe_item_name.startswith("COMPAT_SYSCALL_DEFINE")
-                        if is_syscall:
+                        if is_syscall and self.syscall_name:
+                            ast_staging_name = self.syscall_name
+                            ast_staging_type = ASTT.C_SyscallDef
+                        elif is_syscall:
                             sys_raw = ""
                             args_zone = next((z for z in getattr(self, "zones", ()) if getattr(z, "zone_type", None) == Zone_Type.Function_Args), None)
                             if args_zone and args_zone.children:

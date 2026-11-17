@@ -46,6 +46,12 @@ MAX_XREF_REFS = 5000
 MAX_XREF_TARGETS = 64
 
 
+# m_symbol_def type names of type definitions (struct / union / enum tags are named by the bare tag, typedefs by
+# their name): `kind=type` ranks these first (Go to Type Definition, local scope type resolution)
+TYPE_DEF_TYPES = {"struct": "C_structdecl", "union": "C_uniondecl", "enum": "C_enumdecl", "typedef": "C_SCtypedef"}
+_TYPE_DEF_NAMES = frozenset(TYPE_DEF_TYPES.values())
+
+
 def format_symbol_type(type_name: str) -> str:
     """Format internal AST type names into user-friendly display labels."""
     if type_name == "C_enumequal":
@@ -224,48 +230,72 @@ class SymbolService:
             "arch": arch_id,
         }
 
+    def _ranked_definitions(self, reader: Any, name: str, vname: str, blob_paths: dict[int, list[str]],
+                            arch_id: str, srcarch: Any, bits: int | None, from_file: str | None,
+                            kind: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(in-tree definitions of `name` in rank order, every indexed definition row). With `kind="type"` the
+        struct / union / enum / typedef definitions come first, the order among them and among the others kept."""
+        def_rows = reader.select_rows(
+            ("m_symbol_def", "s"),
+            {"def_id": "s.def_id", "ast_id": "s.ast_id", "name": "s.name", "type_id": "s.type_id",
+             "type_name": "t.name", "fid": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e",
+             "tag_id": "s.tag_id", "linkage": "s.linkage"},
+            {"s.name": name},
+            joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+            order_by=["s.def_id"],
+        )
+        in_tree = [r for r in def_rows if r["fid"] in blob_paths]
+        for r in in_tree:
+            r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
+        in_tree.sort(key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], srcarch, bits))
+        if from_file and in_tree:
+            self._prefer_reachable(in_tree, blob_paths, vname, arch_id, from_file, srcarch, bits)
+        if kind == "type":
+            in_tree.sort(key=lambda r: 0 if safe_decode(r["type_name"]) in _TYPE_DEF_NAMES else 1)
+        return in_tree, def_rows
+
+    def ranked_definitions(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH,
+                           from_file: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
+        """The in-tree definitions of `name` in the order get_symbol_detail() ranks them (no Kconfig lookup):
+        `[{file, line_s, line_e, type_name, linkage}]` (`type_name` the raw AST type name, e.g. `C_structdecl`)."""
+        with get_reader() as reader:
+            _, vname, blob_paths = self._scope(reader, version_name)
+            arch_id, srcarch, bits = definition_arch(vname, arch)
+            in_tree, _rows = self._ranked_definitions(reader, name, vname, blob_paths, arch_id, srcarch, bits,
+                                                      from_file, kind)
+        return [{"file": safe_decode(r["fname"]), "line_s": r["line_s"], "line_e": r["line_e"],
+                 "type_name": safe_decode(r["type_name"]), "linkage": r.get("linkage")} for r in in_tree]
+
     def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH,
-                          from_file: str | None = None) -> dict[str, Any]:
+                          from_file: str | None = None, kind: str | None = None) -> dict[str, Any]:
         """The definition of a symbol in the revision's tree.
 
         Among several definitions the one for `arch` wins (see `definition_rank`); with `from_file` (the
         file the symbol is used in), the definitions its #include chain reaches for that ARCH come first
-        (`_prefer_reachable`). Kconfig symbols are looked up in that ARCH's model. `definitions` lists
-        every in-tree definition in rank order. References are not part of the answer: get_symbol_xref()
-        computes them, only for the views that show them.
+        (`_prefer_reachable`); with `kind="type"` struct / union / enum / typedef definitions rank before
+        every other kind (a tag shared with a function or variable resolves to the type). Kconfig symbols are
+        looked up in that ARCH's model. `definitions` lists every in-tree definition in rank order. References
+        are not part of the answer: get_symbol_xref() computes them, only for the views that show them.
         """
         with get_reader() as reader:
             _, vname, blob_paths = self._scope(reader, version_name)
             arch_id, srcarch, bits = definition_arch(vname, arch)
 
             # A Kconfig configuration symbol (CONFIG_NET, CONFIG_SMP)
-            if name.startswith("CONFIG_"):
+            if name.startswith("CONFIG_") and kind != "type":
                 k_res = self._kconfig_detail(vname, name, arch_id)
                 if k_res is not None:
                     return k_res
 
             # Authoritative definition: one whose blob is in this revision's tree, ranked for the ARCH
-            def_rows = reader.select_rows(
-                ("m_symbol_def", "s"),
-                {"def_id": "s.def_id", "ast_id": "s.ast_id", "name": "s.name", "type_id": "s.type_id",
-                 "type_name": "t.name", "fid": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e",
-                 "tag_id": "s.tag_id", "linkage": "s.linkage"},
-                {"s.name": name},
-                joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
-                order_by=["s.def_id"],
-            )
-            in_tree = [r for r in def_rows if r["fid"] in blob_paths]
-            for r in in_tree:
-                r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
-            in_tree.sort(key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], srcarch, bits))
-            if from_file and in_tree:
-                self._prefer_reachable(in_tree, blob_paths, vname, arch_id, from_file, srcarch, bits)
+            in_tree, def_rows = self._ranked_definitions(reader, name, vname, blob_paths, arch_id, srcarch, bits,
+                                                         from_file, kind)
             s_row = in_tree[0] if in_tree else (def_rows[0] if def_rows else None)
             if s_row is not None and not in_tree:
                 s_row["fname"] = None
             if not s_row:
                 # A Kconfig symbol named without its CONFIG_ prefix (NET)
-                k_res = self._kconfig_detail(vname, name, arch_id)
+                k_res = self._kconfig_detail(vname, name, arch_id) if kind != "type" else None
                 if k_res is not None:
                     return k_res
                 raise HTTPException(status_code=404, detail=f"Symbol '{name}' not found in version '{version_name}'.")
@@ -319,12 +349,15 @@ class SymbolService:
             }
 
     def get_symbol_xref(self, version_name: str, symbol_name: str, limit: int | None = None,
-                        arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
+                        arch: str = DEFAULT_DEFINITION_ARCH, name_fallback: bool = True) -> dict[str, Any]:
         """Definitions and references of a symbol; each reference carries its role badge (`type`).
 
         `definitions` are the definitions in this revision's tree, ranked for `arch` (see `definition_rank`);
         `definition` is the first one. References are looked up for every AST that *is* the symbol, in the
         tree or not, so a revision whose copy of the defining file was never parsed still resolves them.
+        A name without any m_symbol_def row falls back to the ASTs of that name (`m_ast.name`), unless
+        `name_fallback` is False (a name used inside a function body that is no variable there: its same-named
+        ASTs elsewhere in the tree are unrelated).
         """
         with get_reader() as reader:
             _, vname, blob_paths = self._scope(reader, version_name)
@@ -365,7 +398,7 @@ class SymbolService:
             ref_targets = _symbol_asts(in_tree, symbol_name) or _symbol_asts(def_rows, symbol_name)
 
             # Fallback to m_ast lookup if no explicit m_symbol_def record exists
-            if not def_rows:
+            if not def_rows and name_fallback:
                 tag_rows = reader.select_rows(
                     ("m_ast", "a"),
                     {"ast_id": "a.ast_id", "type_id": "a.type_id", "type_name": "t.name",
