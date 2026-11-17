@@ -78,17 +78,33 @@ function commonClicks(e, ctx) {
 }
 
 // ------------------------------------------------------------------ A1 syscalls
+/** ARCHes an unnumbered syscall belongs to: the other ARCHes whose table numbers it, else the arch/<x>/ of its definition. */
+const syscallArches = (r) => {
+  const on = r.definition?.numbered_on || [];
+  if (on.length) return on;
+  const own = /^arch\/([^/]+)\//.exec(r.definition?.path || "");
+  return own ? [own[1]] : [];
+};
+const syscallNumberHtml = (r) => {
+  if (r.nr != null) return `${r.nr} ${r.abi ? `(${escapeHtml(r.abi)})` : ""}`;
+  const on = r.definition?.numbered_on || [];
+  const arches = syscallArches(r);
+  const where = on.length ? `numbered on ${arches.map((a) => `<b>${escapeHtml(a)}</b>`).join(", ")}`
+    : arches.length ? `defined under <code>arch/${escapeHtml(arches[0])}/</code>, in no syscall table`
+      : "in no ARCH's syscall table";
+  return `none on this ARCH · ${where}`;
+};
 registerApiSection({
   id: "syscalls", label: "Syscalls", order: 10, archScoped: true, keywords: "system calls syscall table",
   hint: "System call numbers, entry points and SYSCALL_DEFINE signatures",
   async fetchList(ctx) {
-    const r = await (ctx.api || api).getKapi(ctx.version, `syscalls?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_sys_${ctx.arch}` });
+    const r = await (ctx.api || api).getKapi(ctx.version, `syscalls?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_sys2_${ctx.arch}` });
     const rows = [...r.syscalls.map((s) => ({ ...s, key: `${s.abi}:${s.nr}:${s.name}` })),
       ...r.unnumbered.map((u) => ({ nr: null, abi: "", name: u.name, entry: `sys_${u.name}`, status: "unnumbered", definition: u, key: `u:${u.name}` }))];
     return { rows, note: `from ${r.sources.map((s) => s.path).join(", ") || "no table found"}` };
   },
   rowKey: (r) => r.key,
-  rowText: (r) => `${r.nr ?? ""} ${r.name} ${r.entry} ${(r.definition?.args || []).map((a) => a.type).join(" ")}`,
+  rowText: (r) => `${r.nr ?? ""} ${r.name} ${r.entry} ${(r.definition?.args || []).map((a) => a.type).join(" ")}${r.nr == null ? ` ${syscallArches(r).join(" ")}` : ""}`,
   rowHtml: (r) => `<span class="sv-row-sub" style="min-width:34px;text-align:right">${r.nr ?? "—"}</span><span class="sv-row-main">${escapeHtml(r.name)}<span class="sv-row-sub"> (${(r.definition?.args || []).length})</span></span>`
     + `${r.abi ? `<span class="sv-tag info">${escapeHtml(r.abi)}</span>` : ""}${r.status !== "defined" ? `<span class="sv-tag ${r.status === "ni_syscall" ? "warn" : "bad"}">${escapeHtml(r.status.replace("_", " "))}</span>` : ""}`,
   chips: [
@@ -109,7 +125,7 @@ registerApiSection({
     }
     if (hasFeature(repo, "man")) actions.push(manLinkHtml(r.name, "2", `man 2 ${escapeHtml(r.name)}`));
     return `<h2>${escapeHtml(r.name)}</h2>
-      <dl class="sv-kv"><dt>Number</dt><dd>${r.nr ?? "none on this ARCH"} ${r.abi ? `(${escapeHtml(r.abi)})` : ""}</dd>
+      <dl class="sv-kv"><dt>Number</dt><dd>${syscallNumberHtml(r)}</dd>
       <dt>Entry point</dt><dd><code>${escapeHtml(r.entry)}</code>${r.compat_entry ? ` · compat <code>${escapeHtml(r.compat_entry)}</code>` : ""}</dd>
       <dt>Status</dt><dd>${escapeHtml(r.status)}</dd>
       ${d ? `<dt>Definition</dt><dd>${fileLink(d.path, d.line_s, null, ctx.version)} <code>${escapeHtml(d.macro)}</code></dd>` : ""}</dl>
@@ -118,7 +134,8 @@ registerApiSection({
   },
   onDetailClick: commonClicks,
   downloads: [{ label: "Syscalls", ext: "tsv", build: (rows) => toTsv(rows, [["nr", (r) => r.nr ?? ""], ["abi", (r) => r.abi], ["name", (r) => r.name], ["entry", (r) => r.entry],
-    ["status", (r) => r.status], ["definition", (r) => (r.definition ? `${r.definition.path}:${r.definition.line_s}` : "")]]) }],
+    ["status", (r) => r.status], ["definition", (r) => (r.definition ? `${r.definition.path}:${r.definition.line_s}` : "")],
+    ["arches", (r) => (r.nr == null ? syscallArches(r).join(",") : "")]]) }],
 });
 
 // ------------------------------------------------------------------ A2 exports

@@ -30,6 +30,55 @@ class TestKapiParsers(unittest.TestCase):
         self.assertEqual([(r["nr"], r["name"], r["entry"]) for r in k.parse_unistd_header(hdr)], [(0, "read", "sys_read"), (1, "write", "sys_write")])
         self.assertEqual(k.parse_syscall_table_s("ENTRY(sys_call_table)\n\t.long sys_restart_syscall\n\t.long sys_exit\n"), ["sys_restart_syscall", "sys_exit"])
 
+    def test_unistd_header_word_size(self) -> None:
+        hdr = ("#define __NR3264_mmap 222\n__SC_3264(__NR3264_mmap, sys_mmap2, sys_mmap)\n"
+               "#define __NR_read 63\n__SYSCALL(__NR_read, sys_read)\n"
+               "#if __BITS_PER_LONG == 64 && !defined(__SYSCALL_COMPAT)\n#define __NR_mmap __NR3264_mmap\n"
+               "#else\n#define __NR_mmap2 __NR3264_mmap\n#endif\n"
+               "#if defined(__ARCH_WANT_X) || \\\n __BITS_PER_LONG != 32\n#define __NR_time64only 7\n#endif\n"
+               "#ifdef __ARCH_WANT_Y\n#define __NR_maybe 8\n#else\n#define __NR_other 9\n#endif\n#define __NR_syscalls 300\n")
+        rows64 = k.parse_unistd_header(k.bits_conditional(hdr, False), False)
+        rows32 = k.parse_unistd_header(k.bits_conditional(hdr, True), True)
+        self.assertEqual({(r["nr"], r["name"], r["entry"]) for r in rows64},
+                         {(63, "read", "sys_read"), (222, "mmap", "sys_mmap"), (7, "time64only", "sys_time64only"),
+                          (8, "maybe", "sys_maybe"), (9, "other", "sys_other")})
+        self.assertEqual({(r["nr"], r["name"], r["entry"]) for r in rows32},
+                         {(63, "read", "sys_read"), (222, "mmap2", "sys_mmap2"), (7, "time64only", "sys_time64only"),
+                          (8, "maybe", "sys_maybe"), (9, "other", "sys_other")})
+        mips = "#define __NR_Linux 4000\n#if _MIPS_SIM == _MIPS_SIM_ABI32\n#define __NR_exit (__NR_Linux + 1)\n#endif\n#define __NR_Linux_syscalls 343\n"
+        self.assertEqual([(r["nr"], r["name"]) for r in k.parse_unistd_header(
+            k.bits_conditional(mips, True, {"_MIPS_SIM": 1, "_MIPS_SIM_ABI32": 1}))], [(4001, "exit")])
+        self.assertEqual(k.parse_unistd_header(k.bits_conditional(mips, False, {"_MIPS_SIM": 3, "_MIPS_SIM_ABI32": 1})), [])
+        self.assertIsNone(k._pp_eval("defined(CONFIG_FOO)", True))
+        self.assertTrue(k._pp_eval("!(__BITS_PER_LONG == 32)", False))
+
+    def test_numbered_elsewhere(self) -> None:
+        files_text = {
+            "arch/x86/syscalls/syscall_64.tbl": "0 common read sys_read\n1 64 arch_prctl sys_arch_prctl\n",
+            "arch/x86/syscalls/syscall_32.tbl": "0 i386 read sys_read\n1 i386 ipc sys_ipc\n2 i386 old sys_ni_syscall\n",
+            "arch/arm/tools/syscall.tbl": "0 common read sys_read\n1 oabi ipc sys_ipc\n2 common fork sys_fork\n",
+            "arch/riscv/kernel/Makefile.syscalls": "syscall_abis_64 += riscv\n",
+            "scripts/syscall.tbl": "0 common read sys_read\n1 riscv flush sys_riscv_flush_icache\n2 32 mmap2 sys_mmap2\n3 rlimit setrlimit sys_setrlimit\n",
+            "arch/um/Makefile": "",
+        }
+
+        class Files:
+            sha = "x"
+
+            def lines(self, path: str) -> list[str]:
+                return files_text.get(path, "").split("\n")
+
+        paths = set(files_text)
+        el = k._numbered_elsewhere(Files(), paths, "x86_64", "x86")
+        self.assertEqual(sorted(el["sys_ipc"]), ["i386"])
+        self.assertEqual(sorted(el["sys_read"]), ["arm", "i386", "riscv"])
+        self.assertEqual(sorted(el["sys_riscv_flush_icache"]), ["riscv"])
+        self.assertEqual(sorted(el["sys_mmap2"]), ["riscv"])  # rv32: common + 32
+        self.assertNotIn("sys_setrlimit", el)  # an ABI riscv does not list
+        self.assertNotIn("sys_old", el)  # sys_ni_syscall
+        self.assertNotIn("um", {a for v in el.values() for a in v})
+        self.assertEqual(sorted(k._numbered_elsewhere(Files(), paths, "i386", "x86")["sys_arch_prctl"]), ["x86_64"])
+
     def test_exports(self) -> None:
         self.assertEqual(k.parse_export("EXPORT_SYMBOL(kmalloc);"), {"symbol": "kmalloc", "variant": "plain", "namespace": ""})
         self.assertEqual(k.parse_export("EXPORT_SYMBOL_GPL(kfree_rcu);")["variant"], "gpl")
