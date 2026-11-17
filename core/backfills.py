@@ -769,3 +769,28 @@ def backfill_insights(db: Any, repo_dir: str, repo_id: int, from_ref: str | None
         return release_stats.ingest_insights(db, Path(repo_dir), repo_id, from_tag=from_ref)
 
     return guarded("Backfill insights", db, run)
+
+
+def backfill_cve_releases(
+    db: Any,
+    repo_dir: str,
+    repo_id: int,
+    from_ref: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Backfill pre-evaluated release-to-CVE verdicts (m_cve_release, m_cve_release_state)."""
+
+    def run() -> dict[str, Any]:
+        from parser.cve import cve_ingest, cve_releases
+
+        cve_repo = cve_ingest.repo_dir()
+        return cve_releases.sync(
+            db,
+            repo_id,
+            kernel_repo=Path(repo_dir) if repo_dir else None,
+            cve_repo=cve_repo,
+            force=force,
+            from_tag=from_ref,
+        )
+
+    return guarded("Backfill CVE releases", db, run)

@@ -729,6 +729,60 @@
    1
   ]
  },
+ "m_cve_release": {
+  "binary": [],
+  "est_bytes": [
+   4,
+   26,
+   1,
+   1,
+   1
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "primary": [
+   0,
+   1
+  ]
+ },
+ "m_cve_release_state": {
+  "binary": [
+   2,
+   3
+  ],
+  "est_bytes": [
+   4,
+   4,
+   20,
+   20,
+   18,
+   2,
+   2,
+   8
+  ],
+  "has_auto_increment": false,
+  "large": [],
+  "not_null": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "primary": [
+   0
+  ]
+ },
  "m_cve_source": {
   "binary": [
    2

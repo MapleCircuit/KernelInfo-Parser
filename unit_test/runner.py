@@ -86,6 +86,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_insights",
     "tests.test_webapp_cve",
     "tests.test_cve_ingest",
+    "tests.test_cve_releases",
     "tests.test_release_stats",
     "tests.test_webapp_kbuild_index",
     "tests.test_webapp_kapi",

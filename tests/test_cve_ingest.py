@@ -20,7 +20,17 @@ from parser.cve import cve_records as cr
 from tests.test_webapp_cve import FIX, INTRO, STABLE_FIX, cna_record, other_record
 
 
-CVE_TABLES = (D.m_cve_source, D.m_cve, D.m_cve_commit, D.m_cve_commit_hash, D.m_cve_file)
+CVE_TABLES = (
+    D.m_cve_source,
+    D.m_cve,
+    D.m_cve_commit,
+    D.m_cve_commit_hash,
+    D.m_cve_file,
+    D.m_repository,
+    D.m_release_segment,
+    D.m_cve_release_state,
+    D.m_cve_release,
+)
 
 
 def cve_db() -> SQLiteDB:
@@ -196,9 +206,39 @@ class TestCommitPrefixes(unittest.TestCase):
         db = cve_db()
         db.insert_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"], [(7, "abcdef012345", b"\x01" * 20)])
         db.insert_rows("m_cve_file", ["cve_id", "file_path"], [("CVE-1", "a.c")])
+        db.insert_rows("m_cve", ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
+                       [("CVE-1", 1, 0, 0, 0, 0, "p", "t", b"")])
+        db.insert_rows("m_cve_release", ["segment_id", "cve_id", "state", "basis", "fixed_here"], [(1, "CVE-1", 1, 1, 0)])
+        db.insert_rows("m_cve_release_state", ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
+                       [(1, 7, b"\x01" * 20, b"\x02" * 20, "cvelist", 4, 1, 100)])
         ci.write(db, {"state": "full", "records": {}, "name": "x", "layout": "cvelist", "head": "ab" * 20})
         self.assertEqual(db.count_rows("m_cve_commit_hash"), 0)
         self.assertEqual(db.count_rows("m_cve_file"), 0)
+        self.assertEqual(db.count_rows("m_cve_release"), 0)
+        self.assertEqual(db.count_rows("m_cve_release_state"), 0)
+
+    def test_pull_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream = Path(tmp) / "upstream.git"
+            work = Path(tmp) / "work"
+            clone = Path(tmp) / "clone"
+            subprocess.run(["git", "init", "--bare", "-q", str(upstream)], check=True, env=self.env)
+            subprocess.run(["git", "init", "-q", str(work)], check=True, env=self.env)
+            (work / "a.txt").write_text("1")
+            h1 = TestIngest.commit(self, str(work))
+            subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(upstream)], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(upstream), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=self.env)
+            subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True, env=self.env)
+
+            (work / "a.txt").write_text("2")
+            h2 = TestIngest.commit(self, str(work))
+            subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "HEAD:main"], check=True, env=self.env)
+
+            res = ci.pull_repo(clone)
+            self.assertTrue(res["pulled"], res)
+            self.assertEqual((res["before"], res["after"]), (h1, h2))
+            self.assertIsNone(res["error"])
 
     def test_m_cve_file_insertion_and_deletion(self) -> None:
         """m_cve_file table is populated on insert and cleaned up on delete."""

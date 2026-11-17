@@ -35,13 +35,13 @@ agents.
   - 8.1. High-Level Architecture [L1407-L1450]
   - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1451-L1476]
   - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1477-L1656]
-- 9. CVE List Ingestion (`parser/cve/`) [L1657-L1690]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1691-L1752]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1753-L1887]
-  - 11.1. Architecture & Roles [L1759-L1814]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1815-L1855]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1856-L1887]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1888-L1927]
+- 9. CVE List Ingestion (`parser/cve/`) [L1657-L1701]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1702-L1763]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1764-L1898]
+  - 11.1. Architecture & Roles [L1770-L1825]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1826-L1866]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1867-L1898]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1899-L1940]
 <!-- toc:end -->
 
 ---
@@ -535,7 +535,7 @@ For authoritative table definitions, primary keys, indexes, and the full relatio
 - **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`.
 - **Ingestion State, Watermarks & Checkpoints** (Tables 29, 35, 40–41, 47, 55–58): `m_db_instance`, `m_ingest_state`, `m_ingest_watermark`, `m_ingest_blob`, `m_checkpoint_base`, `m_table_sequence`, `m_ingest_id_range`, `m_parse_node`, `m_parse_task`. Table 58 `m_parse_task` coordinates distributed secondary work: `(task_id, network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name, base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg)`, with unique key `(network_id, ref_name)`.
 - **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59, 66–67): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`, `m_release_pull`, `m_release_section_health`.
-- **CVE Catalogs & Tracking** (Tables 49–51, 62, 65): `m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_commit_hash`, `m_cve_file`. Table 65 `m_cve_file` maps CVE records to affected kernel source and header file paths: `(cve_id, file_path)`, indexed by `file_path`.
+- **CVE Catalogs & Tracking** (Tables 49–51, 62, 65, 68–69): `m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_commit_hash`, `m_cve_file`, `m_cve_release_state`, `m_cve_release`. Table 65 `m_cve_file` maps CVE records to affected kernel source and header file paths: `(cve_id, file_path)`, indexed by `file_path`. Tables 68–69 store pre-evaluated release-to-CVE verdicts (`(segment_id, cve_id) -> (state, basis, fixed_here)`) and each segment's evaluated `cve_head` / `tag_hash` / format state for incremental refreshes.
 
 > [!NOTE]
 > **Kconfig has no tables of its own.** Kconfig entries are tags like any other construct (`m_ast` named after
@@ -1660,8 +1660,11 @@ The parser keeps the database's CVE tables (`m_cve_source`, `m_cve`, `m_cve_comm
 local clone of the CVE list (config `cve.repo_dir`, §7.1; kept current by the operator with `git pull`). The
 webapp only reads them (`webapp/API_ENDPOINTS.md` §4.11).
 - **When**: at the start of every parser run (`main.processing_cve_list()`, after the repository is selected),
-  unless `--no-cve`; `python3 main.py --cve` does only this and exits; `--cve-full` ingests the whole list
-  again. A failure is logged and never stops parsing. A run on a repository of a project that is not a kernel
+  unless `--no-cve`; `python3 main.py --cve` does only this and exits (with `--cve-pull` to run
+  `git pull --ff-only` first, and `--cve-interval <seconds>` to repeat incremental refreshes on an interval);
+  `--cve-full` ingests the whole list and re-evaluates all release-CVE verdicts again. `processing_cve_releases()`
+  also runs after `processing_release_stats()` so newly tagged releases are pre-evaluated immediately. A failure
+  is logged and never stops parsing. A run on a repository of a project that is not a kernel
   tree (`man-pages`, §7.1.1) skips it (`--cve` then only logs a warning).
 - **Abbreviated hashes** (`cve_ingest.resolve_commit_prefixes()`): after each ingestion (also when the HEAD is
   current), every distinct `m_cve_commit.commit_hash` shorter than 40 digits without an `m_cve_commit_hash`
@@ -1687,6 +1690,14 @@ webapp only reads them (`webapp/API_ENDPOINTS.md` §4.11).
   columns the webapp filters on (kind, publication and update dates, CVSS × 10, KEV listing); `m_cve_commit`
   one row per (commit, role) the record names: the fixing commits (role 1, ~98k rows, abbreviated as the
   record gives them) and the introducing ones (role 2, ~26k rows, always full SHAs).
+- **Pre-evaluated release verdicts** (`parser/cve/cve_releases.py`, `m_cve_release_state`, `m_cve_release`):
+  evaluates kernel CVEs against the repository's `m_release_segment` tags using the shared pure `affects()` rules
+  (`CVE_RELEASE_FORMAT = 1`), storing matching `(segment_id, cve_id) -> (state, basis, fixed_here)` rows in
+  `m_cve_release` and each segment's evaluated `cve_head` (plus `tag_hash`, `cve_layout`, `cve_format`,
+  `rel_format`) in `m_cve_release_state` inside one transaction per segment. When `m_cve_source.head` advances
+  from `old_head` to `new_head`, `cve_releases.sync()` diffs `old_head..new_head` via `git diff --name-only`
+  (plus any CVEs whose abbreviated commit prefixes were newly resolved or whose commits landed in newly added
+  segments) and incrementally updates only those CVEs per segment instead of re-evaluating the entire catalog.
 
 ## 10. Release Statistics (`parser/git_ast/release_stats.py`)
 
@@ -1911,6 +1922,8 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 | `--backfill-cve-files` | `m_cve_file` (§4 row 65) | Populates affected source and header file paths for CVE records from parsed `m_cve.data`. |
 
 | `--backfill-insights [--from <ref>]` | `m_release_pull`, `m_release_section_health` (§4 rows 66-67) | Summarizes merge-window pulls and per-section subsystem health for final mainline release segments of the repository (`release_stats.ingest_insights()`), resumable via `--from`. |
+
+| `--backfill-cve-releases [--from <ref>] [--cve-full]` | `m_cve_release_state`, `m_cve_release` (§4 rows 68-69) | Pre-evaluates release-to-CVE verdicts for release segments of the repository (`cve_releases.sync()`), resumable per segment and incremental after each segment's stored `cve_head`. Runs automatically at start when `m_cve_source` and `m_release_segment` have rows while `m_cve_release_state` is empty for the repository (unless `--no-backfill`). |
 
 | `--backfill-mailing-list [--ml-range <range>]` | `m_commit_email` (§4 row 43) | Executes the 6-tier public-inbox resolution waterfall across the specified commit range (or `HEAD~100..HEAD`) via `standalone_resolve_mailing_list()`, populating `m_commit_email` with thread mappings, patch series numbers, and match tiers. |
 

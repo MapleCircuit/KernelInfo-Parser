@@ -36,7 +36,7 @@ from core.DBLayout import (
 from pipeline.backfill_steps import run_automatic_backfills, run_requested_backfills
 from pipeline.cli import arg_handling
 from pipeline.db_setup import drop_familyless_blob_facts, drop_legacy_symbol_tables, drop_obsolete_kconfig_tables, drop_outdated_derived_tables, ensure_db_instance, ensure_db_views, ensure_declared_indexes, outdated_layout
-from pipeline.external_steps import processing_cve_list, processing_release_stats
+from pipeline.external_steps import processing_cve_list, processing_cve_releases, processing_release_stats
 from pipeline.git_ingest import _forget_rolled_back_rows, _purge_partial_version, _resolve_legacy_state, refresh_person_identities
 from pipeline.git_network import repo_project_slug, resolve_git_network_and_repo
 from pipeline.mailing_list_steps import standalone_resolve_mailing_list
@@ -162,9 +162,38 @@ def _run() -> None:
         getattr(args, "cve", False) or (cve_enabled and not getattr(args, "no_cve", False))
     ):
         _cve_net, cve_repo_id = resolve_git_network_and_repo(repo_path)
-        summary = processing_cve_list(force=bool(getattr(args, "cve_full", False)), kernel_repo=repo_path, repo_id=cve_repo_id)
+        cve_pull = bool(getattr(args, "cve_pull", False))
+        summary = processing_cve_list(
+            force=bool(getattr(args, "cve_full", False)),
+            kernel_repo=repo_path,
+            repo_id=cve_repo_id,
+            pull=cve_pull,
+        )
         if summary and summary.get("state") == "current":
             logger.info(f"[CVE] The CVE list is current ({summary.get('records')} kernel records, HEAD {str(summary.get('head'))[:12]}).")
+        cve_interval = int(getattr(args, "cve_interval", 0) or 0)
+        if getattr(args, "cve", False) and cve_interval > 0:
+            import threading
+            stop_ev = threading.Event()
+            quit_listener = GracefulQuitListener(on_request=stop_ev.set)
+            quit_listener.start()
+            logger.info(COLOR.cyan(f"[CVE] Refresh loop active: checking every {cve_interval}s (press 'q' or Ctrl+C to stop)."))
+            try:
+                while not G.is_deadline_exceeded() and not stop_ev.wait(cve_interval):
+                    if quit_listener.requested.is_set():
+                        break
+                    summary = processing_cve_list(
+                        force=False,
+                        kernel_repo=repo_path,
+                        repo_id=cve_repo_id,
+                        pull=cve_pull,
+                    )
+                    if summary and summary.get("state") == "current":
+                        logger.debug(f"[CVE] Current at {str(summary.get('head'))[:12]}.")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                quit_listener.stop()
     if getattr(args, "cve", False):
         G.emergency_shutdown(0)
         return
@@ -393,6 +422,8 @@ def _run() -> None:
     # Release statistics of every release tag (core/API.md section 10); --release-stats does only this
     if getattr(args, "release_stats", False) or not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
         processing_release_stats(repo_path, repo_id)
+        if kernel_repo and cve_enabled and not getattr(args, "no_cve", False) and not getattr(args, "dry_run", False) and not getattr(args, "release_stats", False):
+            processing_cve_releases(repo_path, repo_id)
     if getattr(args, "release_stats", False):
         G.emergency_shutdown(0)
         return
@@ -401,7 +432,7 @@ def _run() -> None:
         G.emergency_shutdown(0)
         return
     if not getattr(args, "dry_run", False):
-        run_automatic_backfills(args)
+        run_automatic_backfills(args, repo_id=repo_id, repo_path=repo_path)
 
     repair_mode = bool(getattr(args, "repair", False))
     backfill_target = getattr(args, "backfill", None)
@@ -549,6 +580,8 @@ def _run() -> None:
     # and tags fetched while it ran are picked up (nothing is read when every tag is summarized)
     if not getattr(args, "no_release_stats", False):
         processing_release_stats(repo_path, repo_id)
+        if kernel_repo and cve_enabled and not getattr(args, "no_cve", False):
+            processing_cve_releases(repo_path, repo_id)
 
     logger.info("We are done! Closing")
     G.emergency_shutdown(0)

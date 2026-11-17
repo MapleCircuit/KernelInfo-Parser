@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable
 
 from fastapi import HTTPException
 
+from db_engine.spec import Agg, Join
 from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and tests
     CVE_ID,
     HEXSHA as _HEXSHA,
@@ -39,6 +40,14 @@ from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and
     parse_record,
     summarize_versions,
     version_status,
+)
+from parser.cve.cve_releases import (
+    CVE_RELEASE_FORMAT,
+    ID_TO_BASIS,
+    ID_TO_STATE,
+    BaseReleaseContext,
+    affects as _affects,
+    is_fixed_here,
 )
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.pool import get_reader
@@ -288,7 +297,7 @@ def stored_prefixes(prefixes: list[str]) -> dict[str, str]:
     return out
 
 
-class Context:
+class Context(BaseReleaseContext):
     """Containment of commits in one release tag, memoized: release membership (first tags), stable
     backports and Fixes: targets (m_commit_relation first, else the commit relation index when built)."""
 
@@ -367,41 +376,6 @@ class Context:
             self._tags[full] = hit if hit and (hit.get("mainline") or hit.get("stable")) else None
         return self._tags[full]
 
-    def contains(self, sha: str | None) -> bool:
-        t = self.tags(sha)
-        if not t or not self.p:
-            return False
-        m, s = t.get("mainline"), t.get("stable")
-        if not self.p["stable"]:
-            return bool(m) and self.release_key(m) <= self.key
-        if m and self.release_key(m) <= self.base_key:
-            return True
-        q = self.parse_tag(s) if s else None
-        return bool(q) and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]
-
-    def applies(self, fix: str) -> bool:
-        """A fixing commit on the release's branch (or not released anywhere yet)."""
-        t = self.tags(fix)
-        if not t:
-            return True
-        if t.get("mainline"):
-            return True
-        q = self.parse_tag(t["stable"]) if t.get("stable") else None
-        return bool(self.p and self.p["stable"] and q and q["series"] == self.p["series"])
-
-    def first_here(self, sha: str | None) -> bool:
-        """The commit first appears in this release: its stable update, its -rc, or its cycle (-rc1 .. final)."""
-        t = self.tags(sha)
-        if not t or not self.p:
-            return False
-        first = t.get("stable") if self.p["stable"] else t.get("mainline")
-        if not first:
-            return False
-        if self.p["stable"] or self.p["pre"]:
-            return first == self.release
-        q = self.parse_tag(first)
-        return bool(q) and not q["stable"] and q["series"] == self.p["series"]
-
     def _backport_tags(self) -> list[str]:
         """The releases whose commits contains() reads backports from: mainline tags up to the release and,
         for a stable release, its series' stable tags up to it."""
@@ -448,53 +422,145 @@ class Context:
 
 def affects(rec: dict[str, Any], release: str, ctx: Context | None = None) -> tuple[str, str]:
     """(state, basis) of a record for a release tag. state: affected | fixed | possibly | unaffected | unknown;
-    basis: record (the kernel CNA's data) | fixes-tag | reference | description."""
-    ctx = ctx or Context(release)
-    if ctx.p is None:
-        return "unknown", ""
-    kind = rec.get("kind", "cna")
-    if kind == "cna":
-        if not ctx.p["pre"] and rec.get("entries"):
-            st = version_status(rec["entries"], ctx.version)
-            if st:
-                return st, "record"
-        verdict = None
-        pending = False
-        is_affected = False
-        for r in rec.get("ranges") or []:
-            fix, intro = r.get("fixed"), r.get("introduced")
-            released = ctx.tags(fix) is not None if fix else False
-            if released and not ctx.applies(fix):
-                continue  # the fix of another stable branch
-            fix_in = released and ctx.contains(fix)
-            intro_in = intro is None or ctx.contains(intro)
-            if intro_in and fix_in:
-                verdict = "fixed"
-                break
-            if intro_in and not fix_in:
-                if fix and not released:
-                    pending = True  # a fix in no release yet (or unknown to this clone): its branch is unknown
-                    continue
-                is_affected = True
-        if verdict:
-            return verdict, "record"
-        if is_affected or pending:
-            return "affected", "record"
-        return "unaffected", "record"
-    if kind == "commit":
-        fixes = [r["fixed"] for r in rec.get("ranges") or [] if r.get("fixed")]
-        for f in fixes:
-            if ctx.contains(f) or any(ctx.contains(b) for b in ctx.backports(f)):
-                return "fixed", "reference"
-        intros = [i for f in fixes for i in ctx.fixes_tags(f)]
-        if intros:
-            return ("affected" if any(ctx.contains(i) for i in intros) else "unaffected"), "fixes-tag"
-        return ("possibly", "reference") if fixes else ("unknown", "")
-    if not ctx.p["pre"] and rec.get("entries"):
-        st = version_status(rec["entries"], ctx.version)
-        if st == "affected":
-            return "possibly", "description" if any(e.get("source") == "description" for e in rec["entries"]) else "versions"
-    return "unknown", ""
+    basis: record (the kernel CNA's data) | fixes-tag | reference | description | versions."""
+    return _affects(rec, release, ctx or Context(release))
+
+
+def _format_report_row(rec: dict[str, Any], state: str, basis: str, fixed_here: bool) -> dict[str, Any]:
+    fixes = [r["fixed"] for r in (rec.get("ranges") or ()) if r.get("fixed")]
+    cvss = rec.get("cvss") or {}
+    return {
+        "id": rec["id"],
+        "title": rec.get("title") or (rec.get("description") or "")[:160],
+        "state": state,
+        "basis": basis,
+        "kind": rec.get("kind", ""),
+        "published": rec.get("published", ""),
+        "fixes": fixes[:4],
+        "fixed_here": fixed_here,
+        "score": cvss.get("score"),
+        "severity": cvss.get("severity") or "",
+        "kev": rec.get("kev"),
+        "cwes": rec.get("cwes") or [],
+    }
+
+
+def _db_kind_counts(reader: Any) -> dict[str, int] | None:
+    counts = {"cna": 0, "commit": 0, "text": 0}
+    for row in reader.aggregate("m_cve", {"n": Agg("COUNT", "*")}, group_by=["kind"]):
+        name = KIND_NAMES.get(int(row["kind"]))
+        if name is None:
+            return None
+        counts[name] = int(row["n"] or 0)
+    return counts
+
+
+def db_release_report(release: str) -> dict[str, Any] | None:
+    """Pre-evaluated CVE report for `release` from `m_cve_release` / `m_cve_release_state` (read only),
+    or None when absent, stale against `m_cve_source` / tag commit, or format differs."""
+    src = source()
+    if src is None:
+        return None
+    tag_sha = rs.tag_commits().get(release)
+    if not tag_sha:
+        return None
+    try:
+        from webapp.backend.database.helpers import get_active_repo_id
+        with get_reader() as reader:
+            repo_id = get_active_repo_id(reader)
+            seg = reader.select_one(
+                "m_release_segment", ["segment_id", "tag_hash"], {"repo_id": repo_id, "tag": release}
+            )
+            if not seg or bytes(seg["tag_hash"]).hex() != tag_sha:
+                return None
+            segment_id = int(seg["segment_id"])
+            st = reader.select_one(
+                "m_cve_release_state",
+                ["cve_head", "cve_layout", "cve_format", "rel_format"],
+                {"segment_id": segment_id},
+            )
+            if not st:
+                return None
+            if bytes(st["cve_head"]).hex() != src["head"]:
+                src = source(fresh=True)
+                if src is None or bytes(st["cve_head"]).hex() != src["head"]:
+                    return None
+            if (
+                _text(st["cve_layout"]) != src["layout"]
+                or int(st["cve_format"]) != RECORD_FORMAT
+                or int(st["rel_format"]) != CVE_RELEASE_FORMAT
+            ):
+                return None
+
+            with _LOCK:
+                mem_recs = (
+                    _MEM["records"]
+                    if (_MEM["built_at"], _MEM["head"]) == (src["built_at"], src["head"])
+                    else None
+                )
+            kind_counts = kinds(mem_recs) if mem_recs is not None else _db_kind_counts(reader)
+            if kind_counts is None:
+                kind_counts = kinds(records())
+                with _LOCK:
+                    mem_recs = (
+                        _MEM["records"]
+                        if (_MEM["built_at"], _MEM["head"]) == (src["built_at"], src["head"])
+                        else None
+                    )
+
+            rows: list[dict[str, Any]] = []
+            if mem_recs is not None:
+                db_rows = reader.select_rows(
+                    "m_cve_release",
+                    ["cve_id", "state", "basis", "fixed_here"],
+                    {"segment_id": segment_id},
+                    order_by=["-cve_id"],
+                )
+                for r in db_rows:
+                    cid = _text(r["cve_id"])
+                    rec = mem_recs.get(cid)
+                    state_str = ID_TO_STATE.get(int(r["state"]))
+                    if rec is None or state_str is None:
+                        return None
+                    basis_str = ID_TO_BASIS.get(int(r["basis"]), "")
+                    rows.append(_format_report_row(rec, state_str, basis_str, bool(int(r["fixed_here"]))))
+            else:
+                db_rows = reader.select_rows(
+                    ("m_cve_release", "r"),
+                    {
+                        "cve_id": "r.cve_id",
+                        "state": "r.state",
+                        "basis": "r.basis",
+                        "fixed_here": "r.fixed_here",
+                        "data": "c.data",
+                    },
+                    {"r.segment_id": segment_id},
+                    joins=[Join(("m_cve", "c"), {"c.cve_id": "r.cve_id"})],
+                    order_by=["-r.cve_id"],
+                )
+                for r in db_rows:
+                    rec = _decode(r["data"])
+                    state_str = ID_TO_STATE.get(int(r["state"]))
+                    if rec is None or state_str is None:
+                        return None
+                    basis_str = ID_TO_BASIS.get(int(r["basis"]), "")
+                    rows.append(_format_report_row(rec, state_str, basis_str, bool(int(r["fixed_here"]))))
+    except Exception as exc:  # noqa: BLE001 - older DB without m_cve_release* or read fallback
+        logger.debug("db_release_report(%s) unavailable: %s", release, exc)
+        return None
+
+    rows.sort(key=lambda r: r["id"], reverse=True)
+    counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
+    counts["fixed_here"] = sum(1 for r in rows if r["fixed_here"])
+    return {
+        "release": release,
+        "head": src["head"],
+        "layout": src["layout"],
+        "kinds": kind_counts,
+        "cves": rows,
+        "counts": counts,
+        "source": "database",
+    }
 
 
 def release_report(release: str, progress: Callable | None = None) -> dict[str, Any]:
@@ -514,13 +580,7 @@ def release_report(release: str, progress: Callable | None = None) -> dict[str, 
         state, basis = affects(rec, release, ctx)
         if state not in ("affected", "fixed", "possibly"):
             continue
-        fixes = [r["fixed"] for r in rec["ranges"] if r.get("fixed")]
-        cvss = rec.get("cvss") or {}
-        rows.append({"id": rec["id"], "title": rec["title"] or rec["description"][:160], "state": state, "basis": basis,
-                     "kind": rec["kind"], "published": rec["published"], "fixes": fixes[:4],
-                     "fixed_here": state == "fixed" and any(ctx.first_here(f) for f in fixes),
-                     "score": cvss.get("score"), "severity": cvss.get("severity") or "", "kev": rec.get("kev"),
-                     "cwes": rec.get("cwes") or []})
+        rows.append(_format_report_row(rec, state, basis, is_fixed_here(rec, state, ctx)))
     rows.sort(key=lambda r: r["id"], reverse=True)
     counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
     counts["fixed_here"] = sum(1 for r in rows if r["fixed_here"])
@@ -535,6 +595,9 @@ def report(release: str, wait: float = 0.0) -> dict[str, Any]:
     if src is None:
         from parser.cve.cve_ingest import repo_dir
         return {"state": "done", "result": {"configured": repo_dir() is not None, "ingested": False, "cves": []}}
+    hit = db_release_report(release)
+    if hit is not None:
+        return {"state": "done", "result": hit}
     dep = rs.ensure_release_index()
     if dep.get("state") != "done":
         return dep

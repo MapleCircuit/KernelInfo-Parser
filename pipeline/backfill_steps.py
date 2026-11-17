@@ -73,10 +73,24 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             requested = True
             summary = backfills.backfill_insights(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
             logger.info(f"[Backfill insights] {summary}")
+        if getattr(args, "backfill_cve_releases", False):
+            requested = True
+            summary = backfills.backfill_cve_releases(
+                db,
+                str(MF.repo_dir),
+                repo_id,
+                getattr(args, "backfill_from", None),
+                force=bool(getattr(args, "cve_full", False)),
+            )
+            logger.info(f"[Backfill CVE releases] {summary}")
     return requested
 
 
-def run_automatic_backfills(args: argparse.Namespace) -> None:
+def run_automatic_backfills(
+    args: argparse.Namespace,
+    repo_id: int | None = None,
+    repo_path: str | None = None,
+) -> None:
     """One-off backfills of tables that are empty while the database holds finished versions (the table was
     just added; core/API.md section 12), unless --no-backfill. Standalone and master roles only."""
     from core import backfills
@@ -88,9 +102,25 @@ def run_automatic_backfills(args: argparse.Namespace) -> None:
             relations_state = backfills.commit_relations_state(db)
             finished = db.row_exists("m_ingest_state", {"status": ingest_state.INGEST_DONE})
             kbuild_empty = finished and not db.row_exists("m_kbuild_symbol")
+            cve_rel_needed = (
+                bool(repo_id)
+                and feature_enabled("cve")
+                and db.table_exists("m_cve_release_state")
+                and db.row_exists("m_cve_source")
+                and db.row_exists("m_release_segment", {"repo_id": repo_id})
+                and not db.row_exists("m_cve_release_state", {"repo_id": repo_id})
+            )
         except Exception as exc:  # noqa: BLE001 - never blocks parsing
             logger.debug(f"Automatic backfill check failed: {exc}")
             return
+        if cve_rel_needed and repo_id is not None:
+            if getattr(args, "no_backfill", False):
+                logger.info("[Backfill CVE releases] m_cve_release_state is empty; skipped (--no-backfill). "
+                            "Run --backfill-cve-releases to fill it.")
+            else:
+                logger.info("[Backfill CVE releases] m_cve_release_state is empty: pre-evaluating release-CVE "
+                            "verdicts once (--no-backfill skips this).")
+                backfills.backfill_cve_releases(db, str(repo_path or MF.repo_dir), repo_id)
         if not relations_state.startswith(BACKFILL_DONE):
             # Until the state row says done, the webapp keeps reading its own relation index (webapp/API.md 2.16)
             if getattr(args, "no_backfill", False):

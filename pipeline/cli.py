@@ -37,8 +37,8 @@ from pipeline.state import gp, logger
 
 
 
-def arg_handling() -> argparse.Namespace:
-    """Handle arguments passed with python."""
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for `main.py`."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-c", "--config",
@@ -324,13 +324,27 @@ def arg_handling() -> argparse.Namespace:
         "--cve",
         dest="cve",
         action="store_true",
-        help="Only ingest the CVE list (config cve.repo_dir) into m_cve / m_cve_commit, then exit",
+        help="Only ingest the CVE list (config cve.repo_dir) into m_cve / m_cve_commit and sync release-CVE verdicts, then exit",
     )
     parser.add_argument(
         "--cve-full",
         dest="cve_full",
         action="store_true",
-        help="Ingest the whole CVE list again instead of the records changed since the last ingestion",
+        help="Ingest the whole CVE list and re-evaluate all release-CVE verdicts instead of incremental updates",
+    )
+    parser.add_argument(
+        "--cve-pull",
+        dest="cve_pull",
+        action="store_true",
+        help="Run git pull --ff-only on the configured CVE clone before ingesting",
+    )
+    parser.add_argument(
+        "--cve-interval",
+        dest="cve_interval",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="With --cve: repeat incremental CVE refresh every SECONDS seconds until interrupted",
     )
     parser.add_argument(
         "--no-cve",
@@ -435,6 +449,12 @@ def arg_handling() -> argparse.Namespace:
         help="Backfill pre-computed merge-window pulls (m_release_pull) and subsystem health summaries (m_release_section_health) for release segments.",
     )
     parser.add_argument(
+        "--backfill-cve-releases",
+        dest="backfill_cve_releases",
+        action="store_true",
+        help="Pre-compute release-to-CVE verdicts (m_cve_release, m_cve_release_state) for release segments of the repository, then exit (core/API.md section 12).",
+    )
+    parser.add_argument(
         "--no-backfill",
         dest="no_backfill",
         action="store_true",
@@ -498,6 +518,12 @@ def arg_handling() -> argparse.Namespace:
         default=False,
         help="In worker role, exit when queue is empty instead of waiting for more versions from master",
     )
+    return parser
+
+
+def arg_handling() -> argparse.Namespace:
+    """Handle arguments passed with python."""
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.unit_test is None and (args.modules or args.changed or args.base or args.summary or args.no_live_db
                                    or args.timeout is not None or args.isolate):

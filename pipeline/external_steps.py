@@ -90,24 +90,80 @@ def processing_source_facts(version: str) -> int:
     return int(result["extracted"])
 
 
-def processing_cve_list(force: bool = False, kernel_repo: str | None = None, repo_id: int | None = None) -> dict[str, Any] | None:
+def processing_cve_list(
+    force: bool = False,
+    kernel_repo: str | None = None,
+    repo_id: int | None = None,
+    pull: bool = False,
+) -> dict[str, Any] | None:
     """Bring m_cve / m_cve_commit to the HEAD of the CVE list clone (config cve.repo_dir, parser/cve/cve_ingest.py),
-    then resolve its abbreviated commit hashes in the kernel repository (m_cve_commit_hash) when one is given.
-    Nothing is read when the HEAD is the one already ingested. Returns the ingestion summary (None: no clone)."""
-    from parser.cve import cve_ingest
+    resolve abbreviated commit hashes in the kernel repository (m_cve_commit_hash), and incrementally sync
+    pre-evaluated release verdicts (m_cve_release / m_cve_release_state). Returns the ingestion summary (None: no clone)."""
+    from parser.cve import cve_ingest, cve_releases
     repo = cve_ingest.repo_dir()
     if repo is None:
         return None
     try:
+        if pull:
+            pull_res = cve_ingest.pull_repo(repo)
+            if pull_res.get("error"):
+                logger.warning(COLOR.yellow(f"[CVE] git pull failed for {repo}: {pull_res['error']}"))
+            elif pull_res.get("before") != pull_res.get("after"):
+                logger.info(
+                    f"[CVE] Pulled {repo}: {str(pull_res.get('before') or '')[:12]} -> {str(pull_res.get('after') or '')[:12]}"
+                )
         with G.DB() as db:
             if db is None:
                 return None
             summary = cve_ingest.ingest(db, repo, force=force)
             if kernel_repo and repo_id and summary.get("state") != "missing":
+                before_unresolved = set(cve_releases.unresolved_prefixes(db, repo_id))
                 summary["prefixes"] = cve_ingest.resolve_commit_prefixes(db, kernel_repo, repo_id)
+                extra_cves: list[str] = []
+                if summary["prefixes"].get("resolved", 0) > 0:
+                    after_unresolved = set(cve_releases.unresolved_prefixes(db, repo_id))
+                    extra_cves = cve_releases.cve_ids_for_prefixes(db, before_unresolved - after_unresolved)
+                summary["releases"] = cve_releases.sync(
+                    db,
+                    repo_id,
+                    kernel_repo=Path(kernel_repo),
+                    cve_repo=repo,
+                    prev_head=summary.get("prev_head"),
+                    changed_ids=summary.get("changed_ids"),
+                    extra_cve_ids=extra_cves,
+                    force=force,
+                )
             return summary
     except Exception as exc:  # noqa: BLE001 - the CVE list never blocks parsing
         logger.warning(COLOR.yellow(f"[CVE] Ingesting {repo} failed: {exc}"))
+        return {"state": "error", "error": str(exc)}
+
+
+def processing_cve_releases(
+    repo_path: str,
+    repo_id: int,
+    force: bool = False,
+    from_tag: str | None = None,
+) -> dict[str, Any] | None:
+    """Sync pre-evaluated release-to-CVE verdicts (m_cve_release / m_cve_release_state) for `repo_id`."""
+    if not feature_enabled("cve"):
+        logger.debug("[CVE Releases] Skipped: 'cve' feature is disabled.")
+        return None
+    from parser.cve import cve_ingest, cve_releases
+    try:
+        with G.DB() as db:
+            if db is None:
+                return None
+            return cve_releases.sync(
+                db,
+                repo_id,
+                kernel_repo=Path(repo_path),
+                cve_repo=cve_ingest.repo_dir(),
+                force=force,
+                from_tag=from_tag,
+            )
+    except Exception as exc:  # noqa: BLE001 - CVE release sync never blocks parsing
+        logger.warning(COLOR.yellow(f"[CVE Releases] Syncing release CVEs for {repo_path} failed: {exc}"))
         return {"state": "error", "error": str(exc)}
 
 

@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 68 core relational database tables used across the parser
+This module defines the 70 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
@@ -75,8 +75,10 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_cve_source (name, layout, head, format, records, built_at)   -- the CVE list ingested
      └── m_cve (cve_id, kind, published, updated, score, kev, record_path, title, data)
            ├── m_cve_commit (commit_hash, role, cve_id)
-           └── m_cve_file (cve_id, file_path)                     -- affected kernel source and header files
+           ├── m_cve_file (cve_id, file_path)                     -- affected kernel source and header files
+           └── m_cve_release (segment_id, cve_id, state, basis, fixed_here)  -- pre-evaluated release verdicts
    m_cve_commit_hash (repo_id, prefix, commit_hash)               -- abbreviated CVE hashes resolved
+   m_cve_release_state (segment_id, repo_id, tag_hash, cve_head, cve_layout, cve_format, rel_format, built_at)  -- last CVE head per segment
    m_release_segment (segment_id, repo_id, tag, tag_hash, chain, base_tag, base_hash, commits, merges,
                       diff_base_tag, files_changed, lines_added, lines_removed, format)  -- release ranges
      ├── m_release_person (segment_id, person_id, role_type, commits)     -- contributors per range
@@ -1900,6 +1902,65 @@ m_release_section_health = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 68. m_cve_release_state (table_id=68): Pre-Evaluated Release CVE Sync State
+#     Tracks the last CVE list HEAD (cve_head), layout, and formats evaluated for each release segment
+#     (parser/cve/cve_releases.py), allowing incremental re-evaluation of only newly changed CVEs.
+# -----------------------------------------------------------------------------
+m_cve_release_state = Table(
+    table_id=68,
+    table_name="m_cve_release_state",
+    columns=(
+        ("segment_id", INT()),
+        ("repo_id", INT()),
+        ("tag_hash", BIN(20)),
+        ("cve_head", BIN(20)),
+        ("cve_layout", VARCHAR(16, bin_collation=True)),
+        ("cve_format", SMALLINT(unsigned=True)),
+        ("rel_format", SMALLINT(unsigned=True)),
+        ("built_at", BIGINT()),
+    ),
+    primary=("segment_id",),
+    foreign=(
+        ("segment_id", "m_release_segment", "segment_id"),
+        ("repo_id", "m_repository", "repo_id"),
+    ),
+    indexes=(("cve_rel_state_repo_idx", ("repo_id",)),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 69. m_cve_release (table_id=69): Pre-Evaluated Release-to-CVE Verdicts
+#     Pre-computed (segment_id, cve_id) -> (state, basis, fixed_here) verdicts for CVEs affecting,
+#     possibly affecting, or fixed in each release segment (read by Insights -> Security).
+# -----------------------------------------------------------------------------
+m_cve_release = Table(
+    table_id=69,
+    table_name="m_cve_release",
+    columns=(
+        ("segment_id", INT()),
+        ("cve_id", VARCHAR(24, bin_collation=True)),
+        ("state", TINYINT(unsigned=True)),
+        ("basis", TINYINT(unsigned=True)),
+        ("fixed_here", TINYINT(unsigned=True)),
+    ),
+    primary=("segment_id", "cve_id"),
+    foreign=(
+        ("segment_id", "m_release_segment", "segment_id"),
+        ("cve_id", "m_cve", "cve_id"),
+    ),
+    indexes=(("cve_release_cve_idx", ("cve_id",)),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -1971,19 +2032,21 @@ TABLES: tuple[Table, ...] = (
     m_cve_file,            # 65
     m_release_pull,        # 66
     m_release_section_health, # 67
+    m_cve_release_state,   # 68
+    m_cve_release,         # 69
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 68 schema tables.
+    """Initialize and populate gp.Table_Array with all 70 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 68 Table schema objects.
+        Immutable tuple of all 70 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

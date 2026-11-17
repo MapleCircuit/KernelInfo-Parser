@@ -508,6 +508,49 @@ class TestCveCatalogAndEndpoints(unittest.TestCase):
         self.assertEqual(by_id["CVE-2024-0002"]["cwes"], ["CWE-416"])
         self.assertNotIn("CVE-2025-0001", by_id)
 
+    def test_report_uses_preparsed_db_and_falls_back_when_stale(self) -> None:
+        tag_sha = "1" * 40
+        self.db.insert_rows("m_git_network", ["network_id", "project_id", "name", "root_commit_hash"],
+                            [(1, 1, "linux", bytes.fromhex("0" * 40))])
+        self.db.insert_rows("m_repository", ["repo_id", "network_id", "name", "git_url", "default_branch"],
+                            [(1, 1, "linux", "", "master")])
+        self.db.insert_rows(
+            "m_release_segment",
+            ["segment_id", "repo_id", "tag", "tag_hash", "chain", "base_tag", "base_hash", "commits", "merges",
+             "diff_base_tag", "files_changed", "lines_added", "lines_removed", "format"],
+            [(10, 1, "v6.6", bytes.fromhex(tag_sha), 1, "v6.5", bytes.fromhex("2" * 40), 1, 0, "v6.5", 0, 0, 0, 2)],
+        )
+        self.db.insert_rows(
+            "m_cve_release_state",
+            ["segment_id", "repo_id", "tag_hash", "cve_head", "cve_layout", "cve_format", "rel_format", "built_at"],
+            [(10, 1, bytes.fromhex(tag_sha), bytes.fromhex("e" * 40), "cvelist", cs.RECORD_FORMAT, cs.CVE_RELEASE_FORMAT, 1700000001)],
+        )
+        self.db.insert_rows(
+            "m_cve_release",
+            ["segment_id", "cve_id", "state", "basis", "fixed_here"],
+            [(10, "CVE-2024-0002", 1, 1, 0)],
+        )
+        with patch("webapp.backend.database.helpers.get_active_repo_id", return_value=1), \
+                patch.object(cs.rs, "tag_commits", return_value={"v6.6": tag_sha}), \
+                patch.object(cs.rs, "ensure_release_index", side_effect=AssertionError("should not build release_index")):
+            # Cold _MEM path (joins m_cve)
+            cs._MEM.update(built_at=None, head=None, records={})
+            res_cold = cs.report("v6.6")
+            self.assertEqual(res_cold["state"], "done")
+            self.assertEqual(res_cold["result"]["source"], "database")
+            self.assertEqual([c["id"] for c in res_cold["result"]["cves"]], ["CVE-2024-0002"])
+            self.assertEqual(res_cold["result"]["counts"], {"affected": 1, "possibly": 0, "fixed": 0, "fixed_here": 0})
+            self.assertEqual(res_cold["result"]["kinds"], {"cna": 2, "commit": 1, "text": 1})
+
+            # Warm _MEM path
+            cs.records()
+            res_warm = cs.report("v6.6")
+            self.assertEqual(res_warm, res_cold)
+
+            # Stale cve_head falls back to release_report / ensure_release_index
+            self.db.update_rows("m_cve_release_state", {"cve_head": bytes.fromhex("a" * 40)}, {"segment_id": 10})
+            self.assertIsNone(cs.db_release_report("v6.6"))
+
 
 if __name__ == "__main__":
     unittest.main()

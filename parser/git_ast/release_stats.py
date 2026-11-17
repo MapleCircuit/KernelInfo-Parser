@@ -309,6 +309,9 @@ def write_segment(db: Any, repo_id: int, rng: dict[str, Any], result: dict[str, 
     in-memory m_person_first_release) is updated for a mainline segment, None skips that."""
     if old_id is not None:
         with contextlib.suppress(Exception):
+            db.delete_rows("m_cve_release", {"segment_id": old_id})
+            db.delete_rows("m_cve_release_state", {"segment_id": old_id})
+        with contextlib.suppress(Exception):
             db.delete_rows("m_release_pull", {"segment_id": old_id})
             db.delete_rows("m_release_section_health", {"segment_id": old_id})
         for table in ("m_commit_release", "m_release_person", "m_person_first_release", "m_release_segment"):

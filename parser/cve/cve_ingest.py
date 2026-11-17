@@ -84,6 +84,25 @@ def head_of(repo: Path) -> str | None:
     return out if _FULL.match(out) else None
 
 
+def pull_repo(repo: Path, timeout: float = 300.0) -> dict[str, Any]:
+    """Fast-forward update `repo` (`git pull --ff-only`); returns `{pulled, before, after, error}`."""
+    before = head_of(repo)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "pull", "--ff-only"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"pulled": False, "before": before, "after": before, "error": str(exc)}
+    after = head_of(repo)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return {"pulled": False, "before": before, "after": after, "error": err}
+    return {"pulled": True, "before": before, "after": after, "error": None}
+
+
 def detect_layout(repo: Path, head: str) -> str | None:
     """"cvelist" (cves/) or "vulns" (cve/published/) from the top of the clone's tree."""
     names = set((_git(repo, ["ls-tree", "--name-only", head], timeout=30) or b"").decode("utf-8", "replace").split("\n"))
@@ -258,9 +277,11 @@ def _ids_of(paths: Iterable[str]) -> list[str]:
 
 
 def _delete_ids(db: Any, ids: list[str]) -> None:
+    has_rel = not hasattr(db, "table_exists") or db.table_exists("m_cve_release")
+    tables = ("m_cve_release", "m_cve_file", "m_cve_commit", "m_cve") if has_rel else ("m_cve_file", "m_cve_commit", "m_cve")
     for i in range(0, len(ids), _BATCH):
         part = ids[i:i + _BATCH]
-        for table in ("m_cve_file", "m_cve_commit", "m_cve"):
+        for table in tables:
             db.delete_rows(table, {"cve_id": part})
 
 
@@ -315,8 +336,9 @@ def write(db: Any, plan: dict[str, Any]) -> int:
     """Apply a `prepare()` plan in one transaction; returns the records the database then holds."""
     with db.transaction():
         if plan["state"] == "full":
-            for table in ("m_cve_file", "m_cve_commit_hash", "m_cve_commit", "m_cve", "m_cve_source"):
-                db.delete_rows(table, None, all_rows=True)
+            for table in ("m_cve_release_state", "m_cve_release", "m_cve_file", "m_cve_commit_hash", "m_cve_commit", "m_cve", "m_cve_source"):
+                if not hasattr(db, "table_exists") or db.table_exists(table):
+                    db.delete_rows(table, None, all_rows=True)
         else:
             # A changed record is replaced; one no longer about the kernel (or deleted) goes away
             _delete_ids(db, _ids_of(plan["paths"]))
@@ -376,6 +398,9 @@ def ingest(db: Any, repo: Path | None = None, force: bool = False, progress: Cal
     summary = {"state": plan["state"], "head": plan["head"], "layout": plan["layout"], "records": total,
                "changed": len(plan["records"]), "paths": len(plan["paths"]), "seconds": round(time.time() - started, 1),
                **plan["counts"]}
+    if plan["state"] == "incremental":
+        summary["prev_head"] = prev["head"] if prev else None
+        summary["changed_ids"] = _ids_of(plan["paths"])
     logger.info(
         f"[CVE] {plan['name']} at {plan['head'][:12]} ({plan['state']}): {len(plan['records'])} kernel record(s) written "
         f"from {len(plan['paths'])} path(s), {total} in the database, {summary['seconds']}s."
