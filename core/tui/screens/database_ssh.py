@@ -281,9 +281,63 @@ class DatabaseSSHScreen(BaseScreen):
             self.btn_cancel,
         ]
 
+        self._sync_engine_layout()
         self.focus_widget(0)
         self._initial_snapshot = self._get_form_snapshot()
         self.last_test_results: Optional[tuple[DiagnosticResult, Optional[DiagnosticResult]]] = None
+
+    def _is_sqlite(self) -> bool:
+        """Return True when the selected database engine is SQLite."""
+        return self.engine.get_selected() == "sqlite"
+
+    def _sync_engine_layout(self) -> None:
+        """Show/hide engine-specific fields, update widget positions, and rebuild focus order."""
+        focused = self.get_focused_widget()
+        if self._is_sqlite():
+            self.database.y = 3
+            ssh_y = 6
+            db_widgets = [self.engine, self.database]
+        else:
+            self.host.y = 3
+            self.port.y = 4
+            self.user.y = 5
+            self.password.y = 6
+            self.database.y = 7
+            self.unix_socket.y = 8
+            ssh_y = 10
+            db_widgets = [
+                self.engine,
+                self.host,
+                self.port,
+                self.user,
+                self.password,
+                self.database,
+                self.unix_socket,
+            ]
+
+        ssh_widgets = [
+            self.ssh_enabled,
+            self.ssh_host,
+            self.ssh_port,
+            self.ssh_user,
+            self.ssh_key_file,
+            self.ssh_password,
+            self.ssh_remote_host,
+            self.ssh_remote_port,
+            self.ssh_local_port,
+        ]
+        for offset, widget in enumerate(ssh_widgets):
+            widget.y = ssh_y + offset
+
+        btn_y = ssh_y + len(ssh_widgets) + 1
+        for btn in (self.btn_save, self.btn_test, self.btn_cancel):
+            btn.y = btn_y
+
+        self.widgets = db_widgets + ssh_widgets + [self.btn_save, self.btn_test, self.btn_cancel]
+        if focused in self.widgets:
+            self.focus_widget(self.widgets.index(focused))
+        elif self.widgets:
+            self.focus_widget(0)
 
     def _get_form_snapshot(self) -> dict[str, Any]:
         """Capture raw values of all form widgets for change detection."""
@@ -361,6 +415,8 @@ class DatabaseSSHScreen(BaseScreen):
 
     def port_mismatch_message(self, db_cfg: dict[str, Any]) -> Optional[str]:
         """Describe an enabled SSH tunnel whose Local Port differs from the database Port, else None."""
+        if db_cfg.get("engine") == "sqlite":
+            return None
         ssh_cfg = db_cfg.get("ssh_tunnel") or {}
         if not ssh_cfg.get("enabled", False):
             return None
@@ -380,12 +436,14 @@ class DatabaseSSHScreen(BaseScreen):
     def invalid_port_fields(self) -> list[str]:
         """Describe each port input that is not a whole number in range (Local Port allows 0 = auto)."""
         errors: list[str] = []
-        fields = (
-            ("Port", self.port, 1),
+        fields: list[tuple[str, TextInput, int]] = []
+        if not self._is_sqlite():
+            fields.append(("Port", self.port, 1))
+        fields.extend([
             ("SSH Port", self.ssh_port, 1),
             ("DB Port @SSH", self.ssh_remote_port, 1),
             ("Local Port", self.ssh_local_port, 0),
-        )
+        ])
         for label, widget, low in fields:
             raw = widget.get_value().strip()
             try:
@@ -567,12 +625,15 @@ class DatabaseSSHScreen(BaseScreen):
         # 7. Pass remaining keys to focused widget (Button, Checkbox, SelectList)
         if focused is not None and hasattr(focused, "handle_key"):
             if focused.handle_key(ch):
+                if focused is self.engine:
+                    self._sync_engine_layout()
                 return True
 
         return False
 
     def draw(self) -> None:
         """Render the complete screen layout, headers, widgets, and status bar."""
+        self._sync_engine_layout()
         max_y, max_x = self.get_maxyx()
         self.clear()
 
@@ -589,7 +650,7 @@ class DatabaseSSHScreen(BaseScreen):
         # Section 2 Header
         sec2_hdr = "── SSH Tunnel (Feature \"database\") "
         sec2_hdr_full = sec2_hdr + "─" * max(0, max_x - len(sec2_hdr) - 4)
-        safe_addstr(self.stdscr, 9, 2, sec2_hdr_full[: max_x - 4], get_color(PAIR_BORDER) | curses.A_BOLD)
+        safe_addstr(self.stdscr, self.ssh_enabled.y - 1, 2, sec2_hdr_full[: max_x - 4], get_color(PAIR_BORDER) | curses.A_BOLD)
 
         # Draw all interactive widgets
         for widget in self.widgets:
@@ -597,10 +658,12 @@ class DatabaseSSHScreen(BaseScreen):
                 widget.draw(self.stdscr)
 
         # The forward destination is resolved by the SSH server, not by this machine
-        hints = (
+        hints: list[tuple[Any, str]] = [
             (self.ssh_remote_host, "where the SSH server reaches the DB (127.0.0.1 = DB on SSH host)"),
             (self.ssh_local_port, "127.0.0.1 port on this machine; keep equal to the DB Port above"),
-        )
+        ]
+        if self._is_sqlite():
+            hints.append((self.database, "path to the SQLite DB file (e.g. /path/to/db.sqlite)"))
         for widget, text in hints:
             hint_x = widget.x + len(widget._get_label_str()) + widget.width + 1
             if widget.y < max_y - 1 and max_x - hint_x > 20:

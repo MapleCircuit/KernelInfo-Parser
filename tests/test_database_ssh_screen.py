@@ -463,6 +463,47 @@ class TestDatabaseSSHScreen(unittest.TestCase):
         self.assertTrue(any("Save" in t for t in rendered_texts))
         self.assertTrue(any("Test Connection" in t for t in rendered_texts))
         self.assertTrue(any("Cancel" in t for t in rendered_texts))
+        self.assertFalse(any("SQLite DB file" in t for t in rendered_texts))
+
+    def test_draw_sqlite_database_path_hint(self) -> None:
+        """Selecting sqlite shows the path hint and hides MariaDB-only connection fields."""
+        screen = DatabaseSSHScreen(self.win, self.app)
+        sqlite_idx = screen.engine.options.index("sqlite")
+        screen.engine.set_selected(sqlite_idx)
+        screen.draw()
+
+        rendered_texts = [c[1][2] for c in self.win.calls if c[0] == "addstr"]
+        self.assertTrue(any("path to the SQLite DB file" in t for t in rendered_texts))
+        for hidden_label in ("Host", "Port", "User", "Password", "Unix Socket"):
+            self.assertFalse(
+                any(t.startswith(hidden_label) for t in rendered_texts),
+                f"Unexpected {hidden_label} field rendered for sqlite",
+            )
+        for hidden_widget in (screen.host, screen.port, screen.user, screen.password, screen.unix_socket):
+            self.assertNotIn(hidden_widget, screen.widgets)
+
+        # Tab from Engine goes directly to Database when sqlite is selected
+        screen.focus_widget(0)
+        screen.handle_key(9)
+        self.assertIs(screen.get_focused_widget(), screen.database)
+
+        # Switching back to mariadb restores the hidden fields
+        mariadb_idx = screen.engine.options.index("mariadb")
+        screen.engine.set_selected(mariadb_idx)
+        screen.draw()
+        for restored_widget in (screen.host, screen.port, screen.user, screen.password, screen.unix_socket):
+            self.assertIn(restored_widget, screen.widgets)
+
+    def test_save_sqlite_ignores_hidden_db_port(self) -> None:
+        """Saving with sqlite selected skips hidden DB Port validation and mismatch checks."""
+        screen = DatabaseSSHScreen(self.win, self.app)
+        screen.engine.set_selected(screen.engine.options.index("sqlite"))
+        screen.port.set_value("invalid")
+        screen.ssh_local_port.set_value("3308")
+        with patch("core.tui.widgets.ModalDialog.show_dialog") as dlg:
+            saved = screen.save()
+        self.assertTrue(saved)
+        dlg.assert_not_called()
 
 
 if __name__ == "__main__":
