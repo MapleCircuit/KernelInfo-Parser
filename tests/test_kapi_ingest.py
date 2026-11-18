@@ -1,11 +1,13 @@
 """tests/test_kapi_ingest.py - Tests for KAPI catalog builders, ingest, ReadIntents, and gating."""
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import DBLayout as D
 from core import backfills
@@ -281,6 +283,19 @@ class TestKapiIngestAndReadIntents(unittest.TestCase):
             self.assertEqual(counts[0]["commits"], 5)
             firsts = reader.person_first_releases(1, [1])
             self.assertEqual(firsts[0]["segment_id"], 1)
+
+    def test_processing_kapi_wrapper(self) -> None:
+        from pipeline import external_steps
+
+        with (
+            mock.patch.object(external_steps, "feature_enabled", return_value=True),
+            mock.patch.object(external_steps.G, "DB", side_effect=lambda: contextlib.nullcontext(self.db)),
+        ):
+            res = external_steps.processing_kapi(str(self.repo), 1, "v6.1", commit_id=10)
+        self.assertIsInstance(res, dict)
+        self.assertEqual(res.get("status"), "built")
+        with self.db.reader() as reader:
+            self.assertIsNotNone(reader.kapi_release_summary(10, arch="x86_64"))
 
 
 if __name__ == "__main__":
