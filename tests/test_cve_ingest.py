@@ -299,3 +299,55 @@ class TestCommitPrefixes(unittest.TestCase):
         from core.DBLayout import TABLES
         marks = {t.table_name: 10 for t, _ in I.marked_tables(TABLES)}
         self.assertNotIn("m_cve_commit_hash", {d.table for d in I.rollback_plan(TABLES, marks, 10, [3])})
+
+    def test_cat_file_drains_non_blob_objects_without_desync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True, env=TestIngest.env)
+            sub = repo / "cves" / "2024" / "0xxx"
+            sub.mkdir(parents=True)
+            payload = b'{"ok": true}\n'
+            (sub / "CVE-2024-0001.json").write_bytes(payload)
+            head = TestIngest.commit(self, tmp)
+
+            items = list(ci.cat_file(repo, head, ["cves/2024/0xxx", "cves/2024/0xxx/CVE-2024-0001.json", "missing.json"]))
+            self.assertEqual(
+                items,
+                [
+                    ("cves/2024/0xxx", None),
+                    ("cves/2024/0xxx/CVE-2024-0001.json", payload),
+                    ("missing.json", None),
+                ],
+            )
+
+    def test_candidate_paths_failure_does_not_wipe_database(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True, env=TestIngest.env)
+            d = repo / "cves" / "2024" / "0xxx"
+            d.mkdir(parents=True)
+            (d / "CVE-2024-0001.json").write_text(json.dumps(cna_record("CVE-2024-0001")))
+            head = TestIngest.commit(self, tmp)
+
+            db = cve_db()
+            first = ci.ingest(db, repo)
+            self.assertEqual(first["records"], 1)
+
+            # git grep exit code 1 (no matches) returns [], while exit code 128 returns None -> prepare() yields "missing"
+            real_run = subprocess.run
+
+            def fake_run(cmd, *args, **kwargs):
+                if "grep" in cmd:
+                    return mock.Mock(returncode=128, stdout=b"")
+                return real_run(cmd, *args, **kwargs)
+
+            with mock.patch("parser.cve.cve_ingest.subprocess.run", return_value=mock.Mock(returncode=1, stdout=b"")):
+                self.assertEqual(ci.candidate_paths(repo, head, "cvelist"), [])
+            with mock.patch("parser.cve.cve_ingest.subprocess.run", side_effect=fake_run):
+                self.assertIsNone(ci.candidate_paths(repo, head, "cvelist"))
+                plan = ci.prepare(repo, None)
+                self.assertEqual(plan["state"], "missing")
+                res = ci.ingest(db, repo, force=True)
+                self.assertEqual(res["state"], "missing")
+            self.assertEqual(ids(db), ["CVE-2024-0001"])

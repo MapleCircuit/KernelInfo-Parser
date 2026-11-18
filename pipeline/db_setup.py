@@ -13,6 +13,7 @@ from core.DBLayout import (
     m_commit_email,
     m_file_reference,
     m_db_instance,
+    m_cve_release,
 )
 from pipeline.state import logger
 
@@ -158,6 +159,14 @@ def drop_outdated_derived_tables(db: Any) -> list[str]:
         db.drop_tables([table], if_exists=False)
         dropped.append(table)
         logger.info(f"Dropped {table} (older layout: {note}); it is recreated empty.")
+    if db.table_exists("m_cve_release") and db.index_exists("cve_release_cve_idx", m_cve_release):
+        db.drop_tables(["m_cve_release", "m_cve_release_state"], ignore_fk=True, if_exists=True)
+        for name in ("m_cve_release", "m_cve_release_state"):
+            if name not in dropped:
+                dropped.append(name)
+        logger.info(
+            "Dropped m_cve_release / m_cve_release_state (older layout: cve_release_cve_idx secondary index); recreated empty."
+        )
     return dropped
 
 

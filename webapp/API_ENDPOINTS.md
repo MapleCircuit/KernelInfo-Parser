@@ -2769,12 +2769,12 @@ window (`health_from_db()`: per-release section summaries read directly from `m_
 (`_aggregate_health()`), so they give identical rows. A job cached per (tag commit, window,
 release membership token, `HEALTH_FORMAT` 3); the `{sec_id}` form returns one section.
 
-#### `GET /api/insights/{version_name}/cves?state=affected|possibly|fixed`
+#### `GET /api/insights/{version_name}/cves?state=affected|possibly|fixed&cvss_op=…&cvss_score=…&offset=0&limit=50000`
 Linux kernel CVEs affecting a release, possibly affecting it, or fixed in it (H4, §4.11): `{release, head,
-source, layout, kinds, counts: {affected, possibly, fixed, fixed_here}, total, cves: [{id, title, state, basis, kind,
-published, fixes, fixed_here, score, severity, kev, cwes}]}` (`fixed_here`: a fix first released in this release —
-its -rc cycle, or this stable update); `{configured, ingested: false, cves: []}` before the parser ingested a
-CVE list. **Database** (`db_release_report()`): when `m_cve_release_state` covers the tag's current
+source, layout, kinds, counts: {affected, possibly, fixed, fixed_here}, total, cvss_filter?, cves: [{id, title, state, basis, kind,
+published, fixes, fixed_here, introduced_release, score, severity, kev, cwes}]}` (`fixed_here`: a fix or stable backport first released in this release —
+its -rc cycle, or this stable update; `introduced_release`: earliest non-`-rc` final mainline release tag containing the introducing commit via `parser/cve/cve_releases.py` `earliest_final_release()`, or `null` when unversioned or `-rc`-only); `{configured, ingested: false, total: 0, cves: []}` before the parser ingested a
+CVE list. Optional `cvss_op` (`lt`, `gt`, `eq`, `ge`, or `<`, `>`, `=`, `>=`, `≥`) and `cvss_score` (clamped to `[0.0, 10.0]` at 1-decimal precision; `=` uses 1-decimal rounding with `< 0.05` epsilon; unscored/`null` CVEs are excluded across all operators) filter CVEs server-side and recompute `counts`, `total`, and `cvss_filter`. **Database** (`db_release_report()`): when `m_cve_release_state` covers the tag's current
 `m_release_segment` at `m_cve_source.head`, `RECORD_FORMAT`, and `CVE_RELEASE_FORMAT`, `report()` reads the
 pre-evaluated verdicts directly from `m_cve_release` (read only, `source: "database"`) without scanning all `m_cve`
 records or submitting a background job. **Fallback**: otherwise runs `release_report()` as a job cached per

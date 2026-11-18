@@ -35,13 +35,13 @@ agents.
   - 8.1. High-Level Architecture [L1407-L1450]
   - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1451-L1476]
   - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1477-L1656]
-- 9. CVE List Ingestion (`parser/cve/`) [L1657-L1707]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1708-L1769]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1770-L1904]
-  - 11.1. Architecture & Roles [L1776-L1831]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1832-L1872]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1873-L1904]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1905-L1946]
+- 9. CVE List Ingestion (`parser/cve/`) [L1657-L1711]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1712-L1773]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1774-L1908]
+  - 11.1. Architecture & Roles [L1780-L1835]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1836-L1876]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1877-L1908]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1909-L1950]
 <!-- toc:end -->
 
 ---
@@ -1695,15 +1695,19 @@ webapp only reads them (`webapp/API_ENDPOINTS.md` §4.11).
   (`CVE_RELEASE_FORMAT = 1`), storing matching `(segment_id, cve_id) -> (state, basis, fixed_here)` rows in
   `m_cve_release` and each segment's evaluated `cve_head` (plus `tag_hash`, `cve_layout`, `cve_format`,
   `rel_format`, and `max_segment_id`, the repository's highest `m_release_segment.segment_id` at evaluation) in
-  `m_cve_release_state` inside one transaction per segment. When `m_cve_source.head` advances
+  `m_cve_release_state` inside batched atomic transactions (executed concurrently across worker connections when
+  the database engine supports `CAP_CONCURRENT_CONNECTIONS`). When `m_cve_source.head` advances
   from `old_head` to `new_head`, `cve_releases.sync()` diffs `old_head..new_head` via `git diff --name-only`
   (plus any CVEs whose abbreviated commit prefixes were newly resolved, and, for a segment whose
-  `max_segment_id` lies below the current highest segment, the CVEs whose commits lie in the segments above it)
-  and incrementally updates only those CVEs per segment instead of re-evaluating the entire catalog. A segment
+  `max_segment_id` lies below the current highest segment, the CVEs whose commits or backports/`Fixes:` relations
+  lie in the segments above it) and incrementally updates only those CVEs across segments instead of re-evaluating
+  the entire catalog (advancing `max_segment_id` even when no CVEs are affected by the newer segments). A segment
   without a state is evaluated in full; it never triggers re-evaluation of segments whose verdicts already saw it,
   so an interrupted first build resumes with the remaining segments only. Progress is logged every 20 s
   (`[CVE Releases] full <done>/<total> (<tag>: <n> CVE verdict(s))`). An `m_cve_release_state` without
-  `max_segment_id` is dropped at start (`pipeline/db_setup.py` `_DERIVED_LAYOUT_MARKERS`) and rebuilt.
+  `max_segment_id` (`pipeline/db_setup.py` `_DERIVED_LAYOUT_MARKERS`) or an `m_cve_release` still carrying the
+  legacy `cve_release_cve_idx` secondary index (`drop_outdated_derived_tables()` and `cve_releases.sync()`) is
+  dropped and rebuilt without secondary indexes or foreign keys.
 
 ## 10. Release Statistics (`parser/git_ast/release_stats.py`)
 

@@ -53,6 +53,15 @@ class TestFrontendJs(unittest.TestCase):
             self.fail("JavaScript unit tests failed:\n" + "\n".join(failing) + "\n\n" + res.stdout[-6000:] + res.stderr[-2000:])
         self.assertRegex(res.stdout, r"# fail 0")
 
+    def test_security_insights_js_suite(self) -> None:
+        """Security Insights JS tests pass (sv-chips first-final-release, CVSS operators/clamping, null/RC edge cases)."""
+        suite = JS_TESTS / "security_insights.test.mjs"
+        self.assertTrue(suite.is_file(), f"Missing {suite}")
+        res = subprocess.run([self.node, "--test", "--test-timeout=60000", str(suite)], capture_output=True,
+                             text=True, timeout=120, cwd=str(ROOT))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertRegex(res.stdout, r"# fail 0")
+
     def test_bridge_reports_failures(self) -> None:
         """A failing assertion makes the bridge fail (the suite cannot pass vacuously)."""
         with tempfile.TemporaryDirectory() as tmp:

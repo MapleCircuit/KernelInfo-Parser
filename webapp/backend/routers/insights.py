@@ -123,16 +123,37 @@ def get_subsystem_health_one(version_name: str, sec_id: int, window: Annotated[i
 def get_release_cves(
     version_name: str,
     state: Annotated[str, Query(pattern="^(|affected|possibly|fixed)$")] = "",
+    cvss_op: Annotated[str, Query(description="CVSS comparison operator: lt, gt, eq, ge (<, >, =, >=, ≥)")] = "",
+    cvss_score: Annotated[float | None, Query(description="CVSS threshold (0.0-10.0, clamped)")] = None,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=50000)] = 50000,
 ) -> Any:
     """CVEs affecting a release, possibly affecting it, or fixed in it (H4). {configured: false} without a CVE clone."""
-    from webapp.backend.services.cve_service import report
+    from webapp.backend.services.cve_service import (
+        clamp_cvss_score,
+        filter_report_by_cvss,
+        normalize_cvss_op,
+        report,
+    )
     safe_rev(version_name)
+    norm_op = normalize_cvss_op(cvss_op)
+    norm_score = clamp_cvss_score(cvss_score)
 
     def shape(r: dict[str, Any]) -> dict[str, Any]:
-        rows = [c for c in r.get("cves", []) if not state or c["state"] == state]
-        return {**{k: v for k, v in r.items() if k != "cves"}, "configured": r.get("configured", True), "total": len(rows),
-                "cves": rows[offset:offset + limit]}
+        if r.get("ingested") is False:
+            return {**{k: v for k, v in r.items() if k != "cves"}, "configured": r.get("configured", True),
+                    "total": 0, "cves": []}
+        cvss_rows, counts, cvss_filter = filter_report_by_cvss(r.get("cves", []), norm_op, norm_score)
+        rows = [c for c in cvss_rows if not state or c["state"] == state]
+        out: dict[str, Any] = {
+            **{k: v for k, v in r.items() if k != "cves"},
+            "counts": counts,
+            "configured": r.get("configured", True),
+            "total": len(rows),
+            "cves": rows[offset:offset + limit],
+        }
+        if cvss_filter is not None:
+            out["cvss_filter"] = cvss_filter
+        return out
 
     return job_answer(report(version_name, wait=2.0), shape)

@@ -76,7 +76,7 @@ registerTabRoute("status", {
 });
 
 // ---------------------------------------------------------------- Kernel API and Insights tabs (§5.29, §5.30)
-const SECTION_KEYS = ["view", "query", "filter", "sel", "arch", "window", "listCollapsed"];
+const SECTION_KEYS = ["view", "query", "filter", "sel", "arch", "window", "listCollapsed", "cvssOp", "cvssScore"];
 for (const [type, title, badge] of [["api", "Kernel API", "[A]"], ["insights", "Insights", "[N]"]]) {
   registerTabRoute(type, {
     badge,

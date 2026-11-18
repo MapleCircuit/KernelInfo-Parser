@@ -1020,3 +1020,166 @@ F:\t*/
             self.assertEqual(r_ok.json()["tag"], "v1.1")
             r_bad = client.get("/api/insights/resolve?rev=deadbeefcafe")
             self.assertEqual(r_bad.status_code, 404)
+
+
+class TestSecurityInsights(unittest.TestCase):
+    def test_first_final_release_resolution_helpers(self) -> None:
+        from parser.cve.cve_releases import earliest_final_release, first_final_release
+
+        tags_with_final = {"v6.1-rc1", "v6.1-rc2", "v6.1", "v5.15"}
+        self.assertEqual(first_final_release({"mainline": "v6.1-rc2", "stable": None}, tags_with_final), "v6.1")
+        self.assertEqual(first_final_release({"mainline": "v6.1", "stable": None}, tags_with_final), "v6.1")
+        # -rc only (no final v6.1 tag yet) -> None
+        self.assertIsNone(first_final_release({"mainline": "v6.1-rc2", "stable": None}, {"v6.1-rc1", "v6.1-rc2"}))
+        # Stable-only, next-*, and unversioned -> None
+        self.assertIsNone(first_final_release({"mainline": None, "stable": "v6.1.3"}, tags_with_final))
+        self.assertIsNone(first_final_release({"mainline": "next-20260101", "stable": None}, tags_with_final | {"next-20260101"}))
+        self.assertIsNone(first_final_release(None, tags_with_final))
+        # Earliest across multiple introducing commits
+        self.assertEqual(
+            earliest_final_release(
+                [{"mainline": "v6.1-rc2", "stable": None}, {"mainline": "v5.15", "stable": None}, None],
+                tags_with_final,
+            ),
+            "v5.15",
+        )
+        self.assertIsNone(earliest_final_release([{"mainline": "v6.2-rc1", "stable": None}, None], tags_with_final))
+
+    def test_security_endpoint_introduced_release_and_cvss_filtering(self) -> None:
+        import json
+        from unittest import mock
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from webapp.backend.routers import insights as insights_router
+        from webapp.backend.services import cve_service as cs
+
+        app = FastAPI()
+        app.include_router(insights_router.router)
+        client = TestClient(app)
+
+        sample_report = {
+            "state": "done",
+            "result": {
+                "release": "v6.6",
+                "head": "a" * 40,
+                "layout": "vulns",
+                "kinds": {"cna": 4, "commit": 0, "text": 0},
+                "counts": {"affected": 2, "possibly": 1, "fixed": 2, "fixed_here": 1},
+                "source": "database",
+                "cves": [
+                    {"id": "CVE-2024-0005", "title": "Exact 7.5 float", "state": "affected", "basis": "record",
+                     "kind": "cna", "published": "2024-01-05", "fixes": [], "fixed_here": False,
+                     "introduced_release": "v6.1", "score": 7.499999999999999, "severity": "HIGH", "kev": None, "cwes": []},
+                    {"id": "CVE-2024-0004", "title": "Critical 9.8", "state": "fixed", "basis": "record",
+                     "kind": "cna", "published": "2024-01-04", "fixes": ["b" * 40], "fixed_here": True,
+                     "introduced_release": "v5.15", "score": 9.8, "severity": "CRITICAL", "kev": "2024-02-01", "cwes": []},
+                    {"id": "CVE-2024-0003", "title": "Exact 7.5", "state": "fixed", "basis": "record",
+                     "kind": "cna", "published": "2024-01-03", "fixes": ["c" * 40], "fixed_here": False,
+                     "introduced_release": "v6.1", "score": 7.5, "severity": "HIGH", "kev": None, "cwes": []},
+                    {"id": "CVE-2024-0002", "title": "Medium 5.2", "state": "possibly", "basis": "description",
+                     "kind": "cna", "published": "2024-01-02", "fixes": [], "fixed_here": False,
+                     "introduced_release": None, "score": 5.2, "severity": "MEDIUM", "kev": None, "cwes": []},
+                    {"id": "CVE-2024-0001", "title": "Unscored RC-only", "state": "affected", "basis": "record",
+                     "kind": "cna", "published": "2024-01-01", "fixes": [], "fixed_here": False,
+                     "introduced_release": None, "score": None, "severity": "", "kev": None, "cwes": []},
+                ],
+            },
+        }
+
+        with mock.patch("webapp.backend.config.repo_feature_enabled", return_value=True), \
+                mock.patch("webapp.backend.services.cve_service.report", return_value=sample_report):
+            # Unfiltered preserves all 5 CVEs including null CVSS and introduced_release
+            r_all = client.get("/api/insights/v6.6/cves")
+            self.assertEqual(r_all.status_code, 200)
+            body_all = r_all.json()
+            self.assertEqual(body_all["total"], 5)
+            self.assertEqual(body_all["cves"][0]["introduced_release"], "v6.1")
+            self.assertIsNone(body_all["cves"][-1]["introduced_release"])
+
+            # `< 7.5`: strictly excludes null CVSS (CVE-2024-0001) and 7.5/9.8
+            r_lt = client.get("/api/insights/v6.6/cves?cvss_op=lt&cvss_score=7.5")
+            self.assertEqual(r_lt.status_code, 200)
+            b_lt = r_lt.json()
+            self.assertEqual([c["id"] for c in b_lt["cves"]], ["CVE-2024-0002"])
+            self.assertEqual(b_lt["total"], 1)
+            self.assertEqual(b_lt["counts"], {"affected": 0, "possibly": 1, "fixed": 0, "fixed_here": 0})
+            self.assertEqual(b_lt["cvss_filter"], {"op": "lt", "score": 7.5})
+
+            # `> 7.5`: only 9.8
+            r_gt = client.get("/api/insights/v6.6/cves?cvss_op=gt&cvss_score=7.5")
+            self.assertEqual([c["id"] for c in r_gt.json()["cves"]], ["CVE-2024-0004"])
+            self.assertEqual(r_gt.json()["counts"], {"affected": 0, "possibly": 0, "fixed": 1, "fixed_here": 1})
+
+            # `= 7.5`: matches 7.5 and float 7.499999999999999 reliably
+            r_eq = client.get("/api/insights/v6.6/cves?cvss_op=eq&cvss_score=7.5")
+            self.assertEqual([c["id"] for c in r_eq.json()["cves"]], ["CVE-2024-0005", "CVE-2024-0003"])
+            self.assertEqual(r_eq.json()["counts"], {"affected": 1, "possibly": 0, "fixed": 1, "fixed_here": 0})
+
+            # `>= 7.5` (also testing symbol alias `≥`)
+            r_ge = client.get("/api/insights/v6.6/cves", params={"cvss_op": "≥", "cvss_score": "7.5"})
+            self.assertEqual([c["id"] for c in r_ge.json()["cves"]], ["CVE-2024-0005", "CVE-2024-0004", "CVE-2024-0003"])
+
+            # Out-of-range clamping on backend (-3.2 -> 0.0; 15.8 -> 10.0)
+            r_low_clamp = client.get("/api/insights/v6.6/cves?cvss_op=ge&cvss_score=-3.2")
+            self.assertEqual(r_low_clamp.status_code, 200)
+            self.assertEqual(r_low_clamp.json()["cvss_filter"], {"op": "ge", "score": 0.0})
+            self.assertEqual(r_low_clamp.json()["total"], 4)  # excludes null CVSS
+
+            r_high_clamp = client.get("/api/insights/v6.6/cves?cvss_op=lt&cvss_score=15.8")
+            self.assertEqual(r_high_clamp.status_code, 200)
+            self.assertEqual(r_high_clamp.json()["cvss_filter"], {"op": "lt", "score": 10.0})
+            self.assertEqual(r_high_clamp.json()["total"], 4)  # excludes null CVSS
+
+            # Invalid operator / non-finite score rejected cleanly
+            self.assertEqual(client.get("/api/insights/v6.6/cves?cvss_op=invalid").status_code, 400)
+            self.assertIn(client.get("/api/insights/v6.6/cves?cvss_score=nan").status_code, (400, 422))
+
+        # Uningested response stays clean with CVSS params
+        with mock.patch("webapp.backend.config.repo_feature_enabled", return_value=True), \
+                mock.patch("webapp.backend.services.cve_service.report",
+                           return_value={"state": "done", "result": {"configured": False, "ingested": False, "cves": []}}):
+            r_un = client.get("/api/insights/v6.6/cves?cvss_op=ge&cvss_score=7")
+            self.assertEqual(r_un.status_code, 200)
+            self.assertEqual(r_un.json(), {"configured": False, "ingested": False, "total": 0, "cves": []})
+
+    def test_release_report_introduced_release_rc_only_and_final(self) -> None:
+        from unittest import mock
+        from webapp.backend.services import cve_service as cs
+
+        c_rc = "1" * 40
+        c_rel = "2" * 40
+        recs = {
+            "CVE-2024-1001": {
+                "id": "CVE-2024-1001", "kind": "cna", "title": "Final tag intro",
+                "description": "", "published": "2024-01-01", "updated": "2024-01-01",
+                "ranges": [{"introduced": c_rel, "fixed": None, "files": []}],
+                "entries": [], "files": [], "references": [],
+                "cvss": {"score": 7.5, "severity": "HIGH"}, "kev": None, "cwes": [],
+            },
+            "CVE-2024-1002": {
+                "id": "CVE-2024-1002", "kind": "cna", "title": "RC-only intro",
+                "description": "", "published": "2024-01-02", "updated": "2024-01-02",
+                "ranges": [{"introduced": c_rc, "fixed": None, "files": []}],
+                "entries": [], "files": [], "references": [],
+                "cvss": None, "kev": None, "cwes": [],
+            },
+        }
+        tag_map = {"v6.1": "a" * 40, "v6.1-rc2": "b" * 40, "v6.2-rc1": "c" * 40}
+        lookup_map = {
+            c_rel: {"mainline": "v6.1-rc2", "stable": None},
+            c_rc: {"mainline": "v6.2-rc1", "stable": None},
+        }
+        with mock.patch.object(cs, "source", return_value={"name": "vulns", "layout": "vulns", "head": "f" * 40, "built_at": 1}), \
+                mock.patch.object(cs, "records", return_value=recs), \
+                mock.patch.object(cs.rs, "tag_commits", return_value=tag_map), \
+                mock.patch.object(cs.rs, "release_lookup", return_value=lookup_map), \
+                mock.patch.object(cs.rs, "release_token", return_value="tok"), \
+                mock.patch.object(cs.rs, "db_covers_all", return_value=False):
+            cs._PREFETCH_CACHE.clear()
+            rep = cs.release_report("v6.2-rc1")
+        by_id = {c["id"]: c for c in rep["cves"]}
+        # v6.1-rc2 resolves to final mainline v6.1
+        self.assertEqual(by_id["CVE-2024-1001"]["introduced_release"], "v6.1")
+        # v6.2-rc1 has no final v6.2 tag yet -> None
+        self.assertIsNone(by_id["CVE-2024-1002"]["introduced_release"])
+

@@ -71,12 +71,12 @@ def repo_dir(raw: str | None = None) -> Path | None:
     return path
 
 
-def _git(repo: Path, args: list[str], timeout: float = 60.0) -> bytes | None:
+def _git(repo: Path, args: list[str], timeout: float = 60.0, ok_codes: tuple[int, ...] = (0,)) -> bytes | None:
     try:
         out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout if out.returncode == 0 else None
+    return out.stdout if out.returncode in ok_codes else None
 
 
 def head_of(repo: Path) -> str | None:
@@ -113,16 +113,20 @@ def detect_layout(repo: Path, head: str) -> str | None:
     return None
 
 
-def candidate_paths(repo: Path, head: str, layout: str) -> list[str]:
-    """Record paths that may concern the kernel (every record of vulns.git)."""
+def candidate_paths(repo: Path, head: str, layout: str) -> list[str] | None:
+    """Record paths that may concern the kernel (every record of vulns.git), or None if Git failed."""
     root = LAYOUTS[layout]
     if layout == "vulns":
-        out = _git(repo, ["ls-tree", "-r", "-z", "--name-only", head, "--", root], timeout=300) or b""
+        out = _git(repo, ["ls-tree", "-r", "-z", "--name-only", head, "--", root], timeout=300)
+        if out is None:
+            return None
         return [p.decode("utf-8", "replace") for p in out.split(b"\0") if p.endswith(b".json") and b"/CVE-" in p]
     args = ["grep", "-l", "-z", "-i", "-F"]
     for marker in GREP_MARKERS:
         args += ["-e", marker]
-    out = _git(repo, [*args, head, "--", root], timeout=900) or b""
+    out = _git(repo, [*args, head, "--", root], timeout=900, ok_codes=(0, 1))
+    if out is None:
+        return None
     prefix = f"{head}:".encode()
     paths = []
     for p in out.split(b"\0"):
@@ -189,6 +193,11 @@ def cat_file(repo: Path, head: str, paths: list[str], progress: Callable | None 
                 yield path, None
                 continue
             header = line.split()
+            if len(header) >= 3 and header[1] in (b"tree", b"commit", b"tag"):
+                size = int(header[2])
+                proc.stdout.read(size + 1)
+                yield path, None
+                continue
             if len(header) < 3 or header[1] != b"blob":
                 yield path, None
                 continue
@@ -277,11 +286,27 @@ def _ids_of(paths: Iterable[str]) -> list[str]:
 
 
 def _delete_ids(db: Any, ids: list[str]) -> None:
+    if not ids:
+        return
     has_rel = not hasattr(db, "table_exists") or db.table_exists("m_cve_release")
-    tables = ("m_cve_release", "m_cve_file", "m_cve_commit", "m_cve") if has_rel else ("m_cve_file", "m_cve_commit", "m_cve")
+    if has_rel:
+        has_state = not hasattr(db, "table_exists") or db.table_exists("m_cve_release_state")
+        sids = (
+            [int(s) for s in db.select_values("m_cve_release_state", "segment_id") if s is not None]
+            if has_state
+            else []
+        )
+        if sids:
+            for i in range(0, len(ids), 200):
+                id_part = ids[i:i + 200]
+                for j in range(0, len(sids), 200):
+                    db.delete_rows("m_cve_release", {"segment_id": sids[j:j + 200], "cve_id": id_part})
+        elif db.row_exists("m_cve_release"):
+            for i in range(0, len(ids), _BATCH):
+                db.delete_rows("m_cve_release", {"cve_id": ids[i:i + _BATCH]})
     for i in range(0, len(ids), _BATCH):
         part = ids[i:i + _BATCH]
-        for table in tables:
+        for table in ("m_cve_file", "m_cve_commit", "m_cve"):
             db.delete_rows(table, {"cve_id": part})
 
 
@@ -328,6 +353,8 @@ def prepare(repo: Path, prev: dict[str, Any] | None, force: bool = False, progre
     mode = "incremental" if paths is not None else "full"
     if paths is None:
         paths = candidate_paths(repo, head, layout)
+    if paths is None:
+        return {"state": "missing"}
     records, counts = read_records(repo, head, layout, paths, progress)
     return {"state": mode, "head": head, "layout": layout, "name": name, "paths": paths, "records": records, "counts": counts}
 
@@ -353,7 +380,13 @@ def write(db: Any, plan: dict[str, Any]) -> int:
     return total
 
 
-def resolve_commit_prefixes(db: Any, kernel_repo: Path | str, repo_id: int) -> dict[str, int]:
+def resolve_commit_prefixes(
+    db: Any,
+    kernel_repo: Path | str,
+    repo_id: int,
+    *,
+    resolved_out: list[str] | None = None,
+) -> dict[str, int]:
     """Store in m_cve_commit_hash the commit each abbreviated m_cve_commit hash names in the kernel repository
     (`commit_relations.resolve_prefixes`), for the prefixes without a row yet; a prefix naming no commit or
     several gets none and is tried again next time. Returns {pending, resolved}."""
@@ -370,11 +403,14 @@ def resolve_commit_prefixes(db: Any, kernel_repo: Path | str, repo_id: int) -> d
     )
     pending = [r[0].decode() if isinstance(r[0], (bytes, bytearray)) else str(r[0]) for r in rows]
     found = resolve_prefixes(kernel_repo, pending) if pending else {}
-    rows_to_ins = [(repo_id, p, bytes.fromhex(found[p.lower()])) for p in pending if p.lower() in found]
+    resolved_prefixes = [p for p in pending if p.lower() in found]
+    rows_to_ins = [(repo_id, p, bytes.fromhex(found[p.lower()])) for p in resolved_prefixes]
     with db.transaction():
         for i in range(0, len(rows_to_ins), 2000):
             db.insert_rows("m_cve_commit_hash", ["repo_id", "prefix", "commit_hash"], rows_to_ins[i:i + 2000],
                            on_conflict="ignore")
+    if resolved_out is not None:
+        resolved_out.extend(resolved_prefixes)
     if pending:
         logger.info(f"[CVE] Resolved {len(rows_to_ins)} of {len(pending)} abbreviated commit hash(es) in {kernel_repo}.")
     return {"pending": len(pending), "resolved": len(rows_to_ins)}

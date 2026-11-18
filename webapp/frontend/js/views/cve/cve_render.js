@@ -30,7 +30,7 @@ export const KIND = {
   text: "another CNA's record about the kernel, linking no commit",
 };
 
-const release = (r) => (r?.released ? (r.first_release || r.first_tag || r.first_stable) : "not released");
+const release = (r) => (r?.released ? (r.first_release || r.first_tag || r.first_stable || "released") : "not released");
 const safeHttpUrl = (u) => {
   const s = String(u || "").trim();
   return /^https?:\/\//i.test(s) ? s : "";
@@ -84,7 +84,7 @@ export function renderCveDetailHtml(c, opts = {}) {
     <input type="text" class="cve-check-release-input" placeholder="Check release (e.g. v6.6.15)…" value="${escapeHtml(opts.checkedRelease || "")}" spellcheck="false" aria-label="Check release" />
     <button type="submit" class="cve-check-release-btn" data-check-release="${escapeHtml(c.id)}">Check release…</button>
   </form>` : ""}
-  ${cvss ? `<p>${severityTag(cvss.score, cvss.severity)} CVSS ${escapeHtml(cvss.version || "")} <code>${escapeHtml(cvss.vector || "")}</code>${cvss.source ? ` (${escapeHtml(cvss.source)})` : ""}</p>` : ""}
+  ${cvss && (cvss.score != null || cvss.vector || cvss.severity) ? `<p>${severityTag(cvss.score, cvss.severity)} CVSS ${escapeHtml(cvss.version || "")} <code>${escapeHtml(cvss.vector || "")}</code>${cvss.source ? ` (${escapeHtml(cvss.source)})` : ""}</p>` : ""}
   ${(c.cwes || []).length ? `<p><strong>Weakness:</strong> ${c.cwes.map((w) => `<span class="sv-tag info">${escapeHtml(w)}</span>`).join(" ")}</p>` : ""}
   ${c.kev ? `<p><span class="sv-tag bad">KEV</span> In CISA's Known Exploited Vulnerabilities catalog since ${escapeHtml(c.kev)}.</p>` : c.exploitation && c.exploitation !== "none" ? `<p>Exploitation: ${escapeHtml(c.exploitation)} (CISA SSVC).</p>` : ""}
   <pre>${escapeHtml(c.description || "")}</pre>

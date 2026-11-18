@@ -19,6 +19,7 @@ the commits their `Fixes:` tags name (commit relation index, section 2.16).
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -47,8 +48,10 @@ from parser.cve.cve_releases import (
     ID_TO_STATE,
     BaseReleaseContext,
     affects as _affects,
+    earliest_final_release,
     is_fixed_here,
 )
+from parser.git_ast.commit_relations import KIND_FIXES
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services import release_service as rs
@@ -57,9 +60,22 @@ from webapp.backend.services.jobs import jobs
 
 logger = logging.getLogger(__name__)
 
-REPORT_FORMAT = 4
+REPORT_FORMAT = 5
 SOURCE_TTL = 60.0
 _FULL = re.compile(r"^[0-9a-f]{40}$")
+_CVSS_OP_ALIASES = {
+    "<": "lt",
+    "lt": "lt",
+    ">": "gt",
+    "gt": "gt",
+    "=": "eq",
+    "==": "eq",
+    "eq": "eq",
+    ">=": "ge",
+    "≥": "ge",
+    "ge": "ge",
+}
+CVSS_OPS = frozenset({"lt", "gt", "eq", "ge"})
 
 _DISK = DiskCache("cve-index", max_bytes=256 << 20, max_entries=6)
 _PREFETCH_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
@@ -249,7 +265,7 @@ def for_commit(sha: str, upstream: Iterable[str] = ()) -> dict[str, list[str]]:
         return empty
 
     def keys(full: str) -> list[str]:
-        return [full] + [full[:n] for n in (12, 13, 14, 16)]  # references that abbreviate the commit
+        return [full] + [full[:n] for n in range(12, 40)]  # references that abbreviate the commit
 
     wanted = {k: full for full in [sha, *ups] for k in keys(full)}
     hits: dict[str, dict[int, list[str]]] = {}
@@ -269,7 +285,6 @@ def for_commit(sha: str, upstream: Iterable[str] = ()) -> dict[str, list[str]]:
         logger.debug("m_cve_commit unavailable: %s", exc)
         return empty
     own = hits.get(sha, {}).get(ROLE_FIX, [])
-    # Introducing commits are recorded in full (40 hex digits), so only the full SHA matches them
     intro = hits.get(sha, {}).get(ROLE_INTRODUCED, [])
     up = [c for u in ups for c in hits.get(u, {}).get(ROLE_FIX, []) if c not in own]
     return {"fixes": own, "introduced": intro, "fixes_upstream": list(dict.fromkeys(up))}
@@ -308,7 +323,8 @@ class Context(BaseReleaseContext):
         self.p = self.parse_tag(release)
         self.version = release[1:] if release.startswith("v") else release
         self.key = self.release_key(release)
-        self.base_key = self.release_key(rs.series_name(self.p["series"])) if self.p else None
+        is_stable = bool(self.p and self.p.get("kind") != "next" and self.p.get("stable"))
+        self.base_key = self.release_key(rs.series_name(self.p["series"])) if is_stable else None
         self._tags: dict[str, dict[str, Any] | None] = {}
         self._full: dict[str, str | None] = {}
         self._backports_complete: bool | None = None
@@ -380,13 +396,19 @@ class Context(BaseReleaseContext):
         """The releases whose commits contains() reads backports from: mainline tags up to the release and,
         for a stable release, its series' stable tags up to it."""
         out = []
+        if not self.p:
+            return out
+        is_next = self.p.get("kind") == "next"
         for t in rs.tag_commits():
             q = self.parse_tag(t)
-            if not q or not self.p:
+            if not q:
                 continue
-            if not q["stable"] and self.release_key(t) <= self.key:
+            if q.get("kind") == "next":
+                if is_next and self.release_key(t) <= self.key:
+                    out.append(t)
+            elif not q["stable"] and self.release_key(t) <= self.key:
                 out.append(t)
-            elif self.p["stable"] and q["stable"] and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]:
+            elif not is_next and self.p["stable"] and q["stable"] and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]:
                 out.append(t)
         return out
 
@@ -426,7 +448,76 @@ def affects(rec: dict[str, Any], release: str, ctx: Context | None = None) -> tu
     return _affects(rec, release, ctx or Context(release))
 
 
-def _format_report_row(rec: dict[str, Any], state: str, basis: str, fixed_here: bool) -> dict[str, Any]:
+def normalize_cvss_op(op: str | None) -> str:
+    """Normalize a CVSS comparison operator (`<`, `>`, `=`, `>=`, `≥`, `lt`, `gt`, `eq`, `ge`)."""
+    raw = str(op or "").strip().lower()
+    if not raw:
+        return ""
+    norm = _CVSS_OP_ALIASES.get(raw)
+    if norm is None:
+        raise HTTPException(status_code=400, detail=f"Invalid cvss_op: {op!r}; expected one of <, >, =, >=, ≥")
+    return norm
+
+
+def clamp_cvss_score(score: float | None) -> float | None:
+    """Validate and clamp a CVSS score threshold to `[0.0, 10.0]` (1-decimal precision)."""
+    if score is None:
+        return None
+    try:
+        val = float(score)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid cvss_score: {score!r}") from exc
+    if not math.isfinite(val):
+        raise HTTPException(status_code=400, detail="CVSS score must be a finite number")
+    return round(min(10.0, max(0.0, val)), 1)
+
+
+def matches_cvss(score: Any, op: str, threshold: float) -> bool:
+    """True when `score` satisfies `op` against clamped `threshold`; excludes unscored/null CVEs across all ops."""
+    if score is None or isinstance(score, bool) or not isinstance(score, (int, float)):
+        return False
+    val = float(score)
+    if not math.isfinite(val):
+        return False
+    t = round(min(10.0, max(0.0, float(threshold))), 1)
+    if op == "eq":
+        return abs(round(val, 1) - t) < 0.05
+    if op == "lt":
+        return round(val, 4) < t - 1e-9
+    if op == "gt":
+        return round(val, 4) > t + 1e-9
+    if op == "ge":
+        return round(val, 4) >= t - 1e-9
+    return False
+
+
+def filter_report_by_cvss(
+    rows: list[dict[str, Any]],
+    cvss_op: str = "",
+    cvss_score: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any] | None]:
+    """Filter release-report CVE rows by CVSS operator & threshold and recompute counts."""
+    op = normalize_cvss_op(cvss_op)
+    score = clamp_cvss_score(cvss_score)
+    if not op and score is None:
+        counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
+        counts["fixed_here"] = sum(1 for r in rows if r.get("fixed_here"))
+        return rows, counts, None
+    op = op or "ge"
+    score = 7.0 if score is None else score
+    filtered = [r for r in rows if matches_cvss(r.get("score"), op, score)]
+    counts = {k: sum(r["state"] == k for r in filtered) for k in ("affected", "possibly", "fixed")}
+    counts["fixed_here"] = sum(1 for r in filtered if r.get("fixed_here"))
+    return filtered, counts, {"op": op, "score": score}
+
+
+def _format_report_row(
+    rec: dict[str, Any],
+    state: str,
+    basis: str,
+    fixed_here: bool,
+    introduced_release: str | None = None,
+) -> dict[str, Any]:
     fixes = [r["fixed"] for r in (rec.get("ranges") or ()) if r.get("fixed")]
     cvss = rec.get("cvss") or {}
     return {
@@ -438,10 +529,99 @@ def _format_report_row(rec: dict[str, Any], state: str, basis: str, fixed_here: 
         "published": rec.get("published", ""),
         "fixes": fixes[:4],
         "fixed_here": fixed_here,
+        "introduced_release": introduced_release,
         "score": cvss.get("score"),
         "severity": cvss.get("severity") or "",
         "kev": rec.get("kev"),
         "cwes": rec.get("cwes") or [],
+    }
+
+
+def _db_introduced_releases(
+    reader: Any,
+    repo_id: int,
+    recs: list[dict[str, Any]],
+) -> dict[str, str | None]:
+    """Resolve earliest first final mainline release for each record's introducing commit(s) (read only)."""
+    rec_intros: dict[str, list[str]] = {}
+    commit_fixes: dict[str, list[str]] = {}
+    for rec in recs:
+        cid = rec["id"]
+        direct = [r["introduced"] for r in (rec.get("ranges") or ()) if r.get("introduced")]
+        if direct:
+            rec_intros[cid] = direct
+        elif rec.get("kind") == "commit":
+            fixes = [r["fixed"] for r in (rec.get("ranges") or ()) if r.get("fixed")]
+            if fixes:
+                commit_fixes[cid] = fixes
+    if not rec_intros and not commit_fixes:
+        return {}
+
+    raw_shas = [s for lst in rec_intros.values() for s in lst] + [s for lst in commit_fixes.values() for s in lst]
+    short_shas = sorted({s for s in raw_shas if not _FULL.match(s)})
+    prefix_map: dict[str, str] = {}
+    if short_shas:
+        for i in range(0, len(short_shas), 1000):
+            part = short_shas[i:i + 1000]
+            for r in reader.select_rows(
+                "m_cve_commit_hash", ["prefix", "commit_hash"], {"repo_id": repo_id, "prefix": part}
+            ):
+                prefix_map[_text(r["prefix"])] = bytes(r["commit_hash"]).hex()
+
+    if commit_fixes:
+        fix_fulls = sorted({s if _FULL.match(s) else prefix_map[s] for lst in commit_fixes.values() for s in lst if _FULL.match(s) or s in prefix_map})
+        fixes_targets: dict[str, list[str]] = {}
+        if fix_fulls:
+            try:
+                from webapp.backend.database.helpers import get_active_network_id
+                network_id = get_active_network_id(reader)
+                if network_id is not None:
+                    cid_by_sha: dict[str, int] = {}
+                    for i in range(0, len(fix_fulls), 1000):
+                        part = [bytes.fromhex(s) for s in fix_fulls[i:i + 1000]]
+                        for r in reader.select_rows(
+                            "m_commit", ["commit_id", "commit_hash"], {"network_id": network_id, "commit_hash": part}
+                        ):
+                            cid_by_sha[bytes(r["commit_hash"]).hex()] = int(r["commit_id"])
+                    if cid_by_sha:
+                        sha_by_cid = {v: k for k, v in cid_by_sha.items()}
+                        cids = sorted(sha_by_cid)
+                        for i in range(0, len(cids), 1000):
+                            for r in reader.select_rows(
+                                "m_commit_relation",
+                                ["commit_id", "target_hash"],
+                                {"commit_id": cids[i:i + 1000], "kind": KIND_FIXES},
+                                order_by=["idx"],
+                            ):
+                                fsha = sha_by_cid.get(int(r["commit_id"]))
+                                th = r.get("target_hash")
+                                if fsha and th:
+                                    fixes_targets.setdefault(fsha, []).append(bytes(th).hex())
+            except Exception as exc:  # noqa: BLE001 - optional enrichment on older schemas
+                logger.debug("Fixes: target lookup skipped: %s", exc)
+        for cid, lst in commit_fixes.items():
+            resolved = [
+                t for s in lst
+                if (full := (s if _FULL.match(s) else prefix_map.get(s)))
+                for t in fixes_targets.get(full, ())
+            ]
+            if resolved:
+                rec_intros[cid] = resolved
+
+    full_by_cid: dict[str, list[str]] = {}
+    all_full: set[str] = set()
+    for cid, lst in rec_intros.items():
+        fulls = [full for s in lst if (full := (s if _FULL.match(s) else prefix_map.get(s))) and _FULL.match(full)]
+        if fulls:
+            full_by_cid[cid] = fulls
+            all_full.update(fulls)
+    if not all_full:
+        return {}
+    tag_names = set(rs.tag_commits())
+    tags_by_sha = rs.release_lookup(sorted(all_full))
+    return {
+        cid: earliest_final_release((tags_by_sha.get(s) for s in fulls), tag_names)
+        for cid, fulls in full_by_cid.items()
     }
 
 
@@ -508,7 +688,7 @@ def db_release_report(release: str) -> dict[str, Any] | None:
                         else None
                     )
 
-            rows: list[dict[str, Any]] = []
+            matched: list[tuple[dict[str, Any], str, str, bool]] = []
             if mem_recs is not None:
                 db_rows = reader.select_rows(
                     "m_cve_release",
@@ -523,7 +703,7 @@ def db_release_report(release: str) -> dict[str, Any] | None:
                     if rec is None or state_str is None:
                         return None
                     basis_str = ID_TO_BASIS.get(int(r["basis"]), "")
-                    rows.append(_format_report_row(rec, state_str, basis_str, bool(int(r["fixed_here"]))))
+                    matched.append((rec, state_str, basis_str, bool(int(r["fixed_here"]))))
             else:
                 db_rows = reader.select_rows(
                     ("m_cve_release", "r"),
@@ -544,7 +724,12 @@ def db_release_report(release: str) -> dict[str, Any] | None:
                     if rec is None or state_str is None:
                         return None
                     basis_str = ID_TO_BASIS.get(int(r["basis"]), "")
-                    rows.append(_format_report_row(rec, state_str, basis_str, bool(int(r["fixed_here"]))))
+                    matched.append((rec, state_str, basis_str, bool(int(r["fixed_here"]))))
+            intro_releases = _db_introduced_releases(reader, repo_id, [rec for rec, *_ in matched])
+            rows = [
+                _format_report_row(rec, state_str, basis_str, fixed_here, intro_releases.get(rec["id"]))
+                for rec, state_str, basis_str, fixed_here in matched
+            ]
     except Exception as exc:  # noqa: BLE001 - older DB without m_cve_release* or read fallback
         logger.debug("db_release_report(%s) unavailable: %s", release, exc)
         return None
@@ -573,14 +758,35 @@ def release_report(release: str, progress: Callable | None = None) -> dict[str, 
     if progress:
         progress(0, len(recs), "looking up commits")
     ctx.prefetch(s for rec in recs for r in rec["ranges"] for s in (r.get("introduced"), r.get("fixed")))
-    rows = []
+    matched: list[tuple[dict[str, Any], str, str, bool]] = []
     for i, rec in enumerate(recs):
         if progress and i % 1000 == 0:
             progress(i, len(recs), "checking records")
         state, basis = affects(rec, release, ctx)
         if state not in ("affected", "fixed", "possibly"):
             continue
-        rows.append(_format_report_row(rec, state, basis, is_fixed_here(rec, state, ctx)))
+        matched.append((rec, state, basis, is_fixed_here(rec, state, ctx)))
+    rec_intros: dict[str, list[str]] = {}
+    for rec, *_ in matched:
+        direct = [r["introduced"] for r in (rec.get("ranges") or ()) if r.get("introduced")]
+        if direct:
+            rec_intros[rec["id"]] = direct
+        elif rec.get("kind") == "commit":
+            inferred = [s for r in (rec.get("ranges") or ()) if r.get("fixed") for s in ctx.fixes_tags(r["fixed"])]
+            if inferred:
+                rec_intros[rec["id"]] = inferred
+    ctx.prefetch(s for lst in rec_intros.values() for s in lst)
+    tag_names = set(rs.tag_commits())
+    rows = [
+        _format_report_row(
+            rec,
+            state,
+            basis,
+            fixed_here,
+            earliest_final_release((ctx.tags(s) for s in rec_intros.get(rec["id"], ())), tag_names),
+        )
+        for rec, state, basis, fixed_here in matched
+    ]
     rows.sort(key=lambda r: r["id"], reverse=True)
     counts = {k: sum(r["state"] == k for r in rows) for k in ("affected", "possibly", "fixed")}
     counts["fixed_here"] = sum(1 for r in rows if r["fixed_here"])
@@ -686,14 +892,29 @@ def cves_for_file(version: str, file_path: str) -> dict[str, Any]:
     from webapp.backend.database.helpers import safe_decode
     with get_reader() as reader:
         cve_ids = [safe_decode(r["cve_id"]) for r in reader.select_rows("m_cve_file", ["cve_id"], {"file_path": clean_path}) if r.get("cve_id")]
+    rel = version
+    if rel and not rs.parse_tag(rel):
+        try:
+            rel = rs.resolve_release_tag(rel).get("tag") or ""
+        except HTTPException:
+            rel = ""
     all_recs = records()
-    ctx = Context(version) if version else None
+    ctx = Context(rel) if rel and rs.parse_tag(rel) else None
+    if ctx is not None:
+        ctx.prefetch(
+            s
+            for cid in cve_ids
+            if (rec := all_recs.get(cid))
+            for r in (rec.get("ranges") or ())
+            for s in (r.get("introduced"), r.get("fixed"))
+            if s
+        )
     results = []
     for cid in cve_ids:
         rec = all_recs.get(cid)
         if not rec:
             continue
-        state, basis = affects(rec, version, ctx) if ctx else ("unknown", "")
+        state, basis = affects(rec, rel, ctx) if ctx else ("unknown", "")
         cvss = rec.get("cvss") or {}
         results.append({
             "cve_id": cid,

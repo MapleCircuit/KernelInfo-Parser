@@ -26,7 +26,7 @@ import { contextMenu } from "../../components/context_menu.js";
 import { VirtualList } from "../../components/virtual_list.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { progressFraction, progressLabel } from "../../utils/job_poll.js";
-import { chipCounts, filterRows, findRowBySel, formatChips, parseChips } from "./section_model.js";
+import { chipCounts, filterRows, findRowBySel, formatChips, parseChips, resolveChips } from "./section_model.js";
 import { releaseKey, isFinalRelease } from "./release_order.js";
 
 export class SectionedView {
@@ -126,7 +126,7 @@ export class SectionedView {
               <button type="button" class="code-btn sv-download" title="Download the filtered list">⬇</button>
               <button type="button" class="collapse-btn sv-collapse" title="Collapse the list" aria-label="Collapse the list">${COLLAPSE_ICON}</button>
             </div>
-            <div class="sv-chips"></div>
+            <div class="sv-chips-row"><div class="sv-chips"></div><div class="sv-filter-extra" hidden></div></div>
             <div class="sv-status" aria-live="polite"></div>
             <div class="sv-summary" hidden></div>
           </div>
@@ -177,6 +177,11 @@ export class SectionedView {
     });
     await this.setupPickers();
     if (rseq !== this.renderSeq || !this.containerEl?.isConnected) return;
+    const extraEl = containerEl.querySelector(".sv-filter-extra");
+    if (extraEl) {
+      extraEl.hidden = !sec.mountExtraChips;
+      if (sec.mountExtraChips) sec.mountExtraChips(extraEl, this);
+    }
     await this.prepareRender?.();
     if (rseq !== this.renderSeq || !this.containerEl?.isConnected) return;
     if (tabData.listCollapsed && tabData.sel && !sec.needsListForDetail) {
@@ -251,7 +256,7 @@ export class SectionedView {
 
   async switchSection(id) {
     this.abort?.abort();
-    this.persist({ view: id, sel: "", filter: "", title: `${this.title} · ${this.visibleSections().find((s) => s.id === id)?.label || id}` });
+    this.persist({ view: id, sel: "", filter: "", cvssOp: "", cvssScore: null, title: `${this.title} · ${this.visibleSections().find((s) => s.id === id)?.label || id}` });
     this.render(this.containerEl, this.tab);
   }
 
@@ -288,6 +293,11 @@ export class SectionedView {
     } catch (err) {
       if (err?.name === "AbortError" || seq !== this.listSeq) return;
       this.rows = [];
+      const summary = this.containerEl?.querySelector(".sv-summary");
+      if (summary) {
+        summary.hidden = true;
+        summary.innerHTML = "";
+      }
       this.applyFilter();
       this.setStatus(`Could not load: ${err.message}`);
       return;
@@ -307,11 +317,37 @@ export class SectionedView {
 
   applyFilter({ keepSelection = false } = {}) {
     const sec = this.section;
+    const chipsEl = this.containerEl.querySelector(".sv-chips");
+    const extraEl = this.containerEl.querySelector(".sv-filter-extra");
+    if (this.result && (this.result.configured === false || this.result.ingested === false)) {
+      this.filtered = [];
+      if (chipsEl) chipsEl.innerHTML = "";
+      if (extraEl) extraEl.hidden = true;
+      this.list.setRows([], { keepScroll: false, selectKey: null });
+      this.setStatus(this.result.note || (this.result.configured === false ? "not configured" : "not ingested"));
+      return;
+    }
+    const ctx = this.ctx();
     const chips = parseChips(this.tab.filter);
-    this.filtered = filterRows(sec, this.rows, this.tab.query, chips);
-    const counts = chipCounts(sec, this.rows);
-    this.containerEl.querySelector(".sv-chips").innerHTML = (sec.chips || []).map((c) =>
-      `<button type="button" class="sv-chip${chips.has(c.id) ? " active" : ""}" data-chip="${escapeHtml(c.id)}" aria-pressed="${chips.has(c.id)}" title="${escapeHtml(c.title || "")}">${escapeHtml(c.label)}${counts[c.id] != null ? ` <span>${counts[c.id]}</span>` : ""}</button>`).join("");
+    const allChips = resolveChips(sec, this.rows, ctx);
+    this.filtered = filterRows(sec, this.rows, this.tab.query, chips, ctx);
+    const counts = chipCounts(sec, this.rows, ctx);
+    if (chipsEl) {
+      chipsEl.innerHTML = allChips.filter((c) => !c.hidden).map((c) =>
+        `<button type="button" class="sv-chip${chips.has(c.id) ? " active" : ""}" data-chip="${escapeHtml(c.id)}" aria-pressed="${chips.has(c.id)}" title="${escapeHtml(c.title || "")}">${escapeHtml(c.label)}${counts[c.id] != null ? ` <span>${counts[c.id]}</span>` : ""}</button>`).join("");
+    }
+    if (extraEl) {
+      extraEl.hidden = !sec.mountExtraChips;
+      sec.updateExtraChips?.(extraEl, this, ctx);
+    }
+    if (!this.result?.summaryHtml && typeof sec.summaryHtml === "function") {
+      const summary = this.containerEl.querySelector(".sv-summary");
+      if (summary) {
+        const html = sec.summaryHtml(this.filtered, this.rows, ctx);
+        summary.hidden = !html;
+        summary.innerHTML = html || "";
+      }
+    }
     this.list.setRows(this.filtered, { keepScroll: keepSelection, selectKey: this.tab.sel || null });
     const r = this.result || {};
     const total = r.total ?? this.rows.length;

@@ -15,6 +15,7 @@ Shared by the parser, which ingests a CVE list into `m_cve` / `m_cve_commit` (`p
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any, Iterable
 
 # Bumped whenever parse_record() changes what it keeps: the parser then ingests the whole list again
@@ -238,9 +239,73 @@ def description_bound(desc: str) -> dict[str, str] | None:
 
 # ------------------------------------------------------------------------------------- versions
 
-def _ver_tuple(v: str) -> tuple[int, ...] | None:
-    m = re.match(r"^v?(\d+(?:\.\d+)*)", str(v or "").strip())
+@lru_cache(maxsize=16384)
+def _parse_ver_tuple(v: str) -> tuple[int, ...] | None:
+    m = re.match(r"^v?(\d+(?:\.\d+)*)", v.strip())
     return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def _ver_tuple(v: Any) -> tuple[int, ...] | None:
+    if not v:
+        return None
+    if isinstance(v, str):
+        return _parse_ver_tuple(v)
+    return _parse_ver_tuple(str(v))
+
+
+def _compile_entry(
+    e: dict[str, Any],
+) -> tuple[
+    int,
+    tuple[tuple[int, int, tuple[int, ...], Any, int], ...],
+    tuple[tuple[tuple[int, ...], int, tuple[int, ...], tuple[int, ...]], ...],
+]:
+    """Pre-compile one `entries` dict into integer opcodes and version tuples."""
+    d = e.get("default")
+    d_code = 1 if d == "affected" else 2 if d == "unaffected" else 0
+    rules: list[tuple[int, int, tuple[int, ...], Any, int]] = []
+    aff_los: list[tuple[tuple[int, ...], int, tuple[int, ...], tuple[int, ...]]] = []
+    for item in e.get("versions") or ():
+        st = item.get("status")
+        st_code = 1 if st == "affected" else 2 if st == "unaffected" else 0
+        lo = _as_tuple(item.get("version_t"))
+        if lo is None:
+            lo = _ver_tuple(item.get("version", ""))
+        if not lo:
+            continue
+        if st_code == 1 and lo != (0,):
+            aff_los.append((lo, len(lo), lo[:2], lo[:3]))
+        if "lessThan" in item:
+            hi = _as_tuple(item.get("lessThan_t")) or _ver_tuple(item.get("lessThan", ""))
+            if hi is not None:
+                rules.append((1, st_code, lo, hi, 0))
+        elif "lessThanOrEqual" in item:
+            pat = item.get("lessThanOrEqual", "")
+            if item.get("lessThanOrEqual_star") or pat == "*":
+                rules.append((2, st_code, lo, None, 0))
+            elif "lessThanOrEqual_star_prefix" in item or pat.endswith(".*"):
+                pref = _as_tuple(item.get("lessThanOrEqual_star_prefix")) or _ver_tuple(pat[:-2])
+                if pref is not None:
+                    rules.append((3, st_code, lo, pref, len(pref)))
+            else:
+                hi = _as_tuple(item.get("lessThanOrEqual_t")) or _ver_tuple(pat)
+                if hi is not None:
+                    rules.append((4, st_code, lo, hi, 0))
+        else:
+            rules.append((0, st_code, lo, None, 0))
+    return d_code, tuple(rules), tuple(aff_los)
+
+
+def normalize_record_tuples(rec: dict[str, Any]) -> dict[str, Any]:
+    """Convert JSON-decoded list bounds inside `rec['entries']` into tuples and pre-compile rules once on load."""
+    for e in rec.get("entries") or ():
+        for item in e.get("versions") or ():
+            for k in ("version_t", "lessThan_t", "lessThanOrEqual_t", "lessThanOrEqual_star_prefix"):
+                v = item.get(k)
+                if isinstance(v, list):
+                    item[k] = tuple(v)
+        e["_compiled"] = _compile_entry(e)
+    return rec
 
 
 def _as_tuple(v: Any) -> tuple[int, ...] | None:
@@ -274,41 +339,56 @@ def _matches(item: dict[str, Any], t: tuple[int, ...]) -> bool:
     return t == lo
 
 
-def version_status(entries: list[dict[str, Any]], version: str) -> str | None:
+def version_status(entries: list[dict[str, Any]], version: str | tuple[int, ...]) -> str | None:
     """"affected" | "fixed" | "unaffected" for a release version (`3.0`, `5.4.270`), or None when silent.
 
     Each affected entry answers on its own (an explicit range, else its defaultStatus); the version is affected
     when one entry says so. Unaffected becomes "fixed" when the bug reached this line before: an affected item
     starting at or below the version (in the same stable series for a stable item, e.g. 5.4.262 <= 5.4.270)."""
-    t = _ver_tuple(version)
+    t = version if isinstance(version, tuple) else _ver_tuple(version)
     if t is None:
         return None
-    said: list[str] = []
+    has_unaff = False
+    compiled: list[tuple[int, tuple, tuple]] = []
     for e in entries:
+        comp = e.get("_compiled")
+        if comp is None:
+            comp = _compile_entry(e)
+        compiled.append(comp)
+        d_code, rules, _aff_los = comp
         aff = unaff = False
-        for item in e.get("versions") or []:
-            if _matches(item, t):
-                if item.get("status") == "affected":
+        for op, st_code, lo, bound, plen in rules:
+            if op == 1:
+                m = lo <= t < bound
+            elif op == 3:
+                m = lo <= t and t[:plen] == bound
+            elif op == 4:
+                m = lo <= t <= bound
+            elif op == 2:
+                m = lo <= t
+            else:
+                m = t == lo
+            if m:
+                if st_code == 1:
                     aff = True
-                elif item.get("status") == "unaffected":
+                elif st_code == 2:
                     unaff = True
-        st = "affected" if aff else "unaffected" if unaff else e.get("default")
-        if st:
-            said.append(st)
-    if "affected" in said:
-        return "affected"
-    if "unaffected" not in said:
+        st = 1 if aff else 2 if unaff else d_code
+        if st == 1:
+            return "affected"
+        if st == 2:
+            has_unaff = True
+    if not has_unaff:
         return None
-    for e in entries:
-        for item in e.get("versions") or []:
-            if item.get("status") != "affected":
+    t2 = t[:2]
+    t3 = t[:3]
+    for _d_code, _rules, aff_los in compiled:
+        for lo, l_len, lo2, lo3 in aff_los:
+            if lo > t:
                 continue
-            lo = _as_tuple(item.get("version_t")) or _ver_tuple(item.get("version", ""))
-            if not lo or lo == (0,) or lo > t:
-                continue
-            if len(lo) >= 3 and lo[:2] != (2, 6) and lo[:2] != t[:2]:
+            if l_len >= 3 and lo2 != (2, 6) and lo2 != t2:
                 continue  # another stable series
-            if lo[:2] == (2, 6) and len(lo) >= 4 and lo[:3] != t[:3]:
+            if lo2 == (2, 6) and l_len >= 4 and lo3 != t3:
                 continue
             return "fixed"
     return "unaffected"

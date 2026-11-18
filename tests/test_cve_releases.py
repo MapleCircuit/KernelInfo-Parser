@@ -289,6 +289,7 @@ class TestCveReleases(unittest.TestCase):
 
         v301 = {c["id"]: c for c in cs.db_release_report("v3.0.1")["cves"]}
         self.assertEqual(v301["CVE-2024-0002"]["state"], "fixed")  # backported in v3.0.1
+        self.assertTrue(v301["CVE-2024-0002"]["fixed_here"])
 
     def test_incremental_cve_update_only_reparses_after_last_hash(self) -> None:
         crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
@@ -492,6 +493,142 @@ class TestCveReleases(unittest.TestCase):
         self.assertTrue(parsed.cve_pull)
         self.assertEqual(parsed.cve_interval, 60)
         self.assertTrue(parsed.backfill_cve_releases)
+
+    def test_next_tag_containment_and_backport_tags(self) -> None:
+        sha_main = "1" * 40
+        sha_prev_month = "2" * 40
+        sha_same_day = "3" * 40
+        sha_future_next = "4" * 40
+        sha_other_stable = "5" * 40
+        lookup = {
+            "short_to_full": {},
+            "sha_tags": {
+                sha_main: {"mainline": "v3.1", "stable": None},
+                sha_prev_month: {"mainline": None, "stable": "next-20260115"},
+                sha_same_day: {"mainline": None, "stable": "next-20260201"},
+                sha_future_next: {"mainline": None, "stable": "next-20260205"},
+                sha_other_stable: {"mainline": None, "stable": "v3.1.1"},
+            },
+            "fixes_map": {},
+            "backports_map": {},
+        }
+        ctx = crl.LookupReleaseContext("next-20260201", lookup)
+        self.assertTrue(ctx.contains(sha_main))
+        self.assertTrue(ctx.contains(sha_prev_month))
+        self.assertTrue(ctx.contains(sha_same_day))
+        self.assertFalse(ctx.contains(sha_future_next))
+        self.assertFalse(ctx.contains(sha_other_stable))
+        self.assertTrue(ctx.applies(sha_prev_month))
+        self.assertFalse(ctx.applies(sha_other_stable))
+        self.assertTrue(ctx.first_here(sha_same_day))
+        self.assertFalse(ctx.first_here(sha_prev_month))
+
+        stable_ctx = crl.LookupReleaseContext("v3.1.2", lookup)
+        self.assertFalse(stable_ctx.applies(sha_same_day))
+        self.assertTrue(stable_ctx.applies(sha_other_stable))
+
+        with patch.object(
+            rs,
+            "tag_commits",
+            return_value={
+                "v3.0": "a" * 40,
+                "v3.1": "b" * 40,
+                "v3.1.1": "c" * 40,
+                "next-20260115": "d" * 40,
+                "next-20260201": "e" * 40,
+                "next-20260205": "f" * 40,
+            },
+        ):
+            web_ctx = cs.Context("next-20260201")
+            self.assertEqual(
+                sorted(web_ctx._backport_tags()),
+                ["next-20260115", "next-20260201", "v3.0", "v3.1"],
+            )
+
+    def test_empty_new_segment_advances_max_segment_id(self) -> None:
+        crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        _git(self.krepo, "checkout", "-q", "master")
+        _commit_file(self.krepo, "plain.c", "plain\n", "unrelated commit")
+        _git(self.krepo, "tag", "v3.2")
+        rs._TAGS_CACHE.clear()
+        rs._DB_COVERAGE.clear()
+        rst.ingest(self.db, self.krepo, repo_id=1)
+
+        res = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual((res["state"], res["full"]), ("updated", 1))
+        top_sid = self._sid("v3.2")
+        watermarks = {int(r[0]) for r in self.db.select_rows("m_cve_release_state", ["max_segment_id"], {"repo_id": 1})}
+        self.assertEqual(watermarks, {top_sid})
+
+        with patch.object(crl, "cve_ids_for_segments", side_effect=AssertionError("should not re-scan segments")):
+            again = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual(again["state"], "current")
+
+    def test_cve_ids_for_segments_includes_backport_and_fixes_relations(self) -> None:
+        bp_cves = crl.cve_ids_for_segments(self.db, 1, [self._sid("v3.0.1")])
+        self.assertIn("CVE-2024-0002", bp_cves)
+        intro_cves = crl.cve_ids_for_segments(self.db, 1, [self._sid("v3.1-rc1")])
+        self.assertIn("CVE-2024-0002", intro_cves)
+
+    def test_worker_eval_and_write_batch_and_legacy_index_migration(self) -> None:
+        from db_engine import DeadlockError
+        from pipeline.db_setup import drop_outdated_derived_tables
+
+        # 1. Verify legacy cve_release_cve_idx triggers drop_outdated_derived_tables and sync() migration
+        self.db.create_index("cve_release_cve_idx", D.m_cve_release, (D.m_cve_release.cve_id,))
+        self.assertTrue(self.db.index_exists("cve_release_cve_idx", D.m_cve_release))
+        dropped = drop_outdated_derived_tables(self.db)
+        self.assertIn("m_cve_release", dropped)
+        self.assertIn("m_cve_release_state", dropped)
+        self.db.create_table([D.m_cve_release_state, D.m_cve_release])
+
+        self.db.create_index("cve_release_cve_idx", D.m_cve_release, (D.m_cve_release.cve_id,))
+        res = crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual(res["state"], "updated")
+        self.assertFalse(self.db.index_exists("cve_release_cve_idx", D.m_cve_release))
+
+        # 2. Verify _worker_eval_and_write_batch writes verdicts and retries transient DeadlockError
+        recs = crl._load_records(self.db)
+        lookup = crl.build_lookup_data(self.db, 1, recs, kernel_repo=self.krepo)
+        slim = [crl._slim_record(r, lookup) for r in recs]
+        tags = {
+            r[1]
+            for r in self.db.select_rows("m_release_segment", ["segment_id", "tag"], {"repo_id": 1}, as_dict=False)
+        }
+        ptags = {t: crl.parse_tag(t) for t in tags}
+        rkeys = {t: crl.release_key(t) for t in tags}
+        src = crl._cve_source(self.db)
+        segs = [
+            {"segment_id": int(r[0]), "tag": str(r[1]), "tag_hash": bytes(r[2]).hex()}
+            for r in self.db.select_rows(
+                "m_release_segment", ["segment_id", "tag", "tag_hash"], {"repo_id": 1}, as_dict=False
+            )
+        ]
+        max_sid = max(s["segment_id"] for s in segs)
+
+        self.db.delete_rows("m_cve_release", None, all_rows=True)
+        self.db.delete_rows("m_cve_release_state", None, all_rows=True)
+        crl._init_worker(slim, lookup, ptags, rkeys, None, 1, src, 1700000100, max_sid)
+        crl._POOL_DATA["db"] = self.db
+
+        orig_write = crl._write_segments_full_batch
+        attempts = {"n": 0}
+
+        def flaky_write(*args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise DeadlockError("simulated deadlock")
+            return orig_write(*args, **kwargs)
+
+        try:
+            with patch.object(crl, "_write_segments_full_batch", side_effect=flaky_write):
+                stats = crl._worker_eval_and_write_batch(segs)
+            self.assertEqual(attempts["n"], 2)
+            self.assertEqual(len(stats), len(segs))
+            self.assertEqual(self.db.count_rows("m_cve_release_state"), len(segs))
+            self.assertGreater(self.db.count_rows("m_cve_release"), 0)
+        finally:
+            crl._POOL_DATA.clear()
 
 
 class _NoDisk:

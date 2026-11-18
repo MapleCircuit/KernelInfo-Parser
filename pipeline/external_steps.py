@@ -117,12 +117,13 @@ def processing_cve_list(
                 return None
             summary = cve_ingest.ingest(db, repo, force=force)
             if kernel_repo and repo_id and summary.get("state") != "missing":
-                before_unresolved = set(cve_releases.unresolved_prefixes(db, repo_id))
-                summary["prefixes"] = cve_ingest.resolve_commit_prefixes(db, kernel_repo, repo_id)
+                resolved_prefixes: list[str] = []
+                summary["prefixes"] = cve_ingest.resolve_commit_prefixes(
+                    db, kernel_repo, repo_id, resolved_out=resolved_prefixes
+                )
                 extra_cves: list[str] = []
-                if summary["prefixes"].get("resolved", 0) > 0:
-                    after_unresolved = set(cve_releases.unresolved_prefixes(db, repo_id))
-                    extra_cves = cve_releases.cve_ids_for_prefixes(db, before_unresolved - after_unresolved)
+                if resolved_prefixes and summary.get("state") != "full":
+                    extra_cves = cve_releases.cve_ids_for_prefixes(db, resolved_prefixes)
                 summary["releases"] = cve_releases.sync(
                     db,
                     repo_id,
@@ -132,6 +133,7 @@ def processing_cve_list(
                     changed_ids=summary.get("changed_ids"),
                     extra_cve_ids=extra_cves,
                     force=force,
+                    prefixes_resolved=True,
                 )
             return summary
     except Exception as exc:  # noqa: BLE001 - the CVE list never blocks parsing

@@ -106,6 +106,13 @@ export class InsightsView extends SectionedView {
 
   loadList() {
     if (this._resolveError) {
+      this.rows = [];
+      const summary = this.containerEl?.querySelector(".sv-summary");
+      if (summary) {
+        summary.hidden = true;
+        summary.innerHTML = "";
+      }
+      this.applyFilter();
       this.setStatus(`Could not load: ${this._resolveError}`);
       return;
     }
