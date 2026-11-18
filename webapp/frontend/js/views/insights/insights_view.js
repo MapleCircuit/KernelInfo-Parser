@@ -60,17 +60,22 @@ export class InsightsView extends SectionedView {
   async prepareRender() {
     this.resolved = null;
     this._resolveError = null;
+    this.abort?.abort();
+    this.abort = new AbortController();
+    const signal = this.abort.signal;
     const ver = this.version;
     const client = this.api || api;
     if (ver && typeof client.resolveInsightsTag === "function") {
       try {
-        this.resolved = await client.resolveInsightsTag(ver);
+        this.resolved = await client.resolveInsightsTag(ver, { signal });
       } catch (err) {
+        if (err?.name === "AbortError" || signal.aborted) return;
         this._resolveError = err?.message || String(err);
       }
     } else if (ver) {
       this.resolved = fallbackResolved(ver);
     }
+    if (signal.aborted) return;
     this.updateDetectedBadge();
   }
 
@@ -104,6 +109,13 @@ export class InsightsView extends SectionedView {
     return base;
   }
 
+  applyFilter(opts = {}) {
+    super.applyFilter(opts);
+    if (this._resolveError) {
+      this.setStatus(`Could not load: ${this._resolveError}`);
+    }
+  }
+
   loadList() {
     if (this._resolveError) {
       this.rows = [];
@@ -113,7 +125,6 @@ export class InsightsView extends SectionedView {
         summary.innerHTML = "";
       }
       this.applyFilter();
-      this.setStatus(`Could not load: ${this._resolveError}`);
       return;
     }
     return super.loadList();

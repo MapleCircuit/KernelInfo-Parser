@@ -385,7 +385,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="backfill_from",
         default=None,
         metavar="REF",
-        help="With --backfill-maintainer-files: resume at this finished version",
+        help="Resume at this finished version/tag (applies to pre-parse and backfills)",
     )
     parser.add_argument(
         "--backfill-facts",
@@ -453,6 +453,76 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="backfill_kapi",
         action="store_true",
         help="Backfill materialized KAPI catalogs (m_kapi_catalog) and release summaries (m_kapi_release_summary) for selected tags, then exit (core/API.md section 12).",
+    )
+    parser.add_argument(
+        "--preparse",
+        dest="preparse",
+        action="store_true",
+        default=False,
+        help="Run unified single-pass multi-core pre-parsing (Subsystem Insights, Stable deltas, and KAPI) for configured or selected tags, then exit.",
+    )
+    parser.add_argument(
+        "--preparse-insights",
+        dest="preparse_insights",
+        action="store_true",
+        default=None,
+        help="With --preparse: enable Subsystem Insights pre-parsing (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-preparse-insights",
+        dest="preparse_insights",
+        action="store_false",
+        help="With --preparse: disable Subsystem Insights pre-parsing.",
+    )
+    parser.add_argument(
+        "--preparse-stable",
+        dest="preparse_stable",
+        action="store_true",
+        default=None,
+        help="With --preparse: enable Stable release delta pre-parsing (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-preparse-stable",
+        dest="preparse_stable",
+        action="store_false",
+        help="With --preparse: disable Stable release delta pre-parsing.",
+    )
+    parser.add_argument(
+        "--preparse-api",
+        dest="preparse_api",
+        action="store_true",
+        default=None,
+        help="With --preparse: enable Kernel API (KAPI) catalog pre-parsing (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-preparse-api",
+        dest="preparse_api",
+        action="store_false",
+        help="With --preparse: disable Kernel API (KAPI) catalog pre-parsing.",
+    )
+    parser.add_argument(
+        "--preparse-tag",
+        dest="preparse_tags",
+        action="append",
+        default=None,
+        metavar="TAG",
+        help="With --preparse: target specific tag(s) instead of configured pre-parse rules (repeatable).",
+    )
+    parser.add_argument(
+        "--kapi-arch",
+        dest="kapi_arches",
+        action="append",
+        default=None,
+        metavar="ARCH",
+        help="With --preparse or --backfill-kapi: target KAPI architecture(s) (repeatable; default: x86_64).",
+    )
+    parser.add_argument(
+        "--preparse-workers",
+        dest="preparse_workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Worker process count for --preparse and backfill extractors (default: saturate all CPU cores).",
     )
     parser.add_argument(
         "--backfill-cve-releases",

@@ -370,6 +370,88 @@ class TestVersionParseScreen(VersionParseTestBase):
         self.assertIn("Pre-Parse", item_7[1])
         self.assertIn("pre-parse", item_7[2].lower())
 
+    def test_preparse_inline_controls_and_launch_args(self) -> None:
+        app = MockApp(make_config("linux"))
+        screen = self.screen(app)
+        self.assertTrue(screen.preparse_insights_cb.is_checked())
+        self.assertTrue(screen.preparse_stable_cb.is_checked())
+        self.assertTrue(screen.preparse_api_cb.is_checked())
+        self.assertIn(screen.preparse_btn, screen.widgets)
+
+        # Default (nothing checked in list): main release tags via all_main
+        self.assertEqual(screen.build_preparse_launch_args(), {
+            "repo": "linux",
+            "preparse": True,
+            "preparse_insights": True,
+            "preparse_stable": True,
+            "preparse_api": True,
+            "preparse_tags": ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"],
+        })
+
+        # Checked tags override configured tag selection
+        self.check(screen, "v3.1-rc1", "v3.0")
+        screen.preparse_api_cb.set_checked(False)
+        self.assertEqual(screen.build_preparse_launch_args(), {
+            "repo": "linux",
+            "preparse": True,
+            "preparse_insights": True,
+            "preparse_stable": True,
+            "preparse_api": False,
+            "preparse_tags": ["v3.0", "v3.1-rc1"],
+        })
+
+        # Stable-only repository falls back to stable tags when none checked
+        stable_app = MockApp(make_config("linux-stable"))
+        stable_screen = self.screen(stable_app)
+        self.assertEqual(stable_screen.build_preparse_launch_args()["preparse_tags"], STABLE_TAGS)
+
+    def test_run_preparse_confirm_and_launch(self) -> None:
+        app = MockApp(make_config("linux"))
+        screen = self.screen(app)
+        with patch.object(vp, "safe_modal_dialog", return_value="Pre-parse") as dialog, \
+                patch.object(vp, "choose_launch_config", return_value=SAVE_AND_RUN) as choose:
+            self.assertTrue(screen.handle_key(ord("X")))
+        self.assertEqual(dialog.call_args.args[1], "Pre-parse Main / Insights / KAPI")
+        self.assertEqual(choose.call_args.kwargs, {"action": "Pre-parse"})
+        self.assertEqual(app.launch_calls, [{
+            "save": True,
+            "repo": "linux",
+            "preparse": True,
+            "preparse_insights": True,
+            "preparse_stable": True,
+            "preparse_api": True,
+            "preparse_tags": ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"],
+        }])
+
+        # Clicking Pre-parse button via Enter
+        app.launch_calls.clear()
+        screen.focus_widget(screen.widgets.index(screen.preparse_btn))
+        with patch.object(vp, "safe_modal_dialog", return_value="Cancel"):
+            self.assertTrue(screen.handle_key(ENTER))
+        self.assertEqual(app.launch_calls, [])
+
+        # Refuses when all 3 targets are unchecked
+        screen.preparse_insights_cb.set_checked(False)
+        screen.preparse_stable_cb.set_checked(False)
+        screen.preparse_api_cb.set_checked(False)
+        with patch.object(vp, "safe_modal_dialog", return_value="OK") as dialog:
+            self.assertFalse(screen.run_preparse())
+        self.assertEqual(dialog.call_args.args[1], "No Pre-Parse Target")
+
+        # Typing 'x' in filter_input edits filter instead of triggering pre-parse
+        screen.focus_widget(screen.widgets.index(screen.filter_input))
+        self.assertTrue(screen.handle_key(ord("x")))
+        self.assertEqual(screen.filter_input.get_value(), "x")
+        self.assertEqual(app.launch_calls, [])
+
+    def test_min_terminal_size_draws_cleanly(self) -> None:
+        self.win.max_y, self.win.max_x = vp.MIN_H, vp.MIN_W
+        screen = self.screen(MockApp(make_config("linux")))
+        screen.draw()
+        drawn = " ".join(c[1][2] for c in self.win.calls if c[0] == "addstr")
+        self.assertIn("Parse (P)", drawn)
+        self.assertIn("Pre-parse (X)", drawn)
+
 
 if __name__ == "__main__":
     unittest.main()

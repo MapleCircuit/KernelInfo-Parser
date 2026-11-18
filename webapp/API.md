@@ -18,7 +18,7 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L264-L272]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L273-L315]
   - 2.6. Frontend & Service Architectural Invariants [L316-L368]
-- 2B. Backend Domain & Infrastructure Services [L369-L1039]
+- 2B. Backend Domain & Infrastructure Services [L369-L1043]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L371-L450]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L451-L483]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L484-L513]
@@ -28,21 +28,21 @@ ES-Module IDE frontend.
   - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L674-L709]
   - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L710-L737]
   - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L738-L766]
-  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L767-L817]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L818-L869]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L870-L887]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L888-L944]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L945-L992]
-  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L993-L1039]
-- 3. Database Schema & Underlying Tables [L1040-L1054]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1055-L1060]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1061-L1066]
-- 6. Using the Services from Python [L1067-L1084]
-- 7. Configuration & Execution [L1085-L1170]
-  - 7.1. Configuration Precedence & Resolution [L1087-L1135]
-  - 7.2. Starting the Server [L1136-L1170]
-- 8. Error Handling, Status Codes & Resilience [L1171-L1202]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1184-L1202]
+  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L767-L819]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L820-L873]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L874-L891]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L892-L948]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L949-L996]
+  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L997-L1043]
+- 3. Database Schema & Underlying Tables [L1044-L1058]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1059-L1064]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1065-L1070]
+- 6. Using the Services from Python [L1071-L1088]
+- 7. Configuration & Execution [L1089-L1174]
+  - 7.1. Configuration Precedence & Resolution [L1091-L1139]
+  - 7.2. Starting the Server [L1140-L1174]
+- 8. Error Handling, Status Codes & Resilience [L1175-L1206]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1188-L1206]
 <!-- toc:end -->
 
 ---
@@ -777,9 +777,11 @@ request open.
   chips, batched), `db_fixes_of()`, `db_backports_of()`, `db_commits_for_mids()` (§4.8). **Coverage**: reverse
   lists only hold commits the parser ingested; fixes and backports made only on refs never ingested (e.g.
   linux-next, stable series never parsed) are missing until ingested. Readers that need complete reverse lists
-  over some releases check `tags_ingested(tags)`: every commit of those release segments (`m_commit_release`,
-  §2.17) is in `m_commit` (the CVE context's backports, the stable-missing report). `relations_token()` (in
-  report cache keys) changes with either source.
+  over scoped releases check `tags_ingested(tags)`: it confirms `db_ready()` (cached for `DB_READY_TTL` and
+  cleared by `mark_stale()`) and verifies that each requested tag has an `m_release_segment` row at
+  `release_stats.FORMAT` with every segment commit present in `m_commit` (§2.17), without requiring
+  `db_covers_all()` across unrelated tags. `relations_token()` (in report cache keys) changes with either
+  source.
 - **Relation index** (cache_engine space, below): commits the database does not hold (refs never ingested), and everything
   while the backfill has not finished. It is built only when such a lookup misses the database, never at
   startup; a repository the database covers never builds it. It reads every commit of every ref, so git-only
@@ -855,12 +857,14 @@ Shared answers about releases, from Git:
   milliseconds. The answer is `{first_tag, first_release (the release a candidate leads to, once tagged),
   first_stable, released}`; a commit on no release chain answers `released: false` with up to 20 branches
   containing it. Answers with a tag are cached permanently.
-- **Revision-to-tag resolution** (`resolve_release_tag(rev)`, `nearest_ancestor_tag(sha)`): resolves a tag,
-  `latest`, branch, or commit SHA to `{rev, sha, tag, exact, latest, source, final, series}` for Insights
-  without blocking on unbuilt indexes — checking exact tag-commit matches first, then `first_containing()`
-  (`allow_slow=False`), and falling back to `nearest_ancestor_tag()` (`git describe --tags --abbrev=0` scoped
-  to the repository's tag family, decorated first-parent history, or binary search over final releases) plus
-  unreleased default-branch cycle detection (`latest`).
+- **Revision-to-tag resolution** (`resolve_release_tag(rev)`, `nearest_ancestor_tag(sha)`): resolves a parsed or
+  unparsed tag, `latest`, branch, or commit SHA to `{rev, sha, tag, exact, latest, source, final, series}` for
+  Insights without blocking on unbuilt indexes — checking exact tag-commit matches first, then
+  `first_containing()` (`allow_slow=False`), and falling back to `nearest_ancestor_tag()` (decorated first-parent
+  history, scoped `git describe --tags --abbrev=0`, chunked `git for-each-ref --merged` candidate filtering via
+  `_merged_from_candidates()`, or binary search over final releases). `latest_info()` and
+  `_is_in_latest_cycle()` likewise use chunked `git for-each-ref --contains` (`_contains_from_candidates()`) /
+  `--merged` checks to avoid per-tag `git merge-base` subprocess loops during cycle detection (`latest`).
 - **Per-release passes**: `release_commits(tag)` (`git log --no-merges <prev>..<tag>`: author, committer,
   date, subject, contributor trailers via `git_commit_parser.iter_trailers` / `CommitRole` — the parser's own
   reading, so name-less and bare-address trailers count as in `m_bridge_commit_person`; `PASS_FORMAT` 3 —

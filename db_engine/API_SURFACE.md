@@ -186,6 +186,11 @@ class ReadIntents  # Named read operations of the webapp, built from spec reads 
     def release_section_health(segment_ids: Sequence[int] | int) -> list[dict[str, Any]]  # Subsystem health rows from `m_release_section_health` for one or more `segment_ids`.
     def release_person_counts(segment_ids: Sequence[int] | int) -> list[dict[str, Any]]  # Aggregated `(person_id, role_type, commits)` across `segment_ids` from `m_release_person`.
     def person_first_releases(repo_id: int, person_ids: Sequence[int]) -> list[dict[str, Any]]  # First mainline release `segment_id` per `person_id` in `repo_id` from `m_person_first_r...
+    def subsystem_version_deltas(series_track: str, *, from_ord: int | None=None, to_ord: int | None=None, tags: Sequence[str] | None=None) -> list[dict[str, Any]]  # Incremental subsystem delta rows from `insights_subsystem_version_delta` for `series_tr...
+    def subsystem_author_deltas(series_track: str, *, from_ord: int | None=None, to_ord: int | None=None, tags: Sequence[str] | None=None, subsystem_name: str | None=None) -> list[dict[str, Any]]  # Incremental subsystem author delta rows from `insights_subsystem_author_delta` for `(fr...
+    def subsystem_distinct_authors(series_track: str, *, from_ord: int | None=None, to_ord: int | None=None, tags: Sequence[str] | None=None) -> dict[str, int]  # Exact `COUNT(DISTINCT author_identity_id)` per `subsystem_name` over `(from_ord, to_ord]`.
+    def stable_version_deltas(series_track: str | None=None, *, from_ord: int | None=None, to_ord: int | None=None, base_mainline_tag: str | None=None, tags: Sequence[str] | None=None) -> list[dict[str, Any]]  # Incremental stable-release delta rows from `insights_stable_version_delta`.
+    def stable_aggregated_metrics(series_track: str | None=None, *, from_ord: int | None=None, to_ord: int | None=None, base_mainline_tag: str | None=None, tags: Sequence[str] | None=None, by_subsystem: bool=False) -> list[dict[str, Any]]  # SQL `SUM(...)` aggregates over `insights_stable_version_delta` with `avg_fix_latency_da...
 ```
 
 ## db_engine/spec.py
@@ -284,6 +289,7 @@ def MEDIUMBLOB(**kw: Any) -> ColumnSpec
 def CHAR(length: int, **kw: Any) -> ColumnSpec
 def VARCHAR(length: int, **kw: Any) -> ColumnSpec
 def BIN(length: int, **kw: Any) -> ColumnSpec  # Fixed-width binary column (`BINARY(length)` on MariaDB, BLOB on SQLite).
+def DOUBLE(**kw: Any) -> ColumnSpec
 def parse_column_fragment(*fragments: str) -> ColumnSpec  # Convert legacy MariaDB DDL fragments (`"INT", "UNSIGNED", "NOT NULL", "DEFAULT 0"`) int...
 def as_column_spec(definition: Any) -> ColumnSpec  # `ColumnSpec` from a `ColumnSpec` or legacy fragment(s) (a string or a sequence of strin...
 ```

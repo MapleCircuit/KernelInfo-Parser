@@ -169,17 +169,21 @@ class SyncManager {
         }
         // Every repository's stamps belonged to the old database
         api._stampsByRepo = {};
+        api.clearInsightsResolveMemo?.();
       }
       await localDB.set("meta", "db_instance_hash", sync.db);
       next.db = sync.db;
       refresh = true;
     }
+    let refsChanged = false;
     for (const key of ["parsed", "git"]) {
       if (sync[key] && sync[key] !== prevRepo[key]) {
         nextRepo[key] = sync[key];
+        if (prevRepo[key]) refsChanged = true;
         refresh = refresh || Boolean(prevRepo[key]);
       }
     }
+    if (refsChanged) api.clearInsightsResolveMemo?.(repo);
     next.repos[repo] = nextRepo;
     if (sync.projects && sync.projects !== prev.projects) {
       next.projects = sync.projects;
@@ -191,7 +195,7 @@ class SyncManager {
     this.tokens = next;
     await localDB.set("meta", "sync_tokens", next);
     if (refreshProjects) await this.refreshProjects({ notify });
-    return refresh ? this.refreshVersions({ notify, repo }) : null;
+    return refresh ? this.refreshVersions({ notify, repo, refsChanged }) : null;
   }
 
   /**
@@ -271,7 +275,7 @@ class SyncManager {
   }
 
   /** Refetch a repository's version and branch stamps; drop its cached data of versions whose stamp changed. */
-  async refreshVersions({ notify, repo = api.repo }) {
+  async refreshVersions({ notify, repo = api.repo, refsChanged = false }) {
     const client = api.forRepo(repo);
     const [vRes, bRes] = await Promise.all([
       client.getVersions(true, { networkFirst: true }),
@@ -289,11 +293,12 @@ class SyncManager {
     await localDB.set("meta", stampsKey(repo), nextStamps);
 
     const stale = [...changed, ...removed];
-    if (stale.length) {
+    const dropInsights = refsChanged || (Object.keys(prevStamps).length > 0 && (stale.length > 0 || added.length > 0));
+    if (stale.length || dropInsights) {
       // Only this repository's entries (cache keys are prefixed "<repo>::")
       const prefix = repo ? `${repo}::` : "";
       const dropped = await localDB.deleteDataWhere((key) => (!prefix || String(key).startsWith(prefix))
-        && stale.some((v) => isStaleKey(key, v, nextStamps[v])));
+        && (stale.some((v) => isStaleKey(key, v, nextStamps[v])) || (dropInsights && isInsightsCacheKey(key, repo))));
       console.info(`[Sync] ${stale.length} version(s) changed (${stale.slice(0, 5).join(", ")}); ${dropped} cached entries dropped.`);
     }
     if (notify && (changed.length || removed.length || added.length)) {
@@ -409,6 +414,13 @@ function isStaleKey(key, v, stamp) {
     i = key.indexOf(`${v}@`, i + 1);
   }
   return false;
+}
+
+/** Whether a cache key is an Insights report entry for `repo` (`health_*`, `stable_*`, `rstats2_*`, `mwin_*`). */
+export function isInsightsCacheKey(key, repo) {
+  const s = String(key || "");
+  const body = repo ? (s.startsWith(`${repo}::`) ? s.slice(repo.length + 2) : null) : (s.includes("::") ? null : s);
+  return body !== null && /^(?:health|stable|rstats2|mwin)_/.test(body);
 }
 
 export const syncManager = new SyncManager();

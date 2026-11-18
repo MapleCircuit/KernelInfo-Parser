@@ -3,11 +3,11 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 72 core relational database tables used across the parser
+This module defines the 75 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
-(`INT`, `BIGINT`, `MEDIUMINT`, `SMALLINT`, `TINYINT`, `CHAR`, `VARCHAR`, `TEXT`, `MEDIUMTEXT`, `BIN`, `MEDIUMBLOB`):
+(`INT`, `BIGINT`, `MEDIUMINT`, `SMALLINT`, `TINYINT`, `CHAR`, `VARCHAR`, `TEXT`, `MEDIUMTEXT`, `BIN`, `MEDIUMBLOB`, `DOUBLE`):
 `unsigned=True`, `null=True|None` (columns are NOT NULL by default), `default=<literal>`, `auto=True`
 (generated id), `bin_collation=True` (case-sensitive text). Each backend renders its own DDL from them
 (`db_engine.sql_render.render_create_table`, MariaDB output pinned by `unit_test/test_ddl_render.py`).
@@ -89,6 +89,16 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
      ├── m_commit_release (repo_id, commit_hash, chain, segment_id)      -- first segment of each commit, per chain
      ├── m_release_pull (segment_id, pull_idx, merge_hash, p1_hash, p2_hash, merge_date, commits, subject, source_url, ref_name, sender, sec_id, sec_name, dirs_json, body, format)
      └── m_release_section_health (segment_id, sec_name, sec_id, status, commits, reviewed_commits, authors_json, activity_json, pat_hash, format)
+   insights_subsystem_version_delta (version_tag, subsystem_name, parent_tag, series_track, series_ord, release_ts,
+                                     maintainer_status, commit_count, merge_commit_count, lines_added, lines_removed,
+                                     files_touched_count, distinct_author_count, fixes_commit_count, stable_cc_count,
+                                     reviewed_commit_count, tested_commit_count)
+   insights_subsystem_author_delta (version_tag, subsystem_name, author_identity_id, series_track, series_ord,
+                                    author_key, commit_count, last_active_ts)
+   insights_stable_version_delta (version_tag, subsystem_name, parent_tag, base_mainline_tag, series_track, series_ord,
+                                  release_ts, total_commits, backport_commits, fixes_tag_commits, cc_stable_commits,
+                                  cve_linked_commits, lines_added, lines_removed, same_cycle_fixes_count,
+                                  cross_release_fixes_count, sum_fix_latency_days, resolved_fixes_count)
 
 8. Maintainers & Credits Subsystem:
    m_maintainer_section (sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id, patchwork, bug_url,
@@ -117,6 +127,7 @@ from db_engine.spec import (
     BIGINT,
     BIN,
     CHAR,
+    DOUBLE,
     INT,
     MEDIUMBLOB,
     MEDIUMINT,
@@ -2015,6 +2026,106 @@ m_kapi_release_summary = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 72. insights_subsystem_version_delta (table_id=72): Incremental Subsystem Deltas
+# -----------------------------------------------------------------------------
+insights_subsystem_version_delta = Table(
+    table_id=72,
+    table_name="insights_subsystem_version_delta",
+    columns=(
+        ("version_tag", VARCHAR(64, bin_collation=True)),
+        ("subsystem_name", VARCHAR(255, bin_collation=True)),
+        ("parent_tag", VARCHAR(64, bin_collation=True, default="")),
+        ("series_track", VARCHAR(64, bin_collation=True)),
+        ("series_ord", BIGINT(unsigned=True)),
+        ("release_ts", BIGINT(unsigned=True, default=0)),
+        ("maintainer_status", VARCHAR(64, default="")),
+        ("commit_count", INT(unsigned=True, default=0)),
+        ("merge_commit_count", INT(unsigned=True, default=0)),
+        ("lines_added", INT(unsigned=True, default=0)),
+        ("lines_removed", INT(unsigned=True, default=0)),
+        ("files_touched_count", INT(unsigned=True, default=0)),
+        ("distinct_author_count", INT(unsigned=True, default=0)),
+        ("fixes_commit_count", INT(unsigned=True, default=0)),
+        ("stable_cc_count", INT(unsigned=True, default=0)),
+        ("reviewed_commit_count", INT(unsigned=True, default=0)),
+        ("tested_commit_count", INT(unsigned=True, default=0)),
+    ),
+    primary=("version_tag", "subsystem_name"),
+    foreign=None,
+    indexes=(("subsys_delta_track_ord_idx", ("series_track", "series_ord")),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 73. insights_subsystem_author_delta (table_id=73): Incremental Author Deltas
+# -----------------------------------------------------------------------------
+insights_subsystem_author_delta = Table(
+    table_id=73,
+    table_name="insights_subsystem_author_delta",
+    columns=(
+        ("version_tag", VARCHAR(64, bin_collation=True)),
+        ("subsystem_name", VARCHAR(255, bin_collation=True)),
+        ("author_identity_id", BIGINT(unsigned=True)),
+        ("series_track", VARCHAR(64, bin_collation=True)),
+        ("series_ord", BIGINT(unsigned=True)),
+        ("author_key", VARCHAR(255, bin_collation=True, default="")),
+        ("commit_count", INT(unsigned=True, default=0)),
+        ("last_active_ts", BIGINT(unsigned=True, default=0)),
+    ),
+    primary=("version_tag", "subsystem_name", "author_identity_id"),
+    foreign=None,
+    indexes=(("subsys_author_delta_idx", ("series_track", "series_ord", "subsystem_name")),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 74. insights_stable_version_delta (table_id=74): Incremental Stable Release Deltas
+# -----------------------------------------------------------------------------
+insights_stable_version_delta = Table(
+    table_id=74,
+    table_name="insights_stable_version_delta",
+    columns=(
+        ("version_tag", VARCHAR(64, bin_collation=True)),
+        ("subsystem_name", VARCHAR(255, bin_collation=True)),
+        ("parent_tag", VARCHAR(64, bin_collation=True, default="")),
+        ("base_mainline_tag", VARCHAR(64, bin_collation=True, default="")),
+        ("series_track", VARCHAR(64, bin_collation=True)),
+        ("series_ord", BIGINT(unsigned=True)),
+        ("release_ts", BIGINT(unsigned=True, default=0)),
+        ("total_commits", INT(unsigned=True, default=0)),
+        ("backport_commits", INT(unsigned=True, default=0)),
+        ("fixes_tag_commits", INT(unsigned=True, default=0)),
+        ("cc_stable_commits", INT(unsigned=True, default=0)),
+        ("cve_linked_commits", INT(unsigned=True, default=0)),
+        ("lines_added", INT(unsigned=True, default=0)),
+        ("lines_removed", INT(unsigned=True, default=0)),
+        ("same_cycle_fixes_count", INT(unsigned=True, default=0)),
+        ("cross_release_fixes_count", INT(unsigned=True, default=0)),
+        ("sum_fix_latency_days", DOUBLE(default=0.0)),
+        ("resolved_fixes_count", INT(unsigned=True, default=0)),
+    ),
+    primary=("version_tag", "subsystem_name"),
+    foreign=None,
+    indexes=(
+        ("stable_delta_track_ord_idx", ("series_track", "series_ord")),
+        ("stable_delta_base_ord_idx", ("base_mainline_tag", "series_ord")),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -2090,19 +2201,22 @@ TABLES: tuple[Table, ...] = (
     m_cve_release,         # 69
     m_kapi_catalog,        # 70
     m_kapi_release_summary,# 71
+    insights_subsystem_version_delta,  # 72
+    insights_subsystem_author_delta,   # 73
+    insights_stable_version_delta,     # 74
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 72 schema tables.
+    """Initialize and populate gp.Table_Array with all 75 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 72 Table schema objects.
+        Immutable tuple of all 75 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

@@ -150,7 +150,7 @@ class GlobalStuff:
         self.TE = None
         self.MF = None
         self.RAMDISK = "/dev/shm"  # noqa: S108
-        self.CPUS = 8
+        self.CPUS = os.cpu_count() or 8
         # Placeholder until main() / webapp config select the configured repository (core.config.get_repository)
         self.linux_directory = Path(__file__).resolve().parent.parent / "repos" / "linux"
         # Active file context for logging

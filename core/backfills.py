@@ -13,6 +13,7 @@ Each backfill takes a database driver (`db`) and returns a summary dict with a `
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 import time
@@ -766,9 +767,26 @@ def backfill_insights(db: Any, repo_dir: str, repo_id: int, from_ref: str | None
     def run() -> dict[str, Any]:
         from parser.git_ast import release_stats
 
-        return release_stats.ingest_insights(db, Path(repo_dir), repo_id, from_tag=from_ref)
+        return release_stats.ingest_insights(db, Path(repo_dir), repo_id, from_tag=from_ref, workers=None)
 
     return guarded("Backfill insights", db, run)
+
+
+def backfill_insights_deltas(db: Any, repo_dir: str, repo_id: int, from_ref: str | None = None) -> dict[str, Any]:
+    """Backfill incremental subsystem, author, and stable insights delta tables."""
+
+    def run() -> dict[str, Any]:
+        from parser.git_ast import insights_deltas
+
+        return insights_deltas.ingest_insights_deltas(
+            db,
+            Path(repo_dir),
+            repo_id,
+            from_tag=from_ref,
+            workers=None,
+        )
+
+    return guarded("Backfill insights deltas", db, run)
 
 
 def backfill_cve_releases(
@@ -820,6 +838,7 @@ def backfill_kapi(
             from_tag=from_ref,
             arches=arches,
             force=force,
+            workers=None,
             repo_entry=repo_entry,
         )
 
@@ -835,6 +854,7 @@ BACKFILL_HANDLERS: dict[str, Any] = {
     "cve_files": backfill_cve_files,
     "mailing_list": backfill_mailing_list,
     "insights": backfill_insights,
+    "insights_deltas": backfill_insights_deltas,
     "cve_releases": backfill_cve_releases,
     "kapi": backfill_kapi,
 }

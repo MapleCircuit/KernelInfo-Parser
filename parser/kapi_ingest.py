@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
+import os
 import subprocess
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 from parser import facts_ingest as fi
@@ -165,61 +169,71 @@ def _resolve_commit_id(db: Any, repo_path: str, repo_id: int | None, tag: str) -
     return None
 
 
-def _load_kapi_records(
-    db: Any,
-    batch: _GitCatBatch,
-    tree_blobs: list[tuple[str, bytes, str]],
-    *,
-    workers: int = 1,
-) -> list[tuple[str, dict[str, Any]]]:
-    """Ensure `m_blob_facts` family 2 exists for `tree_blobs` and return decoded `(path, record)` pairs."""
-    relevant = [(p, b_bytes, b_hex) for p, b_bytes, b_hex in tree_blobs if p.endswith(KAPI_BLOB_SUFFIXES)]
-    blob_to_path: dict[bytes, str] = {}
-    for p, b_bytes, _b_hex in relevant:
-        blob_to_path.setdefault(b_bytes, p)
+_KAPI_WORKER_CTX: dict[str, Any] = {}
 
-    def read_sha(sha: bytes) -> str | None:
-        raw = batch.read_object(sha.hex())
-        return None if raw is None else raw.decode("utf-8", "replace")
 
-    if db is not None and blob_to_path:
-        fi.ingest(
-            db,
-            blob_to_path,
-            lambda p: None,
-            workers=workers,
-            families=(kf.FAMILY,),
-            read_sha=read_sha,
+def _load_existing_facts(db: Any, shas: Iterable[bytes]) -> dict[bytes, bytes]:
+    """Load encoded `m_blob_facts` family-2 payloads for `shas` from `db`."""
+    if db is None:
+        return {}
+    todo = sorted(set(shas))
+    if not todo:
+        return {}
+    out: dict[bytes, bytes] = {}
+    for i in range(0, len(todo), _BATCH_CHUNK):
+        chunk = todo[i : i + _BATCH_CHUNK]
+        rows = db.select_rows(
+            "m_blob_facts",
+            ["blob_hash", "data"],
+            {"blob_hash": chunk, "family": kf.FAMILY, "format": kf.KAPI_FORMAT},
+            as_dict=False,
         )
+        for b_hash, data in rows:
+            out[bytes(b_hash)] = bytes(data) if data is not None else b""
+    return out
 
-    decoded_by_sha: dict[bytes, dict[str, Any]] = {}
-    shas = list(blob_to_path.keys())
-    if db is not None:
-        for i in range(0, len(shas), _BATCH_CHUNK):
-            chunk = shas[i : i + _BATCH_CHUNK]
-            rows = db.select_rows(
-                "m_blob_facts",
-                ["blob_hash", "data"],
-                {"blob_hash": chunk, "family": kf.FAMILY, "format": kf.KAPI_FORMAT},
-                as_dict=True,
-            )
-            for r in rows:
-                b_hash = bytes(r["blob_hash"])
-                raw_data = bytes(r["data"]) if r.get("data") is not None else b""
-                rec = kf.decode(raw_data)
-                if rec:
-                    decoded_by_sha[b_hash] = rec
-    else:
-        for b_bytes, path in blob_to_path.items():
-            text = read_sha(b_bytes)
-            if text is None or len(text) > fi.MAX_TEXT:
-                continue
-            raw_data = fi._encoded(kf.FAMILY, text, None, path)
-            rec = kf.decode(raw_data)
-            if rec:
-                decoded_by_sha[b_bytes] = rec
 
-    return [(p, decoded_by_sha[b_bytes]) for p, b_bytes, _b_hex in relevant if b_bytes in decoded_by_sha]
+def _extract_missing_kapi_facts(
+    batch: _GitCatBatch,
+    missing_items: list[tuple[bytes, str]],
+    workers: int,
+) -> list[tuple[bytes, bytes]]:
+    """Extract encoded family-2 facts for `(blob_sha, path)` pairs missing from `existing_facts`."""
+    if not missing_items:
+        return []
+
+    eff_workers = max(1, int(workers))
+    if eff_workers > 1 and multiprocessing.current_process().daemon:
+        eff_workers = 1
+
+    def _raw_items() -> Iterable[tuple[str, str, tuple[int, ...], str]]:
+        for b_bytes, path in missing_items:
+            raw = batch.read_object(b_bytes.hex())
+            text = raw.decode("utf-8", "replace") if raw is not None else None
+            clean = text if (text is not None and len(text) <= fi.MAX_TEXT) else ""
+            yield b_bytes.hex(), clean, (kf.FAMILY,), path
+
+    out: list[tuple[bytes, bytes]] = []
+    if eff_workers > 1 and len(missing_items) >= 200:
+        try:
+            for sha_hex, family_map in fi.extract(_raw_items(), workers=eff_workers, total=len(missing_items)):
+                out.append((bytes.fromhex(sha_hex), family_map[kf.FAMILY]))
+            return out
+        except (BrokenProcessPool, OSError, NotImplementedError, ImportError, AssertionError) as exc:
+            logger.warning("[KAPI] Fact worker pool unavailable (%s); extracting in-process.", exc)
+            out.clear()
+
+    chunk: list[tuple[str, str, tuple[int, ...], str]] = []
+    for item in _raw_items():
+        chunk.append(item)
+        if len(chunk) >= fi._CHUNK:
+            for sha_hex, family_map in fi.extract_families(chunk):
+                out.append((bytes.fromhex(sha_hex), family_map[kf.FAMILY]))
+            chunk = []
+    if chunk:
+        for sha_hex, family_map in fi.extract_families(chunk):
+            out.append((bytes.fromhex(sha_hex), family_map[kf.FAMILY]))
+    return out
 
 
 def _already_materialized(db: Any, commit_id: int, arches: Sequence[str]) -> bool:
@@ -255,18 +269,10 @@ def _already_materialized(db: Any, commit_id: int, arches: Sequence[str]) -> boo
     return True
 
 
-def _write_catalog_row(
-    db: Any,
-    commit_id: int,
-    arch: str,
-    kind: str,
-    payload: dict[str, Any],
-    built_at: int,
-) -> dict[str, Any]:
+def _encode_catalog_entry(arch: str, kind: str, payload: dict[str, Any], built_at: int) -> tuple[Any, ...]:
     summary = summarize_catalog(kind, payload)
     blob = encode_catalog(payload)
-    row = (
-        int(commit_id),
+    return (
         arch,
         kind,
         CATALOG_FORMAT,
@@ -276,24 +282,172 @@ def _write_catalog_row(
         blob,
         int(built_at),
     )
-    db.insert_rows(
-        "m_kapi_catalog",
-        [
-            "commit_id",
-            "arch",
-            "kind",
-            "catalog_format",
-            "kapi_format",
-            "total_count",
-            "summary_json",
-            "data",
-            "built_at",
-        ],
-        [row],
-        on_conflict="update",
-        update_columns=["catalog_format", "kapi_format", "total_count", "summary_json", "data", "built_at"],
-    )
-    return summary
+
+
+def extract_kapi_release_payload(
+    repo_path: str,
+    tag: str,
+    *,
+    arches: Iterable[str] = ("x86_64",),
+    existing_facts: Mapping[bytes, bytes] | None = None,
+    workers: int = 1,
+) -> dict[str, Any]:
+    """Pure worker extractor building KAPI catalogs and release summaries from Git (no DB access)."""
+    arch_list = tuple(dict.fromkeys((a or "x86_64").strip().lower() for a in arches)) or ("x86_64",)
+    tree_blobs = _list_tree_blobs(repo_path, tag)
+    path_to_sha = {p: b_hex for p, _b_bytes, b_hex in tree_blobs}
+    paths = set(path_to_sha.keys())
+    relevant = [(p, b_bytes, b_hex) for p, b_bytes, b_hex in tree_blobs if p.endswith(KAPI_BLOB_SUFFIXES)]
+
+    blob_to_path: dict[bytes, str] = {}
+    for p, b_bytes, _b_hex in relevant:
+        blob_to_path.setdefault(b_bytes, p)
+
+    decoded_by_sha: dict[bytes, dict[str, Any]] = {}
+    missing_items: list[tuple[bytes, str]] = []
+    for b_bytes, path in blob_to_path.items():
+        if existing_facts is not None and b_bytes in existing_facts:
+            raw_data = bytes(existing_facts[b_bytes])
+            rec = kf.decode(raw_data)
+            if rec:
+                decoded_by_sha[b_bytes] = rec
+        else:
+            missing_items.append((b_bytes, path))
+
+    new_facts: list[tuple[bytes, bytes]] = []
+    with _GitCatBatch(repo_path) as batch:
+        if missing_items:
+            new_facts = _extract_missing_kapi_facts(batch, missing_items, workers=workers)
+            for b_bytes, raw_data in new_facts:
+                rec = kf.decode(raw_data)
+                if rec:
+                    decoded_by_sha[b_bytes] = rec
+
+        records = [(p, decoded_by_sha[b_bytes]) for p, b_bytes, _b_hex in relevant if b_bytes in decoded_by_sha]
+        files = TextCache(lambda p: batch.read_object(path_to_sha[p]) if p in path_to_sha else None)
+
+        built_at = int(time.time())
+        shared_catalogs: dict[str, dict[str, Any]] = {
+            "exports": build_exports(records),
+            "tracepoints": build_tracepoints(records),
+            "devices": build_device_index(files, records),
+        }
+
+        catalog_rows: list[tuple[Any, ...]] = [
+            _encode_catalog_entry("", kind, shared_catalogs[kind], built_at)
+            for kind in ARCH_INDEPENDENT_KINDS
+        ]
+        summary_rows: list[tuple[Any, ...]] = []
+
+        for arch in arch_list:
+            info = resolve_arch_info(files, paths, arch)
+            kbuild_idx = build_kbuild_index(files, paths, info["arch"], info["srcarch"])
+            arch_catalogs: dict[str, dict[str, Any]] = {
+                "syscalls": build_syscalls(files, paths, records, info["arch"], info["srcarch"]),
+                "params": build_params(files, paths, records, info["srcarch"], kbuild_idx=kbuild_idx),
+                "modules": build_modules(records, kbuild_idx, arch=info["arch"]),
+            }
+            for kind in ARCH_SCOPED_KINDS:
+                catalog_rows.append(_encode_catalog_entry(arch, kind, arch_catalogs[kind], built_at))
+
+            combined = {**shared_catalogs, **arch_catalogs}
+            rel_sum = build_release_summary(combined)
+            subsystems_json = json.dumps(
+                {"kinds": rel_sum["kinds"], "subsystems": rel_sum["subsystems"]},
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            summary_rows.append((
+                arch,
+                CATALOG_FORMAT,
+                kf.KAPI_FORMAT,
+                rel_sum["syscalls_count"],
+                rel_sum["exports_count"],
+                rel_sum["params_count"],
+                rel_sum["tracepoints_count"],
+                rel_sum["modules_count"],
+                rel_sum["devices_count"],
+                subsystems_json,
+                built_at,
+            ))
+
+    return {
+        "tag": tag,
+        "arches": list(arch_list),
+        "built_at": built_at,
+        "new_facts": new_facts,
+        "catalog_rows": catalog_rows,
+        "summary_rows": summary_rows,
+    }
+
+
+def write_kapi_release_payload(db: Any, commit_id: int, payload: Mapping[str, Any]) -> None:
+    """Persist extracted KAPI facts, catalogs, and release summaries inside one DB transaction."""
+    cid = int(commit_id)
+    new_facts = payload.get("new_facts") or ()
+    catalog_rows = [(cid, *r) for r in (payload.get("catalog_rows") or ())]
+    summary_rows = [(cid, *r) for r in (payload.get("summary_rows") or ())]
+
+    with db.transaction():
+        if new_facts:
+            fi.store(db, [(sha, kf.FAMILY, data) for sha, data in new_facts])
+        if catalog_rows:
+            db.insert_rows(
+                "m_kapi_catalog",
+                [
+                    "commit_id",
+                    "arch",
+                    "kind",
+                    "catalog_format",
+                    "kapi_format",
+                    "total_count",
+                    "summary_json",
+                    "data",
+                    "built_at",
+                ],
+                catalog_rows,
+                on_conflict="update",
+                update_columns=[
+                    "catalog_format",
+                    "kapi_format",
+                    "total_count",
+                    "summary_json",
+                    "data",
+                    "built_at",
+                ],
+            )
+        if summary_rows:
+            db.insert_rows(
+                "m_kapi_release_summary",
+                [
+                    "commit_id",
+                    "arch",
+                    "catalog_format",
+                    "kapi_format",
+                    "syscalls_count",
+                    "exports_count",
+                    "params_count",
+                    "tracepoints_count",
+                    "modules_count",
+                    "devices_count",
+                    "subsystems_json",
+                    "built_at",
+                ],
+                summary_rows,
+                on_conflict="update",
+                update_columns=[
+                    "catalog_format",
+                    "kapi_format",
+                    "syscalls_count",
+                    "exports_count",
+                    "params_count",
+                    "tracepoints_count",
+                    "modules_count",
+                    "devices_count",
+                    "subsystems_json",
+                    "built_at",
+                ],
+            )
 
 
 def ingest_kapi_release(
@@ -318,92 +472,40 @@ def ingest_kapi_release(
         return {"tag": tag, "commit_id": cid, "status": "skipped", "reason": "up_to_date", "seconds": 0.0}
 
     tree_blobs = _list_tree_blobs(repo_path, tag)
-    path_to_sha = {p: b_hex for p, _b_bytes, b_hex in tree_blobs}
-    paths = set(path_to_sha.keys())
-
-    with _GitCatBatch(repo_path) as batch:
-        records = _load_kapi_records(db, batch, tree_blobs, workers=workers)
-        files = TextCache(lambda p: batch.read_object(path_to_sha[p]) if p in path_to_sha else None)
-
-        built_at = int(time.time())
-        shared_catalogs: dict[str, dict[str, Any]] = {
-            "exports": build_exports(records),
-            "tracepoints": build_tracepoints(records),
-            "devices": build_device_index(files, records),
-        }
-
-        with db.transaction():
-            for kind in ARCH_INDEPENDENT_KINDS:
-                _write_catalog_row(db, cid, "", kind, shared_catalogs[kind], built_at)
-
-            for arch in arch_list:
-                info = resolve_arch_info(files, paths, arch)
-                kbuild_idx = build_kbuild_index(files, paths, info["arch"], info["srcarch"])
-                arch_catalogs: dict[str, dict[str, Any]] = {
-                    "syscalls": build_syscalls(files, paths, records, info["arch"], info["srcarch"]),
-                    "params": build_params(files, paths, records, info["srcarch"], kbuild_idx=kbuild_idx),
-                    "modules": build_modules(records, kbuild_idx, arch=info["arch"]),
-                }
-                for kind in ARCH_SCOPED_KINDS:
-                    _write_catalog_row(db, cid, arch, kind, arch_catalogs[kind], built_at)
-
-                combined = {**shared_catalogs, **arch_catalogs}
-                rel_sum = build_release_summary(combined)
-                subsystems_json = json.dumps(
-                    {"kinds": rel_sum["kinds"], "subsystems": rel_sum["subsystems"]},
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-                db.insert_rows(
-                    "m_kapi_release_summary",
-                    [
-                        "commit_id",
-                        "arch",
-                        "catalog_format",
-                        "kapi_format",
-                        "syscalls_count",
-                        "exports_count",
-                        "params_count",
-                        "tracepoints_count",
-                        "modules_count",
-                        "devices_count",
-                        "subsystems_json",
-                        "built_at",
-                    ],
-                    [
-                        (
-                            cid,
-                            arch,
-                            CATALOG_FORMAT,
-                            kf.KAPI_FORMAT,
-                            rel_sum["syscalls_count"],
-                            rel_sum["exports_count"],
-                            rel_sum["params_count"],
-                            rel_sum["tracepoints_count"],
-                            rel_sum["modules_count"],
-                            rel_sum["devices_count"],
-                            subsystems_json,
-                            built_at,
-                        )
-                    ],
-                    on_conflict="update",
-                    update_columns=[
-                        "catalog_format",
-                        "kapi_format",
-                        "syscalls_count",
-                        "exports_count",
-                        "params_count",
-                        "tracepoints_count",
-                        "modules_count",
-                        "devices_count",
-                        "subsystems_json",
-                        "built_at",
-                    ],
-                )
+    relevant_shas = [b_bytes for p, b_bytes, _b_hex in tree_blobs if p.endswith(KAPI_BLOB_SUFFIXES)]
+    existing_facts = _load_existing_facts(db, relevant_shas)
+    payload = extract_kapi_release_payload(
+        repo_path,
+        tag,
+        arches=arch_list,
+        existing_facts=existing_facts,
+        workers=workers,
+    )
+    write_kapi_release_payload(db, cid, payload)
 
     elapsed = round(time.perf_counter() - started, 2)
     logger.info("KAPI materialized %s (commit_id=%d, arches=%s) in %.2f s", tag, cid, ",".join(arch_list), elapsed)
     return {"tag": tag, "commit_id": cid, "status": "built", "arches": list(arch_list), "seconds": elapsed}
+
+
+def _kapi_worker(job: tuple[str, str, tuple[str, ...]]) -> dict[str, Any]:
+    repo_path, tag, arch_list = job
+    try:
+        payload = extract_kapi_release_payload(
+            repo_path,
+            tag,
+            arches=arch_list,
+            existing_facts=_KAPI_WORKER_CTX.get("existing_facts"),
+            workers=1,
+        )
+        return {"ok": True, "tag": tag, "payload": payload}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "tag": tag, "error": str(exc)}
+
+
+def _collect_relevant_shas_worker(args: tuple[str, str]) -> list[bytes]:
+    repo_path, tag = args
+    return [b_bytes for p, b_bytes, _b_hex in _list_tree_blobs(repo_path, tag) if p.endswith(KAPI_BLOB_SUFFIXES)]
 
 
 def ingest_kapi(
@@ -415,7 +517,7 @@ def ingest_kapi(
     tags: Iterable[str] | None = None,
     arches: Iterable[str] = ("x86_64",),
     force: bool = False,
-    workers: int = 1,
+    workers: int | None = None,
     repo_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Materialize KAPI catalogs & release summaries for selected tags of `repo_path`."""
@@ -435,27 +537,103 @@ def ingest_kapi(
         fk = release_key(from_tag)
         selected = [t for t in selected if release_key(t) >= fk]
 
+    arch_list = tuple(dict.fromkeys((a or "x86_64").strip().lower() for a in arches)) or ("x86_64",)
+    pool_workers = max(1, os.cpu_count() or 4) if workers is None else max(1, int(workers))
+
     built = 0
     skipped = 0
     errors: list[dict[str, str]] = []
+    todo: list[tuple[str, int]] = []
+
     for tag in selected:
+        cid = _resolve_commit_id(db, repo_path, repo_id, tag)
+        if cid is None:
+            skipped += 1
+            continue
+        if not force and _already_materialized(db, cid, arch_list):
+            skipped += 1
+            continue
+        todo.append((tag, cid))
+
+    if not todo:
+        return {
+            "tags": len(selected),
+            "built": built,
+            "skipped": skipped,
+            "errors": errors,
+            "seconds": round(time.perf_counter() - started, 2),
+        }
+
+    if len(todo) == 1 or pool_workers <= 1:
+        for tag, cid in todo:
+            try:
+                res = ingest_kapi_release(
+                    db,
+                    repo_path,
+                    repo_id,
+                    tag,
+                    commit_id=cid,
+                    arches=arch_list,
+                    force=force,
+                    workers=pool_workers,
+                )
+                if res["status"] == "built":
+                    built += 1
+                else:
+                    skipped += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("KAPI ingest failed for %s: %s", tag, exc)
+                errors.append({"tag": tag, "error": str(exc)})
+        return {
+            "tags": len(selected),
+            "built": built,
+            "skipped": skipped,
+            "errors": errors,
+            "seconds": round(time.perf_counter() - started, 2),
+        }
+
+    existing_facts: dict[bytes, bytes] = {}
+    if db is not None and db.row_exists("m_blob_facts", {"family": kf.FAMILY, "format": kf.KAPI_FORMAT}):
+        union_shas: set[bytes] = set()
+        for t, _ in todo:
+            union_shas.update(_collect_relevant_shas_worker((repo_path, t)))
+        existing_facts = _load_existing_facts(db, union_shas)
+
+    cid_by_tag = dict(todo)
+    jobs = [(repo_path, tag, arch_list) for tag, _cid in todo]
+
+    def _consume(res: dict[str, Any]) -> None:
+        nonlocal built
+        tag = res["tag"]
+        if not res.get("ok"):
+            logger.error("KAPI ingest failed for %s: %s", tag, res.get("error", ""))
+            errors.append({"tag": tag, "error": str(res.get("error", ""))})
+            return
+        payload = res["payload"]
+        write_kapi_release_payload(db, cid_by_tag[tag], payload)
+        built += 1
+        logger.info("KAPI materialized %s (commit_id=%d, arches=%s)", tag, cid_by_tag[tag], ",".join(arch_list))
+
+    _KAPI_WORKER_CTX["existing_facts"] = existing_facts
+    try:
+        done = 0
         try:
-            res = ingest_kapi_release(
-                db,
-                repo_path,
-                repo_id,
-                tag,
-                arches=arches,
-                force=force,
-                workers=workers,
-            )
-            if res["status"] == "built":
-                built += 1
-            else:
-                skipped += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("KAPI ingest failed for %s: %s", tag, exc)
-            errors.append({"tag": tag, "error": str(exc)})
+            with ProcessPoolExecutor(
+                max_workers=min(pool_workers, len(jobs)),
+                mp_context=multiprocessing.get_context("fork"),
+            ) as pool:
+                for res in pool.map(_kapi_worker, jobs):
+                    _consume(res)
+                    done += 1
+        except (BrokenProcessPool, OSError, NotImplementedError, ImportError) as exc:
+            logger.warning("[KAPI] Process pool unavailable (%s); using threads.", exc)
+            rest = jobs[done:]
+            if rest:
+                with ThreadPoolExecutor(max_workers=min(pool_workers, len(rest))) as pool:
+                    for res in pool.map(_kapi_worker, rest):
+                        _consume(res)
+    finally:
+        _KAPI_WORKER_CTX.clear()
 
     return {
         "tags": len(selected),

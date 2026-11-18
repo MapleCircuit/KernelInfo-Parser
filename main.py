@@ -36,7 +36,7 @@ from core.DBLayout import (
 from pipeline.backfill_steps import run_automatic_backfills, run_requested_backfills
 from pipeline.cli import arg_handling
 from pipeline.db_setup import drop_familyless_blob_facts, drop_legacy_symbol_tables, drop_obsolete_kconfig_tables, drop_outdated_derived_tables, ensure_db_instance, ensure_db_views, ensure_declared_indexes, outdated_layout
-from pipeline.external_steps import processing_cve_list, processing_cve_releases, processing_release_stats
+from pipeline.external_steps import processing_cve_list, processing_cve_releases, processing_release_stats, processing_unified_preparse
 from pipeline.git_ingest import _forget_rolled_back_rows, _purge_partial_version, _resolve_legacy_state, refresh_person_identities
 from pipeline.git_network import repo_project_slug, resolve_git_network_and_repo
 from pipeline.mailing_list_steps import standalone_resolve_mailing_list
@@ -269,7 +269,12 @@ def _run() -> None:
     with G.DB() as db:
         version_states = ingest_state.fetch_repo_version_states(db, repo_id, network_id)
 
-    if not (getattr(args, "release_stats", False) or getattr(args, "dry_run", False) or getattr(args, "backfill", None)):
+    if not (
+        getattr(args, "release_stats", False)
+        or getattr(args, "preparse", False)
+        or getattr(args, "dry_run", False)
+        or getattr(args, "backfill", None)
+    ):
         # Before registering as a node or leasing a task
         _preflight_libclang()
 
@@ -420,13 +425,50 @@ def _run() -> None:
         ))
 
     # Release statistics of every release tag (core/API.md section 10); --release-stats does only this
-    if getattr(args, "release_stats", False) or not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
-        processing_release_stats(repo_path, repo_id)
-        if kernel_repo and cve_enabled and not getattr(args, "no_cve", False) and not getattr(args, "dry_run", False) and not getattr(args, "release_stats", False):
-            processing_cve_releases(repo_path, repo_id)
     if getattr(args, "release_stats", False):
+        processing_release_stats(repo_path, repo_id)
         G.emergency_shutdown(0)
         return
+
+    if getattr(args, "preparse", False):
+        include_insights = True if getattr(args, "preparse_insights", None) is None else bool(args.preparse_insights)
+        include_stable = True if getattr(args, "preparse_stable", None) is None else bool(args.preparse_stable)
+        include_api = True if getattr(args, "preparse_api", None) is None else bool(args.preparse_api)
+        raw_tags = getattr(args, "preparse_tags", None)
+        preparse_tags = (
+            [t.strip() for item in raw_tags for t in str(item).split(",") if t.strip()]
+            if raw_tags is not None
+            else None
+        )
+        raw_arches = getattr(args, "kapi_arches", None)
+        kapi_arches = (
+            tuple(dict.fromkeys(a.strip().lower() for a in raw_arches if a and a.strip()))
+            if raw_arches
+            else ("x86_64",)
+        )
+        summary = processing_unified_preparse(
+            repo_path,
+            repo_id,
+            include_insights=include_insights,
+            include_stable=include_stable,
+            include_api=include_api,
+            tags=preparse_tags,
+            from_tag=getattr(args, "backfill_from", None),
+            arches=kapi_arches,
+            workers=getattr(args, "preparse_workers", None),
+        )
+        logger.info(f"[Pre-parse] Summary: {summary}")
+        if not getattr(args, "no_release_stats", False) and preparse_tags is None and include_insights:
+            processing_release_stats(repo_path, repo_id)
+            if kernel_repo and cve_enabled and not getattr(args, "no_cve", False):
+                processing_cve_releases(repo_path, repo_id)
+        G.emergency_shutdown(0)
+        return
+
+    if not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
+        processing_release_stats(repo_path, repo_id)
+        if kernel_repo and cve_enabled and not getattr(args, "no_cve", False):
+            processing_cve_releases(repo_path, repo_id)
 
     if run_requested_backfills(args, network_id, repo_id):
         G.emergency_shutdown(0)

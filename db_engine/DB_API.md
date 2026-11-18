@@ -11,7 +11,7 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L595]
+- 2. Core Method Specifications [L148-L596]
   - 2.1. Lifecycle, Session & Health [L150-L210]
   - 2.2. Sequence Tracking & Single-Row CRUD [L211-L258]
   - 2.3. Multi-Table Relational Views [L259-L268]
@@ -23,12 +23,12 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - 2.9. Catalog & Server Introspection [L446-L461]
   - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L462-L478]
   - 2.11. Pipeline Intent Methods [L479-L492]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L493-L517]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L518-L529]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L530-L537]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L538-L595]
-- 3. Factory Resolver (`get_db_engine`) [L596-L617]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L618-L644]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L493-L518]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L519-L530]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L531-L538]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L539-L596]
+- 3. Factory Resolver (`get_db_engine`) [L597-L618]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L619-L645]
 <!-- toc:end -->
 
 ---
@@ -514,6 +514,7 @@ Read-only query abstraction for web services providing dictionary-mapped results
   - `symbol_name_page(prefix, *, after=None, limit=400) -> list[str]`: distinct names (`m_tag_def`, `m_blob_symbol_def`) shortest first, keyset paged after `(len(name), name)`.
   - `symbol_refs_of_targets(ast_ids, *, role=None, with_caller=False, limit=None)` / `symbol_def_blobs_of_targets(ast_ids)`: the key-first readers of `db_engine/symbol_rows.py` (§2.11).
   - **Checkpoint tree** (a version's full file tree is the `m_checkpoint_tree` view, or `m_bridge_checkpoint` on a database created before it): `checkpoint_tree_source() -> str` (the relation to use as a `Select` / `Join` source, e.g. `(reader.checkpoint_tree_source(), "bc")`; `resolve_relation_name("m_checkpoint_tree")`), `checkpoint_tree_exists(commit_id) -> bool`, `checkpoint_tree_files(commit_id, *, fnames=None, name=None, files_only=False, with_ftype=False, include_unnamed=False, order_by_name=False, limit=None) -> list[dict]` (`fnid, fname, blob_id[, ftype]`; `name` is a `Cond` such as `like(prefix, "prefix")`; `include_unnamed` left-joins `m_file_name`), `checkpoint_find_file(commit_id, candidates, suffix=None) -> str | None` (exact candidate names in order, else a path ending with `suffix`, shortest first; directories skipped). Services never rewrite table names in SQL text.
+  - **Insights delta queries**: `subsystem_version_deltas(series_track, *, from_ord=None, to_ord=None, tags=None) -> list[dict]`, `subsystem_author_deltas(series_track, *, from_ord=None, to_ord=None, tags=None, subsystem_name=None) -> list[dict]`, `subsystem_distinct_authors(series_track, *, from_ord=None, to_ord=None, tags=None) -> dict[str, int]` (`COUNT(DISTINCT author_identity_id)` grouped by `subsystem_name`, excluding `""`), `stable_version_deltas(series_track=None, *, from_ord=None, to_ord=None, base_mainline_tag=None, tags=None) -> list[dict]`, and `stable_aggregated_metrics(series_track=None, *, from_ord=None, to_ord=None, base_mainline_tag=None, tags=None, by_subsystem=False) -> list[dict]` (SQL `SUM(...)` aggregates with `avg_fix_latency_days` rounded to 2 decimals or `None` when zero resolved fixes). All methods apply `(from_ord, to_ord]` half-open bounds, check `existing_tables(...)`, decode binary text fields safely, and return `[]`/`{}` when empty.
 
 ### 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`)
 Standalone embedded SQLite store for local indexes, caches, and offline testing. `SQLiteStore` does not subclass `BaseDBEngine`; it mirrors a subset of the spec read/write primitives with its own signatures.

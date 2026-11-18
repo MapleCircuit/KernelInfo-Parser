@@ -44,6 +44,7 @@ from core.tui.widgets import (
     StatusBar,
     TextInput,
 )
+from parser.git_ast.release_order import parse_tag, release_key
 
 VIEW_KEY = "version_parse"
 DEFAULT_HIGHLIGHT_TAG = "v3.0"
@@ -154,9 +155,14 @@ class VersionParseScreen(BaseScreen):
         )
         self.rc_checkbox = Checkbox(y=12, x=2, label="Include -rc / pre-release tags", checked=True)
         self.continue_checkbox = Checkbox(y=13, x=2, label="Continue through later releases", checked=False)
-        self.parse_btn = Button(y=15, x=2, label="Parse (P)", on_click=self.parse)
-        self.save_btn = Button(y=15, x=18, label="Save Pre-parse (S)", on_click=self.save_preparse)
-        self.back_btn = Button(y=15, x=42, label="Back (Esc)", on_click=self.go_back)
+        self.preparse_insights_cb = Checkbox(y=14, x=2, label="Insights (Subsystems)", checked=True)
+        self.preparse_stable_cb = Checkbox(y=14, x=28, label="Stable deltas", checked=True)
+        self.preparse_api_cb = Checkbox(y=14, x=47, label="KAPI", checked=True)
+        self._summary_y: int | None = 15
+        self.parse_btn = Button(y=16, x=2, label="Parse (P)", on_click=self.parse)
+        self.preparse_btn = Button(y=16, x=17, label="Pre-parse (X)", on_click=self.run_preparse)
+        self.save_btn = Button(y=16, x=36, label="Save Pre-parse (S)", on_click=self.save_preparse)
+        self.back_btn = Button(y=16, x=60, label="Back (Esc)", on_click=self.go_back)
         self.status_bar = StatusBar(
             shortcuts=[
                 ("Tab", "Next"),
@@ -166,6 +172,7 @@ class VersionParseScreen(BaseScreen):
                 ("a", "All"),
                 ("S", "Save"),
                 ("P", "Run"),
+                ("X", "Pre-parse"),
                 ("Esc", "Back"),
             ],
         )
@@ -185,7 +192,11 @@ class VersionParseScreen(BaseScreen):
             self.tag_list,
             self.rc_checkbox,
             self.continue_checkbox,
+            self.preparse_insights_cb,
+            self.preparse_stable_cb,
+            self.preparse_api_cb,
             self.parse_btn,
+            self.preparse_btn,
             self.save_btn,
             self.back_btn,
         ]
@@ -420,6 +431,42 @@ class VersionParseScreen(BaseScreen):
             args["include_pre_releases"] = self.rc_checkbox.is_checked()
         return args
 
+    def preparse_target_tags(self) -> list[str]:
+        """Target tags for pre-parsing: checked tags in list, else configured pre-parse rules."""
+        checked = self.selected_tags()
+        if checked:
+            return checked
+        include_insights = self.preparse_insights_cb.is_checked()
+        include_stable = self.preparse_stable_cb.is_checked()
+        include_api = self.preparse_api_cb.is_checked()
+        if not (include_insights or include_stable or include_api):
+            return []
+
+        wanted: set[str] = set()
+        if include_insights:
+            wanted.update(self.preparse_tags("insights"))
+        if include_api:
+            wanted.update(self.preparse_tags("api"))
+        if include_stable and ((not include_insights and not include_api) or not wanted):
+            stable = [
+                t for t in self.all_tags
+                if (parsed := parse_tag(t)) is not None and parsed["kind"] == "stable"
+            ]
+            wanted.update(stable or self.preparse_tags("insights"))
+        return sorted(wanted, key=release_key)
+
+    def build_preparse_launch_args(self) -> dict[str, Any]:
+        """CLI overrides for unified multi-core pre-parsing of selected modes and tags."""
+        entry = self.current_repo or {}
+        return {
+            "repo": repo_label(entry),
+            "preparse": True,
+            "preparse_insights": self.preparse_insights_cb.is_checked(),
+            "preparse_stable": self.preparse_stable_cb.is_checked(),
+            "preparse_api": self.preparse_api_cb.is_checked(),
+            "preparse_tags": self.preparse_target_tags(),
+        }
+
     def mode_description(self) -> str:
         """Human-readable parse mode of the current selection."""
         tags = self.selected_tags()
@@ -493,6 +540,68 @@ class VersionParseScreen(BaseScreen):
         self._remember_view_state()
         return launch_pipeline(self.stdscr, self.app, mode, **args)
 
+    def run_preparse(self) -> bool:
+        """Confirm, resolve configuration choice, and launch unified pre-parsing."""
+        if self.current_repo is None:
+            return False
+        args = self.build_preparse_launch_args()
+        targets = [
+            label
+            for enabled, label in (
+                (args["preparse_insights"], "Insights (Subsystems)"),
+                (args["preparse_stable"], "Stable deltas"),
+                (args["preparse_api"], "KAPI"),
+            )
+            if enabled
+        ]
+        if not targets:
+            safe_modal_dialog(
+                self.stdscr,
+                "No Pre-Parse Target",
+                "Select at least one pre-parse target (Insights, Stable deltas, or KAPI).",
+                ["OK"],
+            )
+            return False
+        tags = args["preparse_tags"]
+        if not tags:
+            safe_modal_dialog(
+                self.stdscr,
+                "No Tags Selected",
+                "No tags matched the selected pre-parse rules (or check tags in the list).",
+                ["OK"],
+            )
+            return False
+        source_note = "Checked tags in list" if self.selected_tags() else "Configured pre-parse rules"
+        message = (
+            f"Repository: {args['repo']}\n"
+            f"Targets: {', '.join(targets)}\n"
+            f"Tags ({len(tags)}, {source_note}): {format_tag_list(tags)}\n\n"
+            f"Exit the TUI and run unified pre-parsing across all CPU cores?"
+        )
+        if safe_modal_dialog(
+            self.stdscr,
+            "Pre-parse Main / Insights / KAPI",
+            message,
+            ["Pre-parse", "Cancel"],
+            0,
+        ) != "Pre-parse":
+            self.status_bar.set_message("Pre-parse cancelled.", color=PAIR_MUTED)
+            return False
+        mode = choose_launch_config(self.stdscr, self.app, action="Pre-parse")
+        if mode is None:
+            self.status_bar.set_message("Pre-parse cancelled.", color=PAIR_MUTED)
+            return False
+        if mode == RUN_SAVED and not self._repo_in_saved_config(args["repo"]):
+            safe_modal_dialog(
+                self.stdscr,
+                "Repository Not Saved",
+                f"'{args['repo']}' is not in the saved config.json.\nChoose 'Save & Pre-parse' to include it.",
+                ["OK"],
+            )
+            return False
+        self._remember_view_state()
+        return launch_pipeline(self.stdscr, self.app, mode, **args)
+
     # --- Rendering ---
 
     def _layout(self, max_y: int, max_x: int) -> None:
@@ -506,15 +615,55 @@ class VersionParseScreen(BaseScreen):
         self.api_mode_select.y, self.api_mode_select.x, self.api_mode_select.width = 5, 2, mode_w
         self.api_n_input.y, self.api_n_input.x = 5, n_x
 
-        list_h = max(3, max_y - 12)
+        list_h = max(3, max_y - 14)
         self.tag_list.y, self.tag_list.x = 6, 2
         self.tag_list.height, self.tag_list.width = list_h, max(20, max_x - 4)
         bottom = 6 + list_h
         self.rc_checkbox.y = bottom
         self.continue_checkbox.y = bottom + 1
-        self.parse_btn.y = self.save_btn.y = self.back_btn.y = bottom + 3
-        self.save_btn.x = self.parse_btn.x + len(self.parse_btn.label) + 4
-        self.back_btn.x = self.save_btn.x + len(self.save_btn.label) + 4
+
+        if max_y >= 16:
+            self._summary_y = bottom + 2
+            cb_y = bottom + 3
+            if max_x >= 60:
+                self.preparse_insights_cb.y = self.preparse_stable_cb.y = self.preparse_api_cb.y = cb_y
+                self.preparse_insights_cb.x = 2
+                self.preparse_stable_cb.x = 28
+                self.preparse_api_cb.x = 47
+                cb_rows = 1
+            else:
+                self.preparse_insights_cb.y, self.preparse_insights_cb.x = cb_y, 2
+                self.preparse_api_cb.y, self.preparse_api_cb.x = cb_y, 29
+                self.preparse_stable_cb.y, self.preparse_stable_cb.x = cb_y + 1, 2
+                cb_rows = 2
+            btn_y = cb_y + cb_rows + (1 if cb_y + cb_rows + 2 < max_y else 0)
+        elif max_y == 15:
+            self._summary_y = bottom + 2
+            cb_y = bottom + 3
+            self.preparse_insights_cb.y = self.preparse_stable_cb.y = self.preparse_api_cb.y = cb_y
+            self.preparse_insights_cb.x, self.preparse_stable_cb.x, self.preparse_api_cb.x = 2, 27, 44
+            btn_y = bottom + 4
+        else:
+            self._summary_y = None
+            cb_y = bottom + 2
+            self.preparse_insights_cb.y = self.preparse_stable_cb.y = self.preparse_api_cb.y = cb_y
+            self.preparse_insights_cb.x, self.preparse_stable_cb.x, self.preparse_api_cb.x = 2, 27, 44
+            btn_y = bottom + 3
+
+        if max_x >= 76 or btn_y + 1 >= max_y - 1:
+            self.parse_btn.y = self.preparse_btn.y = self.save_btn.y = self.back_btn.y = btn_y
+            gap = 2 if max_x >= 76 else 1
+            self.parse_btn.x = 2
+            self.preparse_btn.x = self.parse_btn.x + len(self.parse_btn.label) + 4 + gap
+            self.save_btn.x = self.preparse_btn.x + len(self.preparse_btn.label) + 4 + gap
+            self.back_btn.x = self.save_btn.x + len(self.save_btn.label) + 4 + gap
+        else:
+            self.parse_btn.y = self.preparse_btn.y = btn_y
+            self.save_btn.y = self.back_btn.y = btn_y + 1
+            self.parse_btn.x = 2
+            self.preparse_btn.x = self.parse_btn.x + len(self.parse_btn.label) + 6
+            self.save_btn.x = 2
+            self.back_btn.x = self.save_btn.x + len(self.save_btn.label) + 6
         self.status_bar.y = max_y - 1
 
     def summary_line(self, width: int) -> str:
@@ -573,10 +722,21 @@ class VersionParseScreen(BaseScreen):
         if not self.visible_tags:
             empty = "(no release tags found)" if not self.all_tags else "(no tags match the filter)"
             self.safe_addstr(self.tag_list.y + 1, self.tag_list.x + 2, empty, get_color(PAIR_MUTED))
-        for widget in (self.rc_checkbox, self.continue_checkbox, self.parse_btn, self.save_btn, self.back_btn):
+        for widget in (
+            self.rc_checkbox,
+            self.continue_checkbox,
+            self.preparse_insights_cb,
+            self.preparse_stable_cb,
+            self.preparse_api_cb,
+            self.parse_btn,
+            self.preparse_btn,
+            self.save_btn,
+            self.back_btn,
+        ):
             widget.draw(self.stdscr)
-        summary_attr = get_color(PAIR_SUCCESS) if n_sel else get_color(PAIR_MUTED)
-        self.safe_addstr(self.continue_checkbox.y + 1, 2, self.summary_line(max_x - 4), summary_attr)
+        if self._summary_y is not None:
+            summary_attr = get_color(PAIR_SUCCESS) if n_sel else get_color(PAIR_MUTED)
+            self.safe_addstr(self._summary_y, 2, self.summary_line(max_x - 4), summary_attr)
         self.status_bar.draw(self.stdscr)
         self.refresh()
 
@@ -659,6 +819,9 @@ class VersionParseScreen(BaseScreen):
 
         if ch in (ord("P"), ord("p")):
             self.parse()
+            return True
+        if ch in (ord("X"), ord("x")):
+            self.run_preparse()
             return True
         if ch in (ord("S"), ord("s")):
             self.save_preparse()

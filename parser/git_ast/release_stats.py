@@ -41,7 +41,15 @@ from db_engine.spec import Join
 from parser.git_ast.git_commit_parser import iter_trailers
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.identity import identity_key, person_key
-from parser.git_ast.release_order import parse_tag, release_key, release_ranges, release_tag_names
+from parser.git_ast.release_order import (
+    parse_tag,
+    release_key,
+    release_ranges,
+    release_tag_names,
+    series_name,
+    series_ord_for,
+    series_track_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -699,6 +707,55 @@ class _PullSectionResolver:
         return None
 
 
+def _lookup_tag_section_ids(
+    db: Any,
+    tag: str,
+    sha: str,
+    maintainers_file: str = "MAINTAINERS",
+) -> dict[str, int]:
+    """Lookup `{lower_sec_name: sec_id}` from DB checkpoint for `(tag, sha)`."""
+    if db is None or not maintainers_file:
+        return {}
+    with contextlib.suppress(Exception):
+        commit_id: int | None = None
+        if hasattr(db, "table_exists") and db.table_exists("m_git_ref"):
+            ref_row = db.select_one("m_git_ref", ["commit_id"], {"ref_name": tag})
+            if ref_row and ref_row[0]:
+                commit_id = int(ref_row[0])
+        if commit_id is None and hasattr(db, "table_exists") and db.table_exists("m_commit") and sha:
+            c_row = db.select_one("m_commit", ["commit_id"], {"commit_hash": bytes.fromhex(sha)})
+            if c_row and c_row[0]:
+                commit_id = int(c_row[0])
+        if commit_id is None:
+            return {}
+
+        blob_id: int | None = None
+        if hasattr(db, "checkpoint_tree_files"):
+            files = db.checkpoint_tree_files(commit_id, fnames=[maintainers_file])
+            for f in files:
+                fname = f["fname"] if isinstance(f, dict) else f[1]
+                if _text(fname) == maintainers_file:
+                    blob_id = int(f["blob_id"] if isinstance(f, dict) else f[2])
+                    break
+        if blob_id is None and hasattr(db, "table_exists") and db.table_exists("m_bridge_checkpoint") and db.table_exists("m_file_name"):
+            fn_row = db.select_one("m_file_name", ["fnid"], {"fname": maintainers_file})
+            if fn_row and fn_row[0]:
+                cp_row = db.select_one("m_bridge_checkpoint", ["blob_id"], {"commit_id": commit_id, "fnid": int(fn_row[0])})
+                if cp_row and cp_row[0]:
+                    blob_id = int(cp_row[0])
+
+        if blob_id is not None and hasattr(db, "table_exists") and db.table_exists("m_maintainer_section"):
+            from parser.maintainer_ast import maintainer_store
+            sec_map = {}
+            with contextlib.suppress(Exception):
+                sec_map = maintainer_store.blob_section_ids(db, blob_id)
+            if not sec_map:
+                sec_rows = db.select_rows("m_maintainer_section", ["sec_id", "name"], {"blob_id": blob_id})
+                sec_map = {_text(name).strip().lower(): int(sid) for sid, name in sec_rows if sid}
+            return sec_map
+    return {}
+
+
 def load_tag_maintainers(
     db: Any,
     repo: Path,
@@ -723,47 +780,193 @@ def load_tag_maintainers(
     matcher = MaintainerMatcher(sections)
 
     if sections and db is not None:
-        with contextlib.suppress(Exception):
-            commit_id: int | None = None
-            if hasattr(db, "table_exists") and db.table_exists("m_git_ref"):
-                ref_row = db.select_one("m_git_ref", ["commit_id"], {"ref_name": tag})
-                if ref_row and ref_row[0]:
-                    commit_id = int(ref_row[0])
-            if commit_id is None and hasattr(db, "table_exists") and db.table_exists("m_commit") and sha:
-                c_row = db.select_one("m_commit", ["commit_id"], {"commit_hash": bytes.fromhex(sha)})
-                if c_row and c_row[0]:
-                    commit_id = int(c_row[0])
-
-            if commit_id is not None:
-                blob_id: int | None = None
-                if hasattr(db, "checkpoint_tree_files"):
-                    files = db.checkpoint_tree_files(commit_id, fnames=[maintainers_file])
-                    for f in files:
-                        fname = f["fname"] if isinstance(f, dict) else f[1]
-                        if _text(fname) == maintainers_file:
-                            blob_id = int(f["blob_id"] if isinstance(f, dict) else f[2])
-                            break
-                if blob_id is None and hasattr(db, "table_exists") and db.table_exists("m_bridge_checkpoint") and db.table_exists("m_file_name"):
-                    fn_row = db.select_one("m_file_name", ["fnid"], {"file_name": maintainers_file})
-                    if fn_row and fn_row[0]:
-                        cp_row = db.select_one("m_bridge_checkpoint", ["blob_id"], {"commit_id": commit_id, "fnid": int(fn_row[0])})
-                        if cp_row and cp_row[0]:
-                            blob_id = int(cp_row[0])
-
-                if blob_id is not None and hasattr(db, "table_exists") and db.table_exists("m_maintainer_section"):
-                    from parser.maintainer_ast import maintainer_store
-                    sec_map = {}
-                    with contextlib.suppress(Exception):
-                        sec_map = maintainer_store.blob_section_ids(db, blob_id)
-                    if not sec_map:
-                        sec_rows = db.select_rows("m_maintainer_section", ["sec_id", "name"], {"blob_id": blob_id})
-                        sec_map = {_text(name).strip().lower(): int(sid) for sid, name in sec_rows if sid}
-                    for sec in sections:
-                        k = getattr(sec, "name", "").strip().lower()
-                        if k in sec_map:
-                            sec.sec_id = sec_map[k]
+        sec_map = _lookup_tag_section_ids(db, tag, sha, maintainers_file)
+        for sec in sections:
+            k = getattr(sec, "name", "").strip().lower()
+            if k in sec_map:
+                sec.sec_id = sec_map[k]
 
     return sections, matcher
+
+
+def _build_pulls_from_merges(
+    repo: Path,
+    sha: str,
+    prev_sha: str | None,
+    span: list[str],
+    merges: list[dict[str, Any]],
+    changed_files_map: dict[str, list[str]],
+    sections: list[Any],
+    matcher: Any,
+    cfg: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build pull-request records with commit counts, dirstats, senders, and MAINTAINERS sections."""
+    from webapp.backend.services.insights_service import _fallback_sender, _sender, parse_pull
+
+    if not merges:
+        return []
+
+    commit_counts: dict[str, int] = {}
+    try:
+        rev_list_out = _git(repo, ["rev-list", "--parents", *span], timeout=600.0)
+    except Exception:
+        rev_list_out = ""
+
+    parent_map: dict[str, list[str]] = {}
+    is_merge: dict[str, bool] = {}
+    for line in rev_list_out.splitlines():
+        p_parts = line.split()
+        if not p_parts:
+            continue
+        c = p_parts[0]
+        ps = p_parts[1:]
+        parent_map[c] = ps
+        is_merge[c] = len(ps) >= 2
+
+    curr = sha
+    reached_prev = False
+    fp_chain: list[str] = [sha]
+    while curr in parent_map:
+        ps = parent_map[curr]
+        if not ps:
+            break
+        curr = ps[0]
+        fp_chain.append(curr)
+        if prev_sha and curr == prev_sha:
+            reached_prev = True
+            break
+
+    if not prev_sha:
+        reached_prev = True
+
+    if not reached_prev:
+        for m in merges:
+            p1 = m["parents"][0]
+            p2 = m["parents"][1]
+            try:
+                cnt_str = _git(repo, ["rev-list", "--count", "--no-merges", p2, f"^{p1}"], timeout=60.0)
+                commit_counts[m["sha"]] = int(cnt_str.strip() or 0)
+            except Exception:
+                commit_counts[m["sha"]] = 0
+    else:
+        merges_oldest_first = list(reversed(merges))
+        seen_ancestors: set[str] = set()
+        if prev_sha:
+            seen_ancestors.add(prev_sha)
+
+        trunk_commits = list(reversed(fp_chain))
+        trunk_idx = 0
+
+        for m in merges_oldest_first:
+            m_sha = m["sha"]
+            p1 = m["parents"][0]
+            while trunk_idx < len(trunk_commits):
+                tc = trunk_commits[trunk_idx]
+                trunk_idx += 1
+                seen_ancestors.add(tc)
+                if tc == p1:
+                    break
+
+            side_visited: set[str] = set()
+            queue = [p for p in m["parents"][1:] if p in parent_map and p not in seen_ancestors]
+            for p in queue:
+                side_visited.add(p)
+            while queue:
+                node = queue.pop()
+                for p in parent_map.get(node, ()):
+                    if p in parent_map and p not in seen_ancestors and p not in side_visited:
+                        side_visited.add(p)
+                        queue.append(p)
+
+            cnt = sum(1 for c in side_visited if not is_merge.get(c, False))
+            commit_counts[m_sha] = cnt
+            seen_ancestors.update(side_visited)
+            seen_ancestors.add(m_sha)
+
+    dirstats_map: dict[str, list[dict[str, Any]]] = {}
+    with contextlib.suppress(Exception):
+        dirstat_out = _git(repo, [
+            "log", "--first-parent", "--merges", "-m", "--dirstat=files,3,cumulative",
+            f"--format={_RECORD}%H", *span
+        ], timeout=600.0)
+        for chunk in dirstat_out.split(_RECORD):
+            if not chunk.strip():
+                continue
+            lines = chunk.strip().splitlines()
+            m_sha = lines[0].strip()
+            if not _FULL_SHA.match(m_sha) or m_sha in dirstats_map:
+                continue
+            dirs = []
+            for line in lines[1:9]:
+                pct, _, d = line.strip().partition("% ")
+                if d:
+                    with contextlib.suppress(ValueError):
+                        dirs.append({"dir": d.strip(), "percent": float(pct)})
+            dirstats_map[m_sha] = dirs
+
+    need_p2 = []
+    parsed_merges = []
+    for m in merges:
+        pull = parse_pull(m["subject"])
+        body_sender = _sender(m["body"])
+        parsed_merges.append((m, pull, body_sender))
+        if not body_sender:
+            need_p2.append(m["parents"][1])
+
+    p2_committers = _parent_committers(repo, need_p2) if need_p2 else {}
+    resolver = _PullSectionResolver(sections, matcher, insights_cfg=dict(cfg))
+
+    pulls: list[dict[str, Any]] = []
+    for m, pull, body_sender in parsed_merges:
+        p2 = m["parents"][1]
+        p2_name, p2_email = p2_committers.get(p2, ("", ""))
+        tree_cands = resolver.tree_candidates(pull["url"]) if pull["url"] else []
+        sender, sender_email = _fallback_sender(
+            body_sender,
+            p2_name=p2_name,
+            p2_email=p2_email,
+            committer=m["committer"],
+            url=pull["url"],
+            body=m["body"],
+            tree_cands=tree_cands,
+        )
+
+        sec = None
+        if len(tree_cands) == 1:
+            s_cand = tree_cands[0]
+            sec = {"sec_id": getattr(s_cand, "sec_id", 0), "name": s_cand.name}
+        else:
+            paths = changed_files_map.get(m["sha"], []) if sections else []
+            dirs = dirstats_map.get(m["sha"], [])
+            if not paths and dirs:
+                paths = [d["dir"] for d in dirs]
+            sec = resolver.resolve(
+                url=pull["url"],
+                ref=pull["ref"],
+                subject=m["subject"],
+                sender=sender,
+                sender_email=sender_email,
+                body=m["body"],
+                committer=m["committer"],
+                committer_email=m.get("committer_email", ""),
+                changed_paths=paths,
+            )
+
+        pulls.append({
+            "merge": m["sha"],
+            "parents": m["parents"],
+            "date": m["date"],
+            "subject": m["subject"],
+            "source_url": pull.get("url", ""),
+            "ref_name": pull.get("ref", ""),
+            "sender": sender,
+            "sec_id": sec.get("sec_id", 0) if sec else 0,
+            "sec_name": sec.get("name", "") if sec else "",
+            "dirs": dirstats_map.get(m["sha"], []),
+            "body": m["body"],
+            "commits": commit_counts.get(m["sha"], 0),
+        })
+    return pulls
 
 
 def compute_tag_insights(
@@ -776,8 +979,6 @@ def compute_tag_insights(
     insights_cfg: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Compute merge-window pulls and subsystem health metrics for a final mainline release."""
-    from webapp.backend.services.insights_service import _fallback_sender, _sender, parse_pull
-
     span = [sha] + ([f"^{prev_sha}"] if prev_sha else [])
     cfg = insights_cfg or {}
     catchall_section = str(cfg.get("catchall_section", "THE REST") or "THE REST")
@@ -824,108 +1025,6 @@ def compute_tag_insights(
             })
 
         if merges:
-            # Step 2: Compute non-merge commit counts per pull
-            commit_counts: dict[str, int] = {}
-            try:
-                rev_list_out = _git(repo, ["rev-list", "--parents", *span], timeout=600.0)
-            except Exception:
-                rev_list_out = ""
-
-            parent_map: dict[str, list[str]] = {}
-            is_merge: dict[str, bool] = {}
-            for line in rev_list_out.splitlines():
-                p_parts = line.split()
-                if not p_parts:
-                    continue
-                c = p_parts[0]
-                ps = p_parts[1:]
-                parent_map[c] = ps
-                is_merge[c] = len(ps) >= 2
-
-            curr = sha
-            reached_prev = False
-            fp_chain: list[str] = [sha]
-            while curr in parent_map:
-                ps = parent_map[curr]
-                if not ps:
-                    break
-                curr = ps[0]
-                fp_chain.append(curr)
-                if prev_sha and curr == prev_sha:
-                    reached_prev = True
-                    break
-
-            if not prev_sha:
-                reached_prev = True
-
-            if not reached_prev:
-                # Fallback to git rev-list --count --no-merges p2 ^p1
-                for m in merges:
-                    p1 = m["parents"][0]
-                    p2 = m["parents"][1]
-                    try:
-                        cnt_str = _git(repo, ["rev-list", "--count", "--no-merges", p2, f"^{p1}"], timeout=60.0)
-                        commit_counts[m["sha"]] = int(cnt_str.strip() or 0)
-                    except Exception:
-                        commit_counts[m["sha"]] = 0
-            else:
-                # O(V+E) incremental ancestor set walk from oldest merge to newest merge
-                merges_oldest_first = list(reversed(merges))
-                seen_ancestors: set[str] = set()
-                if prev_sha:
-                    seen_ancestors.add(prev_sha)
-
-                trunk_commits = list(reversed(fp_chain))
-                trunk_idx = 0
-
-                for m in merges_oldest_first:
-                    m_sha = m["sha"]
-                    p1 = m["parents"][0]
-                    while trunk_idx < len(trunk_commits):
-                        tc = trunk_commits[trunk_idx]
-                        trunk_idx += 1
-                        seen_ancestors.add(tc)
-                        if tc == p1:
-                            break
-
-                    side_visited: set[str] = set()
-                    queue = [p for p in m["parents"][1:] if p in parent_map and p not in seen_ancestors]
-                    for p in queue:
-                        side_visited.add(p)
-                    while queue:
-                        node = queue.pop()
-                        for p in parent_map.get(node, ()):
-                            if p in parent_map and p not in seen_ancestors and p not in side_visited:
-                                side_visited.add(p)
-                                queue.append(p)
-
-                    cnt = sum(1 for c in side_visited if not is_merge.get(c, False))
-                    commit_counts[m_sha] = cnt
-                    seen_ancestors.update(side_visited)
-                    seen_ancestors.add(m_sha)
-
-            # Step 3: Compute dirstats and changed files
-            dirstats_map: dict[str, list[dict[str, Any]]] = {}
-            with contextlib.suppress(Exception):
-                dirstat_out = _git(repo, [
-                    "log", "--first-parent", "--merges", "-m", "--dirstat=files,3,cumulative",
-                    f"--format={_RECORD}%H", *span
-                ], timeout=600.0)
-                for chunk in dirstat_out.split(_RECORD):
-                    if not chunk.strip():
-                        continue
-                    lines = chunk.strip().splitlines()
-                    m_sha = lines[0].strip()
-                    if not _FULL_SHA.match(m_sha) or m_sha in dirstats_map:
-                        continue
-                    dirs = []
-                    for line in lines[1:9]:
-                        pct, _, d = line.strip().partition("% ")
-                        if d:
-                            with contextlib.suppress(ValueError):
-                                dirs.append({"dir": d.strip(), "percent": float(pct)})
-                    dirstats_map[m_sha] = dirs
-
             changed_files_map: dict[str, list[str]] = {}
             if sections:
                 with contextlib.suppress(Exception):
@@ -941,69 +1040,9 @@ def compute_tag_insights(
                         if not _FULL_SHA.match(m_sha) or m_sha in changed_files_map:
                             continue
                         changed_files_map[m_sha] = [f.strip() for f in lines[1:] if f.strip()]
-
-            # Step 4: Resolve sender and section
-            need_p2 = []
-            parsed_merges = []
-            for m in merges:
-                pull = parse_pull(m["subject"])
-                body_sender = _sender(m["body"])
-                parsed_merges.append((m, pull, body_sender))
-                if not body_sender:
-                    need_p2.append(m["parents"][1])
-
-            p2_committers = _parent_committers(repo, need_p2) if need_p2 else {}
-            resolver = _PullSectionResolver(sections, matcher, insights_cfg=cfg)
-
-            for m, pull, body_sender in parsed_merges:
-                p2 = m["parents"][1]
-                p2_name, p2_email = p2_committers.get(p2, ("", ""))
-                tree_cands = resolver.tree_candidates(pull["url"]) if pull["url"] else []
-                sender, sender_email = _fallback_sender(
-                    body_sender,
-                    p2_name=p2_name,
-                    p2_email=p2_email,
-                    committer=m["committer"],
-                    url=pull["url"],
-                    body=m["body"],
-                    tree_cands=tree_cands,
-                )
-
-                sec = None
-                if len(tree_cands) == 1:
-                    s_cand = tree_cands[0]
-                    sec = {"sec_id": getattr(s_cand, "sec_id", 0), "name": s_cand.name}
-                else:
-                    paths = changed_files_map.get(m["sha"], []) if sections else []
-                    dirs = dirstats_map.get(m["sha"], [])
-                    if not paths and dirs:
-                        paths = [d["dir"] for d in dirs]
-                    sec = resolver.resolve(
-                        url=pull["url"],
-                        ref=pull["ref"],
-                        subject=m["subject"],
-                        sender=sender,
-                        sender_email=sender_email,
-                        body=m["body"],
-                        committer=m["committer"],
-                        committer_email=m.get("committer_email", ""),
-                        changed_paths=paths,
-                    )
-
-                pulls.append({
-                    "merge": m["sha"],
-                    "parents": m["parents"],
-                    "date": m["date"],
-                    "subject": m["subject"],
-                    "source_url": pull.get("url", ""),
-                    "ref_name": pull.get("ref", ""),
-                    "sender": sender,
-                    "sec_id": sec.get("sec_id", 0) if sec else 0,
-                    "sec_name": sec.get("name", "") if sec else "",
-                    "dirs": dirstats_map.get(m["sha"], []),
-                    "body": m["body"],
-                    "commits": commit_counts.get(m["sha"], 0),
-                })
+            pulls = _build_pulls_from_merges(
+                repo, sha, prev_sha, span, merges, changed_files_map, sections, matcher, cfg
+            )
 
     # 2. Sec stats
     sec_stats: dict[str, dict[str, Any]] = {}
@@ -1083,6 +1122,84 @@ def compute_tag_insights(
     return pulls, sec_stats
 
 
+_INSIGHTS_WORKER_CTX: dict[str, Any] = {}
+
+
+def _insights_worker(job: tuple[Any, ...]) -> dict[str, Any]:
+    """Module-level (picklable) worker computing tag insights and optional delta rows without DB access."""
+    (
+        repo,
+        seg,
+        prev_sha,
+        delta_parent_tag,
+        delta_parent_sha,
+        need_ph,
+        has_deltas,
+        need_deltas,
+        insights_cfg,
+        maintainers_file,
+        catchall_section,
+    ) = job
+    tag = seg["tag"]
+    sha = seg["sha"]
+
+    if has_deltas and need_deltas:
+        from parser.git_ast.insights_deltas import extract_release_deltas_from_git
+
+        cve_hashes = _INSIGHTS_WORKER_CTX.get("cve_commit_hashes")
+        sha_to_rel = _INSIGHTS_WORKER_CTX.get("sha_to_release")
+        same_span = (delta_parent_sha or "") == (prev_sha or "")
+        extracted = extract_release_deltas_from_git(
+            repo,
+            tag,
+            sha,
+            delta_parent_tag,
+            delta_parent_sha,
+            catchall_section=catchall_section,
+            cve_commit_hashes=cve_hashes,
+            sha_to_release=sha_to_rel,
+            compute_pulls=bool(need_ph and same_span),
+            insights_cfg=insights_cfg,
+            maintainers_file=maintainers_file,
+        )
+        sections = extracted["sections"]
+        if need_ph and same_span:
+            pulls = extracted["pulls"]
+            sec_stats = extracted["sec_stats"]
+        elif need_ph:
+            from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+
+            matcher = MaintainerMatcher(sections)
+            pulls, sec_stats = compute_tag_insights(
+                repo, tag, sha, prev_sha, sections, matcher, insights_cfg=insights_cfg
+            )
+        else:
+            pulls, sec_stats = [], {}
+        return {
+            "seg": seg,
+            "need_ph": need_ph,
+            "need_deltas": True,
+            "sections": sections,
+            "pulls": pulls,
+            "sec_stats": sec_stats,
+            "extracted": extracted,
+        }
+
+    sections, matcher = load_tag_maintainers(None, repo, tag, sha, maintainers_file=maintainers_file)
+    pulls, sec_stats = compute_tag_insights(
+        repo, tag, sha, prev_sha, sections, matcher, insights_cfg=insights_cfg
+    )
+    return {
+        "seg": seg,
+        "need_ph": need_ph,
+        "need_deltas": False,
+        "sections": sections,
+        "pulls": pulls,
+        "sec_stats": sec_stats,
+        "extracted": None,
+    }
+
+
 def ingest_insights(
     db: Any,
     repo: Path,
@@ -1091,8 +1208,9 @@ def ingest_insights(
     from_tag: str | None = None,
     insights_cfg: dict[str, Any] | None = None,
     repo_entry: dict[str, Any] | None = None,
+    workers: int | None = None,
 ) -> dict[str, Any]:
-    """Ingest pre-computed merge window pulls and subsystem health metrics for release segments."""
+    """Ingest pre-computed merge window pulls, subsystem health, and delta tables for release segments."""
     started = time.time()
     if db is None:
         return {"state": "unavailable", "segments": 0}
@@ -1105,6 +1223,14 @@ def ingest_insights(
             db.select_one("m_release_section_health", ["segment_id"], limit=1)
         except Exception:
             return {"state": "unavailable", "segments": 0}
+
+    delta_tables = ("insights_subsystem_version_delta", "insights_subsystem_author_delta", "insights_stable_version_delta")
+    if hasattr(db, "existing_tables"):
+        has_deltas = len(db.existing_tables(delta_tables)) == len(delta_tables)
+    elif hasattr(db, "table_exists"):
+        has_deltas = all(db.table_exists(t) for t in delta_tables)
+    else:
+        has_deltas = False
 
     if repo_entry is None:
         from core.config import get_repository
@@ -1150,6 +1276,23 @@ def ingest_insights(
 
     target_segments.sort(key=lambda s: release_key(s["tag"]))
 
+    prev_on_track: dict[str, str] = {}
+    for seg in target_segments:
+        t = seg["tag"]
+        track = series_track_for(t)
+        p = parse_tag(t)
+        if track in prev_on_track:
+            d_parent = prev_on_track[track]
+        elif p and p["kind"] == "stable":
+            base_ml = series_name(p["series"])
+            d_parent = base_ml if base_ml in tag_to_sha else ""
+        elif p and p["kind"] == "next":
+            d_parent = seg["diff_base_tag"]
+        else:
+            d_parent = ""
+        seg["delta_parent_tag"] = d_parent
+        prev_on_track[track] = t
+
     if from_tag:
         from_key = release_key(from_tag)
         target_segments = [s for s in target_segments if release_key(s["tag"]) >= from_key]
@@ -1174,40 +1317,154 @@ def ingest_insights(
         )
     }
 
-    missing_segments = [
-        s for s in target_segments
-        if s["segment_id"] not in current_pull_sids or s["segment_id"] not in current_health_sids
-    ]
+    stored_subsys: dict[str, str] = {}
+    stored_stable: dict[str, str] = {}
+    if has_deltas:
+        target_tag_names = [s["tag"] for s in target_segments]
+        stored_subsys = {
+            _text(vt): _text(pt)
+            for vt, pt in db.select_rows(
+                "insights_subsystem_version_delta",
+                ["version_tag", "parent_tag"],
+                {"subsystem_name": "", "version_tag": target_tag_names},
+                as_dict=False,
+            )
+        }
+        stored_stable = {
+            _text(vt): _text(pt)
+            for vt, pt in db.select_rows(
+                "insights_stable_version_delta",
+                ["version_tag", "parent_tag"],
+                {"subsystem_name": "", "version_tag": target_tag_names},
+                as_dict=False,
+            )
+        }
 
-    if not missing_segments:
+    missing_work: list[tuple[dict[str, Any], bool, bool]] = []
+    for s in target_segments:
+        if not s["sha"]:
+            continue
+        need_ph = s["segment_id"] not in current_pull_sids or s["segment_id"] not in current_health_sids
+        need_deltas = False
+        if has_deltas:
+            want_parent = s["delta_parent_tag"]
+            p = parse_tag(s["tag"])
+            is_stable = bool(p and p["kind"] == "stable")
+            if stored_subsys.get(s["tag"]) != want_parent:
+                need_deltas = True
+            elif is_stable and stored_stable.get(s["tag"]) != want_parent:
+                need_deltas = True
+        if need_ph or need_deltas:
+            missing_work.append((s, need_ph, need_deltas))
+
+    if not missing_work:
         return {"state": "current", "segments": 0}
 
     maintainers_file = str(insights_cfg.get("maintainers_file", "MAINTAINERS") or "")
     catchall_section = str(insights_cfg.get("catchall_section", "THE REST") or "THE REST")
+    pool_workers = process_workers() if workers is None else max(1, int(workers))
+
+    def _resolve_sha(tag_name: str, known: str | None) -> str | None:
+        if known:
+            return known
+        if not tag_name:
+            return None
+        with contextlib.suppress(Exception):
+            return _git(repo, ["rev-parse", f"{tag_name}^{{commit}}"], timeout=10.0).strip() or None
+        return None
+
+    need_stable_ctx = False
+    jobs: list[tuple[Any, ...]] = []
+    for seg, need_ph, need_deltas in missing_work:
+        prev_sha = _resolve_sha(seg["diff_base_tag"], seg["prev_sha"])
+        d_parent_tag = seg["delta_parent_tag"] or None
+        d_parent_sha = _resolve_sha(d_parent_tag or "", tag_to_sha.get(d_parent_tag or ""))
+        if need_deltas:
+            p = parse_tag(seg["tag"])
+            if p and p["kind"] == "stable":
+                need_stable_ctx = True
+        jobs.append((
+            repo,
+            seg,
+            prev_sha,
+            d_parent_tag,
+            d_parent_sha,
+            need_ph,
+            has_deltas,
+            need_deltas,
+            dict(insights_cfg),
+            maintainers_file,
+            catchall_section,
+        ))
+
+    if need_stable_ctx:
+        from parser.git_ast.insights_deltas import build_sha_to_release, load_cve_commit_hashes
+
+        _INSIGHTS_WORKER_CTX["cve_commit_hashes"] = load_cve_commit_hashes(db, repo_id)
+        _INSIGHTS_WORKER_CTX["sha_to_release"] = build_sha_to_release(repo, tag_to_sha, workers=pool_workers)
 
     count = 0
-    for seg in missing_segments:
-        sha = seg["sha"]
-        if not sha:
-            continue
-        prev_sha = seg["prev_sha"]
-        if not prev_sha and seg["diff_base_tag"]:
-            with contextlib.suppress(Exception):
-                prev_sha = _git(repo, ["rev-parse", f"{seg['diff_base_tag']}^{{commit}}"], timeout=10.0).strip()
 
-        sections, matcher = load_tag_maintainers(
-            db, repo, seg["tag"], sha, maintainers_file=maintainers_file
-        )
-        pulls, sec_stats = compute_tag_insights(
-            repo, seg["tag"], sha, prev_sha, sections, matcher, insights_cfg=insights_cfg
-        )
+    def _write_result(res: dict[str, Any]) -> None:
+        nonlocal count
+        seg = res["seg"]
+        sections = res["sections"]
+        pulls = res["pulls"]
+        sec_stats = res["sec_stats"]
+        need_ph = res["need_ph"]
+        need_deltas = res["need_deltas"]
+        extracted = res["extracted"]
+
+        if need_ph and sections:
+            sec_id_map = _lookup_tag_section_ids(db, seg["tag"], seg["sha"], maintainers_file)
+            if sec_id_map:
+                for sec in sections:
+                    k = getattr(sec, "name", "").strip().lower()
+                    if k in sec_id_map:
+                        sec.sec_id = sec_id_map[k]
+                for pl in pulls:
+                    if not pl.get("sec_id") and pl.get("sec_name"):
+                        k = str(pl["sec_name"]).strip().lower()
+                        if k in sec_id_map:
+                            pl["sec_id"] = sec_id_map[k]
+
         with db.transaction():
-            write_release_pulls(db, seg["segment_id"], pulls, fmt=MW_FORMAT)
-            write_release_section_health(
-                db, seg["segment_id"], sections, sec_stats,
-                catchall_section=catchall_section, fmt=HEALTH_FORMAT
-            )
+            if need_ph:
+                write_release_pulls(db, seg["segment_id"], pulls, fmt=MW_FORMAT)
+                write_release_section_health(
+                    db, seg["segment_id"], sections, sec_stats,
+                    catchall_section=catchall_section, fmt=HEALTH_FORMAT
+                )
+            if need_deltas and extracted is not None:
+                from parser.git_ast.insights_deltas import write_deltas_in_tx
+
+                is_existing = seg["tag"] in stored_subsys or seg["tag"] in stored_stable
+                write_deltas_in_tx(db, extracted, replace=is_existing)
         count += 1
+
+    try:
+        if pool_workers <= 1 or len(jobs) <= 1:
+            for job in jobs:
+                _write_result(_insights_worker(job))
+        else:
+            done = 0
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=min(pool_workers, len(jobs)),
+                    mp_context=multiprocessing.get_context("fork"),
+                ) as pool:
+                    for res in pool.map(_insights_worker, jobs):
+                        _write_result(res)
+                        done += 1
+            except (BrokenProcessPool, OSError, NotImplementedError, ImportError) as exc:
+                logger.warning("[Insights] Process pool unavailable (%s); using threads.", exc)
+                rest = jobs[done:]
+                if rest:
+                    with ThreadPoolExecutor(max_workers=min(pool_workers, len(rest))) as pool:
+                        for res in pool.map(_insights_worker, rest):
+                            _write_result(res)
+    finally:
+        _INSIGHTS_WORKER_CTX.clear()
 
     return {
         "state": "updated",
@@ -1217,8 +1474,8 @@ def ingest_insights(
 
 
 def process_workers() -> int:
-    """Processes of the summarizing pool: min(cpu, 8) - 1, at least 1."""
-    return max(1, min(os.cpu_count() or 4, 8) - 1)
+    """Processes of the summarizing pool: saturate available CPU cores."""
+    return max(1, os.cpu_count() or 4)
 
 
 def _compute_args(args: tuple[Path, dict[str, Any]]) -> dict[str, Any]:

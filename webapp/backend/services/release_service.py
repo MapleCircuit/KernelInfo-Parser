@@ -143,6 +143,37 @@ def _is_ancestor(ancestor_sha: str, desc_sha: str) -> bool:
     return ancestor_sha == desc_sha or _git(["merge-base", "--is-ancestor", ancestor_sha, desc_sha], timeout=10) is not None
 
 
+def _ref_filter_from_candidates(flag: str, sha: str, candidates: list[str], chunk: int = 500) -> set[str] | None:
+    """Single-command `git for-each-ref` ancestry filter (`--merged=<sha>` or `--contains=<sha>`) over `candidates`."""
+    if not _FULL_SHA.match(sha or ""):
+        return None
+    if not candidates:
+        return set()
+    allowed = set(candidates)
+    out_set: set[str] = set()
+    for i in range(0, len(candidates), chunk):
+        part = candidates[i:i + chunk]
+        out = _git(
+            ["for-each-ref", f"--{flag}={sha}", "--format=%(refname:short)", *(f"refs/tags/{t}" for t in part)],
+            timeout=30,
+        )
+        if out is None:
+            return None
+        for line in out.splitlines():
+            name = line.strip()
+            if name in allowed:
+                out_set.add(name)
+    return out_set
+
+
+def _merged_from_candidates(sha: str, candidates: list[str]) -> set[str] | None:
+    return _ref_filter_from_candidates("merged", sha, candidates)
+
+
+def _contains_from_candidates(sha: str, candidates: list[str]) -> set[str] | None:
+    return _ref_filter_from_candidates("contains", sha, candidates)
+
+
 def latest_branch() -> str:
     """Default branch name of the active repository that resolves to a commit, else 'HEAD'."""
     from core.config import detect_default_branch
@@ -182,11 +213,16 @@ def latest_info() -> dict[str, Any]:
         return dict(cached[3])
     mainline = releases("mainline")
     finals = [t for t in mainline if parse_tag(t)["final"]]
+    merged_finals = _merged_from_candidates(sha, finals)
     prev_name = None
-    for t in reversed(finals):
-        if _is_ancestor(tags[t], sha):
-            prev_name = t
-            break
+    if merged_finals is not None:
+        if merged_finals:
+            prev_name = max(merged_finals, key=release_key)
+    else:
+        for t in reversed(finals):
+            if _is_ancestor(tags[t], sha):
+                prev_name = t
+                break
     prev_sha = tags.get(prev_name) if prev_name else None
     if prev_name:
         prev_family = parse_tag(prev_name)["family"]
@@ -195,12 +231,16 @@ def latest_info() -> dict[str, Any]:
     else:
         prev_family = KERNEL_FAMILY
     prev_key = release_key(prev_name) if prev_name else None
-    post_rcs = [
+    cand_rcs = [
         t for t in mainline
         if (p := parse_tag(t)) and p["pre"] and p["family"] == prev_family
         and (prev_key is None or release_key(t) > prev_key)
-        and _is_ancestor(tags[t], sha)
     ]
+    merged_rcs = _merged_from_candidates(sha, cand_rcs)
+    if merged_rcs is not None:
+        post_rcs = [t for t in cand_rcs if t in merged_rcs]
+    else:
+        post_rcs = [t for t in cand_rcs if _is_ancestor(tags[t], sha)]
     try:
         from webapp.backend.config import get_active_insights_config
         milestone_rc = int(get_active_insights_config().get("milestone_rc", 1))
@@ -621,33 +661,38 @@ def nearest_ancestor_tag(sha: str) -> str | None:
         if found:
             return _pick_best_tag(found)
 
-    # 3. Fallback: binary search mainline final releases, then check later tags in that series/next cycle
+    # 3. Fallback: single-command ancestry check over mainline final releases, then later tags in that series/next cycle
     finals = [t for t in releases("mainline") if parse_tag(t)["final"]]
-    lo, hi, best_idx = 0, len(finals) - 1, -1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if _is_ancestor(tags[finals[mid]], full):
-            best_idx = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    if best_idx >= 0:
-        base = finals[best_idx]
+    merged_finals = _merged_from_candidates(full, finals)
+    if merged_finals is None:
+        merged_finals = {t for t in finals if _is_ancestor(tags[t], full)}
+    if merged_finals:
+        base = max(merged_finals, key=release_key)
         base_key = release_key(base)
-        next_final_key = release_key(finals[best_idx + 1]) if best_idx + 1 < len(finals) else None
+        next_finals = [release_key(t) for t in finals if release_key(t) > base_key]
+        next_final_key = min(next_finals) if next_finals else None
         cand_tags = [
             t for t in tags
             if release_key(t) >= base_key and (next_final_key is None or release_key(t) < next_final_key)
         ]
-        matched = [t for t in sorted(cand_tags, key=release_key, reverse=True) if _is_ancestor(tags[t], full)]
+        matched = _merged_from_candidates(full, cand_tags)
+        if matched is None:
+            matched = {t for t in cand_tags if _is_ancestor(tags[t], full)}
         if matched:
-            return matched[0]
+            best = max(matched, key=release_key)
+            same_commit = [t for t in matched if tags.get(t) == tags.get(best)]
+            return _pick_best_tag(same_commit) or best
         return base
 
-    # Repo may only have pre-release tags before any final tag
-    for t in reversed(releases("all")):
-        if _is_ancestor(tags[t], full):
-            return t
+    # Repo may only have pre-release / non-final tags before any final tag
+    non_finals = [t for t in releases("all") if not (parse_tag(t) or {}).get("final")]
+    merged_other = _merged_from_candidates(full, non_finals)
+    if merged_other is None:
+        merged_other = {t for t in non_finals if _is_ancestor(tags[t], full)}
+    if merged_other:
+        best = max(merged_other, key=release_key)
+        same_commit = [t for t in merged_other if tags.get(t) == tags.get(best)]
+        return _pick_best_tag(same_commit) or best
     return None
 
 
@@ -698,10 +743,29 @@ def _is_in_latest_cycle(sha: str, info: dict[str, Any] | None, tags: dict[str, s
         return False
     prev_name = info.get("prev")
     prev_key = release_key(prev_name) if prev_name else None
-    for t, t_sha in tags.items():
-        if (prev_key is None or release_key(t) > prev_key) and _is_ancestor(sha, t_sha):
+    candidates = [t for t in tags if prev_key is None or release_key(t) > prev_key]
+    if not candidates:
+        return True
+    contained = _contains_from_candidates(sha, candidates)
+    if contained is not None:
+        return not contained
+    for t in candidates:
+        if _is_ancestor(sha, tags[t]):
             return False
     return True
+
+
+def _tag_in_latest_cycle(tag: str, sha: str) -> bool:
+    info = _safe_latest_info()
+    if not info:
+        return False
+    prev_name = info.get("prev")
+    if prev_name and release_key(tag) <= release_key(prev_name):
+        return False
+    return bool(
+        _is_ancestor(sha, info["sha"])
+        and (not info["prev_sha"] or _is_ancestor(info["prev_sha"], sha))
+    )
 
 
 def resolve_release_tag(rev: str) -> dict[str, Any]:
@@ -725,11 +789,7 @@ def resolve_release_tag(rev: str) -> dict[str, Any]:
     if rev in tags:
         sha = tags[rev]
         final = _final_for(rev, tags)
-        is_latest = False
-        if final is None and (parse_tag(rev) or {}).get("pre"):
-            info = _safe_latest_info()
-            if info and _is_ancestor(sha, info["sha"]) and (not info["prev_sha"] or _is_ancestor(info["prev_sha"], sha)):
-                is_latest = True
+        is_latest = bool(final is None and (parse_tag(rev) or {}).get("pre") and _tag_in_latest_cycle(rev, sha))
         return {
             "rev": rev,
             "sha": sha,
@@ -749,11 +809,7 @@ def resolve_release_tag(rev: str) -> dict[str, Any]:
     if exact_tags:
         tag = _pick_best_tag(exact_tags)
         final = _final_for(tag, tags)
-        is_latest = False
-        if final is None and tag and (parse_tag(tag) or {}).get("pre"):
-            info = _safe_latest_info()
-            if info and _is_ancestor(sha, info["sha"]) and (not info["prev_sha"] or _is_ancestor(info["prev_sha"], sha)):
-                is_latest = True
+        is_latest = bool(final is None and tag and (parse_tag(tag) or {}).get("pre") and _tag_in_latest_cycle(tag, sha))
         return {
             "rev": rev,
             "sha": sha,

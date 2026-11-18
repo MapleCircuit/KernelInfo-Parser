@@ -465,6 +465,341 @@ class TestInsightsHelpers(unittest.TestCase):
         h_rows = [tuple(r) for r in db.select_rows("m_release_section_health", ["segment_id", "sec_name", "format"], {"segment_id": 42})]
         self.assertEqual(h_rows, [(42, "", rst.HEALTH_FORMAT)])
 
+    def test_process_workers_saturates_cpus(self) -> None:
+        self.assertEqual(rst.process_workers(), max(1, os.cpu_count() or 4))
+
+
+class TestInsightsDeltas(unittest.TestCase):
+    """Tests for delta tables, pure extractor, idempotent upsert, ReadIntents ranges, and backfills."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="insights-deltas-"))
+        self.db = SQLiteDB(":memory:", foreign_keys=False)
+        self.db.create_table(D.TABLES)
+        self.git("init", "-q", "-b", "master")
+
+        maint = (
+            "NETWORKING\n"
+            "M:\tAnn B <ann@x.org>\n"
+            "S:\tMaintained\n"
+            "F:\tdrivers/net/\n\n"
+            "FILESYSTEMS\n"
+            "M:\tBob Z <bob@z.org>\n"
+            "S:\tSupported\n"
+            "F:\tfs/\n\n"
+            "THE REST\n"
+            "M:\tLinus <torvalds@l.org>\n"
+            "S:\tBuried\n"
+            "F:\t*\n"
+        )
+        self.commit("Ann B", "ann@x.org", "init MAINTAINERS", {"MAINTAINERS": maint, "Makefile": "VERSION = 3\n"}, ts=1_700_000_000)
+        self.sha_v30_net = self.commit("Ann B", "ann@x.org", "net: init eth", {"drivers/net/eth.c": "int x = 1;\n"}, ts=1_700_000_100)
+        self.git("tag", "v3.0")
+
+        # Empty/unmatched stable branch off v3.0 to test sentinel row with 0 matched commits
+        self.git("checkout", "-q", "-b", "stable-3.0", "v3.0")
+        self.commit("Ann B", "ann@x.org", "kbuild: bump Makefile", {"Makefile": "VERSION = 3\nEXTRA = .1\n"}, ts=1_700_000_200)
+        self.git("tag", "v3.0.1")
+
+        # Back to master for v3.1-rc1 and v3.1
+        self.git("checkout", "-q", "master")
+        self.sha_rc1_a = self.commit(
+            "Ann B",
+            "ann@x.org",
+            "net: fix eth rx\n\nReviewed-by: Cy D <cy@y.org>\nTested-by: Tester <t@t.org>\n",
+            {"drivers/net/eth.c": "int x = 1;\nint y = 2;\n"},
+            ts=1_700_086_400,
+        )
+        self.sha_rc1_b = self.commit(
+            "Ann B",
+            "ann@work.com",
+            f"net/fs: cross-subsys fix\n\nFixes: {self.sha_v30_net[:12]} (\"net: init eth\")\nCc: stable@vger.kernel.org\n",
+            {"drivers/net/eth.c": "int x = 1;\nint y = 3;\n", "fs/ext4.c": "int f = 1;\n"},
+            ts=1_700_172_800,
+        )
+        self.git("tag", "-a", "-m", "v3.1-rc1", "v3.1-rc1")
+
+        # Side branch merged for v3.1 to test merge_commit_count
+        self.git("checkout", "-q", "-b", "side", "v3.1-rc1")
+        self.commit("Bob Z", "bob@z.org", "net: add wifi", {"drivers/net/wifi.c": "int w = 1;\n"}, ts=1_700_259_200)
+        self.git("checkout", "-q", "master")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge branch 'side'", "side", env_ts=1_700_259_300)
+        self.sha_v31_main = self.commit(
+            "Bob Z",
+            "bob@z.org",
+            "net: tweak wifi\n",
+            {"drivers/net/wifi.c": "int w = 2;\n"},
+            ts=1_700_345_600,
+        )
+        self.git("tag", "v3.1")
+
+        # Stable series v3.1.1 and v3.1.2 off v3.1
+        self.git("checkout", "-q", "-b", "stable-3.1", "v3.1")
+        # Target timestamps: sha_rc1_a = 1_700_086_400 (+10 days = 1_700_950_400), sha_v30_net = 1_700_000_100 (+11 days diff check)
+        self.sha_upstream_cve = "d" * 40
+        self.sha_v311 = self.commit(
+            "Ann B",
+            "ann@x.org",
+            (
+                "net: backport fix\n\n"
+                f"[ Upstream commit {self.sha_upstream_cve} ]\n"
+                f"Fixes: {self.sha_rc1_a[:12]} (\"net: fix eth rx\")\n"
+                f"Fixes: {self.sha_v30_net[:12]} (\"net: init eth\")\n"
+                "Cc: stable@vger.kernel.org\n"
+            ),
+            {"drivers/net/eth.c": "int x = 10;\nint y = 3;\n"},
+            ts=1_700_950_400,  # 10.0 days after sha_rc1_a, 11.0 days - 100s = 10.9988 days after sha_v30_net
+        )
+        self.git("tag", "v3.1.1")
+        self.commit(
+            "Bob Z",
+            "bob@z.org",
+            f"net: second backport\n\nFixes: {self.sha_rc1_a[:12]} (\"net: fix eth rx\")\n",
+            {"drivers/net/wifi.c": "int w = 3;\n"},
+            ts=1_701_814_400,  # 20.0 days after sha_rc1_a
+        )
+        self.git("tag", "v3.1.2")
+        self.git("checkout", "-q", "master")
+
+        # Seed CVE fix record matching upstream commit of v3.1.1
+        self.db.insert_rows("m_cve", ["cve_id", "kind", "published", "updated", "score", "kev", "record_path", "title", "data"],
+                            [("CVE-2026-0001", "commit", 0, 0, 0, 0, "p", "t", b"{}")])
+        self.db.insert_rows("m_cve_commit", ["commit_hash", "role", "cve_id"],
+                            [(self.sha_upstream_cve, 1, "CVE-2026-0001")])
+
+    def tearDown(self) -> None:
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def git(self, *args: str, env_ts: int | None = None) -> str:
+        env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_COMMITTER_NAME": "Linus",
+            "GIT_COMMITTER_EMAIL": "torvalds@l.org",
+            "GIT_AUTHOR_NAME": "Linus",
+            "GIT_AUTHOR_EMAIL": "torvalds@l.org",
+        }
+        if env_ts is not None:
+            env["GIT_AUTHOR_DATE"] = f"{env_ts} +0000"
+            env["GIT_COMMITTER_DATE"] = f"{env_ts} +0000"
+        return subprocess.run(["git", "-C", str(self.dir), *args], check=True, capture_output=True, text=True, env=env).stdout
+
+    def commit(self, name: str, email: str, message: str, files: dict[str, str], ts: int) -> str:
+        for rel, content in files.items():
+            p = self.dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            self.git("add", rel, env_ts=ts)
+        self.git(
+            "-c", f"user.name={name}",
+            "-c", f"user.email={email}",
+            "commit", "-q", "--author", f"{name} <{email}>", "-m", message,
+            env_ts=ts,
+        )
+        return self.git("rev-parse", "HEAD").strip()
+
+    def test_track_ordinal_and_author_id_helpers(self) -> None:
+        from parser.git_ast.identity import author_identity_id
+        from parser.git_ast.release_order import series_ord_for, series_track_for
+
+        self.assertEqual(series_track_for("v3.0"), "mainline")
+        self.assertEqual(series_track_for("v3.1-rc1"), "mainline")
+        self.assertEqual(series_track_for("v3.0.1"), "stable:v3.0")
+        self.assertEqual(series_track_for("v2.6.39.4"), "stable:v2.6.39")
+        self.assertEqual(series_track_for("next-20260810"), "next")
+        self.assertEqual(series_track_for("man-pages-6.9.1"), "stable:man-pages-6.9")
+        self.assertEqual(series_track_for("not-a-tag"), "")
+        self.assertEqual(series_ord_for("not-a-tag"), 0)
+
+        self.assertLess(series_ord_for("v2.6.39"), series_ord_for("v3.0-rc1"))
+        self.assertLess(series_ord_for("v3.0-rc1"), series_ord_for("v3.0-rc2"))
+        self.assertLess(series_ord_for("v3.0-rc2"), series_ord_for("v3.0"))
+        self.assertLess(series_ord_for("v3.0"), series_ord_for("v3.1-rc1"))
+        self.assertEqual(series_ord_for("v3.0.1"), 1)
+        self.assertEqual(series_ord_for("v3.0.2"), 2)
+        self.assertEqual(series_ord_for("next-20260810"), 20260810)
+
+        id1 = author_identity_id("n:ann b")
+        id2 = author_identity_id("n:bob z")
+        self.assertEqual(id1, author_identity_id("n:ann b"))
+        self.assertGreaterEqual(id1, 1)
+        self.assertLess(id1, 1 << 63)
+        self.assertNotEqual(id1, id2)
+
+    def test_ingest_deltas_idempotence_and_read_intents(self) -> None:
+        from parser.git_ast import insights_deltas as idl
+        from parser.git_ast.release_order import series_ord_for
+
+        summary = idl.ingest_insights_deltas(self.db, self.dir, repo_id=1, workers=2)
+        self.assertEqual(summary["state"], "updated")
+        self.assertEqual(summary["tags"], 6)
+        self.assertEqual(summary["written"], 6)
+
+        # Incremental skip on second run
+        again = idl.ingest_insights_deltas(self.db, self.dir, repo_id=1, workers=2)
+        self.assertEqual(again["state"], "current")
+        self.assertEqual(again["written"], 0)
+
+        with self.db.reader() as reader:
+            # Sentinel row emitted for v3.0.1 even with 0 matched commits
+            v301 = reader.subsystem_version_deltas("stable:v3.0", tags=["v3.0.1"])
+            self.assertEqual(len(v301), 1)
+            self.assertEqual((v301[0]["subsystem_name"], v301[0]["commit_count"]), ("", 0))
+            v301_stable = reader.stable_version_deltas("stable:v3.0", tags=["v3.0.1"])
+            self.assertEqual(len(v301_stable), 1)
+            self.assertEqual((v301_stable[0]["subsystem_name"], v301_stable[0]["total_commits"]), ("", 0))
+
+            # Half-open (from_ord, to_ord] range query: (v3.0, v3.1] excludes v3.0 and includes v3.1-rc1, v3.1
+            deltas = reader.subsystem_version_deltas(
+                "mainline",
+                from_ord=series_ord_for("v3.0"),
+                to_ord=series_ord_for("v3.1"),
+            )
+            by_tag_sub = {(r["version_tag"], r["subsystem_name"]): r for r in deltas}
+            self.assertNotIn(("v3.0", ""), by_tag_sub)
+            self.assertIn(("v3.1-rc1", ""), by_tag_sub)
+            self.assertIn(("v3.1", ""), by_tag_sub)
+            self.assertNotIn(("v3.1-rc1", "THE REST"), by_tag_sub)
+
+            rc1_net = by_tag_sub[("v3.1-rc1", "NETWORKING")]
+            self.assertEqual(rc1_net["maintainer_status"], "Maintained")
+            self.assertEqual(rc1_net["commit_count"], 2)
+            self.assertEqual(rc1_net["distinct_author_count"], 1)  # both Ann B aliases fold to one identity_key
+            self.assertEqual(rc1_net["reviewed_commit_count"], 1)
+            self.assertEqual(rc1_net["tested_commit_count"], 1)
+            self.assertEqual(rc1_net["fixes_commit_count"], 1)
+            self.assertEqual(rc1_net["stable_cc_count"], 1)
+            self.assertEqual(rc1_net["files_touched_count"], 1)
+            self.assertGreater(rc1_net["lines_added"], 0)
+
+            rc1_fs = by_tag_sub[("v3.1-rc1", "FILESYSTEMS")]
+            self.assertEqual(rc1_fs["commit_count"], 1)
+            self.assertEqual(rc1_fs["fixes_commit_count"], 1)
+
+            v31_net = by_tag_sub[("v3.1", "NETWORKING")]
+            self.assertEqual(v31_net["merge_commit_count"], 1)
+            self.assertEqual(v31_net["commit_count"], 2)  # side commit + v31 commit
+
+            # Exact COUNT(DISTINCT author_identity_id) over (v3.0, v3.1]
+            dist_window = reader.subsystem_distinct_authors(
+                "mainline",
+                from_ord=series_ord_for("v3.0"),
+                to_ord=series_ord_for("v3.1"),
+            )
+            self.assertEqual(dist_window, {"FILESYSTEMS": 1, "NETWORKING": 2})
+
+            dist_rc1 = reader.subsystem_distinct_authors(
+                "mainline",
+                from_ord=series_ord_for("v3.0"),
+                to_ord=series_ord_for("v3.1-rc1"),
+            )
+            self.assertEqual(dist_rc1, {"FILESYSTEMS": 1, "NETWORKING": 1})
+
+            auth_rows = reader.subsystem_author_deltas(
+                "mainline",
+                from_ord=series_ord_for("v3.0"),
+                to_ord=series_ord_for("v3.1"),
+                subsystem_name="NETWORKING",
+            )
+            self.assertEqual(sum(r["commit_count"] for r in auth_rows), 4)
+
+            # Stable version deltas + SQL SUM / avg_fix_latency_days aggregation
+            st_rows = reader.stable_version_deltas(series_track="stable:v3.1")
+            st_map = {(r["version_tag"], r["subsystem_name"]): r for r in st_rows}
+            v311_net = st_map[("v3.1.1", "NETWORKING")]
+            self.assertEqual(v311_net["base_mainline_tag"], "v3.1")
+            self.assertEqual(v311_net["total_commits"], 1)
+            self.assertEqual(v311_net["backport_commits"], 1)
+            self.assertEqual(v311_net["fixes_tag_commits"], 1)
+            self.assertEqual(v311_net["cc_stable_commits"], 1)
+            self.assertEqual(v311_net["cve_linked_commits"], 1)
+            self.assertEqual(v311_net["same_cycle_fixes_count"], 1)
+            self.assertEqual(v311_net["cross_release_fixes_count"], 1)
+            self.assertEqual(v311_net["resolved_fixes_count"], 2)
+
+            agg_all = reader.stable_aggregated_metrics(base_mainline_tag="v3.1")
+            self.assertEqual(len(agg_all), 1)
+            expected_sum_days = (10.0 + (1_700_950_400 - 1_700_000_100) / 86400.0 + 20.0)
+            self.assertEqual(agg_all[0]["total_commits"], 2)
+            self.assertEqual(agg_all[0]["resolved_fixes_count"], 3)
+            self.assertEqual(agg_all[0]["same_cycle_fixes_count"], 2)
+            self.assertEqual(agg_all[0]["cross_release_fixes_count"], 1)
+            self.assertEqual(agg_all[0]["avg_fix_latency_days"], round(expected_sum_days / 3, 2))
+
+            agg_by_sub = reader.stable_aggregated_metrics(base_mainline_tag="v3.1", by_subsystem=True)
+            self.assertEqual([r["subsystem_name"] for r in agg_by_sub], ["NETWORKING"])
+
+            # Empty query cases
+            self.assertEqual(reader.subsystem_version_deltas("mainline", from_ord=999999999999999), [])
+            self.assertEqual(reader.subsystem_distinct_authors("mainline", tags=[]), {})
+            self.assertEqual(reader.stable_aggregated_metrics(series_track="stable:v9.9"), [])
+            # Zero resolved fixes -> avg_fix_latency_days is None
+            agg_zero = reader.stable_aggregated_metrics(series_track="stable:v3.0")
+            self.assertEqual(len(agg_zero), 1)
+            self.assertIsNone(agg_zero[0]["avg_fix_latency_days"])
+
+        # Idempotent upsert verification
+        v31_sha = self.git("rev-parse", "v3.1^{commit}").strip()
+        v31_rc1_sha = self.git("rev-parse", "v3.1-rc1^{commit}").strip()
+        ext = idl.extract_release_deltas_from_git(self.dir, "v3.1", v31_sha, "v3.1-rc1", v31_rc1_sha, compute_pulls=False)
+        for row in ext["subsystem_deltas"]:
+            if row["subsystem_name"] == "NETWORKING":
+                row["commit_count"] = 77
+        idl.write_insights_deltas(self.db, ext)
+        with self.db.reader() as reader:
+            rows = reader.subsystem_version_deltas("mainline", tags=["v3.1"])
+            net = [r for r in rows if r["subsystem_name"] == "NETWORKING"]
+            self.assertEqual(len(net), 1)
+            self.assertEqual(net[0]["commit_count"], 77)
+
+    def test_backfill_insights_deltas_and_ingest_insights(self) -> None:
+        from core import backfills
+
+        self.assertIs(backfills.BACKFILL_HANDLERS["insights_deltas"], backfills.backfill_insights_deltas)
+        res = backfills.backfill_insights_deltas(self.db, str(self.dir), repo_id=1)
+        self.assertEqual(res["state"], "updated")
+        self.assertGreater(res["written"], 0)
+        res2 = backfills.backfill_insights_deltas(self.db, str(self.dir), repo_id=1)
+        self.assertEqual(res2["state"], "current")
+
+        # Also verify release_stats.ingest() populates delta tables alongside pulls/health
+        for tbl in ("insights_subsystem_version_delta", "insights_subsystem_author_delta", "insights_stable_version_delta"):
+            self.db.delete_rows(tbl, None, all_rows=True)
+        ingest_summary = rst.ingest(self.db, self.dir, repo_id=1, workers=2)
+        self.assertEqual(ingest_summary["state"], "updated")
+        with self.db.reader() as reader:
+            ml = reader.subsystem_version_deltas("mainline")
+            self.assertGreater(len(ml), 0)
+
+    def test_mockdb_read_intents_empty_and_populated(self) -> None:
+        from db_engine import MockDB
+        from parser.git_ast import insights_deltas as idl
+        from parser.git_ast.release_order import series_ord_for
+
+        mdb = MockDB(use_global=False)
+        try:
+            with mdb.reader() as reader:
+                self.assertEqual(reader.subsystem_version_deltas("mainline"), [])
+                self.assertEqual(reader.subsystem_distinct_authors("mainline"), {})
+                self.assertEqual(reader.stable_aggregated_metrics(base_mainline_tag="v3.1"), [])
+
+            res = idl.ingest_insights_deltas(mdb, self.dir, repo_id=1, workers=2)
+            self.assertEqual(res["state"], "updated")
+            with mdb.reader() as reader:
+                dist = reader.subsystem_distinct_authors(
+                    "mainline",
+                    from_ord=series_ord_for("v3.0"),
+                    to_ord=series_ord_for("v3.1"),
+                )
+                self.assertEqual(dist, {"FILESYSTEMS": 1, "NETWORKING": 2})
+                agg = reader.stable_aggregated_metrics(base_mainline_tag="v3.1")
+                self.assertEqual(len(agg), 1)
+                self.assertEqual(agg[0]["total_commits"], 2)
+        finally:
+            mdb.close()
+
 
 if __name__ == "__main__":
     unittest.main()

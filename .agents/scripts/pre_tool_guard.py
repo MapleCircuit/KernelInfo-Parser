@@ -178,8 +178,8 @@ def evaluate_read_file(
                 "spec.py, errors.py, read_intents.py, __init__.py (token-save.md §2).",
             )
 
-    # 5. Large file slice-read guardrail
-    if p.is_file() and "slice_limit" not in allow:
+    # 5. Large file slice-read guardrail (generated API_SURFACE.md files are always readable in full)
+    if p.is_file() and filename_lower != "api_surface.md" and "slice_limit" not in allow:
         try:
             file_size = p.stat().st_size
         except OSError:

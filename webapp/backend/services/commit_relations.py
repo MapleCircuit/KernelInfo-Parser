@@ -430,6 +430,7 @@ def ensure_index(wait: float = 0.0) -> dict[str, Any]:
 def mark_stale() -> None:
     """The `git` token changed: the next request checks the heads and refreshes incrementally."""
     _STALE.clear()
+    _DB_READY.clear()
 
 
 register_refs_changed(mark_stale)
@@ -686,29 +687,39 @@ def db_commits_for_mids(mids: list[str]) -> dict[str, list[str]] | None:
 def tags_ingested(tags: list[str]) -> bool:
     """Every commit of the release segments of `tags` (m_commit_release, D03) is in the active network's
     m_commit, so its relation rows exist: reverse lists over those releases are complete. False when a tag
-    has no current segment. Cached per tag set and release/relation token."""
+    has no current segment. Does not require db_covers_all() across unrelated future tags."""
+    from parser.git_ast import release_stats
     from webapp.backend.services import release_service as rs
-    if not tags or not db_ready() or not rs.db_covers_all():
+    if not tags or not db_ready():
         return False
     key = ("ingested", tuple(sorted(tags)), rs.release_token(), relations_token())
     hit = _DB_READY.get(key)
     if hit is not None:
-        return hit
+        val, ts = hit
+        if val or time.monotonic() - ts < DB_READY_TTL:
+            return val
     current = rs.tag_commits()
     ok = False
     try:
         with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
             network_id = get_active_network_id(cur)
+            if repo_id is None or repo_id <= 0 or network_id is None:
+                _DB_READY[key] = (False, time.monotonic())
+                return False
             seg: dict[str, int] = {}
             for i in range(0, len(tags), DB_CHUNK):
                 part = tags[i:i + DB_CHUNK]
                 for r in cur.select_rows(
-                    "m_release_segment", ["segment_id", "tag", "tag_hash"], {"repo_id": repo_id, "tag": part}
+                    "m_release_segment", ["segment_id", "tag", "tag_hash", "format"], {"repo_id": repo_id, "tag": part}
                 ):
-                    if _bytes(r["tag_hash"]).hex() == current.get(_text(r["tag"])):
-                        seg[_text(r["tag"])] = int(r["segment_id"])
-            ok = network_id is not None and all(t in seg for t in tags)
+                    t_name = _text(r["tag"])
+                    if (
+                        _bytes(r["tag_hash"]).hex() == current.get(t_name)
+                        and int(r.get("format") or 0) == release_stats.FORMAT
+                    ):
+                        seg[t_name] = int(r["segment_id"])
+            ok = all(t in seg for t in tags)
             ids = sorted(seg.values())
             for i in range(0, len(ids), DB_CHUNK) if ok else ():
                 part = ids[i:i + DB_CHUNK]
@@ -724,7 +735,7 @@ def tags_ingested(tags: list[str]) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug("release ingestion coverage failed: %s", exc)
         ok = False
-    _DB_READY[key] = ok
+    _DB_READY[key] = (ok, time.monotonic())
     return ok
 
 

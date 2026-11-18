@@ -630,6 +630,10 @@ def BIN(length: int, **kw: Any) -> ColumnSpec:
     return _make(ColumnType.BINARY, length, **kw)
 
 
+def DOUBLE(**kw: Any) -> ColumnSpec:
+    return _make(ColumnType.DOUBLE, **kw)
+
+
 _FRAGMENT_TYPE = re.compile(r"^([A-Za-z]+)\s*(?:\((\d+)\))?$")
 
 

@@ -1705,5 +1705,118 @@
       9,
       11
     ]
+  },
+  "insights_subsystem_version_delta": {
+    "has_auto_increment": false,
+    "est_bytes": [
+      66,
+      257,
+      66,
+      66,
+      8,
+      8,
+      66,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4
+    ],
+    "binary": [],
+    "large": [],
+    "not_null": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ]
+  },
+  "insights_subsystem_author_delta": {
+    "has_auto_increment": false,
+    "est_bytes": [
+      66,
+      257,
+      8,
+      66,
+      8,
+      257,
+      4,
+      8
+    ],
+    "binary": [],
+    "large": [],
+    "not_null": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "insights_stable_version_delta": {
+    "has_auto_increment": false,
+    "est_bytes": [
+      66,
+      257,
+      66,
+      66,
+      66,
+      8,
+      8,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      8,
+      4
+    ],
+    "binary": [],
+    "large": [],
+    "not_null": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17
+    ]
   }
 }

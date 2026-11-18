@@ -1199,3 +1199,257 @@ class TestSecurityInsights(unittest.TestCase):
         # v6.2-rc1 has no final v6.2 tag yet -> None
         self.assertIsNone(by_id["CVE-2024-1002"]["introduced_release"])
 
+
+class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
+    """Delta range scans, boundary fallbacks, -rc/next/stable windows, and bugfixes in subsystems health."""
+
+    def test_health_window_rc_next_and_stable_tags(self) -> None:
+        from unittest import mock
+        tag_map = {
+            "v1.0": "1" * 40,
+            "v1.0.1": "2" * 40,
+            "v1.0.2": "3" * 40,
+            "v1.1": "4" * 40,
+            "v1.2-rc1": "5" * 40,
+            "v1.2-rc2": "6" * 40,
+            "next-20261109": "7" * 40,
+            "next-20261110": "8" * 40,
+        }
+        with mock.patch.object(rs, "tag_commits", return_value=tag_map):
+            self.assertEqual(ins._health_window("v1.2-rc2", 4), ["v1.0", "v1.1", "v1.2-rc2"])
+            self.assertEqual(ins._health_window("v1.2-rc2", 1), ["v1.2-rc2"])
+            self.assertEqual(ins._health_window("next-20261110", 3), ["v1.1", "next-20261109", "next-20261110"])
+            self.assertEqual(ins._health_window("v1.0.2", 3), ["v1.0", "v1.0.1", "v1.0.2"])
+            self.assertEqual(ins._health_window("v1.0.2", 4), ["v1.0", "v1.0.1", "v1.0.2"])
+
+    def test_delta_range_scan_dedup_rc_and_boundary_fallback(self) -> None:
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from parser.git_ast.release_order import series_ord_for, series_track_for
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+        from tests.db_fixtures import make_db, patch_reader
+        from tests.test_commit_relations import git
+        from webapp.backend.services.jobs import JobManager
+
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git is not installed")
+
+        tmp = Path(tempfile.mkdtemp(prefix="subsys-delta-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        g = lambda *a: git(tmp, *a)  # noqa: E731
+
+        maint_v1 = (
+            "FOO DRIVER\nM:\tAnn Dev <ann@x.org>\nS:\tMaintained\nF:\tdrivers/foo/\n\n"
+            "NO FILES\nM:\tAnn Dev <ann@x.org>\nS:\tMaintained\nN:\tfoo\n\n"
+            "THE REST\nM:\tLinus <l@x.org>\nS:\tBuried\nF:\t*\n"
+        )
+
+        def commit(author: str, email: str, msg: str, files: dict[str, str]) -> str:
+            for path, text in files.items():
+                (tmp / path).parent.mkdir(parents=True, exist_ok=True)
+                (tmp / path).write_text(text)
+            g("add", "-A")
+            g("-c", f"user.name={author}", "-c", f"user.email={email}", "commit", "-q", "--author", f"{author} <{email}>", "-m", msg)
+            return g("rev-parse", "HEAD").strip()
+
+        g("init", "-q", "-b", "master")
+        commit("Ann Dev", "ann@x.org", "init", {"MAINTAINERS": maint_v1, "drivers/foo/a.c": "0\n"})
+        g("tag", "v1.0")
+        commit("Ann Dev", "ann@x.org", "rc1 fix\n\nReviewed-by: Rev <rev@x.org>", {"drivers/foo/a.c": "1\n"})
+        g("tag", "v1.1-rc1")
+        commit("Bob Bar", "bob@x.org", "final fix", {"drivers/foo/a.c": "2\n"})
+        g("tag", "v1.1")
+        commit("Ann Dev", "ann@x.org", "v1.2 work", {"drivers/foo/a.c": "3\n"})
+        g("tag", "v1.2")
+
+        secs = MaintainerParser(maint_v1).parse()
+        for idx, s in enumerate(secs, start=1):
+            s.sec_id = idx
+        matcher = MaintainerMatcher(secs)
+
+        db = make_db(
+            "sqlite",
+            tables=[D.insights_subsystem_version_delta, D.insights_subsystem_author_delta],
+        )
+        ann_key = ins.identity("Ann Dev", "ann@x.org")
+        bob_key = ins.identity("Bob Bar", "bob@x.org")
+
+        # Insert BOTH rolled-up v1.1 (parent_tag=v1.0) AND v1.1-rc1 (parent_tag=v1.0) to verify no double-counting,
+        # plus v1.2 (parent_tag=v1.1).
+        db.insert_rows(
+            "insights_subsystem_version_delta",
+            [
+                "version_tag", "subsystem_name", "parent_tag", "series_track", "series_ord",
+                "release_ts", "maintainer_status", "commit_count", "merge_commit_count",
+                "lines_added", "lines_removed", "files_touched_count", "distinct_author_count",
+                "fixes_commit_count", "stable_cc_count", "reviewed_commit_count", "tested_commit_count",
+            ],
+            [
+                ("v1.1-rc1", "", "v1.0", series_track_for("v1.1-rc1"), series_ord_for("v1.1-rc1"), 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ("v1.1-rc1", "FOO DRIVER", "v1.0", series_track_for("v1.1-rc1"), series_ord_for("v1.1-rc1"), 0, "Maintained", 1, 0, 1, 0, 1, 1, 0, 0, 1, 0),
+                ("v1.1", "", "v1.0", series_track_for("v1.1"), series_ord_for("v1.1"), 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ("v1.1", "FOO DRIVER", "v1.0", series_track_for("v1.1"), series_ord_for("v1.1"), 0, "Maintained", 2, 0, 2, 0, 1, 2, 0, 0, 1, 0),
+                ("v1.2", "", "v1.1", series_track_for("v1.2"), series_ord_for("v1.2"), 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                ("v1.2", "FOO DRIVER", "v1.1", series_track_for("v1.2"), series_ord_for("v1.2"), 0, "Maintained", 1, 0, 1, 0, 1, 1, 0, 0, 0, 0),
+            ],
+        )
+        db.insert_rows(
+            "insights_subsystem_author_delta",
+            ["version_tag", "subsystem_name", "author_identity_id", "series_track", "series_ord", "author_key", "commit_count", "last_active_ts"],
+            [
+                ("v1.1-rc1", "FOO DRIVER", 1, series_track_for("v1.1-rc1"), series_ord_for("v1.1-rc1"), ann_key, 1, 100),
+                ("v1.1", "FOO DRIVER", 1, series_track_for("v1.1"), series_ord_for("v1.1"), ann_key, 1, 200),
+                ("v1.1", "FOO DRIVER", 2, series_track_for("v1.1"), series_ord_for("v1.1"), bob_key, 1, 250),
+                ("v1.2", "FOO DRIVER", 1, series_track_for("v1.2"), series_ord_for("v1.2"), ann_key, 1, 300),
+            ],
+        )
+
+        with patch_reader(db), \
+                mock.patch.object(rs, "get_repo_dir", lambda: tmp), \
+                mock.patch.object(ins, "get_repo_dir", lambda: tmp), \
+                mock.patch.object(rs, "_PASS_DISK", _NoDisk()), \
+                mock.patch.object(ins, "_DISK", _NoDisk()), \
+                mock.patch.object(rs, "jobs", JobManager(workers=1)), \
+                mock.patch("webapp.backend.database.helpers.get_active_repo_id", lambda cur: 1), \
+                mock.patch("webapp.backend.database.helpers.get_active_network_id", lambda cur: 1), \
+                mock.patch.object(ins, "_maintainer_data", return_value=(secs, matcher)):
+            rs._TAGS_CACHE.clear()
+            self.addCleanup(rs._TAGS_CACHE.clear)
+
+            # Full delta coverage serves synchronously from DB without double-counting v1.1-rc1
+            res = ins.subsystem_health("v1.2", window=2)
+            self.assertEqual(res["state"], "done")
+            self.assertEqual(res["result"]["source"], "database")
+            rows = {r["name"]: r for r in res["result"]["sections"]}
+            self.assertEqual(rows["FOO DRIVER"]["commits"], 3)
+            self.assertEqual(rows["FOO DRIVER"]["per_release"], [2, 1])
+            self.assertEqual(rows["FOO DRIVER"]["authors"], 2)  # Ann (2) + Bob (1)
+            self.assertEqual(rows["FOO DRIVER"]["bus_factor"], 1)
+            self.assertEqual(rows["FOO DRIVER"]["maintainers"][0]["last_active"], 300)
+            self.assertTrue(rows["FOO DRIVER"]["has_file_patterns"])
+            self.assertFalse(rows["NO FILES"]["has_file_patterns"])
+
+            # Delete v1.2 from deltas -> partial window merges v1.1 from delta + ONLY v1.2 from Git!
+            db.delete_rows("insights_subsystem_version_delta", {"version_tag": "v1.2"})
+            db.delete_rows("insights_subsystem_author_delta", {"version_tag": "v1.2"})
+            with mock.patch.object(rs, "release_commits_now", wraps=rs.release_commits_now) as m_pass:
+                mixed = ins.compute_subsystem_health("v1.2", 2)
+            self.assertEqual(mixed["source"], "git")
+            m_pass.assert_called_once()
+            self.assertEqual(m_pass.call_args.args[0], "v1.2")
+            m_rows = {r["name"]: r for r in mixed["sections"]}
+            self.assertEqual(m_rows["FOO DRIVER"]["commits"], 3)
+            self.assertEqual(m_rows["FOO DRIVER"]["per_release"], [2, 1])
+            self.assertEqual(m_rows["FOO DRIVER"]["authors"], 2)
+
+            # repo_id < 0 or empty tags never falsely return source="database"
+            with mock.patch("webapp.backend.database.helpers.get_active_repo_id", lambda cur: -1):
+                self.assertIsNone(ins.health_from_db("v1.2", ["v1.1", "v1.2"], secs, matcher))
+            self.assertIsNone(ins.health_from_db("v1.2", [], secs, matcher))
+
+    def test_precomputed_health_keeps_earlier_releases_across_maintainers_evolution(self) -> None:
+        import json
+        from unittest import mock
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+        from tests.db_fixtures import make_db, patch_reader
+
+        maint_v1 = "FOO SUBSYSTEM\nM:\tAnn B <ann@x.org>\nS:\tMaintained\nF:\ta.c\n\nTHE REST\nF:\t*\n"
+        maint_v2 = (
+            "FOO SUBSYSTEM\nM:\tAnn B <ann@x.org>\nS:\tMaintained\nF:\ta.c\n\n"
+            "NEW SUBSYSTEM\nM:\tBob <bob@x.org>\nS:\tMaintained\nF:\tb.c\n\n"
+            "THE REST\nF:\t*\n"
+        )
+        secs_v1 = MaintainerParser(maint_v1).parse()
+        secs_v2 = MaintainerParser(maint_v2).parse()
+        matcher_v2 = MaintainerMatcher(secs_v2)
+
+        db = make_db("sqlite", tables=[D.m_release_segment, D.m_release_section_health])
+        h1, h2 = "a" * 40, "b" * 40
+        db.insert_rows(
+            "m_release_segment",
+            ["segment_id", "repo_id", "tag", "tag_hash", "chain", "base_tag", "base_hash", "commits", "merges", "diff_base_tag", "files_changed", "lines_added", "lines_removed", "format"],
+            [
+                (1, 1, "v1.1", bytes.fromhex(h1), 1, "v1.0", b"\x00" * 20, 2, 0, "v1.0", 1, 1, 0, 2),
+                (2, 1, "v1.2", bytes.fromhex(h2), 1, "v1.1", bytes.fromhex(h1), 1, 0, "v1.1", 1, 1, 0, 2),
+            ],
+        )
+        foo_v1 = secs_v1[0]
+        db.insert_rows(
+            "m_release_section_health",
+            ["segment_id", "sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
+            [
+                (1, "FOO SUBSYSTEM", 1, "Maintained", 2, 1, json.dumps({"e:ann@x.org": 2}), json.dumps({"e:ann@x.org": 10}), ins._section_pattern_hash(foo_v1), ins.HEALTH_FORMAT),
+                (1, "", 0, "", 0, 0, None, None, ins._sections_manifest_hash(secs_v1, "THE REST"), ins.HEALTH_FORMAT),
+                (2, "FOO SUBSYSTEM", 1, "Maintained", 1, 0, json.dumps({"e:ann@x.org": 1}), json.dumps({"e:ann@x.org": 20}), ins._section_pattern_hash(secs_v2[0]), ins.HEALTH_FORMAT),
+                (2, "NEW SUBSYSTEM", 2, "Maintained", 1, 1, json.dumps({"e:bob@x.org": 1}), json.dumps({"e:bob@x.org": 21}), ins._section_pattern_hash(secs_v2[1]), ins.HEALTH_FORMAT),
+                (2, "", 0, "", 0, 0, None, None, ins._sections_manifest_hash(secs_v2, "THE REST"), ins.HEALTH_FORMAT),
+            ],
+        )
+        from webapp.backend.database.pool import get_reader
+        tc = {"v1.0": "0" * 40, "v1.1": h1, "v1.2": h2}
+        with patch_reader(db), \
+                mock.patch.object(rs, "tag_commits", return_value=tc), \
+                mock.patch.object(rs, "previous", side_effect=lambda t: {"v1.1": "v1.0", "v1.2": "v1.1"}.get(t)):
+            with get_reader() as cur:
+                pre, unans = ins._read_precomputed_health(cur, 1, ["v1.1", "v1.2"], secs_v2, tc, target_tag="v1.2")
+        # v1.1 must NOT be invalidated just because NEW SUBSYSTEM was added in v1.2!
+        self.assertEqual(unans, [])
+        self.assertIn("v1.1", pre)
+        self.assertIn("v1.2", pre)
+        res = ins._aggregate_health("v1.2", ["v1.1", "v1.2"], secs_v2, matcher_v2, lambda t: [], precomputed=pre)
+        by_name = {s["name"]: s for s in res["sections"]}
+        self.assertEqual(by_name["FOO SUBSYSTEM"]["per_release"], [2, 1])
+        self.assertEqual(by_name["NEW SUBSYSTEM"]["per_release"], [0, 1])
+
+    def test_load_maintainers_skips_db_for_unparsed_and_latest(self) -> None:
+        from unittest import mock
+        from tests.db_fixtures import make_db, patch_reader
+
+        db = make_db("sqlite", tables=[D.m_git_ref, D.m_commit, D.m_ingest_state])
+        with patch_reader(db), \
+                mock.patch("webapp.backend.database.helpers.get_active_repo_id", lambda cur: -1), \
+                mock.patch.object(ins, "_git", return_value="FOO\nM:\tA <a@x>\nS:\tMaintained\nF:\ta.c\n"), \
+                mock.patch("webapp.backend.services.maintainer_service.MaintainerService.get_maintainer_data",
+                           side_effect=AssertionError("should not query MaintainerService when unparsed")):
+            secs, _matcher = ins._load_maintainers("latest", "a" * 40)
+            self.assertEqual([s.name for s in secs], ["FOO"])
+            secs2, _ = ins._load_maintainers("v99.0", "b" * 40)
+            self.assertEqual([s.name for s in secs2], ["FOO"])
+
+    def test_compute_subsystem_health_reraises_job_cancelled(self) -> None:
+        from unittest import mock
+        from webapp.backend.services.jobs import JobCancelled
+
+        with mock.patch.object(ins, "_health_window", return_value=["v1.1"]), \
+                mock.patch.object(ins, "_maintainer_data", return_value=([], None)), \
+                mock.patch.object(ins, "health_from_db", side_effect=JobCancelled()):
+            with self.assertRaises(JobCancelled):
+                ins.compute_subsystem_health("v1.1", 1)
+
+    def test_subsystem_health_cache_key_changes_with_window_tags(self) -> None:
+        from unittest import mock
+        seen_keys: list[str] = []
+
+        def fake_job(key, build, ck, wait):
+            seen_keys.append(ck)
+            return {"state": "building", "progress": {}}
+
+        with mock.patch.object(ins, "_check_release"), \
+                mock.patch.object(ins, "_maintainer_data", return_value=([], None)), \
+                mock.patch.object(ins, "health_from_db", return_value=None), \
+                mock.patch.object(rs, "release_token", return_value="tok"), \
+                mock.patch.object(ins, "_job", side_effect=fake_job):
+            with mock.patch.object(rs, "tag_commits", return_value={"v1.0": "1" * 40, "v1.2": "2" * 40}), \
+                    mock.patch.object(ins, "_health_window", return_value=["v1.0", "v1.2"]):
+                ins.subsystem_health("v1.2", window=2)
+            with mock.patch.object(rs, "tag_commits", return_value={"v1.0": "1" * 40, "v1.1": "3" * 40, "v1.2": "2" * 40}), \
+                    mock.patch.object(ins, "_health_window", return_value=["v1.1", "v1.2"]):
+                ins.subsystem_health("v1.2", window=2)
+        self.assertEqual(len(seen_keys), 2)
+        self.assertNotEqual(seen_keys[0], seen_keys[1])
+
+

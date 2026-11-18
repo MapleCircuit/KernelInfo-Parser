@@ -14,6 +14,7 @@ Shared by the parser's release statistics step (parser/git_ast/release_stats.py)
 """
 
 import contextlib
+import hashlib
 from typing import Any, Iterable
 
 from db_engine.spec import gt
@@ -45,6 +46,13 @@ def identity_key(name: str | None, email: str | None) -> str:
     if norm_name:
         return f"n:{norm_name}"
     return f"e:{(email or '').strip().casefold()}"
+
+
+def author_identity_id(key: str) -> int:
+    """Deterministic positive 63-bit integer (>= 1) derived from SHA-256 of `key`."""
+    digest = hashlib.sha256((key or "").encode("utf-8", errors="replace")).digest()
+    val = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    return val or 1
 
 
 def merge_emails(emails: Iterable[str | None]) -> list[str]:

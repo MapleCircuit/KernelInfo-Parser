@@ -128,6 +128,40 @@ def series_name(series: tuple) -> str:
     return f"v{series[0]}.{series[1]}.{series[2]}" if series[:2] == (2, 6) else f"v{series[0]}.{series[1]}"
 
 
+def series_track_for(tag: str) -> str:
+    """Logical release series track of `tag`: `'mainline'`, `'stable:<series>'`, or `'next'`
+    (prefixed mainline: `'mainline:<family>'`; `''` if unparsed)."""
+    p = parse_tag(tag)
+    if p is None:
+        return ""
+    if p["kind"] == "next":
+        return "next"
+    if p["kind"] == "stable":
+        return f"stable:{series_name(p['series'])}"
+    if p["family"] != KERNEL_FAMILY:
+        return f"mainline:{p['family']}"
+    return "mainline"
+
+
+def series_ord_for(tag: str) -> int:
+    """Monotonic unsigned integer ordinal of `tag` within its `series_track_for(tag)`."""
+    p = parse_tag(tag)
+    if p is None:
+        return 0
+    if p["kind"] == "next":
+        _, year, month = p["series"]
+        return int(year) * 10000 + int(month) * 100 + int(p["stable"])
+    if p["kind"] == "stable":
+        return int(p["stable"])
+    pre = int(p["pre"])
+    suffix = pre if pre else 9999
+    if p["family"] != KERNEL_FAMILY:
+        _, _prefix, major, minor = p["series"]
+        return ((int(major) * 10000 + int(minor)) * 10000) * 10000 + suffix
+    a, b, c = p["series"]
+    return ((int(a) * 10000 + int(b)) * 10000 + int(c)) * 10000 + suffix
+
+
 def previous_in(tag: str, tags: Iterable[str]) -> str | None:
     """The release `tag` follows, among the `tags` of its family:
 

@@ -6,18 +6,44 @@ import { api } from "../../api.js";
 import { escapeHtml } from "../../components/modal.js";
 import { registerInsightsSection } from "./insights_view.js";
 import { toTsv } from "../sections/section_model.js";
+import { kpiHtml } from "../../utils/svg_charts.js";
 import { hasFeature } from "../../utils/projects.js";
 
 const REASON = { "cc-stable": "Cc: stable", fixes: "Fixes a commit of the series" };
+const n = (x) => (x == null ? "—" : Number(x).toLocaleString("en-US"));
+
+export function buildStableSummaryHtml(summary) {
+  if (!summary || summary.available === false) return "";
+  const lat = summary.avg_fix_latency_days == null ? "—" : `${Number(summary.avg_fix_latency_days).toFixed(1)} d`;
+  const tiles = [
+    [n(summary.commits), "commits", summary.releases != null ? `${n(summary.releases)} stable releases` : ""],
+    [n(summary.backports), "backports"],
+    [n(summary.fixes), "Fixes"],
+    [n(summary.cc_stable), "Cc: stable"],
+    [n(summary.cve_commits), "CVE-linked"],
+    [`+${n(summary.lines_added)} −${n(summary.lines_removed)}`, "lines"],
+    [`${n(summary.same_cycle_fixes)} / ${n(summary.cross_release_fixes)}`, "same / cross fixes", "Same-cycle vs cross-release fixes"],
+    [lat, "avg fix latency"],
+  ];
+  // kpiHtml escapes every tile value, label, and title via esc()
+  return kpiHtml(tiles);
+}
 
 registerInsightsSection({
   id: "stable", label: "Stable", order: 50, keywords: "stable backport missing cc",
+  needsListForDetail: true,
   visible: (repo) => hasFeature(repo, "stable"),
   hint: "Mainline fixes marked for a stable series that it does not carry",
   emptyText: "Every marked commit has a backport in this series.",
   async fetchList(ctx) {
     if (!ctx.release) return { rows: [], emptyText: "No release tag found for this revision." };
-    const res = await (ctx.api || api).getInsights(ctx.version || ctx.release, `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`, ctx);
+    const client = ctx.api || api;
+    const verKey = client._vk ? client._vk(ctx.release) : ctx.release;
+    const res = await client.getInsights(
+      ctx.release,
+      `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`,
+      { ...ctx, cacheKey: `stable_${verKey}` },
+    );
     if (!res?.available) {
       return {
         rows: [],
@@ -25,8 +51,9 @@ registerInsightsSection({
         note: res?.reason || "no stable history",
       };
     }
+    const summaryHtml = res.summary ? buildStableSummaryHtml(res.summary) : "";
     return {
-      rows: res.candidates, total: res.total,
+      rows: res.candidates, total: res.total, summaryHtml,
       note: `${res.candidates_checked.toLocaleString("en-US")} marked commits checked against ${res.stable_tags} tags up to ${res.last_stable}`,
     };
   },

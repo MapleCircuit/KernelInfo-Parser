@@ -256,7 +256,7 @@ export class SectionedView {
 
   async switchSection(id) {
     this.abort?.abort();
-    this.persist({ view: id, sel: "", filter: "", cvssOp: "", cvssScore: null, title: `${this.title} · ${this.visibleSections().find((s) => s.id === id)?.label || id}` });
+    this.persist({ view: id, sel: "", filter: "", cvssOp: "", cvssScore: null, window: null, title: `${this.title} · ${this.visibleSections().find((s) => s.id === id)?.label || id}` });
     this.render(this.containerEl, this.tab);
   }
 

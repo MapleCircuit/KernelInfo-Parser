@@ -36,6 +36,35 @@ def _text(value: Any) -> Any:
     return value
 
 
+def _delta_where(
+    series_track: str | None = None,
+    *,
+    from_ord: int | None = None,
+    to_ord: int | None = None,
+    base_mainline_tag: str | None = None,
+    tags: Sequence[str] | None = None,
+    subsystem_name: str | None = None,
+    exclude_sentinel: bool = False,
+) -> list[Any]:
+    """Build spec Where terms for `(series_track, from_ord, to_ord]` insights delta queries."""
+    where: list[Any] = []
+    if series_track is not None:
+        where.append({"series_track": series_track})
+    if from_ord is not None:
+        where.append({"series_ord": gt(int(from_ord))})
+    if to_ord is not None:
+        where.append({"series_ord": le(int(to_ord))})
+    if base_mainline_tag is not None:
+        where.append({"base_mainline_tag": base_mainline_tag})
+    if tags is not None:
+        where.append({"version_tag": list(tags)})
+    if subsystem_name is not None:
+        where.append({"subsystem_name": subsystem_name})
+    elif exclude_sentinel:
+        where.append({"subsystem_name": ne("")})
+    return where
+
+
 class ReadIntents:
     """Named read operations of the webapp, built from spec reads (all rows are dicts)."""
 
@@ -653,5 +682,240 @@ class ReadIntents:
                     as_dict=True,
                 )
             )
+        return out
+
+    # ---- insights deltas -----------------------------------------------------------------------------------------
+    def subsystem_version_deltas(
+        self,
+        series_track: str,
+        *,
+        from_ord: int | None = None,
+        to_ord: int | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Incremental subsystem delta rows from `insights_subsystem_version_delta` for `series_track` and `(from_ord, to_ord]`."""
+        if tags is not None and not tags:
+            return []
+        if not self.existing_tables(["insights_subsystem_version_delta"]):  # type: ignore[attr-defined]
+            return []
+        where = _delta_where(series_track, from_ord=from_ord, to_ord=to_ord, tags=tags)
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "insights_subsystem_version_delta",
+            [
+                "version_tag",
+                "subsystem_name",
+                "parent_tag",
+                "series_track",
+                "series_ord",
+                "release_ts",
+                "maintainer_status",
+                "commit_count",
+                "merge_commit_count",
+                "lines_added",
+                "lines_removed",
+                "files_touched_count",
+                "distinct_author_count",
+                "fixes_commit_count",
+                "stable_cc_count",
+                "reviewed_commit_count",
+                "tested_commit_count",
+            ],
+            where or None,
+            order_by=["series_ord", "version_tag", "subsystem_name"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("version_tag", "subsystem_name", "parent_tag", "series_track", "maintainer_status"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+        return rows
+
+    def subsystem_author_deltas(
+        self,
+        series_track: str,
+        *,
+        from_ord: int | None = None,
+        to_ord: int | None = None,
+        tags: Sequence[str] | None = None,
+        subsystem_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Incremental subsystem author delta rows from `insights_subsystem_author_delta` for `(from_ord, to_ord]`."""
+        if tags is not None and not tags:
+            return []
+        if not self.existing_tables(["insights_subsystem_author_delta"]):  # type: ignore[attr-defined]
+            return []
+        where = _delta_where(
+            series_track,
+            from_ord=from_ord,
+            to_ord=to_ord,
+            tags=tags,
+            subsystem_name=subsystem_name,
+        )
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "insights_subsystem_author_delta",
+            [
+                "version_tag",
+                "subsystem_name",
+                "author_identity_id",
+                "series_track",
+                "series_ord",
+                "author_key",
+                "commit_count",
+                "last_active_ts",
+            ],
+            where or None,
+            order_by=["series_ord", "version_tag", "subsystem_name", "-commit_count", "author_identity_id"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("version_tag", "subsystem_name", "series_track", "author_key"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+        return rows
+
+    def subsystem_distinct_authors(
+        self,
+        series_track: str,
+        *,
+        from_ord: int | None = None,
+        to_ord: int | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> dict[str, int]:
+        """Exact `COUNT(DISTINCT author_identity_id)` per `subsystem_name` over `(from_ord, to_ord]`."""
+        if tags is not None and not tags:
+            return {}
+        if not self.existing_tables(["insights_subsystem_author_delta"]):  # type: ignore[attr-defined]
+            return {}
+        where = _delta_where(series_track, from_ord=from_ord, to_ord=to_ord, tags=tags, exclude_sentinel=True)
+        rows = self.aggregate(  # type: ignore[attr-defined]
+            "insights_subsystem_author_delta",
+            {"distinct_authors": Agg("COUNT", "author_identity_id", distinct=True)},
+            where or None,
+            group_by=["subsystem_name"],
+            as_dict=True,
+        )
+        out: dict[str, int] = {}
+        for r in rows:
+            name = str(_text(r.get("subsystem_name", "")) or "")
+            if name:
+                out[name] = int(r.get("distinct_authors") or 0)
+        return out
+
+    def stable_version_deltas(
+        self,
+        series_track: str | None = None,
+        *,
+        from_ord: int | None = None,
+        to_ord: int | None = None,
+        base_mainline_tag: str | None = None,
+        tags: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Incremental stable-release delta rows from `insights_stable_version_delta`."""
+        if tags is not None and not tags:
+            return []
+        if not self.existing_tables(["insights_stable_version_delta"]):  # type: ignore[attr-defined]
+            return []
+        where = _delta_where(
+            series_track,
+            from_ord=from_ord,
+            to_ord=to_ord,
+            base_mainline_tag=base_mainline_tag,
+            tags=tags,
+        )
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "insights_stable_version_delta",
+            [
+                "version_tag",
+                "subsystem_name",
+                "parent_tag",
+                "base_mainline_tag",
+                "series_track",
+                "series_ord",
+                "release_ts",
+                "total_commits",
+                "backport_commits",
+                "fixes_tag_commits",
+                "cc_stable_commits",
+                "cve_linked_commits",
+                "lines_added",
+                "lines_removed",
+                "same_cycle_fixes_count",
+                "cross_release_fixes_count",
+                "sum_fix_latency_days",
+                "resolved_fixes_count",
+            ],
+            where or None,
+            order_by=["series_ord", "version_tag", "subsystem_name"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("version_tag", "subsystem_name", "parent_tag", "base_mainline_tag", "series_track"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+        return rows
+
+    def stable_aggregated_metrics(
+        self,
+        series_track: str | None = None,
+        *,
+        from_ord: int | None = None,
+        to_ord: int | None = None,
+        base_mainline_tag: str | None = None,
+        tags: Sequence[str] | None = None,
+        by_subsystem: bool = False,
+    ) -> list[dict[str, Any]]:
+        """SQL `SUM(...)` aggregates over `insights_stable_version_delta` with `avg_fix_latency_days`."""
+        if tags is not None and not tags:
+            return []
+        if not self.existing_tables(["insights_stable_version_delta"]):  # type: ignore[attr-defined]
+            return []
+        int_cols = (
+            "total_commits",
+            "backport_commits",
+            "fixes_tag_commits",
+            "cc_stable_commits",
+            "cve_linked_commits",
+            "lines_added",
+            "lines_removed",
+            "same_cycle_fixes_count",
+            "cross_release_fixes_count",
+            "resolved_fixes_count",
+        )
+        aggs = {c: Agg("SUM", c) for c in (*int_cols, "sum_fix_latency_days")}
+        where = _delta_where(
+            series_track,
+            from_ord=from_ord,
+            to_ord=to_ord,
+            base_mainline_tag=base_mainline_tag,
+            tags=tags,
+            exclude_sentinel=by_subsystem,
+        )
+        rows = self.aggregate(  # type: ignore[attr-defined]
+            "insights_stable_version_delta",
+            aggs,
+            where or None,
+            group_by=["subsystem_name"] if by_subsystem else (),
+            order_by=["subsystem_name"] if by_subsystem else (),
+            as_dict=True,
+        )
+        if not rows:
+            return []
+        if not by_subsystem and rows[0].get("total_commits") is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item: dict[str, Any] = {}
+            if by_subsystem:
+                name = str(_text(r.get("subsystem_name", "")) or "")
+                if not name:
+                    continue
+                item["subsystem_name"] = name
+            for c in int_cols:
+                item[c] = int(r.get(c) or 0)
+            sum_days = float(r.get("sum_fix_latency_days") or 0.0)
+            resolved = item["resolved_fixes_count"]
+            item["sum_fix_latency_days"] = sum_days
+            item["avg_fix_latency_days"] = round(sum_days / resolved, 2) if resolved else None
+            out.append(item)
         return out
 

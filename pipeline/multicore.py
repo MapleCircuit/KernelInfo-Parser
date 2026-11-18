@@ -9,12 +9,16 @@ from core.config import (
     get_db_config,
     get_ssh_tunnel_config,
 )
+import multiprocessing
 import os
+import pickle
 import sys
 
 import time
 from typing import Any
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 import gc
 from db_engine import (
     tuning_note_is_warning,
@@ -319,3 +323,126 @@ def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
             logger.warning(COLOR.yellow(f"[DB Tuning] {note}"))
         else:
             logger.info(f"[DB Tuning] {note}")
+
+
+def preparse_worker_count(task_count: int | None = None, workers: int | None = None) -> int:
+    """Return worker count saturating available CPU cores (clamped when `task_count` is positive)."""
+    if workers is None:
+        count = max(1, int(os.cpu_count() or getattr(G, "CPUS", 0) or 4))
+    else:
+        count = max(1, int(workers))
+    if task_count is not None and task_count > 0:
+        count = min(count, int(task_count))
+    return max(1, count)
+
+
+def _is_pool_or_pickle_error(exc: BaseException) -> bool:
+    """Return True when `exc` indicates a process-pool startup or pickling failure."""
+    if isinstance(exc, (pickle.PicklingError, BrokenProcessPool, EOFError)):
+        return True
+    if isinstance(exc, (TypeError, AttributeError)):
+        msg = str(exc).lower()
+        return "pickle" in msg or "local object" in msg
+    return False
+
+
+def _drain_pool_futures(
+    futures: list[tuple[int, Any]],
+    item_list: list[Any],
+    results: list[Any],
+    completed: set[int],
+    on_result: Callable[[Any, Any], None] | None,
+    ordered: bool,
+    pool: Any,
+    *,
+    catch_pool_errors: bool,
+) -> BaseException | None:
+    """Collect futures in index or completion order, invoking `on_result` serially in parent."""
+    if ordered:
+        seq: Iterable[tuple[int, Any]] = futures
+    else:
+        future_to_idx = {fut: idx for idx, fut in futures}
+        seq = ((future_to_idx[fut], fut) for fut in as_completed(future_to_idx))
+
+    for idx, fut in seq:
+        try:
+            res = fut.result()
+        except Exception as exc:
+            if catch_pool_errors and _is_pool_or_pickle_error(exc):
+                pool.shutdown(wait=False, cancel_futures=True)
+                return exc
+            raise
+        results[idx] = res
+        completed.add(idx)
+        if on_result is not None:
+            on_result(item_list[idx], res)
+    return None
+
+
+def run_unified_preparse_pool(
+    items: Sequence[Any],
+    worker_fn: Callable[[Any], Any],
+    *,
+    workers: int | None = None,
+    on_result: Callable[[Any, Any], None] | None = None,
+    ordered: bool = False,
+) -> list[Any]:
+    """Execute `worker_fn(item)` across forked workers saturating CPU cores, falling back to threads.
+
+    All `on_result(item, result)` callbacks execute serially in the parent process so database
+    persistence remains contention-free.
+    """
+    item_list = list(items)
+    total = len(item_list)
+    if total == 0:
+        return []
+
+    n_workers = preparse_worker_count(task_count=total, workers=workers)
+    results: list[Any] = [None] * total
+    completed: set[int] = set()
+
+    if n_workers == 1 or total == 1:
+        for idx, item in enumerate(item_list):
+            res = worker_fn(item)
+            results[idx] = res
+            completed.add(idx)
+            if on_result is not None:
+                on_result(item, res)
+        return results
+
+    fallback_exc: BaseException | None = None
+    try:
+        mp_ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_ctx) as pool:
+            futures: list[tuple[int, Any]] = []
+            for idx, item in enumerate(item_list):
+                try:
+                    fut = pool.submit(worker_fn, item)
+                except Exception as exc:
+                    if _is_pool_or_pickle_error(exc):
+                        fallback_exc = exc
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    raise
+                futures.append((idx, fut))
+
+            if fallback_exc is None:
+                fallback_exc = _drain_pool_futures(
+                    futures, item_list, results, completed, on_result, ordered, pool, catch_pool_errors=True
+                )
+    except (OSError, NotImplementedError, ValueError, ImportError, BrokenProcessPool) as exc:
+        fallback_exc = exc
+
+    if fallback_exc is not None:
+        logger.warning(
+            COLOR.yellow(f"[Pre-parse] Process pool unavailable ({fallback_exc}); using {n_workers} thread worker(s).")
+        )
+        remaining = [idx for idx in range(total) if idx not in completed]
+        if remaining:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                t_futures = [(idx, pool.submit(worker_fn, item_list[idx])) for idx in remaining]
+                _drain_pool_futures(
+                    t_futures, item_list, results, completed, on_result, ordered, pool, catch_pool_errors=False
+                )
+
+    return results

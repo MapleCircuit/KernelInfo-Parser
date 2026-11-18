@@ -63,6 +63,25 @@ def get_stable_missing(
     return job_answer(missing_report(series, wait=2.0), shape)
 
 
+@router.get("/{version_name}/stable/summary", dependencies=[Depends(require_feature("stable"))])
+def get_stable_summary(
+    version_name: str,
+    series: Annotated[str | None, Query(description="A release with stable tags, e.g. v3.0")] = None,
+    from_ref: Annotated[str | None, Query(description="Exclusive lower release/stable tag bound")] = None,
+    to_ref: Annotated[str | None, Query(description="Inclusive upper stable tag bound")] = None,
+) -> dict[str, Any]:
+    """Aggregated stable-series delta metrics (commits, backports, Fixes, Cc: stable, CVEs, lines, fix latency)."""
+    from webapp.backend.services.stable_service import stable_summary
+
+    target = series or version_name
+    safe_rev(target, "series")
+    if from_ref is not None:
+        safe_rev(from_ref, "from_ref")
+    if to_ref is not None:
+        safe_rev(to_ref, "to_ref")
+    return stable_summary(target, from_ref=from_ref, to_ref=to_ref)
+
+
 @router.get("/{version_name}/release-stats", dependencies=[Depends(require_feature("commits"))])
 def get_release_stats(version_name: str) -> Any:
     """Statistics of a release (H6): commits, merges, authors, first-timers, lines, days, -rc count, top

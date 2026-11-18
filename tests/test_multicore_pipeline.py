@@ -528,10 +528,6 @@ class TestEpochOrdering(unittest.TestCase):
             self.assertEqual([b[0] for b in in_order[0]], [0, 1, 2, 3, 4])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class _FakeConn:
     """Worker-side pipe end: serves one task frame, then reports a closed pipe; keeps what is sent."""
 
@@ -884,3 +880,110 @@ class TestSchedulerAndStageFixes(unittest.TestCase):
         self.assertEqual(nid, 42)
         fake_db.reserve_id_block.assert_called_once_with(m_project, 1)
         fake_db.get_next_id.assert_not_called()
+
+
+def _picklable_preparse_worker(x: int) -> tuple[int, int]:
+    """Module-level picklable worker verifying ProcessPoolExecutor execution."""
+    return (x * x, os.getpid())
+
+
+class TestUnifiedPreparsePool(unittest.TestCase):
+    def test_global_cpus_tracks_os_cpu_count(self) -> None:
+        from core.globalstuff import GlobalStuff
+
+        with mock.patch("core.globalstuff.os.cpu_count", return_value=24):
+            gs = GlobalStuff()
+            self.assertEqual(gs.CPUS, 24)
+        with mock.patch("core.globalstuff.os.cpu_count", return_value=None):
+            gs = GlobalStuff()
+            self.assertEqual(gs.CPUS, 8)
+
+    def test_preparse_worker_count_saturates_cores_and_clamps(self) -> None:
+        with mock.patch("pipeline.multicore.os.cpu_count", return_value=32):
+            self.assertEqual(pipeline.multicore.preparse_worker_count(), 32)
+            self.assertEqual(pipeline.multicore.preparse_worker_count(task_count=5), 5)
+            self.assertEqual(pipeline.multicore.preparse_worker_count(task_count=0), 32)
+            self.assertEqual(pipeline.multicore.preparse_worker_count(task_count=10, workers=6), 6)
+            self.assertEqual(pipeline.multicore.preparse_worker_count(task_count=3, workers=6), 3)
+        with mock.patch("pipeline.multicore.os.cpu_count", return_value=None), \
+                mock.patch.object(G, "CPUS", 12):
+            self.assertEqual(pipeline.multicore.preparse_worker_count(), 12)
+
+    def test_pool_runs_forked_processes_and_parent_on_result(self) -> None:
+        self.assertEqual(pipeline.multicore.run_unified_preparse_pool([], _picklable_preparse_worker), [])
+
+        seen: list[tuple[int, int]] = []
+        res = pipeline.multicore.run_unified_preparse_pool(
+            [2, 3, 4, 5],
+            _picklable_preparse_worker,
+            workers=2,
+            on_result=lambda item, val: seen.append((item, val[0])),
+        )
+        self.assertEqual([r[0] for r in res], [4, 9, 16, 25])
+        self.assertEqual(sorted(seen), [(2, 4), (3, 9), (4, 16), (5, 25)])
+        self.assertTrue(any(pid != os.getpid() for _, pid in res))
+
+    def test_pool_falls_back_to_threads_when_unpicklable(self) -> None:
+        seen: list[tuple[int, int]] = []
+        res = pipeline.multicore.run_unified_preparse_pool(
+            [1, 2, 3],
+            lambda x: x + 10,
+            workers=2,
+            on_result=lambda item, val: seen.append((item, val)),
+            ordered=True,
+        )
+        self.assertEqual(res, [11, 12, 13])
+        self.assertEqual(seen, [(1, 11), (2, 12), (3, 13)])
+
+    def test_pool_partial_crash_retries_only_remaining_items_without_duplicate_callbacks(self) -> None:
+        from concurrent.futures.process import BrokenProcessPool
+
+        calls: list[int] = []
+        seen: list[tuple[int, int]] = []
+
+        class _FakeFut:
+            def __init__(self, idx: int) -> None:
+                self.idx = idx
+
+            def result(self) -> int:
+                if self.idx == 0:
+                    return 100
+                raise BrokenProcessPool("child died")
+
+        class _FakeProcPool:
+            def __init__(self, *args, **kwargs) -> None:
+                self.futs = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def submit(self, fn, item):
+                fut = _FakeFut(len(self.futs))
+                self.futs.append(fut)
+                return fut
+
+            def shutdown(self, wait=True, cancel_futures=False) -> None:
+                return None
+
+        def _worker(x: int) -> int:
+            calls.append(x)
+            return x * 10
+
+        with mock.patch("pipeline.multicore.ProcessPoolExecutor", _FakeProcPool):
+            res = pipeline.multicore.run_unified_preparse_pool(
+                [1, 2, 3],
+                _worker,
+                workers=2,
+                on_result=lambda item, val: seen.append((item, val)),
+                ordered=True,
+            )
+        self.assertEqual(res, [100, 20, 30])
+        self.assertEqual(seen, [(1, 100), (2, 20), (3, 30)])
+        self.assertEqual(calls, [2, 3])
+
+
+if __name__ == "__main__":
+    unittest.main()

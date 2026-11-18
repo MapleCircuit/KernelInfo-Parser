@@ -3,14 +3,24 @@ from core.globalstuff import (
     G,
 )
 from core import ingest_state
-from core.config import (
-    get_parser_config,
-)
 
 import argparse
 import contextlib
+import inspect
+from typing import Any
 from pipeline.git_network import feature_enabled
+from pipeline.multicore import preparse_worker_count
 from pipeline.state import MF, logger
+
+
+def _resolve_backfill_workers(args: argparse.Namespace) -> int:
+    """Resolve worker count for backfill extractors, defaulting to full CPU core saturation."""
+    explicit = getattr(args, "preparse_workers", None)
+    try:
+        workers_arg = int(explicit) if explicit is not None else None
+    except (TypeError, ValueError):
+        workers_arg = None
+    return preparse_worker_count(workers=workers_arg)
 
 
 
@@ -33,10 +43,7 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             logger.info(f"[Backfill Kbuild] {summary}")
         if getattr(args, "backfill_facts", False):
             requested = True
-            try:
-                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
-            except (TypeError, ValueError):
-                workers = 4
+            workers = _resolve_backfill_workers(args)
             summary = backfills.backfill_facts(db, MF, network_id, repo_id, getattr(args, "facts_families", None), workers)
             logger.info(f"[Backfill facts] {summary}")
         if getattr(args, "backfill_commit_relations", False):
@@ -49,18 +56,12 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             logger.info(f"[Repair head commit files] {summary}")
         if getattr(args, "backfill_doc_references", False):
             requested = True
-            try:
-                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
-            except (TypeError, ValueError):
-                workers = 4
+            workers = _resolve_backfill_workers(args)
             summary = backfills.backfill_doc_references(db, MF, network_id, repo_id, workers)
             logger.info(f"[Backfill doc references] {summary}")
         if getattr(args, "backfill_cve_files", False):
             requested = True
-            try:
-                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
-            except (TypeError, ValueError):
-                workers = 4
+            workers = _resolve_backfill_workers(args)
             summary = backfills.backfill_cve_files(db, MF, network_id, repo_id, workers)
             logger.info(f"[Backfill CVE files] {summary}")
         if getattr(args, "backfill_mailing_list", False):
@@ -71,11 +72,21 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             logger.info(f"[Backfill mailing list] {summary}")
         if getattr(args, "backfill_insights", False):
             requested = True
-            summary = backfills.backfill_insights(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
+            ins_kwargs: dict[str, Any] = {}
+            if "workers" in inspect.signature(backfills.backfill_insights).parameters:
+                ins_kwargs["workers"] = _resolve_backfill_workers(args)
+            summary = backfills.backfill_insights(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None), **ins_kwargs)
             logger.info(f"[Backfill insights] {summary}")
         if getattr(args, "backfill_kapi", False):
             requested = True
-            summary = backfills.backfill_kapi(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
+            kapi_kwargs: dict[str, Any] = {}
+            kapi_sig = inspect.signature(backfills.backfill_kapi).parameters
+            if "workers" in kapi_sig:
+                kapi_kwargs["workers"] = _resolve_backfill_workers(args)
+            raw_arches = getattr(args, "kapi_arches", None)
+            if raw_arches and "arches" in kapi_sig:
+                kapi_kwargs["arches"] = tuple(dict.fromkeys(a.strip().lower() for a in raw_arches if a and a.strip()))
+            summary = backfills.backfill_kapi(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None), **kapi_kwargs)
             logger.info(f"[Backfill KAPI] {summary}")
         if getattr(args, "backfill_cve_releases", False):
             requested = True

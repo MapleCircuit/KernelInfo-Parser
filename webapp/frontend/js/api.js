@@ -446,6 +446,19 @@ class ApiClient {
     return data;
   }
 
+  /** Clear memoized `/api/insights/resolve` entries (all repos when `repo == null`, else only `repo`). */
+  clearInsightsResolveMemo(repo = null) {
+    if (!this._insightsResolveMemo) return;
+    if (repo === null || repo === undefined) {
+      this._insightsResolveMemo.clear();
+      return;
+    }
+    const prefix = `${repo}|`;
+    for (const key of this._insightsResolveMemo.keys()) {
+      if (key.startsWith(prefix)) this._insightsResolveMemo.delete(key);
+    }
+  }
+
   /**
    * An Insights report (`GET /api/insights/{v}/<path>`, §4.10): polls while its background job runs
    * (202, §2.15). `cacheKey` (optional) keeps the final body in the `tools` store.

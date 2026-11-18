@@ -297,6 +297,55 @@ class TestKapiIngestAndReadIntents(unittest.TestCase):
         with self.db.reader() as reader:
             self.assertIsNotNone(reader.kapi_release_summary(10, arch="x86_64"))
 
+    def test_pure_extract_and_parallel_ingest_kapi(self) -> None:
+        # Pure extractor works with zero DB dependency and writes cleanly via write_kapi_release_payload
+        payload = ki.extract_kapi_release_payload(str(self.repo), "v6.1", arches=("x86_64",))
+        self.assertEqual(payload["tag"], "v6.1")
+        self.assertGreater(len(payload["new_facts"]), 0)
+        self.assertGreater(len(payload["catalog_rows"]), 0)
+        self.assertEqual(len(payload["summary_rows"]), 1)
+
+        ki.write_kapi_release_payload(self.db, 10, payload)
+        # Re-extracting with existing_facts skips re-extracting already-known blobs
+        existing = ki._load_existing_facts(self.db, [sha for sha, _ in payload["new_facts"]])
+        payload2 = ki.extract_kapi_release_payload(str(self.repo), "v6.1", arches=("x86_64",), existing_facts=existing)
+        self.assertEqual(payload2["new_facts"], [])
+
+        # Multi-tag parallel ingest_kapi across v6.1 and v6.2-rc1
+        res = ki.ingest_kapi(self.db, str(self.repo), 1, tags=["v6.1", "v6.2-rc1"], force=True, workers=2)
+        self.assertEqual(res["built"], 2)
+        self.assertEqual(res["errors"], [])
+        with self.db.reader() as reader:
+            self.assertIsNotNone(reader.kapi_release_summary(10, arch="x86_64"))
+            self.assertIsNotNone(reader.kapi_release_summary(11, arch="x86_64"))
+
+        # Incremental skip after parallel build
+        res_skip = ki.ingest_kapi(self.db, str(self.repo), 1, tags=["v6.1", "v6.2-rc1"], workers=2)
+        self.assertEqual(res_skip["built"], 0)
+        self.assertEqual(res_skip["skipped"], 2)
+
+        # Single-tag multi-core fact extraction (>= 200 blobs triggers fi.extract with workers > 1)
+        extra_files = {f"drivers/extra/mod_{i:03d}.c": f"EXPORT_SYMBOL(sym_{i});\n" for i in range(205)}
+        sha_many = _git_commit_tag(self.repo, extra_files, "v6.3")
+        with mock.patch.object(ki.fi, "extract", wraps=ki.fi.extract) as spy_extract:
+            many_payload = ki.extract_kapi_release_payload(str(self.repo), "v6.3", arches=("x86_64",), workers=2)
+        self.assertTrue(spy_extract.called)
+        self.assertGreaterEqual(len(many_payload["new_facts"]), 205)
+
+        # Backfill KAPI passes workers=None (auto CPU saturation)
+        self.db.insert_rows(
+            "m_commit",
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            [(12, 1, bytes.fromhex(sha_many), 1, 3000, 1, 3000, "v6.3", "v6.3")],
+        )
+        self.db.insert_rows(
+            "m_git_ref",
+            ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id", "tagger_id", "tagger_date", "tag_message"],
+            [(3, 1, 1, "v6.3", 12, 1, 3000, "")],
+        )
+        bf_res = backfills.backfill_kapi(self.db, str(self.repo), 1)
+        self.assertGreaterEqual(bf_res["built"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

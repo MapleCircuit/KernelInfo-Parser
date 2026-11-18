@@ -735,5 +735,400 @@ class TestFeatureGating(unittest.TestCase):
             pipeline.backfill_steps.run_automatic_backfills(args)
 
 
+class TestUnifiedPreparseCLIAndOrchestration(unittest.TestCase):
+    """Tests for --preparse CLI flags, backfill worker saturation, and unified single-pass orchestration."""
+
+    def test_cli_preparse_flags_and_from_help(self) -> None:
+        import pipeline.cli as cli
+
+        parser = cli.build_arg_parser()
+        args = parser.parse_args([
+            "--preparse",
+            "--no-preparse-stable",
+            "--preparse-insights",
+            "--preparse-api",
+            "--preparse-tag", "v3.0",
+            "--preparse-tag", "v3.1",
+            "--kapi-arch", "x86_64",
+            "--kapi-arch", "arm64",
+            "--preparse-workers", "12",
+            "--from", "v3.0",
+        ])
+        self.assertTrue(args.preparse)
+        self.assertTrue(args.preparse_insights)
+        self.assertFalse(args.preparse_stable)
+        self.assertTrue(args.preparse_api)
+        self.assertEqual(args.preparse_tags, ["v3.0", "v3.1"])
+        self.assertEqual(args.kapi_arches, ["x86_64", "arm64"])
+        self.assertEqual(args.preparse_workers, 12)
+        self.assertEqual(args.backfill_from, "v3.0")
+        from_opt = next(a for a in parser._actions if a.dest == "backfill_from")
+        self.assertIn("pre-parse", from_opt.help.lower())
+
+    def test_backfills_and_kapi_default_to_preparse_worker_count(self) -> None:
+        import argparse
+        from contextlib import contextmanager
+        from core import backfills
+        import pipeline.backfill_steps as bfs
+        import pipeline.external_steps as ext
+
+        @contextmanager
+        def _ctx(db):
+            yield db
+
+        fake_db = mock.MagicMock()
+        args = argparse.Namespace(
+            backfill_facts=True,
+            facts_families=None,
+            backfill_doc_references=True,
+            backfill_cve_files=True,
+        )
+        with mock.patch.object(G, "DB", lambda: _ctx(fake_db)), \
+                mock.patch.object(bfs, "preparse_worker_count", return_value=16), \
+                mock.patch.object(backfills, "backfill_facts", return_value={"ok": 1}) as bf_facts, \
+                mock.patch.object(backfills, "backfill_doc_references", return_value={"ok": 1}) as bf_docs, \
+                mock.patch.object(backfills, "backfill_cve_files", return_value={"ok": 1}) as bf_cve:
+            self.assertTrue(bfs.run_requested_backfills(args, 1, 1))
+        self.assertEqual(bf_facts.call_args.args[5], 16)
+        self.assertEqual(bf_docs.call_args.args[4], 16)
+        self.assertEqual(bf_cve.call_args.args[4], 16)
+
+        with mock.patch.object(ext, "feature_enabled", return_value=True), \
+                mock.patch.object(ext, "preparse_worker_count", return_value=16), \
+                mock.patch.object(ext, "get_repository", return_value=None), \
+                mock.patch.object(G, "DB", lambda: _ctx(fake_db)), \
+                mock.patch("parser.kapi_ingest.ingest_kapi", return_value={"tags": 0, "built": 0, "skipped": 0, "errors": []}) as ki_mock:
+            ext.processing_kapi("/tmp/repo", 1)
+        self.assertEqual(ki_mock.call_args.kwargs["workers"], 16)
+
+    def test_unified_preparse_runs_insights_stable_and_kapi_in_single_pass(self) -> None:
+        from contextlib import contextmanager
+        from core.DBLayout import TABLES
+        import pipeline.external_steps as ext
+        from parser import kapi_catalog as kc, kapi_facts as kf, kapi_ingest as ki
+        from parser.git_ast import insights_deltas as real_deltas, release_stats
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = os.path.join(tmp.name, "linux")
+        os.makedirs(repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "-C", repo, "init", "-q"], check=True, env=env)
+        for fname, content, tag in [
+            ("a.c", "int v30;\n", "v3.0"),
+            ("a.c", "int v301;\n", "v3.0.1"),
+            ("a.c", "int v31;\n", "v3.1"),
+        ]:
+            with open(os.path.join(repo, fname), "w") as f:
+                f.write(content)
+            subprocess.run(["git", "-C", repo, "add", fname], check=True, env=env)
+            subprocess.run(["git", "-C", repo, "commit", "-q", "-m", tag], check=True, env=env)
+            subprocess.run(["git", "-C", repo, "tag", tag], check=True, env=env)
+
+        def _sha(t):
+            return subprocess.run(["git", "-C", repo, "rev-parse", f"{t}^{{commit}}"], capture_output=True, text=True, check=True).stdout.strip()
+
+        db = MockDB(use_global=False)
+        db.create_table(TABLES)
+        self.addCleanup(db.close)
+        db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
+        db.insert_rows("m_git_network", ["network_id", "project_id", "name", "root_commit_hash"], [(1, 1, "main", bytes.fromhex(_sha("v3.0")))])
+        db.insert_rows("m_repository", ["repo_id", "network_id", "name", "git_url", "default_branch"], [(1, 1, "linux", repo, "master")])
+        db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(1, "t", "t@t")])
+        db.insert_rows(
+            "m_commit",
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            [
+                (10, 1, bytes.fromhex(_sha("v3.0")), 1, 1, 1, 1, "v3.0", "v3.0"),
+                (11, 1, bytes.fromhex(_sha("v3.1")), 1, 2, 1, 2, "v3.1", "v3.1"),
+            ],
+        )
+        db.insert_rows(
+            "m_git_ref",
+            ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id", "tagger_id", "tagger_date", "tag_message"],
+            [(1, 1, 1, "v3.0", 10, 1, 1, ""), (2, 1, 1, "v3.1", 11, 1, 2, "")],
+        )
+        # Mark v3.0 KAPI already current so only v3.1 KAPI runs, while v3.0 insights/v3.0.1 stable/v3.1 all run
+        for kind in kc.ARCH_INDEPENDENT_KINDS:
+            db.insert_rows("m_kapi_catalog", ["commit_id", "arch", "kind", "catalog_format", "kapi_format", "total_count", "summary_json", "data", "built_at"],
+                           [(10, "", kind, kc.CATALOG_FORMAT, kf.KAPI_FORMAT, 0, "{}", b"{}", 1)])
+        db.insert_rows("m_kapi_release_summary", ["commit_id", "arch", "catalog_format", "kapi_format", "syscalls_count", "exports_count", "params_count", "tracepoints_count", "modules_count", "devices_count", "subsystems_json", "built_at"],
+                       [(10, "x86_64", kc.CATALOG_FORMAT, kf.KAPI_FORMAT, 0, 0, 0, 0, 0, 0, "{}", 1)])
+
+        write_delta_records = []
+        write_kapi_records = []
+
+        def _fake_extract_deltas(repo_arg, tag, sha, parent_tag, parent_sha, **kwargs):
+            return {
+                "tag": tag,
+                "parent_tag": parent_tag,
+                "compute_pulls": kwargs.get("compute_pulls"),
+                "pulls": [],
+                "sec_stats": {},
+                "sections": [],
+            }
+
+        def _fake_write_deltas_in_tx(db_arg, extracted, replace=False):
+            write_delta_records.append(
+                (extracted["tag"], extracted.get("parent_tag"), extracted.get("compute_pulls"), bool(replace))
+            )
+
+        def _fake_extract_kapi(rp, tag, *, arches=("x86_64",), existing_facts=None, workers=1):
+            return {"tag": tag, "arches": list(arches)}
+
+        def _fake_write_kapi(db_arg, commit_id, payload):
+            write_kapi_records.append((commit_id, payload["tag"], tuple(payload["arches"])))
+            return {"status": "built"}
+
+        @contextmanager
+        def _ctx():
+            yield db
+
+        pool_calls = []
+        real_pool = ext.run_unified_preparse_pool
+
+        def _spy_pool(*args, **kwargs):
+            pool_calls.append(len(args[0]))
+            return real_pool(*args, **kwargs)
+
+        with mock.patch.object(G, "DB", _ctx), \
+                mock.patch.object(ext, "feature_enabled", return_value=True), \
+                mock.patch.object(ext, "get_repository", return_value=None), \
+                mock.patch.object(ext, "run_unified_preparse_pool", side_effect=_spy_pool), \
+                mock.patch.object(real_deltas, "extract_release_deltas_from_git", side_effect=_fake_extract_deltas), \
+                mock.patch.object(real_deltas, "write_deltas_in_tx", side_effect=_fake_write_deltas_in_tx), \
+                mock.patch.object(real_deltas, "load_cve_commit_hashes", return_value=set()), \
+                mock.patch.object(real_deltas, "build_sha_to_release", return_value=None), \
+                mock.patch.object(ki, "extract_kapi_release_payload", side_effect=_fake_extract_kapi), \
+                mock.patch.object(ki, "write_kapi_release_payload", side_effect=_fake_write_kapi):
+            summary = ext.processing_unified_preparse(repo, 1, workers=2)
+            first_deltas = sorted(write_delta_records)
+            # Also verify tags override + from_tag filtering (v3.0.1 has no commit_id -> api_skipped_no_commit=1)
+            write_delta_records.clear()
+            write_kapi_records.clear()
+            summary_filtered = ext.processing_unified_preparse(
+                repo, 1, tags=["v3.0", "v3.0.1", "v3.1"], from_tag="v3.0.1", workers=2
+            )
+            # Verify interrupted ingest skips m_release_segment writes
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 10, 1, 1)])
+            write_delta_records.clear()
+            write_kapi_records.clear()
+            summary_interrupted = ext.processing_unified_preparse(repo, 1, tags=["v3.1"], force=True, workers=1)
+
+        self.assertEqual(len(pool_calls), 3, "each call must execute in a single unified pool pass")
+        self.assertEqual(summary["state"], "updated")
+        self.assertEqual(summary["insights_built"], 2)
+        self.assertEqual(summary["stable_built"], 1)
+        self.assertEqual(summary["api_built"], 1)
+        self.assertEqual(summary["segments_built"], 3)
+        self.assertEqual(
+            first_deltas,
+            [
+                ("v3.0", None, True, False),
+                ("v3.0.1", "v3.0", False, False),
+                ("v3.1", "v3.0", True, False),
+            ],
+        )
+        self.assertEqual(summary_filtered["api_skipped_no_commit"], 1)
+        self.assertEqual(summary_filtered["tags"], 2)
+        self.assertEqual(summary_interrupted["segments_built"], 0)
+        self.assertEqual(summary_interrupted["insights_built"], 1)
+        self.assertEqual(summary_interrupted["api_built"], 1)
+        self.assertEqual(len(release_stats.stored_segments(db, 1)), 3)
+        self.assertEqual(
+            write_delta_records,
+            [("v3.1", "v3.0", True, True)],
+        )
+        self.assertEqual(write_kapi_records, [(11, "v3.1", ("x86_64",))])
+
+    def test_unified_preparse_end_to_end_real_extractors_and_sqlite_tables(self) -> None:
+        from contextlib import contextmanager
+        from core.DBLayout import TABLES
+        from db_engine import SQLiteDB
+        import pipeline.external_steps as ext
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = os.path.join(tmp.name, "linux")
+        os.makedirs(repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Alice", "GIT_AUTHOR_EMAIL": "alice@example.com",
+               "GIT_COMMITTER_NAME": "Alice", "GIT_COMMITTER_EMAIL": "alice@example.com"}
+        subprocess.run(["git", "-C", repo, "init", "-q"], check=True, env=env)
+
+        def _commit_tag(files: dict[str, str], tag: str, msg: str) -> str:
+            for rel, txt in files.items():
+                p = os.path.join(repo, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(txt)
+            subprocess.run(["git", "-C", repo, "add", "-A"], check=True, env=env)
+            subprocess.run(["git", "-C", repo, "commit", "-q", "-m", msg], check=True, env=env)
+            subprocess.run(["git", "-C", repo, "tag", tag], check=True, env=env)
+            return subprocess.run(
+                ["git", "-C", repo, "rev-parse", f"{tag}^{{commit}}"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+        maint = "CORE SUBSYSTEM\nM:\tAlice <alice@example.com>\nS:\tMaintained\nF:\tfs/\n"
+        sha30 = _commit_tag(
+            {
+                "MAINTAINERS": maint,
+                "Makefile": "VERSION = 3\nPATCHLEVEL = 0\nSRCARCH := x86\ncore-y := fs/\n",
+                "arch/x86/Makefile": "",
+                "arch/x86/entry/syscalls/syscall_64.tbl": "0\tcommon\tread\tsys_read\n",
+                "fs/Makefile": "obj-y += rw.o\n",
+                "fs/rw.c": "SYSCALL_DEFINE3(read, int, fd, char *, buf, size_t, n) { return 0; }\nEXPORT_SYMBOL(vfs_read);\n",
+            },
+            "v3.0",
+            "Linux v3.0",
+        )
+        sha301 = _commit_tag(
+            {
+                "fs/rw.c": (
+                    "SYSCALL_DEFINE3(read, int, fd, char *, buf, size_t, n) { return 0; }\n"
+                    "EXPORT_SYMBOL(vfs_read);\nEXPORT_SYMBOL(vfs_write);\n"
+                ),
+            },
+            "v3.0.1",
+            f"fix read\n\nFixes: {sha30[:12]} (\"Linux v3.0\")\nCc: stable@vger.kernel.org\n",
+        )
+        sha31 = _commit_tag(
+            {
+                "fs/rw.c": (
+                    "SYSCALL_DEFINE3(read, int, fd, char *, buf, size_t, n) { return 0; }\n"
+                    "EXPORT_SYMBOL(vfs_read);\nEXPORT_SYMBOL(vfs_write);\nEXPORT_SYMBOL(vfs_open);\n"
+                ),
+            },
+            "v3.1",
+            "Linux v3.1",
+        )
+
+        db = SQLiteDB(":memory:")
+        db.create_table(TABLES)
+        self.addCleanup(db.close)
+        db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
+        db.insert_rows("m_git_network", ["network_id", "project_id", "name", "root_commit_hash"], [(1, 1, "mainline", bytes.fromhex(sha30))])
+        db.insert_rows("m_repository", ["repo_id", "network_id", "name", "git_url", "default_branch"], [(1, 1, "linux", repo, "master")])
+        db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(1, "Alice", "alice@example.com")])
+        db.insert_rows(
+            "m_commit",
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            [
+                (10, 1, bytes.fromhex(sha30), 1, 1, 1, 1, "v3.0", "v3.0"),
+                (11, 1, bytes.fromhex(sha301), 1, 2, 1, 2, "v3.0.1", "v3.0.1"),
+                (12, 1, bytes.fromhex(sha31), 1, 3, 1, 3, "v3.1", "v3.1"),
+            ],
+        )
+        db.insert_rows(
+            "m_git_ref",
+            ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id", "tagger_id", "tagger_date", "tag_message"],
+            [(1, 1, 1, "v3.0", 10, 1, 1, ""), (2, 1, 1, "v3.0.1", 11, 1, 2, ""), (3, 1, 1, "v3.1", 12, 1, 3, "")],
+        )
+
+        @contextmanager
+        def _ctx():
+            yield db
+
+        with mock.patch.object(G, "DB", _ctx), \
+                mock.patch.object(ext, "feature_enabled", return_value=True), \
+                mock.patch.object(ext, "get_repository", return_value=None):
+            summary = ext.processing_unified_preparse(repo, 1, workers=2)
+            again = ext.processing_unified_preparse(repo, 1, workers=2)
+
+        self.assertEqual(summary["state"], "updated")
+        self.assertEqual(summary["insights_built"], 2)
+        self.assertEqual(summary["stable_built"], 1)
+        self.assertEqual(summary["api_built"], 2)  # all_main -> v3.0 and v3.1
+        self.assertEqual(summary["errors"], [])
+        self.assertGreater(db.count_rows("insights_subsystem_version_delta"), 0)
+        self.assertGreater(db.count_rows("insights_subsystem_author_delta"), 0)
+        self.assertGreater(db.count_rows("insights_stable_version_delta"), 0)
+        self.assertGreater(db.count_rows("m_release_segment"), 0)
+        self.assertGreater(db.count_rows("m_release_pull"), 0)
+        self.assertGreater(db.count_rows("m_release_section_health"), 0)
+        self.assertGreater(db.count_rows("m_kapi_catalog"), 0)
+        self.assertEqual(db.count_rows("m_kapi_release_summary"), 2)
+        self.assertGreater(db.count_rows("m_blob_facts"), 0)
+
+        # Second pass skips all already-current tags
+        self.assertEqual(again["state"], "current")
+        self.assertEqual(again["work_items"], 0)
+        self.assertEqual(again["skipped_current"], 3)
+
+    def test_main_dispatches_preparse_mode_without_libclang_preflight(self) -> None:
+        import argparse
+        import tempfile as tf
+
+        tmp = tf.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = os.path.join(tmp.name, "linux")
+        os.makedirs(repo)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "-C", repo, "init", "-q"], check=True, env=env)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env)
+
+        args = argparse.Namespace(
+            mem_max=0,
+            role="standalone",
+            reset=False,
+            Drop=False,
+            repo=repo,
+            cve=False,
+            no_cve=True,
+            clean_temp=False,
+            resolve_ml=False,
+            branches=False,
+            ref=["HEAD"],
+            single_version=True,
+            include_pre_releases=True,
+            release_stats=False,
+            no_release_stats=True,
+            dry_run=False,
+            backfill=None,
+            preparse=True,
+            preparse_insights=True,
+            preparse_stable=False,
+            preparse_api=True,
+            preparse_tags=["v3.0"],
+            kapi_arches=["x86_64"],
+            preparse_workers=6,
+            backfill_from="v3.0",
+        )
+        fake_db = MockDB(use_global=False)
+        fake_db.create_table(main.TABLES)
+        self.addCleanup(fake_db.close)
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            yield fake_db
+
+        with mock.patch.object(main, "arg_handling", return_value=args), \
+                mock.patch.object(G, "DB", _ctx), \
+                mock.patch.object(main, "_apply_db_server_tuning"), \
+                mock.patch.object(main, "get_ssh_tunnel_config", return_value={"enabled": False}), \
+                mock.patch.object(main, "resolve_git_network_and_repo", return_value=(1, 1)), \
+                mock.patch.object(main.ingest_state, "fetch_repo_version_states", return_value={}), \
+                mock.patch.object(main, "_preflight_libclang", side_effect=AssertionError("preflight ran")), \
+                mock.patch.object(main, "processing_unified_preparse", return_value={"state": "updated"}) as prep_mock, \
+                mock.patch.object(G, "emergency_shutdown") as shut_mock:
+            main._run()
+        prep_mock.assert_called_once_with(
+            repo,
+            1,
+            include_insights=True,
+            include_stable=False,
+            include_api=True,
+            tags=["v3.0"],
+            from_tag="v3.0",
+            arches=("x86_64",),
+            workers=6,
+        )
+        shut_mock.assert_called_once_with(0)
+
+
 if __name__ == "__main__":
     unittest.main()

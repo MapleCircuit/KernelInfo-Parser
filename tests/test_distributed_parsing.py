@@ -34,8 +34,8 @@ from table_engine.te_cached_db import TECachedDB
 
 class TestDistributedParsing(unittest.TestCase):
     def test_schema_tables_registered(self):
-        """Verify all 72 tables including distributed coordination tables are registered."""
-        self.assertEqual(len(TABLES), 72)
+        """Verify all 75 tables including distributed coordination tables are registered."""
+        self.assertEqual(len(TABLES), 75)
         names = {t.table_name for t in TABLES}
         for expected in ("m_table_sequence", "m_ingest_id_range", "m_parse_node", "m_parse_task"):
             self.assertIn(expected, names)
