@@ -794,3 +794,47 @@ def backfill_cve_releases(
         )
 
     return guarded("Backfill CVE releases", db, run)
+
+
+def backfill_kapi(
+    db: Any,
+    repo_dir: str,
+    repo_id: int,
+    from_ref: str | None = None,
+    arches: tuple[str, ...] = ("x86_64",),
+    force: bool = False,
+) -> dict[str, Any]:
+    """Backfill materialized KAPI catalogs (m_kapi_catalog) and release summaries (m_kapi_release_summary)."""
+
+    def run() -> dict[str, Any]:
+        from core.config import get_repository
+        from parser import kapi_ingest
+
+        repo_entry = None
+        with contextlib.suppress(Exception):
+            repo_entry = get_repository(str(repo_dir))
+        return kapi_ingest.ingest_kapi(
+            db,
+            str(repo_dir),
+            repo_id,
+            from_tag=from_ref,
+            arches=arches,
+            force=force,
+            repo_entry=repo_entry,
+        )
+
+    return guarded("Backfill KAPI", db, run)
+
+
+BACKFILL_HANDLERS: dict[str, Any] = {
+    "maintainer_files": backfill_maintainer_files,
+    "kbuild": backfill_kbuild,
+    "facts": backfill_facts,
+    "commit_relations": backfill_commit_relations,
+    "doc_references": backfill_doc_references,
+    "cve_files": backfill_cve_files,
+    "mailing_list": backfill_mailing_list,
+    "insights": backfill_insights,
+    "cve_releases": backfill_cve_releases,
+    "kapi": backfill_kapi,
+}

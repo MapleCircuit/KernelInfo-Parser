@@ -38,6 +38,13 @@ def get_api_diff(
     return job_answer(diff(a, b, arch, [x.strip() for x in kinds.split(",") if x.strip()]))
 
 
+@router.get("/{version_name}/summary")
+def get_summary(version_name: str, arch: Arch = DEFAULT_ARCH) -> dict[str, Any]:
+    """Per-release KAPI summary & counts (DB-first from m_kapi_release_summary / m_kapi_catalog,
+    with fallback to cached catalog metadata/counts when unparsed)."""
+    return k.summary(version_name, arch)
+
+
 @router.get("/{version_name}/syscalls")
 def get_syscalls(version_name: str, arch: Arch = DEFAULT_ARCH) -> Any:
     """System calls of an ARCH (A1): number, ABI, name, entry point, status (defined / ni_syscall /

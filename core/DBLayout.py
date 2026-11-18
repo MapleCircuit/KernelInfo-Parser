@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 70 core relational database tables used across the parser
+This module defines the 72 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
@@ -72,6 +72,9 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_blob_facts (blob_hash, family, format, data)                 -- per-blob facts: calls/ops tables (1), Kernel API (2),
                                                                      includes (3), Kconfig definitions (4), doc labels (5),
                                                                      man pages (6)
+   m_kapi_catalog (commit_id, arch, kind, catalog_format, kapi_format, total_count, summary_json, data, built_at)
+   m_kapi_release_summary (commit_id, arch, catalog_format, kapi_format, syscalls_count, exports_count, params_count,
+                           tracepoints_count, modules_count, devices_count, subsystems_json, built_at)
    m_cve_source (name, layout, head, format, records, built_at)   -- the CVE list ingested
      └── m_cve (cve_id, kind, published, updated, score, kev, record_path, title, data)
            ├── m_cve_commit (commit_hash, role, cve_id)
@@ -1957,6 +1960,61 @@ m_cve_release = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 70. m_kapi_catalog (table_id=70): Materialized Per-Revision KAPI Catalogs
+# -----------------------------------------------------------------------------
+m_kapi_catalog = Table(
+    table_id=70,
+    table_name="m_kapi_catalog",
+    columns=(
+        ("commit_id", INT()),
+        ("arch", VARCHAR(32, default="")),
+        ("kind", VARCHAR(32)),
+        ("catalog_format", SMALLINT(unsigned=True)),
+        ("kapi_format", SMALLINT(unsigned=True)),
+        ("total_count", INT(unsigned=True, default=0)),
+        ("summary_json", TEXT(null=True)),
+        ("data", MEDIUMBLOB()),
+        ("built_at", BIGINT(unsigned=True, default=0)),
+    ),
+    primary=("commit_id", "arch", "kind"),
+    foreign=(("commit_id", "m_commit", "commit_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 71. m_kapi_release_summary (table_id=71): Materialized Per-Release KAPI Summary
+# -----------------------------------------------------------------------------
+m_kapi_release_summary = Table(
+    table_id=71,
+    table_name="m_kapi_release_summary",
+    columns=(
+        ("commit_id", INT()),
+        ("arch", VARCHAR(32, default="x86_64")),
+        ("catalog_format", SMALLINT(unsigned=True)),
+        ("kapi_format", SMALLINT(unsigned=True)),
+        ("syscalls_count", INT(unsigned=True, default=0)),
+        ("exports_count", INT(unsigned=True, default=0)),
+        ("params_count", INT(unsigned=True, default=0)),
+        ("tracepoints_count", INT(unsigned=True, default=0)),
+        ("modules_count", INT(unsigned=True, default=0)),
+        ("devices_count", INT(unsigned=True, default=0)),
+        ("subsystems_json", MEDIUMTEXT(null=True)),
+        ("built_at", BIGINT(unsigned=True, default=0)),
+    ),
+    primary=("commit_id", "arch"),
+    foreign=(("commit_id", "m_commit", "commit_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -2030,19 +2088,21 @@ TABLES: tuple[Table, ...] = (
     m_release_section_health, # 67
     m_cve_release_state,   # 68
     m_cve_release,         # 69
+    m_kapi_catalog,        # 70
+    m_kapi_release_summary,# 71
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 70 schema tables.
+    """Initialize and populate gp.Table_Array with all 72 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 70 Table schema objects.
+        Immutable tuple of all 72 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

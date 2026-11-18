@@ -221,3 +221,58 @@ def processing_insights(repo_path: str, repo_id: int, from_tag: str | None = Non
         logger.warning(COLOR.yellow(f"[Insights] Ingesting insights for {repo_path} failed: {exc}"))
         return {"state": "error", "error": str(exc)}
 
+
+def processing_kapi(
+    repo_path: str,
+    repo_id: int | None,
+    tag: str | None = None,
+    *,
+    commit_id: int | None = None,
+    arches: tuple[str, ...] = ("x86_64",),
+) -> dict[str, Any] | None:
+    """Materialize per-revision KAPI catalogs and release summaries (parser/kapi_ingest.py) when the
+    'api' feature is enabled and the tag is selected for 'api' pre-parsing."""
+    if not feature_enabled("api"):
+        logger.debug("[KAPI] Skipped: 'api' feature is disabled.")
+        return None
+    from core.config import get_parser_config, get_repository, is_tag_selected_for_preparse
+    from parser import kapi_ingest
+    from parser.kapi_ingest import _git_release_tags
+
+    repo_entry = None
+    with contextlib.suppress(Exception):
+        repo_entry = get_repository(str(repo_path))
+    try:
+        workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
+    except (TypeError, ValueError):
+        workers = 1
+    try:
+        with G.DB() as db:
+            if db is None:
+                return None
+            if tag is not None:
+                all_tags = _git_release_tags(str(repo_path))
+                if not is_tag_selected_for_preparse(repo_entry, "api", tag, all_tags):
+                    logger.debug("[KAPI] Skipped %s: not selected for 'api' pre-parsing.", tag)
+                    return {"state": "skipped", "reason": "not_selected", "tag": tag}
+                return kapi_ingest.ingest_kapi_release(
+                    db,
+                    str(repo_path),
+                    repo_id,
+                    tag,
+                    commit_id=commit_id,
+                    arches=arches,
+                    workers=workers,
+                )
+            return kapi_ingest.ingest_kapi(
+                db,
+                str(repo_path),
+                repo_id,
+                arches=arches,
+                workers=workers,
+                repo_entry=repo_entry,
+            )
+    except Exception as exc:  # noqa: BLE001 - KAPI pre-parsing never blocks parsing
+        logger.warning(COLOR.yellow(f"[KAPI] Pre-parsing KAPI for {repo_path} ({tag or 'all'}) failed: {exc}"))
+        return {"state": "error", "error": str(exc)}
+

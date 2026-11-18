@@ -908,6 +908,173 @@ class TestProjectInsightsConfig(unittest.TestCase):
         self.assertEqual(loaded["repositories"][0]["insights"], {"milestone_rc": 2})
         self.assertNotIn("insights", loaded["repositories"][1])
 
+    def test_preparse_defaults_normalization_and_pruning(self) -> None:
+        from core.config import (
+            DEFAULT_PREPARSE_SPEC,
+            OPTIONAL_REPOSITORY_KEYS,
+            PREPARSE_FEATURES,
+            PREPARSE_MODES,
+            REPOSITORY_KEYS,
+            default_repo_preparse,
+            normalize_preparse_overrides,
+            normalize_preparse_spec,
+            prune_default_preparse_overrides,
+            resolve_repo_preparse,
+        )
+
+        self.assertEqual(PREPARSE_FEATURES, ("insights", "api"))
+        self.assertEqual(PREPARSE_MODES, ("all_main", "latest_n_main", "groups", "custom"))
+        self.assertIn("preparse", REPOSITORY_KEYS)
+        self.assertIn("preparse", OPTIONAL_REPOSITORY_KEYS)
+
+        defaults = default_repo_preparse("linux")
+        self.assertEqual(set(defaults), {"insights", "api"})
+        self.assertEqual(defaults["insights"], DEFAULT_PREPARSE_SPEC)
+        self.assertEqual(defaults["api"], DEFAULT_PREPARSE_SPEC)
+        self.assertIsNot(defaults["insights"], defaults["api"])
+
+        self.assertEqual(normalize_preparse_spec(None), DEFAULT_PREPARSE_SPEC)
+        spec = normalize_preparse_spec({
+            "mode": "LATEST_N_MAIN",
+            "latest_n": 0,
+            "include_main": "false",
+            "include_stable": True,
+            "include_rc": "yes",
+            "versions": ["v6.6", " ", "v6.6", "v6.7-rc1"],
+        })
+        self.assertEqual(spec, {
+            "mode": "latest_n_main",
+            "latest_n": 1,
+            "include_main": False,
+            "include_stable": True,
+            "include_rc": True,
+            "versions": ["v6.6", "v6.7-rc1"],
+        })
+
+        overrides = normalize_preparse_overrides({
+            "API": {"mode": "custom", "versions": ["v6.6"]},
+            "unknown": {"mode": "all_main"},
+        })
+        self.assertEqual(set(overrides), {"api"})
+        self.assertEqual(overrides["api"]["mode"], "custom")
+        self.assertEqual(overrides["api"]["versions"], ["v6.6"])
+
+        resolved = resolve_repo_preparse({"project": "linux", "preparse": {"api": {"mode": "custom", "versions": ["v6.6"]}}})
+        self.assertEqual(resolved["insights"]["mode"], "all_main")
+        self.assertEqual(resolved["api"]["mode"], "custom")
+        self.assertEqual(resolved["api"]["versions"], ["v6.6"])
+
+        pruned = prune_default_preparse_overrides("linux", {
+            "insights": dict(DEFAULT_PREPARSE_SPEC),
+            "api": {"mode": "latest_n_main", "latest_n": 5},
+        })
+        self.assertEqual(set(pruned), {"api"})
+        self.assertEqual(pruned["api"]["mode"], "latest_n_main")
+        self.assertEqual(pruned["api"]["latest_n"], 5)
+
+    def test_resolve_preparse_tags_modes_and_classification(self) -> None:
+        from core.config import is_tag_selected_for_preparse, resolve_preparse_tags
+
+        tags = [
+            "v2.6.39",
+            "v2.6.39.4",
+            "v6.5",
+            "v6.6-rc1",
+            "v6.6",
+            "v6.6.1",
+            "v6.7-rc2",
+            "v6.7",
+            "next-20250101",
+            "unrelated-tag",
+        ]
+
+        # Default (all_main)
+        self.assertEqual(
+            resolve_preparse_tags(None, "insights", tags),
+            ["v2.6.39", "v6.5", "v6.6", "v6.7"],
+        )
+        self.assertTrue(is_tag_selected_for_preparse(None, "api", "v6.6", tags))
+        self.assertFalse(is_tag_selected_for_preparse(None, "api", "v6.6.1", tags))
+        self.assertFalse(is_tag_selected_for_preparse(None, "api", "v6.6-rc1", tags))
+
+        # latest_n_main + explicit version
+        entry_latest = {
+            "preparse": {
+                "api": {"mode": "latest_n_main", "latest_n": 2, "versions": ["v2.6.39.4"]},
+            }
+        }
+        self.assertEqual(
+            resolve_preparse_tags(entry_latest, "api", tags),
+            ["v2.6.39.4", "v6.6", "v6.7"],
+        )
+        # Insights remains independent (default all_main)
+        self.assertEqual(
+            resolve_preparse_tags(entry_latest, "insights", tags),
+            ["v2.6.39", "v6.5", "v6.6", "v6.7"],
+        )
+
+        # groups: stable + rc + explicit
+        entry_groups = {
+            "preparse": {
+                "insights": {
+                    "mode": "groups",
+                    "include_main": False,
+                    "include_stable": True,
+                    "include_rc": True,
+                    "versions": ["v6.5"],
+                }
+            }
+        }
+        self.assertEqual(
+            resolve_preparse_tags(entry_groups, "insights", tags),
+            ["v2.6.39.4", "v6.5", "v6.6-rc1", "v6.6.1", "v6.7-rc2"],
+        )
+
+        # custom: only explicit versions present in tags
+        entry_custom = {
+            "preparse": {
+                "api": {"mode": "custom", "versions": ["v6.6", "v6.6-rc1", "v99.0"]},
+            }
+        }
+        self.assertEqual(
+            resolve_preparse_tags(entry_custom, "api", tags),
+            ["v6.6-rc1", "v6.6"],
+        )
+
+    def test_preparse_normalized_in_load_config(self) -> None:
+        from core.config import load_config
+
+        cfg_path = self.root / "config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "repositories": [
+                        {
+                            "name": "linux",
+                            "path": "repos/linux",
+                            "project": "linux",
+                            "preparse": {
+                                "api": {"mode": "latest_n_main", "latest_n": 3},
+                                "bogus": {"mode": "custom"},
+                            },
+                        },
+                        {
+                            "name": "empty",
+                            "path": "repos/empty",
+                            "project": "linux",
+                            "preparse": {},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_config(cfg_path)
+        self.assertEqual(set(loaded["repositories"][0]["preparse"]), {"api"})
+        self.assertEqual(loaded["repositories"][0]["preparse"]["api"]["mode"], "latest_n_main")
+        self.assertEqual(loaded["repositories"][0]["preparse"]["api"]["latest_n"], 3)
+        self.assertNotIn("preparse", loaded["repositories"][1])
+
 
 if __name__ == "__main__":
     unittest.main()

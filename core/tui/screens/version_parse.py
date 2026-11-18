@@ -1,17 +1,30 @@
-"""core/tui/screens/version_parse.py - Parse specific versions / tags of one repository.
+"""core/tui/screens/version_parse.py - Parse and pre-parse version/tag configuration screen.
 
-The user picks a configured Git repository and one or more release tags, then the TUI exits into
-the parser pipeline with `repo`, `ref`, `single_version` (and `include_pre_releases` when the
-pipeline continues through later releases) applied as CLI overrides.
+The user picks a configured Git repository and can:
+1. Select one or more release tags for immediate parsing (with `repo`, `ref`, `single_version`,
+   and optional `include_pre_releases` passed as CLI overrides).
+2. Independently configure per-feature pre-parsing rules (`insights` and `api`) via mode/group
+   presets (All Main Tags, Latest N Main, Main + Stable, Stable Tags, RC Tags, Main + Stable + RC,
+   Custom) and per-tag explicit toggles, persisted to `entry["preparse"]`.
 """
 
 from __future__ import annotations
 
+import copy
 import curses
 import fnmatch
 from typing import Any
 
-from core.config import _coerce_bool, resolve_repo_path
+from core.config import (
+    PREPARSE_FEATURES,
+    _coerce_bool,
+    normalize_preparse_spec,
+    prune_default_preparse_overrides,
+    repository_project,
+    resolve_preparse_tags,
+    resolve_repo_path,
+    resolve_repo_preparse,
+)
 from core.tui.git_ops import PRE_RELEASE_RE, is_git_repo, list_version_tags
 from core.tui.screens.base import BaseScreen
 from core.tui.screens.launch import RUN_SAVED, choose_launch_config, launch_pipeline
@@ -39,6 +52,39 @@ CONFIRM_TAG_LIMIT = 10
 ENTER_KEYS = (10, 13, curses.KEY_ENTER)
 SHIFT_TAB_KEYS = (getattr(curses, "KEY_BTAB", 353), 353)
 
+PREPARSE_PRESETS: list[tuple[str, dict[str, Any]]] = [
+    ("All Main Tags", {"mode": "all_main", "include_main": True, "include_stable": False, "include_rc": False}),
+    ("Latest N Main", {"mode": "latest_n_main", "include_main": True, "include_stable": False, "include_rc": False}),
+    ("Main + Stable", {"mode": "groups", "include_main": True, "include_stable": True, "include_rc": False}),
+    ("Stable Tags", {"mode": "groups", "include_main": False, "include_stable": True, "include_rc": False}),
+    ("RC Tags", {"mode": "groups", "include_main": False, "include_stable": False, "include_rc": True}),
+    ("Main + Stable + RC", {"mode": "groups", "include_main": True, "include_stable": True, "include_rc": True}),
+    ("Custom", {"mode": "custom", "include_main": False, "include_stable": False, "include_rc": False}),
+]
+PREPARSE_PRESET_LABELS = [label for label, _ in PREPARSE_PRESETS]
+
+
+def _preset_index_for_spec(spec: dict[str, Any]) -> int:
+    mode = spec.get("mode", "all_main")
+    if mode == "all_main":
+        return 0
+    if mode == "latest_n_main":
+        return 1
+    if mode == "custom":
+        return 6
+    flags = (
+        bool(spec.get("include_main")),
+        bool(spec.get("include_stable")),
+        bool(spec.get("include_rc")),
+    )
+    flag_map = {
+        (True, True, False): 2,
+        (False, True, False): 3,
+        (False, False, True): 4,
+        (True, True, True): 5,
+    }
+    return flag_map.get(flags, 2)
+
 
 def repo_label(entry: dict[str, Any]) -> str:
     """Identifier of a repositories[] entry handed to `--repo` (its name, else its path)."""
@@ -62,11 +108,12 @@ def format_tag_list(tags: list[str], limit: int = CONFIRM_TAG_LIMIT) -> str:
 
 
 class VersionParseScreen(BaseScreen):
-    """Tag selector that launches the parser pipeline on exactly the chosen release tags.
+    """Shared screen to select tags for immediate parsing and configure Insights/API pre-parsing.
 
-    Keys: Tab / Shift-Tab move focus; in the tag list Space / Enter toggle the highlighted tag,
-    `a` toggles every visible tag, `n` / `c` clear the selection; `P` (outside the filter field)
-    or Enter on [Parse] launches; Esc goes back. Typing in the filter field refilters live.
+    Keys: Tab / Shift-Tab move focus; in the tag list Space / Enter toggle the highlighted tag for
+    Parse, `i` toggles Insights pre-parse, `k` toggles API pre-parse, `a` toggles every visible tag
+    for Parse, `n` / `c` clear Parse selection; `P` launches Parse; `S` saves pre-parse config;
+    Esc goes back. Typing in filter or N fields edits live.
     """
 
     def __init__(self, stdscr: Any, app: Any = None) -> None:
@@ -77,6 +124,9 @@ class VersionParseScreen(BaseScreen):
         self.all_tags: list[str] = []
         self.visible_tags: list[str] = []
         self.selected: set[str] = set()
+        self.preparse_specs: dict[str, dict[str, Any]] = {}
+        self._preparse_resolved: dict[str, set[str]] = {f: set() for f in PREPARSE_FEATURES}
+        self._syncing_preparse_widgets = False
 
         self.repo_select = SelectList(
             y=2, x=2, width=40, label="Repository", label_width=10,
@@ -84,22 +134,38 @@ class VersionParseScreen(BaseScreen):
             on_change=lambda idx, _name: self.select_repo(idx),
         )
         self.filter_input = TextInput(y=3, x=2, width=40, label="Filter", label_width=10)
+        self.insights_mode_select = SelectList(
+            y=4, x=2, width=26, label="Insights", label_width=10,
+            options=PREPARSE_PRESET_LABELS,
+            on_change=lambda idx, _name: self._on_preset_change("insights", idx),
+        )
+        self.insights_n_input = TextInput(y=4, x=42, width=6, label="N", value="10", max_len=4, label_width=2)
+        self.api_mode_select = SelectList(
+            y=5, x=2, width=26, label="API", label_width=10,
+            options=PREPARSE_PRESET_LABELS,
+            on_change=lambda idx, _name: self._on_preset_change("api", idx),
+        )
+        self.api_n_input = TextInput(y=5, x=42, width=6, label="N", value="10", max_len=4, label_width=2)
+
         self.tag_list = ScrollableList(
-            y=5, x=2, height=6, width=60, items=[],
-            title="Tags ([Space] Toggle  [a] All visible  [n] None)",
+            y=6, x=2, height=6, width=60, items=[],
+            title="Tags ([Space] Parse  [i] Ins  [k] API  [a] All  [n] None)",
             render_item_func=self._render_tag,
         )
-        self.rc_checkbox = Checkbox(y=11, x=2, label="Include -rc / pre-release tags", checked=True)
-        self.continue_checkbox = Checkbox(y=12, x=2, label="Continue through later releases", checked=False)
-        self.parse_btn = Button(y=14, x=2, label="Parse (P)", on_click=self.parse)
-        self.back_btn = Button(y=14, x=18, label="Back (Esc)", on_click=self.go_back)
+        self.rc_checkbox = Checkbox(y=12, x=2, label="Include -rc / pre-release tags", checked=True)
+        self.continue_checkbox = Checkbox(y=13, x=2, label="Continue through later releases", checked=False)
+        self.parse_btn = Button(y=15, x=2, label="Parse (P)", on_click=self.parse)
+        self.save_btn = Button(y=15, x=18, label="Save Pre-parse (S)", on_click=self.save_preparse)
+        self.back_btn = Button(y=15, x=42, label="Back (Esc)", on_click=self.go_back)
         self.status_bar = StatusBar(
             shortcuts=[
                 ("Tab", "Next"),
-                ("Space", "Toggle"),
-                ("a", "All visible"),
-                ("n", "None"),
-                ("P", "Parse"),
+                ("Space", "Parse"),
+                ("i", "Ins"),
+                ("k", "API"),
+                ("a", "All"),
+                ("S", "Save"),
+                ("P", "Run"),
                 ("Esc", "Back"),
             ],
         )
@@ -112,10 +178,15 @@ class VersionParseScreen(BaseScreen):
         self.widgets = [
             *([self.repo_select] if len(self.repos) > 1 else []),
             self.filter_input,
+            self.insights_mode_select,
+            self.insights_n_input,
+            self.api_mode_select,
+            self.api_n_input,
             self.tag_list,
             self.rc_checkbox,
             self.continue_checkbox,
             self.parse_btn,
+            self.save_btn,
             self.back_btn,
         ]
         state = self.recall_view(VIEW_KEY)
@@ -162,8 +233,110 @@ class VersionParseScreen(BaseScreen):
             self._tag_cache[key] = list_version_tags(path, include_pre_releases=True)
         return self._tag_cache[key]
 
+    def _sync_preparse_widgets(self) -> None:
+        """Update mode SelectLists and N TextInputs from `self.preparse_specs`."""
+        self._syncing_preparse_widgets = True
+        try:
+            ins = self.preparse_specs.get("insights", {})
+            api = self.preparse_specs.get("api", {})
+            self.insights_mode_select.selected_index = _preset_index_for_spec(ins)
+            self.insights_n_input.set_value(str(ins.get("latest_n", 10)))
+            self.api_mode_select.selected_index = _preset_index_for_spec(api)
+            self.api_n_input.set_value(str(api.get("latest_n", 10)))
+        finally:
+            self._syncing_preparse_widgets = False
+
+    def _refresh_preparse_resolved(self) -> None:
+        """Recompute resolved tag sets for both `insights` and `api` against `self.all_tags`."""
+        dummy_entry = {"preparse": self.preparse_specs}
+        for feat in PREPARSE_FEATURES:
+            self._preparse_resolved[feat] = set(resolve_preparse_tags(dummy_entry, feat, self.all_tags))
+
+    def _persist_preparse_to_repo(self) -> None:
+        """Write pruned `preparse` overrides to `self.current_repo` and mark app dirty if changed."""
+        repo = self.current_repo
+        if repo is None:
+            return
+        old_val = copy.deepcopy(repo.get("preparse"))
+        pruned = prune_default_preparse_overrides(repository_project(repo), self.preparse_specs)
+        if pruned:
+            repo["preparse"] = pruned
+        else:
+            repo.pop("preparse", None)
+        if repo.get("preparse") != old_val and self.app is not None:
+            self.app.is_dirty = True
+
+    def _on_preset_change(self, feature: str, preset_idx: int) -> None:
+        """Apply a mode/group preset for `feature` (`insights` or `api`)."""
+        if self._syncing_preparse_widgets or not (0 <= preset_idx < len(PREPARSE_PRESETS)):
+            return
+        _, updates = PREPARSE_PRESETS[preset_idx]
+        spec = self.preparse_specs.setdefault(feature, normalize_preparse_spec(None))
+        spec.update(updates)
+        self.preparse_specs[feature] = normalize_preparse_spec(spec)
+        self._refresh_preparse_resolved()
+        self._persist_preparse_to_repo()
+
+    def _on_n_input_change(self, feature: str, widget: TextInput) -> None:
+        """Update `latest_n` for `feature` when the user edits its N field."""
+        raw = widget.get_value().strip()
+        if not raw.isdigit():
+            return
+        val = max(1, int(raw))
+        spec = self.preparse_specs.setdefault(feature, normalize_preparse_spec(None))
+        if spec.get("latest_n") != val:
+            spec["latest_n"] = val
+            self._refresh_preparse_resolved()
+            self._persist_preparse_to_repo()
+
+    def preparse_tags(self, feature: str) -> list[str]:
+        """Resolved pre-parse tags for `feature` in version order."""
+        resolved = self._preparse_resolved.get(feature, set())
+        return [t for t in self.all_tags if t in resolved]
+
+    def toggle_preparse_tag(self, feature: str, tag: str | None = None) -> bool:
+        """Toggle `tag` (or the highlighted tag) for `feature` (`insights` or `api`)."""
+        target = tag if tag is not None else self.tag_list.get_selected()
+        if target is None or feature not in PREPARSE_FEATURES:
+            return False
+        spec = self.preparse_specs.setdefault(feature, normalize_preparse_spec(None))
+        versions = list(spec.get("versions") or [])
+        resolved = self._preparse_resolved.get(feature, set())
+        if target in versions:
+            versions = [v for v in versions if v != target]
+            spec["versions"] = versions
+        elif target in resolved:
+            # Already included by mode/group rule: switch to custom without `target` so toggling unchecks it.
+            remaining = [t for t in self.all_tags if t in resolved and t != target]
+            spec["mode"] = "custom"
+            spec["include_main"] = False
+            spec["include_stable"] = False
+            spec["include_rc"] = False
+            spec["versions"] = remaining
+            self._sync_preparse_widgets()
+        else:
+            versions.append(target)
+            spec["versions"] = versions
+        self.preparse_specs[feature] = normalize_preparse_spec(spec)
+        self._refresh_preparse_resolved()
+        self._persist_preparse_to_repo()
+        return True
+
+    def save_preparse(self) -> bool:
+        """Persist current pre-parse rules to the repository entry and save config if supported."""
+        if self.current_repo is None:
+            return False
+        self._persist_preparse_to_repo()
+        save_fn = getattr(self.app, "save_config", None)
+        if callable(save_fn):
+            ok, msg = save_fn()
+            self.status_bar.set_message(msg, color=PAIR_SUCCESS if ok else PAIR_ERROR)
+            return bool(ok)
+        self.status_bar.set_message("Pre-parse configuration updated.", color=PAIR_SUCCESS)
+        return True
+
     def select_repo(self, index: int, highlight: str | None = None) -> None:
-        """Show the tags of repository `index`, clearing the selection; highlights `highlight` or v3.0."""
+        """Show the tags of repository `index`, clearing Parse selection; highlights `highlight` or v3.0."""
         if not self.repos:
             return
         self.repo_index = max(0, min(index, len(self.repos) - 1))
@@ -171,6 +344,9 @@ class VersionParseScreen(BaseScreen):
             self.repo_select.selected_index = self.repo_index
         self.all_tags = self._load_tags(self.repos[self.repo_index])
         self.selected = set()
+        self.preparse_specs = resolve_repo_preparse(self.repos[self.repo_index])
+        self._sync_preparse_widgets()
+        self._refresh_preparse_resolved()
         self.apply_filter(keep_highlight=False)
         target = highlight if highlight in self.visible_tags else DEFAULT_HIGHLIGHT_TAG
         if target in self.visible_tags:
@@ -191,15 +367,26 @@ class VersionParseScreen(BaseScreen):
         if current in self.visible_tags:
             self.tag_list.set_selected(self.visible_tags.index(current))
 
+    def _preparse_mark(self, feature: str, tag: str) -> str:
+        spec = self.preparse_specs.get(feature, {})
+        if tag in (spec.get("versions") or ()):
+            return "x"
+        if tag in self._preparse_resolved.get(feature, set()):
+            return "G"
+        return " "
+
     def _render_tag(self, tag: str) -> str:
-        return f"[{'x' if tag in self.selected else ' '}] {tag}"
+        parse_mark = "x" if tag in self.selected else " "
+        ins_mark = self._preparse_mark("insights", tag)
+        api_mark = self._preparse_mark("api", tag)
+        return f"[{parse_mark}] {tag:<22} Ins:[{ins_mark}] API:[{api_mark}]"
 
     def selected_tags(self) -> list[str]:
         """Checked tags in version order."""
         return [t for t in self.all_tags if t in self.selected]
 
     def toggle_highlighted(self) -> bool:
-        """Toggle the highlighted tag; False when the list is empty."""
+        """Toggle the highlighted tag for immediate Parse; False when the list is empty."""
         tag = self.tag_list.get_selected()
         if tag is None:
             return False
@@ -207,14 +394,14 @@ class VersionParseScreen(BaseScreen):
         return True
 
     def toggle_all_visible(self) -> None:
-        """Check every visible tag, or uncheck them all when all are already checked."""
+        """Check every visible tag for Parse, or uncheck them all when all are already checked."""
         if self.visible_tags and all(t in self.selected for t in self.visible_tags):
             self.selected.difference_update(self.visible_tags)
         else:
             self.selected.update(self.visible_tags)
 
     def clear_selection(self) -> None:
-        """Uncheck every tag (hidden ones included)."""
+        """Uncheck every Parse tag (hidden ones included)."""
         self.selected.clear()
 
     def continues(self) -> bool:
@@ -312,24 +499,35 @@ class VersionParseScreen(BaseScreen):
         field_w = max(16, min(50, max_x - 15))
         self.repo_select.width = field_w
         self.filter_input.width = field_w
-        list_h = max(3, max_y - 10)
-        self.tag_list.y, self.tag_list.x = 5, 2
+        mode_w = max(16, min(28, max_x - 28))
+        n_x = min(max_x - 10, 14 + mode_w + 2)
+        self.insights_mode_select.y, self.insights_mode_select.x, self.insights_mode_select.width = 4, 2, mode_w
+        self.insights_n_input.y, self.insights_n_input.x = 4, n_x
+        self.api_mode_select.y, self.api_mode_select.x, self.api_mode_select.width = 5, 2, mode_w
+        self.api_n_input.y, self.api_n_input.x = 5, n_x
+
+        list_h = max(3, max_y - 12)
+        self.tag_list.y, self.tag_list.x = 6, 2
         self.tag_list.height, self.tag_list.width = list_h, max(20, max_x - 4)
-        bottom = 5 + list_h
+        bottom = 6 + list_h
         self.rc_checkbox.y = bottom
         self.continue_checkbox.y = bottom + 1
-        self.parse_btn.y = self.back_btn.y = bottom + 3
-        self.back_btn.x = self.parse_btn.x + len(self.parse_btn.label) + 6
+        self.parse_btn.y = self.save_btn.y = self.back_btn.y = bottom + 3
+        self.save_btn.x = self.parse_btn.x + len(self.parse_btn.label) + 4
+        self.back_btn.x = self.save_btn.x + len(self.save_btn.label) + 4
         self.status_bar.y = max_y - 1
 
     def summary_line(self, width: int) -> str:
-        """`N selected: tags...` truncated to `width`."""
+        """`N selected: tags... | Ins: M  API: K` truncated to `width`."""
         tags = self.selected_tags()
-        text = f"{len(tags)} selected" + (f": {', '.join(tags)}" if tags else "")
+        n_ins = len(self._preparse_resolved.get("insights", set()))
+        n_api = len(self._preparse_resolved.get("api", set()))
+        parse_part = f"{len(tags)} selected" + (f": {', '.join(tags)}" if tags else "")
+        text = f"{parse_part}  |  Ins: {n_ins}  API: {n_api}"
         return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
     def draw(self) -> None:
-        """Render the repository picker, tag filter, tag checklist, options and buttons."""
+        """Render the repository picker, filter, pre-parse controls, tag checklist, options and buttons."""
         self.clear()
         max_y, max_x = self.get_maxyx()
         if max_y < MIN_H or max_x < MIN_W:
@@ -337,7 +535,7 @@ class VersionParseScreen(BaseScreen):
             self.refresh()
             return
 
-        header = " Parse Specific Versions / Tags "
+        header = " Parse & Pre-Parse Versions / Tags "
         self.safe_addstr(0, max(2, (max_x - len(header)) // 2), header, get_color(PAIR_HEADER) | curses.A_BOLD)
 
         if not self.repos:
@@ -361,12 +559,21 @@ class VersionParseScreen(BaseScreen):
         hint_x = self.filter_input.x + 11 + self.filter_input.width + 1
         if max_x - hint_x > 12:
             self.safe_addstr(3, hint_x, "substring or glob (* ?)"[: max_x - hint_x - 1], get_color(PAIR_MUTED))
-        self.tag_list.title = f"Tags {len(self.visible_tags)}/{len(self.all_tags)} ([Space] Toggle [a] All [n] None)"
+
+        self.insights_mode_select.draw(self.stdscr)
+        self.insights_n_input.draw(self.stdscr)
+        self.api_mode_select.draw(self.stdscr)
+        self.api_n_input.draw(self.stdscr)
+
+        self.tag_list.title = (
+            f"Tags {len(self.visible_tags)}/{len(self.all_tags)} "
+            "([Space] Parse [i] Ins [k] API [a] All [n] None)"
+        )
         self.tag_list.draw(self.stdscr)
         if not self.visible_tags:
             empty = "(no release tags found)" if not self.all_tags else "(no tags match the filter)"
             self.safe_addstr(self.tag_list.y + 1, self.tag_list.x + 2, empty, get_color(PAIR_MUTED))
-        for widget in (self.rc_checkbox, self.continue_checkbox, self.parse_btn, self.back_btn):
+        for widget in (self.rc_checkbox, self.continue_checkbox, self.parse_btn, self.save_btn, self.back_btn):
             widget.draw(self.stdscr)
         summary_attr = get_color(PAIR_SUCCESS) if n_sel else get_color(PAIR_MUTED)
         self.safe_addstr(self.continue_checkbox.y + 1, 2, self.summary_line(max_x - 4), summary_attr)
@@ -376,7 +583,7 @@ class VersionParseScreen(BaseScreen):
     # --- Input ---
 
     def handle_key(self, ch: int) -> bool:
-        """Focus navigation, tag toggling shortcuts, filter editing and launch."""
+        """Focus navigation, tag toggling shortcuts, pre-parse controls, filter editing and launch."""
         if ch == 27:
             return self.go_back()
         if ch == 9:
@@ -406,6 +613,12 @@ class VersionParseScreen(BaseScreen):
             if ch in (ord(" "), *ENTER_KEYS):
                 self.toggle_highlighted()
                 return True
+            if ch in (ord("i"), ord("I")):
+                self.toggle_preparse_tag("insights")
+                return True
+            if ch in (ord("k"), ord("K")):
+                self.toggle_preparse_tag("api")
+                return True
             if ch in (ord("a"), ord("A")):
                 self.toggle_all_visible()
                 return True
@@ -428,8 +641,27 @@ class VersionParseScreen(BaseScreen):
                 self.apply_filter()
             return consumed
 
+        if focused in (self.insights_n_input, self.api_n_input):
+            if ch in (curses.KEY_UP, curses.KEY_DOWN):
+                if ch == curses.KEY_UP:
+                    self.focus_prev()
+                else:
+                    self.focus_next()
+                return True
+            if ch in ENTER_KEYS:
+                self.focus_next()
+                return True
+            consumed = focused.handle_key(ch)
+            if consumed:
+                feat = "insights" if focused is self.insights_n_input else "api"
+                self._on_n_input_change(feat, focused)
+            return consumed
+
         if ch in (ord("P"), ord("p")):
             self.parse()
+            return True
+        if ch in (ord("S"), ord("s")):
+            self.save_preparse()
             return True
         if ch == curses.KEY_UP:
             self.focus_prev()

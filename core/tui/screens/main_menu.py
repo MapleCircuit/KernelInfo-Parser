@@ -39,7 +39,7 @@ class MainMenuScreen(BaseScreen):
         ("L", "Logging Configuration", "Parser & webapp log files, directories, levels & request filter"),
         ("5", "Run Diagnostics (Test All)", "Verify all database, SSH, git, CVE, and daemon configurations"),
         ("6", "Git Repository Manager", "Linux, CVE & other repos: select, clone, add, remotes, fetch all"),
-        ("7", "Parse Specific Versions / Tags", "Pick one or more release tags with the tag selector and parse them"),
+        ("7", "Parse & Pre-Parse Versions / Tags", "Select tags to parse now and configure Insights / API pre-parse rules"),
         ("8", "Table Reset", "Drop & recreate every database table (type RESET to confirm)"),
         ("9", "DB Content Viewer", "Parsed versions, repos & branches, ML/CVE data, table sizes, clean partial runs"),
         ("S", "Save Configuration", "Saves to Active Config File"),

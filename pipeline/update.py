@@ -19,7 +19,7 @@ from pipeline.arch_layouts import processing_arch_layouts
 from pipeline.blob_reuse import _log_preload_summary, _record_reparsed_blobs, _reuse_parsed_blobs
 from pipeline.changesets import file_fid_cache, file_fnid_cache
 from pipeline.commits import processing_git_commits
-from pipeline.external_steps import processing_source_facts
+from pipeline.external_steps import processing_kapi, processing_source_facts
 from pipeline.file_references import processing_file_references
 from pipeline.git_commit_worker import _start_git_commit_worker
 from pipeline.git_ingest import _ensure_full_checkpoint, create_new_vid, finish_version_ingest
@@ -313,5 +313,6 @@ def update(version: str, repo_path: str | None = None) -> None:
     if hasattr(G.TE, "update_in_mem_indexes"):
         G.TE.update_in_mem_indexes = True
     finish_version_ingest(gp.VID)
+    processing_kapi(str(MF.repo_dir), getattr(gp, "repo_id", None), version, commit_id=gp.VID)
     reclaim_system_memory()
     return

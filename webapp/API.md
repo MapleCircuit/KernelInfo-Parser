@@ -96,7 +96,7 @@ webapp/
 │   │   ├── insights_service.py     # Release stats, merge windows, subsystem health (§4.10)
 │   │   ├── cve_service.py          # Linux kernel CVEs the parser ingested (m_cve, m_cve_commit), catalog & per release (§4.11)
 │   │   ├── kbuild_index_service.py # Kbuild object index per revision and ARCH (§4.4)
-│   │   ├── kapi_service.py         # Syscalls, exports, parameters, tracepoints, modules from per-blob Kernel API records (§4.9)
+│   │   ├── kapi_service.py         # Syscalls, exports, parameters, tracepoints, modules (DB-first m_kapi_catalog / m_kapi_release_summary, fallback per-blob Kernel API records) (§4.9)
 │   │   ├── device_index_service.py # Device tables, hardware id -> driver matching (§4.9, N4)
 │   │   ├── patch_apply.py          # In-memory git-am-style applier of archive patches (§4.8, P1)
 │   │   ├── patch_series.py         # git format-patch style multi-file series formatter (§4.6, P3)

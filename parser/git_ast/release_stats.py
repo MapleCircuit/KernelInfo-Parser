@@ -1090,6 +1090,7 @@ def ingest_insights(
     *,
     from_tag: str | None = None,
     insights_cfg: dict[str, Any] | None = None,
+    repo_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ingest pre-computed merge window pulls and subsystem health metrics for release segments."""
     started = time.time()
@@ -1105,17 +1106,19 @@ def ingest_insights(
         except Exception:
             return {"state": "unavailable", "segments": 0}
 
-    if insights_cfg is None:
-        from core.config import get_repository, resolve_repo_insights
-        repo_entry = None
+    if repo_entry is None:
+        from core.config import get_repository
         with contextlib.suppress(Exception):
             repo_entry = get_repository(str(repo))
+
+    if insights_cfg is None:
+        from core.config import resolve_repo_insights
         insights_cfg = resolve_repo_insights(repo_entry)
 
     rows = db.select_rows(
         "m_release_segment",
         ["segment_id", "tag", "tag_hash", "base_tag", "base_hash", "diff_base_tag"],
-        {"repo_id": repo_id, "chain": CHAIN_MAINLINE},
+        {"repo_id": repo_id},
     )
     if not rows:
         return {"state": "current", "segments": 0}
@@ -1126,15 +1129,18 @@ def ingest_insights(
         if th and th != _NO_HASH
     }
 
-    final_segments = []
+    from core.config import resolve_preparse_tags
+    all_tags = [_text(r[1]) for r in rows]
+    selected_tags = set(resolve_preparse_tags(repo_entry, "insights", all_tags))
+
+    target_segments = []
     for sid, tag, th, bt, bh, dbt in rows:
         tag_str = _text(tag)
-        parsed = parse_tag(tag_str)
-        if parsed and parsed.get("final"):
+        if tag_str in selected_tags:
             sha_hex = bytes(th).hex() if th and th != _NO_HASH else ""
             dbt_str = _text(dbt)
             prev_sha = tag_to_sha.get(dbt_str)
-            final_segments.append({
+            target_segments.append({
                 "segment_id": int(sid),
                 "tag": tag_str,
                 "sha": sha_hex,
@@ -1142,16 +1148,16 @@ def ingest_insights(
                 "prev_sha": prev_sha,
             })
 
-    final_segments.sort(key=lambda s: release_key(s["tag"]))
+    target_segments.sort(key=lambda s: release_key(s["tag"]))
 
     if from_tag:
         from_key = release_key(from_tag)
-        final_segments = [s for s in final_segments if release_key(s["tag"]) >= from_key]
+        target_segments = [s for s in target_segments if release_key(s["tag"]) >= from_key]
 
-    if not final_segments:
+    if not target_segments:
         return {"state": "current", "segments": 0}
 
-    target_sids = [s["segment_id"] for s in final_segments]
+    target_sids = [s["segment_id"] for s in target_segments]
 
     current_pull_sids = {
         int(sid) for sid in db.select_values(
@@ -1169,7 +1175,7 @@ def ingest_insights(
     }
 
     missing_segments = [
-        s for s in final_segments
+        s for s in target_segments
         if s["segment_id"] not in current_pull_sids or s["segment_id"] not in current_health_sids
     ]
 
@@ -1252,8 +1258,10 @@ def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str]
     todo = plan(tags, {t: row[1:6] for t, row in stored.items()})
     if not todo:
         if hasattr(db, "table_exists") and db.table_exists("m_release_pull"):
-            with contextlib.suppress(Exception):
+            try:
                 ingest_insights(db, repo, repo_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Release stats] Insights pre-parse failed: %s", exc, exc_info=True)
         return {"state": "current", "tags": len(tags), "segments": 0, "persons_added": 0, "seconds": 0.0}
     # Replacing a mainline segment can move a person's first release later: recompute those from scratch
     replaced_mainline = any(r["tag"] in stored and r["chain"] == CHAIN_MAINLINE for r in todo)
@@ -1289,7 +1297,9 @@ def ingest(db: Any, repo: Path, repo_id: int, progress: Callable[[int, int, str]
         with db.transaction():
             _rebuild_first_releases(db, repo_id, mainline)
     if hasattr(db, "table_exists") and db.table_exists("m_release_pull"):
-        with contextlib.suppress(Exception):
+        try:
             ingest_insights(db, repo, repo_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Release stats] Insights pre-parse failed: %s", exc, exc_info=True)
     return {"state": "updated", "tags": len(tags), "segments": done, "persons_added": persons.added,
             "seconds": round(time.time() - started, 1)}

@@ -387,3 +387,271 @@ class ReadIntents:
 
         return symbol_rows.symbol_def_blobs_of_targets(self, ast_ids)
 
+    # ---- kapi ----------------------------------------------------------------------------------------------------
+    def kapi_resolve_commit_id(self, version_or_sha: str, repo_id: int | None = None) -> int | None:
+        """Resolve a tag/ref name or commit hash (prefix or full 40-char SHA) to `commit_id`."""
+        from db_engine.spec import hash_prefix as hash_prefix_cond
+
+        key = (version_or_sha or "").strip()
+        if not key:
+            return None
+        ref_where: dict[str, Any] = {"ref_name": key}
+        if repo_id is not None:
+            ref_where["repo_id"] = int(repo_id)
+        ref_row = self.select_one(  # type: ignore[attr-defined]
+            "m_git_ref", ["commit_id"], ref_where, order_by=["-commit_id"], as_dict=True
+        )
+        if ref_row and ref_row.get("commit_id") is not None:
+            return int(ref_row["commit_id"])
+        if 4 <= len(key) <= 40 and all(c in "0123456789abcdefABCDEF" for c in key):
+            where: list[Any] = [{"c.commit_hash": hash_prefix_cond(key)}]
+            joins: list[Join] = []
+            if repo_id is not None:
+                joins.append(Join(("m_repository", "rep"), {"rep.network_id": "c.network_id"}))
+                where.append({"rep.repo_id": int(repo_id)})
+            commit_row = self.select_one(  # type: ignore[attr-defined]
+                ("m_commit", "c"),
+                ["c.commit_id"],
+                where,
+                joins=joins,
+                order_by=["-c.commit_id"],
+                as_dict=True,
+            )
+            if commit_row and commit_row.get("commit_id") is not None:
+                return int(commit_row["commit_id"])
+        return None
+
+    def kapi_catalog(self, commit_id: int, kind: str, arch: str = "") -> dict[str, Any] | None:
+        """Return the materialized `m_kapi_catalog` row (including `data` BLOB) for `(commit_id, arch, kind)`."""
+        if not self.existing_tables(["m_kapi_catalog"]):  # type: ignore[attr-defined]
+            return None
+        row = self.select_one(  # type: ignore[attr-defined]
+            "m_kapi_catalog",
+            [
+                "commit_id",
+                "arch",
+                "kind",
+                "catalog_format",
+                "kapi_format",
+                "total_count",
+                "summary_json",
+                "data",
+                "built_at",
+            ],
+            {"commit_id": int(commit_id), "arch": arch, "kind": kind},
+            as_dict=True,
+        )
+        if row is None:
+            return None
+        row["arch"] = _text(row.get("arch", ""))
+        row["kind"] = _text(row.get("kind", ""))
+        if row.get("summary_json") is not None:
+            row["summary_json"] = _text(row["summary_json"])
+        if isinstance(row.get("data"), (bytearray, memoryview)):
+            row["data"] = bytes(row["data"])
+        return row
+
+    def kapi_catalog_meta(self, commit_id: int, arch: str | None = "") -> list[dict[str, Any]]:
+        """Return metadata rows (without `data` BLOB) from `m_kapi_catalog` for `commit_id`."""
+        if not self.existing_tables(["m_kapi_catalog"]):  # type: ignore[attr-defined]
+            return []
+        where: dict[str, Any] = {"commit_id": int(commit_id)}
+        if arch is not None:
+            where["arch"] = arch
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "m_kapi_catalog",
+            ["commit_id", "arch", "kind", "catalog_format", "kapi_format", "total_count", "summary_json", "built_at"],
+            where,
+            order_by=["arch", "kind"],
+            as_dict=True,
+        )
+        for r in rows:
+            r["arch"] = _text(r.get("arch", ""))
+            r["kind"] = _text(r.get("kind", ""))
+            if r.get("summary_json") is not None:
+                r["summary_json"] = _text(r["summary_json"])
+        return rows
+
+    def kapi_release_summary(self, commit_id: int, arch: str = "x86_64") -> dict[str, Any] | None:
+        """Return the materialized `m_kapi_release_summary` row for `(commit_id, arch)`."""
+        if not self.existing_tables(["m_kapi_release_summary"]):  # type: ignore[attr-defined]
+            return None
+        row = self.select_one(  # type: ignore[attr-defined]
+            "m_kapi_release_summary",
+            [
+                "commit_id",
+                "arch",
+                "catalog_format",
+                "kapi_format",
+                "syscalls_count",
+                "exports_count",
+                "params_count",
+                "tracepoints_count",
+                "modules_count",
+                "devices_count",
+                "subsystems_json",
+                "built_at",
+            ],
+            {"commit_id": int(commit_id), "arch": arch},
+            as_dict=True,
+        )
+        if row is None:
+            return None
+        row["arch"] = _text(row.get("arch", ""))
+        if row.get("subsystems_json") is not None:
+            row["subsystems_json"] = _text(row["subsystems_json"])
+        return row
+
+    # ---- insights ------------------------------------------------------------------------------------------------
+    def release_segments(
+        self,
+        repo_id: int | None = None,
+        *,
+        chain: str | None = None,
+        tags: Sequence[str] | None = None,
+        segment_ids: Sequence[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Release segments from `m_release_segment` filtered by `repo_id`, `chain`, `tags`, or `segment_ids`."""
+        if tags is not None and not tags:
+            return []
+        if segment_ids is not None and not segment_ids:
+            return []
+        where: dict[str, Any] = {}
+        if repo_id is not None:
+            where["repo_id"] = int(repo_id)
+        if chain is not None:
+            where["chain"] = chain
+        if tags is not None:
+            where["tag"] = list(tags)
+        if segment_ids is not None:
+            where["segment_id"] = [int(s) for s in segment_ids]
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "m_release_segment",
+            [
+                "segment_id",
+                "repo_id",
+                "tag",
+                "tag_hash",
+                "chain",
+                "base_tag",
+                "base_hash",
+                "commits",
+                "merges",
+                "diff_base_tag",
+                "files_changed",
+                "lines_added",
+                "lines_removed",
+                "format",
+            ],
+            where or None,
+            order_by=["segment_id"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("tag", "chain", "base_tag", "diff_base_tag"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+            for k in ("tag_hash", "base_hash"):
+                if isinstance(r.get(k), (bytearray, memoryview)):
+                    r[k] = bytes(r[k])
+        return rows
+
+    def release_pulls(self, segment_ids: Sequence[int] | int) -> list[dict[str, Any]]:
+        """Pull-request records from `m_release_pull` for one or more `segment_ids`, ordered by `segment_id, pull_idx`."""
+        ids = [int(segment_ids)] if isinstance(segment_ids, int) else [int(s) for s in segment_ids]
+        if not ids or not self.existing_tables(["m_release_pull"]):  # type: ignore[attr-defined]
+            return []
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "m_release_pull",
+            [
+                "segment_id",
+                "pull_idx",
+                "merge_hash",
+                "p1_hash",
+                "p2_hash",
+                "merge_date",
+                "commits",
+                "subject",
+                "source_url",
+                "ref_name",
+                "sender",
+                "sec_id",
+                "sec_name",
+                "dirs_json",
+                "body",
+                "format",
+            ],
+            {"segment_id": ids},
+            order_by=["segment_id", "pull_idx"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("subject", "source_url", "ref_name", "sender", "sec_name", "dirs_json", "body"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+            for k in ("merge_hash", "p1_hash", "p2_hash"):
+                if isinstance(r.get(k), (bytearray, memoryview)):
+                    r[k] = bytes(r[k])
+        return rows
+
+    def release_section_health(self, segment_ids: Sequence[int] | int) -> list[dict[str, Any]]:
+        """Subsystem health rows from `m_release_section_health` for one or more `segment_ids`."""
+        ids = [int(segment_ids)] if isinstance(segment_ids, int) else [int(s) for s in segment_ids]
+        if not ids or not self.existing_tables(["m_release_section_health"]):  # type: ignore[attr-defined]
+            return []
+        rows = self.select_rows(  # type: ignore[attr-defined]
+            "m_release_section_health",
+            [
+                "segment_id",
+                "sec_name",
+                "sec_id",
+                "status",
+                "commits",
+                "reviewed_commits",
+                "authors_json",
+                "activity_json",
+                "pat_hash",
+                "format",
+            ],
+            {"segment_id": ids},
+            order_by=["segment_id", "sec_name"],
+            as_dict=True,
+        )
+        for r in rows:
+            for k in ("sec_name", "status", "authors_json", "activity_json"):
+                if r.get(k) is not None:
+                    r[k] = _text(r[k])
+            if isinstance(r.get("pat_hash"), (bytearray, memoryview)):
+                r["pat_hash"] = bytes(r["pat_hash"])
+        return rows
+
+    def release_person_counts(self, segment_ids: Sequence[int] | int) -> list[dict[str, Any]]:
+        """Aggregated `(person_id, role_type, commits)` across `segment_ids` from `m_release_person`."""
+        ids = [int(segment_ids)] if isinstance(segment_ids, int) else [int(s) for s in segment_ids]
+        if not ids:
+            return []
+        return self.aggregate(  # type: ignore[attr-defined, no-any-return]
+            "m_release_person",
+            {"person_id": "person_id", "role_type": "role_type", "commits": Agg("SUM", "commits")},
+            {"segment_id": ids},
+            group_by=["person_id", "role_type"],
+            as_dict=True,
+        )
+
+    def person_first_releases(self, repo_id: int, person_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """First mainline release `segment_id` per `person_id` in `repo_id` from `m_person_first_release`."""
+        pids = sorted({int(p) for p in person_ids})
+        if not pids:
+            return []
+        out: list[dict[str, Any]] = []
+        for i in range(0, len(pids), 1000):
+            out.extend(
+                self.select_rows(  # type: ignore[attr-defined]
+                    "m_person_first_release",
+                    ["person_id", "segment_id"],
+                    {"repo_id": int(repo_id), "person_id": pids[i : i + 1000]},
+                    as_dict=True,
+                )
+            )
+        return out
+

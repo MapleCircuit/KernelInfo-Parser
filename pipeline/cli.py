@@ -449,6 +449,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Backfill pre-computed merge-window pulls (m_release_pull) and subsystem health summaries (m_release_section_health) for release segments.",
     )
     parser.add_argument(
+        "--backfill-kapi",
+        dest="backfill_kapi",
+        action="store_true",
+        help="Backfill materialized KAPI catalogs (m_kapi_catalog) and release summaries (m_kapi_release_summary) for selected tags, then exit (core/API.md section 12).",
+    )
+    parser.add_argument(
         "--backfill-cve-releases",
         dest="backfill_cve_releases",
         action="store_true",

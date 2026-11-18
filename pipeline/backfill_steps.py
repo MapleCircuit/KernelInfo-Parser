@@ -73,6 +73,10 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             requested = True
             summary = backfills.backfill_insights(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
             logger.info(f"[Backfill insights] {summary}")
+        if getattr(args, "backfill_kapi", False):
+            requested = True
+            summary = backfills.backfill_kapi(db, str(MF.repo_dir), repo_id, getattr(args, "backfill_from", None))
+            logger.info(f"[Backfill KAPI] {summary}")
         if getattr(args, "backfill_cve_releases", False):
             requested = True
             summary = backfills.backfill_cve_releases(

@@ -204,11 +204,7 @@ def _db_authors_before(tag_or_prev: str | None, family: str) -> set[str] | None:
 
         with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
-            stored_rows = cur.select_rows(
-                "m_release_segment",
-                ["segment_id", "tag", "tag_hash", "chain", "format"],
-                {"repo_id": repo_id, "tag": prior_tags},
-            )
+            stored_rows = cur.release_segments(repo_id=repo_id, tags=prior_tags)
             stored_by_tag: dict[str, Any] = {_text(r["tag"]): r for r in stored_rows}
             sids: list[int] = []
             for t in prior_tags:
@@ -417,15 +413,7 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
             if repo_id is None or repo_id <= 0:
                 return None
             members = list(rng["tags"])
-            seg = {
-                _text(r["tag"]): r
-                for r in cur.select_rows(
-                    "m_release_segment",
-                    ["segment_id", "tag", "tag_hash", "base_tag", "base_hash", "diff_base_tag", "format", "commits",
-                     "merges", "files_changed", "lines_added", "lines_removed"],
-                    {"repo_id": repo_id, "tag": members},
-                )
-            }
+            seg = {r["tag"]: r for r in cur.release_segments(repo_id=repo_id, tags=members)}
             for t, base in rng["tags"].items():
                 r = seg.get(t)
                 if (r is None or bytes(r["tag_hash"]).hex() != tags[t] or _text(r["base_tag"]) != (base or "")
@@ -436,13 +424,8 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
                 return None
             ids = [int(r["segment_id"]) for r in seg.values()]
             counts = [
-                (int(r["person_id"]), int(r["role_type"]), int(r["n"]))
-                for r in cur.select_rows(
-                    "m_release_person",
-                    {"person_id": "person_id", "role_type": "role_type", "n": Agg("SUM", "commits")},
-                    {"segment_id": ids},
-                    group_by=["person_id", "role_type"],
-                )
+                (int(r["person_id"]), int(r["role_type"]), int(r["commits"]))
+                for r in cur.release_person_counts(ids)
             ]
             pids = sorted({p for p, _, _ in counts})
             persons: dict[int, tuple[str, str]] = {}
@@ -458,22 +441,17 @@ def db_release_stats(tag: str) -> dict[str, Any] | None:
             if rng["kind"] == "mainline":
                 author_keys = {key_of[p] for p, role, _ in counts if role == int(CommitRole.AUTHOR)}
                 aliases = sorted({a for k in author_keys for a in members_of.get(k, [])} | {p for p, role, _ in counts if role == int(CommitRole.AUTHOR)})
-                firsts: list[tuple[int, int]] = []
-                for i in range(0, len(aliases), 1000):
-                    part = aliases[i:i + 1000]
-                    firsts += [
-                        (int(r["person_id"]), int(r["segment_id"]))
-                        for r in cur.select_rows(
-                            "m_person_first_release", ["person_id", "segment_id"], {"repo_id": repo_id, "person_id": part}
-                        )
-                    ]
+                firsts = [
+                    (int(r["person_id"]), int(r["segment_id"]))
+                    for r in cur.person_first_releases(repo_id, aliases)
+                ]
                 sids = sorted({s for _, s in firsts})
                 seg_tag: dict[int, str] = {}
                 for i in range(0, len(sids), 1000):
                     part = sids[i:i + 1000]
                     seg_tag.update({
-                        int(r["segment_id"]): _text(r["tag"])
-                        for r in cur.select_rows("m_release_segment", ["segment_id", "tag"], {"segment_id": part})
+                        int(r["segment_id"]): r["tag"]
+                        for r in cur.release_segments(segment_ids=part)
                     })
                 for p, s in firsts:
                     if s not in seg_tag:
@@ -1255,11 +1233,8 @@ def db_merge_window(tag: str) -> dict[str, Any] | None:
         prev_name = rs.previous(tag)
         with get_reader() as cur:
             repo_id = get_active_repo_id(cur)
-            seg = cur.select_one(
-                "m_release_segment",
-                ["segment_id", "tag_hash", "diff_base_tag"],
-                {"repo_id": repo_id, "tag": tag},
-            )
+            segs = cur.release_segments(repo_id=repo_id, tags=[tag])
+            seg = segs[0] if segs else None
             if not seg:
                 return None
             if bytes(seg["tag_hash"]).hex() != tags.get(tag):
@@ -1267,13 +1242,7 @@ def db_merge_window(tag: str) -> dict[str, Any] | None:
             if _text(seg["diff_base_tag"]) != (prev_name or ""):
                 return None
             segment_id = int(seg["segment_id"])
-            rows = cur.select_rows(
-                "m_release_pull",
-                ["pull_idx", "merge_hash", "p1_hash", "p2_hash", "merge_date", "commits", "subject",
-                 "source_url", "ref_name", "sender", "sec_id", "sec_name", "dirs_json", "body", "format"],
-                {"segment_id": segment_id},
-                order_by=["pull_idx"],
-            )
+            rows = cur.release_pulls(segment_id)
             if not rows or any(int(r["format"]) != MW_FORMAT for r in rows):
                 return None
 
@@ -1597,6 +1566,93 @@ def _maintainer_data(tag: str, *, sha: str | None = None) -> tuple[list[Any], An
     return _load_maintainers(rev, resolved_sha)
 
 
+def _read_precomputed_health(
+    cur: Any,
+    repo_id: int,
+    tags: list[str],
+    sections: list[Any],
+    tc: dict[str, str],
+) -> tuple[dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]], list[str]]:
+    """Validate and load pre-computed `m_release_section_health` rows for `tags`.
+    Returns `(precomputed_by_tag, unanswered_tags)`."""
+    from parser.git_ast import release_stats
+
+    catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
+    active_sections = [s for s in sections if not catchall or s.name != catchall]
+    sec_pat_hashes = {s.name: _section_pattern_hash(s) for s in active_sections}
+    manifest_hash = _sections_manifest_hash(sections, catchall)
+
+    query_tags = [t for t in tags if t != rs.LATEST_RELEASE and t in tc]
+    seg_by_tag = {
+        r["tag"]: r
+        for r in cur.release_segments(repo_id=repo_id, tags=query_tags)
+    } if query_tags else {}
+
+    valid_segs: dict[str, int] = {}
+    unanswered_tags: list[str] = []
+    for t in tags:
+        if t == rs.LATEST_RELEASE or t not in tc:
+            unanswered_tags.append(t)
+            continue
+        prev = rs.previous(t)
+        seg = seg_by_tag.get(t)
+        if (
+            not seg
+            or int(seg["format"]) != release_stats.FORMAT
+            or bytes(seg["tag_hash"]).hex() != tc.get(t)
+            or _text(seg["diff_base_tag"]) != (prev or "")
+        ):
+            unanswered_tags.append(t)
+            continue
+        valid_segs[t] = int(seg["segment_id"])
+
+    health_by_seg: dict[int, list[dict[str, Any]]] = {}
+    if valid_segs:
+        try:
+            for r in cur.release_section_health(list(valid_segs.values())):
+                health_by_seg.setdefault(int(r["segment_id"]), []).append(r)
+        except Exception:
+            health_by_seg = {}
+
+    precomputed: dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]] = {}
+    for t in tags:
+        sid = valid_segs.get(t)
+        if sid is None:
+            continue
+        health_rows = health_by_seg.get(sid)
+        if not health_rows or any(int(r["format"]) != HEALTH_FORMAT for r in health_rows):
+            unanswered_tags.append(t)
+            continue
+        sentinel = next((r for r in health_rows if _text(r["sec_name"]) == ""), None)
+        if sentinel is None:
+            unanswered_tags.append(t)
+            continue
+        sentinel_pat = bytes(sentinel["pat_hash"])
+        by_name = {_text(r["sec_name"]): r for r in health_rows if _text(r["sec_name"]) != ""}
+        valid = True
+        for s in active_sections:
+            if s.name in by_name:
+                if bytes(by_name[s.name]["pat_hash"]) != sec_pat_hashes[s.name]:
+                    valid = False
+                    break
+            elif sentinel_pat != manifest_hash:
+                valid = False
+                break
+        if not valid:
+            unanswered_tags.append(t)
+            continue
+        precomputed[t] = {
+            sec_n: (
+                int(r["commits"]),
+                int(r["reviewed_commits"]),
+                json.loads(_text(r["authors_json"]) or "{}"),
+                json.loads(_text(r["activity_json"]) or "{}"),
+            )
+            for sec_n, r in by_name.items()
+        }
+    return precomputed, unanswered_tags
+
+
 def compute_subsystem_health(tag: str, window: int, progress: Callable | None = None, *, latest: dict[str, Any] | None = None) -> dict[str, Any]:
     """The subsystem-health report: from the database when it covers every release of the window
     (health_from_db()), else one `git log --name-only` pass per release (`source: "git"`)."""
@@ -1619,76 +1675,19 @@ def compute_subsystem_health(tag: str, window: int, progress: Callable | None = 
     non_latest = [t for t in tags if t != rs.LATEST_RELEASE]
     if non_latest:
         try:
-            from parser.git_ast import release_stats
             from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
             from webapp.backend.database.pool import get_reader
 
-            catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
-            active_sections = [s for s in sections if not catchall or s.name != catchall]
-            sec_pat_hashes = {s.name: _section_pattern_hash(s) for s in active_sections}
-            manifest_hash = _sections_manifest_hash(sections, catchall)
             tc = rs.tag_commits()
-
             with get_reader() as cur:
                 repo_id = get_active_repo_id(cur)
                 network_id = get_active_network_id(cur)
-                unanswered: list[str] = []
-                for t in non_latest:
-                    if t not in tc:
-                        continue
-                    prev = rs.previous(t)
-                    seg = cur.select_one(
-                        "m_release_segment",
-                        ["segment_id", "tag_hash", "diff_base_tag", "format"],
-                        {"repo_id": repo_id, "tag": t},
-                    )
-                    if (
-                        not seg
-                        or int(seg["format"]) != release_stats.FORMAT
-                        or bytes(seg["tag_hash"]).hex() != tc.get(t)
-                        or _text(seg["diff_base_tag"]) != (prev or "")
-                    ):
-                        unanswered.append(t)
-                        continue
-                    try:
-                        h_rows = cur.select_rows(
-                            "m_release_section_health",
-                            ["sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
-                            {"segment_id": int(seg["segment_id"])},
-                        )
-                    except Exception:
-                        h_rows = None
-                    if not h_rows or any(int(r["format"]) != HEALTH_FORMAT for r in h_rows):
-                        unanswered.append(t)
-                        continue
-                    sentinel = next((r for r in h_rows if _text(r["sec_name"]) == ""), None)
-                    if sentinel is None:
-                        unanswered.append(t)
-                        continue
-                    sentinel_pat = bytes(sentinel["pat_hash"])
-                    by_name = {_text(r["sec_name"]): r for r in h_rows if _text(r["sec_name"]) != ""}
-                    valid = True
-                    for s in active_sections:
-                        if s.name in by_name:
-                            if bytes(by_name[s.name]["pat_hash"]) != sec_pat_hashes[s.name]:
-                                valid = False
-                                break
-                        else:
-                            if sentinel_pat != manifest_hash:
-                                valid = False
-                                break
-                    if not valid:
-                        unanswered.append(t)
-                        continue
-                    t_data: dict[str, Any] = {}
-                    for sec_n, r in by_name.items():
-                        t_data[sec_n] = (
-                            int(r["commits"]),
-                            int(r["reviewed_commits"]),
-                            json.loads(_text(r["authors_json"]) or "{}"),
-                            json.loads(_text(r["activity_json"]) or "{}"),
-                        )
-                    db_precomputed[t] = t_data
+                check_tags = [t for t in non_latest if t in tc]
+                db_precomputed, unanswered = (
+                    _read_precomputed_health(cur, repo_id, check_tags, sections, tc)
+                    if repo_id is not None and check_tags
+                    else ({}, [])
+                )
 
                 # For unanswered non-latest tags, try health_coverage
                 if unanswered and network_id is not None:
@@ -1739,6 +1738,7 @@ def compute_subsystem_health(tag: str, window: int, progress: Callable | None = 
                                 int(r["fnid"]): safe_decode(r["fname"])
                                 for r in cur.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part})
                             })
+                        catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
                         sec_name = {s.sec_id: s.name for s in sections if (not catchall or s.name != catchall) and isinstance(s.sec_id, int)}
                         sec_ids = sorted(sec_name)
                         if sec_ids:
@@ -1825,87 +1825,17 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
 
     Pre-computed rows from m_release_section_health are read directly when format and pattern hashes match.
     Other releases are read via m_commit, m_commit_file, and m_bridge_commit_person."""
-    from parser.git_ast import release_stats
     from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
     from webapp.backend.database.pool import get_reader
 
-    catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
-    active_sections = [s for s in sections if not catchall or s.name != catchall]
-    sec_pat_hashes = {s.name: _section_pattern_hash(s) for s in active_sections}
-    manifest_hash = _sections_manifest_hash(sections, catchall)
     tc = rs.tag_commits()
-
-    precomputed: dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]] = {}
-    unanswered_tags: list[str] = []
-
     with get_reader() as cur:
         repo_id = get_active_repo_id(cur)
         network_id = get_active_network_id(cur)
         if repo_id is None:
             return None
 
-        # Check m_release_section_health for each tag in tags
-        for t in tags:
-            if t == rs.LATEST_RELEASE or t not in tc:
-                unanswered_tags.append(t)
-                continue
-            prev = rs.previous(t)
-            seg = cur.select_one(
-                "m_release_segment",
-                ["segment_id", "tag_hash", "diff_base_tag", "format"],
-                {"repo_id": repo_id, "tag": t},
-            )
-            if (
-                not seg
-                or int(seg["format"]) != release_stats.FORMAT
-                or bytes(seg["tag_hash"]).hex() != tc.get(t)
-                or _text(seg["diff_base_tag"]) != (prev or "")
-            ):
-                unanswered_tags.append(t)
-                continue
-
-            try:
-                health_rows = cur.select_rows(
-                    "m_release_section_health",
-                    ["sec_name", "sec_id", "status", "commits", "reviewed_commits", "authors_json", "activity_json", "pat_hash", "format"],
-                    {"segment_id": int(seg["segment_id"])},
-                )
-            except Exception:
-                health_rows = None
-            if not health_rows or any(int(r["format"]) != HEALTH_FORMAT for r in health_rows):
-                unanswered_tags.append(t)
-                continue
-
-            sentinel = next((r for r in health_rows if _text(r["sec_name"]) == ""), None)
-            if sentinel is None:
-                unanswered_tags.append(t)
-                continue
-
-            sentinel_pat = bytes(sentinel["pat_hash"])
-            by_name = {_text(r["sec_name"]): r for r in health_rows if _text(r["sec_name"]) != ""}
-            valid = True
-            for s in active_sections:
-                if s.name in by_name:
-                    if bytes(by_name[s.name]["pat_hash"]) != sec_pat_hashes[s.name]:
-                        valid = False
-                        break
-                else:
-                    if sentinel_pat != manifest_hash:
-                        valid = False
-                        break
-
-            if not valid:
-                unanswered_tags.append(t)
-                continue
-
-            t_data: dict[str, tuple[int, int, dict[str, int], dict[str, int]]] = {}
-            for sec_n, r in by_name.items():
-                c_num = int(r["commits"])
-                rev_num = int(r["reviewed_commits"])
-                auth_dict = json.loads(_text(r["authors_json"]) or "{}")
-                act_dict = json.loads(_text(r["activity_json"]) or "{}")
-                t_data[sec_n] = (c_num, rev_num, auth_dict, act_dict)
-            precomputed[t] = t_data
+        precomputed, unanswered_tags = _read_precomputed_health(cur, repo_id, tags, sections, tc)
 
         if not unanswered_tags:
             report = _aggregate_health(tag, tags, sections, matcher, lambda t: [], progress=progress, precomputed=precomputed)
@@ -1967,6 +1897,7 @@ def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                 int(r["fnid"]): safe_decode(r["fname"])
                 for r in cur.select_rows("m_file_name", ["fnid", "fname"], {"fnid": part})
             })
+        catchall = str(_insights_cfg().get("catchall_section", "THE REST") or "")
         sec_name = {s.sec_id: s.name for s in sections if (not catchall or s.name != catchall) and isinstance(s.sec_id, int)}
         file_secs: dict[str, list[str]] = {}
         sec_ids = sorted(sec_name)
@@ -1997,6 +1928,16 @@ def subsystem_health(tag: str, window: int = 4, wait: float = 0.0) -> dict[str, 
         info = rs.latest_info()
         ck = f"{get_active_repo_name()}|health|{HEALTH_FORMAT}|latest|{info['prev_sha'] or '-'}|{info['sha']}|{window}|{rs.release_token()}"
         return _job(f"insights:{ck}", lambda p, _info=info: compute_subsystem_health(tag, window, p, latest=_info), ck, wait)
+    tags = _health_window(tag, window)
+    if rs.LATEST_RELEASE not in tags:
+        try:
+            sections, matcher = _maintainer_data(tag)
+            hit = health_from_db(tag, tags, sections, matcher)
+        except Exception as exc:  # noqa: BLE001 - Git answers
+            logger.warning("subsystem health of %s from the database failed: %s", tag, exc)
+            hit = None
+        if hit is not None:
+            return {"state": "done", "result": hit}
     sha = rs.tag_commits()[tag]
     # The release membership token separates a report built from the database from one built from Git
     ck = f"{get_active_repo_name()}|health|{HEALTH_FORMAT}|{sha}|{window}|{rs.release_token()}"

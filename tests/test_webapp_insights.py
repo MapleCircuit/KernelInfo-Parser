@@ -472,6 +472,22 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
                 __import__("unittest").mock.patch.object(ins, "health_from_db", return_value=None):
             self.assertEqual(ins.compute_subsystem_health("v1.2", 2)["source"], "git")
 
+    def test_subsystem_health_serves_synchronously_from_db(self) -> None:
+        from unittest import mock
+        secs, matcher = self.sections()
+        with mock.patch.object(ins, "_maintainer_data", return_value=(secs, matcher)), \
+                mock.patch.object(ins, "_job", side_effect=AssertionError("_job should not run")):
+            res = ins.subsystem_health("v1.2", window=2, wait=0.0)
+        self.assertEqual(res["state"], "done")
+        self.assertEqual(res["result"]["source"], "database")
+
+        with mock.patch.object(ins, "_maintainer_data", return_value=(secs, matcher)), \
+                mock.patch.object(ins, "health_from_db", return_value=None), \
+                mock.patch.object(ins, "_job", return_value={"state": "building", "progress": {}}) as m_job:
+            res_fb = ins.subsystem_health("v1.2", window=2, wait=0.0)
+        self.assertEqual(res_fb["state"], "building")
+        m_job.assert_called_once()
+
 
 class TestMergeWindowSectionResolution(unittest.TestCase):
     """Merge-window subsystem resolution via T: tree, changed files/directories, and maintainer."""

@@ -63,9 +63,26 @@ def compare(kind: str, a: dict[str, dict[str, Any]], b: dict[str, dict[str, Any]
     return {"added": added, "removed": removed, "changed": changed}
 
 
+def _rev_key(version: str) -> str:
+    from webapp.backend.security.git import safe_rev
+
+    safe_rev(version)
+    try:
+        from webapp.backend.database.helpers import get_active_repo_id
+        from webapp.backend.database.pool import get_reader
+
+        with get_reader() as reader:
+            cid = reader.kapi_resolve_commit_id(version, repo_id=get_active_repo_id(reader))
+            if cid is not None:
+                return f"cid:{cid}"
+    except Exception:  # noqa: BLE001
+        pass
+    return k.resolve(version)
+
+
 def diff(a: str, b: str, arch: str, kinds: list[str]) -> dict[str, Any]:
     """{state: "done", result} or the state of a catalog still building."""
-    sha_a, sha_b = k.resolve(a), k.resolve(b)
+    sha_a, sha_b = _rev_key(a), _rev_key(b)
     kinds = [x for x in KINDS if x in kinds] or list(KINDS)
     ck = (sha_a, sha_b, arch, tuple(kinds))
     hit = _CACHE.get(ck)

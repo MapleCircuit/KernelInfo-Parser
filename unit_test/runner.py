@@ -102,6 +102,7 @@ DEFAULT_MODULES = [
     "tests.test_man_ast",
     "tests.test_webapp_man",
     "tests.test_kapi_facts",
+    "tests.test_kapi_ingest",
     "tests.test_checkpoints",
     "tests.test_webapp_ops",
     "tests.test_webapp_callpath",

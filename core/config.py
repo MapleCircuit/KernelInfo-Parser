@@ -17,7 +17,7 @@ import re
 import stat
 import subprocess
 from pathlib import Path
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -263,8 +263,9 @@ REPOSITORY_KEYS = (
     "tag_views",
     "features",
     "insights",
+    "preparse",
 )
-OPTIONAL_REPOSITORY_KEYS = frozenset({"features", "insights"})
+OPTIONAL_REPOSITORY_KEYS = frozenset({"features", "insights", "preparse"})
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
@@ -1251,6 +1252,156 @@ def prune_default_insights_overrides(
     return {k: v for k, v in normalized.items() if v != defaults.get(k)}
 
 
+PREPARSE_FEATURES: tuple[str, ...] = ("insights", "api")
+PREPARSE_MODES: tuple[str, ...] = ("all_main", "latest_n_main", "groups", "custom")
+DEFAULT_PREPARSE_SPEC: dict[str, Any] = {
+    "mode": "all_main",
+    "latest_n": 10,
+    "include_main": True,
+    "include_stable": False,
+    "include_rc": False,
+    "versions": [],
+}
+
+
+def default_repo_preparse(slug: str | None = None) -> dict[str, dict[str, Any]]:
+    """Return a copy of the default per-feature pre-parse configuration for a repository."""
+    _ = slug
+    return {feat: copy.deepcopy(DEFAULT_PREPARSE_SPEC) for feat in PREPARSE_FEATURES}
+
+
+def normalize_preparse_spec(raw: Any) -> dict[str, Any]:
+    """Validate and normalize a single feature's pre-parse specification."""
+    spec = copy.deepcopy(DEFAULT_PREPARSE_SPEC)
+    if not isinstance(raw, Mapping):
+        return spec
+
+    raw_mode = raw.get("mode")
+    if isinstance(raw_mode, str):
+        mode = raw_mode.strip().lower()
+        if mode in PREPARSE_MODES:
+            spec["mode"] = mode
+
+    if "latest_n" in raw:
+        spec["latest_n"] = max(1, _coerce_int(raw.get("latest_n"), DEFAULT_PREPARSE_SPEC["latest_n"]))
+
+    if "include_main" in raw:
+        spec["include_main"] = _coerce_bool(raw.get("include_main"), DEFAULT_PREPARSE_SPEC["include_main"])
+    if "include_stable" in raw:
+        spec["include_stable"] = _coerce_bool(raw.get("include_stable"), DEFAULT_PREPARSE_SPEC["include_stable"])
+    if "include_rc" in raw:
+        spec["include_rc"] = _coerce_bool(raw.get("include_rc"), DEFAULT_PREPARSE_SPEC["include_rc"])
+
+    raw_versions = raw.get("versions")
+    if isinstance(raw_versions, (list, tuple, set)):
+        seen: set[str] = set()
+        versions: list[str] = []
+        for item in raw_versions:
+            tag = str(item or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                versions.append(tag)
+        spec["versions"] = versions
+
+    return spec
+
+
+def normalize_preparse_overrides(raw: Any) -> dict[str, dict[str, Any]]:
+    """Validate and normalize a repository's per-feature `preparse` override mapping."""
+    if not isinstance(raw, Mapping):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for feat, spec_raw in raw.items():
+        key = str(feat or "").strip().lower()
+        if key not in PREPARSE_FEATURES:
+            logger.warning("Ignoring unknown repository preparse feature %r", feat)
+            continue
+        normalized[key] = normalize_preparse_spec(spec_raw)
+    return normalized
+
+
+def resolve_repo_preparse(entry: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Merge default per-feature pre-parse configuration with any valid `entry['preparse']` overrides."""
+    slug = repository_project(entry) if isinstance(entry, Mapping) else None
+    resolved = default_repo_preparse(slug)
+    if isinstance(entry, Mapping) and "preparse" in entry and entry["preparse"] is not None:
+        resolved.update(normalize_preparse_overrides(entry["preparse"]))
+    return resolved
+
+
+def prune_default_preparse_overrides(
+    slug: str | None, overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Return only feature specs in `normalize_preparse_overrides(overrides)` that differ from `default_repo_preparse(slug)`."""
+    defaults = default_repo_preparse(slug)
+    normalized = normalize_preparse_overrides(overrides)
+    return {feat: spec for feat, spec in normalized.items() if spec != defaults.get(feat)}
+
+
+def resolve_preparse_tags(
+    entry: Mapping[str, Any] | None, feature: str, tags: Iterable[str]
+) -> list[str]:
+    """Resolve which tags from `tags` should be pre-parsed for `feature` according to `entry['preparse']`."""
+    feature_key = str(feature or "").strip().lower()
+    if feature_key not in PREPARSE_FEATURES:
+        return []
+
+    from parser.git_ast.release_order import parse_tag, release_key
+
+    spec = resolve_repo_preparse(entry)[feature_key]
+    available: list[str] = []
+    available_set: set[str] = set()
+    for raw_tag in tags:
+        if not isinstance(raw_tag, str):
+            continue
+        tag = raw_tag.strip()
+        if tag and tag not in available_set:
+            available_set.add(tag)
+            available.append(tag)
+
+    main_tags: list[str] = []
+    stable_tags: list[str] = []
+    rc_tags: list[str] = []
+    for tag in available:
+        parsed = parse_tag(tag)
+        if parsed is None:
+            continue
+        if parsed["kind"] == "mainline" and parsed["final"]:
+            main_tags.append(tag)
+        elif parsed["kind"] == "stable":
+            stable_tags.append(tag)
+        elif parsed["pre"] > 0:
+            rc_tags.append(tag)
+
+    selected: set[str] = {t for t in spec["versions"] if t in available_set}
+    mode = spec["mode"]
+    if mode == "all_main":
+        selected.update(main_tags)
+    elif mode == "latest_n_main":
+        latest_n = max(1, int(spec["latest_n"]))
+        sorted_main = sorted(main_tags, key=release_key)
+        selected.update(sorted_main[-latest_n:])
+    elif mode == "groups":
+        if spec["include_main"]:
+            selected.update(main_tags)
+        if spec["include_stable"]:
+            selected.update(stable_tags)
+        if spec["include_rc"]:
+            selected.update(rc_tags)
+    # mode == "custom" keeps only explicit versions in `available_set`
+
+    return sorted(selected, key=release_key)
+
+
+def is_tag_selected_for_preparse(
+    entry: Mapping[str, Any] | None, feature: str, tag: str, all_tags: Iterable[str]
+) -> bool:
+    """True when `tag` is selected for pre-parsing `feature` given `entry` and `all_tags`."""
+    if not isinstance(tag, str) or not tag.strip():
+        return False
+    return tag.strip() in set(resolve_preparse_tags(entry, feature, all_tags))
+
+
 def detect_repository_insights(
     repo: Path,
     project_slug: str | None = None,
@@ -1362,7 +1513,7 @@ def detect_repository_insights(
 
 
 def _normalize_repo_entry_features(entry: dict[str, Any]) -> dict[str, Any]:
-    """Normalize `entry['features']` and `entry['insights']` in place (omitting when empty) and upgrade legacy default `tag_views`."""
+    """Normalize `entry['features']`, `entry['insights']`, and `entry['preparse']` in place (omitting when empty) and upgrade legacy default `tag_views`."""
     if "features" in entry:
         normalized = normalize_feature_overrides(entry["features"])
         if normalized:
@@ -1375,6 +1526,12 @@ def _normalize_repo_entry_features(entry: dict[str, Any]) -> dict[str, Any]:
             entry["insights"] = normalized_ins
         else:
             entry.pop("insights", None)
+    if "preparse" in entry:
+        normalized_pre = normalize_preparse_overrides(entry["preparse"])
+        if normalized_pre:
+            entry["preparse"] = normalized_pre
+        else:
+            entry.pop("preparse", None)
     if entry.get("tag_views") == _LEGACY_DEFAULT_TAG_VIEWS:
         entry["tag_views"] = copy.deepcopy(DEFAULT_TAG_VIEWS)
     return entry

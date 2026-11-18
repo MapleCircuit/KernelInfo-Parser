@@ -41,7 +41,7 @@ agents.
   - 11.1. Architecture & Roles [L1780-L1835]
   - 11.2. Concurrency Guarantees & ID Block Leasing [L1836-L1876]
   - 11.3. Surgical Range-Isolated Crash Recovery [L1877-L1908]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1909-L1950]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1909-L1952]
 <!-- toc:end -->
 
 ---
@@ -517,7 +517,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-66 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple
+72 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple
 (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). `core/DBLayout.py` is the single authoritative
 source of truth for table definitions, columns, and types. The database schema eliminates synthetic linear
 release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$
@@ -532,7 +532,7 @@ For authoritative table definitions, primary keys, indexes, and the full relatio
 - **AST Nodes & Spatial Mapping** (Tables 5–14, 34): `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`, `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_ast_hash`, `m_ast_attribute`.
 - **Maintainers & CREDITS** (Tables 15–20): `m_maintainer_person`, `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry`. `m_maintainer_section` records subsystem metadata: `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id, patchwork, bug_url, chat_channel, profile_doc)`.
 - **Git Commit DAG & Lineage** (Tables 21–25, 30–33, 43, 60, 63–64): `m_commit`, `m_bridge_commit_person`, `m_commit_file`, `m_bridge_commit_tag`, `m_moved_tag`, `m_git_network`, `m_repository`, `m_git_ref`, `m_commit_parent`, `m_commit_email`, `m_commit_release`, `m_commit_relation`, `m_commit_link`.
-- **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`.
+- **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61, 70–71): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`, `m_kapi_catalog`, `m_kapi_release_summary`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`. Tables 70–71 store materialized per-revision Kernel API catalogs (`(commit_id, arch, kind)` -> zlib JSON BLOB + summary) and per-release cross-kind summaries (`(commit_id, arch)` -> per-kind counts and subsystem breakdowns).
 - **Ingestion State, Watermarks & Checkpoints** (Tables 29, 35, 40–41, 47, 55–58): `m_db_instance`, `m_ingest_state`, `m_ingest_watermark`, `m_ingest_blob`, `m_checkpoint_base`, `m_table_sequence`, `m_ingest_id_range`, `m_parse_node`, `m_parse_task`. Table 58 `m_parse_task` coordinates distributed secondary work: `(task_id, network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name, base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg)`, with unique key `(network_id, ref_name)`.
 - **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59, 66–67): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`, `m_release_pull`, `m_release_section_health`.
 - **CVE Catalogs & Tracking** (Tables 49–51, 62, 65, 68–69): `m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_commit_hash`, `m_cve_file`, `m_cve_release_state`, `m_cve_release`. Table 65 `m_cve_file` maps CVE records to affected kernel source and header file paths: `(cve_id, file_path)`, indexed by `file_path`. Tables 68–69 store pre-evaluated release-to-CVE verdicts (`(segment_id, cve_id) -> (state, basis, fixed_here)`) and each segment's evaluated `cve_head` / `tag_hash` / format / `max_segment_id` state for incremental refreshes.
@@ -1931,7 +1931,9 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 
 | `--backfill-cve-files` | `m_cve_file` (§4 row 65) | Populates affected source and header file paths for CVE records from parsed `m_cve.data`. |
 
-| `--backfill-insights [--from <ref>]` | `m_release_pull`, `m_release_section_health` (§4 rows 66-67) | Summarizes merge-window pulls and per-section subsystem health for final mainline release segments of the repository (`release_stats.ingest_insights()`), resumable via `--from`. |
+| `--backfill-insights [--from <ref>]` | `m_release_pull`, `m_release_section_health` (§4 rows 66-67) | Summarizes merge-window pulls and per-section subsystem health for release segments selected by `preparse.insights` (`release_stats.ingest_insights()`), resumable via `--from`. |
+
+| `--backfill-kapi [--from <ref>]` | `m_kapi_catalog`, `m_kapi_release_summary` (§4 rows 70-71) | Materializes the 6 Kernel API catalogs (`syscalls`, `exports`, `params`, `tracepoints`, `modules`, `devices`) and per-release summaries for tags selected by `preparse.api` (`kapi_ingest.ingest_kapi()`), reading `m_blob_facts` family 2 and extracting missing blobs on the fly; resumable via `--from`. |
 
 | `--backfill-cve-releases [--from <ref>] [--cve-full]` | `m_cve_release_state`, `m_cve_release` (§4 rows 68-69) | Pre-evaluates release-to-CVE verdicts for release segments of the repository (`cve_releases.sync()`), resumable per segment and incremental after each segment's stored `cve_head`. Runs automatically at start when `m_cve_source` and `m_release_segment` have rows while `m_cve_release_state` is empty for the repository (unless `--no-backfill`). |
 

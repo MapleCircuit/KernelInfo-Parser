@@ -308,6 +308,68 @@ class TestVersionParseScreen(VersionParseTestBase):
             screen.handle_key(TAB)
         self.assertEqual(screen.focused_widget_index, start)
 
+    def test_preparse_defaults_and_independent_presets(self) -> None:
+        app = MockApp(make_config("linux"))
+        screen = self.screen(app)
+        # Default is all_main for both insights and api
+        self.assertEqual(screen.preparse_tags("insights"), ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"])
+        self.assertEqual(screen.preparse_tags("api"), ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"])
+        self.assertNotIn("preparse", screen.current_repo)
+        self.assertFalse(app.is_dirty)
+
+        screen.draw()
+        drawn = " ".join(c[1][2] for c in self.win.calls if c[0] == "addstr")
+        self.assertIn("Ins:[G] API:[G]", drawn)
+        self.assertIn("Ins: 5  API: 5", drawn)
+
+        # Change Insights to Latest N Main (N=2) independently of API
+        screen.focus_widget(screen.widgets.index(screen.insights_mode_select))
+        screen.handle_key(curses.KEY_RIGHT)  # All Main -> Latest N Main (default N=10)
+        self.assertEqual(screen.preparse_tags("insights"), ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"])
+        # Edit N to 2
+        screen.focus_widget(screen.widgets.index(screen.insights_n_input))
+        screen.insights_n_input.set_value("")
+        screen.handle_key(ord("2"))
+        self.assertEqual(screen.preparse_tags("insights"), ["v3.2", "v3.10"])
+        self.assertEqual(screen.preparse_tags("api"), ["v2.6.39", "v3.0", "v3.1", "v3.2", "v3.10"])
+        self.assertTrue(app.is_dirty)
+        self.assertEqual(set(screen.current_repo["preparse"]), {"insights"})
+        self.assertEqual(screen.current_repo["preparse"]["insights"]["mode"], "latest_n_main")
+        self.assertEqual(screen.current_repo["preparse"]["insights"]["latest_n"], 2)
+
+    def test_preparse_independent_tag_toggles_and_save(self) -> None:
+        app = MockApp(make_config("linux"))
+        save_calls: list[bool] = []
+        app.save_config = lambda: (save_calls.append(True) or (True, "Saved!"))  # type: ignore[attr-defined]
+        screen = self.screen(app)
+
+        # Toggle v3.0-rc1 for Insights only via 'i'
+        screen.focus_widget(screen.widgets.index(screen.tag_list))
+        screen.tag_list.set_selected(screen.visible_tags.index("v3.0-rc1"))
+        self.assertTrue(screen.handle_key(ord("i")))
+        self.assertIn("v3.0-rc1", screen.preparse_tags("insights"))
+        self.assertNotIn("v3.0-rc1", screen.preparse_tags("api"))
+
+        # Toggle v3.0 off for API only via 'k' (switches API to custom without v3.0)
+        screen.tag_list.set_selected(screen.visible_tags.index("v3.0"))
+        self.assertTrue(screen.handle_key(ord("k")))
+        self.assertNotIn("v3.0", screen.preparse_tags("api"))
+        self.assertIn("v3.1", screen.preparse_tags("api"))
+        self.assertIn("v3.0", screen.preparse_tags("insights"))
+
+        # Save via 'S'
+        self.assertTrue(screen.handle_key(ord("S")))
+        self.assertEqual(len(save_calls), 1)
+        self.assertEqual(screen.current_repo["preparse"]["insights"]["versions"], ["v3.0-rc1"])
+        self.assertEqual(screen.current_repo["preparse"]["api"]["mode"], "custom")
+
+    def test_main_menu_item_7_mentions_preparse(self) -> None:
+        from core.tui.screens.main_menu import MainMenuScreen
+
+        item_7 = next(item for item in MainMenuScreen.MENU_ITEMS if item[0] == "7")
+        self.assertIn("Pre-Parse", item_7[1])
+        self.assertIn("pre-parse", item_7[2].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

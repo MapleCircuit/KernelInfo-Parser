@@ -107,10 +107,6 @@ class TestKapiParsers(unittest.TestCase):
         self.assertEqual((ev["class"], ev["name"]), ("sched_class", "sched_wakeup"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestApiDiff(unittest.TestCase):
     def test_compare(self) -> None:
         from webapp.backend.services.kapi_diff_service import compare
@@ -122,3 +118,212 @@ class TestApiDiff(unittest.TestCase):
         self.assertEqual(r["changed"], [{"key": "x", "field": "variant", "from": "plain", "to": "gpl", "path": "a.c"}])
         t = compare("tracepoints", {"e": {"fields": ["a", "b"], "printk": "x", "path": "t.h"}}, {"e": {"fields": ["b", "c"], "printk": "x", "path": "t.h"}})
         self.assertEqual(t["changed"], [{"key": "e", "fields_added": ["c"], "fields_removed": ["a"], "printk_changed": False, "path": "t.h"}])
+
+
+class TestKapiDbFirstReadPath(unittest.TestCase):
+    def setUp(self) -> None:
+        import contextlib
+        import json
+        from unittest import mock
+
+        from core import DBLayout as D
+        from db_engine import SQLiteDB
+        from parser import kapi_catalog as kc
+        from parser import kapi_facts as kf
+
+        self.db = SQLiteDB(":memory:")
+        self.db.create_table(D.TABLES)
+        self.db.insert_rows(
+            "m_repository",
+            ["repo_id", "network_id", "name", "git_url", "default_branch"],
+            [(1, 0, "linux", "/tmp/linux", "master")],
+        )
+        self.db.insert_rows(
+            "m_commit",
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            [
+                (10, 0, bytes.fromhex("a" * 40), 0, 1000, 0, 1000, "v6.1", "v6.1"),
+                (11, 0, bytes.fromhex("b" * 40), 0, 2000, 0, 2000, "v6.2", "v6.2"),
+            ],
+        )
+        self.db.insert_rows(
+            "m_git_ref",
+            ["ref_id", "repo_id", "ref_name", "ref_type", "commit_id"],
+            [
+                (1, 1, "v6.1", 1, 10),
+                (2, 1, "v6.2", 1, 11),
+            ],
+        )
+
+        # Build pure catalogs using parser/kapi_catalog.py
+        files_v1 = kc.TextCache(lambda p: {
+            "Makefile": "VERSION = 6\nPATCHLEVEL = 1\n",
+            "arch/x86/entry/syscalls/syscall_64.tbl": "0\tcommon\tread\tsys_read\n",
+            "Documentation/admin-guide/kernel-parameters.txt": "\tfoo=\t\t[KNL] Foo param\n",
+        }.get(p))
+        paths_v1 = {
+            "Makefile",
+            "arch/x86/entry/syscalls/syscall_64.tbl",
+            "Documentation/admin-guide/kernel-parameters.txt",
+            "drivers/net/foo.c",
+            "include/trace/events/foo.h",
+        }
+        records_v1 = [
+            ("fs/read_write.c", {"s": [("SYSCALL_DEFINE3", 10, ["read", "unsigned int", "fd", "char *", "buf", "size_t", "count"])]}),
+            ("drivers/net/foo.c", {
+                "x": [("foo_init", "gpl", "", 20)],
+                "p": [("__setup", 30, '"foo=", foo_setup', ['"foo="', "foo_setup"])],
+                "m": [("MODULE_LICENSE", 40, ['"GPL"'])],
+                "v": [("pci", "foo_pci_tbl", 50, ["{ PCI_DEVICE(0x8086, 0x10d3) }"])],
+            }),
+            ("include/trace/events/foo.h", {
+                "ts": "foo",
+                "e": [(15, {"macro": "TRACE_EVENT", "name": "foo_ev", "class": "", "proto": "int x", "args": "x", "fields": [], "printk": '"x=%d"'})],
+            }),
+        ]
+        kbuild_idx_v1 = {
+            "arch": "x86_64",
+            "exprs": [{"sym": "FOO"}],
+            "files": {"drivers/net/foo.c": [0]},
+            "objects": [{"kind": "obj", "modname": "foo", "target": "drivers/net/foo.ko", "expr": 0, "members": [{"path": "drivers/net/foo.c"}]}],
+        }
+        self.catalogs_v1 = {
+            "syscalls": kc.build_syscalls(files_v1, paths_v1, records_v1, "x86_64", "x86"),
+            "exports": kc.build_exports(records_v1),
+            "params": kc.build_params(files_v1, paths_v1, records_v1, "x86", kbuild_idx=kbuild_idx_v1),
+            "tracepoints": kc.build_tracepoints(records_v1),
+            "modules": kc.build_modules(records_v1, kbuild_idx_v1, arch="x86_64"),
+            "devices": kc.build_device_index(files_v1, records_v1),
+        }
+        self.catalogs_v2 = {
+            **self.catalogs_v1,
+            "exports": kc.build_exports([
+                ("drivers/net/foo.c", {"x": [("foo_init", "gpl", "", 20), ("bar_export", "plain", "", 25)]}),
+            ]),
+        }
+
+        for cid, cats in ((10, self.catalogs_v1), (11, self.catalogs_v2)):
+            rows = []
+            for kind, payload in cats.items():
+                arch = "" if kind in kc.ARCH_INDEPENDENT_KINDS else "x86_64"
+                s = kc.summarize_catalog(kind, payload)
+                rows.append((
+                    cid, arch, kind, kc.CATALOG_FORMAT, kf.KAPI_FORMAT,
+                    int(s.get("total", 0)), json.dumps(s, separators=(",", ":")),
+                    kc.encode_catalog(payload), 1000,
+                ))
+            self.db.insert_rows(
+                "m_kapi_catalog",
+                ["commit_id", "arch", "kind", "catalog_format", "kapi_format", "total_count", "summary_json", "data", "built_at"],
+                rows,
+            )
+            rel_sum = kc.build_release_summary(cats)
+            self.db.insert_rows(
+                "m_kapi_release_summary",
+                [
+                    "commit_id", "arch", "catalog_format", "kapi_format",
+                    "syscalls_count", "exports_count", "params_count",
+                    "tracepoints_count", "modules_count", "devices_count",
+                    "subsystems_json", "built_at",
+                ],
+                [(
+                    cid, "x86_64", kc.CATALOG_FORMAT, kf.KAPI_FORMAT,
+                    rel_sum["syscalls_count"], rel_sum["exports_count"], rel_sum["params_count"],
+                    rel_sum["tracepoints_count"], rel_sum["modules_count"], rel_sum["devices_count"],
+                    json.dumps(rel_sum["subsystems"], separators=(",", ":")), 1000,
+                )],
+            )
+
+        @contextlib.contextmanager
+        def _fake_reader():
+            with self.db.reader() as reader:
+                yield reader
+
+        self.patches = [
+            mock.patch("webapp.backend.database.pool.get_reader", _fake_reader),
+            mock.patch("webapp.backend.database.helpers.get_active_repo_id", lambda _r: 1),
+            mock.patch("webapp.backend.services.kapi_service.get_active_repo_name", lambda: "linux"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in self.patches:
+            p.stop()
+        self.db.close()
+
+    def test_preparsed_catalogs_and_summary_serve_synchronously_from_db(self) -> None:
+        from unittest import mock
+
+        from webapp.backend.services import device_index_service as dis
+        from webapp.backend.services import kapi_diff_service as kdiff
+
+        with mock.patch("webapp.backend.services.jobs.jobs.submit", side_effect=AssertionError("jobs.submit must not run")), \
+                mock.patch("webapp.backend.services.kapi_service.resolve", side_effect=AssertionError("resolve must not run")):
+            for kind, fn in (
+                ("syscalls", lambda: k.syscalls("v6.1", "x86_64")),
+                ("exports", lambda: k.exports("v6.1")),
+                ("params", lambda: k.params("v6.1", "x86_64")),
+                ("tracepoints", lambda: k.tracepoints("v6.1")),
+                ("modules", lambda: k.modules("v6.1", "x86_64")),
+                ("devices", lambda: dis.index_state("v6.1")),
+            ):
+                res = fn()
+                self.assertEqual(res["state"], "done")
+                self.assertEqual(res["result"], self.catalogs_v1[kind])
+
+            summ = k.summary("v6.1", "x86_64")
+            self.assertEqual(summ["source"], "db")
+            self.assertTrue(summ["preparsed"])
+            self.assertEqual(summ["counts"]["exports"], 1)
+            self.assertEqual(summ["counts"]["modules"], 1)
+            self.assertEqual(summ["counts"]["devices"], 1)
+            self.assertIn("drivers/net", summ["subsystems"])
+
+            with mock.patch("webapp.backend.services.kapi_service._kbuild_files", return_value=None):
+                exp_detail = k.export_detail("v6.1", "foo_init", "x86_64")
+                self.assertEqual(len(exp_detail["sites"]), 1)
+                mod_detail = k.module_detail("v6.1", "x86_64", "foo")
+                self.assertEqual(mod_detail["modname"], "foo")
+                self.assertEqual(len(mod_detail["exports"]), 1)
+                self.assertEqual(len(mod_detail["params"]), 1)
+
+            diff_res = kdiff.diff("v6.1", "v6.2", "x86_64", ["exports"])
+            self.assertEqual(diff_res["state"], "done")
+            self.assertEqual(diff_res["result"]["counts"]["exports"]["added"], 1)
+            self.assertEqual(diff_res["result"]["exports"]["added"][0]["key"], "bar_export")
+
+    def test_summary_endpoint_and_unparsed_fallback(self) -> None:
+        from unittest import mock
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from webapp.backend.routers import kapi as kapi_router
+
+        app = FastAPI()
+        app.include_router(kapi_router.router)
+        client = TestClient(app)
+        with mock.patch("webapp.backend.config.is_feature_enabled", return_value=True):
+            resp = client.get("/api/kapi/v6.1/summary?arch=x86_64")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["source"], "db")
+        self.assertEqual(body["counts"]["syscalls"], 1)
+
+        # Unparsed/unselected revision falls back cleanly to DiskCache / jobs.submit
+        with mock.patch("webapp.backend.services.kapi_service.resolve", return_value="c" * 40), \
+                mock.patch("webapp.backend.services.jobs.jobs.submit", return_value={"state": "building", "progress": {}}) as m_sub:
+            fb_cat = k.exports("v9.9-unparsed")
+        self.assertEqual(fb_cat["state"], "building")
+        m_sub.assert_called_once()
+
+        with mock.patch("webapp.backend.services.kapi_service.resolve", return_value="c" * 40):
+            fb_sum = k.summary("v9.9-unparsed", "x86_64")
+        self.assertFalse(fb_sum["preparsed"])
+        self.assertEqual(fb_sum["source"], "unparsed")
+        self.assertIsNone(fb_sum["counts"]["exports"])
+
+
+if __name__ == "__main__":
+    unittest.main()

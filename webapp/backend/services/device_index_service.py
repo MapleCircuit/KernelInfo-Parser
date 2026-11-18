@@ -13,155 +13,38 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections import ChainMap
 from typing import Any, Callable
 
 from fastapi import HTTPException
+
+from parser import kapi_catalog as kc
+from parser.kapi_catalog import parse_entry, to_int  # noqa: F401 - re-exported for tests
 
 # entries_of, parse_defines, table_initializer are re-exported: the device index readers (tests)
 from parser.kapi_facts import entries_of, parse_defines, quoted_includes, split_args, string_value, table_initializer  # noqa: F401
 from webapp.backend.config import get_active_repo_name
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
-from webapp.backend.services.kapi_service import FileCache, resolve, revision_records
+from webapp.backend.services.kapi_service import FileCache, _db_catalog, resolve, revision_records
 
 logger = logging.getLogger(__name__)
 
-INDEX_FORMAT = 3
+INDEX_FORMAT = kc.CATALOG_FORMAT
 _DISK = DiskCache("device-index", max_bytes=256 << 20)
-PCI_ANY = 0xFFFFFFFF
+PCI_ANY = kc.PCI_ANY
 MAX_INPUT = 64 * 1024
-
-# ------------------------------------------------------------------------------- constants
-
-
-def to_int(token: str, defines: Any, depth: int = 0) -> int | None:
-    t = (token or "").strip().strip("()").strip()
-    if not t:
-        return None
-    if re.fullmatch(r"0[xX][0-9a-fA-F]+[uUlL]*", t):
-        return int(t.rstrip("uUlL"), 16)
-    if re.fullmatch(r"\d+[uUlL]*", t):
-        return int(t.rstrip("uUlL"))
-    if t == "PCI_ANY_ID":
-        return PCI_ANY
-    if depth < 4 and t in defines:
-        return to_int(defines[t], defines, depth + 1)
-    m = re.fullmatch(r"(\w+)\s*<<\s*(\d+)", t)
-    if m:
-        base = to_int(m.group(1), defines, depth + 1)
-        return None if base is None else base << int(m.group(2))
-    return None
-
-
-# ------------------------------------------------------------------------------- tables
-
-def parse_entry(bus: str, entry: str, defines: Any) -> dict[str, Any]:
-    body = entry[1:-1].strip() if entry.startswith("{") and entry.endswith("}") else entry
-    rec: dict[str, Any] = {"text": re.sub(r"\s+", " ", entry)[:200]}
-    if bus == "pci":
-        m = re.search(r"\bPCI_(V?)DEVICE(?:_SUB)?\s*\(([^)]*)\)", body)
-        if m:
-            args = [a.strip() for a in m.group(2).split(",")]
-            vendor = f"PCI_VENDOR_ID_{args[0]}" if m.group(1) == "V" else args[0]
-            rec.update(vendor=to_int(vendor, defines), device=to_int(args[1], defines) if len(args) > 1 else None)
-            if len(args) >= 4:
-                rec.update(subvendor=to_int(args[2], defines), subdevice=to_int(args[3], defines))
-            named = dict(re.findall(r"\.(class|class_mask)\s*=\s*([^,}]+)", body))
-            if named:
-                rec.update(cls=to_int(named.get("class", ""), defines), mask=to_int(named.get("class_mask", ""), defines))
-            return rec
-        m = re.search(r"\bPCI_DEVICE_CLASS\s*\(([^,]+),([^)]+)\)", body)
-        if m:
-            rec.update(cls=to_int(m.group(1), defines), mask=to_int(m.group(2), defines))
-            return rec
-        named = dict(re.findall(r"\.(vendor|device|subvendor|subdevice|class|class_mask)\s*=\s*([^,}]+)", body))
-        if named:
-            rec.update(vendor=to_int(named.get("vendor", ""), defines), device=to_int(named.get("device", ""), defines),
-                       cls=to_int(named.get("class", ""), defines), mask=to_int(named.get("class_mask", ""), defines))
-            return rec
-        args = split_args(body)
-        if len(args) >= 2:
-            rec.update(vendor=to_int(args[0], defines), device=to_int(args[1], defines))
-            if len(args) >= 4:
-                rec.update(subvendor=to_int(args[2], defines), subdevice=to_int(args[3], defines))
-            if len(args) >= 6:
-                rec.update(cls=to_int(args[4], defines), mask=to_int(args[5], defines))
-        return rec
-    if bus == "usb":
-        m = re.search(r"\bUSB_DEVICE\w*\s*\(([^,]+),([^,)]+)", body)
-        if m:
-            rec.update(vendor=to_int(m.group(1), defines), device=to_int(m.group(2), defines))
-            return rec
-        m = re.search(r"\bUSB_INTERFACE_INFO\s*\(([^,]+),([^,]+),([^)]+)\)", body)
-        if m:
-            rec.update(cls=to_int(m.group(1), defines))
-            return rec
-        named = dict(re.findall(r"\.(idVendor|idProduct|bInterfaceClass)\s*=\s*([^,}]+)", body))
-        if named:
-            rec.update(vendor=to_int(named.get("idVendor", ""), defines), device=to_int(named.get("idProduct", ""), defines),
-                       cls=to_int(named.get("bInterfaceClass", ""), defines))
-        return rec
-    if bus == "of":
-        m = re.search(r"\.compatible\s*=\s*(\"(?:[^\"\\]|\\.)*\"(?:\s*\"(?:[^\"\\]|\\.)*\")*)", body)
-        if m:
-            rec["compatible"] = string_value(m.group(1))
-        return rec
-    if bus == "acpi":
-        args = split_args(body)
-        ident = string_value(args[0]) if args else None
-        m = re.search(r"\.id\s*=\s*(\"[^\"]*\")", body)
-        rec["acpi_id"] = string_value(m.group(1)) if m else ident
-        return rec
-    return rec
 
 
 def build_index(sha: str, progress: Callable | None = None) -> dict[str, Any]:
     files = FileCache(sha)
-    headers: dict[str, tuple[str, list[str], dict[str, str]]] = {}  # path -> (text, quoted includes, defines)
-
-    def header(path: str) -> tuple[str, list[str], dict[str, str]]:
-        if path not in headers:
-            text = "\n".join(files.lines(path))
-            headers[path] = (text, quoted_includes(text), parse_defines(text)) if text else ("", [], {})
-        return headers[path]
-
-    pci_ids = header("include/linux/pci_ids.h")[2]
-    records = [(path, rec) for path, rec in revision_records(sha, progress) if rec.get("v") and path.endswith(".c")]
-    tables = 0
-    entries = []
-    for n, (path, rec) in enumerate(records):
-        if progress and n % 200 == 0:
-            progress(n, len(records), "device tables")
-        # The driver's own headers (#include "…", followed 3 levels: netdev.c -> e1000.h -> hw.h); the nearer
-        # include wins, the driver's own #defines over all of them, include/linux/pci_ids.h last
-        seen = {path}
-        frontier = [(path, rec.get("vi") or [])]
-        local: list[dict[str, str]] = []
-        for _ in range(3):
-            nxt = []
-            for src, includes in frontier:
-                for inc in includes:
-                    hdr = os.path.normpath(os.path.join(os.path.dirname(src), inc))
-                    if hdr in seen:
-                        continue
-                    seen.add(hdr)
-                    text, hdr_includes, hdr_defines = header(hdr)
-                    if text:
-                        local.append(hdr_defines)
-                        nxt.append((hdr, hdr_includes))
-            frontier = nxt
-        defines = ChainMap(rec.get("vd") or {}, *local, pci_ids)
-        for bus, name, line, table_entries in rec["v"]:
-            tables += 1
-            if table_entries is None:
-                continue
-            for e in table_entries:
-                entries.append({**parse_entry(bus, e, defines), "bus": bus, "table": name, "path": path, "line": line})
-    return {"entries": entries, "tables": tables}
+    records = revision_records(sha, progress)
+    return kc.build_device_index(files, records)
 
 
 def index_state(version: str, wait: float = 0.0) -> dict[str, Any]:
+    hit = _db_catalog("devices", version, "")
+    if hit is not None:
+        return {"state": "done", "result": hit}
     sha = resolve(version)
     ck = f"{get_active_repo_name()}|devices|{INDEX_FORMAT}|{sha}"
     state = jobs.submit(f"devices:{ck}", lambda p: build_index(sha, p), cache=_DISK, cache_key=ck)
