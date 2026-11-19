@@ -209,7 +209,7 @@
 
 /* 3. NodeMap Inspector Sidebar */
 .nodemap-inspector {
-  width: 280px;
+  width: calc(280px * var(--ui-layout-scale, 1));
   background: var(--bg-secondary);
   border-left: 1px solid var(--border-color);
   display: flex;

@@ -1460,6 +1460,7 @@ export class KconfigView {
     const val = (sym) => (this.engine.isDefined(sym) ? this.valueOf(sym) : "?");
     const fill = (sym) => ({ y: "rgba(63,185,80,0.25)", m: "rgba(210,153,34,0.25)" }[val(sym)] || "rgba(110,118,129,0.18)");
     const stroke = (sym) => ({ y: "var(--accent-green)", m: "var(--accent-yellow)" }[val(sym)] || "var(--text-muted)");
+    /* ui-scale-exempt-start (fixed viewBox 620xH scaled via max-width * --ui-layout-scale) */
     const node = (sym, x, y, isRoot = false) => `
       <g class="kgraph-node" data-symbol="${escapeHtml(sym)}" style="cursor:pointer;">
         <rect x="${x}" y="${y - 10}" width="${NODE_W}" height="20" rx="4" fill="${isRoot ? "rgba(56,139,253,0.25)" : fill(sym)}" stroke="${isRoot ? "var(--accent-blue)" : stroke(sym)}" />
@@ -1467,9 +1468,10 @@ export class KconfigView {
         <title>CONFIG_${escapeHtml(sym)} = ${escapeHtml(val(sym))}</title>
       </g>`;
     const rootX = (W - NODE_W) / 2;
-    let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;">
+    let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:calc(${W}px * var(--ui-layout-scale, 1));display:block;">
       <text x="10" y="14" font-size="10" fill="var(--text-secondary)">depends on</text>
       <text x="${W - 10}" y="14" font-size="10" fill="var(--text-secondary)" text-anchor="end">selects / implies</text>`;
+    /* ui-scale-exempt-end */
     left.forEach((_sym, i) => {
       const y = colY(left.length, i);
       svg += `<path d="M ${10 + NODE_W} ${y} C ${rootX - 30} ${y}, ${rootX - 30} ${rootY}, ${rootX} ${rootY}" fill="none" stroke="var(--text-muted)" stroke-opacity="0.6" />`;
@@ -1481,7 +1483,7 @@ export class KconfigView {
     left.forEach((sym, i) => { svg += node(sym, 10, colY(left.length, i)); });
     right.forEach((sym, i) => { svg += node(sym, W - NODE_W - 10, colY(right.length, i)); });
     svg += node(symbolName, rootX, rootY, true);
-    svg += `</svg><div class="kconfig-muted" style="font-size:10px;margin-top:4px;">Green = y, amber = m, grey = n under the current configuration. Click a node to inspect it.</div>`;
+    svg += `</svg><div class="kconfig-muted" style="font-size:var(--fs-10, 10px);margin-top:4px;">Green = y, amber = m, grey = n under the current configuration. Click a node to inspect it.</div>`;
     container.innerHTML = svg;
     container.querySelectorAll(".kgraph-node").forEach((g) => {
       g.addEventListener("click", () => {
@@ -1506,7 +1508,7 @@ export class KconfigView {
         ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-yellow);">Values kconfig would not keep (${adjusted.length})</div>
             ${adjusted.slice(0, 400).map((a) => row(`<code>CONFIG_${escapeHtml(a.name)}</code> ${escapeHtml(a.want)} → <strong>${escapeHtml(a.got || '""')}</strong> <span class="kconfig-muted">${escapeHtml(a.reason)}</span>`)).join("")}</div>`
         : `<div class="ki-modal-empty">✓ Every value is accepted by kconfig for ARCH=${escapeHtml(this.currentArch)}${this.engineActive ? " (the engine only allows valid values)" : ""}.</div>`}
-      ${unknown.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}
+      ${unknown.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:var(--fs-11, 11px);">${unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}
       ${warnings.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-orange);">kconfig warnings: selected with unmet direct dependencies (${warnings.length})</div>
           ${warnings.map((n) => row(`<code>CONFIG_${escapeHtml(n)}</code> <span class="kconfig-muted">selected by ${escapeHtml(probe.exprStr(probe.syms[n].rev_dep, true))}; depends on ${escapeHtml(probe.exprStr(probe.syms[n].dir_dep, true))}</span>`)).join("")}
           <div class="kconfig-muted">The real kconfig prints the same warning and keeps the value; the build may still fail for these options.</div></div>` : ""}

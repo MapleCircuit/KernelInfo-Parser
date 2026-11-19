@@ -1372,14 +1372,14 @@ export class VirtualEditor {
         const dirListHtml = entries.map((item) => {
           const isItemDir = item.type === "dir";
           const icon = isItemDir ? "📁" : "📄";
-          const statBadge = item.s_stat_label ? `<span class="badge" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-tertiary);">${escapeHtml(item.s_stat_label)}</span>` : "";
+          const statBadge = item.s_stat_label ? `<span class="badge" style="font-size:var(--fs-10, 10px);padding:1px 6px;border-radius:3px;background:var(--bg-tertiary);">${escapeHtml(item.s_stat_label)}</span>` : "";
           return `
             <div class="dir-entry-row" data-path="${escapeHtml(item.path)}" data-type="${escapeHtml(item.type)}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border-color);cursor:pointer;transition:background 0.15s;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background='transparent'">
               <div style="display:flex;align-items:center;gap:10px;">
-                <span style="font-size:16px;">${icon}</span>
+                <span style="font-size:var(--fs-16, 16px);">${icon}</span>
                 <span style="font-weight:${isItemDir ? '600' : '400'};color:${isItemDir ? 'var(--accent-blue)' : 'var(--text-primary)'};">${escapeHtml(item.name)}</span>
               </div>
-              <div style="display:flex;align-items:center;gap:12px;font-size:11px;color:var(--text-muted);">
+              <div style="display:flex;align-items:center;gap:12px;font-size:var(--fs-11, 11px);color:var(--text-muted);">
                 ${statBadge}
                 <span>${item.type === "dir" ? "Directory" : "File"}</span>
               </div>
@@ -1388,11 +1388,11 @@ export class VirtualEditor {
         }).join("");
 
         this.linesContainer.innerHTML = `
-          <div class="directory-browser-container" style="max-width:860px;margin:0 auto;padding:24px 16px;">
+          <div class="directory-browser-container" style="max-width:calc(860px * var(--ui-layout-scale, 1));margin:0 auto;padding:24px 16px;font-family:var(--font-sans);font-size:var(--fs-13, 13px);">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;border-bottom:1px solid var(--border-color);padding-bottom:12px;">
               <div>
-                <h3 style="margin:0;font-size:18px;display:flex;align-items:center;gap:8px;">📁 ${escapeHtml(this.currentFilePath || "Kernel Root")}</h3>
-                <span style="font-size:12px;color:var(--text-muted);">${entries.length} items in this directory</span>
+                <h3 style="margin:0;font-size:var(--fs-18, 18px);display:flex;align-items:center;gap:8px;">📁 ${escapeHtml(this.currentFilePath || "Kernel Root")}</h3>
+                <span style="font-size:var(--fs-12, 12px);color:var(--text-muted);">${entries.length} items in this directory</span>
               </div>
             </div>
             <div class="dir-entries-card" style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:6px;overflow:hidden;">

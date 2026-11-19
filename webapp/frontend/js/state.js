@@ -5,6 +5,7 @@
 import { canBeVersionlessTab, isAlwaysVersionlessTab, tabRoute } from "./tab_routes.js";
 import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
+import { emitUiScaleChanged } from "./utils/ui_scale.js";
 
 // A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
 const MIN_CONFIG_SYMBOLS = 50;
@@ -194,6 +195,7 @@ class GlobalState {
   emit(event, data) {
     // The header's project follows the active tab before anyone reacts to the change (§5.18)
     if (event === "tabs:changed" || event === "pane:activated") this.syncRepoFromActiveTab();
+    if (event === "ui:scale-changed") emitUiScaleChanged(data);
     if (this.subscribers.has(event)) {
       this.subscribers.get(event).forEach((cb) => {
         try {

@@ -7,6 +7,7 @@ import { shortRef } from "../../components/ref_picker.js";
 import { escapeHtml } from "../../components/modal.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { progressLabel } from "../../utils/job_poll.js";
+import { scaleUiPx } from "../../utils/ui_scale.js";
 
 const PALETTE = Array.from({ length: 12 }, (_, k) => `var(--chart-${k + 1})`); // theme tokens (G08)
 const MIN_LABEL_W = 46;
@@ -149,7 +150,8 @@ export class TreemapView {
     const offB = state.subscribe("kconfig:engine:changed", () => {
       if (this.engineTabId && !state.hasEngine(this.engineTabId)) this.setEngine("");
     });
-    this.offEngine = () => { offA?.(); offB?.(); };
+    const offC = state.subscribe("ui:scale-changed", () => this.draw());
+    this.offEngine = () => { offA?.(); offB?.(); offC?.(); };
     this._resizeObserver?.disconnect();
     this._resizeObserver = new ResizeObserver(() => this.draw());
     this._resizeObserver.observe(containerEl.querySelector(".treemap-canvas"));
@@ -261,23 +263,27 @@ export class TreemapView {
       .filter((it) => it.value > 0)
       .sort((a, b) => b.value - a.value);
 
+    const minLabelW = scaleUiPx(MIN_LABEL_W);
+    const minLabelH = scaleUiPx(MIN_LABEL_H);
+    const dirHeaderH = scaleUiPx(18);
+    const subMinH = scaleUiPx(14);
     let html = "";
     for (const r of squarify(items, 0, 0, W, H)) {
       const n = r.node;
       const isDir = n.type === "dir";
-      const showLabel = r.w >= MIN_LABEL_W && r.h >= MIN_LABEL_H;
+      const showLabel = r.w >= minLabelW && r.h >= minLabelH;
       const color = n.built_y !== undefined ? buildColor(n) : r.color;
       html += `<div class="treemap-cell ${isDir ? "dir" : "file"}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;--tm-color:${color};" data-path="${escapeHtml(n.path)}" data-type="${n.type}">`;
       if (showLabel) html += `<div class="treemap-label">${escapeHtml(n.name)}${isDir ? "/" : ""}</div>`;
       // Second level, inset under the label
-      if (isDir && n.children?.length && r.w > 60 && r.h > 40) {
+      if (isDir && n.children?.length && r.w > scaleUiPx(60) && r.h > scaleUiPx(40)) {
         const inner = n.children
           .map((c) => ({ node: c, value: metricValue(c, metric) }))
           .filter((it) => it.value > 0)
           .sort((a, b) => b.value - a.value);
-        for (const c of squarify(inner, 2, 18, r.w - 4, r.h - 20)) {
+        for (const c of squarify(inner, 2, dirHeaderH, r.w - 4, r.h - dirHeaderH - 2)) {
           const cn = c.node;
-          html += `<div class="treemap-sub ${cn.type}" style="left:${c.x}px;top:${c.y}px;width:${c.w}px;height:${c.h}px;" data-path="${escapeHtml(cn.path)}" data-type="${cn.type}">${c.w >= MIN_LABEL_W && c.h >= 14 ? `<span>${escapeHtml(cn.name)}</span>` : ""}</div>`;
+          html += `<div class="treemap-sub ${cn.type}" style="left:${c.x}px;top:${c.y}px;width:${c.w}px;height:${c.h}px;" data-path="${escapeHtml(cn.path)}" data-type="${cn.type}">${c.w >= minLabelW && c.h >= subMinH ? `<span>${escapeHtml(cn.name)}</span>` : ""}</div>`;
         }
       }
       html += `</div>`;

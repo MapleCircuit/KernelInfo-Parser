@@ -46,7 +46,7 @@
         </div>
         <div class="version-selector-container">
           <label for="project-select">Project:</label>
-          <select id="project-select" style="max-width: 130px; font-size: 12px;">
+          <select id="project-select" style="max-width: calc(130px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);">
             <option value="1">Linux Kernel</option>
           </select>
           <label for="branch-picker-btn">Branch:</label>
@@ -55,11 +55,11 @@
             <span class="branch-picker-caret">▾</span>
           </button>
           <label for="version-select">Tag:</label>
-          <select id="version-select" style="max-width: 130px; font-size: 12px;">
+          <select id="version-select" style="max-width: calc(130px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);">
             <option value="v3.0">v3.0</option>
           </select>
           <label for="rc-select" id="rc-select-label" hidden>Release:</label>
-          <select id="rc-select" style="max-width: 120px; font-size: 12px;" title="Releases and release candidates of the selected release" hidden></select>
+          <select id="rc-select" style="max-width: calc(120px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);" title="Releases and release candidates of the selected release" hidden></select>
           <label for="commit-picker-btn">Commit:</label>
           <button id="commit-picker-btn" class="commit-picker-btn" type="button" title="Select a specific commit">
             <span id="commit-picker-label">—</span>
@@ -72,7 +72,7 @@
           <button id="session-picker-btn" class="session-picker-btn" type="button" title="Workspace Sessions">
             <span>🗂</span>
             <span id="session-picker-label">Default Session</span>
-            <span style="font-size: 9px; color: var(--text-muted);">▾</span>
+            <span style="font-size: var(--fs-9, 9px); color: var(--text-muted);">▾</span>
           </button>
         </div>
       </div>

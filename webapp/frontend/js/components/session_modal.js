@@ -127,7 +127,7 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
                   <span class="session-card-time">${formatRelativeTime(s.updatedAt)}</span>
                 </div>
                 <div class="session-card-meta">
-                  <span class="session-meta-tag" style="font-family: var(--font-mono); font-size: 10px; color: var(--accent-blue);" title="Session ID">ID: ${escapeHtml(s.id)}</span>
+                  <span class="session-meta-tag" style="font-family: var(--font-mono); font-size: var(--fs-10, 10px); color: var(--accent-blue);" title="Session ID">ID: ${escapeHtml(s.id)}</span>
                   <span class="session-meta-tag">Ref: ${escapeHtml(s.version || 'v3.0')}</span>
                   ${s.repo ? `<span class="session-meta-tag">Repo: ${escapeHtml(s.repo)}</span>` : ''}
                   <span class="session-meta-tag">${s.tabCount || 0} tab${(s.tabCount || 0) === 1 ? '' : 's'}</span>
@@ -154,18 +154,18 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
       : `
         <div class="session-empty-state">
           <p>No saved workspace sessions found.</p>
-          <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">Create a new session to get started.</p>
+          <p style="font-size:var(--fs-11, 11px);color:var(--text-muted);margin-top:4px;">Create a new session to get started.</p>
         </div>
       `;
 
     backdrop.innerHTML = `
-      <div class="ki-modal session-modal-content" style="max-width: 660px; width: 90vw;">
+      <div class="ki-modal session-modal-content" style="max-width: calc(660px * var(--ui-layout-scale, 1)); width: 90vw;">
         <div class="ki-modal-header session-modal-top">
           <div>
             <h2 class="ki-modal-title" style="display:flex;align-items:center;gap:8px;">
               <span>🗂 Workspace Sessions</span>
             </h2>
-            <div style="font-size:11px;color:var(--text-secondary);margin-top:2px;">
+            <div style="font-size:var(--fs-11, 11px);color:var(--text-secondary);margin-top:2px;">
               Select a session to resume in this browser tab, or create a new workspace session.
             </div>
           </div>

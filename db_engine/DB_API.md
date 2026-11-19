@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L600]
-  - 2.1. Lifecycle, Session & Health [L150-L210]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L211-L258]
-  - 2.3. Multi-Table Relational Views [L259-L268]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L269-L307]
-  - 2.5. DDL & Index Management [L308-L349]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L350-L400]
-  - 2.7. Spec Read Primitives [L401-L428]
-  - 2.8. Spec Write Primitives [L429-L445]
-  - 2.9. Catalog & Server Introspection [L446-L461]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L462-L478]
-  - 2.11. Pipeline Intent Methods [L479-L496]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L497-L522]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L523-L534]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L535-L542]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L543-L600]
-- 3. Factory Resolver (`get_db_engine`) [L601-L622]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L623-L649]
+- 2. Core Method Specifications [L148-L612]
+  - 2.1. Lifecycle, Session & Health [L150-L222]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L223-L270]
+  - 2.3. Multi-Table Relational Views [L271-L280]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L281-L319]
+  - 2.5. DDL & Index Management [L320-L361]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L362-L412]
+  - 2.7. Spec Read Primitives [L413-L440]
+  - 2.8. Spec Write Primitives [L441-L457]
+  - 2.9. Catalog & Server Introspection [L458-L473]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L474-L490]
+  - 2.11. Pipeline Intent Methods [L491-L508]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L509-L534]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L535-L546]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L547-L554]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L555-L612]
+- 3. Factory Resolver (`get_db_engine`) [L613-L634]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L635-L661]
 <!-- toc:end -->
 
 ---
@@ -159,6 +159,18 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - Context manager lifecycle; rolls back pending transaction on unhandled exception.
 - **`close() -> None`**
   - Safely releases cursor and database connection socket handles.
+- **Lifecycle logging** *(all engines, `BaseDBEngine.__init_subclass__`, `note_engine_started` / `note_engine_closed`)*
+  - Open engine handles are counted per process and engine name: the first successful `__init__` logs one `INFO` line
+    `DB_engine <name> Started.`, and the `close()` that releases the last handle logs `DB_engine <name> Closed.` (repeat
+    `close()` calls stay silent). Helper connections opened while another handle is live (`create_indexes` /
+    `remove_indexes` workers, per-session SQLite readers) therefore log nothing, and each forked worker process logs its
+    own pair. The webapp reader pool (`db_engine/pool.py`) counts as one `MariaDB` handle from its first connection to
+    `close_db_pool()`; pooled `ReadSession`s do not count. `<name>` is the engine's `display_name`, or its class name when
+    it keeps the base default (`MariaDB`).
+  - `close()` is the public shutdown. MariaDB's drop-and-retry paths (`check_if_connected`, `_reconnect`, connection-lost
+    retries in writes and `reserve_id_block`) release the socket through the private `_drop_connection()`, which leaves
+    the lifecycle count unchanged.
+  - The `mysql.connector` logger is capped at `WARNING`, so the driver's per-connect auth-plugin `INFO` lines never print.
 - **`_raw_cursor(dictionary: bool = False) -> Any`** *(driver-private)*
   - Leases a fresh driver cursor (`MariaDB`: after `check_if_connected()`). The driver's internal shared cursor is the private attribute `_cur`. `MockDB` raises `UnsupportedOperation`. Together with `_raw_query`, `_raw_query_one`, `_raw_query_iter`, `_raw_execute`, `_raw_executemany` and `_raw_delete` this is the raw-SQL surface that only `db_engine/` internals (catalog defaults, DDL, temp-table helpers) and driver-level unit tests use; consumers outside `db_engine/` never call it (`tests/test_db_boundary.py`).
 - **`probe_connection(cfg: Mapping[str, Any]) -> ProbeResult`** *(classmethod, never raises)*

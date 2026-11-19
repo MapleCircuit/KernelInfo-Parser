@@ -59,7 +59,7 @@ export class NodeRenderer {
 
       // Expand / Collapse button
       const expandBtn = document.createElement("button");
-      expandBtn.style.fontSize = "11px";
+      expandBtn.style.fontSize = "var(--fs-11, 11px)";
       expandBtn.style.color = "var(--text-muted)";
       expandBtn.textContent = node.expanded ? "−" : "+";
       expandBtn.title = node.expanded ? "Collapse constituents" : "Expand constituents";

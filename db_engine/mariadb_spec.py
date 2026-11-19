@@ -259,7 +259,7 @@ class MariaDBSpec:
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
                         if self._in_txn:
                             raise
-                        self.close()
+                        self._drop_connection()
                         if attempt == 2:
                             raise
                         time.sleep(0.5 * (attempt + 1))

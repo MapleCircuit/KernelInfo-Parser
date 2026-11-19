@@ -43,8 +43,8 @@
 }
 
 .brand-icon {
-  width: 24px;
-  height: 24px;
+  width: calc(24px * var(--ui-layout-scale, 1));
+  height: calc(24px * var(--ui-layout-scale, 1));
   flex-shrink: 0;
 }
 
@@ -127,7 +127,7 @@
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  width: 268px;
+  width: calc(268px * var(--ui-layout-scale, 1));
   max-width: calc(100vw - 16px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -262,7 +262,7 @@
 
 .offline-badge .badge-dot {
   order: 1;
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   line-height: 1;
   flex-shrink: 0;
   display: inline-flex;
@@ -397,8 +397,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: calc(20px * var(--ui-layout-scale, 1));
+  height: calc(20px * var(--ui-layout-scale, 1));
   padding: 0;
   border: none;
   border-radius: 3px;
@@ -419,8 +419,8 @@
 }
 
 .collapse-btn svg {
-  width: 14px;
-  height: 14px;
+  width: calc(14px * var(--ui-layout-scale, 1));
+  height: calc(14px * var(--ui-layout-scale, 1));
   fill: currentColor;
 }
 
@@ -462,8 +462,8 @@
 }
 
 .tree-item .chevron {
-  width: 14px;
-  height: 14px;
+  width: calc(14px * var(--ui-layout-scale, 1));
+  height: calc(14px * var(--ui-layout-scale, 1));
   transition: transform var(--transition-fast);
   color: var(--text-muted);
 }
@@ -587,10 +587,10 @@
   align-items: center;
   justify-content: center;
   gap: 4px;
-  height: 24px;
+  height: var(--control-height-sm, 24px);
   box-sizing: border-box;
   line-height: 1;
-  max-width: 150px;
+  max-width: calc(150px * var(--ui-layout-scale, 1));
   padding: 0 6px;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
@@ -638,7 +638,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 24px;
+  height: var(--control-height-sm, 24px);
   box-sizing: border-box;
   line-height: 1;
   padding: 0 8px;
@@ -670,7 +670,7 @@
 .ref-picker {
   position: fixed;
   z-index: 2000;
-  width: 440px;
+  width: calc(440px * var(--ui-layout-scale, 1));
   max-width: calc(100vw - 16px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -823,7 +823,7 @@
   align-items: center;
   justify-content: center;
   gap: 8px;
-  height: 28px;
+  height: var(--control-height, 28px);
   box-sizing: border-box;
   line-height: 1;
   padding: 0 10px;
@@ -844,8 +844,8 @@
 
 .global-search-btn kbd {
   padding: 0 5px;
-  height: 18px;
-  line-height: 16px;
+  height: calc(18px * var(--ui-layout-scale, 1));
+  line-height: calc(16px * var(--ui-layout-scale, 1));
   box-sizing: border-box;
   border: 1px solid var(--border-color);
   border-radius: 3px;
@@ -871,7 +871,7 @@
 .cmdp {
   display: flex;
   flex-direction: column;
-  width: 680px;
+  width: calc(680px * var(--ui-layout-scale, 1));
   max-width: calc(100vw - 32px);
   max-height: 70vh;
   background: var(--bg-secondary);
@@ -946,7 +946,7 @@
 
 .cmdp-icon {
   flex-shrink: 0;
-  width: 18px;
+  width: calc(18px * var(--ui-layout-scale, 1));
   text-align: center;
   color: var(--text-secondary);
 }
@@ -1083,8 +1083,8 @@
 
   /* Offline badge: collapse to dot-only icon */
   .offline-badge {
-    width: 28px;
-    min-width: 28px;
+    width: var(--control-height, 28px);
+    min-width: var(--control-height, 28px);
     padding: 0;
     justify-content: center;
     border-radius: var(--radius-md);
@@ -1095,14 +1095,14 @@
   }
 
   .offline-badge .badge-dot {
-    font-size: 20px;
+    font-size: var(--fs-20, 20px);
     line-height: 1;
   }
 
   /* Global search button: collapse to icon-only */
   .global-search-btn {
-    width: 28px;
-    min-width: 28px;
+    width: var(--control-height, 28px);
+    min-width: var(--control-height, 28px);
     padding: 0;
     justify-content: center;
   }
@@ -1112,7 +1112,7 @@
   }
 
   .global-search-btn .search-icon {
-    font-size: 14px;
+    font-size: var(--fs-14, 14px);
     line-height: 1;
   }
 }
@@ -1129,11 +1129,11 @@
 
   /* Compact dropdown and commit buttons for ultra-narrow viewports */
   .version-selector-container select {
-    max-width: 90px !important;
+    max-width: calc(90px * var(--ui-layout-scale, 1)) !important;
   }
 
   .branch-picker-btn,
   .commit-picker-btn {
-    max-width: 90px;
+    max-width: calc(90px * var(--ui-layout-scale, 1));
   }
 }

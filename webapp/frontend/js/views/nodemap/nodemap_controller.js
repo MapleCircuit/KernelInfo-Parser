@@ -67,7 +67,7 @@ export class NodeMapController {
         <!-- Inspector Drawer -->
         <div class="nodemap-inspector" id="nm-inspector">
           <div class="inspector-header">Node Inspector</div>
-          <div id="nm-inspector-content" style="color:var(--text-muted);font-size:11px;">
+          <div id="nm-inspector-content" style="color:var(--text-muted);font-size:var(--fs-11, 11px);">
             Click on any schematic node to inspect its attributes and constituent members.
           </div>
         </div>
@@ -433,7 +433,7 @@ export class NodeMapController {
           <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px;">
             ${
               (node.constituents || []).map((c) => `
-                <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent-blue);">
+                <div style="font-family:var(--font-mono);font-size:var(--fs-11, 11px);color:var(--accent-blue);">
                   • ${escapeHtml(c.name || c.type || "")}
                 </div>
               `).join("") || `<span style="color:var(--text-muted);">None loaded</span>`
@@ -684,6 +684,7 @@ export class NodeMapController {
     });
 
     // Nodes
+    /* ui-scale-exempt-start (NodeMap generated SVG) */
     this.nodes.forEach((node) => {
       svgContent += `
         <g transform="translate(${node.x}, ${node.y})">
@@ -693,6 +694,7 @@ export class NodeMapController {
         </g>
       `;
     });
+    /* ui-scale-exempt-end */
 
     svgContent += `</svg>`;
 

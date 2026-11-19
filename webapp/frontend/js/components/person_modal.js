@@ -37,7 +37,7 @@ export async function showPersonModal(version, personIdentifier) {
     border: 1px solid var(--border-color, #333);
     border-radius: 8px;
     width: 100%;
-    max-width: 600px;
+    max-width: calc(600px * var(--ui-layout-scale, 1));
     max-height: 85vh;
     display: flex;
     flex-direction: column;
@@ -47,10 +47,10 @@ export async function showPersonModal(version, personIdentifier) {
 
   modal.innerHTML = `
     <div style="padding: 16px 20px; border-bottom: 1px solid var(--border-color, #333); display: flex; justify-content: space-between; align-items: center; background: var(--bg-tertiary, #252526);">
-      <div style="font-weight: 600; font-size: 14px; color: var(--text-primary, #ccc); display: flex; align-items: center; gap: 8px;">
+      <div style="font-weight: 600; font-size: var(--fs-14, 14px); color: var(--text-primary, #ccc); display: flex; align-items: center; gap: 8px;">
         <span>👤 Developer Profile</span>
       </div>
-      <button class="person-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: 20px; cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
+      <button class="person-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </div>
     <div class="person-modal-body" style="padding: 24px 20px; overflow-y: auto; flex: 1;">
       <div style="text-align: center; color: var(--text-muted, #888); padding: 30px;">
@@ -96,39 +96,39 @@ export async function showPersonModal(version, personIdentifier) {
     bodyEl.innerHTML = `
       <!-- Profile Header -->
       <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 20px;">
-        <div style="width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)); color: var(--text-on-accent); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 20px; flex-shrink: 0; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
+        <div style="width: calc(52px * var(--ui-layout-scale, 1)); height: calc(52px * var(--ui-layout-scale, 1)); border-radius: 50%; background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)); color: var(--text-on-accent); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: var(--fs-20, 20px); flex-shrink: 0; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
           ${initials}
         </div>
         <div style="flex: 1; min-width: 0;">
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <span style="font-size: 18px; font-weight: 600; color: var(--text-primary, #eee);">${escapeHtml(name)}</span>
-            ${inCredits ? `<span style="background: rgba(227, 179, 65, 0.15); color: var(--syn-macro); border: 1px solid rgba(227, 179, 65, 0.3); font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px;">⭐ CREDITS</span>` : ""}
+            <span style="font-size: var(--fs-18, 18px); font-weight: 600; color: var(--text-primary, #eee);">${escapeHtml(name)}</span>
+            ${inCredits ? `<span style="background: rgba(227, 179, 65, 0.15); color: var(--syn-macro); border: 1px solid rgba(227, 179, 65, 0.3); font-size: var(--fs-10, 10px); font-weight: 600; padding: 2px 6px; border-radius: 4px;">⭐ CREDITS</span>` : ""}
           </div>
-          ${email ? `<div style="font-size: 12px; color: var(--accent-blue, #58a6ff); font-family: var(--font-mono, monospace); margin-top: 2px;">${escapeHtml(email)}</div>` : ""}
+          ${email ? `<div style="font-size: var(--fs-12, 12px); color: var(--accent-blue, #58a6ff); font-family: var(--font-mono, monospace); margin-top: 2px;">${escapeHtml(email)}</div>` : ""}
         </div>
       </div>
 
       <!-- Quick Metrics Grid -->
       <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px;">
         <div style="background: var(--bg-tertiary, #252526); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color, #333);">
-          <div style="font-size: 10px; text-transform: uppercase; color: var(--text-muted, #888); font-weight: 600;">Authored Commits</div>
-          <div style="font-size: 20px; font-weight: bold; color: var(--accent-blue, #58a6ff); margin-top: 4px;">${authoredCount}</div>
+          <div style="font-size: var(--fs-10, 10px); text-transform: uppercase; color: var(--text-muted, #888); font-weight: 600;">Authored Commits</div>
+          <div style="font-size: var(--fs-20, 20px); font-weight: bold; color: var(--accent-blue, #58a6ff); margin-top: 4px;">${authoredCount}</div>
         </div>
         <div style="background: var(--bg-tertiary, #252526); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color, #333);">
-          <div style="font-size: 10px; text-transform: uppercase; color: var(--text-muted, #888); font-weight: 600;">Maintained Subsystems</div>
-          <div style="font-size: 20px; font-weight: bold; color: var(--accent-green, #3fb950); margin-top: 4px;">${sections.length}</div>
+          <div style="font-size: var(--fs-10, 10px); text-transform: uppercase; color: var(--text-muted, #888); font-weight: 600;">Maintained Subsystems</div>
+          <div style="font-size: var(--fs-20, 20px); font-weight: bold; color: var(--accent-green, #3fb950); margin-top: 4px;">${sections.length}</div>
         </div>
       </div>
 
       <!-- CREDITS Record -->
       ${credits.description || credits.web_page || credits.pgp_key || credits.snail_mail ? `
         <div style="background: var(--bg-tertiary, #252526); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color, #333); margin-bottom: 16px;">
-          <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted, #888); margin-bottom: 8px;">biographical credits record</div>
-          <div style="font-size: 12px; color: var(--text-secondary, #ccc); display: flex; flex-direction: column; gap: 6px;">
+          <div style="font-size: var(--fs-11, 11px); font-weight: 600; text-transform: uppercase; color: var(--text-muted, #888); margin-bottom: 8px;">biographical credits record</div>
+          <div style="font-size: var(--fs-12, 12px); color: var(--text-secondary, #ccc); display: flex; flex-direction: column; gap: 6px;">
             ${credits.description ? `<div><strong>Description:</strong> ${escapeHtml(credits.description)}</div>` : ""}
             ${credits.web_page ? `<div><strong>Web Page:</strong> <a href="${escapeHtml(credits.web_page)}" target="_blank" style="color:var(--accent-blue, #58a6ff);">${escapeHtml(credits.web_page)} ↗</a></div>` : ""}
-            ${credits.pgp_key ? `<div><strong>PGP Key:</strong> <code style="font-family:var(--font-mono, monospace); font-size: 11px; color: var(--accent-orange, #f0883e);">${escapeHtml(credits.pgp_key)}</code></div>` : ""}
-            ${credits.snail_mail ? `<div><strong>Postal / Snail Mail:</strong><pre style="margin-top:4px; font-family:inherit; white-space:pre-wrap; color:var(--text-muted, #888); font-size:11px;">${escapeHtml(credits.snail_mail)}</pre></div>` : ""}
+            ${credits.pgp_key ? `<div><strong>PGP Key:</strong> <code style="font-family:var(--font-mono, monospace); font-size: var(--fs-11, 11px); color: var(--accent-orange, #f0883e);">${escapeHtml(credits.pgp_key)}</code></div>` : ""}
+            ${credits.snail_mail ? `<div><strong>Postal / Snail Mail:</strong><pre style="margin-top:4px; font-family:inherit; white-space:pre-wrap; color:var(--text-muted, #888); font-size:var(--fs-11, 11px);">${escapeHtml(credits.snail_mail)}</pre></div>` : ""}
           </div>
         </div>
       ` : ""}
@@ -136,12 +136,12 @@ export async function showPersonModal(version, personIdentifier) {
       <!-- Maintained Subsystems List -->
       ${sections.length > 0 ? `
         <div style="background: var(--bg-tertiary, #252526); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color, #333); margin-bottom: 16px;">
-          <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted, #888); margin-bottom: 8px;">Maintained Subsystems (${sections.length})</div>
+          <div style="font-size: var(--fs-11, 11px); font-weight: 600; text-transform: uppercase; color: var(--text-muted, #888); margin-bottom: 8px;">Maintained Subsystems (${sections.length})</div>
           <div style="display: flex; flex-direction: column; gap: 6px; max-height: 140px; overflow-y: auto;">
             ${sections.map((sec) => `
-              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: var(--bg-secondary, #1e1e1e); border-radius: 4px; font-size: 11px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; background: var(--bg-secondary, #1e1e1e); border-radius: 4px; font-size: var(--fs-11, 11px);">
                 <span style="font-weight: 600; color: var(--text-primary, #eee);">${escapeHtml(sec.name)}</span>
-                <span style="color: var(--accent-blue, #58a6ff); font-size: 10px; background: rgba(88, 166, 255, 0.1); padding: 2px 6px; border-radius: 3px;">${escapeHtml(sec.role_name || (sec.role_type === 1 ? 'Maintainer' : 'Reviewer'))}</span>
+                <span style="color: var(--accent-blue, #58a6ff); font-size: var(--fs-10, 10px); background: rgba(88, 166, 255, 0.1); padding: 2px 6px; border-radius: 3px;">${escapeHtml(sec.role_name || (sec.role_type === 1 ? 'Maintainer' : 'Reviewer'))}</span>
               </div>
             `).join("")}
           </div>
@@ -150,10 +150,10 @@ export async function showPersonModal(version, personIdentifier) {
 
       <!-- Action Buttons -->
       <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--border-color, #333);">
-        <button id="modal-filter-commits-btn" class="code-btn" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--border-color, #444); background: var(--bg-tertiary, #2a2d2e); color: var(--text-primary, #eee); display: flex; align-items: center; gap: 6px;">
+        <button id="modal-filter-commits-btn" class="code-btn" style="padding: 6px 14px; font-size: var(--fs-12, 12px); cursor: pointer; border-radius: 4px; border: 1px solid var(--border-color, #444); background: var(--bg-tertiary, #2a2d2e); color: var(--text-primary, #eee); display: flex; align-items: center; gap: 6px;">
           <span>🔍 View Commits</span>
         </button>
-        <button id="modal-open-maintainers-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent); display: flex; align-items: center; gap: 6px;">
+        <button id="modal-open-maintainers-btn" class="code-btn active" style="padding: 6px 14px; font-size: var(--fs-12, 12px); cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent); display: flex; align-items: center; gap: 6px;">
           <span>📋 Open in Maintainers Tab &rarr;</span>
         </button>
       </div>
@@ -188,13 +188,13 @@ export async function showPersonModal(version, personIdentifier) {
   } catch (err) {
     bodyEl.innerHTML = `
       <div style="padding: 24px; text-align: center;">
-        <div style="font-size: 14px; font-weight: 600; color: var(--accent-red, #f85149); margin-bottom: 8px;">
+        <div style="font-size: var(--fs-14, 14px); font-weight: 600; color: var(--accent-red, #f85149); margin-bottom: 8px;">
           Profile Not Found
         </div>
-        <div style="font-size: 12px; color: var(--text-muted, #888); margin-bottom: 16px;">
+        <div style="font-size: var(--fs-12, 12px); color: var(--text-muted, #888); margin-bottom: 16px;">
           Could not locate developer record for: <code>${escapeHtml(String(personIdentifier))}</code>
         </div>
-        <button id="modal-search-commits-fallback-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent);">
+        <button id="modal-search-commits-fallback-btn" class="code-btn active" style="padding: 6px 14px; font-size: var(--fs-12, 12px); cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent);">
           Search Commits for "${escapeHtml(String(personIdentifier))}"
         </button>
       </div>

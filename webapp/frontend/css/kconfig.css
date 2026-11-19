@@ -468,7 +468,7 @@
 }
 
 .kconfig-node-loc {
-  max-width: 140px;
+  max-width: calc(140px * var(--ui-layout-scale, 1));
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -497,7 +497,7 @@
 }
 
 .kconfig-set-btn {
-  min-width: 28px;
+  min-width: calc(28px * var(--ui-layout-scale, 1));
   font-family: var(--font-mono);
 }
 
@@ -514,7 +514,7 @@
   font-family: var(--font-mono);
   font-size: var(--fs-12, 12px);
   padding: 3px 6px;
-  min-width: 160px;
+  min-width: calc(160px * var(--ui-layout-scale, 1));
 }
 
 .kconfig-expr {
@@ -700,7 +700,7 @@
 }
 
 .kconfig-tc-table .kconfig-value-input {
-  min-width: 120px;
+  min-width: calc(120px * var(--ui-layout-scale, 1));
   width: 100%;
   box-sizing: border-box;
 }

@@ -17,7 +17,8 @@
 }
 
 .palette-box {
-  width: 580px;
+  width: calc(580px * var(--ui-layout-scale, 1));
+  max-width: calc(100vw - 32px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-lg);
@@ -57,8 +58,8 @@
   border-radius: var(--radius-md);
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.25);
   padding: 4px 0;
-  min-width: 220px;
-  max-width: 320px;
+  min-width: calc(220px * var(--ui-layout-scale, 1));
+  max-width: calc(320px * var(--ui-layout-scale, 1));
   z-index: 1000;
   font-family: var(--font-sans);
   font-size: var(--fs-12, 12px);
@@ -103,7 +104,7 @@
 
 .context-menu-item .menu-icon {
   font-size: var(--fs-13, 13px);
-  width: 16px;
+  width: calc(16px * var(--ui-layout-scale, 1));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -153,7 +154,7 @@
 
 /* Commit Popover Box */
 .commit-popover-box {
-  width: 520px;
+  width: calc(520px * var(--ui-layout-scale, 1));
   max-width: 90vw;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -168,7 +169,8 @@
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  width: 650px;
+  width: calc(650px * var(--ui-layout-scale, 1));
+  max-width: 92vw;
   max-height: 80vh;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -431,7 +433,7 @@
 
 /* XRef reference badges; a local variable's uses carry their access (§5.6) */
 .xref-badge {
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   background: var(--bg-tertiary);
   padding: 1px 6px;
   border-radius: 3px;
@@ -447,7 +449,8 @@
 /* 7. Include Symbols Popover */
 .include-symbols-popover {
   position: fixed;
-  width: 480px;
+  width: calc(480px * var(--ui-layout-scale, 1));
+  max-width: calc(100vw - 16px);
   max-height: 520px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -721,7 +724,7 @@
   font-family: var(--font-mono);
   font-size: var(--fs-11, 11px);
   color: var(--text-muted);
-  max-width: 140px;
+  max-width: calc(140px * var(--ui-layout-scale, 1));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -906,7 +909,7 @@
 }
 
 .symhist-branch {
-  max-width: 220px;
+  max-width: calc(220px * var(--ui-layout-scale, 1));
   background: var(--bg-secondary);
   color: var(--text-primary);
   border: 1px solid var(--border-color);
@@ -1042,7 +1045,7 @@
 }
 
 .symhist-fields td:first-child {
-  width: 150px;
+  width: calc(150px * var(--ui-layout-scale, 1));
   color: var(--text-secondary);
   white-space: nowrap;
 }
@@ -1062,7 +1065,7 @@
   border-radius: 0;
 }
 
-.symhist-code .diff-content > div { min-height: 18px; }
+.symhist-code .diff-content > div { min-height: calc(18px * var(--ui-font-scale, 1)); }
 
 .symhist-commits {
   padding: 6px 10px;
@@ -1194,7 +1197,7 @@
   border: 1px solid var(--border-muted);
   padding: 2px 6px;
   border-radius: 3px;
-  max-width: 140px;
+  max-width: calc(140px * var(--ui-layout-scale, 1));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1285,30 +1288,30 @@
 .kbd-overlay .ki-modal-body { display: flex; flex-direction: column; gap: 10px; }
 .kbd-search {
   width: 100%; padding: 6px 10px; background: var(--bg-primary); color: var(--text-primary);
-  border: 1px solid var(--border-color); border-radius: 4px; font-size: 13px;
+  border: 1px solid var(--border-color); border-radius: 4px; font-size: var(--fs-13, 13px);
 }
 .kbd-search:focus { outline: none; border-color: var(--accent-blue); }
-.kbd-group h4 { margin: 8px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); }
-.kbd-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.kbd-group h4 { margin: 8px 0 4px; font-size: var(--fs-12, 12px); text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); }
+.kbd-table { width: 100%; border-collapse: collapse; font-size: var(--fs-12, 12px); }
 .kbd-table td { padding: 4px 6px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
 .kbd-table tr.customized .kbd-keys kbd { border-color: var(--accent-blue); }
 .kbd-table tr.conflict .kbd-keys kbd { border-color: var(--accent-red); }
 .kbd-desc { color: var(--text-primary); }
 .kbd-keys { white-space: nowrap; text-align: right; }
 .kbd-keys kbd {
-  display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 3px; border: 1px solid var(--border-color);
+  display: inline-block; min-width: calc(18px * var(--ui-layout-scale, 1)); padding: 1px 6px; margin-left: 3px; border: 1px solid var(--border-color);
   border-bottom-width: 2px; border-radius: 4px; background: var(--bg-tertiary); color: var(--text-primary);
-  font-family: var(--font-mono, monospace); font-size: 11px; text-align: center;
+  font-family: var(--font-mono, monospace); font-size: var(--fs-11, 11px); text-align: center;
 }
-.kbd-actions { width: 120px; text-align: right; white-space: nowrap; }
+.kbd-actions { width: calc(120px * var(--ui-layout-scale, 1)); text-align: right; white-space: nowrap; }
 .kbd-edit, .kbd-reset {
   padding: 2px 8px; margin-left: 4px; background: var(--bg-tertiary); color: var(--text-secondary);
-  border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer; font-size: 11px;
+  border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer; font-size: var(--fs-11, 11px);
 }
 .kbd-edit:hover, .kbd-reset:hover { color: var(--text-primary); border-color: var(--accent-blue); }
-.kbd-fixed, .kbd-none { color: var(--text-muted); font-size: 11px; }
-.kbd-capturing { color: var(--accent-yellow); font-size: 11px; }
-.kbd-msg { margin-top: 3px; color: var(--accent-red); font-size: 11px; }
+.kbd-fixed, .kbd-none { color: var(--text-muted); font-size: var(--fs-11, 11px); }
+.kbd-capturing { color: var(--accent-yellow); font-size: var(--fs-11, 11px); }
+.kbd-msg { margin-top: 3px; color: var(--accent-red); font-size: var(--fs-11, 11px); }
 .kbd-empty { padding: 16px; text-align: center; color: var(--text-muted); }
 
 /* Session export / import (G07) */

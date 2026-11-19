@@ -2,6 +2,7 @@
  * modal.js - Minimal shared modal dialog (backdrop, header, scrollable body, footer).
  */
 import { shortcuts } from "../utils/shortcuts.js";
+import { scaleCssLength } from "../utils/ui_scale.js";
 
 /**
  * @param {{ title: string, subtitle?: string, width?: string, footerHtml?: string, className?: string, onClose?: () => void }} opts
@@ -11,7 +12,7 @@ export function openModal({ title, subtitle = "", width = "760px", footerHtml = 
   const backdrop = document.createElement("div");
   backdrop.className = "ki-modal-backdrop";
   backdrop.innerHTML = `
-    <div class="ki-modal ${className}" style="width:${width};" role="dialog" aria-modal="true">
+    <div class="ki-modal ${className}" style="width:${scaleCssLength(width)};" role="dialog" aria-modal="true">
       <div class="ki-modal-header">
         <div class="ki-modal-titles">
           <h3 class="ki-modal-title"></h3>

@@ -59,7 +59,7 @@
 }
 
 .explorer-filter {
-  width: 200px;
+  width: calc(200px * var(--ui-layout-scale, 1));
   padding: 2px 8px;
   font-size: var(--fs-11, 11px);
   background: var(--bg-primary);

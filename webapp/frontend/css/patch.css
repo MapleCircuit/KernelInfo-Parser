@@ -59,7 +59,7 @@
 .bm-actions button, .bm-tour-new button, .bm-note-actions button { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 2px 8px; font-size: var(--fs-11, 11px); cursor: pointer; }
 .bm-actions button.active { border-color: var(--accent-blue); color: var(--accent-blue); }
 .bm-actions .bm-label { flex: 1 1 120px; }
-.bm-actions .bm-groupin { width: 90px; }
+.bm-actions .bm-groupin { width: calc(90px * var(--ui-layout-scale, 1)); }
 .bm-note { margin-top: 6px; }
 .bm-note-view { margin-top: 6px; padding: 6px 8px; border-left: 3px solid var(--accent-blue); font-size: var(--fs-12, 12px); }
 .bm-tour-new { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -80,7 +80,7 @@
 
 /* Watch list (G10, §5.36) */
 .watch-bell { position: relative; background: transparent; border: 1px solid var(--border-color); border-radius: var(--radius-sm); color: var(--text-primary); cursor: pointer; padding: 2px 8px; margin-right: 6px; }
-.watch-bell-count { position: absolute; top: -6px; right: -6px; min-width: 16px; height: 16px; padding: 0 3px; border-radius: 8px; background: var(--accent-red); color: var(--text-on-accent); font-size: 10px; line-height: 16px; text-align: center; }
+.watch-bell-count { position: absolute; top: -6px; right: -6px; min-width: calc(16px * var(--ui-layout-scale, 1)); height: calc(16px * var(--ui-layout-scale, 1)); padding: 0 3px; border-radius: 8px; background: var(--accent-red); color: var(--text-on-accent); font-size: var(--fs-10, 10px); line-height: calc(16px * var(--ui-layout-scale, 1)); text-align: center; }
 .watch-row.watch-unread { border-color: var(--accent-yellow); }
 .watch-new { font-size: var(--fs-10, 10px); color: var(--accent-yellow); text-transform: uppercase; }
 .watch-change { margin-top: 4px; font-size: var(--fs-12, 12px); }

@@ -595,7 +595,7 @@ class GenericDBEngineTestCase:
             mock_driver.cnx = MagicMock()
             mock_driver._cur = MagicMock()
             mock_driver.check_if_connected = MagicMock()
-            mock_driver.close = MagicMock()
+            mock_driver._drop_connection = MagicMock()
             mock_driver._cur.executemany.side_effect = mysql.connector.errors.OperationalError(
                 errno=1153, msg="Got a packet bigger than 'max_allowed_packet' bytes"
             )
@@ -1416,7 +1416,7 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
         maria._cur = MagicMock()
         maria.cnx = MagicMock()
         maria.check_if_connected = MagicMock()
-        maria.close = MagicMock()
+        maria._drop_connection = MagicMock()
 
         def mock_executemany(sql, chunk_data):
             if len(chunk_data) >= 4:
@@ -1438,7 +1438,7 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
         maria._cur = MagicMock()
         maria.cnx = MagicMock()
         maria.check_if_connected = MagicMock()
-        maria.close = MagicMock()
+        maria._drop_connection = MagicMock()
 
         large_code = "A" * (500 * 1024)
         sample_data = tuple((b"\x02" * 32, large_code) for _ in range(10))

@@ -33,7 +33,7 @@ export async function showFileHistoryModal(version, filePath) {
     background: var(--bg-secondary, #1e1e1e);
     border: 1px solid var(--border-color, #333);
     border-radius: 8px;
-    width: 760px;
+    width: calc(760px * var(--ui-layout-scale, 1));
     max-width: 95vw;
     max-height: 85vh;
     display: flex;
@@ -46,17 +46,17 @@ export async function showFileHistoryModal(version, filePath) {
 
   modal.innerHTML = `
     <div style="padding: 14px 18px; border-bottom: 1px solid var(--border-color, #333); display: flex; justify-content: space-between; align-items: center; background: var(--bg-tertiary, #252526);">
-      <h3 style="margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary, #fff); display: flex; align-items: center; gap: 8px;">
+      <h3 style="margin: 0; font-size: var(--fs-14, 14px); font-weight: 600; color: var(--text-primary, #fff); display: flex; align-items: center; gap: 8px;">
         <span>📜 File Commit History:</span>
-        <code style="color: var(--accent-blue, #61afef); font-size: 13px;">${escapeHtml(cleanPath)}</code>
+        <code style="color: var(--accent-blue, #61afef); font-size: var(--fs-13, 13px);">${escapeHtml(cleanPath)}</code>
       </h3>
-      <button class="file-history-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: 20px; cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
+      <button class="file-history-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </div>
     <div class="file-history-modal-body" style="padding: 16px 20px; overflow-y: auto; flex: 1;">
       <div style="padding: 30px; text-align: center; color: var(--text-muted);">⏳ Loading Git commit history for ${escapeHtml(cleanPath)}...</div>
     </div>
     <div style="padding: 10px 18px; border-top: 1px solid var(--border-color, #333); display: flex; justify-content: flex-end; background: var(--bg-tertiary, #252526);">
-      <button class="code-btn file-history-close-btn" style="padding: 4px 14px; font-size: 12px;">Close</button>
+      <button class="code-btn file-history-close-btn" style="padding: 4px 14px; font-size: var(--fs-12, 12px);">Close</button>
     </div>
   `;
 
@@ -91,16 +91,16 @@ export async function showFileHistoryModal(version, filePath) {
       summaryHtml = `
         <div style="background: rgba(97, 175, 239, 0.08); border: 1px solid rgba(97, 175, 239, 0.25); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
           <div>
-            <div style="font-size: 11px; color: var(--accent-blue, #61afef); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">🕒 Last Changed Commit (${escapeHtml(version)})</div>
-            <div style="font-size: 14px; font-weight: bold; color: var(--text-primary, #fff); margin-top: 4px;">${escapeHtml(lastChanged.subject || 'No subject')}</div>
-            <div style="font-size: 12px; color: var(--text-muted, #888); margin-top: 4px;">
+            <div style="font-size: var(--fs-11, 11px); color: var(--accent-blue, #61afef); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">🕒 Last Changed Commit (${escapeHtml(version)})</div>
+            <div style="font-size: var(--fs-14, 14px); font-weight: bold; color: var(--text-primary, #fff); margin-top: 4px;">${escapeHtml(lastChanged.subject || 'No subject')}</div>
+            <div style="font-size: var(--fs-12, 12px); color: var(--text-muted, #888); margin-top: 4px;">
               <span>Author: <strong>${escapeHtml(lastChanged.author_name || 'Unknown')}</strong> &lt;${escapeHtml(lastChanged.author_email || '')}&gt;</span>
               <span style="margin-left: 12px;">📅 ${escapeHtml(lastChanged.author_date_iso || '')}</span>
             </div>
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
-            <span class="badge" style="font-family: monospace; font-size: 12px; padding: 3px 8px; background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--accent-blue);"># ${escapeHtml(lastChanged.commit_hash_short || (lastChanged.commit_hash || '').substring(0, 10))}</span>
-            <button class="code-btn active" id="btn-summary-explore" style="padding: 3px 10px; font-size: 11px;">Explore ➔</button>
+            <span class="badge" style="font-family: monospace; font-size: var(--fs-12, 12px); padding: 3px 8px; background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--accent-blue);"># ${escapeHtml(lastChanged.commit_hash_short || (lastChanged.commit_hash || '').substring(0, 10))}</span>
+            <button class="code-btn active" id="btn-summary-explore" style="padding: 3px 10px; font-size: var(--fs-11, 11px);">Explore ➔</button>
           </div>
         </div>
       `;
@@ -116,19 +116,19 @@ export async function showFileHistoryModal(version, filePath) {
             <div class="commit-history-item" style="background: var(--bg-tertiary, #252526); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 12px 14px;" data-hash="${c.commit_hash}">
               <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
                 <div style="display: flex; align-items: center; gap: 8px;">
-                  <span class="badge" style="font-family: monospace; font-size: 11px; padding: 2px 6px; background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);"># ${escapeHtml(c.commit_hash_short || c.commit_hash.substring(0, 10))}</span>
-                  <span style="font-weight: 600; font-size: 12px; color: var(--text-primary, #fff);">${escapeHtml(c.author_name || 'Unknown')}</span>
-                  <span style="font-size: 11px; color: var(--text-muted, #888);">&lt;${escapeHtml(c.author_email || '')}&gt;</span>
+                  <span class="badge" style="font-family: monospace; font-size: var(--fs-11, 11px); padding: 2px 6px; background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);"># ${escapeHtml(c.commit_hash_short || c.commit_hash.substring(0, 10))}</span>
+                  <span style="font-weight: 600; font-size: var(--fs-12, 12px); color: var(--text-primary, #fff);">${escapeHtml(c.author_name || 'Unknown')}</span>
+                  <span style="font-size: var(--fs-11, 11px); color: var(--text-muted, #888);">&lt;${escapeHtml(c.author_email || '')}&gt;</span>
                 </div>
-                <span style="font-size: 11px; color: var(--text-muted, #888);">📅 ${escapeHtml(c.author_date_iso || '')}</span>
+                <span style="font-size: var(--fs-11, 11px); color: var(--text-muted, #888);">📅 ${escapeHtml(c.author_date_iso || '')}</span>
               </div>
-              <div style="font-size: 13px; color: var(--text-primary, #ddd); margin: 6px 0; font-weight: 500;">
+              <div style="font-size: var(--fs-13, 13px); color: var(--text-primary, #ddd); margin: 6px 0; font-weight: 500;">
                 ${escapeHtml(c.subject || '')}
               </div>
               <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px;">
-                <button class="code-btn btn-copy-sha" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: 11px;">📋 Copy SHA</button>
-                <button class="code-btn active btn-explore-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: 11px;">Explore at Commit ➔</button>
-                <button class="code-btn btn-view-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: 11px; background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);">View Commit ➔</button>
+                <button class="code-btn btn-copy-sha" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">📋 Copy SHA</button>
+                <button class="code-btn active btn-explore-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">Explore at Commit ➔</button>
+                <button class="code-btn btn-view-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px); background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);">View Commit ➔</button>
               </div>
             </div>
           `).join("")}

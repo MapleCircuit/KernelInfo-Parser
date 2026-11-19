@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import mysql.connector
 import mysql.connector.errors
 
-from db_engine.base import ColumnInfo, TableStats
+from db_engine.base import ColumnInfo, TableStats, note_engine_closed, note_engine_started
 from db_engine.errors import ConnectionLostError, ReadOnlyViolation
 from db_engine.read_intents import ReadIntents
 from db_engine.spec import (
@@ -79,6 +79,7 @@ class ConnectionPool:
         self._open = 0
         self._closed = False
         self._cond = threading.Condition()
+        self._lifecycle_pid: int | None = None  # set once the pool is live (`note_engine_started`)
 
     def acquire(self, timeout: float = POOL_WAIT_S) -> Any:
         """Lend a connection, waiting up to `timeout` s while all `size` are lent."""
@@ -127,6 +128,9 @@ class ConnectionPool:
         with self._cond:
             self._closed = True
             idle, self._idle = self._idle, []
+            pid, self._lifecycle_pid = self._lifecycle_pid, None
+        if pid is not None:
+            note_engine_closed("MariaDB", pid)
         for cnx in idle:
             self._forget(cnx)
 
@@ -212,6 +216,7 @@ def _create_pool() -> ConnectionPool:
             try:
                 pool.release(pool.acquire())
                 _POOL = pool
+                pool._lifecycle_pid = note_engine_started("MariaDB")
                 logger.info("Initialized connection pool (up to %d connections) via Unix socket (%s).", POOL_SIZE, socket_path)
                 return _POOL
             except Exception as e:
@@ -225,6 +230,7 @@ def _create_pool() -> ConnectionPool:
         pool = ConnectionPool(connect_kwargs)
         pool.release(pool.acquire())
         _POOL = pool
+        pool._lifecycle_pid = note_engine_started("MariaDB")
         logger.info(
             "Initialized connection pool (up to %d connections) via TCP (%s:%s).",
             POOL_SIZE,

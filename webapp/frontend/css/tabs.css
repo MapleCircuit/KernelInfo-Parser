@@ -173,8 +173,8 @@
 }
 
 .tabstrip-btn svg {
-  width: 14px;
-  height: 14px;
+  width: calc(14px * var(--ui-layout-scale, 1));
+  height: calc(14px * var(--ui-layout-scale, 1));
   fill: currentColor;
 }
 
