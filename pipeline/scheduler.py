@@ -8,6 +8,7 @@ from core.globalstuff import (
 )
 
 import contextlib
+import random
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterator, Mapping, Sequence
@@ -17,6 +18,7 @@ from core import ingest_state
 from core.DBLayout import TABLES
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import ChangeSet, is_data_unsafe
+from db_engine.errors import DeadlockError
 from db_engine.spec import AnyOf, Col, Exists, Join, Pred, Value, ge, gt, le, lt, ne, sub
 from pipeline.changesets import execute_and_purge, extract_tags_and_evacuate_cs
 from pipeline.state import logger
@@ -731,13 +733,13 @@ class DistributedTaskScheduler:
         init_cid = int(row[3]) if row[3] and int(row[3]) > 0 else 0
         init_ref = str(row[4] or "")
 
-        pending_cids = {init_cid} if init_cid > 0 else set()
-        pending_refs = {init_ref} if init_ref else set()
-        seen_cids: set[int] = set()
-        seen_refs: set[str] = set()
-        total_cascaded = 0
+        def _op() -> int:
+            pending_cids = {init_cid} if init_cid > 0 else set()
+            pending_refs = {init_ref} if init_ref else set()
+            seen_cids: set[int] = set()
+            seen_refs: set[str] = set()
+            total_cascaded = 0
 
-        with conn.transaction():
             while pending_cids or pending_refs:
                 step_cids = pending_cids - seen_cids
                 step_refs = pending_refs - seen_refs
@@ -783,7 +785,17 @@ class DistributedTaskScheduler:
                         next_refs.add(dr)
                 pending_cids = next_cids
                 pending_refs = next_refs
-        return total_cascaded
+            return total_cascaded
+
+        for attempt in range(1, 6):
+            try:
+                with conn.transaction():
+                    return _op()
+            except DeadlockError:
+                if attempt >= 5:
+                    raise
+                time.sleep(0.02 * attempt + random.uniform(0.0, 0.03))
+        return 0
 
     def fail(
         self,

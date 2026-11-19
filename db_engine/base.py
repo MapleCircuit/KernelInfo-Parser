@@ -7,15 +7,16 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import random
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, ContextManager, Literal, Mapping, NamedTuple, Self
 
 from core.globalstuff import JoinsType, PointerType, SafeDataType
-from db_engine.errors import UnsupportedOperation
+from db_engine.errors import DeadlockError, UnsupportedOperation
 from db_engine.spec import (
     as_column_spec,
     Agg,
@@ -819,6 +820,26 @@ class BaseDBEngine(ABC):
         """Run operations within an atomic transaction, committed on exit or rolled back on error."""
         yield self
 
+    def _retry_deadlock(self, fn: Callable[[], Any], *, max_attempts: int = 5) -> Any:
+        """Retry transient `DeadlockError` (lock deadlock, wait timeout, or snapshot conflict) with jittered backoff."""
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn()
+            except DeadlockError:
+                if attempt >= attempts:
+                    raise
+                time.sleep(0.02 * attempt + random.uniform(0.0, 0.03))
+        raise AssertionError("unreachable")
+
+    def _run_tx_with_retry(self, fn: Callable[[], Any], *, max_attempts: int = 5) -> Any:
+        """Execute `fn()` inside `self.transaction()`, retrying on transient `DeadlockError`."""
+        def _attempt() -> Any:
+            with self.transaction():
+                return fn()
+
+        return self._retry_deadlock(_attempt, max_attempts=max_attempts)
+
     # -------------------------------------------------------------------------
     # Read Primitives (§2)
     # -------------------------------------------------------------------------
@@ -1521,7 +1542,7 @@ class BaseDBEngine(ABC):
                 "target_sha",
             ),
         }
-        with self.transaction():
+        def _op() -> int:
             # Split `status` and `target_sha` updates across two statements so MariaDB's
             # left-to-right ON DUPLICATE KEY UPDATE never creates a mutual read-before-write cycle.
             written = self.insert_rows(
@@ -1542,6 +1563,8 @@ class BaseDBEngine(ABC):
                     update_exprs=target_sha_exprs,
                 )
             return written
+
+        return int(self._run_tx_with_retry(_op))
 
     def register_worker_capabilities(
         self,
@@ -1588,7 +1611,7 @@ class BaseDBEngine(ABC):
             "local_repo_path",
             "updated_ts",
         ]
-        with self.transaction():
+        def _op() -> int:
             self.delete_rows("distributed_worker_capabilities", {"worker_id": worker_id, "network_id": int(network_id)})
             if not deduped:
                 return 0
@@ -1598,6 +1621,8 @@ class BaseDBEngine(ABC):
                 list(deduped.values()),
                 on_conflict="update",
             )
+
+        return int(self._run_tx_with_retry(_op) or 0)
 
     def unregister_worker_capabilities(self, worker_id: str) -> int:
         """Remove all capability rows registered for `worker_id`."""
@@ -1688,32 +1713,8 @@ class BaseDBEngine(ABC):
             )
             return [int(r[0]) for r in rows]
 
-        seen: set[int] = set()
-        if preferred_track:
-            pref_ids = _scan({"t.track_name": preferred_track}, min(5, max(1, int(scan_limit))))
-            for tid in pref_ids:
-                seen.add(tid)
-                with self.transaction():
-                    rc = self.update_rows(
-                        "distributed_tasks",
-                        {"status": "claimed", "worker_id": worker_id, "heartbeat_ts": ts, "updated_ts": ts},
-                        {"task_id": tid, "status": "pending"},
-                    )
-                    if rc and rc > 0:
-                        row = self.select_one(
-                            "distributed_tasks",
-                            list(self._DISTRIBUTED_TASK_COLUMNS),
-                            {"task_id": tid},
-                            as_dict=True,
-                        )
-                        if row is not None:
-                            return dict(row)
-
-        for tid in _scan(None, max(1, int(scan_limit))):
-            if tid in seen:
-                continue
-            seen.add(tid)
-            with self.transaction():
+        def _claim_tid(tid: int) -> dict[str, Any] | None:
+            def _op() -> dict[str, Any] | None:
                 rc = self.update_rows(
                     "distributed_tasks",
                     {"status": "claimed", "worker_id": worker_id, "heartbeat_ts": ts, "updated_ts": ts},
@@ -1728,15 +1729,40 @@ class BaseDBEngine(ABC):
                     )
                     if row is not None:
                         return dict(row)
+                return None
+
+            return self._run_tx_with_retry(_op)
+
+        seen: set[int] = set()
+        if preferred_track:
+            pref_ids = _scan({"t.track_name": preferred_track}, min(5, max(1, int(scan_limit))))
+            for tid in pref_ids:
+                seen.add(tid)
+                claimed = _claim_tid(tid)
+                if claimed is not None:
+                    return claimed
+
+        for tid in _scan(None, max(1, int(scan_limit))):
+            if tid in seen:
+                continue
+            seen.add(tid)
+            claimed = _claim_tid(tid)
+            if claimed is not None:
+                return claimed
         return None
 
     def heartbeat_distributed_task(self, task_id: int, worker_id: str, *, now: int | None = None) -> int:
         """Renew `heartbeat_ts` on an actively claimed task owned by `worker_id`."""
         ts = int(time.time()) if now is None else int(now)
-        return self.update_rows(
-            "distributed_tasks",
-            {"heartbeat_ts": ts, "updated_ts": ts},
-            {"task_id": int(task_id), "worker_id": worker_id, "status": "claimed"},
+        return int(
+            self._retry_deadlock(
+                lambda: self.update_rows(
+                    "distributed_tasks",
+                    {"heartbeat_ts": ts, "updated_ts": ts},
+                    {"task_id": int(task_id), "worker_id": worker_id, "status": "claimed"},
+                )
+            )
+            or 0
         )
 
     def reset_zombie_distributed_tasks(
@@ -1759,16 +1785,21 @@ class BaseDBEngine(ABC):
             if not ids:
                 return 0
             where.append({"task_id": ids})
-        return self.update_rows(
-            "distributed_tasks",
-            {
-                "status": "pending",
-                "worker_id": "",
-                "heartbeat_ts": 0,
-                "updated_ts": ts,
-                "error_msg": "Zombie task recovered after heartbeat expiration",
-            },
-            where,
+        return int(
+            self._retry_deadlock(
+                lambda: self.update_rows(
+                    "distributed_tasks",
+                    {
+                        "status": "pending",
+                        "worker_id": "",
+                        "heartbeat_ts": 0,
+                        "updated_ts": ts,
+                        "error_msg": "Zombie task recovered after heartbeat expiration",
+                    },
+                    where,
+                )
+            )
+            or 0
         )
 
     def complete_distributed_task(
@@ -1786,7 +1817,10 @@ class BaseDBEngine(ABC):
         where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
         if worker_id:
             where["worker_id"] = worker_id
-        with self.transaction():
+
+        def _op() -> bool:
+            eff_ref = ref_name
+            eff_net = network_id
             rc = self.update_rows(
                 "distributed_tasks",
                 {"status": "completed", "commit_id": int(commit_id), "error_msg": "", "updated_ts": ts},
@@ -1803,25 +1837,31 @@ class BaseDBEngine(ABC):
                 )
                 t_repo = str(task_row[1]) if task_row else ""
                 t_type = str(task_row[3]) if task_row else ""
-                if task_row and ref_name is None:
-                    ref_name = str(task_row[2])
-                if task_row and network_id is None:
-                    network_id = int(task_row[0])
-                if ref_name and network_id is not None and t_type != "preparse":
+                if task_row and eff_ref is None:
+                    eff_ref = str(task_row[2])
+                if task_row and eff_net is None:
+                    eff_net = int(task_row[0])
+                if eff_ref and eff_net is not None and t_type != "preparse":
                     backfill_where: dict[str, Any] = {
-                        "network_id": int(network_id),
+                        "network_id": int(eff_net),
                         "status": "pending",
-                        "base_ref_name": ref_name,
+                        "base_ref_name": eff_ref,
                         "base_commit_id": 0,
                     }
                     if t_repo:
                         backfill_where["repo_name"] = t_repo
-                    self.update_rows(
-                        "distributed_tasks",
-                        {"base_commit_id": int(commit_id), "updated_ts": ts},
-                        backfill_where,
-                    )
-        return True
+                    # Resolve target PKs via a consistent read first so the UPDATE does not
+                    # scan unrelated pending rows in dist_task_base_idx under snapshot isolation.
+                    dep_ids = self.select_values("distributed_tasks", "task_id", backfill_where)
+                    if dep_ids:
+                        self.update_rows(
+                            "distributed_tasks",
+                            {"base_commit_id": int(commit_id), "updated_ts": ts},
+                            {"task_id": dep_ids, "status": "pending", "base_commit_id": 0},
+                        )
+            return True
+
+        return bool(self._run_tx_with_retry(_op))
 
     def fail_distributed_task(
         self,
@@ -1837,17 +1877,24 @@ class BaseDBEngine(ABC):
         where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
         if worker_id:
             where["worker_id"] = worker_id
-        return self.update_rows(
-            "distributed_tasks",
-            {
-                "status": Case([(Pred(add("retry_count", 1), ge(int(max_attempts))), Value("failed"))], Value("pending")),
-                "retry_count": add("retry_count", 1),
-                "error_msg": str(error_msg)[:1000],
-                "worker_id": "",
-                "heartbeat_ts": 0,
-                "updated_ts": ts,
-            },
-            where,
+        return int(
+            self._retry_deadlock(
+                lambda: self.update_rows(
+                    "distributed_tasks",
+                    {
+                        "status": Case(
+                            [(Pred(add("retry_count", 1), ge(int(max_attempts))), Value("failed"))], Value("pending")
+                        ),
+                        "retry_count": add("retry_count", 1),
+                        "error_msg": str(error_msg)[:1000],
+                        "worker_id": "",
+                        "heartbeat_ts": 0,
+                        "updated_ts": ts,
+                    },
+                    where,
+                )
+            )
+            or 0
         )
 
     def release_distributed_task(
@@ -1860,16 +1907,18 @@ class BaseDBEngine(ABC):
     ) -> bool:
         """Return a claimed task to `pending` without incrementing `retry_count`."""
         ts = int(time.time()) if now is None else int(now)
-        rc = self.update_rows(
-            "distributed_tasks",
-            {
-                "status": "pending",
-                "worker_id": "",
-                "heartbeat_ts": 0,
-                "updated_ts": ts,
-                "error_msg": str(reason)[:1000],
-            },
-            {"task_id": int(task_id), "status": "claimed", "worker_id": worker_id},
+        rc = self._retry_deadlock(
+            lambda: self.update_rows(
+                "distributed_tasks",
+                {
+                    "status": "pending",
+                    "worker_id": "",
+                    "heartbeat_ts": 0,
+                    "updated_ts": ts,
+                    "error_msg": str(reason)[:1000],
+                },
+                {"task_id": int(task_id), "status": "claimed", "worker_id": worker_id},
+            )
         )
         return bool(rc and rc > 0)
 

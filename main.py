@@ -92,6 +92,11 @@ def _is_git_repo_dir(path: str | Path) -> bool:
 def _rollback_and_clean_ingest_state(db: object, network_id: int, commit_id: int) -> None:
     if not commit_id or db is None:
         return
+    if ingest_state.get_status(db, network_id, commit_id) == ingest_state.INGEST_DONE:
+        logger.warning(
+            f"[Distributed] Skipping rollback for commit_id {commit_id}: already marked INGEST_DONE."
+        )
+        return
     rb = ingest_state.rollback_version(db, network_id, commit_id, gp.Table_Array)
     if rb is False:
         ingest_state.purge_partial_version(db, commit_id)
@@ -675,10 +680,13 @@ def _run() -> None:
                         f"[Worker] Processing distributed task {t_id} ({t_type}: '{ref_name}', track: '{preferred_track}', "
                         f"repo: '{t_repo_name or 'default'}', base: '{b_name}', base_cid: {b_cid}, commit_id: {cid})."
                     ))
+                    parse_finished = False
                     try:
                         if t_type == "preparse":
                             with git_repo_lock(task_repo_path, exclusive=False):
                                 processing_unified_preparse(task_repo_path, task_repo_id, tags=[ref_name])
+                            parse_finished = True
+                            heartbeat_daemon.clear_active()
                             ok = active_scheduler.complete(t_id, cid, ref_name=ref_name)
                             if not ok:
                                 logger.warning(COLOR.yellow(f"[Worker] Distributed pre-parse task {t_id} claim was lost before completion."))
@@ -694,6 +702,8 @@ def _run() -> None:
                                     _rollback_and_clean_ingest_state(db, task_net_id, getattr(gp, "VID", 0))
                                     active_scheduler.release(t_id, "Execution deadline reached", db=db)
                                 break
+                            parse_finished = True
+                            heartbeat_daemon.clear_active()
                             ok = active_scheduler.complete(t_id, getattr(gp, "VID", cid), ref_name=ref_name)
                             if not ok:
                                 logger.warning(COLOR.yellow(f"[Worker] Distributed task {t_id} claim was lost/revoked before completion."))
@@ -708,10 +718,16 @@ def _run() -> None:
                         worker_exit_code = 1
                         break
                     except Exception as e:
-                        logger.error(f"[Worker] Failed distributed task {t_id} ('{ref_name}'): {e}", exc_info=True)
-                        with G.DB() as db:
-                            _rollback_and_clean_ingest_state(db, task_net_id, getattr(gp, "VID", 0))
-                            active_scheduler.fail(t_id, str(e), db=db)
+                        if parse_finished:
+                            logger.error(
+                                f"[Worker] Failed finalizing distributed task {t_id} ('{ref_name}') after ingest: {e}",
+                                exc_info=True,
+                            )
+                        else:
+                            logger.error(f"[Worker] Failed distributed task {t_id} ('{ref_name}'): {e}", exc_info=True)
+                            with G.DB() as db:
+                                _rollback_and_clean_ingest_state(db, task_net_id, getattr(gp, "VID", 0))
+                                active_scheduler.fail(t_id, str(e), db=db)
                     finally:
                         gp._active_dist_task_id = None
                         heartbeat_daemon.clear_active()
@@ -1130,6 +1146,7 @@ def _run() -> None:
                     f"[Master] Claimed priority-{task.get('priority', 10)} task {t_id}: '{ref}' "
                     f"(base: '{gp.Old_Version_Name}', base_cid: {gp.Old_VID})."
                 ))
+                parse_finished = False
                 try:
                     completed = update(ref, repo_path=repo_path)
                     if completed is False:
@@ -1137,6 +1154,9 @@ def _run() -> None:
                             _rollback_and_clean_ingest_state(db, network_id, getattr(gp, "VID", 0))
                             master_scheduler.release(t_id, "Execution deadline reached", db=db)
                         break
+                    parse_finished = True
+                    if heartbeat_daemon is not None:
+                        heartbeat_daemon.clear_active()
                     master_scheduler.complete(t_id, getattr(gp, "VID", cid), ref_name=ref)
                 except SystemicParseError as exc:
                     with G.DB() as db:
@@ -1144,9 +1164,15 @@ def _run() -> None:
                         master_scheduler.release(t_id, f"Released by {node_id}: {exc}", db=db)
                     raise
                 except Exception as exc:
-                    with G.DB() as db:
-                        _rollback_and_clean_ingest_state(db, network_id, getattr(gp, "VID", 0))
-                        master_scheduler.fail(t_id, str(exc), db=db)
+                    if parse_finished:
+                        logger.error(
+                            f"[Master] Failed finalizing completed task {t_id} ('{ref}') after ingest: {exc}",
+                            exc_info=True,
+                        )
+                    else:
+                        with G.DB() as db:
+                            _rollback_and_clean_ingest_state(db, network_id, getattr(gp, "VID", 0))
+                            master_scheduler.fail(t_id, str(exc), db=db)
                     raise
                 finally:
                     gp._active_dist_task_id = None

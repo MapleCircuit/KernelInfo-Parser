@@ -1645,6 +1645,14 @@ class TestMariaDBReserveIdBlockSql(unittest.TestCase):
         self.assertIsInstance(translate_mysql_error(err_1213), DeadlockError)
         err_1205 = mysql.connector.errors.InternalError(errno=1205, msg="Lock wait timeout exceeded")
         self.assertIsInstance(translate_mysql_error(err_1205), DeadlockError)
+        err_1020 = mysql.connector.errors.DatabaseError(
+            errno=1020, msg="Record has changed since last read in table 'distributed_tasks'"
+        )
+        self.assertIsInstance(translate_mysql_error(err_1020), DeadlockError)
+        err_1020_msg = mysql.connector.errors.DatabaseError(
+            errno=-1, msg="Record has changed since last read in table 'distributed_tasks'"
+        )
+        self.assertIsInstance(translate_mysql_error(err_1020_msg), DeadlockError)
 
 
 _generate_engine_test_classes()

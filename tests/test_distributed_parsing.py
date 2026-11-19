@@ -2102,5 +2102,138 @@ class TestIngestBugFixes(unittest.TestCase):
         self.assertGreater(cid, 10)
 
 
+class TestDistributedConcurrencyResilience(unittest.TestCase):
+    """Verify distributed_tasks retry on snapshot/deadlock conflicts and INGEST_DONE rollback protection."""
+
+    def test_complete_distributed_task_retries_deadlock_and_targets_backfill_pks(self) -> None:
+        from db_engine import DeadlockError
+
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "main", "mainline", "0.99.15j", "1" * 40, 0, "", 0, 10, 100, "pending", now, now),
+            (1, 1, "linux", "main", "mainline", "0.99.15k", "2" * 40, 0, "0.99.15j", 0, 10, 101, "pending", now, now),
+            (1, 1, "linux", "stable", "stable:v6.6", "v6.6.1", "3" * 40, 0, "v6.6", 0, 5, 200, "pending", now, now),
+        ])
+        by_ref = {r["ref_name"]: r for r in db.dist_tasks}
+        tid_j = by_ref["0.99.15j"]["task_id"]
+        tid_k = by_ref["0.99.15k"]["task_id"]
+        db.update_rows("distributed_tasks", {"status": "claimed", "worker_id": "master:1"}, {"task_id": tid_j})
+
+        orig_update = db.update_rows
+        backfill_calls = []
+        attempts = {"count": 0}
+
+        def flaky_update(table, values, where, *args, **kwargs):
+            if table == "distributed_tasks" and "base_commit_id" in values:
+                backfill_calls.append(dict(where))
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise DeadlockError("1020 (HY000): Record has changed since last read in table 'distributed_tasks'")
+            return orig_update(table, values, where, *args, **kwargs)
+
+        with mock.patch.object(db, "update_rows", side_effect=flaky_update), mock.patch("db_engine.base.time.sleep"):
+            ok = db.complete_distributed_task(tid_j, 50001, worker_id="master:1", ref_name="0.99.15j", network_id=1, now=now + 5)
+
+        self.assertTrue(ok)
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(backfill_calls[0]["task_id"], [tid_k], "backfill update must target resolved dependent task_ids")
+        refreshed = {r["ref_name"]: r for r in db.dist_tasks}
+        self.assertEqual((refreshed["0.99.15j"]["status"], refreshed["0.99.15j"]["commit_id"]), ("completed", 50001))
+        self.assertEqual(refreshed["0.99.15k"]["base_commit_id"], 50001)
+        self.assertEqual(refreshed["v6.6.1"]["base_commit_id"], 0)
+
+    def test_complete_distributed_task_skips_backfill_update_when_no_dependents(self) -> None:
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "main", "mainline", "0.99.15j", "1" * 40, 0, "", 0, 10, 100, "pending", now, now),
+            (1, 1, "linux", "stable", "stable:v6.6", "v6.6.1", "3" * 40, 0, "v6.6", 0, 5, 200, "pending", now, now),
+        ])
+        tid_j = {r["ref_name"]: r for r in db.dist_tasks}["0.99.15j"]["task_id"]
+        db.update_rows("distributed_tasks", {"status": "claimed", "worker_id": "master:1"}, {"task_id": tid_j})
+
+        orig_update = db.update_rows
+        update_calls = []
+
+        def spy_update(table, values, where, *args, **kwargs):
+            update_calls.append((table, dict(values), dict(where) if isinstance(where, dict) else where))
+            return orig_update(table, values, where, *args, **kwargs)
+
+        with mock.patch.object(db, "update_rows", side_effect=spy_update):
+            ok = db.complete_distributed_task(tid_j, 50001, worker_id="master:1", ref_name="0.99.15j", network_id=1, now=now + 5)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(update_calls), 1, "no backfill UPDATE should run when no pending dependents match")
+
+    def test_enqueue_and_claim_and_cascade_retry_deadlock(self) -> None:
+        from db_engine import DeadlockError
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        orig_insert = db.insert_rows
+        enq_attempts = {"count": 0}
+
+        def flaky_insert(*args, **kwargs):
+            enq_attempts["count"] += 1
+            if enq_attempts["count"] == 2:
+                raise DeadlockError("1020 (HY000): Record has changed since last read in table 'distributed_tasks'")
+            return orig_insert(*args, **kwargs)
+
+        with mock.patch.object(db, "insert_rows", side_effect=flaky_insert), mock.patch("db_engine.base.time.sleep"):
+            written = db.enqueue_distributed_tasks([
+                (1, 1, "linux", "stable", "stable:v6.6", "v6.6.1", "1" * 40, 0, "", 0, 5, 1, "pending", now, now),
+                (1, 1, "linux", "stable", "stable:v6.6", "v6.6.2", "2" * 40, 0, "v6.6.1", 0, 5, 2, "pending", now, now),
+            ])
+        self.assertEqual(written, 2)
+        self.assertEqual(enq_attempts["count"], 4)
+
+        sched = DistributedTaskScheduler(lambda: db, 1, "w1", distributed.ROLE_WORKER)
+        sched.register_capabilities([{"repo_name": "linux", "track_name": "*"}], db=db)
+
+        orig_update = db.update_rows
+        claim_attempts = {"count": 0}
+
+        def flaky_claim_update(table, values, where, *args, **kwargs):
+            if table == "distributed_tasks" and values.get("status") == "claimed":
+                claim_attempts["count"] += 1
+                if claim_attempts["count"] == 1:
+                    raise DeadlockError("1020 (HY000): Record has changed since last read in table 'distributed_tasks'")
+            return orig_update(table, values, where, *args, **kwargs)
+
+        with mock.patch.object(db, "update_rows", side_effect=flaky_claim_update), mock.patch("db_engine.base.time.sleep"):
+            claimed = sched.claim_next(db=db, now=now + 1)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["ref_name"], "v6.6.1")
+        self.assertEqual(claim_attempts["count"], 2)
+
+        cascade_attempts = {"count": 0}
+
+        def flaky_cascade_update(table, values, where, *args, **kwargs):
+            if table == "distributed_tasks" and values.get("error_msg") == "Prerequisite base task failed":
+                cascade_attempts["count"] += 1
+                if cascade_attempts["count"] == 1:
+                    raise DeadlockError("1020 (HY000): Record has changed since last read in table 'distributed_tasks'")
+            return orig_update(table, values, where, *args, **kwargs)
+
+        with mock.patch.object(db, "update_rows", side_effect=flaky_cascade_update), mock.patch("pipeline.scheduler.time.sleep"):
+            self.assertTrue(sched.fail(claimed["task_id"], "fatal", max_attempts=1, db=db, now=now + 2))
+        self.assertEqual(cascade_attempts["count"], 2)
+        self.assertEqual({r["ref_name"]: r["status"] for r in db.dist_tasks}["v6.6.2"], "failed")
+
+    def test_rollback_and_clean_ingest_state_skips_ingest_done_version(self) -> None:
+        from main import _rollback_and_clean_ingest_state
+
+        db = DistDB(full_schema=True)
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 50001, ingest_state.INGEST_DONE, 100)])
+        with mock.patch("main.ingest_state.rollback_version") as mock_rb, \
+             mock.patch("main.ingest_state.purge_partial_version") as mock_purge:
+            _rollback_and_clean_ingest_state(db, 1, 50001)
+        mock_rb.assert_not_called()
+        mock_purge.assert_not_called()
+        self.assertEqual(ingest_state.get_status(db, 1, 50001), ingest_state.INGEST_DONE)
+
+
 if __name__ == "__main__":
     unittest.main()
