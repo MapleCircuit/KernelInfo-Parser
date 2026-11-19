@@ -412,6 +412,15 @@ class BaseDBEngine(ABC):
         """True when `name` is in `capabilities`."""
         return name in self.capabilities
 
+    def worker_factory(self) -> Callable[[], BaseDBEngine]:
+        """Picklable zero-argument constructor of a new, independent connection to this engine's database.
+
+        Worker processes (`ProcessPoolExecutor` initializers) call it to open their own engine; it holds no live handle
+        of this one. The default is the engine class itself, for engines configured from the environment (`MariaDB`).
+        Engines whose connection depends on constructor arguments override it.
+        """
+        return type(self)
+
     @classmethod
     def probe_connection(cls, cfg: Mapping[str, Any]) -> ProbeResult:
         """Try to connect with the `database` config section `cfg`; never raises. Engines override."""

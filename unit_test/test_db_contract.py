@@ -6,17 +6,22 @@ the backend that differs from MariaDB semantics.
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
+import pickle
 import tempfile
 import unittest
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable
 
 from core import DBLayout as D
 from db_engine import (
+    CAP_CONCURRENT_CONNECTIONS,
     Agg,
     Case,
     Col,
     Concat,
+    DeadlockError,
     DuplicateKeyError,
     Incoming,
     Join,
@@ -27,6 +32,7 @@ from db_engine import (
     Select,
     SpecError,
     SQLiteDB,
+    UnsupportedOperation,
     ge,
     gt,
     in_select,
@@ -35,6 +41,7 @@ from db_engine import (
     like,
     lt,
     ne,
+    worker_engine_factory,
 )
 from db_engine.base import BaseDBEngine
 from db_engine.spec import Pred, Value, all_of, any_of, eq, add, between, exists_select, not_in, not_null
@@ -759,12 +766,112 @@ class TestSQLiteFileDatabase(unittest.TestCase):
         mem = SQLiteDB(":memory:")
         self.assertFalse(mem.has_capability("persistent"))
         self.assertFalse(mem.has_capability("server_tuning"))
+        self.assertFalse(mem.has_capability(CAP_CONCURRENT_CONNECTIONS))
+        self.assertFalse(SQLiteDB(":memory:shared").has_capability(CAP_CONCURRENT_CONNECTIONS))
+        self.assertFalse(MockDB(use_global=False).has_capability(CAP_CONCURRENT_CONNECTIONS))
+        with self.assertRaises(UnsupportedOperation):
+            mem.worker_factory()
+        with self.assertRaises(UnsupportedOperation):
+            worker_engine_factory(MockDB(use_global=False))
         probe = SQLiteDB.probe_connection({"path": ":memory:"})
         self.assertTrue(probe.ok)
         self.assertTrue(probe.version)
 
+    def test_worker_factory_reopens_the_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.sqlite3")
+            db = SQLiteDB(path, foreign_keys=False, timeout=5.0)
+            self.addCleanup(db.close)
+            self.assertTrue(db.has_capability(CAP_CONCURRENT_CONNECTIONS))
+            db.create_table([D.m_file_name])
+            db.insert_rows("m_file_name", ["fname"], [("parent",)])
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)  # a relative path still names the same file once the worker's cwd differs
+                rel = SQLiteDB("k.sqlite3")
+            finally:
+                os.chdir(cwd)
+            self.addCleanup(rel.close)
+            for engine in (db, rel):
+                factory = pickle.loads(pickle.dumps(worker_engine_factory(engine)))
+                other = factory()
+                try:
+                    self.assertIsInstance(other, SQLiteDB)
+                    self.assertEqual(other.path, os.path.realpath(path))
+                    self.assertEqual(other.select_values("m_file_name", "fname", {"fname": "parent"}), ["parent"])
+                finally:
+                    other.close()
+            other = db.worker_factory()()
+            self.assertEqual((other.foreign_keys, other.timeout, other.read_only), (False, 5.0, False))
+            other.close()
+            ro = SQLiteDB(path, read_only=True)
+            self.addCleanup(ro.close)
+            ro_other = ro.worker_factory()()
+            self.addCleanup(ro_other.close)
+            with self.assertRaises(ReadOnlyViolation):
+                ro_other.insert_rows("m_file_name", ["fname"], [("x",)])
+
+    def test_lock_held_past_timeout_is_retryable_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.sqlite3")
+            holder = SQLiteDB(path)
+            self.addCleanup(holder.close)
+            holder.create_table([D.m_file_name])
+            waiter = SQLiteDB(path, timeout=0.05)
+            self.addCleanup(waiter.close)
+            with holder.transaction():
+                holder.insert_rows("m_file_name", ["fname"], [("held",)])
+                with self.assertRaises(DeadlockError), waiter.transaction():
+                    waiter.insert_rows("m_file_name", ["fname"], [("blocked",)])
+                with self.assertRaises(DeadlockError):
+                    waiter.insert_rows("m_file_name", ["fname"], [("blocked",)])
+                self.assertEqual(waiter.select_values("m_file_name", "fname", {"fname": "held"}), [])  # WAL: readers never wait
+            with waiter.transaction():
+                waiter.insert_rows("m_file_name", ["fname"], [("after",)])
+            self.assertEqual(sorted(holder.select_values("m_file_name", "fname", {"fname": ["after", "held"]})), ["after", "held"])
+
+    def test_forked_workers_write_through_worker_factory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.sqlite3")
+            db = SQLiteDB(path)
+            self.addCleanup(db.close)
+            db.create_table([D.m_file_name])
+            factory = worker_engine_factory(db)
+            with ProcessPoolExecutor(
+                max_workers=3,
+                mp_context=multiprocessing.get_context("fork"),
+                initializer=_init_file_worker,
+                initargs=(factory,),
+            ) as pool:
+                pids = set(pool.map(_write_file_name, [f"w{i}" for i in range(24)]))
+            self.assertNotIn(os.getpid(), pids)
+            self.assertEqual(
+                sorted(db.select_values("m_file_name", "fname", {"fname": [f"w{i}" for i in range(24)]})),
+                sorted(f"w{i}" for i in range(24)),
+            )
+
     def test_probe_missing_directory(self) -> None:
         self.assertFalse(SQLiteDB.probe_connection({"path": "/nonexistent-dir-xyz/k.sqlite3"}).ok)
+
+
+_FILE_WORKER: dict[str, Any] = {}
+
+
+def _init_file_worker(factory: Callable[[], Any]) -> None:
+    _FILE_WORKER["db"] = factory()
+
+
+def _write_file_name(name: str) -> int:
+    db = _FILE_WORKER["db"]
+    for attempt in range(5):
+        try:
+            with db.transaction():
+                db.insert_rows("m_file_name", ["fname"], [(name,)])
+            return os.getpid()
+        except DeadlockError:
+            if attempt == 4:
+                raise
+    return os.getpid()
 
 
 class TestForeignSQLiteFiles(unittest.TestCase):

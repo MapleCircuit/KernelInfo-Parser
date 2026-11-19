@@ -1,8 +1,10 @@
 """tests/test_cve_releases.py - Pre-evaluated release-to-CVE verdicts (parser/cve/cve_releases.py)."""
 from __future__ import annotations
 
+import functools
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -16,7 +18,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import DBLayout as D
 from core import backfills
-from db_engine import SQLiteDB
+from db_engine import (
+    CAP_CONCURRENT_CONNECTIONS,
+    ConnectionLostError,
+    EnginePool,
+    PooledEngineFactory,
+    PooledEngineLease,
+    SQLiteDB,
+    worker_engine_factory,
+)
 from parser.cve import cve_ingest as ci
 from parser.cve import cve_releases as crl
 from parser.git_ast import release_stats as rst
@@ -180,52 +190,7 @@ class TestCveReleases(unittest.TestCase):
         self.head1 = _git(self.crepo, "rev-parse", "HEAD")
 
         # Set up in-memory SQLite DB with full schema
-        self.db = SQLiteDB(":memory:", foreign_keys=True)
-        self.db.create_table(list(D.TABLES))
-        self.db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
-        self.db.insert_rows(
-            "m_git_network",
-            ["network_id", "project_id", "name", "root_commit_hash"],
-            [(1, 1, "linux", bytes.fromhex(self.c_init))],
-        )
-        self.db.insert_rows(
-            "m_repository",
-            ["repo_id", "network_id", "name", "git_url", "default_branch"],
-            [(1, 1, "linux", "", "master")],
-        )
-
-        # Ingest release stats + CVE list + resolve prefixes
-        rst.ingest(self.db, self.krepo, repo_id=1)
-        ci.ingest(self.db, self.crepo)
-        ci.resolve_commit_prefixes(self.db, self.krepo, 1)
-
-        # Populate m_commit + m_commit_relation so both parser and webapp see identical commit relations
-        _shas = [self.c_init, self.c_intro, self.c_intro2, self.c_fix1, self.c_fix2, self.c_bp2]
-        self.db.insert_rows(
-            "m_maintainer_person",
-            ["person_id", "name", "email"],
-            [(1, "Test", "test@kernel.org")],
-            on_conflict="ignore",
-        )
-        self.db.insert_rows(
-            "m_commit",
-            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
-            [
-                (
-                    i,
-                    1,
-                    bytes.fromhex(sha),
-                    1,
-                    1700000000 + i,
-                    1,
-                    1700000000 + i,
-                    _git(self.krepo, "log", "-1", "--format=%s", sha),
-                    _git(self.krepo, "log", "-1", "--format=%B", sha),
-                )
-                for i, sha in enumerate(_shas, start=1)
-            ],
-        )
-        backfills.backfill_commit_relations(self.db, str(self.krepo))
+        self.db = self._build_db(":memory:")
 
         # Clear webapp caches and patch reader/repo
         self._reset_webapp_caches()
@@ -244,6 +209,56 @@ class TestCveReleases(unittest.TestCase):
         ):
             p.start()
             self.addCleanup(p.stop)
+
+    def _build_db(self, path: str) -> SQLiteDB:
+        """SQLite database at `path` with the full schema, release stats, CVE list and commit relations ingested."""
+        db = SQLiteDB(path, foreign_keys=True)
+        db.create_table(list(D.TABLES))
+        db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
+        db.insert_rows(
+            "m_git_network",
+            ["network_id", "project_id", "name", "root_commit_hash"],
+            [(1, 1, "linux", bytes.fromhex(self.c_init))],
+        )
+        db.insert_rows(
+            "m_repository",
+            ["repo_id", "network_id", "name", "git_url", "default_branch"],
+            [(1, 1, "linux", "", "master")],
+        )
+
+        # Ingest release stats + CVE list + resolve prefixes
+        rst.ingest(db, self.krepo, repo_id=1)
+        ci.ingest(db, self.crepo)
+        ci.resolve_commit_prefixes(db, self.krepo, 1)
+
+        # Populate m_commit + m_commit_relation so both parser and webapp see identical commit relations
+        _shas = [self.c_init, self.c_intro, self.c_intro2, self.c_fix1, self.c_fix2, self.c_bp2]
+        db.insert_rows(
+            "m_maintainer_person",
+            ["person_id", "name", "email"],
+            [(1, "Test", "test@kernel.org")],
+            on_conflict="ignore",
+        )
+        db.insert_rows(
+            "m_commit",
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            [
+                (
+                    i,
+                    1,
+                    bytes.fromhex(sha),
+                    1,
+                    1700000000 + i,
+                    1,
+                    1700000000 + i,
+                    _git(self.krepo, "log", "-1", "--format=%s", sha),
+                    _git(self.krepo, "log", "-1", "--format=%B", sha),
+                )
+                for i, sha in enumerate(_shas, start=1)
+            ],
+        )
+        backfills.backfill_commit_relations(db, str(self.krepo))
+        return db
 
     @staticmethod
     def _reset_webapp_caches() -> None:
@@ -636,6 +651,102 @@ class TestCveReleases(unittest.TestCase):
             self.assertGreater(self.db.count_rows("m_cve_release"), 0)
         finally:
             crl._POOL_DATA.clear()
+
+    def test_parallel_full_write_runs_in_forked_workers_through_pooled_lease(self) -> None:
+        """A `PooledEngineLease` over a SQLite file drives the forked parallel write path end to end.
+
+        Each worker opens its own engine on the same file, writes its batches, and closes it when the pool shuts down;
+        the verdicts equal a serial run.
+        """
+        for i in range(200):
+            cve_id = f"CVE-2024-{1000 + i}"
+            (self.cve_dir / f"{cve_id}.json").write_text(json.dumps(_text_cve(cve_id, "3.1")))
+        _git(self.crepo, "add", "-A")
+        _git(self.crepo, "commit", "-q", "-m", "bulk cves")
+        ci.ingest(self.db, self.crepo)
+        db_path = os.path.realpath(os.path.join(self.tmp.name, "kip.sqlite3"))
+        file_db = self._build_db(db_path)
+        self.addCleanup(file_db.close)
+        self.assertTrue(file_db.has_capability(CAP_CONCURRENT_CONNECTIONS))
+
+        events = Path(self.tmp.name) / "worker_events"
+        orig_write = crl._write_segments_full_batch
+        orig_close = crl._close_worker_db
+
+        def logged_write(w_db, *args, **kwargs):
+            with open(events, "a") as f:
+                f.write(f"write {os.getpid()} {w_db.path}\n")
+            return orig_write(w_db, *args, **kwargs)
+
+        def logged_close() -> None:
+            with open(events, "a") as f:
+                f.write(f"close {os.getpid()} {int('db' in crl._POOL_DATA)}\n")
+            orig_close()
+
+        pool = EnginePool(lambda: file_db, max_size=1)
+        self.addCleanup(pool.close)
+        lease = pool.lease()
+        self.assertIsInstance(lease, PooledEngineLease)
+        try:
+            with patch.object(crl, "_process_workers", return_value=2), \
+                    patch.object(crl, "_write_segments_full_batch", logged_write), \
+                    patch.object(crl, "_close_worker_db", logged_close):
+                res = crl.sync(lease, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        finally:
+            lease.close()
+        self.assertEqual(res["state"], "updated")
+
+        lines = [ln.split() for ln in events.read_text().splitlines()]
+        writes = [ln for ln in lines if ln[0] == "write"]
+        closes = [ln for ln in lines if ln[0] == "close"]
+        self.assertTrue(writes)
+        self.assertTrue(all(ln[2] == db_path for ln in writes))
+        writer_pids = {ln[1] for ln in writes}
+        self.assertNotIn(str(os.getpid()), writer_pids)
+        self.assertTrue(writer_pids <= {ln[1] for ln in closes if ln[2] == "1"})  # every writer closed its engine
+
+        cols = ["segment_id", "cve_id", "state", "basis", "fixed_here"]
+        parallel = sorted(file_db.select_rows("m_cve_release", cols, as_dict=False))
+        self.assertGreater(len(parallel), 200)
+        crl.sync(self.db, 1, kernel_repo=self.krepo, cve_repo=self.crepo)
+        self.assertEqual(sorted(self.db.select_rows("m_cve_release", cols, as_dict=False)), parallel)
+
+
+class TestWorkerEngineFactory(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.realpath(os.path.join(tmp.name, "w.sqlite3"))
+        self.factory = PooledEngineFactory(functools.partial(SQLiteDB, self.path), max_size=1)
+        self.addCleanup(self.factory.close)
+        self.addCleanup(crl._POOL_DATA.clear)
+
+    def test_unwraps_leases_and_factories(self) -> None:
+        self.assertIs(worker_engine_factory(SQLiteDB), SQLiteDB)
+        self.assertIs(worker_engine_factory(self.factory), self.factory.engine_class)
+        with self.factory() as lease:
+            self.assertIsInstance(lease, PooledEngineLease)
+            built = pickle.loads(pickle.dumps(worker_engine_factory(lease)))()
+        self.addCleanup(built.close)
+        self.assertIsInstance(built, SQLiteDB)
+        self.assertNotIsInstance(built, PooledEngineLease)
+        self.assertEqual(built.path, self.path)
+        with self.assertRaises(TypeError):
+            worker_engine_factory(42)
+
+    def test_init_worker_builds_standalone_engine_from_lease(self) -> None:
+        with self.factory() as lease, patch.dict(os.environ, {"DB_USER": "test"}), \
+                patch.object(crl.mp_util, "Finalize") as finalize:
+            crl._init_worker([], {}, {}, {}, worker_engine_factory(lease), 1, None, 0, 0)
+        w_db = crl._POOL_DATA["db"]
+        self.assertIsInstance(w_db, SQLiteDB)
+        self.assertNotIsInstance(w_db, PooledEngineLease)
+        self.assertEqual(w_db.path, self.path)
+        finalize.assert_called_once_with(None, crl._close_worker_db, exitpriority=10)
+        crl._close_worker_db()
+        self.assertNotIn("db", crl._POOL_DATA)
+        with self.assertRaises(ConnectionLostError):
+            w_db.select_values("m_file_name", "fname")
 
 
 class _NoDisk:

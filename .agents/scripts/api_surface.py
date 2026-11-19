@@ -32,7 +32,7 @@ SURFACES: dict[str, dict] = {
             "table: `db_engine/DB_API.md`. Method body: `python3 .agents/scripts/code_symbol.py <file.py> <Class.method>`."
         ),
         "entries": [
-            ("db_engine/__init__.py", ["register_engine", "available_engines", "default_socket_paths", "get_db_engine"], "all"),
+            ("db_engine/__init__.py", ["register_engine", "available_engines", "default_socket_paths", "get_db_engine", "worker_engine_factory"], "all"),
             ("db_engine/base.py", None, "all"),
             ("db_engine/pool.py", ["configure_pool", "get_db_reader", "PoolConfigError", "ReadAPI", "ReadSession"], "all"),
             ("db_engine/read_intents.py", None, "all"),

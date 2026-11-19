@@ -35,14 +35,14 @@ agents.
   - 8.1. High-Level Architecture [L1429-L1472]
   - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1473-L1498]
   - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1499-L1697]
-- 9. CVE List Ingestion (`parser/cve/`) [L1698-L1753]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1754-L1821]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1822-L1952]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1830-L1861]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1862-L1902]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1903-L1935]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1936-L1952]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1953-L1998]
+- 9. CVE List Ingestion (`parser/cve/`) [L1698-L1754]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1755-L1822]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1823-L1953]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1831-L1862]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1863-L1903]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1904-L1936]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1937-L1953]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1954-L1999]
 <!-- toc:end -->
 
 ---
@@ -1737,8 +1737,9 @@ webapp only reads them (`webapp/API_ENDPOINTS.md` §4.11).
   (`CVE_RELEASE_FORMAT = 1`), storing matching `(segment_id, cve_id) -> (state, basis, fixed_here)` rows in
   `m_cve_release` and each segment's evaluated `cve_head` (plus `tag_hash`, `cve_layout`, `cve_format`,
   `rel_format`, and `max_segment_id`, the repository's highest `m_release_segment.segment_id` at evaluation) in
-  `m_cve_release_state` inside batched atomic transactions (executed concurrently across worker connections when
-  the database engine supports `CAP_CONCURRENT_CONNECTIONS`). When `m_cve_source.head` advances
+  `m_cve_release_state` inside batched atomic transactions (executed concurrently by forked worker processes, each on
+  its own engine from `worker_engine_factory(db)`, when the database engine supports `CAP_CONCURRENT_CONNECTIONS`:
+  MariaDB, file-backed SQLite). When `m_cve_source.head` advances
   from `old_head` to `new_head`, `cve_releases.sync()` diffs `old_head..new_head` via `git diff --name-only`
   (plus any CVEs whose abbreviated commit prefixes were newly resolved, and, for a segment whose
   `max_segment_id` lies below the current highest segment, the CVEs whose commits or backports/`Fixes:` relations

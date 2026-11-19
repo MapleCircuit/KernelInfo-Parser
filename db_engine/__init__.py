@@ -7,6 +7,7 @@ Exports:
     - DBError / UnsupportedOperation: Neutral exceptions raised by drivers (`db_engine/errors.py`).
     - MockDB: Fast in-memory database driver for isolated unit testing.
     - get_db_engine: Factory function to retrieve engine class by name.
+    - worker_engine_factory: Standalone-engine constructor for worker processes (unwraps pool leases/factories).
 """
 from __future__ import annotations
 
@@ -216,6 +217,24 @@ def get_db_engine(name: str | None = None) -> type[BaseDBEngine]:
     return DB_ENGINES[key]
 
 
+def worker_engine_factory(db: Any) -> Any:
+    """Zero-argument constructor of a standalone engine on the same database as `db`, for a worker process.
+
+    `db` is an engine instance or a `PooledEngineLease` (its `BaseDBEngine.worker_factory()`: the engine class, or
+    e.g. a `SQLiteDB` bound to the same file), an engine class, or a `PooledEngineFactory` (its `engine_class`);
+    never a pool wrapper that needs constructor arguments. Picklable whenever the engine class is importable.
+    """
+    if PooledEngineFactory is not None and isinstance(db, PooledEngineFactory):
+        return worker_engine_factory(db.engine_class)
+    if isinstance(db, type):
+        return db
+    if isinstance(db, BaseDBEngine) or (PooledEngineLease is not None and isinstance(db, PooledEngineLease)):
+        return db.worker_factory()
+    if callable(db):
+        return db
+    raise TypeError(f"worker_engine_factory() needs a DB engine, engine class, lease or factory, not {type(db).__name__}")
+
+
 __all__ = [
     "PoolConfigError",
     "EnginePool",
@@ -289,6 +308,7 @@ __all__ = [
     "ReadSession",
     "get_db_reader",
     "get_db_engine",
+    "worker_engine_factory",
     "DB_ENGINES",
     "Source",
     "Where",

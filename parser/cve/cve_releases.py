@@ -16,9 +16,9 @@ Incremental refresh:
 """
 from __future__ import annotations
 
-import atexit
 import json
 import logging
+import multiprocessing
 import os
 import re
 import subprocess
@@ -29,11 +29,17 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from multiprocessing import util as mp_util
 from pathlib import Path
 from typing import Any
 
 from core.DBLayout import m_cve_release, m_cve_release_state
-from db_engine import CAP_CONCURRENT_CONNECTIONS, ConnectionLostError, DeadlockError
+from db_engine import (
+    CAP_CONCURRENT_CONNECTIONS,
+    ConnectionLostError,
+    DeadlockError,
+    worker_engine_factory,
+)
 from db_engine.spec import Agg, Join
 from parser.cve.cve_ingest import LAYOUTS, _ids_of, changed_paths
 from parser.cve.cve_records import HEXSHA, normalize_record_tuples, version_status
@@ -1074,7 +1080,9 @@ def _init_worker(
             from core.config import get_config, sync_environ
             sync_environ(get_config())
         _POOL_DATA["db"] = db_cls()
-        atexit.register(_close_worker_db)
+        # `multiprocessing` runs its finalizers when a worker exits cleanly on every Python version (plain `atexit`
+        # hooks of forked children only run from 3.14 on).
+        mp_util.Finalize(None, _close_worker_db, exitpriority=10)
 
 
 def _worker_eval(item: tuple[int, str]) -> tuple[int, list[tuple[str, int, int, int]]]:
@@ -1563,8 +1571,9 @@ def sync(
                     ]
                     with ProcessPoolExecutor(
                         max_workers=workers,
+                        mp_context=multiprocessing.get_context("fork"),
                         initializer=_init_worker,
-                        initargs=(slim_recs, lookup, ptags, rkeys, type(db), repo_id, src, built_at, max_sid),
+                        initargs=(slim_recs, lookup, ptags, rkeys, worker_engine_factory(db), repo_id, src, built_at, max_sid),
                     ) as pool:
                         for batch_stats in pool.map(_worker_eval_and_write_batch, batches, chunksize=1):
                             for seg_id, tag, n_rows in batch_stats:
@@ -1576,6 +1585,7 @@ def sync(
                     chunksize = max(1, min(16, len(items) // (workers * 4)))
                     with ProcessPoolExecutor(
                         max_workers=workers,
+                        mp_context=multiprocessing.get_context("fork"),
                         initializer=_init_worker,
                         initargs=(slim_recs, lookup, ptags, rkeys),
                     ) as pool:
@@ -1584,7 +1594,7 @@ def sync(
                             if len(pending_batch) >= _FULL_SEGMENT_BATCH:
                                 _flush_full_batch()
                     _flush_full_batch()
-            except (BrokenProcessPool, OSError, PermissionError):
+            except (BrokenProcessPool, OSError, PermissionError, ValueError):
                 pending_batch.clear()
                 use_pool = False
 
