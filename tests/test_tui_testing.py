@@ -40,7 +40,9 @@ _ML_LATEST = {
 }
 
 
-def _fake_ml_daemon(search: dict | None = None, message: dict | None = None, search_error: int | None = None):
+def _fake_ml_daemon(search: dict | None = None, message: dict | None = None, search_error: int | None = None,
+                    search_body: bytes = b'{"error": "Daemon is above its memory soft limit"}',
+                    search_timeout: bool = False):
     """urlopen side effect answering /health, /search and /message like the mailing list daemon."""
     import io
     import json
@@ -57,11 +59,12 @@ def _fake_ml_daemon(search: dict | None = None, message: dict | None = None, sea
     def _urlopen(req, timeout=None):
         url = req.full_url
         if "/health" in url:
-            return _resp({"status": "ok", "version": "1.4.6"})
+            return _resp({"status": "ok", "version": "1.4.8"})
         if "/search" in url:
+            if search_timeout:
+                raise TimeoutError("timed out")
             if search_error:
-                raise urllib.error.HTTPError(url, search_error, "err", {},
-                                             io.BytesIO(b'{"error": "Daemon is above its memory soft limit"}'))
+                raise urllib.error.HTTPError(url, search_error, "err", {}, io.BytesIO(search_body))
             return _resp(search if search is not None else {"results": [dict(_ML_LATEST)]})
         if "/message" in url:
             return _resp(message if message is not None else {"message": {"num": 7, "raw": "From: a@b\n\nbody"}})
@@ -613,6 +616,21 @@ class TestMailingListDiagnostic(unittest.TestCase):
         self.assertFalse(res.passed)
         self.assertIn("archive query failed (HTTP 503)", res.message)
         self.assertIn("memory soft limit", res.details)
+
+    @patch("urllib.request.urlopen")
+    def test_mailing_list_daemon_busy_timeout_not_verified(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _fake_ml_daemon(search_timeout=True)
+        res = test_mailing_list({"port": 8192})
+        self.assertTrue(res.passed)
+        self.assertIn("likely busy serving ingest", res.message)
+        self.assertIn("archive not verified", res.message)
+
+    @patch("urllib.request.urlopen")
+    def test_mailing_list_daemon_busy_503_not_verified(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _fake_ml_daemon(search_error=503, search_body=b'{"error": "Daemon is busy; retry shortly"}')
+        res = test_mailing_list({"port": 8192})
+        self.assertTrue(res.passed)
+        self.assertIn("busy serving ingest", res.message)
 
     def test_mailing_list_local_storage_not_an_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

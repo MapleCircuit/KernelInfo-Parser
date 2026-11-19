@@ -16,7 +16,7 @@ import urllib.parse
 import zlib
 
 from db_engine import DBError, ForeignReader, MissingTableError, open_foreign_sqlite
-from db_engine.spec import AnyOf, Hex, Join, gt, is_null, le
+from db_engine.spec import Hex, Join, gt, le
 from parser.mailing_list.ml_types import SmsgRecord
 
 try:
@@ -749,11 +749,14 @@ class PublicInboxLocalStore:
                     clean_q, limit=fetch, scan_limit=MAX_SEARCH_SCAN, offset=offset
                 )
             else:
-                # Empty query: recent messages ordered chronologically, future dates excluded
+                # Empty query: recent messages ordered chronologically, future dates excluded.
+                # A plain `ds <=` bound keeps the walk on `idx_ds` (newest first, stops at
+                # `limit`); adding `ds IS NULL OR` makes SQLite sort the whole 22M-row table
+                # (~20s). Only ghost rows (`num <= 0`) lack a `ds`, and `num > 0` drops them anyway.
                 try:
                     rows = self.over_db.select_rows(
                         "over", _OVER_COLS,
-                        [{"num": gt(0)}, AnyOf({"ds": is_null()}, {"ds": le(int(time.time()) + FUTURE_DATE_SKEW_SECONDS)})],
+                        [{"num": gt(0)}, {"ds": le(int(time.time()) + FUTURE_DATE_SKEW_SECONDS)}],
                         order_by=["-ds"], limit=fetch, offset=offset,
                     )
                     matched_records = [self._unpack_row(r) for r in rows]

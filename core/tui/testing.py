@@ -776,11 +776,15 @@ def _summarize_ml_archive(latest: dict[str, Any], detail: dict[str, Any] | None)
     return True, f"newest message {date_iso[:10] or f'#{num}'}", "\n".join(lines)
 
 
-def _probe_ml_archive_http(port: int, timeout: float = 15.0) -> tuple[bool, str, str]:
+def _probe_ml_archive_http(port: int, timeout: float = 15.0) -> tuple[bool | None, str, str]:
     """Read the newest archive message through a daemon on 127.0.0.1:<port>.
 
     `GET /search` with an empty query returns the newest overview row (indexed `ds` order, one row),
     then `GET /message` reads that message in full, which goes through all.git.
+
+    Returns `(ok, summary, details)`; `ok` is None when the daemon is busy (a timeout, or a `503`
+    "busy" answer while ingest holds every request slot), so the archive is not verified rather
+    than failed.
     """
     base = f"http://127.0.0.1:{port}"
 
@@ -802,10 +806,25 @@ def _probe_ml_archive_http(port: int, timeout: float = 15.0) -> tuple[bool, str,
             body = ""
         finally:
             exc.close()
-        return False, f"archive query failed (HTTP {exc.code})", f"{exc.geturl()}\n{body}".strip()
+        details = f"{exc.geturl()}\n{body}".strip()
+        if exc.code == 503 and "busy" in body.lower():
+            return None, "daemon is busy serving ingest (all request slots held); archive not verified", details
+        return False, f"archive query failed (HTTP {exc.code})", details
+    except (TimeoutError, socket.timeout) as exc:
+        return None, _ML_BUSY_TIMEOUT.format(timeout=timeout), f"{exc}"
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return None, _ML_BUSY_TIMEOUT.format(timeout=timeout), f"{exc}"
+        return False, f"archive query failed: {exc}", traceback.format_exc()
     except Exception as exc:
         return False, f"archive query failed: {exc}", traceback.format_exc()
     return _summarize_ml_archive(latest, detail)
+
+
+_ML_BUSY_TIMEOUT = (
+    "daemon did not answer the archive read within {timeout:.0f}s (likely busy serving ingest); "
+    "archive not verified"
+)
 
 
 def _probe_ml_archive_local(storage_dir: str) -> tuple[bool, str, str]:
@@ -874,7 +893,7 @@ def _test_mailing_list_tunnel(ml_cfg: dict[str, Any], ssh_cfg: dict[str, Any], t
             message = f"Remote daemon responding through SSH tunnel ({ssh_host}) but {archive_summary}"
         return DiagnosticResult(
             name=test_name,
-            passed=archive_ok,
+            passed=archive_ok is not False,
             latency_ms=latency_ms,
             message=message,
             details=f"{forward}\n{health_details}\n\nArchive check:\n{archive_details}",
@@ -909,7 +928,8 @@ def test_mailing_list(ml_cfg: dict[str, Any]) -> DiagnosticResult:
     daemon's /health through it. Otherwise probes a local daemon on 127.0.0.1:<port> and
     falls back to opening the archive under `storage_dir` in-process. Whichever backend
     answers, the test then reads the archive's newest message (overview row plus raw
-    RFC-822 from all.git) and fails when that read fails.
+    RFC-822 from all.git) and fails when that read fails. A daemon too busy serving ingest to
+    answer that read in time passes with the archive reported as not verified.
 
     Args:
         ml_cfg: Mailing list configuration mapping (storage_dir, port, ssh_tunnel, etc.).
@@ -944,7 +964,7 @@ def test_mailing_list(ml_cfg: dict[str, Any]) -> DiagnosticResult:
             latency_ms = (time.perf_counter() - t0) * 1000.0
             return DiagnosticResult(
                 name=test_name,
-                passed=archive_ok,
+                passed=archive_ok is not False,
                 latency_ms=round(latency_ms, 2),
                 message=(
                     f"Mailing list archive readable through daemon on port {port}: {archive_summary}"

@@ -32,7 +32,7 @@ from parser.mailing_list.ml_types import (
 logger = logging.getLogger(__name__)
 
 
-DAEMON_VERSION = "1.4.6"
+DAEMON_VERSION = "1.4.8"
 
 # Total seconds to wait for a freshly launched remote daemon to report healthy
 DAEMON_START_TIMEOUT = 30.0
@@ -43,6 +43,43 @@ DAEMON_START_ATTEMPTS = 2
 LOCK_HOLD_SECONDS = 5
 # Seconds a contending startup waits for that lock before giving up (must exceed the hold)
 LOCK_WAIT_SECONDS = 8
+# A running daemon of another version is replaced only once no client has used it for
+# this long (no request in flight). A daemon in use, or one newer than this client, is
+# reused as-is so one machine's start never kills the daemon another machine is querying.
+DAEMON_IDLE_RESTART_SECONDS = 120
+# Log the remote daemon writes; its mtime is the activity signal for daemons older than
+# 1.4.8, whose /health does not report `idle_s`.
+REMOTE_DAEMON_LOG = "/tmp/ml_server.log"
+
+
+def _version_tuple(version: Any) -> tuple[int, ...]:
+    """`"1.4.8"` -> `(1, 4, 8)`; an unparsable version sorts before every real one."""
+    try:
+        return tuple(int(part) for part in str(version).split("."))
+    except (TypeError, ValueError):
+        return ()
+
+
+def daemon_reuse_reason(health: dict[str, Any] | None) -> str | None:
+    """Why a responding daemon must be kept rather than replaced, or None if it may be replaced.
+
+    Kept: the current version, a newer version, or an older one still in use (a request
+    in flight or `idle_s` under `DAEMON_IDLE_RESTART_SECONDS`). Returns None for no daemon
+    and for an outdated daemon that reports itself idle. A daemon without `idle_s` (older
+    than 1.4.8) yields `"unknown"`: only the remote host can judge it (log mtime).
+    """
+    if not health:
+        return None
+    version = str(health.get("version") or "")
+    if version == DAEMON_VERSION:
+        return "current"
+    if _version_tuple(version) > _version_tuple(DAEMON_VERSION):
+        return "newer"
+    if health.get("idle_s") is None:
+        return "unknown"
+    if int(health.get("in_flight") or 0) > 0 or float(health["idle_s"]) < DAEMON_IDLE_RESTART_SECONDS:
+        return "in use"
+    return None
 
 
 def _build_remote_daemon_bundle(repo_root: Path) -> bytes:
@@ -70,43 +107,6 @@ def _build_remote_daemon_bundle(repo_root: Path) -> bytes:
     return buf.getvalue()
 
 
-def _sync_remote_daemon_code(
-    repo_root: Path,
-    target: str,
-    ssh_port: int,
-    key_path: str | None = None,
-) -> bool:
-    """Sync remote daemon runtime modules (`parser/mailing_list`, `db_engine`, `core`) over SSH."""
-    try:
-        bundle = _build_remote_daemon_bundle(repo_root)
-        ssh_cmd = ["ssh", "-p", str(ssh_port), "-o", "BatchMode=yes"]
-        if key_path:
-            ssh_cmd.extend(["-i", key_path])
-        remote_extract = (
-            "mkdir -p ~/KernelInfo-Parser && "
-            "rm -rf ~/KernelInfo-Parser/parser/mailing_list/__pycache__ "
-            "~/KernelInfo-Parser/db_engine/__pycache__ "
-            "~/KernelInfo-Parser/core/__pycache__ && "
-            "tar -xzf - -C ~/KernelInfo-Parser"
-        )
-        ssh_cmd.extend([target, remote_extract])
-        res = subprocess.run(
-            ssh_cmd,
-            input=bundle,
-            timeout=20,
-            capture_output=True,
-            check=False,
-        )
-        if res.returncode != 0:
-            err = (res.stderr or res.stdout or b"").decode("utf-8", errors="replace").strip()
-            logger.warning("Remote daemon code sync failed (exit %d): %s", res.returncode, err or "unknown error")
-            return False
-        return True
-    except Exception as exc:
-        logger.warning("Remote daemon code sync failed: %s", exc)
-        return False
-
-
 class MailingListClient:
     """Client for resolving kernel commits to mailing list emails."""
 
@@ -114,6 +114,7 @@ class MailingListClient:
     DAEMON_START_ATTEMPTS = DAEMON_START_ATTEMPTS
     LOCK_HOLD_SECONDS = LOCK_HOLD_SECONDS
     LOCK_WAIT_SECONDS = LOCK_WAIT_SECONDS
+    DAEMON_IDLE_RESTART_SECONDS = DAEMON_IDLE_RESTART_SECONDS
 
     def __init__(
         self,
@@ -184,26 +185,47 @@ class MailingListClient:
                     "Ensure the daemon is running on the remote host or enable 'auto_start_daemon'."
                 )
 
-    def _check_health(self, timeout: float = 2.0) -> bool:
-        """Check if daemon is responding to /health on 127.0.0.1:<effective_port>."""
+    def _probe_health(self, timeout: float = 2.0) -> dict[str, Any] | None:
+        """GET /health on 127.0.0.1:<effective_port>; the decoded payload, or None if no daemon answers."""
         url = f"http://127.0.0.1:{self._effective_port}/health"
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
-                    return data.get("status") == "ok" and data.get("version") == DAEMON_VERSION
+                    if isinstance(data, dict) and data.get("status") == "ok":
+                        return data
         except Exception:
-            return False
-        return False
+            return None
+        return None
+
+    def _check_health(self, timeout: float = 2.0) -> bool:
+        """True if a daemon (of any version) answers /health on 127.0.0.1:<effective_port>."""
+        return self._probe_health(timeout) is not None
 
     def _ensure_remote_daemon_running(self) -> None:
-        """Probe remote daemon health; if inactive, sync package and launch remotely via SSH."""
-        if self._check_health(timeout=1.5):
-            logger.info("Mailing list daemon is healthy on port %d", self._effective_port)
+        """Make sure a remote daemon answers, starting one only when none is usable.
+
+        A responding daemon is reused when it runs this client's version, a newer one, or
+        an older one other clients are still using (`daemon_reuse_reason`). Only when no
+        daemon answers, or an outdated one has been idle for `DAEMON_IDLE_RESTART_SECONDS`,
+        does a single SSH call ship the code bundle and (re)launch it; the remote side
+        repeats that judgement under its lock, so a decision raced by another worker or by
+        resumed traffic still never stops a daemon in use.
+        """
+        health = self._probe_health(timeout=1.5)
+        reason = daemon_reuse_reason(health)
+        if reason is not None and reason != "unknown":
+            self._log_reused_daemon(health or {}, reason)
             return
 
-        logger.info("Remote mailing list daemon not reachable on port %d; attempting remote startup...", self._effective_port)
+        if health is None:
+            logger.info("Remote mailing list daemon not reachable on port %d; attempting remote startup...", self._effective_port)
+        else:
+            logger.info(
+                "Remote mailing list daemon on port %d runs version %s (client %s); replacing it if no client uses it...",
+                self._effective_port, health.get("version"), DAEMON_VERSION,
+            )
         host = self.tunnel_cfg.get("host", "")
         ssh_port = self.tunnel_cfg.get("port", 22)
         user = self.tunnel_cfg.get("user", "")
@@ -215,83 +237,41 @@ class MailingListClient:
 
         target = f"{user}@{host}" if user else host
         key_path = str(Path(os.path.expanduser(key_file)).resolve()) if key_file else None
-
-        # 1. Sync parser/mailing_list, db_engine, and core modules to remote host cleanly
         repo_root = Path(__file__).resolve().parents[2]
-        _sync_remote_daemon_code(repo_root, target, int(ssh_port), key_path)
+        bundle = _build_remote_daemon_bundle(repo_root)
 
-        # 2. Restart the daemon, idempotently and race-free:
-        #    - The advisory lock on fd 9 serializes concurrent startups from parser
-        #      workers, and is held for LOCK_HOLD_SECONDS past the launch so a worker
-        #      arriving a moment later cannot kill the daemon that was just launched.
-        #      A contending worker waits for the lock (LOCK_WAIT_SECONDS) rather than
-        #      giving up, then finds the new daemon healthy and returns without killing
-        #      it. The daemon itself is launched with `9>&-` so it does not inherit the
-        #      lock fd and hold the lock for its whole lifetime, which would silently
-        #      block every later restart.
-        #    - The health pre-check makes a redundant restart a no-op. It retries, so a
-        #      momentarily busy daemon is never mistaken for a dead one and killed out
-        #      from under another worker's in-flight query.
-        #    - Only the process owning the LISTENING socket is stopped (SIGTERM, then
-        #      SIGKILL if it lingers). `fuser -k <port>/tcp` must not be used: it also
-        #      kills every process merely *connected* to the port, including the sshd
-        #      serving other workers' tunnels, which tears down their queries. A
-        #      `pkill -f` on the module path is equally unusable, as it matches this
-        #      startup shell's own command line.
-        #    - The listening socket is drained before binding so a killed predecessor
-        #      cannot cause EADDRINUSE (the daemon also retries the bind).
-        health_probe = (
-            "import json,sys,time,urllib.request;"
-            "ok=0\n"
-            "for _ in range(3):\n"
-            "    try:\n"
-            f"        d=json.load(urllib.request.urlopen('http://127.0.0.1:{remote_port}/health',timeout=5))\n"
-            f"        ok=1 if d.get('version')=='{DAEMON_VERSION}' else 0\n"
-            "        break\n"
-            "    except Exception:\n"
-            "        time.sleep(1)\n"
-            "sys.exit(0 if ok else 1)"
-        )
-        lock_file = f"/tmp/ml_server.{remote_port}.lock"
-        listen_pids = (
-            f"ss -ltnpH sport = :{remote_port} 2>/dev/null "
-            f"| grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u"
-        )
-        remote_script = (
-            f"exec 9>{lock_file} || exit 0; "
-            f"flock -w {self.LOCK_WAIT_SECONDS} 9 || exit 0; "
-            f"if printf '%s' {shlex.quote(health_probe)} | python3 - >/dev/null 2>&1; then exit 0; fi; "
-            f"for p in $({listen_pids}); do kill $p >/dev/null 2>&1 || true; done; "
-            f"for i in $(seq 1 20); do "
-            f"[ -z \"$({listen_pids})\" ] && break; sleep 0.25; done; "
-            f"for p in $({listen_pids}); do kill -9 $p >/dev/null 2>&1 || true; done; "
-            f"for i in $(seq 1 20); do "
-            f"[ -z \"$({listen_pids})\" ] && break; sleep 0.25; done; "
-            f"cd ~/KernelInfo-Parser || exit 1; "
-            f"nohup python3 -m parser.mailing_list.ml_server --storage-dir \"{self.storage_dir}\" "
-            f"--port {remote_port} --max-rss-mb {self.daemon_max_rss_mb} "
-            f"--max-concurrent {self.daemon_max_concurrent} "
-            f">/tmp/ml_server.log 2>&1 </dev/null 9>&- & "
-            f"sleep {self.LOCK_HOLD_SECONDS}"
-        )
-        cmd = ["ssh", "-f", "-n", "-p", str(ssh_port), "-o", "BatchMode=yes"]
+        cmd = ["ssh", "-p", str(ssh_port), "-o", "BatchMode=yes"]
         if key_path:
             cmd.extend(["-i", key_path])
-        cmd.extend([target, remote_script])
+        cmd.extend([target, self._remote_start_script(int(remote_port))])
+        ssh_timeout = self.LOCK_WAIT_SECONDS + self.LOCK_HOLD_SECONDS + 40
 
-        # 3. Launch and wait for health. A launch that another starter's lock skipped is
-        #    retried, so the client never gives up on a merely contended startup.
+        # Launch and wait for health. A launch that another starter's lock skipped is
+        # retried, so the client never gives up on a merely contended startup.
         attempt_wait = self.DAEMON_START_TIMEOUT / self.DAEMON_START_ATTEMPTS
         for attempt in range(1, self.DAEMON_START_ATTEMPTS + 1):
+            outcome = ""
             try:
-                subprocess.run(cmd, timeout=6, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                res = subprocess.run(cmd, input=bundle, timeout=ssh_timeout, capture_output=True, check=False)
+                out_lines = (res.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
+                outcome = out_lines[-1].strip() if out_lines else ""
+                if res.returncode != 0:
+                    err = (res.stderr or b"").decode("utf-8", errors="replace").strip()
+                    logger.warning("Remote daemon startup exited %d: %s", res.returncode, err or outcome or "no output")
             except Exception as exc:
                 logger.warning("Remote daemon startup command failed: %s", exc)
+
+            if outcome.startswith("KEEP"):
+                kept = self._probe_health(timeout=5.0)
+                if kept is not None:
+                    self._log_reused_daemon(kept, outcome[4:].strip(" :") or "in use")
+                    return
 
             start_t = time.time()
             while time.time() - start_t < attempt_wait:
                 time.sleep(0.5)
-                if self._check_health(timeout=2.0):
+                current = self._probe_health(timeout=2.0)
+                if current is not None and (outcome.startswith("KEEP") or current.get("version") == DAEMON_VERSION):
                     logger.info("Remote mailing list daemon successfully initialized on port %d!", self._effective_port)
                     return
             if attempt < self.DAEMON_START_ATTEMPTS:
@@ -302,21 +282,110 @@ class MailingListClient:
                     self.DAEMON_START_ATTEMPTS,
                 )
 
+        # An outdated daemon that still answers is better than none.
+        fallback = self._probe_health(timeout=2.0)
+        if fallback is not None:
+            self._log_reused_daemon(fallback, "replacement did not come up")
+            return
+
         # Fetch remote log tail if startup timed out
         remote_log = ""
         try:
             log_cmd = ["ssh", "-p", str(ssh_port), "-o", "BatchMode=yes"]
             if key_path:
                 log_cmd.extend(["-i", key_path])
-            log_cmd.extend([target, "tail -n 10 /tmp/ml_server.log 2>/dev/null"])
+            log_cmd.extend([target, f"tail -n 10 {REMOTE_DAEMON_LOG} 2>/dev/null"])
             log_res = subprocess.run(log_cmd, timeout=5, capture_output=True, text=True, check=False)
             if log_res.stdout.strip():
-                remote_log = f"\nRemote log (/tmp/ml_server.log):\n{log_res.stdout.strip()}"
+                remote_log = f"\nRemote log ({REMOTE_DAEMON_LOG}):\n{log_res.stdout.strip()}"
         except Exception:
             pass
 
         raise ConnectionError(
             f"Remote mailing list daemon could not be reached on {target}:{remote_port} via port {self._effective_port}.{remote_log}"
+        )
+
+    def _log_reused_daemon(self, health: dict[str, Any], reason: str) -> None:
+        version = health.get("version")
+        if version == DAEMON_VERSION:
+            logger.info("Mailing list daemon is healthy on port %d", self._effective_port)
+        else:
+            logger.warning(
+                "Reusing mailing list daemon %s on port %d (client %s): %s; it is replaced once idle "
+                "for %ds.",
+                version, self._effective_port, DAEMON_VERSION, reason, self.DAEMON_IDLE_RESTART_SECONDS,
+            )
+
+    def _remote_start_script(self, remote_port: int) -> str:
+        """Shell run on the archive host: keep a usable daemon, else unpack the bundle (stdin) and launch.
+
+        - The advisory lock on fd 9 serializes concurrent startups from parser workers, and is
+          held for LOCK_HOLD_SECONDS past the launch so a worker arriving a moment later finds
+          the new daemon instead of starting another. A contending worker waits for the lock
+          (LOCK_WAIT_SECONDS). The daemon is launched with `9>&-` so it does not inherit the
+          lock fd and hold the lock for its whole lifetime, which would block every later start.
+        - The probe inside the lock retries /health, so a momentarily busy daemon is never
+          mistaken for a dead one, and keeps (prints `KEEP <reason>`, exit 0) a daemon that runs
+          this or a newer version, or an older one with a request in flight or used within
+          DAEMON_IDLE_RESTART_SECONDS (`idle_s`, else the daemon log's mtime). Only a missing,
+          hung, or idle outdated daemon is replaced, and the code bundle is unpacked only then,
+          so a running daemon never lazily imports a newer module.
+        - Only the process owning the LISTENING socket is stopped (SIGTERM, then SIGKILL if it
+          lingers). `fuser -k <port>/tcp` must not be used: it also kills every process merely
+          *connected* to the port, including the sshd serving other workers' tunnels. A
+          `pkill -f` on the module path is equally unusable, as it matches this shell's own
+          command line. The listening socket is drained before binding so a killed predecessor
+          cannot cause EADDRINUSE (the daemon also retries the bind).
+        """
+        probe = (
+            "import json,os,sys,time,urllib.request\n"
+            f"ours={_version_tuple(DAEMON_VERSION)!r}\n"
+            "d=None\n"
+            "for _ in range(3):\n"
+            "    try:\n"
+            f"        d=json.load(urllib.request.urlopen('http://127.0.0.1:{remote_port}/health',timeout=5)); break\n"
+            "    except Exception:\n"
+            "        time.sleep(1)\n"
+            "if not isinstance(d,dict): sys.exit(1)\n"
+            "v=str(d.get('version',''))\n"
+            "try: vt=tuple(int(x) for x in v.split('.'))\n"
+            "except ValueError: vt=()\n"
+            "if vt==ours: print('KEEP current'); sys.exit(0)\n"
+            "if vt>ours: print('KEEP newer version '+v); sys.exit(0)\n"
+            "idle=d.get('idle_s')\n"
+            "if idle is None:\n"
+            f"    try: idle=time.time()-os.path.getmtime({REMOTE_DAEMON_LOG!r})\n"
+            "    except OSError: idle=1e9\n"
+            f"if int(d.get('in_flight') or 0)>0 or float(idle)<{self.DAEMON_IDLE_RESTART_SECONDS}:\n"
+            "    print('KEEP in use (version %s, idle %.0fs)'%(v,float(idle))); sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        lock_file = f"/tmp/ml_server.{remote_port}.lock"
+        listen_pids = (
+            f"ss -ltnpH sport = :{remote_port} 2>/dev/null "
+            f"| grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u"
+        )
+        return (
+            f"exec 9>{lock_file} || {{ cat >/dev/null; exit 1; }}; "
+            f"flock -w {self.LOCK_WAIT_SECONDS} 9 || {{ cat >/dev/null; echo LOCKED; exit 0; }}; "
+            f"if keep=$(printf '%s' {shlex.quote(probe)} | python3 - 2>/dev/null); then "
+            f"cat >/dev/null; echo \"$keep\"; exit 0; fi; "
+            f"mkdir -p ~/KernelInfo-Parser && "
+            f"rm -rf ~/KernelInfo-Parser/parser/mailing_list/__pycache__ "
+            f"~/KernelInfo-Parser/db_engine/__pycache__ ~/KernelInfo-Parser/core/__pycache__ && "
+            f"tar -xzf - -C ~/KernelInfo-Parser || exit 1; "
+            f"for p in $({listen_pids}); do kill $p >/dev/null 2>&1 || true; done; "
+            f"for i in $(seq 1 20); do "
+            f"[ -z \"$({listen_pids})\" ] && break; sleep 0.25; done; "
+            f"for p in $({listen_pids}); do kill -9 $p >/dev/null 2>&1 || true; done; "
+            f"for i in $(seq 1 20); do "
+            f"[ -z \"$({listen_pids})\" ] && break; sleep 0.25; done; "
+            f"cd ~/KernelInfo-Parser || exit 1; "
+            f"nohup python3 -m parser.mailing_list.ml_server --storage-dir {shlex.quote(str(self.storage_dir))} "
+            f"--port {remote_port} --max-rss-mb {self.daemon_max_rss_mb} "
+            f"--max-concurrent {self.daemon_max_concurrent} "
+            f">{REMOTE_DAEMON_LOG} 2>&1 </dev/null 9>&- & "
+            f"sleep {self.LOCK_HOLD_SECONDS}; echo STARTED"
         )
 
     MAX_CHUNK_ATTEMPTS = 3

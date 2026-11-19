@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import MagicMock
 import urllib.request
 import zlib
 from http.server import HTTPServer, ThreadingHTTPServer
@@ -239,6 +240,14 @@ class TestPublicInboxLocalStore(unittest.TestCase):
         nums = sorted(r["num"] for r in found["results"])
         self.assertEqual(nums, [9, 10])
         self.assertEqual(found["total"], 2)
+
+    def test_empty_query_browse_skips_ghosts(self):
+        """Ghost rows (num <= 0) carry no ds; the browse filter (`ds <=`, index-driven) drops them."""
+        conn = create_foreign_sqlite(self.storage_dir / "over.sqlite3")
+        conn.insert_rows("over", OVER_COLUMNS, [(-3, 10, None, None, None, zlib.compress(b"ghost"))])
+        conn.close()
+        found = self.store.search_emails(query="", limit=50)
+        self.assertEqual(sorted(r["num"] for r in found["results"]), [9, 10])
 
     def test_explicit_query_still_finds_future_dated(self):
         self._insert_future_dated_message()
@@ -1013,6 +1022,59 @@ class TestBlobQueryConstruction(unittest.TestCase):
         self.assertEqual(rest[1], "FIRST")
 
 
+class TestDaemonLightBrowse(unittest.TestCase):
+    """An empty-query /search (newest messages) must not queue behind ingest's heavy requests."""
+
+    def test_is_heavy_request_classification(self):
+        from parser.mailing_list.ml_server import LIGHT_BROWSE_MAX_OFFSET, is_heavy_request
+
+        self.assertFalse(is_heavy_request("/search", {"q": "", "limit": "1"}))
+        self.assertFalse(is_heavy_request("/search", {"q": "  ", "offset": str(LIGHT_BROWSE_MAX_OFFSET)}))
+        self.assertTrue(is_heavy_request("/search", {"q": "", "offset": str(LIGHT_BROWSE_MAX_OFFSET + 1)}))
+        self.assertTrue(is_heavy_request("/search", {"q": "", "offset": "bogus"}))
+        self.assertTrue(is_heavy_request("/search", {"q": "s:fix"}))
+        self.assertTrue(is_heavy_request("/search", None))
+        self.assertTrue(is_heavy_request("/resolve_batch", {"q": ""}))
+        self.assertFalse(is_heavy_request("/message", {"num": "7"}))
+        self.assertFalse(is_heavy_request("/health"))
+
+    def test_browse_answers_while_all_slots_are_held(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        store = MagicMock()
+        store.search_emails.return_value = {"results": [{"num": 7}], "total": 1}
+
+        class Handler(MLServerRequestHandler):
+            resolver = MagicMock(store=store)
+            memory_guard = None
+            request_slots = threading.BoundedSemaphore(1)
+
+            def log_message(self, format, *args):
+                pass
+
+        Handler.request_slots.acquire()  # ingest holds every slot
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            with urllib.request.urlopen(f"{base}/search?q=&limit=1", timeout=5) as resp:
+                self.assertEqual(_json.loads(resp.read())["results"][0]["num"], 7)
+            req = urllib.request.Request(
+                f"{base}/search", data=_json.dumps({"q": "", "limit": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(_json.loads(resp.read())["results"][0]["num"], 7)
+        finally:
+            server.shutdown()
+            server.server_close()
+            Handler.request_slots.release()
+
+
 class TestDaemonMemoryGuard(unittest.TestCase):
     """The daemon must refuse work rather than become the host's OOM victim."""
 
@@ -1387,24 +1449,130 @@ class TestRemoteDaemonBundle(unittest.TestCase):
                 )
                 self.assertEqual(res.returncode, 0, f"Isolated import failed:\n{res.stderr}\n{res.stdout}")
 
-    def test_sync_remote_daemon_code_pipes_bundle_over_ssh(self) -> None:
+
+class TestDaemonReuse(unittest.TestCase):
+    """Auto-start opens a daemon only when none is usable and never stops one in use."""
+
+    def _client(self):
         from unittest import mock
-        from parser.mailing_list.ml_client import _sync_remote_daemon_code
+        from parser.mailing_list.ml_client import MailingListClient
 
-        repo_root = Path(__file__).resolve().parents[1]
-        with mock.patch("parser.mailing_list.ml_client.subprocess.run") as mock_run:
-            mock_run.return_value = mock.MagicMock(returncode=0, stdout=b"", stderr=b"")
-            ok = _sync_remote_daemon_code(repo_root, "user@example", 2222, "/tmp/id_ed25519")
+        with mock.patch.object(MailingListClient, "_init_backend"):
+            client = MailingListClient(config={"storage_dir": "/srv/lore"})
+        client.tunnel_cfg = {"host": "lore", "port": 22, "user": "u", "remote_port": 8192}
+        client.DAEMON_START_TIMEOUT = 1.0
+        return client
 
-        self.assertTrue(ok)
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args.args[0]
-        kwargs = mock_run.call_args.kwargs
-        self.assertEqual(cmd[:5], ["ssh", "-p", "2222", "-o", "BatchMode=yes"])
-        self.assertIn("user@example", cmd)
+    def test_reuse_reason(self):
+        from parser.mailing_list.ml_client import DAEMON_IDLE_RESTART_SECONDS, DAEMON_VERSION, daemon_reuse_reason
+
+        self.assertIsNone(daemon_reuse_reason(None))
+        self.assertEqual(daemon_reuse_reason({"version": DAEMON_VERSION}), "current")
+        self.assertEqual(daemon_reuse_reason({"version": "99.0.0"}), "newer")
+        self.assertEqual(daemon_reuse_reason({"version": "1.0.0"}), "unknown")
+        self.assertEqual(daemon_reuse_reason({"version": "1.0.0", "in_flight": 1, "idle_s": 999}), "in use")
+        self.assertEqual(daemon_reuse_reason({"version": "1.0.0", "in_flight": 0, "idle_s": 5}), "in use")
+        self.assertIsNone(daemon_reuse_reason(
+            {"version": "1.0.0", "in_flight": 0, "idle_s": DAEMON_IDLE_RESTART_SECONDS + 1}))
+
+    def test_in_use_outdated_daemon_is_reused_without_ssh(self):
+        from unittest import mock
+
+        client = self._client()
+        health = {"status": "ok", "version": "1.0.0", "in_flight": 2, "idle_s": 0.0}
+        with mock.patch.object(client, "_probe_health", return_value=health), \
+                mock.patch("parser.mailing_list.ml_client.subprocess.run") as run:
+            client._ensure_remote_daemon_running()
+        run.assert_not_called()
+
+    def test_missing_daemon_ships_bundle_and_starts(self):
+        from unittest import mock
+        from parser.mailing_list.ml_client import DAEMON_VERSION
+
+        client = self._client()
+        probes = iter([None, {"status": "ok", "version": DAEMON_VERSION}])
+        with mock.patch.object(client, "_probe_health", side_effect=lambda timeout=2.0: next(probes)), \
+                mock.patch("parser.mailing_list.ml_client.time.sleep"), \
+                mock.patch("parser.mailing_list.ml_client.subprocess.run") as run:
+            run.return_value = mock.MagicMock(returncode=0, stdout=b"STARTED\n", stderr=b"")
+            client._ensure_remote_daemon_running()
+        run.assert_called_once()
+        cmd, kwargs = run.call_args.args[0], run.call_args.kwargs
+        self.assertEqual(cmd[:4], ["ssh", "-p", "22", "-o"])
+        self.assertNotIn("-f", cmd)
+        self.assertIn("u@lore", cmd)
         self.assertIn("tar -xzf - -C ~/KernelInfo-Parser", cmd[-1])
         self.assertIsInstance(kwargs["input"], bytes)
         self.assertGreater(len(kwargs["input"]), 1024)
+
+    def test_remote_keep_answer_reuses_daemon(self):
+        from unittest import mock
+
+        client = self._client()
+        old = {"status": "ok", "version": "1.0.0"}  # no idle_s: the remote host judges it
+        with mock.patch.object(client, "_probe_health", return_value=old), \
+                mock.patch("parser.mailing_list.ml_client.subprocess.run") as run:
+            run.return_value = mock.MagicMock(returncode=0, stdout=b"KEEP in use (version 1.0.0, idle 3s)\n", stderr=b"")
+            client._ensure_remote_daemon_running()
+        run.assert_called_once()
+
+    def test_remote_probe_keeps_in_use_and_replaces_idle(self):
+        """Run the remote probe script against a fake /health."""
+        import re
+        import subprocess
+        import sys
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import json as _json
+
+        payload = {}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = _json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
+            script = self._client()._remote_start_script(port)
+            probe = re.search(r"if keep=\$\(printf '%s' ('.*?') \| python3 -", script, re.S).group(1)
+            import shlex
+            probe_src = shlex.split(probe)[0]
+
+            def run_probe(p):
+                payload.clear()
+                payload.update(p)
+                return subprocess.run([sys.executable, "-I", "-c", probe_src], capture_output=True, text=True, timeout=30)
+
+            busy = run_probe({"status": "ok", "version": "1.0.0", "in_flight": 1, "idle_s": 0})
+            self.assertEqual(busy.returncode, 0)
+            self.assertIn("KEEP in use", busy.stdout)
+            idle = run_probe({"status": "ok", "version": "1.0.0", "in_flight": 0, "idle_s": 10_000})
+            self.assertEqual(idle.returncode, 1)
+            newer = run_probe({"status": "ok", "version": "99.0"})
+            self.assertIn("KEEP newer", newer.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_health_reports_activity(self):
+        from parser.mailing_list.ml_server import ActivityTracker
+
+        tracker = ActivityTracker()
+        tracker.begin()
+        self.assertEqual(tracker.snapshot()[0], 1)
+        tracker.end()
+        in_flight, idle = tracker.snapshot()
+        self.assertEqual(in_flight, 0)
+        self.assertLess(idle, 5)
 
 
 if __name__ == "__main__":

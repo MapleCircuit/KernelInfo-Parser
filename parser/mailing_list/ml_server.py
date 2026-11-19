@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("ml_server")
 
 
-DAEMON_VERSION = "1.4.6"
+DAEMON_VERSION = "1.4.8"
 
 # Seconds to keep retrying the listen bind while a killed predecessor releases the port.
 # Kept short so a daemon that loses the race exits instead of lingering and later
@@ -59,6 +59,24 @@ THREAD_STACK_BYTES = 512 * 1024
 WATCHDOG_INTERVAL_SECONDS = 1.0
 
 HEAVY_PATHS = ("/resolve_batch", "/resolve_commit", "/search", "/thread")
+# An empty-query `/search` near the top of the listing is one indexed `over` read
+# (`ORDER BY ds DESC LIMIT n`, no Xapian), so it bypasses the request slots: it must
+# stay answerable while ingest holds every slot with long `/resolve_batch` calls.
+LIGHT_BROWSE_MAX_OFFSET = 1000
+
+
+def is_heavy_request(path: str, params: dict[str, Any] | None = None) -> bool:
+    """Whether a request takes a heavy-request slot (`HEAVY_PATHS`, minus light browse reads)."""
+    if path not in HEAVY_PATHS:
+        return False
+    if path == "/search" and params is not None:
+        try:
+            offset = int(params.get("offset", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if not str(params.get("q", "") or "").strip() and offset <= LIGHT_BROWSE_MAX_OFFSET:
+            return False
+    return True
 
 
 def current_rss_mb() -> float:
@@ -176,8 +194,38 @@ class MemoryGuard:
         threading.Thread(target=_loop, name="memory-watchdog", daemon=True).start()
 
 
+class ActivityTracker:
+    """Counts in-flight client requests and when the last one finished.
+
+    `/health` reports it (`in_flight`, `idle_s`) so a starting client can tell whether
+    other clients are still using this daemon before it replaces an outdated one.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self._last = time.monotonic()
+
+    def begin(self) -> None:
+        with self._lock:
+            self._in_flight += 1
+            self._last = time.monotonic()
+
+    def end(self) -> None:
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._last = time.monotonic()
+
+    def snapshot(self) -> tuple[int, float]:
+        """(requests in flight, seconds since the last request began or finished)."""
+        with self._lock:
+            return self._in_flight, max(0.0, time.monotonic() - self._last)
+
+
 class MLServerRequestHandler(BaseHTTPRequestHandler):
     """Handles HTTP health, batch resolution, thread, and email search requests."""
+
+    activity = ActivityTracker()
 
     @property
     def resolver(self) -> KernelCommitEmailResolver:
@@ -243,13 +291,23 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         import urllib.parse
-        heavy = urllib.parse.urlparse(self.path).path in HEAVY_PATHS
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+        tracked = path not in ("/health", "/")
+        if tracked:
+            self.activity.begin()
+        try:
+            self._handle_get(path, qs)
+        finally:
+            if tracked:
+                self.activity.end()
+
+    def _handle_get(self, path: str, qs: dict[str, list[str]]) -> None:
+        heavy = is_heavy_request(path, {k: v[0] for k, v in qs.items() if v})
         if heavy and not self._admit():
             return
         try:
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
-            qs = urllib.parse.parse_qs(parsed.query)
 
             store = getattr(self.resolver, "store", None)
 
@@ -259,6 +317,7 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
                 shards = int(getattr(store, "shard_count", 0)) if store else 0
                 guard = self.guard
                 rss_now = guard.observe() if guard else current_rss_mb()
+                in_flight, idle_s = self.activity.snapshot()
                 self._send_json(
                     200,
                     {
@@ -271,6 +330,8 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
                         "rss_mb": round(rss_now, 1),
                         "peak_rss_mb": round(guard.peak_mb, 1) if guard else None,
                         "max_rss_mb": round(guard.max_rss_mb, 1) if guard else None,
+                        "in_flight": in_flight,
+                        "idle_s": round(idle_s, 1),
                     },
                 )
             elif path == "/message":
@@ -331,6 +392,13 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
     MAX_REQUEST_BYTES = 64 << 20
 
     def do_POST(self) -> None:
+        self.activity.begin()
+        try:
+            self._handle_post()
+        finally:
+            self.activity.end()
+
+    def _handle_post(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length <= 0:
             self._send_json(400, {"error": "Missing or empty request body"})
@@ -340,18 +408,29 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": f"Request body exceeds {self.MAX_REQUEST_BYTES} bytes"})
             return
 
-        heavy = self.path in HEAVY_PATHS
+        # `/search` bodies are tiny query objects, read before admission so a light
+        # browse read can skip the slots; every other heavy body is read once admitted.
+        req_data: Any = None
+        if self.path == "/search":
+            try:
+                req_data = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except Exception as exc:
+                self._release_thread_resources()
+                self._send_json(400, {"error": f"Invalid JSON: {exc}"})
+                return
+        heavy = is_heavy_request(self.path, req_data if isinstance(req_data, dict) else None)
         if heavy and not self._admit():
             return
 
-        try:
-            body = self.rfile.read(content_length)
-            req_data = json.loads(body.decode("utf-8"))
-            del body
-        except Exception as exc:
-            self._finish_heavy(heavy)
-            self._send_json(400, {"error": f"Invalid JSON: {exc}"})
-            return
+        if req_data is None:
+            try:
+                body = self.rfile.read(content_length)
+                req_data = json.loads(body.decode("utf-8"))
+                del body
+            except Exception as exc:
+                self._finish_heavy(heavy)
+                self._send_json(400, {"error": f"Invalid JSON: {exc}"})
+                return
 
         store = getattr(self.resolver, "store", None)
 
