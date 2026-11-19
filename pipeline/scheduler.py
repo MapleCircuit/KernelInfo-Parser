@@ -7,11 +7,17 @@ from core.globalstuff import (
     reclaim_system_memory,
 )
 
+import contextlib
 import time
+from collections import defaultdict, deque
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
-from collections import deque, defaultdict
+
+from core import ingest_state
+from core.DBLayout import TABLES
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import ChangeSet, is_data_unsafe
+from db_engine.spec import AnyOf, Col, Exists, Join, Pred, Value, ge, gt, le, lt, ne, sub
 from pipeline.changesets import execute_and_purge, extract_tags_and_evacuate_cs
 from pipeline.state import logger
 from pipeline.worker_stage import _commit_all_with_retry
@@ -478,3 +484,407 @@ def execute_phase2_parallel_waves(
         f"[Phase 2] Completed resolution of {executed_count} ChangeSets across {wave_num} waves{breaks_suffix} "
         f"in {resolution_time:.1f}s ({avg_velocity:.1f} files/s); final commit {commit_time:.1f}s."
     ))
+
+
+class DistributedTaskScheduler:
+    """Pure-DB distributed task queue scheduler backed by `distributed_tasks` and `distributed_worker_capabilities`."""
+
+    def __init__(
+        self,
+        db_factory: Any,
+        network_id: int,
+        node_id: str,
+        role: str,
+        *,
+        heartbeat_timeout: int = 180,
+        repo_name: str | None = None,
+        min_priority: int | None = None,
+        max_priority: int | None = None,
+        task_types: Sequence[str] | None = None,
+    ) -> None:
+        self.db_factory = db_factory
+        self.network_id = int(network_id)
+        self.node_id = str(node_id)
+        self.role = str(role)
+        self.heartbeat_timeout = int(heartbeat_timeout)
+        self.repo_name = repo_name
+        self.min_priority = min_priority
+        self.max_priority = max_priority
+        self.task_types = tuple(task_types) if task_types is not None else None
+
+    @contextlib.contextmanager
+    def _with_db(self, db: Any) -> Iterator[Any]:
+        if db is not None:
+            yield db
+            return
+        with self.db_factory() as conn:
+            yield conn
+
+    def register_capabilities(self, capabilities: Sequence[Mapping[str, Any]], db: Any = None) -> int:
+        """Register or replace this worker's capabilities in `distributed_worker_capabilities`."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return 0
+            return int(conn.register_worker_capabilities(self.node_id, self.network_id, capabilities, role=self.role) or 0)
+
+    def _resolve_task_commit_id(self, conn: Any, row: Mapping[str, Any]) -> int:
+        cid = int(row.get("commit_id") or 0)
+        ref_name = str(row.get("ref_name") or "")
+        if cid == 0 and ref_name:
+            found = conn.select_one(
+                ("m_git_ref", "r"),
+                ["r.commit_id"],
+                {"repo.network_id": self.network_id, "r.ref_name": ref_name, "r.commit_id": gt(0)},
+                joins=[Join(("m_repository", "repo"), {"repo.repo_id": "r.repo_id"})],
+                as_dict=False,
+            )
+            if found and found[0]:
+                cid = int(found[0])
+        return cid
+
+    def _sweep_commit_zombie(
+        self,
+        conn: Any,
+        row: Mapping[str, Any],
+        cid: int,
+        ts: int,
+        expired_filter: Any,
+    ) -> int:
+        tid = int(row["task_id"])
+        ref_name = str(row.get("ref_name") or "")
+        orig_worker = str(row.get("worker_id") or "")
+
+        if conn.row_exists(
+            "m_ingest_state",
+            {"network_id": self.network_id, "commit_id": cid, "status": ingest_state.INGEST_DONE},
+        ):
+            promoted = conn.complete_distributed_task(
+                tid,
+                cid,
+                worker_id=orig_worker,
+                ref_name=ref_name or None,
+                network_id=self.network_id,
+                now=ts,
+            )
+            return 1 if promoted else 0
+
+        rc = conn.update_rows(
+            "distributed_tasks",
+            {"worker_id": "recovering", "heartbeat_ts": ts, "updated_ts": ts},
+            [{"task_id": tid, "status": "claimed", "worker_id": orig_worker}, expired_filter],
+        )
+        if not (rc and rc > 0):
+            return 0
+
+        logger.warning(
+            f"[Distributed] Sweeping zombie task {tid} ('{ref_name}', worker '{orig_worker}', commit_id {cid})."
+        )
+        try:
+            if not ingest_state.rollback_version(conn, self.network_id, cid, TABLES):
+                ingest_state.purge_partial_version(conn, cid)
+            conn.delete_rows(
+                "m_ingest_state",
+                {"network_id": self.network_id, "commit_id": cid, "status": ingest_state.INGEST_PARSING},
+            )
+        except ingest_state.RecoveryError as exc:
+            logger.error(f"[Distributed] Zombie rollback refused for task {tid} (commit_id {cid}): {exc}")
+            fail_rc = conn.update_rows(
+                "distributed_tasks",
+                {
+                    "status": "failed",
+                    "worker_id": "",
+                    "heartbeat_ts": 0,
+                    "updated_ts": ts,
+                    "error_msg": f"Rollback refused during zombie recovery: {exc}"[:1000],
+                },
+                {"task_id": tid, "status": "claimed", "worker_id": "recovering"},
+            )
+            if fail_rc and fail_rc > 0:
+                self._cascade_failed_dependents(conn, tid, ts)
+                return 1
+            return 0
+
+        reset_rc = conn.update_rows(
+            "distributed_tasks",
+            {
+                "status": "pending",
+                "worker_id": "",
+                "heartbeat_ts": 0,
+                "updated_ts": ts,
+                "error_msg": "Zombie task recovered after heartbeat expiration",
+            },
+            {"task_id": tid, "status": "claimed", "worker_id": "recovering"},
+        )
+        return 1 if (reset_rc and reset_rc > 0) else 0
+
+    def sweep_zombies(self, db: Any = None, now: int | None = None) -> int:
+        """Recover expired claimed tasks, rolling back partial version writes before resetting to pending."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return 0
+            ts = int(time.time()) if now is None else int(now)
+            cutoff = ts - max(1, int(self.heartbeat_timeout))
+            expired_filter = AnyOf({"heartbeat_ts": lt(cutoff)}, {"heartbeat_ts": 0, "updated_ts": lt(cutoff)})
+            expired_rows = conn.select_rows(
+                "distributed_tasks",
+                ["task_id", "task_type", "ref_name", "commit_id", "worker_id"],
+                [{"network_id": self.network_id, "status": "claimed"}, expired_filter],
+                as_dict=True,
+            )
+            if not expired_rows:
+                return 0
+
+            recovered = 0
+            plain_ids: list[int] = []
+            for row in expired_rows:
+                tid = int(row["task_id"])
+                if str(row.get("task_type") or "") == "preparse":
+                    plain_ids.append(tid)
+                    continue
+                cid = self._resolve_task_commit_id(conn, row)
+                if cid == 0:
+                    plain_ids.append(tid)
+                    continue
+                recovered += self._sweep_commit_zombie(conn, row, cid, ts, expired_filter)
+
+            if plain_ids:
+                recovered += int(
+                    conn.reset_zombie_distributed_tasks(
+                        self.network_id,
+                        self.heartbeat_timeout,
+                        now=ts,
+                        task_ids=plain_ids,
+                    )
+                    or 0
+                )
+            return recovered
+
+    def claim_next(
+        self,
+        db: Any = None,
+        *,
+        preferred_track: str | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Sweep zombie tasks and atomically claim the highest-priority task matching worker capabilities."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return None
+            self.sweep_zombies(conn, now=now)
+            task = conn.claim_distributed_task(
+                self.network_id,
+                self.node_id,
+                min_priority=self.min_priority,
+                max_priority=self.max_priority,
+                task_types=self.task_types,
+                repo_name=self.repo_name,
+                preferred_track=preferred_track,
+                now=now,
+            )
+            if task is not None:
+                task["_queue"] = "distributed_tasks"
+            return task
+
+    def heartbeat(self, task_id: int, db: Any = None, now: int | None = None) -> bool:
+        """Renew `heartbeat_ts` on an actively claimed task owned by this node."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return False
+            return bool(conn.heartbeat_distributed_task(task_id, self.node_id, now=now))
+
+    def complete(
+        self,
+        task_id: int,
+        commit_id: int,
+        *,
+        ref_name: str | None = None,
+        db: Any = None,
+        now: int | None = None,
+    ) -> bool:
+        """Mark a claimed task completed and backfill dependent tasks' `base_commit_id`."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return False
+            return bool(
+                conn.complete_distributed_task(
+                    task_id,
+                    commit_id,
+                    worker_id=self.node_id,
+                    ref_name=ref_name,
+                    network_id=self.network_id,
+                    now=now,
+                )
+            )
+
+    def _cascade_failed_dependents(self, conn: Any, initial_task_id: int, ts: int) -> int:
+        """Iteratively fail downstream pending tasks whose base matches a failed task in the same repo."""
+        row = conn.select_one(
+            "distributed_tasks",
+            ["network_id", "repo_name", "task_type", "commit_id", "ref_name"],
+            {"task_id": int(initial_task_id)},
+            as_dict=False,
+        )
+        if not row or str(row[2] or "") == "preparse":
+            return 0
+        net_id = int(row[0])
+        repo_name = str(row[1] or "")
+        init_cid = int(row[3]) if row[3] and int(row[3]) > 0 else 0
+        init_ref = str(row[4] or "")
+
+        pending_cids = {init_cid} if init_cid > 0 else set()
+        pending_refs = {init_ref} if init_ref else set()
+        seen_cids: set[int] = set()
+        seen_refs: set[str] = set()
+        total_cascaded = 0
+
+        with conn.transaction():
+            while pending_cids or pending_refs:
+                step_cids = pending_cids - seen_cids
+                step_refs = pending_refs - seen_refs
+                seen_cids.update(step_cids)
+                seen_refs.update(step_refs)
+                if not step_cids and not step_refs:
+                    break
+                branches: list[Any] = []
+                if step_cids:
+                    branches.append({"base_commit_id": sorted(step_cids)})
+                if step_refs:
+                    branches.append({"base_ref_name": sorted(step_refs)})
+                down_rows = conn.select_rows(
+                    "distributed_tasks",
+                    ["task_id", "task_type", "commit_id", "ref_name"],
+                    [{"network_id": net_id, "repo_name": repo_name, "status": "pending"}, AnyOf(*branches)],
+                    as_dict=False,
+                )
+                if not down_rows:
+                    break
+                target_ids = [int(r[0]) for r in down_rows]
+                affected = int(
+                    conn.update_rows(
+                        "distributed_tasks",
+                        {"status": "failed", "error_msg": "Prerequisite base task failed", "updated_ts": ts},
+                        {"task_id": target_ids, "status": "pending"},
+                    )
+                    or 0
+                )
+                total_cascaded += affected
+                if affected == 0:
+                    break
+                next_cids: set[int] = set()
+                next_refs: set[str] = set()
+                for _tid, d_type, d_cid, d_ref in down_rows:
+                    if str(d_type or "") == "preparse":
+                        continue
+                    dc = int(d_cid) if d_cid and int(d_cid) > 0 else 0
+                    dr = str(d_ref or "")
+                    if dc > 0 and dc not in seen_cids:
+                        next_cids.add(dc)
+                    if dr and dr not in seen_refs:
+                        next_refs.add(dr)
+                pending_cids = next_cids
+                pending_refs = next_refs
+        return total_cascaded
+
+    def fail(
+        self,
+        task_id: int,
+        error_msg: str,
+        *,
+        max_attempts: int = 3,
+        db: Any = None,
+        now: int | None = None,
+    ) -> bool:
+        """Record a task failure; on terminal `"failed"` status, cascade failure to downstream dependents."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return False
+            ts = int(time.time()) if now is None else int(now)
+            rc = conn.fail_distributed_task(
+                task_id,
+                error_msg,
+                worker_id=self.node_id,
+                max_attempts=max_attempts,
+                now=ts,
+            )
+            if not (rc and rc > 0):
+                return False
+            row = conn.select_one("distributed_tasks", ["status"], {"task_id": int(task_id)}, as_dict=False)
+            if row and row[0] == "failed":
+                self._cascade_failed_dependents(conn, int(task_id), ts)
+            return True
+
+    def release(self, task_id: int, reason: str, *, db: Any = None, now: int | None = None) -> bool:
+        """Return a claimed task to `pending` without incrementing `retry_count`."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return False
+            return bool(conn.release_distributed_task(task_id, reason, self.node_id, now=now))
+
+    def is_queue_drained(self, db: Any = None, *, coordinator_timeout: int = 120) -> bool:
+        """True only when tasks exist, none are claimed, no master/daemon is active, and no matching task is claimable."""
+        with self._with_db(db) as conn:
+            if conn is None:
+                return False
+            if conn.count_rows("distributed_tasks", {"network_id": self.network_id}) == 0:
+                return False
+            if conn.row_exists("distributed_tasks", {"network_id": self.network_id, "status": "claimed"}):
+                return False
+            now = int(time.time())
+            cutoff = now - max(1, int(coordinator_timeout))
+            if conn.row_exists(
+                "m_parse_node",
+                {"network_id": self.network_id, "role": ["master", "daemon"], "heartbeat_at": ge(cutoff)},
+            ):
+                return False
+
+            base_filter: dict[str, Any] = {"t.network_id": self.network_id, "t.status": "pending"}
+            pri_conds = []
+            if self.min_priority is not None:
+                pri_conds.append(ge(int(self.min_priority)))
+            if self.max_priority is not None:
+                pri_conds.append(le(int(self.max_priority)))
+            if len(pri_conds) == 1:
+                base_filter["t.priority"] = pri_conds[0]
+            elif len(pri_conds) > 1:
+                base_filter["t.priority"] = pri_conds
+            if self.task_types:
+                base_filter["t.task_type"] = list(self.task_types)
+            if self.repo_name:
+                base_filter["t.repo_name"] = self.repo_name
+
+            base_ready = AnyOf(
+                {"t.base_ref_name": ""},
+                [
+                    {"t.base_commit_id": gt(0)},
+                    Exists(
+                        ("m_ingest_state", "bs"),
+                        {"bs.network_id": "t.network_id", "bs.commit_id": "t.base_commit_id"},
+                        {"bs.status": ingest_state.INGEST_DONE},
+                    ),
+                ],
+                Exists(
+                    ("distributed_tasks", "bt"),
+                    {"bt.network_id": "t.network_id", "bt.repo_name": "t.repo_name", "bt.ref_name": "t.base_ref_name"},
+                    {"bt.status": "completed", "bt.task_type": ne("preparse")},
+                ),
+            )
+            where_terms: list[Any] = [
+                base_filter,
+                AnyOf(
+                    {"c.track_name": Col("t.track_name")},
+                    {"c.track_name": "*"},
+                    [{"t.task_type": "preparse"}, {"c.track_name": "preparse"}],
+                ),
+                AnyOf({"t.task_type": ne("preparse")}, {"c.supports_preparse": 1}),
+                AnyOf({"c.min_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("t.seq_order", "c.min_seq_order"), ge(0))),
+                AnyOf({"c.max_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("c.max_seq_order", "t.seq_order"), ge(0))),
+                base_ready,
+            ]
+            cap_join = [
+                Join(
+                    ("distributed_worker_capabilities", "c"),
+                    {"c.worker_id": Value(self.node_id), "c.network_id": "t.network_id", "c.repo_name": "t.repo_name"},
+                    "inner",
+                )
+            ]
+            return not conn.row_exists(("distributed_tasks", "t"), where_terms, joins=cap_join)

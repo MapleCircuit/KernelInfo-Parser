@@ -129,7 +129,9 @@ class TestRollbackPlan(unittest.TestCase):
         self.assertTrue({"m_file_blob", "m_file_name", "m_ast", "m_tag", "m_commit", "m_blob_symbol_def"} <= names)
         # Static registries, hash/composite keys and foreign-key primary keys are not watermarked
         self.assertFalse(names & {"m_type_descriptor", "m_git_ref", "m_repository", "m_bridge_tag",
-                                  "m_ast_include", "m_ingest_state", "m_ingest_watermark", "m_ingest_blob"})
+                                  "m_ast_include", "m_ingest_state", "m_ingest_watermark", "m_ingest_blob",
+                                  "m_table_sequence", "m_parse_task", "distributed_tasks",
+                                  "distributed_worker_capabilities"})
 
     def test_children_are_deleted_before_their_parents(self) -> None:
         plan = I.rollback_plan(TABLES, MARKS, 10, [3])
@@ -377,6 +379,18 @@ class TestIngestStateDatabase(unittest.TestCase):
         self.assertEqual(marks["m_commit"], 11)
         self.assertEqual(db.count_rows("m_ingest_watermark"), len(I.marked_tables(TABLES)))
         self.assertEqual(I.get_status(db, 1, 10), I.INGEST_PARSING)
+
+    def test_fetch_repo_ref_hashes_returns_commit_sha(self) -> None:
+        db = seeded()
+        db.add("m_repository", 1, 1, "linux", "", "master")
+        db.add("m_git_ref", 1, 1, 1, "v3.0", 10)
+        I.set_status(db, 1, 10, I.INGEST_DONE)
+        hashes = I.fetch_repo_ref_hashes(db, repo_id=1, network_id=1)
+        self.assertIn("v3.0", hashes)
+        cid, state, sha = hashes["v3.0"]
+        self.assertEqual(cid, 10)
+        self.assertEqual(state, "done")
+        self.assertEqual(sha, b"h10".hex())
 
 
 class _OnSQLite:

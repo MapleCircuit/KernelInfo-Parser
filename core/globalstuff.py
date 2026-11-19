@@ -942,8 +942,14 @@ def setup_memory_limit(limit_gb: float = 60.0) -> None:
     except Exception as e:
         logger.debug(f"[Memory Guard] cgroups inspection check skipped: {e}")
 
-    # 2. If unconstrained and systemd-run is available, re-exec inside a dedicated cgroup scope (except in unit tests)
-    if not is_test_environment() and os.environ.get("KERNELINFO_CGROUP_ACTIVE") != "1" and shutil.which("systemd-run"):
+    # 2. If unconstrained and systemd-run is available with an active user session, re-exec inside a cgroup scope
+    has_user_session = bool(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+    if (
+        not is_test_environment()
+        and os.environ.get("KERNELINFO_CGROUP_ACTIVE") != "1"
+        and has_user_session
+        and shutil.which("systemd-run")
+    ):
         try:
             os.environ["KERNELINFO_CGROUP_ACTIVE"] = "1"
             logger.info(COLOR.cyan(f"[Memory Guard] Activating cgroups v2 scope via systemd-run: max={limit_gb:.1f} GB, high={limit_gb*0.9:.1f} GB..."))

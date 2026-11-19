@@ -21,6 +21,7 @@ from parser.cve import cve_ingest as ci
 from parser.cve import cve_releases as crl
 from parser.git_ast import release_stats as rst
 from tests.db_fixtures import patch_reader
+from webapp.backend.database import helpers as db_helpers
 from webapp.backend.services import commit_relations as crel
 from webapp.backend.services import cve_service as cs
 from webapp.backend.services import release_service as rs
@@ -233,6 +234,9 @@ class TestCveReleases(unittest.TestCase):
             patch_reader(self.db),
             patch("webapp.backend.database.helpers.get_active_repo_id", return_value=1),
             patch("webapp.backend.database.helpers.get_active_network_id", return_value=1),
+            patch.object(rs, "get_active_repo_id", return_value=1),
+            patch.object(crel, "get_active_repo_id", return_value=1),
+            patch.object(crel, "get_active_network_id", return_value=1),
             patch.object(rs, "get_repo_dir", return_value=self.krepo),
             patch.object(crel, "get_repo_dir", return_value=self.krepo),
             patch.object(rs, "_PASS_DISK", _NoDisk()),
@@ -243,11 +247,14 @@ class TestCveReleases(unittest.TestCase):
 
     @staticmethod
     def _reset_webapp_caches() -> None:
+        db_helpers._REPO_ID_CACHE.clear()
         cs._SOURCE.update(checked=0.0, row=None)
         cs._MEM.update(built_at=None, head=None, records={})
         cs._CATALOG.update(built_at=None, head=None, rows=[])
         cs._PREFETCH_CACHE.clear()
         rs._TAGS_CACHE.clear()
+        rs._CONTAINS_CACHE.clear()
+        rs._LATEST_CACHE.clear()
         rs._DB_COVERAGE.clear()
         crel._DB_READY.clear()
 

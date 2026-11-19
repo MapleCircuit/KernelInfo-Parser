@@ -25,7 +25,6 @@ from db_engine.base import (
     CAP_SERVER_TUNING,
     tuning_note_is_warning,
 )
-from db_engine.DBHandling import MariaDB
 from db_engine.errors import (
     ConnectionLostError,
     DBError,
@@ -38,8 +37,32 @@ from db_engine.errors import (
     SpecError,
     UnsupportedOperation,
 )
+
+
+def _is_missing_mysql(exc: ModuleNotFoundError) -> bool:
+    name = str(getattr(exc, "name", "") or "")
+    return name == "mysql" or name.startswith("mysql.")
+
+
+try:
+    from db_engine.DBHandling import MariaDB
+except ModuleNotFoundError as exc:
+    if not _is_missing_mysql(exc):
+        raise
+    MariaDB = None  # type: ignore[assignment]
+
 from db_engine.mock_db import MockDB, MockReadSession
-from db_engine.pool import PoolConfigError, ReadAPI, ReadSession, configure_pool, get_db_reader
+
+try:
+    from db_engine.pool import PoolConfigError, ReadAPI, ReadSession, configure_pool, get_db_reader
+except ModuleNotFoundError as exc:
+    if not _is_missing_mysql(exc):
+        raise
+    PoolConfigError = ConfigurationError  # type: ignore[assignment]
+    ReadAPI = None  # type: ignore[assignment]
+    ReadSession = None  # type: ignore[assignment]
+    configure_pool = None  # type: ignore[assignment]
+    get_db_reader = None  # type: ignore[assignment]
 from db_engine.spec import (
     Agg,
     AnyOf,
@@ -108,14 +131,15 @@ from db_engine.sqlite_store import SQLiteStore, StoreError, TableSpec
 from db_engine.views import DEF_ID_FLAG, KIND_DEFS, KIND_REFS, ORDERED_VIEW_NAMES, VIEW_DEFINITIONS
 
 DB_ENGINES: dict[str, type[BaseDBEngine]] = {
-    "mariadb": MariaDB,
-    "mysql": MariaDB,
     "mock": MockDB,
     "mockdb": MockDB,
     "inmemory": MockDB,
     "sqlite": SQLiteDB,
     "sqlite3": SQLiteDB,
 }
+if MariaDB is not None:
+    DB_ENGINES["mariadb"] = MariaDB
+    DB_ENGINES["mysql"] = MariaDB
 
 # canonical engine name -> aliases; the canonical names are what `available_engines()` offers to UIs and CLIs
 _ENGINE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -161,9 +185,13 @@ def get_db_engine(name: str | None = None) -> type[BaseDBEngine]:
         ValueError: If unsupported engine name is provided.
     """
     if not name:
+        if MariaDB is None:
+            raise ConfigurationError("MariaDB driver requires 'mysql-connector-python', which is not installed.")
         return MariaDB
     key = name.strip().lower()
     if key not in DB_ENGINES:
+        if key in ("mariadb", "mysql") and MariaDB is None:
+            raise ConfigurationError("MariaDB driver requires 'mysql-connector-python', which is not installed.")
         valid_options = ", ".join(sorted(set(DB_ENGINES.keys())))
         raise ValueError(f"Unknown database engine '{name}'. Supported options: {valid_options}")
     return DB_ENGINES[key]

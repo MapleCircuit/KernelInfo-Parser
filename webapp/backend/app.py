@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from core.logging_setup import setup_webapp_logging
-from webapp.backend.config import get_backend_logging_config
+from webapp.backend.config import get_backend_logging_config, refresh_default_repo_dir
 from webapp.backend.security.middleware import (
     RepoContextMiddleware,
     RequestLoggingMiddleware,
@@ -116,6 +116,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI web application instance."""
+    refresh_default_repo_dir()
     setup_webapp_logging()
     app = FastAPI(
         title="KernelInfo-Parser Developer Platform",

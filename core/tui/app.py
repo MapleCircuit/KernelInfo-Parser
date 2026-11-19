@@ -1,5 +1,6 @@
 """Application controller and screen stack orchestrator for the KernelInfo-Parser TUI."""
 
+import contextlib
 import copy
 import curses
 import json
@@ -9,9 +10,15 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from core.config import DEFAULT_CONFIG, REPO_ROOT, find_config_path
+from core.config import (
+    DEFAULT_CONFIG,
+    REPO_ROOT,
+    ensure_standalone_config,
+    find_config_path,
+    prune_webapp_config,
+)
 from core.tui.screens.base import BaseScreen
 from core.tui.output_capture import TerminalOutputCapture
 from core.tui.screens.main_menu import MainMenuScreen
@@ -29,6 +36,12 @@ class TUIApp:
         else:
             resolved = find_config_path(None)
             self.config_path = Path(resolved).resolve() if resolved is not None else (REPO_ROOT / "config.json")
+
+        self.base_config_path: Path = self.config_path
+        self.config_scope: str = "full"
+        self._config_context_stack: list[
+            tuple[Path, dict[str, Any], dict[str, Any], bool, str, dict[str, dict[str, Any]]]
+        ] = []
 
         self.config: dict[str, Any] = self._load_initial_config()
         self.initial_config: dict[str, Any] = copy.deepcopy(self.config)
@@ -130,12 +143,95 @@ class TUIApp:
         """Configuration as written to disk: `database.ssh_tunnel` is the only database tunnel section.
 
         The top-level `ssh_tunnel` key is a legacy alias of `database.ssh_tunnel`; it is left out so
-        a stale copy never shadows the tunnel edited in the TUI.
+        a stale copy never shadows the tunnel edited in the TUI. When `config_scope == "webapp"`,
+        parser-only sections and fields are stripped via `prune_webapp_config()`.
         """
         data = dict(self.config)
         if isinstance(data.get("database"), dict) and isinstance(data["database"].get("ssh_tunnel"), dict):
             data.pop("ssh_tunnel", None)
+        if self.config_scope == "webapp":
+            data = prune_webapp_config(data)
         return data
+
+    def push_config_context(
+        self,
+        config_path: str | Path,
+        scope: str = "full",
+        *,
+        seed_service: str | None = None,
+    ) -> None:
+        """Switch the active configuration file and scope, pushing the previous context onto a stack.
+
+        When `seed_service` (`"daemon"` or `"webapp"`) is given, `ensure_standalone_config()` is called
+        first (bootstrap-only: existing standalone files are never overwritten).
+        """
+        if scope not in ("full", "daemon", "webapp"):
+            raise ValueError(f"Invalid config scope {scope!r}; expected 'full', 'daemon', or 'webapp'")
+        target = Path(config_path).expanduser().resolve()
+        if seed_service is not None:
+            ensure_standalone_config(
+                seed_service,
+                config_path=target,
+                base_config_path=self.base_config_path,
+            )
+
+        self._config_context_stack.append((
+            self.config_path,
+            self.config,
+            self.initial_config,
+            self.is_dirty,
+            self.config_scope,
+            self.view_state,
+        ))
+        self.config_path = target
+        self.config_scope = scope
+        self.config = self._load_initial_config()
+        self.initial_config = copy.deepcopy(self.config)
+        self.is_dirty = False
+        self.view_state = {}
+
+    def restore_config_context(self) -> bool:
+        """Pop and restore the most recently pushed configuration context; return True if restored."""
+        if not self._config_context_stack:
+            return False
+        (
+            self.config_path,
+            self.config,
+            self.initial_config,
+            self.is_dirty,
+            self.config_scope,
+            self.view_state,
+        ) = self._config_context_stack.pop()
+        return True
+
+    @contextlib.contextmanager
+    def suspend(self) -> Iterator[None]:
+        """Temporarily suspend curses and output capture so interactive commands (e.g. sudo) can use the tty."""
+        cap = self.output_capture
+        was_capturing = cap.pause() if cap is not None else False
+        curses_suspended = False
+        try:
+            try:
+                curses.def_prog_mode()
+                curses.endwin()
+                curses_suspended = True
+            except Exception:
+                pass
+            yield
+        finally:
+            if curses_suspended:
+                try:
+                    curses.reset_prog_mode()
+                except Exception:
+                    pass
+            if was_capturing and cap is not None:
+                cap.resume()
+            if self.stdscr is not None:
+                try:
+                    self.stdscr.clearok(True)
+                    self.stdscr.refresh()
+                except Exception:
+                    pass
 
     def save_config(self, target_path: Path | None = None) -> tuple[bool, str]:
         """Persist the active configuration atomically to disk."""

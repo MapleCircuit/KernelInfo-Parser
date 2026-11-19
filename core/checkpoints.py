@@ -67,12 +67,19 @@ def is_checkpoint_pinned(db: Any, commit_id: int) -> bool:
     if not commit_id:
         return False
     active = [0, 1, 2]
+    dist_active = ["pending", "claimed"]
     probes = (
         lambda: db.row_exists("m_parse_task", {"base_commit_id": commit_id, "status": active}),
         lambda: db.row_exists(
             ("m_parse_task", "t"),
             {"r.commit_id": commit_id, "t.status": active},
             joins=[Join(("m_git_ref", "r"), {"r.ref_name": "t.base_ref_name"})],
+        ),
+        lambda: db.row_exists("distributed_tasks", {"base_commit_id": commit_id, "status": dist_active}),
+        lambda: db.row_exists(
+            ("distributed_tasks", "dt"),
+            {"r.commit_id": commit_id, "dt.status": dist_active},
+            joins=[Join(("m_git_ref", "r"), {"r.ref_name": "dt.base_ref_name"})],
         ),
         lambda: db.row_exists("m_ingest_state", {"base_commit_id": commit_id, "status": 1}),
     )

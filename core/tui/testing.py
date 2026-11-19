@@ -654,7 +654,7 @@ def test_cve_catalog(cve_cfg: dict[str, Any]) -> DiagnosticResult:
                 passed=False,
                 latency_ms=0.0,
                 message=f"CVE directory does not exist: {repo_path}",
-                details="Clone cvelistV5 or linux-vulns repository to this path or update config.json.",
+                details="Clone cvelistV5 or linux-vulns repository to this path or update the CVE Repo Directory setting.",
             )
 
         if not is_git_repository(repo_path):

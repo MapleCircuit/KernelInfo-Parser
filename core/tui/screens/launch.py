@@ -45,3 +45,8 @@ def launch_pipeline(stdscr: Any, app: Any, mode: str, **launch_args: Any) -> boo
     if not ok:
         ModalDialog.show_dialog(stdscr, "Save Failed", msg, ["OK"])
     return ok
+
+
+def launch_daemon(stdscr: Any, app: Any, mode: str) -> bool:
+    """Exit the TUI into the pipeline running in singleton daemon role."""
+    return launch_pipeline(stdscr, app, mode, role="daemon")

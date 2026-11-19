@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 75 core relational database tables used across the parser
+This module defines the 77 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
@@ -115,6 +115,11 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_parse_node (node_id, network_id, role, hostname, pid, active_commit_id, heartbeat_at) -- active parser nodes
    m_parse_task (task_id, network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name,
                  base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg) -- secondary work queue
+   distributed_tasks (task_id, network_id, repo_id, repo_name, task_type, track_name, ref_name, target_sha,
+                      commit_id, base_ref_name, base_commit_id, priority, seq_order, status, worker_id,
+                      heartbeat_ts, created_ts, updated_ts, retry_count, error_msg) -- pure-DB coordination queue
+   distributed_worker_capabilities (worker_id, network_id, repo_name, track_name, min_seq_order, max_seq_order,
+                                    min_ref, max_ref, supports_preparse, role, local_repo_path, updated_ts) -- worker local repo/track registry
 ===============================================================================
 """
 from __future__ import annotations
@@ -2126,6 +2131,87 @@ insights_stable_version_delta = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 75. distributed_tasks (table_id=75): Pure-DB Distributed Coordination Queue
+#     Coordinates main release tags, stable tracks, branches, and pre-parsing tasks
+#     across standalone/master/worker/daemon roles with priority weighting and heartbeat recovery.
+# -----------------------------------------------------------------------------
+distributed_tasks = Table(
+    table_id=75,
+    table_name="distributed_tasks",
+    columns=(
+        ("task_id", INT(auto=True)),
+        ("network_id", INT(default=1)),
+        ("repo_id", INT(default=0)),
+        ("repo_name", VARCHAR(128, default="", bin_collation=True)),
+        ("task_type", VARCHAR(32, default="parse", bin_collation=True)),
+        ("track_name", VARCHAR(128, default="", bin_collation=True)),
+        ("ref_name", VARCHAR(255, bin_collation=True)),
+        ("target_sha", VARCHAR(64, default="", bin_collation=True)),
+        ("commit_id", INT(default=0)),
+        ("base_ref_name", VARCHAR(255, default="", bin_collation=True)),
+        ("base_commit_id", INT(default=0)),
+        ("priority", SMALLINT(unsigned=True, default=5)),
+        ("seq_order", BIGINT(default=0)),
+        ("status", VARCHAR(16, default="pending", bin_collation=True)),
+        ("worker_id", VARCHAR(128, default="", bin_collation=True)),
+        ("heartbeat_ts", BIGINT(unsigned=True, default=0)),
+        ("created_ts", BIGINT(unsigned=True, default=0)),
+        ("updated_ts", BIGINT(unsigned=True, default=0)),
+        ("retry_count", SMALLINT(unsigned=True, default=0)),
+        ("error_msg", TEXT(null=None, default="", bin_collation=True)),
+    ),
+    primary=("task_id",),
+    foreign=(("network_id", "m_git_network", "network_id"),),
+    unique_keys=(("network_id", "repo_name", "task_type", "ref_name"),),
+    indexes=(
+        ("dist_task_claim_idx", ("network_id", "status", "priority", "seq_order")),
+        ("dist_task_heartbeat_idx", ("status", "heartbeat_ts")),
+        ("dist_task_base_idx", ("network_id", "base_commit_id", "status")),
+        ("dist_task_repo_track_idx", ("network_id", "repo_name", "track_name", "status")),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 76. distributed_worker_capabilities (table_id=76): Worker Local Repo & Track Registry
+#     Registers each node's locally mirrored repositories, supported tracks, and ref boundaries
+#     so task assignment only matches locally available work.
+# -----------------------------------------------------------------------------
+distributed_worker_capabilities = Table(
+    table_id=76,
+    table_name="distributed_worker_capabilities",
+    columns=(
+        ("worker_id", VARCHAR(128, bin_collation=True)),
+        ("network_id", INT(default=1)),
+        ("repo_name", VARCHAR(128, bin_collation=True)),
+        ("track_name", VARCHAR(128, bin_collation=True)),
+        ("min_seq_order", BIGINT(default=0)),
+        ("max_seq_order", BIGINT(default=0)),
+        ("min_ref", VARCHAR(128, default="", bin_collation=True)),
+        ("max_ref", VARCHAR(128, default="", bin_collation=True)),
+        ("supports_preparse", TINYINT(unsigned=True, default=1)),
+        ("role", VARCHAR(32, default="worker", bin_collation=True)),
+        ("local_repo_path", VARCHAR(512, default="", bin_collation=True)),
+        ("updated_ts", BIGINT(unsigned=True, default=0)),
+    ),
+    primary=("worker_id", "network_id", "repo_name", "track_name"),
+    foreign=(("network_id", "m_git_network", "network_id"),),
+    indexes=(
+        ("dist_cap_lookup_idx", ("worker_id", "network_id", "repo_name")),
+        ("dist_cap_net_repo_track_idx", ("network_id", "repo_name", "track_name")),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -2204,19 +2290,21 @@ TABLES: tuple[Table, ...] = (
     insights_subsystem_version_delta,  # 72
     insights_subsystem_author_delta,   # 73
     insights_stable_version_delta,     # 74
+    distributed_tasks,                 # 75
+    distributed_worker_capabilities,   # 76
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 75 schema tables.
+    """Initialize and populate gp.Table_Array with all 77 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 75 Table schema objects.
+        Immutable tuple of all 77 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

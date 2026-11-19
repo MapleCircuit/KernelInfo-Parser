@@ -38,11 +38,11 @@ ES-Module IDE frontend.
 - 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1059-L1064]
 - 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1065-L1070]
 - 6. Using the Services from Python [L1071-L1088]
-- 7. Configuration & Execution [L1089-L1174]
+- 7. Configuration & Execution [L1089-L1177]
   - 7.1. Configuration Precedence & Resolution [L1091-L1139]
-  - 7.2. Starting the Server [L1140-L1174]
-- 8. Error Handling, Status Codes & Resilience [L1175-L1206]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1188-L1206]
+  - 7.2. Starting the Server [L1140-L1177]
+- 8. Error Handling, Status Codes & Resilience [L1178-L1209]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1191-L1209]
 <!-- toc:end -->
 
 ---
@@ -1144,13 +1144,16 @@ Start the application from the repository root:
 # Using webapp entrypoint (with CLI overrides; -c selects another config.json)
 python3 webapp/main.py -c config.json --host 0.0.0.0 --port 8000 --no-reload
 
-# Or via uvicorn directly (CONFIG_FILE selects another config.json)
+# Or via uvicorn directly (CONFIG_FILE / KERNELINFO_CONFIG selects another config file)
 uvicorn webapp.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-`-c` is passed on as the `CONFIG_FILE` environment variable before anything reads the configuration, so it
-also applies to the process uvicorn's reloader starts. Options left unset fall back to the `webapp` section of
-the configuration (`host`, `port`, `reload`).
+`-c` / `--config` validates the target file exists (raising `FileNotFoundError` if missing), sets both
+`CONFIG_FILE` and `KERNELINFO_CONFIG` in `os.environ`, and calls `core.config.init_config()` before starting
+uvicorn so both the server process and any reloader subprocesses use that exact configuration.
+`webapp/backend/app.py:create_app()` calls `webapp/backend/config.py:refresh_default_repo_dir()`, and
+`get_repo_dir()` / `get_active_repository()` resolve dynamically against the active configuration. Options left
+unset fall back to the `webapp` section of the configuration (`host`, `port`, `reload`).
 
 - **Backend File Logging & Request Capture**:
   - `webapp/main.py` calls `core.logging_setup.setup_webapp_logging()` before `uvicorn.run()`, and

@@ -13,6 +13,7 @@ from core.tui.screens.launch import RUN_SAVED, launch_pipeline
 from core.tui.screens.logging_cfg import LoggingScreen
 from core.tui.screens.parser_dist import ParserDistributedScreen
 from core.tui.screens.repos import RepositoriesScreen
+from core.tui.screens.systemd_services import SystemdServicesScreen
 from core.tui.screens.table_reset import run_table_reset
 from core.tui.screens.version_parse import VersionParseScreen
 from core.tui.theme import (
@@ -34,7 +35,7 @@ class MainMenuScreen(BaseScreen):
     MENU_ITEMS = [
         ("1", "Repositories, Git & Branch Filters", "Detect repos, configure branches, start_ref, tag rules"),
         ("2", "Database, SSH Tunnel & Auth", "Database credentials, socket, and SSH port forwarding"),
-        ("3", "Parser Engine & Distributed Node ID", "Memory limit, hugepages, worker_id, master/worker role"),
+        ("3", "Parser Engine & Distributed Node ID", "Memory limit, hugepages, worker_id, standalone/master/worker/daemon role"),
         ("4", "CVE Catalog & Mailing List", "CVE list clone directory, lore storage & ML daemon tunnel"),
         ("L", "Logging Configuration", "Parser & webapp log files, directories, levels & request filter"),
         ("5", "Run Diagnostics (Test All)", "Verify all database, SSH, git, CVE, and daemon configurations"),
@@ -42,6 +43,7 @@ class MainMenuScreen(BaseScreen):
         ("7", "Parse & Pre-Parse Versions / Tags", "Select tags to parse now and configure Insights / API pre-parse rules"),
         ("8", "Table Reset", "Drop & recreate every database table (type RESET to confirm)"),
         ("9", "DB Content Viewer", "Parsed versions, repos & branches, ML/CVE data, table sizes, clean partial runs"),
+        ("0", "Systemd Services (Daemon & Webapp)", "Install & manage daemon/webapp systemd units, tmux mode & configs"),
         ("S", "Save Configuration", "Saves to Active Config File"),
         ("R", "Save & Run Pipeline", "Save settings and proceed directly to running the parser pipeline"),
         ("P", "Run Pipeline (saved config.json)", "Run the parser with config.json as saved on disk, without saving"),
@@ -90,7 +92,7 @@ class MainMenuScreen(BaseScreen):
         self.safe_addstr(
             2,
             2,
-            "Use Arrow keys and [Enter] to navigate, or press hotkeys [1-9, L, S, R, P, Q].",
+            "Use Arrow keys and [Enter] to navigate, or press hotkeys [0-9, L, S, R, P, Q].",
             curses.A_NORMAL,
         )
 
@@ -174,6 +176,7 @@ class MainMenuScreen(BaseScreen):
         if self.app is None:
             return key in self.HOTKEYS.values()
         screens = {
+            "0": SystemdServicesScreen,
             "1": RepositoriesScreen,
             "2": DatabaseSSHScreen,
             "3": ParserDistributedScreen,

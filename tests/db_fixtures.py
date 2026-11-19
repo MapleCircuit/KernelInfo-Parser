@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import os
+import sys
 import time
 import unittest
 from collections.abc import Mapping, Sequence
@@ -30,7 +31,19 @@ from typing import Any, Literal
 from unittest import mock
 
 from core import distributed
-from core.DBLayout import TABLES, m_checkpoint_base, m_bridge_checkpoint, m_commit, m_git_ref, m_ingest_state, m_parse_node, m_parse_task, m_repository
+from core.DBLayout import (
+    TABLES,
+    distributed_tasks,
+    distributed_worker_capabilities,
+    m_bridge_checkpoint,
+    m_checkpoint_base,
+    m_commit,
+    m_git_ref,
+    m_ingest_state,
+    m_parse_node,
+    m_parse_task,
+    m_repository,
+)
 from db_engine import MockDB, SQLiteDB
 from db_engine.base import BaseDBEngine
 
@@ -73,6 +86,17 @@ def make_db(
     return db
 
 
+def _clear_webapp_db_caches() -> None:
+    """Clear already-imported webapp DB lookup caches when switching patched readers."""
+    helpers = sys.modules.get("webapp.backend.database.helpers")
+    if helpers is None:
+        return
+    for attr in ("_REPO_ID_CACHE", "_NAME_TO_VID_CACHE", "_VID_TO_NAME_CACHE", "_PRELOADED"):
+        cache = getattr(helpers, attr, None)
+        if cache is not None and hasattr(cache, "clear"):
+            cache.clear()
+
+
 class _ReaderPatch:
     """Context manager / `start()` + `stop()` pair serving `get_reader()` from one engine. Patches nest and may stop in
     any order: the most recently started engine that has not stopped serves, and the seam is restored once none is
@@ -87,6 +111,7 @@ class _ReaderPatch:
 
     def start(self) -> None:
         cls = _ReaderPatch
+        _clear_webapp_db_caches()
         self._token = (self._db,)
         cls._stack.append(self._token)
         if cls._patcher is None:
@@ -101,6 +126,7 @@ class _ReaderPatch:
         if not cls._stack and cls._patcher is not None:
             cls._patcher.stop()
             cls._patcher = None
+        _clear_webapp_db_caches()
 
     def __enter__(self) -> _ReaderPatch:
         self.start()
@@ -118,8 +144,21 @@ def patch_reader(db: Any) -> _ReaderPatch:
     return _ReaderPatch(db)
 
 
-DIST_TABLES = (m_parse_task, m_parse_node, m_ingest_state, m_git_ref, m_repository, m_commit, m_bridge_checkpoint, m_checkpoint_base)
+DIST_TABLES = (
+    m_parse_task,
+    m_parse_node,
+    m_ingest_state,
+    m_git_ref,
+    m_repository,
+    m_commit,
+    m_bridge_checkpoint,
+    m_checkpoint_base,
+    distributed_tasks,
+    distributed_worker_capabilities,
+)
 _TASK_COLUMNS = [c[0] for c in m_parse_task.init_columns]
+_DIST_TASK_COLUMNS = [c[0] for c in distributed_tasks.init_columns]
+_WORKER_CAP_COLUMNS = [c[0] for c in distributed_worker_capabilities.init_columns]
 
 
 class DistDB(SQLiteDB):
@@ -135,6 +174,56 @@ class DistDB(SQLiteDB):
                    "commit_id": 0, "base_ref_name": "", "base_commit_id": 0, "status": distributed.TASK_PENDING,
                    "worker_id": "", "lease_expires_at": 0, "retry_count": 0, "error_msg": "", **t}
             self.insert_rows("m_parse_task", list(row), [tuple(row.values())])
+        return self
+
+    def add_dist_tasks(self, *tasks: dict) -> DistDB:
+        now = int(time.time())
+        for idx, t in enumerate(tasks, start=1):
+            tid = t.get("task_id", idx)
+            row = {
+                "network_id": 1,
+                "repo_id": 1,
+                "repo_name": "linux",
+                "task_type": "stable",
+                "track_name": "stable:v3.0",
+                "ref_name": f"ref-{tid}",
+                "target_sha": "",
+                "commit_id": 0,
+                "base_ref_name": "",
+                "base_commit_id": 0,
+                "priority": 5,
+                "seq_order": 0,
+                "status": "pending",
+                "worker_id": "",
+                "heartbeat_ts": 0,
+                "created_ts": now,
+                "updated_ts": now,
+                "retry_count": 0,
+                "error_msg": "",
+                **t,
+            }
+            self.insert_rows("distributed_tasks", list(row), [tuple(row.values())])
+        return self
+
+    def add_worker_caps(self, *caps: dict) -> DistDB:
+        now = int(time.time())
+        for c in caps:
+            row = {
+                "worker_id": "worker-1",
+                "network_id": 1,
+                "repo_name": "linux",
+                "track_name": "*",
+                "min_seq_order": 0,
+                "max_seq_order": 0,
+                "min_ref": "",
+                "max_ref": "",
+                "supports_preparse": 1,
+                "role": "worker",
+                "local_repo_path": "",
+                "updated_ts": now,
+                **c,
+            }
+            self.insert_rows("distributed_worker_capabilities", list(row), [tuple(row.values())], on_conflict="update")
         return self
 
     def add_nodes(self, *nodes: dict) -> DistDB:
@@ -159,11 +248,27 @@ class DistDB(SQLiteDB):
         return self.select_rows("m_parse_task", _TASK_COLUMNS, order_by=["task_id"], as_dict=True)
 
     @property
+    def dist_tasks(self) -> list[dict]:
+        return self.select_rows("distributed_tasks", _DIST_TASK_COLUMNS, order_by=["task_id"], as_dict=True)
+
+    @property
+    def worker_caps(self) -> list[dict]:
+        return self.select_rows(
+            "distributed_worker_capabilities",
+            _WORKER_CAP_COLUMNS,
+            order_by=["worker_id", "repo_name", "track_name"],
+            as_dict=True,
+        )
+
+    @property
     def nodes(self) -> list[dict]:
         return self.select_rows("m_parse_node", ["node_id", "role", "heartbeat_at"], order_by=["node_id"], as_dict=True)
 
     def task(self, task_id: int) -> dict:
         return next(t for t in self.tasks if t["task_id"] == task_id)
+
+    def dist_task(self, task_id: int) -> dict:
+        return next(t for t in self.dist_tasks if t["task_id"] == task_id)
 
 
 NO_LIVE_DB_ENV = "KIP_NO_LIVE_DB"

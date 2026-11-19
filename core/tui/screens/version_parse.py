@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import curses
 import fnmatch
+from pathlib import Path
 from typing import Any
 
 from core.config import (
@@ -531,9 +532,10 @@ class VersionParseScreen(BaseScreen):
             self.status_bar.set_message("Parse cancelled.", color=PAIR_MUTED)
             return False
         if mode == RUN_SAVED and not self._repo_in_saved_config(args["repo"]):
+            cfg_name = Path(str(getattr(self.app, "config_path", "config.json"))).name
             safe_modal_dialog(
                 self.stdscr, "Repository Not Saved",
-                f"'{args['repo']}' is not in the saved config.json.\nChoose 'Save & Parse' to include it.",
+                f"'{args['repo']}' is not in the saved {cfg_name}.\nChoose 'Save & Parse' to include it.",
                 ["OK"],
             )
             return False
@@ -592,10 +594,11 @@ class VersionParseScreen(BaseScreen):
             self.status_bar.set_message("Pre-parse cancelled.", color=PAIR_MUTED)
             return False
         if mode == RUN_SAVED and not self._repo_in_saved_config(args["repo"]):
+            cfg_name = Path(str(getattr(self.app, "config_path", "config.json"))).name
             safe_modal_dialog(
                 self.stdscr,
                 "Repository Not Saved",
-                f"'{args['repo']}' is not in the saved config.json.\nChoose 'Save & Pre-parse' to include it.",
+                f"'{args['repo']}' is not in the saved {cfg_name}.\nChoose 'Save & Pre-parse' to include it.",
                 ["OK"],
             )
             return False

@@ -1342,5 +1342,70 @@ class TestResolveBatchTimeBudget(unittest.TestCase):
         self.assertEqual(feat.merge_branch, "v6.1-fixes")
 
 
+class TestRemoteDaemonBundle(unittest.TestCase):
+    """Verify remote ml_server code sync includes db_engine/core and imports without mysql.connector."""
+
+    def test_remote_daemon_bundle_imports_ml_server_isolated_without_mysql(self) -> None:
+        import io
+        import subprocess
+        import sys
+        import tarfile
+        from parser.mailing_list.ml_client import _build_remote_daemon_bundle
+
+        repo_root = Path(__file__).resolve().parents[1]
+        bundle = _build_remote_daemon_bundle(repo_root)
+        with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+            names = [m.name for m in tf.getmembers()]
+            for required in (
+                "parser/mailing_list/ml_server.py",
+                "parser/mailing_list/ml_store.py",
+                "db_engine/__init__.py",
+                "db_engine/errors.py",
+                "db_engine/foreign.py",
+                "db_engine/spec.py",
+                "core/__init__.py",
+                "core/DBLayout.py",
+            ):
+                self.assertIn(required, names)
+            self.assertFalse(any("__pycache__" in n or n.endswith(".pyc") for n in names))
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tf.extractall(tmp)
+                script = (
+                    "import sys;"
+                    f"sys.path.insert(0, {tmp!r});"
+                    "sys.modules['mysql'] = None;"
+                    "sys.modules['mysql.connector'] = None;"
+                    "import parser.mailing_list.ml_server as s;"
+                    "assert hasattr(s, 'DAEMON_VERSION')"
+                )
+                res = subprocess.run(
+                    [sys.executable, "-I", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(res.returncode, 0, f"Isolated import failed:\n{res.stderr}\n{res.stdout}")
+
+    def test_sync_remote_daemon_code_pipes_bundle_over_ssh(self) -> None:
+        from unittest import mock
+        from parser.mailing_list.ml_client import _sync_remote_daemon_code
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with mock.patch("parser.mailing_list.ml_client.subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout=b"", stderr=b"")
+            ok = _sync_remote_daemon_code(repo_root, "user@example", 2222, "/tmp/id_ed25519")
+
+        self.assertTrue(ok)
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.args[0]
+        kwargs = mock_run.call_args.kwargs
+        self.assertEqual(cmd[:5], ["ssh", "-p", "2222", "-o", "BatchMode=yes"])
+        self.assertIn("user@example", cmd)
+        self.assertIn("tar -xzf - -C ~/KernelInfo-Parser", cmd[-1])
+        self.assertIsInstance(kwargs["input"], bytes)
+        self.assertGreater(len(kwargs["input"]), 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

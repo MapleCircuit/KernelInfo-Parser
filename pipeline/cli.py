@@ -17,6 +17,7 @@ from core.config import (
     sync_repositories,
     normalize_memory_mode,
 )
+from core.distributed import resolve_poll_settings
 from core.logging_setup import setup_parser_logging
 from core.ssh_tunnel import start_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler
@@ -557,9 +558,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--role",
         dest="role",
-        choices=["standalone", "master", "worker"],
+        choices=["standalone", "master", "worker", "daemon"],
         default=None,
-        help="Opt-in distributed parsing role: 'standalone' (default, single computer), 'master' (mainline only, coordinates tasks), or 'worker' (parses delegated stable/past branches)",
+        help=(
+            "Opt-in operational role: 'standalone' (default, single computer one-shot run), "
+            "'master' (singleton mainline coordinator publishing delegated tasks), "
+            "'worker' (leases and parses delegated tasks), or "
+            "'daemon' (singleton continuous service managing git updates, task scheduling, and zombie recovery)"
+        ),
     )
     parser.add_argument(
         "--worker-id",
@@ -594,6 +600,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="In worker role, exit when queue is empty instead of waiting for more versions from master",
     )
+    parser.add_argument(
+        "--force-singleton",
+        dest="force_singleton",
+        action="store_true",
+        default=False,
+        help="Override an existing singleton PID lock or active node registration for master/daemon roles",
+    )
+    parser.add_argument(
+        "--lock-dir",
+        dest="lock_dir",
+        default=None,
+        help="Directory for singleton master/daemon PID lock files (default: KERNELINFO_LOCK_DIR or system temp)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        dest="poll_interval",
+        type=int,
+        default=None,
+        help="Polling interval in seconds for daemon/worker coordination loops (default: from config or 60)",
+    )
+    parser.add_argument(
+        "--daemon-once",
+        dest="daemon_once",
+        action="store_true",
+        default=False,
+        help="In daemon role, execute a single poll/reconciliation cycle and exit",
+    )
+    parser.add_argument(
+        "--no-git-update",
+        dest="no_git_update",
+        action="store_true",
+        default=False,
+        help="Disable automatic periodic git updates in daemon mode",
+    )
+    parser.add_argument(
+        "--git-update-interval",
+        dest="git_update_interval",
+        type=int,
+        default=None,
+        help="Minimum interval in seconds between automatic git updates in daemon mode (default: from config or 300)",
+    )
     return parser
 
 
@@ -619,14 +666,20 @@ def arg_handling() -> argparse.Namespace:
             setattr(args, key, value)
         init_config(args.config)
     else:
-        cfg_file = find_config_path(args.config)
-        launch_tui = bool(getattr(args, "configure", False)) or (
-            cfg_file is None
-            and sys.stdin.isatty()
-            and args.unit_test is None
-            and not args.detect_repos
-            and not getattr(args, "worker_once", False)
-        )
+        if getattr(args, "configure", False):
+            # Allow --configure --config <new_path> before <new_path> exists on disk.
+            launch_tui = True
+        else:
+            cfg_file = find_config_path(args.config)
+            launch_tui = (
+                cfg_file is None
+                and sys.stdin.isatty()
+                and args.unit_test is None
+                and not args.detect_repos
+                and not getattr(args, "worker_once", False)
+                and not getattr(args, "daemon_once", False)
+                and getattr(args, "role", None) != "daemon"
+            )
         if launch_tui:
             from core.tui.app import run_config_tui_launch
             launch = run_config_tui_launch(args.config)
@@ -667,6 +720,7 @@ def arg_handling() -> argparse.Namespace:
     if args.unit_test is None:
         setup_parser_logging()
     dist_cfg = parser_cfg.get("distributed", {}) if isinstance(parser_cfg, dict) else {}
+    poll_cfg = resolve_poll_settings(dist_cfg)
     if getattr(args, "role", None) is None:
         args.role = dist_cfg.get("role", "standalone") if dist_cfg.get("enabled", False) else "standalone"
     if getattr(args, "worker_id", None) is None:
@@ -676,6 +730,16 @@ def arg_handling() -> argparse.Namespace:
     if getattr(args, "delegate_branches", None) is None:
         # None (key absent or null): every non-trunk branch is discovered and delegated; [] delegates none
         args.delegate_branches = dist_cfg.get("delegate_branches")
+    if not getattr(args, "lock_dir", None):
+        args.lock_dir = poll_cfg["lock_dir"]
+    if getattr(args, "poll_interval", None) is None or args.poll_interval <= 0:
+        args.poll_interval = poll_cfg["poll_interval_seconds"]
+    if getattr(args, "no_git_update", False):
+        args.git_auto_update = False
+    elif getattr(args, "git_auto_update", None) is None:
+        args.git_auto_update = poll_cfg["git_auto_update"]
+    if getattr(args, "git_update_interval", None) is None or args.git_update_interval <= 0:
+        args.git_update_interval = poll_cfg["git_update_interval_seconds"]
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
     ml_cfg = get_mailing_list_config()

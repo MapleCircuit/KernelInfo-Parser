@@ -9,13 +9,16 @@ Coordinates Master and Secondary (Worker) parser instances sharing a MariaDB dat
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import json
 import logging
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import subprocess as sp
+import tempfile
 import threading
 import time
 from typing import Any
@@ -23,7 +26,7 @@ from typing import Any
 from core.DBLayout import TABLES, m_ingest_blob, m_ingest_state, m_parse_node, m_parse_task
 from core.ingest_state import INGEST_DONE, INGEST_PARSING, rollback_version
 from db_engine import DBError
-from db_engine.spec import AnyOf, Case, Join, ge, gt, is_null, le, like, lt, ne, not_null
+from db_engine.spec import AnyOf, Case, Join, ge, gt, is_null, le, like, lt, not_null
 from parser.git_ast import release_order
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,9 @@ logger = logging.getLogger(__name__)
 ROLE_STANDALONE = "standalone"
 ROLE_MASTER = "master"
 ROLE_WORKER = "worker"
+ROLE_DAEMON = "daemon"
+VALID_ROLES = (ROLE_STANDALONE, ROLE_MASTER, ROLE_WORKER, ROLE_DAEMON)
+SINGLETON_ROLES = (ROLE_MASTER, ROLE_DAEMON)
 
 # Task statuses in m_parse_task
 TASK_PENDING = 0     # Waiting for base_commit_id to reach INGEST_DONE
@@ -42,8 +48,47 @@ TASK_DONE = 3        # Ingest completed successfully
 TASK_FAILED = 4      # Failed after maximum retries
 TASK_RECLAIMING = 5  # Lease expired / reclaimed; rollback in progress before re-enqueue or failure
 
+# Task statuses in distributed_tasks
+DIST_STATUS_PENDING = "pending"
+DIST_STATUS_CLAIMED = "claimed"
+DIST_STATUS_COMPLETED = "completed"
+DIST_STATUS_FAILED = "failed"
+
+# Task priorities in distributed_tasks
+PRIORITY_MAIN = 10
+PRIORITY_STABLE = 5
+PRIORITY_PREPARSE = 1
+
 DEFAULT_LEASE_TTL = 180
 DEFAULT_HEARTBEAT_INTERVAL = 30
+DEFAULT_POLL_INTERVAL = 60
+DEFAULT_GIT_UPDATE_INTERVAL = 300
+
+
+def _positive_int(cfg: Mapping[str, Any], keys: tuple[str, ...], default: int) -> int:
+    """Return the first positive integer setting under `keys` in `cfg`, else `default`."""
+    for key in keys:
+        if key not in cfg or cfg[key] is None:
+            continue
+        raw = cfg[key]
+        if isinstance(raw, bool):
+            continue
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return val if val > 0 else default
+    return default
+
+
+def _resolve_lock_dir(lock_dir: str | Path | None = None) -> Path:
+    """Resolve singleton lock directory from argument, `KERNELINFO_LOCK_DIR`, or system temp."""
+    if lock_dir is not None and str(lock_dir).strip():
+        return Path(str(lock_dir).strip())
+    env_dir = os.environ.get("KERNELINFO_LOCK_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path(tempfile.gettempdir()) / "kernelinfo-locks"
 
 
 def resolve_lease_settings(dist_cfg: Any) -> tuple[int, int]:
@@ -52,18 +97,202 @@ def resolve_lease_settings(dist_cfg: Any) -> tuple[int, int]:
     Reads `lease_ttl_seconds` and `heartbeat_seconds`; a missing or non-positive value takes its default. The
     lease is raised to at least twice the heartbeat interval so a live node always renews before it expires.
     """
-    cfg = dist_cfg if isinstance(dist_cfg, dict) else {}
-
-    def _positive(key: str, default: int) -> int:
-        try:
-            val = int(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-        return val if val > 0 else default
-
-    interval = _positive("heartbeat_seconds", DEFAULT_HEARTBEAT_INTERVAL)
-    lease_ttl = max(_positive("lease_ttl_seconds", DEFAULT_LEASE_TTL), 2 * interval)
+    cfg = dist_cfg if isinstance(dist_cfg, Mapping) else {}
+    interval = _positive_int(cfg, ("heartbeat_seconds",), DEFAULT_HEARTBEAT_INTERVAL)
+    lease_ttl = max(_positive_int(cfg, ("lease_ttl_seconds",), DEFAULT_LEASE_TTL), 2 * interval)
     return lease_ttl, interval
+
+
+def resolve_poll_settings(dist_cfg: Any) -> dict[str, Any]:
+    """Resolve polling, git auto-update, and lock directory defaults from `parser.distributed`."""
+    from core.config import _coerce_bool
+
+    cfg = dist_cfg if isinstance(dist_cfg, Mapping) else {}
+    return {
+        "poll_interval_seconds": _positive_int(
+            cfg, ("poll_interval_seconds", "poll_interval"), DEFAULT_POLL_INTERVAL
+        ),
+        "git_auto_update": _coerce_bool(cfg.get("git_auto_update"), True),
+        "git_update_interval_seconds": _positive_int(
+            cfg, ("git_update_interval_seconds", "git_update_interval"), DEFAULT_GIT_UPDATE_INTERVAL
+        ),
+        "lock_dir": str(_resolve_lock_dir(cfg.get("lock_dir"))),
+    }
+
+
+class SingletonRoleConflictError(RuntimeError):
+    """Raised when a singleton role (`master` or `daemon`) conflicts with an active holder."""
+
+
+class SingletonProcessLock:
+    """Exclusive OS-level `flock` PID lock file protecting singleton `master`/`daemon` roles."""
+
+    def __init__(
+        self,
+        role: str,
+        network_id: int = 1,
+        node_id: str = "",
+        lock_dir: str | Path | None = None,
+    ) -> None:
+        self.role = str(role)
+        self.network_id = int(network_id)
+        self.node_id = str(node_id or "")
+        self.lock_dir = _resolve_lock_dir(lock_dir)
+        self.lock_path = self.lock_dir / f"kernelinfo-{self.role}-net{self.network_id}.lock"
+        self._fd: int | None = None
+        self._started_at: int = 0
+        self._hostname: str = socket.gethostname() or ""
+        self._io_lock = threading.Lock()
+
+    def _conflict_error(self, holder: Mapping[str, Any]) -> SingletonRoleConflictError:
+        pid = holder.get("pid", "unknown")
+        node_id = holder.get("node_id") or "unknown"
+        hostname = holder.get("hostname") or "unknown"
+        return SingletonRoleConflictError(
+            f"Singleton lock conflict for role '{self.role}' on network {self.network_id}: "
+            f"lock file '{self.lock_path}' is already held by PID {pid} "
+            f"(node_id='{node_id}', hostname='{hostname}'). "
+            f"Pass --force-singleton to override."
+        )
+
+    def _write_metadata(self, heartbeat_at: int) -> None:
+        if self._fd is None:
+            return
+        payload = {
+            "pid": os.getpid(),
+            "node_id": self.node_id,
+            "role": self.role,
+            "hostname": self._hostname,
+            "network_id": self.network_id,
+            "started_at": self._started_at,
+            "heartbeat_at": int(heartbeat_at),
+        }
+        data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        os.ftruncate(self._fd, 0)
+        view = memoryview(data)
+        written = 0
+        while written < len(data):
+            written += os.write(self._fd, view[written:])
+        os.fsync(self._fd)
+
+    def acquire(self, force: bool = False) -> Path:
+        """Acquire exclusive non-blocking `flock` on `lock_path` and persist holder metadata."""
+        if self.role not in SINGLETON_ROLES:
+            raise ValueError(
+                f"Role '{self.role}' is not a singleton role (expected one of {SINGLETON_ROLES})."
+            )
+        with self._io_lock:
+            if self._fd is not None:
+                return self.lock_path
+            self.lock_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as exc:
+                holder = self.read_holder() or {}
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                if not force:
+                    raise self._conflict_error(holder) from exc
+                logger.warning(
+                    "[Distributed] Forcing singleton lock takeover for role '%s' (network %s) at '%s' "
+                    "(previous holder pid=%s node_id='%s' hostname='%s').",
+                    self.role,
+                    self.network_id,
+                    self.lock_path,
+                    holder.get("pid", "unknown"),
+                    holder.get("node_id") or "unknown",
+                    holder.get("hostname") or "unknown",
+                )
+                with contextlib.suppress(FileNotFoundError):
+                    self.lock_path.unlink()
+                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError) as retry_exc:
+                    retry_holder = self.read_holder() or holder
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise self._conflict_error(retry_holder) from retry_exc
+
+            try:
+                now = int(time.time())
+                self._started_at = now
+                self._fd = fd
+                self._write_metadata(now)
+            except Exception:
+                self._fd = None
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            return self.lock_path
+
+    def touch_heartbeat(self, now: int | None = None) -> None:
+        """Update `heartbeat_at` in the open lock file while holding the exclusive lock."""
+        with self._io_lock:
+            if self._fd is None:
+                return
+            ts = int(time.time()) if now is None else int(now)
+            self._write_metadata(ts)
+
+    def read_holder(self) -> dict[str, Any] | None:
+        """Read current JSON holder metadata from `lock_path` if present and valid."""
+        try:
+            raw = self.lock_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not raw.strip():
+            return None
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def release(self) -> None:
+        """Idempotently unlink own lock inode, release `flock`, and close file descriptor."""
+        with self._io_lock:
+            fd = self._fd
+            if fd is None:
+                return
+            self._fd = None
+            try:
+                if os.fstat(fd).st_ino == os.stat(self.lock_path).st_ino:
+                    with contextlib.suppress(FileNotFoundError, OSError):
+                        self.lock_path.unlink()
+            except OSError:
+                pass
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+    def __enter__(self) -> SingletonProcessLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+def acquire_singleton_lock(
+    role: str,
+    network_id: int = 1,
+    node_id: str = "",
+    *,
+    lock_dir: str | Path | None = None,
+    force: bool = False,
+) -> SingletonProcessLock | None:
+    """Acquire a `SingletonProcessLock` for `master`/`daemon`, returning `None` for other roles."""
+    if role not in SINGLETON_ROLES:
+        return None
+    lock = SingletonProcessLock(role, network_id=network_id, node_id=node_id, lock_dir=lock_dir)
+    lock.acquire(force=force)
+    return lock
 
 
 def get_default_node_id(role: str, worker_id: str | None = None) -> str:
@@ -96,7 +325,17 @@ def ensure_distributed_tables(db: Any) -> None:
     """Create missing distributed coordination tables if not existing."""
     if db is None:
         return
-    needed = [t for t in TABLES if t.table_name in ("m_table_sequence", "m_ingest_id_range", "m_parse_node", "m_parse_task")]
+    needed = [
+        t for t in TABLES
+        if t.table_name in (
+            "m_table_sequence",
+            "m_ingest_id_range",
+            "m_parse_node",
+            "m_parse_task",
+            "distributed_tasks",
+            "distributed_worker_capabilities",
+        )
+    ]
     missing = db.test_tables(needed)
     if missing:
         db.create_table([t for t in needed if t.table_name in missing])
@@ -114,28 +353,47 @@ def ensure_distributed_tables(db: Any) -> None:
         logger.warning(f"Index check on m_ingest_blob(blob_id): {e}")
 
 
-def _other_active_master(db: Any, network_id: int, node_id: str, now: int) -> tuple | None:
-    """(node_id,) of another master node with a heartbeat in the last 120 seconds, or None."""
-    return db.select_one(
+def _active_singleton_nodes(
+    db: Any,
+    network_id: int,
+    role: str,
+    now: int,
+    heartbeat_timeout: int = 120,
+) -> list[str]:
+    """Return active `node_id`s of `(network_id, role)` ordered deterministically."""
+    rows = db.select_rows(
         "m_parse_node",
         ["node_id"],
-        {"network_id": network_id, "role": ROLE_MASTER, "heartbeat_at": ge(now - 120), "node_id": ne(node_id)},
+        {"network_id": network_id, "role": role, "heartbeat_at": ge(now - heartbeat_timeout)},
+        order_by=["node_id"],
         as_dict=False,
     )
+    return [str(r[0]) for r in rows if r and r[0]]
 
 
-def register_node(db: Any, node_id: str, role: str, network_id: int = 1) -> None:
-    """Register parser node in m_parse_node."""
+def register_node(
+    db: Any,
+    node_id: str,
+    role: str,
+    network_id: int = 1,
+    *,
+    force: bool = False,
+    heartbeat_timeout: int = 120,
+) -> None:
+    """Register parser node in m_parse_node, enforcing singleton exclusivity for master/daemon roles."""
     if db is None:
         return
     hostname = socket.gethostname() or ""
     pid = os.getpid()
     now = int(time.time())
-    if role == ROLE_MASTER:
-        row = _other_active_master(db, network_id, node_id, now)
-        if row:
-            other_id = row[0]
-            raise RuntimeError(f"Another master node '{other_id}' is already active for network {network_id}.")
+    if role in SINGLETON_ROLES and not force:
+        active_ids = _active_singleton_nodes(db, network_id, role, now, heartbeat_timeout)
+        others = [nid for nid in active_ids if nid != node_id]
+        if others:
+            other_id = others[0]
+            raise SingletonRoleConflictError(
+                f"Another {role} node '{other_id}' is already active for network {network_id}."
+            )
     db.insert_rows(
         "m_parse_node",
         ["node_id", "network_id", "role", "hostname", "pid", "active_commit_id", "heartbeat_at"],
@@ -143,24 +401,29 @@ def register_node(db: Any, node_id: str, role: str, network_id: int = 1) -> None
         on_conflict="update",
         update_columns=["network_id", "role", "hostname", "pid", "active_commit_id", "heartbeat_at"],
     )
-    if role == ROLE_MASTER:
-        # Re-check after insertion to prevent concurrent master registration race
-        row = _other_active_master(db, network_id, node_id, now)
-        if row:
-            other_id = row[0]
-            if other_id < node_id:
-                db.delete_rows("m_parse_node", {"node_id": node_id})
-                raise RuntimeError(f"Another master node '{other_id}' is already active for network {network_id}.")
+    if role in SINGLETON_ROLES and not force:
+        # Symmetric post-insert race check: lowest lexicographical node_id retains singleton ownership
+        active_ids = _active_singleton_nodes(db, network_id, role, now, heartbeat_timeout)
+        if active_ids and active_ids[0] != node_id:
+            other_id = active_ids[0]
+            db.delete_rows("m_parse_node", {"node_id": node_id})
+            raise SingletonRoleConflictError(
+                f"Another {role} node '{other_id}' is already active for network {network_id}."
+            )
     logger.info(f"[Distributed] Registered {role} parser node '{node_id}' (PID {pid}).")
 
 
 def unregister_node(db: Any, node_id: str) -> None:
-    """Remove parser node from m_parse_node on shutdown."""
+    """Remove parser node and worker capabilities on shutdown."""
     if db is None:
         return
     try:
         db.delete_rows("m_parse_node", {"node_id": node_id})
     except Exception:  # best effort at shutdown (the database may already be unreachable)
+        pass
+    try:
+        db.unregister_worker_capabilities(node_id)
+    except Exception:  # best effort at shutdown (method or table may be unavailable)
         pass
     logger.info(f"[Distributed] Unregistered parser node '{node_id}'.")
 
@@ -174,6 +437,7 @@ def update_node_heartbeat(
     role: str = "worker",
     network_id: int = 1,
     allow_insert: bool = True,
+    current_dist_task_id: int | None = None,
 ) -> None:
     """Update heartbeat timestamp and renew active task lease."""
     if db is None:
@@ -202,6 +466,8 @@ def update_node_heartbeat(
                     {"lease_expires_at": now + lease_ttl},
                     {"commit_id": active_commit_id, "worker_id": node_id, "status": TASK_LEASED},
                 )
+            if current_dist_task_id is not None:
+                db.heartbeat_distributed_task(current_dist_task_id, node_id, now=now)
     except Exception as e:
         logger.warning(f"[Distributed] Heartbeat update error for node '{node_id}': {e}")
 
@@ -217,6 +483,7 @@ class NodeHeartbeatDaemon:
         lease_ttl: int = DEFAULT_LEASE_TTL,
         role: str = "worker",
         network_id: int = 1,
+        singleton_lock: SingletonProcessLock | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.node_id = node_id
@@ -224,8 +491,10 @@ class NodeHeartbeatDaemon:
         self.lease_ttl = lease_ttl
         self.role = role
         self.network_id = network_id
+        self.singleton_lock = singleton_lock
         self.active_commit_id: int = 0
         self.current_task_id: int | None = None
+        self.current_dist_task_id: int | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -239,18 +508,26 @@ class NodeHeartbeatDaemon:
             self._thread = threading.Thread(target=self._run, name=f"Heartbeat-{self.node_id}", daemon=True)
             self._thread.start()
 
-    def set_active(self, commit_id: int, task_id: int | None = None) -> None:
-        """Set active commit and task currently being parsed."""
+    def set_active(
+        self,
+        commit_id: int,
+        task_id: int | None = None,
+        dist_task_id: int | None = None,
+    ) -> None:
+        """Set active commit and tasks currently being parsed."""
         with self._lock:
             self.active_commit_id = commit_id
             if task_id is not None or self.current_task_id is None:
                 self.current_task_id = task_id
+            if dist_task_id is not None or self.current_dist_task_id is None:
+                self.current_dist_task_id = dist_task_id
 
     def clear_active(self) -> None:
         """Clear active commit/task when version completes."""
         with self._lock:
             self.active_commit_id = 0
             self.current_task_id = None
+            self.current_dist_task_id = None
 
     def stop(self) -> None:
         """Stop heartbeat thread."""
@@ -266,6 +543,12 @@ class NodeHeartbeatDaemon:
             with self._lock:
                 cid = self.active_commit_id
                 tid = self.current_task_id
+                dtid = self.current_dist_task_id
+            if self.singleton_lock is not None:
+                try:
+                    self.singleton_lock.touch_heartbeat()
+                except Exception as e:
+                    logger.debug(f"[Distributed] Singleton lock heartbeat update failed: {e}")
             try:
                 with self.db_factory() as db:
                     if self._stop_event.is_set():
@@ -279,6 +562,7 @@ class NodeHeartbeatDaemon:
                         role=self.role,
                         network_id=self.network_id,
                         allow_insert=not self._stop_event.is_set(),
+                        current_dist_task_id=dtid,
                     )
             except Exception as e:
                 now = time.time()
@@ -362,14 +646,30 @@ def _load_tag_map(repo_dir: str | Path) -> dict[str, str]:
     return {sha: sorted(names)[0] for sha, names in by_sha.items()}
 
 
+def _resolve_upstream_trunk(repo_dir: str | Path, branch: str) -> str:
+    """Resolve the upstream trunk ref for `branch` dynamically."""
+    if str(branch).startswith("history/"):
+        return "history/master"
+    for candidate in ("master", "main", "origin/master", "origin/main", "HEAD"):
+        chk = sp.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", "--quiet", candidate],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0 and chk.stdout.strip():
+            return candidate
+    return "master"
+
+
 def _resolve_branch_merge_base(
     repo_dir: str | Path,
     branch: str,
     tag_map: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Run `git merge-base` for a branch against its upstream trunk and return `(base_ref, sha)`."""
-    upstream = "history/master" if str(branch).startswith("history/") else "master"
     try:
+        upstream = _resolve_upstream_trunk(repo_dir, branch)
         res = sp.run(
             ["git", "-C", str(repo_dir), "merge-base", str(branch), upstream],
             capture_output=True,
@@ -403,17 +703,20 @@ def _resolve_base_commit_id(
     sha: str,
     version_states: dict[str, tuple[int, str]] | None = None,
 ) -> int:
-    """Resolve database commit_id for a merge-base ref/SHA from `version_states` or `m_commit`."""
-    if not base_ref:
-        return 0
-    if version_states and base_ref in version_states:
-        return version_states[base_ref][0]
-    if db is not None and len(sha) == 40:
-        row = db.select_one(
-            "m_commit", ["commit_id"], {"network_id": network_id, "commit_hash": bytes.fromhex(sha)}, as_dict=False
-        )
-        if row and row[0]:
-            return int(row[0])
+    """Resolve database commit_id for a merge-base ref/SHA from `m_commit` first, then `version_states`."""
+    if db is not None and sha and len(sha) == 40:
+        try:
+            commit_bytes = bytes.fromhex(sha)
+        except ValueError:
+            commit_bytes = None
+        if commit_bytes is not None:
+            row = db.select_one(
+                "m_commit", ["commit_id"], {"network_id": network_id, "commit_hash": commit_bytes}, as_dict=False
+            )
+            if row and row[0]:
+                return int(row[0])
+    if base_ref and version_states and base_ref in version_states:
+        return int(version_states[base_ref][0])
     return 0
 
 
@@ -685,8 +988,40 @@ def claim_next_task(
     now = int(time.time())
     expires_at = now + lease_ttl
 
-    # 1. Try preferred_chain first if specified
-    candidates: list[tuple[int, str, str, str, int, str, int]] = []
+    def _try_claim(cands: Sequence[tuple[int, str, str, str, int, str, int]]) -> dict[str, Any] | None:
+        for t_id, c_name, c_kind, r_name, cid, b_name, b_cid in cands:
+            # Atomic claim: only one worker changes the row from ELIGIBLE (the affected-row count tells who won)
+            rc = db.update_rows(
+                "m_parse_task",
+                {"status": TASK_LEASED, "worker_id": worker_id, "lease_expires_at": expires_at},
+                {"task_id": t_id, "status": TASK_ELIGIBLE},
+            )
+            if rc and rc > 0:
+                fresh_row = db.select_one(
+                    "m_parse_task", ["commit_id", "base_commit_id", "base_ref_name"], {"task_id": t_id}, as_dict=False
+                )
+                if fresh_row:
+                    cid = int(fresh_row[0] or 0)
+                    b_cid = int(fresh_row[1] or 0)
+                    b_name = str(fresh_row[2] or "")
+                logger.info(
+                    f"[Distributed] Worker '{worker_id}' successfully leased task {t_id}: "
+                    f"'{r_name}' (chain '{c_name}', base '{b_name}', commit_id {cid})."
+                )
+                return {
+                    "task_id": t_id,
+                    "chain_name": c_name,
+                    "chain_kind": c_kind,
+                    "ref_name": r_name,
+                    "commit_id": cid,
+                    "base_ref_name": b_name,
+                    "base_commit_id": b_cid,
+                }
+        return None
+
+    tried_ids: set[int] = set()
+
+    # 1. Try preferred_chain first if specified; fall through to general scan if all CAS attempts lose
     if preferred_chain:
         rows = db.select_rows(
             "m_parse_task",
@@ -696,60 +1031,32 @@ def claim_next_task(
             limit=5,
             as_dict=False,
         )
-        candidates = [
+        pref_candidates = [
             (int(r[0]), str(r[1]), str(r[2]), str(r[3]), int(r[4]), str(r[5]), int(r[6]))
             for r in rows
         ]
+        tried_ids.update(c[0] for c in pref_candidates)
+        claimed = _try_claim(pref_candidates)
+        if claimed is not None:
+            return claimed
 
-    # 2. If no candidate in preferred chain, scan across all eligible tasks, oldest release first
-    if not candidates:
-        rows = db.select_rows(
-            "m_parse_task",
-            _CLAIM_COLUMNS,
-            {"network_id": network_id, "status": TASK_ELIGIBLE},
-            order_by=[_CLAIM_ORDER, "chain_name", "seq_order"],
-            limit=_CLAIM_SCAN_LIMIT,
-            as_dict=False,
-        )
-        candidates = [
-            (int(r[0]), str(r[1]), str(r[2]), str(r[3]), int(r[4]), str(r[5]), int(r[6]))
-            for r in rows
-        ]
-        # SQL orders chain names as text (stable:v3.0 < stable:v3.10 < stable:v2.6.11 by length or bytes)
-        candidates.sort(key=lambda c: (_claim_priority(c[1], c[2]), release_order.release_key(c[3])))
-        candidates = candidates[:10]
-
-    for cand in candidates:
-        t_id, c_name, c_kind, r_name, cid, b_name, b_cid = cand
-        # Atomic claim: only one worker changes the row from ELIGIBLE (the affected-row count tells who won)
-        rc = db.update_rows(
-            "m_parse_task",
-            {"status": TASK_LEASED, "worker_id": worker_id, "lease_expires_at": expires_at},
-            {"task_id": t_id, "status": TASK_ELIGIBLE},
-        )
-        if rc and rc > 0:
-            fresh_row = db.select_one(
-                "m_parse_task", ["commit_id", "base_commit_id", "base_ref_name"], {"task_id": t_id}, as_dict=False
-            )
-            if fresh_row:
-                cid = int(fresh_row[0] or 0)
-                b_cid = int(fresh_row[1] or 0)
-                b_name = str(fresh_row[2] or "")
-            logger.info(
-                f"[Distributed] Worker '{worker_id}' successfully leased task {t_id}: "
-                f"'{r_name}' (chain '{c_name}', base '{b_name}', commit_id {cid})."
-            )
-            return {
-                "task_id": t_id,
-                "chain_name": c_name,
-                "chain_kind": c_kind,
-                "ref_name": r_name,
-                "commit_id": cid,
-                "base_ref_name": b_name,
-                "base_commit_id": b_cid,
-            }
-
-    return None
+    # 2. Scan across all eligible tasks, oldest release first
+    rows = db.select_rows(
+        "m_parse_task",
+        _CLAIM_COLUMNS,
+        {"network_id": network_id, "status": TASK_ELIGIBLE},
+        order_by=[_CLAIM_ORDER, "chain_name", "seq_order"],
+        limit=_CLAIM_SCAN_LIMIT,
+        as_dict=False,
+    )
+    candidates = [
+        (int(r[0]), str(r[1]), str(r[2]), str(r[3]), int(r[4]), str(r[5]), int(r[6]))
+        for r in rows
+        if int(r[0]) not in tried_ids
+    ]
+    # SQL orders chain names as text (stable:v3.0 < stable:v3.10 < stable:v2.6.11 by length or bytes)
+    candidates.sort(key=lambda c: (_claim_priority(c[1], c[2]), release_order.release_key(c[3])))
+    return _try_claim(candidates[:10])
 
 
 def check_lease_held(db: Any, task_id: int, worker_id: str) -> bool:
@@ -1097,3 +1404,148 @@ def is_parsing_finished(db: Any, network_id: int, master_heartbeat_timeout: int 
 
     # Only return True if all pending tasks cannot be unblocked (all their bases are failed or missing)
     return True
+
+
+def recover_zombie_tasks(
+    db: Any,
+    network_id: int = 1,
+    timeout_seconds: int = DEFAULT_LEASE_TTL,
+    *,
+    now: int | None = None,
+    task_ids: Sequence[int] | None = None,
+) -> int:
+    """Reset claimed `distributed_tasks` whose heartbeat expired back to `pending`."""
+    if db is None:
+        return 0
+    recovered = db.reset_zombie_distributed_tasks(
+        network_id,
+        timeout_seconds,
+        now=now,
+        task_ids=task_ids,
+    )
+    if recovered:
+        logger.warning(f"[Distributed] Recovered {recovered} zombie task(s) on network {network_id}.")
+    return int(recovered or 0)
+
+
+def register_worker_capabilities(
+    db: Any,
+    worker_id: str,
+    network_id: int,
+    capabilities: Sequence[Mapping[str, Any]],
+    *,
+    role: str = ROLE_WORKER,
+    now: int | None = None,
+) -> int:
+    """Register local repository/track capabilities for `worker_id` in `distributed_worker_capabilities`."""
+    if db is None:
+        return 0
+    return int(
+        db.register_worker_capabilities(
+            worker_id,
+            network_id,
+            capabilities,
+            role=role,
+            now=now,
+        )
+        or 0
+    )
+
+
+def claim_distributed_task(
+    db: Any,
+    network_id: int,
+    worker_id: str,
+    *,
+    min_priority: int | None = None,
+    max_priority: int | None = None,
+    task_types: Sequence[str] | None = None,
+    repo_name: str | None = None,
+    preferred_track: str | None = None,
+    now: int | None = None,
+    scan_limit: int = 20,
+) -> dict[str, Any] | None:
+    """Claim the highest-priority pending task in `distributed_tasks` matching `worker_id` capabilities."""
+    if db is None:
+        return None
+    return db.claim_distributed_task(
+        network_id,
+        worker_id,
+        min_priority=min_priority,
+        max_priority=max_priority,
+        task_types=task_types,
+        repo_name=repo_name,
+        preferred_track=preferred_track,
+        now=now,
+        scan_limit=scan_limit,
+    )
+
+
+def complete_distributed_task(
+    db: Any,
+    task_id: int,
+    commit_id: int,
+    *,
+    worker_id: str | None = None,
+    ref_name: str | None = None,
+    network_id: int | None = None,
+    now: int | None = None,
+) -> bool:
+    """Mark a claimed `distributed_tasks` row completed and backfill dependent `base_commit_id`."""
+    if db is None:
+        return False
+    return bool(
+        db.complete_distributed_task(
+            task_id,
+            commit_id,
+            worker_id=worker_id,
+            ref_name=ref_name,
+            network_id=network_id,
+            now=now,
+        )
+    )
+
+
+def fail_distributed_task(
+    db: Any,
+    task_id: int,
+    error_msg: str,
+    *,
+    worker_id: str | None = None,
+    max_attempts: int = 3,
+    now: int | None = None,
+) -> int:
+    """Record a failure on a claimed `distributed_tasks` row; retries as `pending` until `max_attempts`."""
+    if db is None:
+        return 0
+    return int(
+        db.fail_distributed_task(
+            task_id,
+            error_msg,
+            worker_id=worker_id,
+            max_attempts=max_attempts,
+            now=now,
+        )
+        or 0
+    )
+
+
+def release_distributed_task(
+    db: Any,
+    task_id: int,
+    reason: str,
+    worker_id: str,
+    *,
+    now: int | None = None,
+) -> bool:
+    """Return a claimed `distributed_tasks` row to `pending` without incrementing `retry_count`."""
+    if db is None:
+        return False
+    return bool(
+        db.release_distributed_task(
+            task_id,
+            reason,
+            worker_id,
+            now=now,
+        )
+    )

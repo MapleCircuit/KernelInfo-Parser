@@ -23,6 +23,7 @@ from pipeline.external_steps import processing_kapi, processing_source_facts
 from pipeline.file_references import processing_file_references
 from pipeline.git_commit_worker import _start_git_commit_worker
 from pipeline.git_ingest import _ensure_full_checkpoint, create_new_vid, finish_version_ingest
+from pipeline.git_sync import git_repo_lock
 from pipeline.maintainers import processing_maintainer_files
 from pipeline.multicore import trigger_multicore
 from pipeline.scheduler import DependencyScheduler
@@ -55,9 +56,11 @@ def _has_peer_nodes() -> bool:
         return True
 
 
-def update(version: str, repo_path: str | None = None) -> None:
+def update(version: str, repo_path: str | None = None) -> bool:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
-    
+
+    Returns True when the version completed (or was already ingested), False when halted early by deadline.
+
     Workflow Steps:
     1. Register/synchronize version in `m_git_ref` via `create_new_vid()`.
     1.5 Expand the previous version's checkpoint if it is stored as a delta (core/checkpoints.py).
@@ -78,13 +81,15 @@ def update(version: str, repo_path: str | None = None) -> None:
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 1: Git Ref Synchronization"):
         gp.init_cs_dict()
-        if create_new_vid(version):
+        with git_repo_lock(MF.get_repo_dir(), exclusive=False):
+            already = create_new_vid(version)
+        if already:
             logger.info(COLOR.yellow(f"=======================Version/Ref '{version}' already exists in DB. Skipping======================="))
-            return
+            return True
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 1. Halting '{version}' early."))
-        return
+        return False
 
     logger.info(COLOR.green(f"=======================Working on {version} (commit_id {gp.VID})======================="))
 
@@ -119,55 +124,57 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 2. Halting '{version}' early."))
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 3: Clone repository branch version to RAMDISK workspace
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 3: Branch Checkout"):
         # Rewrites only the files that differ from the previous version when the workspace holds it
-        MF.checkout_version(version, gp.Old_Version_Name, gp.PURGE_LIST)
+        with git_repo_lock(MF.get_repo_dir(), exclusive=False):
+            MF.checkout_version(version, gp.Old_Version_Name, gp.PURGE_LIST)
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 3. Halting '{version}' early."))
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 4: Generate git diff change list & extract Git blob hashes
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 4: Tree Diff & Blob Hashes"):
-        MF.generate_change_list(gp)
+        with git_repo_lock(MF.get_repo_dir(), exclusive=False):
+            MF.generate_change_list(gp)
 
-        if hasattr(MF, "git_tree_blobs"):
-            file_blob_hashes = MF.git_tree_blobs(version)
-        else:
-            git_dir = MF._get_git_dir()
-            ls_res = sp.run(
-                ["git", f"--git-dir={git_dir}", "ls-tree", "-r", f"{version}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if ls_res.returncode != 0:
-                # Without blob hashes every parsed file would share the all-zero hash (one m_file_blob row per type)
-                raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
-            file_blob_hashes = {}
-            for line in ls_res.stdout.splitlines():
-                if not line:
-                    continue
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    path = parts[1]
-                    meta = parts[0].split()
-                    if len(meta) >= 3 and meta[1] == "blob":
-                        h_hex = meta[2]
-                        if len(h_hex) == 40:
-                            file_blob_hashes[path] = bytes.fromhex(h_hex)
+            if hasattr(MF, "git_tree_blobs"):
+                file_blob_hashes = MF.git_tree_blobs(version)
+            else:
+                git_dir = MF._get_git_dir()
+                ls_res = sp.run(
+                    ["git", f"--git-dir={git_dir}", "ls-tree", "-r", f"{version}"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if ls_res.returncode != 0:
+                    # Without blob hashes every parsed file would share the all-zero hash (one m_file_blob row per type)
+                    raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
+                file_blob_hashes = {}
+                for line in ls_res.stdout.splitlines():
+                    if not line:
+                        continue
+                    parts = line.split("\t", 1)
+                    if len(parts) == 2:
+                        path = parts[1]
+                        meta = parts[0].split()
+                        if len(meta) >= 3 and meta[1] == "blob":
+                            h_hex = meta[2]
+                            if len(h_hex) == 40:
+                                file_blob_hashes[path] = bytes.fromhex(h_hex)
         gp.file_blob_hashes = file_blob_hashes
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 4. Halting '{version}' early."))
-        return
+        return False
 
     # Parse this version's git commits in the background while blobs are deduplicated and files parsed;
     # forked before the TableEngine preload so the child shares as little parent memory as possible
@@ -200,7 +207,7 @@ def update(version: str, repo_path: str | None = None) -> None:
             G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 5 & 6: Spawn multicore workers to parse files & stream ChangeSet execution
@@ -221,7 +228,7 @@ def update(version: str, repo_path: str | None = None) -> None:
             G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 6.1: Resolve Symbolic Links & Alias directly in m_bridge_file
@@ -231,24 +238,29 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached before Git commits. Finalizing '{version}'..."))
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all()
         G.TE.close()
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 6.5: Parse Git Commits, Multi-Contributors & Bridge Tags to Commits
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 6.5: Git Commits & Contributors"):
-        processing_git_commits(version)
+        with git_repo_lock(MF.get_repo_dir(), exclusive=False):
+            processing_git_commits(version)
 
     # Commit git commits, checkpoint files, and git tags staged during git processing
     G.TE.commit_all()
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached before File References. Finalizing '{version}'..."))
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all()
         G.TE.close()
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 6.6: Parse Kbuild/Makefiles, Documentation & Cross-File References
@@ -262,7 +274,7 @@ def update(version: str, repo_path: str | None = None) -> None:
             G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
-        return
+        return False
 
     # -------------------------------------------------------------------------
     # STEP 6.7: Batch Match Maintainer Sections & Populate m_maintainer_file
@@ -313,6 +325,7 @@ def update(version: str, repo_path: str | None = None) -> None:
     if hasattr(G.TE, "update_in_mem_indexes"):
         G.TE.update_in_mem_indexes = True
     finish_version_ingest(gp.VID)
-    processing_kapi(str(MF.repo_dir), getattr(gp, "repo_id", None), version, commit_id=gp.VID)
+    with git_repo_lock(MF.get_repo_dir(), exclusive=False):
+        processing_kapi(str(MF.repo_dir), getattr(gp, "repo_id", None), version, commit_id=gp.VID)
     reclaim_system_memory()
-    return
+    return True

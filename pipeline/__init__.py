@@ -5,7 +5,9 @@ setup. Modules import the names they call from the module that defines them (no 
 on the module that looks it up.
 
 - `state`: process-wide objects. `db_setup`: startup migrations, indexes, views.
-- `cli`: `arg_handling`. `repair`: `orchestrate_repair_pipeline`. `update`: `update()` per-version sequence.
+- `cli`: `arg_handling`. `daemon`: continuous coordinator & Git watcher loop. `git_sync`: `flock`-protected
+  Git remote updates, capability discovery, and task publishing. `repair`: `orchestrate_repair_pipeline`.
+  `update`: `update()` per-version sequence.
 - Parallel parsing: `worker_protocol` (frames), `worker_stage` (pool stage), `systemic` (version-wide failures),
   `multicore` (`trigger_multicore`, DB tuning), `scheduler` (dependency-driven ChangeSet resolution),
   `source_order` (changed-file ordering and epochs), `file_processing` (worker body), `changesets`, `blob_reuse`.

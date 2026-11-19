@@ -122,6 +122,13 @@ class LoggingScreen(BaseScreen):
     def __init__(self, stdscr: Any, app: Any = None) -> None:
         super().__init__(stdscr, app)
 
+        scope = str(getattr(self.app, "config_scope", "full") or "full").strip().lower()
+        if scope not in ("full", "daemon", "webapp"):
+            scope = "full"
+        self.config_scope = scope
+        self.show_parser = scope in ("full", "daemon")
+        self.show_webapp = scope in ("full", "webapp")
+
         # Retrieve or initialize config sections
         if self.app is not None and hasattr(self.app, "config") and isinstance(self.app.config, dict):
             logging_cfg = self.app.config.get("logging")
@@ -131,14 +138,23 @@ class LoggingScreen(BaseScreen):
         else:
             logging_cfg = {}
 
-        parser_cfg = logging_cfg.get("parser")
-        if not isinstance(parser_cfg, dict):
-            parser_cfg = {}
-            logging_cfg["parser"] = parser_cfg
-        webapp_cfg = logging_cfg.get("webapp")
-        if not isinstance(webapp_cfg, dict):
-            webapp_cfg = {}
-            logging_cfg["webapp"] = webapp_cfg
+        if self.show_parser:
+            parser_cfg = logging_cfg.get("parser")
+            if not isinstance(parser_cfg, dict):
+                parser_cfg = {}
+                logging_cfg["parser"] = parser_cfg
+        else:
+            raw_p = logging_cfg.get("parser")
+            parser_cfg = raw_p if isinstance(raw_p, dict) else {}
+
+        if self.show_webapp:
+            webapp_cfg = logging_cfg.get("webapp")
+            if not isinstance(webapp_cfg, dict):
+                webapp_cfg = {}
+                logging_cfg["webapp"] = webapp_cfg
+        else:
+            raw_w = logging_cfg.get("webapp")
+            webapp_cfg = raw_w if isinstance(raw_w, dict) else {}
 
         self.logging_cfg = logging_cfg
         self.parser_log_cfg = parser_cfg
@@ -189,12 +205,15 @@ class LoggingScreen(BaseScreen):
             y=9, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_p_level, label_width=20
         )
 
-        # Box 2: Webapp Backend Logging widgets (y=12..18 inside box y=11, h=9)
+        # Box 2: Webapp Backend Logging widgets (y=12..18 in full scope, y=4..10 in webapp scope)
+        webapp_box_y = 11 if self.show_parser else 3
+        self._webapp_box_y = webapp_box_y
+        wy = webapp_box_y + 1
         self.chk_webapp_enabled = Checkbox(
-            y=12, x=4, label="Enable webapp file logging", checked=cur_w_enabled
+            y=wy, x=4, label="Enable webapp file logging", checked=cur_w_enabled
         )
         self.sel_webapp_request_mode = SelectList(
-            y=13,
+            y=wy + 1,
             x=4,
             width=16,
             label="Request Logging",
@@ -203,24 +222,25 @@ class LoggingScreen(BaseScreen):
             label_width=20,
         )
         self.inp_webapp_dir = TextInput(
-            y=14, x=4, width=26, label="Log Directory", value=cur_w_dir, label_width=20
+            y=wy + 2, x=4, width=26, label="Log Directory", value=cur_w_dir, label_width=20
         )
         self.inp_webapp_file = TextInput(
-            y=15, x=4, width=26, label="Log File", value=cur_w_file, label_width=20
+            y=wy + 3, x=4, width=26, label="Log File", value=cur_w_file, label_width=20
         )
         self.inp_webapp_error_dir = TextInput(
-            y=16, x=4, width=26, label="Error Dir (opt)", value=cur_w_err_dir, label_width=20
+            y=wy + 4, x=4, width=26, label="Error Dir (opt)", value=cur_w_err_dir, label_width=20
         )
         self.inp_webapp_error_file = TextInput(
-            y=17, x=4, width=26, label="Error File (opt)", value=cur_w_err_file, label_width=20
+            y=wy + 5, x=4, width=26, label="Error File (opt)", value=cur_w_err_file, label_width=20
         )
         self.sel_webapp_level = SelectList(
-            y=18, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_w_level, label_width=20
+            y=wy + 6, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_w_level, label_width=20
         )
 
         # Action buttons
-        self.btn_save = Button(y=21, x=4, label="Save Settings", on_click=self.save)
-        self.btn_cancel = Button(y=21, x=24, label="Cancel", on_click=self.cancel)
+        btn_y = 21 if (self.show_parser and self.show_webapp) else (12 if self.show_parser else 13)
+        self.btn_save = Button(y=btn_y, x=4, label="Save Settings", on_click=self.save)
+        self.btn_cancel = Button(y=btn_y, x=24, label="Cancel", on_click=self.cancel)
 
         # Status Bar
         self.status_bar = StatusBar(
@@ -233,23 +253,28 @@ class LoggingScreen(BaseScreen):
             ]
         )
 
-        self.widgets = [
-            self.chk_parser_enabled,
-            self.inp_parser_dir,
-            self.inp_parser_file,
-            self.inp_parser_error_dir,
-            self.inp_parser_error_file,
-            self.sel_parser_level,
-            self.chk_webapp_enabled,
-            self.sel_webapp_request_mode,
-            self.inp_webapp_dir,
-            self.inp_webapp_file,
-            self.inp_webapp_error_dir,
-            self.inp_webapp_error_file,
-            self.sel_webapp_level,
-            self.btn_save,
-            self.btn_cancel,
-        ]
+        widgets: list[Any] = []
+        if self.show_parser:
+            widgets.extend([
+                self.chk_parser_enabled,
+                self.inp_parser_dir,
+                self.inp_parser_file,
+                self.inp_parser_error_dir,
+                self.inp_parser_error_file,
+                self.sel_parser_level,
+            ])
+        if self.show_webapp:
+            widgets.extend([
+                self.chk_webapp_enabled,
+                self.sel_webapp_request_mode,
+                self.inp_webapp_dir,
+                self.inp_webapp_file,
+                self.inp_webapp_error_dir,
+                self.inp_webapp_error_file,
+                self.sel_webapp_level,
+            ])
+        widgets.extend([self.btn_save, self.btn_cancel])
+        self.widgets = widgets
 
         self.help_topic_for = {
             id(self.chk_parser_enabled): "parser_enabled",
@@ -300,37 +325,57 @@ class LoggingScreen(BaseScreen):
     def _validate_path_fields(self) -> list[str]:
         """Validate all path/file inputs do not contain NUL bytes; return list of error messages."""
         errors: list[str] = []
-        path_widgets = (
-            ("Parser", self.inp_parser_dir),
-            ("Parser", self.inp_parser_file),
-            ("Parser", self.inp_parser_error_dir),
-            ("Parser", self.inp_parser_error_file),
-            ("Webapp", self.inp_webapp_dir),
-            ("Webapp", self.inp_webapp_file),
-            ("Webapp", self.inp_webapp_error_dir),
-            ("Webapp", self.inp_webapp_error_file),
-        )
+        path_widgets: list[tuple[str, TextInput]] = []
+        if self.show_parser:
+            path_widgets.extend([
+                ("Parser", self.inp_parser_dir),
+                ("Parser", self.inp_parser_file),
+                ("Parser", self.inp_parser_error_dir),
+                ("Parser", self.inp_parser_error_file),
+            ])
+        if self.show_webapp:
+            path_widgets.extend([
+                ("Webapp", self.inp_webapp_dir),
+                ("Webapp", self.inp_webapp_file),
+                ("Webapp", self.inp_webapp_error_dir),
+                ("Webapp", self.inp_webapp_error_file),
+            ])
         for section, widget in path_widgets:
             if "\x00" in widget.get_value():
                 errors.append(f"{section} {widget.label}: path cannot contain NUL bytes")
         return errors
 
     def draw(self) -> None:
-        """Render parser and webapp logging configuration screen."""
+        """Render parser and/or webapp logging configuration screen."""
         self.clear()
         max_y, max_x = self.get_maxyx()
 
         # Header Title
-        title = "Logging Configuration"
+        if self.config_scope == "daemon":
+            title = "Parser Logging Configuration"
+        elif self.config_scope == "webapp":
+            title = "Webapp Logging Configuration"
+        else:
+            title = "Logging Configuration"
         safe_addstr(self.stdscr, 1, 2, title, get_color(PAIR_HEADER) | curses.A_BOLD)
 
         box_w, help_w = self._layout_widths(max_x)
 
         # Box 1: Parser Logging
-        draw_box(self.stdscr, 3, 2, 8, box_w, title="Parser Logging", color_pair=PAIR_BORDER)
+        if self.show_parser:
+            draw_box(self.stdscr, 3, 2, 8, box_w, title="Parser Logging", color_pair=PAIR_BORDER)
 
         # Box 2: Webapp Backend Logging
-        draw_box(self.stdscr, 11, 2, 9, box_w, title="Webapp Backend Logging", color_pair=PAIR_BORDER)
+        if self.show_webapp:
+            draw_box(
+                self.stdscr,
+                self._webapp_box_y,
+                2,
+                9,
+                box_w,
+                title="Webapp Backend Logging",
+                color_pair=PAIR_BORDER,
+            )
 
         # Side help panel for the focused field (F1 shows it as a dialog when the terminal is too narrow)
         if help_w:
@@ -419,37 +464,35 @@ class LoggingScreen(BaseScreen):
         else:
             logging_cfg = self.logging_cfg
 
-        parser_cfg = logging_cfg.get("parser")
-        if not isinstance(parser_cfg, dict):
-            parser_cfg = {}
-            logging_cfg["parser"] = parser_cfg
+        if self.show_parser:
+            parser_cfg = logging_cfg.get("parser")
+            if not isinstance(parser_cfg, dict):
+                parser_cfg = {}
+                logging_cfg["parser"] = parser_cfg
+            parser_cfg["enabled"] = self.chk_parser_enabled.is_checked()
+            parser_cfg["dir"] = self.inp_parser_dir.get_value().strip()
+            parser_cfg["file"] = self.inp_parser_file.get_value().strip()
+            parser_cfg["error_dir"] = self.inp_parser_error_dir.get_value().strip()
+            parser_cfg["error_file"] = self.inp_parser_error_file.get_value().strip()
+            parser_cfg["level"] = normalize_log_level(self.sel_parser_level.get_selected())
+            self.parser_log_cfg = parser_cfg
 
-        webapp_cfg = logging_cfg.get("webapp")
-        if not isinstance(webapp_cfg, dict):
-            webapp_cfg = {}
-            logging_cfg["webapp"] = webapp_cfg
-
-        # Parser logging attributes
-        parser_cfg["enabled"] = self.chk_parser_enabled.is_checked()
-        parser_cfg["dir"] = self.inp_parser_dir.get_value().strip()
-        parser_cfg["file"] = self.inp_parser_file.get_value().strip()
-        parser_cfg["error_dir"] = self.inp_parser_error_dir.get_value().strip()
-        parser_cfg["error_file"] = self.inp_parser_error_file.get_value().strip()
-        parser_cfg["level"] = normalize_log_level(self.sel_parser_level.get_selected())
-
-        # Webapp logging attributes
-        webapp_cfg["enabled"] = self.chk_webapp_enabled.is_checked()
-        webapp_cfg["request_mode"] = normalize_webapp_request_mode(self.sel_webapp_request_mode.get_selected())
-        webapp_cfg["dir"] = self.inp_webapp_dir.get_value().strip()
-        webapp_cfg["file"] = self.inp_webapp_file.get_value().strip()
-        webapp_cfg["error_dir"] = self.inp_webapp_error_dir.get_value().strip()
-        webapp_cfg["error_file"] = self.inp_webapp_error_file.get_value().strip()
-        webapp_cfg["level"] = normalize_log_level(self.sel_webapp_level.get_selected())
+        if self.show_webapp:
+            webapp_cfg = logging_cfg.get("webapp")
+            if not isinstance(webapp_cfg, dict):
+                webapp_cfg = {}
+                logging_cfg["webapp"] = webapp_cfg
+            webapp_cfg["enabled"] = self.chk_webapp_enabled.is_checked()
+            webapp_cfg["request_mode"] = normalize_webapp_request_mode(self.sel_webapp_request_mode.get_selected())
+            webapp_cfg["dir"] = self.inp_webapp_dir.get_value().strip()
+            webapp_cfg["file"] = self.inp_webapp_file.get_value().strip()
+            webapp_cfg["error_dir"] = self.inp_webapp_error_dir.get_value().strip()
+            webapp_cfg["error_file"] = self.inp_webapp_error_file.get_value().strip()
+            webapp_cfg["level"] = normalize_log_level(self.sel_webapp_level.get_selected())
+            self.webapp_log_cfg = webapp_cfg
 
         # Update references
         self.logging_cfg = logging_cfg
-        self.parser_log_cfg = parser_cfg
-        self.webapp_log_cfg = webapp_cfg
 
         # Mark application dirty and pop screen if supported
         if self.app is not None:

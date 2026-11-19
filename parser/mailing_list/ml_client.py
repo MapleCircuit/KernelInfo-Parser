@@ -5,12 +5,14 @@ auto-launching, batch HTTP requests, and TableEngine staging into m_commit_email
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import tarfile
 import time
 from typing import Any
 import urllib.error
@@ -41,6 +43,68 @@ DAEMON_START_ATTEMPTS = 2
 LOCK_HOLD_SECONDS = 5
 # Seconds a contending startup waits for that lock before giving up (must exceed the hold)
 LOCK_WAIT_SECONDS = 8
+
+
+def _build_remote_daemon_bundle(repo_root: Path) -> bytes:
+    """Create a compressed tar bundle of `parser/mailing_list`, `db_engine`, and `core` `.py` modules."""
+    buf = io.BytesIO()
+    now = int(time.time())
+    pkg_dirs = (
+        Path("parser") / "mailing_list",
+        Path("db_engine"),
+        Path("core"),
+    )
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for rel_dir in pkg_dirs:
+            src_dir = repo_root / rel_dir
+            if not src_dir.is_dir():
+                continue
+            for py_file in sorted(src_dir.glob("*.py")):
+                if not py_file.is_file():
+                    continue
+                arcname = (rel_dir / py_file.name).as_posix()
+                info = tar.gettarinfo(str(py_file), arcname=arcname)
+                info.mtime = now
+                with py_file.open("rb") as fh:
+                    tar.addfile(info, fh)
+    return buf.getvalue()
+
+
+def _sync_remote_daemon_code(
+    repo_root: Path,
+    target: str,
+    ssh_port: int,
+    key_path: str | None = None,
+) -> bool:
+    """Sync remote daemon runtime modules (`parser/mailing_list`, `db_engine`, `core`) over SSH."""
+    try:
+        bundle = _build_remote_daemon_bundle(repo_root)
+        ssh_cmd = ["ssh", "-p", str(ssh_port), "-o", "BatchMode=yes"]
+        if key_path:
+            ssh_cmd.extend(["-i", key_path])
+        remote_extract = (
+            "mkdir -p ~/KernelInfo-Parser && "
+            "rm -rf ~/KernelInfo-Parser/parser/mailing_list/__pycache__ "
+            "~/KernelInfo-Parser/db_engine/__pycache__ "
+            "~/KernelInfo-Parser/core/__pycache__ && "
+            "tar -xzf - -C ~/KernelInfo-Parser"
+        )
+        ssh_cmd.extend([target, remote_extract])
+        res = subprocess.run(
+            ssh_cmd,
+            input=bundle,
+            timeout=20,
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or b"").decode("utf-8", errors="replace").strip()
+            logger.warning("Remote daemon code sync failed (exit %d): %s", res.returncode, err or "unknown error")
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("Remote daemon code sync failed: %s", exc)
+        return False
 
 
 class MailingListClient:
@@ -152,26 +216,9 @@ class MailingListClient:
         target = f"{user}@{host}" if user else host
         key_path = str(Path(os.path.expanduser(key_file)).resolve()) if key_file else None
 
-        # 1. Sync parser/mailing_list package to remote host so daemon code is guaranteed present
-        try:
-            local_pkg = Path(__file__).resolve().parent
-            scp_cmd = ["scp", "-P", str(ssh_port), "-o", "BatchMode=yes"]
-            ssh_prep = ["ssh", "-p", str(ssh_port), "-o", "BatchMode=yes"]
-            if key_path:
-                scp_cmd.extend(["-i", key_path])
-                ssh_prep.extend(["-i", key_path])
-
-            subprocess.run(
-                ssh_prep + [target, "mkdir -p ~/KernelInfo-Parser/parser"],
-                timeout=5,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            scp_cmd.extend(["-r", str(local_pkg), f"{target}:~/KernelInfo-Parser/parser/"])
-            subprocess.run(scp_cmd, timeout=8, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception as exc:
-            logger.debug("Optional scp sync of parser/mailing_list to remote host: %s", exc)
+        # 1. Sync parser/mailing_list, db_engine, and core modules to remote host cleanly
+        repo_root = Path(__file__).resolve().parents[2]
+        _sync_remote_daemon_code(repo_root, target, int(ssh_port), key_path)
 
         # 2. Restart the daemon, idempotently and race-free:
         #    - The advisory lock on fd 9 serializes concurrent startups from parser

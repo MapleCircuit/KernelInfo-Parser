@@ -218,18 +218,30 @@ class TestConfigManagement(unittest.TestCase):
         """webapp/main.py parses CLI overrides, and -c becomes the configuration of the server process."""
         from webapp import main as webapp_main
 
-        args = webapp_main.parse_args(["-c", "custom.json", "--host", "127.0.0.1", "--port", "9099", "--no-reload"])
-        self.assertEqual(args.config, "custom.json")
-        self.assertEqual(args.host, "127.0.0.1")
-        self.assertEqual(args.port, 9099)
-        self.assertFalse(args.reload)
-        self.assertIsNone(webapp_main.parse_args([]).reload)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "custom_webapp.json"
+            cfg_file.write_text(json.dumps({"webapp": {"port": 9099, "reload": False}}), encoding="utf-8")
 
-        # -c reaches core.config (and uvicorn's reloader process) as CONFIG_FILE
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CONFIG_FILE", None)
-            webapp_main.apply_config_path(args)
-            self.assertEqual(os.environ["CONFIG_FILE"], str(Path("custom.json").resolve()))
+            args = webapp_main.parse_args(["-c", str(cfg_file), "--host", "127.0.0.1", "--port", "9099", "--no-reload"])
+            self.assertEqual(args.config, str(cfg_file))
+            self.assertEqual(args.host, "127.0.0.1")
+            self.assertEqual(args.port, 9099)
+            self.assertFalse(args.reload)
+            self.assertIsNone(webapp_main.parse_args([]).reload)
+
+            # -c reaches core.config (and uvicorn's reloader process) as CONFIG_FILE and KERNELINFO_CONFIG
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CONFIG_FILE", None)
+                os.environ.pop("KERNELINFO_CONFIG", None)
+                webapp_main.apply_config_path(args)
+                self.assertEqual(os.environ["CONFIG_FILE"], str(cfg_file.resolve()))
+                self.assertEqual(os.environ["KERNELINFO_CONFIG"], str(cfg_file.resolve()))
+                self.assertEqual(get_webapp_config()["port"], 9099)
+                self.assertFalse(get_webapp_config()["reload"])
+
+            missing_args = webapp_main.parse_args(["-c", str(Path(tmpdir) / "missing.json")])
+            with self.assertRaises(FileNotFoundError):
+                webapp_main.apply_config_path(missing_args)
 
     def test_default_continuous_parsing_arguments(self) -> None:
         """Verify pipeline.cli.arg_handling defaults single_version to False for continuous parsing."""
@@ -1074,6 +1086,418 @@ class TestProjectInsightsConfig(unittest.TestCase):
         self.assertEqual(loaded["repositories"][0]["preparse"]["api"]["mode"], "latest_n_main")
         self.assertEqual(loaded["repositories"][0]["preparse"]["api"]["latest_n"], 3)
         self.assertNotIn("preparse", loaded["repositories"][1])
+
+
+class TestServiceConfigIsolation(unittest.TestCase):
+    """Standalone service config seeding, pruning, validation, env fallback, and entrypoint wiring."""
+
+    def setUp(self) -> None:
+        import copy
+        import core.config
+
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
+        reset_config()
+        self.original_env = dict(os.environ)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        import copy
+        import core.config
+
+        reset_config()
+        os.environ.clear()
+        os.environ.update(self.original_env)
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core.config._LOADED_CONFIG_PATH = self._orig_cfg_path
+        self._tmp.cleanup()
+
+    def test_find_config_path_kernelinfo_config_fallback_and_missing_errors(self) -> None:
+        import core.config
+
+        default_cfg = self.root / "config.json"
+        default_cfg.write_text("{}", encoding="utf-8")
+        ki_cfg = self.root / "ki.json"
+        ki_cfg.write_text("{}", encoding="utf-8")
+        cf_cfg = self.root / "cf.json"
+        cf_cfg.write_text("{}", encoding="utf-8")
+        cli_cfg = self.root / "cli.json"
+        cli_cfg.write_text("{}", encoding="utf-8")
+
+        for k in ("CONFIG_FILE", "CONFIG_PATH", "KERNELINFO_CONFIG"):
+            os.environ.pop(k, None)
+
+        with patch.object(core.config, "REPO_ROOT", self.root):
+            # 1. Falls back to REPO_ROOT/config.json when no env/custom path
+            self.assertEqual(find_config_path(), default_cfg)
+
+            # 2. KERNELINFO_CONFIG overrides REPO_ROOT/config.json
+            os.environ["KERNELINFO_CONFIG"] = str(ki_cfg)
+            self.assertEqual(find_config_path(), ki_cfg.resolve())
+
+            # 3. CONFIG_FILE overrides KERNELINFO_CONFIG
+            os.environ["CONFIG_FILE"] = str(cf_cfg)
+            self.assertEqual(find_config_path(), cf_cfg.resolve())
+
+            # 4. Explicit custom_path overrides everything
+            self.assertEqual(find_config_path(cli_cfg), cli_cfg.resolve())
+
+            # 5. Missing explicit custom_path raises FileNotFoundError (never falls back to config.json)
+            with self.assertRaises(FileNotFoundError):
+                find_config_path(self.root / "does_not_exist.json")
+
+            # 6. Missing KERNELINFO_CONFIG raises FileNotFoundError (never falls back to config.json)
+            os.environ.pop("CONFIG_FILE", None)
+            os.environ.pop("CONFIG_PATH", None)
+            os.environ["KERNELINFO_CONFIG"] = str(self.root / "missing_ki.json")
+            with self.assertRaises(FileNotFoundError):
+                find_config_path()
+
+    def test_get_service_config_path(self) -> None:
+        from core.config import (
+            DAEMON_CONFIG_FILENAME,
+            REPO_ROOT,
+            WEBAPP_CONFIG_FILENAME,
+            get_service_config_path,
+        )
+
+        self.assertEqual(get_service_config_path("daemon"), REPO_ROOT / DAEMON_CONFIG_FILENAME)
+        self.assertEqual(get_service_config_path("webapp"), REPO_ROOT / WEBAPP_CONFIG_FILENAME)
+        with self.assertRaises(ValueError):
+            get_service_config_path("unknown")
+
+    def test_prune_webapp_config_omits_parser_only_and_keeps_webapp_sections(self) -> None:
+        from core.config import prune_webapp_config
+
+        sample = {
+            "database": {
+                "host": "db.internal",
+                "port": 3306,
+                "user": "kip",
+                "password": "secret",
+                "database": "kernelinfo",
+                "engine": "mariadb",
+                "unix_socket": "auto",
+                "ssl_disabled": False,
+                "server_tuning": {"innodb_buffer_pool_size": "8G"},
+                "resolved_unix_socket": "/run/mysqld/mysqld.sock",
+            },
+            "ssh_tunnel": {"enabled": True, "host": "bastion.internal"},
+            "cache": {"engine": "sqlite", "dir": "/tmp/kip-cache"},
+            "webapp": {
+                "host": "127.0.0.1",
+                "port": 8080,
+                "reload": True,
+                "cache": {"max_mb": 512},
+                "jobs": {"workers": 4},
+                "prewarm_indexes": False,
+                "tools": {"checkpatch": {"enabled": False, "ref": "latest-release"}, "sandbox": ""},
+                "source_index": {"workers": 2, "max_mb": 1024, "revisions": 8},
+            },
+            "cve": {"repo_dir": "cvelistV5"},
+            "parser": {"table_engine": "cached", "memory_mode": "low", "mem_max": 32},
+            "mailing_list": {"storage_dir": "/srv/lore", "port": 8192},
+            "workspace": {"repos_dir": "repos", "auto_detect_repos": True},
+            "logging": {
+                "parser": {"enabled": True, "file": "parser.log"},
+                "webapp": {"enabled": True, "file": "webapp.log", "request_mode": "errors"},
+            },
+            "repositories": [
+                {
+                    "name": "linux",
+                    "path": "repos/linux",
+                    "features": {"kconfig": True},
+                    "insights": {"milestone_rc": 1},
+                    "preparse": {"api": {"mode": "latest_n_main", "latest_n": 3}},
+                }
+            ],
+        }
+        pruned = prune_webapp_config(sample)
+
+        # Input is untouched
+        self.assertIn("parser", sample)
+        self.assertIn("server_tuning", sample["database"])
+        self.assertIn("preparse", sample["repositories"][0])
+
+        # Parser-only keys removed
+        self.assertNotIn("parser", pruned)
+        self.assertNotIn("ssh_tunnel", pruned)
+        self.assertNotIn("server_tuning", pruned["database"])
+        self.assertNotIn("resolved_unix_socket", pruned["database"])
+        self.assertNotIn("parser", pruned["logging"])
+        self.assertNotIn("preparse", pruned["repositories"][0])
+
+        # Webapp-used sections & migrated tunnel preserved
+        self.assertEqual(pruned["database"]["ssh_tunnel"]["host"], "bastion.internal")
+        self.assertEqual(pruned["cache"], sample["cache"])
+        self.assertEqual(pruned["webapp"], sample["webapp"])
+        self.assertEqual(pruned["cve"], sample["cve"])
+        self.assertEqual(pruned["mailing_list"], sample["mailing_list"])
+        self.assertEqual(pruned["workspace"], sample["workspace"])
+        self.assertEqual(pruned["logging"]["webapp"], sample["logging"]["webapp"])
+        self.assertEqual(pruned["repositories"][0]["features"], {"kconfig": True})
+        self.assertEqual(pruned["repositories"][0]["insights"], {"milestone_rc": 1})
+
+    def test_ensure_standalone_config_bootstrap_only(self) -> None:
+        from core.config import ensure_standalone_config
+
+        base_cfg = self.root / "config.json"
+        base_cfg.write_text(
+            json.dumps(
+                {
+                    "database": {
+                        "host": "10.1.2.3",
+                        "user": "reader",
+                        "password": "pw",
+                        "engine": "mariadb",
+                        "server_tuning": {"innodb_buffer_pool_size": "4G"},
+                    },
+                    "parser": {"mem_max": 24, "distributed": {"enabled": False, "role": "standalone"}},
+                    "webapp": {"port": 9001, "reload": True},
+                    "cve": {"repo_dir": "vulns"},
+                    "mailing_list": {"storage_dir": "/data/lore"},
+                    "workspace": {"repos_dir": "trees", "auto_detect_repos": False},
+                    "logging": {
+                        "parser": {"enabled": True, "file": "p.log"},
+                        "webapp": {"enabled": True, "file": "w.log"},
+                    },
+                    "repositories": [
+                        {
+                            "name": "linux",
+                            "path": "trees/linux",
+                            "preparse": {"insights": {"mode": "all_final"}},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        daemon_target = self.root / "config_daemon.json"
+        path_d, created_d = ensure_standalone_config("daemon", config_path=daemon_target, base_config_path=base_cfg)
+        self.assertEqual(path_d, daemon_target.resolve())
+        self.assertTrue(created_d)
+        d_data = json.loads(daemon_target.read_text(encoding="utf-8"))
+        self.assertEqual(d_data["database"]["host"], "10.1.2.3")
+        self.assertEqual(d_data["parser"]["mem_max"], 24)
+        self.assertTrue(d_data["parser"]["distributed"]["enabled"])
+        self.assertEqual(d_data["parser"]["distributed"]["role"], "daemon")
+        self.assertEqual(d_data["cve"]["repo_dir"], "vulns")
+        self.assertEqual(d_data["mailing_list"]["storage_dir"], "/data/lore")
+
+        webapp_target = self.root / "config_webapp.json"
+        path_w, created_w = ensure_standalone_config("webapp", config_path=webapp_target, base_config_path=base_cfg)
+        self.assertEqual(path_w, webapp_target.resolve())
+        self.assertTrue(created_w)
+        w_data = json.loads(webapp_target.read_text(encoding="utf-8"))
+        self.assertEqual(w_data["database"]["host"], "10.1.2.3")
+        self.assertNotIn("server_tuning", w_data["database"])
+        self.assertNotIn("parser", w_data)
+        self.assertNotIn("parser", w_data["logging"])
+        self.assertNotIn("preparse", w_data["repositories"][0])
+        self.assertEqual(w_data["webapp"]["port"], 9001)
+        self.assertFalse(w_data["webapp"]["reload"])
+
+        # Bootstrap-only: mutating base config.json must never overwrite existing standalone configs
+        w_data["webapp"]["port"] = 7777
+        w_data["webapp"]["reload"] = True
+        webapp_target.write_text(json.dumps(w_data), encoding="utf-8")
+        base_cfg.write_text(json.dumps({"database": {"host": "overwritten"}, "webapp": {"port": 1111}}), encoding="utf-8")
+
+        path_w2, created_w2 = ensure_standalone_config("webapp", config_path=webapp_target, base_config_path=base_cfg)
+        self.assertEqual(path_w2, webapp_target.resolve())
+        self.assertFalse(created_w2)
+        w_after = json.loads(webapp_target.read_text(encoding="utf-8"))
+        self.assertEqual(w_after["webapp"]["port"], 7777)
+        self.assertTrue(w_after["webapp"]["reload"])
+        self.assertEqual(w_after["database"]["host"], "10.1.2.3")
+
+        # When base_config_path does not exist, seeds cleanly from DEFAULT_CONFIG
+        fresh_daemon = self.root / "fresh_daemon.json"
+        _, created_fresh = ensure_standalone_config(
+            "daemon", config_path=fresh_daemon, base_config_path=self.root / "no_base.json"
+        )
+        self.assertTrue(created_fresh)
+        fd_data = json.loads(fresh_daemon.read_text(encoding="utf-8"))
+        self.assertTrue(fd_data["parser"]["distributed"]["enabled"])
+        self.assertEqual(fd_data["parser"]["distributed"]["role"], "daemon")
+
+    def test_validate_service_config(self) -> None:
+        import core.config
+        from core.config import validate_service_config
+
+        # Pre-seed active config to verify validate_service_config does not mutate global state
+        active_path = self.root / "active.json"
+        active_path.write_text(json.dumps({"database": {"host": "active.db", "engine": "sqlite", "path": ":memory:"}}), encoding="utf-8")
+        init_config(active_path)
+        before_active = dict(core.config._ACTIVE_CONFIG["database"])
+        before_loaded_path = core.config._LOADED_CONFIG_PATH
+        before_db_host_env = os.environ.get("DB_HOST")
+
+        valid_wa = self.root / "valid_wa.json"
+        valid_wa.write_text(
+            json.dumps({"database": {"host": "other.db", "engine": "sqlite", "path": ":memory:"}, "webapp": {"port": 8081}}),
+            encoding="utf-8",
+        )
+        ok, errs, cfg = validate_service_config("webapp", valid_wa)
+        self.assertTrue(ok)
+        self.assertEqual(errs, [])
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["webapp"]["port"], 8081)
+
+        # Global config state and env are completely unchanged
+        self.assertEqual(core.config._ACTIVE_CONFIG["database"]["host"], before_active["host"])
+        self.assertEqual(core.config._LOADED_CONFIG_PATH, before_loaded_path)
+        self.assertEqual(os.environ.get("DB_HOST"), before_db_host_env)
+
+        # Missing file
+        ok, errs, cfg = validate_service_config("webapp", self.root / "missing.json")
+        self.assertFalse(ok)
+        self.assertTrue(errs)
+        self.assertIsNone(cfg)
+
+        # Invalid port & unknown db engine
+        bad_wa = self.root / "bad_wa.json"
+        bad_wa.write_text(json.dumps({"database": {"engine": "bogusdb"}, "webapp": {"port": 70000}}), encoding="utf-8")
+        ok, errs, cfg = validate_service_config("webapp", bad_wa)
+        self.assertFalse(ok)
+        self.assertGreaterEqual(len(errs), 2)
+        self.assertIsNone(cfg)
+
+        # Valid daemon vs invalid daemon
+        valid_daemon = self.root / "valid_daemon.json"
+        valid_daemon.write_text(
+            json.dumps({"database": {"engine": "mock"}, "parser": {"table_engine": "cached", "mem_max": 32, "distributed": {"role": "daemon"}}}),
+            encoding="utf-8",
+        )
+        ok, errs, cfg = validate_service_config("daemon", valid_daemon)
+        self.assertTrue(ok)
+        self.assertEqual(errs, [])
+        self.assertIsNotNone(cfg)
+
+        bad_daemon = self.root / "bad_daemon.json"
+        bad_daemon.write_text(
+            json.dumps({"database": {"engine": "mock"}, "parser": {"table_engine": "invalid", "distributed": {"role": "bogus"}}}),
+            encoding="utf-8",
+        )
+        ok, errs, cfg = validate_service_config("daemon", bad_daemon)
+        self.assertFalse(ok)
+        self.assertGreaterEqual(len(errs), 2)
+        self.assertIsNone(cfg)
+
+    def test_cli_configure_allows_missing_config_and_sync_writes_to_custom_config(self) -> None:
+        import core.config
+        import pipeline.cli
+
+        new_cfg = self.root / "new_daemon.json"
+        with mock.patch("sys.argv", ["main.py", "--configure", "--config", str(new_cfg)]):
+            with mock.patch("core.tui.app.run_config_tui_launch", return_value=None) as mock_tui:
+                with self.assertRaises(SystemExit) as cm:
+                    pipeline.cli.arg_handling()
+                self.assertEqual(cm.exception.code, 0)
+                mock_tui.assert_called_once_with(str(new_cfg))
+
+        # Non-TUI run with missing --config raises FileNotFoundError (no fallback to config.json)
+        with mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(new_cfg)]):
+            with self.assertRaises(FileNotFoundError):
+                pipeline.cli.arg_handling()
+
+        # sync_repositories(write=True) writes to the --config file, not REPO_ROOT/config.json
+        repos_dir = self.root / "repos"
+        repos_dir.mkdir()
+        _make_git_repo(repos_dir / "linux", commits=2, tags={1: "v3.0"})
+        default_cfg = self.root / "config.json"
+        default_cfg.write_text(json.dumps({"workspace": {"repos_dir": str(repos_dir), "auto_detect_repos": False}}), encoding="utf-8")
+        daemon_cfg = self.root / "config_daemon.json"
+        daemon_cfg.write_text(
+            json.dumps(
+                {
+                    "database": {"engine": "mock"},
+                    "workspace": {"repos_dir": str(repos_dir), "auto_detect_repos": True},
+                    "parser": {"distributed": {"enabled": True, "role": "daemon"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(core.config, "REPO_ROOT", self.root):
+            with mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(daemon_cfg)]):
+                pipeline.cli.arg_handling()
+            saved_daemon = json.loads(daemon_cfg.read_text(encoding="utf-8"))
+            saved_default = json.loads(default_cfg.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved_daemon.get("repositories") or []), 1)
+            self.assertEqual(saved_daemon["repositories"][0]["name"], "linux")
+            self.assertNotIn("repositories", saved_default)
+
+    def test_webapp_backend_config_resolves_after_late_init_config(self) -> None:
+        from webapp.backend import app as webapp_app
+        from webapp.backend import config as webapp_config
+
+        repo_a = self.root / "repo_a"
+        repo_b = self.root / "repo_b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        cfg_a = self.root / "wa_a.json"
+        cfg_b = self.root / "wa_b.json"
+        cfg_a.write_text(
+            json.dumps({"workspace": {"auto_detect_repos": False}, "repositories": [{"name": "a", "path": str(repo_a), "default": True}]}),
+            encoding="utf-8",
+        )
+        cfg_b.write_text(
+            json.dumps({"workspace": {"auto_detect_repos": False}, "repositories": [{"name": "b", "path": str(repo_b), "default": True}]}),
+            encoding="utf-8",
+        )
+
+        init_config(cfg_a)
+        webapp_config.refresh_default_repo_dir()
+        self.assertEqual(webapp_config.get_repo_dir(), repo_a.resolve())
+
+        init_config(cfg_b)
+        self.assertEqual(webapp_config.get_repo_dir(), repo_b.resolve())
+        webapp_app.create_app()
+        self.assertEqual(webapp_config.LINUX_REPO_DIR, repo_b.resolve())
+
+    def test_setup_memory_limit_skips_systemd_run_without_user_session(self) -> None:
+        import core.globalstuff as gs
+
+        orig_initialized = gs._MEMORY_GUARD_INITIALIZED
+        try:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            os.environ.pop("KERNELINFO_CGROUP_ACTIVE", None)
+
+            gs._MEMORY_GUARD_INITIALIZED = False
+            with (
+                mock.patch.object(gs.sys, "platform", "linux"),
+                mock.patch.object(gs, "is_test_environment", return_value=False),
+                mock.patch.object(gs.os.path, "exists", return_value=False),
+                mock.patch.object(gs.shutil, "which", return_value="/usr/bin/systemd-run"),
+                mock.patch.object(gs.os, "execvp") as mock_execvp,
+                mock.patch("resource.getrlimit", return_value=(-1, -1)),
+                mock.patch("resource.setrlimit") as mock_setrlimit,
+            ):
+                gs.setup_memory_limit(10.0)
+                mock_execvp.assert_not_called()
+                mock_setrlimit.assert_called_once()
+
+            # When XDG_RUNTIME_DIR is present, systemd-run --user is attempted
+            gs._MEMORY_GUARD_INITIALIZED = False
+            os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
+            with (
+                mock.patch.object(gs.sys, "platform", "linux"),
+                mock.patch.object(gs, "is_test_environment", return_value=False),
+                mock.patch.object(gs.os.path, "exists", return_value=False),
+                mock.patch.object(gs.shutil, "which", return_value="/usr/bin/systemd-run"),
+                mock.patch.object(gs.os, "execvp") as mock_execvp,
+                mock.patch("resource.getrlimit", return_value=(-1, -1)),
+                mock.patch("resource.setrlimit"),
+            ):
+                gs.setup_memory_limit(10.0)
+                mock_execvp.assert_called_once()
+                self.assertEqual(mock_execvp.call_args.args[0], "systemd-run")
+                self.assertIn("--user", mock_execvp.call_args.args[1])
+        finally:
+            gs._MEMORY_GUARD_INITIALIZED = orig_initialized
 
 
 if __name__ == "__main__":

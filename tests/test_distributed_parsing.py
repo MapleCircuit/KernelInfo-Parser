@@ -24,6 +24,8 @@ from core.DBLayout import (
     m_parse_node,
     m_parse_task,
     m_table_sequence,
+    distributed_tasks,
+    distributed_worker_capabilities,
 )
 from core import checkpoints, distributed, ingest_state
 from db_engine import MockDB, SQLiteDB
@@ -34,13 +36,22 @@ from table_engine.te_cached_db import TECachedDB
 
 class TestDistributedParsing(unittest.TestCase):
     def test_schema_tables_registered(self):
-        """Verify all 75 tables including distributed coordination tables are registered."""
-        self.assertEqual(len(TABLES), 75)
+        """Verify all 77 tables including distributed coordination tables are registered."""
+        self.assertEqual(len(TABLES), 77)
         names = {t.table_name for t in TABLES}
-        for expected in ("m_table_sequence", "m_ingest_id_range", "m_parse_node", "m_parse_task"):
+        for expected in (
+            "m_table_sequence",
+            "m_ingest_id_range",
+            "m_parse_node",
+            "m_parse_task",
+            "distributed_tasks",
+            "distributed_worker_capabilities",
+        ):
             self.assertIn(expected, names)
         # Verify unique_keys on m_parse_task uses ("network_id", "ref_name")
         self.assertEqual(m_parse_task.unique_keys, (("network_id", "ref_name"),))
+        self.assertEqual(distributed_tasks.unique_keys, (("network_id", "repo_name", "task_type", "ref_name"),))
+        self.assertEqual(distributed_worker_capabilities.init_primary, ("worker_id", "network_id", "repo_name", "track_name"))
 
     def test_reserve_id_block_disjoint(self):
         """Verify that successive reserve_id_block calls allocate strictly disjoint ranges and log them."""
@@ -1386,6 +1397,709 @@ class TestMemMaxResolution(unittest.TestCase):
         self.assertEqual(pipeline.multicore._resolve_mem_max(None), 60.0)
         self.assertEqual(pipeline.multicore._resolve_mem_max("bad"), 60.0)
         self.assertEqual(pipeline.multicore._resolve_mem_max(-5), 60.0)
+
+
+class TestPureDBQueueAndCapabilities(unittest.TestCase):
+    """Pure-DB distributed_tasks, capability matching, zombie recovery, and priority tests."""
+
+    def test_priority_weighting_and_dependency_gating(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "main", "mainline", "v3.1", "a" * 40, 0, "v3.0", 0, 10, 3001000999, "pending", now, now),
+            (1, 1, "linux", "stable", "stable:v3.0", "v3.0.1", "b" * 40, 0, "v3.0", 10, 5, 1, "pending", now, now),
+            (1, 1, "linux", "stable", "stable:v3.0", "v3.0.2", "c" * 40, 0, "v3.0.1", 0, 5, 2, "pending", now, now),
+            (1, 1, "linux", "preparse", "mainline", "v3.0", "d" * 40, 10, "", 0, 1, 3000000999, "pending", now, now),
+        ])
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 10, ingest_state.INGEST_DONE, now)])
+
+        master_sched = DistributedTaskScheduler(
+            lambda: db, 1, "master-1", distributed.ROLE_MASTER, min_priority=distributed.PRIORITY_MAIN
+        )
+        worker_sched = DistributedTaskScheduler(
+            lambda: db, 1, "worker-1", distributed.ROLE_WORKER, max_priority=distributed.PRIORITY_STABLE
+        )
+        master_sched.register_capabilities([{"repo_name": "linux", "track_name": "*"}], db=db)
+        worker_sched.register_capabilities([{"repo_name": "linux", "track_name": "*"}], db=db)
+
+        # v3.1 depends on v3.0 (commit_id 0 in task row, ref v3.0 not yet marked completed in distributed_tasks,
+        # wait: v3.0 has base_commit_id=0 in v3.1 row -> unblocked once v3.0 completed or base_commit_id>0).
+        self.assertIsNone(master_sched.claim_next(db=db))
+        db.update_rows("distributed_tasks", {"base_commit_id": 10}, {"ref_name": "v3.1"})
+
+        # Master claims priority-10 main task only
+        m_task = master_sched.claim_next(db=db)
+        self.assertIsNotNone(m_task)
+        self.assertEqual((m_task["ref_name"], m_task["priority"]), ("v3.1", 10))
+        self.assertIsNone(master_sched.claim_next(db=db))
+
+        # Worker claims priority-5 stable task before priority-1 preparse; v3.0.2 stays blocked until v3.0.1 finishes
+        w_task1 = worker_sched.claim_next(db=db)
+        self.assertIsNotNone(w_task1)
+        self.assertEqual((w_task1["ref_name"], w_task1["priority"]), ("v3.0.1", 5))
+
+        w_task2 = worker_sched.claim_next(db=db)
+        self.assertIsNotNone(w_task2)
+        self.assertEqual((w_task2["task_type"], w_task2["priority"]), ("preparse", 1))
+        self.assertIsNone(worker_sched.claim_next(db=db))
+
+        # Completing v3.0.1 with commit_id=11 unblocks v3.0.2 automatically
+        self.assertTrue(worker_sched.complete(w_task1["task_id"], 11, ref_name="v3.0.1", db=db))
+        w_task3 = worker_sched.claim_next(db=db)
+        self.assertIsNotNone(w_task3)
+        self.assertEqual(w_task3["ref_name"], "v3.0.2")
+        self.assertEqual(w_task3["base_commit_id"], 11)
+
+    def test_capability_matching_filters_repo_track_and_range(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True).add_dist_tasks(
+            {"task_id": 1, "repo_name": "man-pages", "task_type": "stable", "track_name": "stable:v6.6", "ref_name": "mp-1", "priority": 5, "seq_order": 3},
+            {"task_id": 2, "repo_name": "linux", "task_type": "stable", "track_name": "stable:v6.1", "ref_name": "v6.1.3", "priority": 5, "seq_order": 3},
+            {"task_id": 3, "repo_name": "linux", "task_type": "stable", "track_name": "stable:v6.6", "ref_name": "v6.6.1", "priority": 5, "seq_order": 1},
+            {"task_id": 4, "repo_name": "linux", "task_type": "stable", "track_name": "stable:v6.6", "ref_name": "v6.6.6", "priority": 5, "seq_order": 6},
+            {"task_id": 5, "repo_name": "linux", "task_type": "preparse", "track_name": "stable:v6.6", "ref_name": "v6.6.3", "priority": 1, "seq_order": 3},
+            {"task_id": 6, "repo_name": "linux", "task_type": "stable", "track_name": "stable:v6.6", "ref_name": "v6.6.4", "priority": 5, "seq_order": 4},
+        )
+        sched = DistributedTaskScheduler(lambda: db, 1, "worker-cap", distributed.ROLE_WORKER, max_priority=5)
+        sched.register_capabilities(
+            [{
+                "repo_name": "linux",
+                "track_name": "stable:v6.6",
+                "min_seq_order": 2,
+                "max_seq_order": 5,
+                "supports_preparse": 0,
+            }],
+            db=db,
+        )
+        claimed = sched.claim_next(db=db)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["task_id"], 6)
+        self.assertIsNone(sched.claim_next(db=db), "tasks outside local repo/track/range or preparse must never be claimed")
+
+    def test_moved_target_sha_reopens_completed_but_keeps_claimed(self) -> None:
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "branch", "branch:master", "master", "1" * 40, 50, "", 0, 5, 1, "completed", now, now),
+            (1, 1, "linux", "branch", "branch:next", "linux-next/master", "2" * 40, 51, "", 0, 5, 1, "pending", now, now),
+        ])
+        db.update_rows("distributed_tasks", {"status": "claimed", "worker_id": "w1", "heartbeat_ts": now}, {"ref_name": "linux-next/master"})
+
+        # Re-enqueue with moved SHA
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "branch", "branch:master", "master", "a" * 40, 0, "", 0, 5, 1, "pending", now + 5, now + 5),
+            (1, 1, "linux", "branch", "branch:next", "linux-next/master", "b" * 40, 0, "", 0, 5, 1, "pending", now + 5, now + 5),
+        ])
+        by_ref = {r["ref_name"]: r for r in db.dist_tasks}
+        self.assertEqual(by_ref["master"]["status"], "pending")
+        self.assertEqual(by_ref["master"]["commit_id"], 0)
+        self.assertEqual(by_ref["master"]["target_sha"], "a" * 40)
+        self.assertEqual(by_ref["linux-next/master"]["status"], "claimed")
+        self.assertEqual(by_ref["linux-next/master"]["worker_id"], "w1")
+        self.assertEqual(by_ref["linux-next/master"]["target_sha"], "2" * 40, "claimed task retains its in-flight target_sha")
+
+        # Once the claimed task finishes on its original SHA, a new enqueue with the moved SHA reopens it
+        self.assertTrue(db.complete_distributed_task(by_ref["linux-next/master"]["task_id"], 51, worker_id="w1", now=now + 6))
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "branch", "branch:next", "linux-next/master", "b" * 40, 0, "", 0, 5, 1, "pending", now + 7, now + 7),
+        ])
+        refreshed = {r["ref_name"]: r for r in db.dist_tasks}["linux-next/master"]
+        self.assertEqual((refreshed["status"], refreshed["target_sha"], refreshed["commit_id"], refreshed["worker_id"]), ("pending", "b" * 40, 0, ""))
+
+    def test_complete_distributed_task_scopes_backfill_by_repo_name(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.enqueue_distributed_tasks([
+            (1, 1, "linux", "branch", "branch:master", "master", "1" * 40, 0, "", 0, 5, 1, "pending", now, now),
+            (1, 1, "linux", "branch", "branch:next", "next", "2" * 40, 0, "master", 0, 5, 2, "pending", now, now),
+            (1, 2, "linux-rt", "branch", "branch:rt", "rt-next", "3" * 40, 0, "master", 0, 5, 2, "pending", now, now),
+        ])
+        sched = DistributedTaskScheduler(lambda: db, 1, "w1", distributed.ROLE_WORKER)
+        sched.register_capabilities([{"repo_name": "linux", "track_name": "*"}], db=db)
+
+        claimed = sched.claim_next(db=db, now=now + 1)
+        self.assertIsNotNone(claimed)
+        self.assertEqual((claimed["repo_name"], claimed["ref_name"]), ("linux", "master"))
+        self.assertTrue(sched.complete(claimed["task_id"], 77, ref_name="master", db=db, now=now + 2))
+
+        by_repo_ref = {(r["repo_name"], r["ref_name"]): r for r in db.dist_tasks}
+        self.assertEqual(by_repo_ref[("linux", "next")]["base_commit_id"], 77)
+        self.assertEqual(by_repo_ref[("linux-rt", "rt-next")]["base_commit_id"], 0, "other repo must not receive base_commit_id backfill")
+
+    def test_zombie_task_recovery_and_partial_rollback(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True)
+        now = int(time.time())
+        db.add_dist_tasks(
+            {"task_id": 1, "ref_name": "v3.0.1", "commit_id": 101, "status": "claimed", "worker_id": "dead-1", "heartbeat_ts": now - 500},
+            {"task_id": 2, "ref_name": "v3.0.2", "commit_id": 102, "status": "claimed", "worker_id": "dead-2", "heartbeat_ts": now - 500},
+            {"task_id": 3, "ref_name": "v3.0.3", "commit_id": 103, "status": "claimed", "worker_id": "alive-1", "heartbeat_ts": now - 10},
+            {"task_id": 4, "task_type": "preparse", "ref_name": "v3.0", "commit_id": 10, "status": "claimed", "worker_id": "dead-3", "heartbeat_ts": now - 500},
+        )
+        db.insert_rows(
+            "m_ingest_state",
+            ["network_id", "commit_id", "status", "updated_at"],
+            [(1, 101, ingest_state.INGEST_DONE, now), (1, 102, ingest_state.INGEST_PARSING, now - 500)],
+        )
+        sched = DistributedTaskScheduler(lambda: db, 1, "daemon-1", distributed.ROLE_DAEMON, heartbeat_timeout=120)
+        with mock.patch("pipeline.scheduler.ingest_state.rollback_version", return_value=False) as mock_rb, \
+             mock.patch("pipeline.scheduler.ingest_state.purge_partial_version", return_value=3) as mock_purge:
+            recovered = sched.sweep_zombies(db=db, now=now)
+
+        self.assertEqual(recovered, 3)
+        mock_rb.assert_called_once_with(db, 1, 102, TABLES)
+        mock_purge.assert_called_once_with(db, 102)
+        self.assertIsNone(ingest_state.get_status(db, 1, 102), "stale INGEST_PARSING row must be deleted on recovery")
+        self.assertEqual(db.dist_task(1)["status"], "completed", "already INGEST_DONE zombie promotes to completed")
+        self.assertEqual((db.dist_task(2)["status"], db.dist_task(2)["worker_id"], db.dist_task(2)["heartbeat_ts"]), ("pending", "", 0))
+        self.assertEqual(db.dist_task(3)["status"], "claimed", "live heartbeating worker is untouched")
+        self.assertEqual((db.dist_task(4)["status"], db.dist_task(4)["worker_id"]), ("pending", ""))
+
+    def test_fail_retry_and_downstream_cascade(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True).add_dist_tasks(
+            {"task_id": 1, "ref_name": "v3.0.1", "commit_id": 11, "status": "claimed", "worker_id": "w1", "retry_count": 2},
+            {"task_id": 2, "ref_name": "v3.0.2", "base_ref_name": "v3.0.1", "base_commit_id": 11, "status": "pending"},
+            {"task_id": 3, "ref_name": "v3.0.3", "base_ref_name": "v3.0.2", "status": "pending"},
+            {"task_id": 4, "task_type": "preparse", "ref_name": "v3.0.1", "status": "pending"},
+        )
+        sched = DistributedTaskScheduler(lambda: db, 1, "w1", distributed.ROLE_WORKER)
+        self.assertTrue(sched.fail(1, "parse crash", max_attempts=3, db=db))
+        self.assertEqual(db.dist_task(1)["status"], "failed")
+        self.assertEqual(db.dist_task(2)["status"], "failed")
+        self.assertEqual(db.dist_task(3)["status"], "failed")
+        self.assertEqual(db.dist_task(4)["status"], "pending", "preparse task is independent of parse failure cascade")
+
+    def test_is_queue_drained_respects_daemon_and_master_heartbeats(self) -> None:
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        db = DistDB(full_schema=True).add_dist_tasks(
+            {"task_id": 1, "repo_name": "linux", "track_name": "stable:v6.6", "status": "pending", "priority": 5}
+        )
+        sched = DistributedTaskScheduler(lambda: db, 1, "w1", distributed.ROLE_WORKER, max_priority=5)
+        sched.register_capabilities([{"repo_name": "linux", "track_name": "stable:v6.6"}], db=db)
+
+        db.add_nodes({"node_id": "daemon:1", "role": distributed.ROLE_DAEMON})
+        self.assertFalse(sched.is_queue_drained(db=db))
+
+        distributed.unregister_node(db, "daemon:1")
+        self.assertFalse(sched.is_queue_drained(db=db), "claimable task still pending for this worker")
+
+        db.update_rows("distributed_tasks", {"status": "completed"}, {"task_id": 1})
+        self.assertTrue(sched.is_queue_drained(db=db))
+
+
+class TestSingletonLockingAndRegistration(unittest.TestCase):
+    """Singleton PID flock files and DB node exclusivity for master and daemon roles."""
+
+    def test_singleton_process_lock_collision_and_force_override(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lock1 = distributed.acquire_singleton_lock("master", network_id=1, node_id="master-a", lock_dir=tmp)
+            self.assertIsNotNone(lock1)
+            self.assertTrue(lock1.lock_path.exists())
+            lock1.touch_heartbeat(123456789)
+            holder = lock1.read_holder()
+            self.assertEqual(holder["node_id"], "master-a")
+            self.assertEqual(holder["heartbeat_at"], 123456789)
+
+            # Second master on same network fails explicitly
+            with self.assertRaises(distributed.SingletonRoleConflictError) as ctx:
+                distributed.acquire_singleton_lock("master", network_id=1, node_id="master-b", lock_dir=tmp)
+            self.assertIn("master-a", str(ctx.exception))
+
+            # Daemon on the same network coexists with master
+            daemon_lock = distributed.acquire_singleton_lock("daemon", network_id=1, node_id="daemon-a", lock_dir=tmp)
+            self.assertIsNotNone(daemon_lock)
+            with self.assertRaises(distributed.SingletonRoleConflictError):
+                distributed.acquire_singleton_lock("daemon", network_id=1, node_id="daemon-b", lock_dir=tmp)
+            daemon_lock.release()
+
+            # Non-singleton roles return None
+            self.assertIsNone(distributed.acquire_singleton_lock("worker", network_id=1, node_id="w1", lock_dir=tmp))
+            self.assertIsNone(distributed.acquire_singleton_lock("standalone", network_id=1, node_id="s1", lock_dir=tmp))
+
+            # Force override steals lock and release cleans up cleanly
+            lock_forced = distributed.acquire_singleton_lock("master", network_id=1, node_id="master-b", lock_dir=tmp, force=True)
+            self.assertEqual(lock_forced.read_holder()["node_id"], "master-b")
+            lock1.release()
+            self.assertTrue(lock_forced.lock_path.exists(), "old lock release must not unlink newer inode")
+            lock_forced.release()
+            self.assertFalse(lock_forced.lock_path.exists())
+
+    def test_daemon_db_exclusivity_and_capability_cleanup(self) -> None:
+        db = DistDB(full_schema=True)
+        distributed.register_node(db, "daemon-1", distributed.ROLE_DAEMON, network_id=1)
+        distributed.register_worker_capabilities(db, "daemon-1", 1, [{"repo_name": "linux", "track_name": "*"}], role="daemon")
+        with self.assertRaises(distributed.SingletonRoleConflictError):
+            distributed.register_node(db, "daemon-2", distributed.ROLE_DAEMON, network_id=1)
+
+        # Master can register alongside daemon
+        distributed.register_node(db, "master-1", distributed.ROLE_MASTER, network_id=1)
+        distributed.unregister_node(db, "daemon-1")
+        self.assertEqual(db.worker_caps, [])
+        distributed.register_node(db, "daemon-2", distributed.ROLE_DAEMON, network_id=1)
+
+
+class TestGitSyncAndDaemon(unittest.TestCase):
+    """Locked git remote update --prune, capability discovery, task generation, and daemon loop."""
+
+    @staticmethod
+    def _git(repo, *args: str) -> str:
+        import subprocess
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        }
+        res = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env, check=True)
+        return res.stdout.strip()
+
+    def _make_upstream_and_mirror(self, tmp_dir):
+        from pathlib import Path
+        import subprocess
+
+        root = Path(tmp_dir)
+        upstream = root / "upstream.git"
+        work = root / "work"
+        mirror = root / "mirror"
+        subprocess.run(["git", "init", "--bare", "--initial-branch=master", str(upstream)], check=True, capture_output=True)
+        subprocess.run(["git", "clone", str(upstream), str(work)], check=True, capture_output=True)
+
+        (work / "init.c").write_text("int init(void) { return 0; }\n")
+        self._git(work, "add", "init.c")
+        self._git(work, "commit", "-m", "v3.0")
+        self._git(work, "tag", "v3.0")
+        self._git(work, "checkout", "-b", "topic/prune-me")
+        (work / "topic.c").write_text("int t(void) { return 1; }\n")
+        self._git(work, "add", "topic.c")
+        self._git(work, "commit", "-m", "topic")
+        self._git(work, "checkout", "master")
+        self._git(work, "push", "origin", "master", "topic/prune-me", "--tags")
+
+        subprocess.run(["git", "clone", str(upstream), str(mirror)], check=True, capture_output=True)
+        return upstream, work, mirror
+
+    def test_git_repo_lock_shared_vs_exclusive(self) -> None:
+        import tempfile
+        from pipeline.git_sync import GitLockTimeoutError, git_repo_lock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, mirror = self._make_upstream_and_mirror(tmp)
+            with git_repo_lock(mirror, exclusive=False, timeout=1.0):
+                with git_repo_lock(mirror, exclusive=False, timeout=1.0):
+                    with self.assertRaises(GitLockTimeoutError):
+                        with git_repo_lock(mirror, exclusive=True, timeout=0.05, poll_interval=0.01):
+                            pass
+
+    def test_sync_capabilities_moved_refs_and_daemon_once(self) -> None:
+        import tempfile
+        from pipeline.daemon import run_daemon_loop
+        from pipeline.git_sync import discover_local_repo_capabilities, sync_and_enqueue_repo_tasks, sync_git_repository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream, work, mirror = self._make_upstream_and_mirror(tmp)
+
+            # Advance upstream with a stable tag, a new commit on master, and a deleted branch
+            (work / "stable.c").write_text("int stable(void) { return 1; }\n")
+            self._git(work, "add", "stable.c")
+            self._git(work, "commit", "-m", "v3.0.1")
+            self._git(work, "tag", "v3.0.1")
+            (work / "next.c").write_text("int nxt(void) { return 2; }\n")
+            self._git(work, "add", "next.c")
+            self._git(work, "commit", "-m", "advance master")
+            self._git(work, "push", "origin", "master", "--tags")
+            self._git(work, "push", "origin", ":topic/prune-me")
+
+            sync_res = sync_git_repository(mirror, raise_on_error=True)
+            self.assertTrue(sync_res.updated)
+            self.assertIn("v3.0.1", sync_res.new_tags)
+            self.assertIn("refs/remotes/origin/topic/prune-me", sync_res.changed_refs)
+
+            caps = discover_local_repo_capabilities(mirror, 1, "linux")
+            tracks = {c["track_name"]: c for c in caps}
+            self.assertIn("mainline", tracks)
+            self.assertIn("stable:v3.0", tracks)
+
+            db = DistDB(full_schema=True)
+            db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
+            db.insert_rows("m_git_network", ["network_id", "project_id", "name", "root_commit_hash"], [(1, 1, "linux-network", b"\x01" * 20)])
+            db.insert_rows("m_repository", ["repo_id", "network_id", "name", "git_url", "default_branch"], [(1, 1, "linux", str(upstream), "master")])
+
+            # Record v3.0 as already parsed at old commit, and branch master at old SHA so movement is detected
+            old_sha = self._git(mirror, "rev-parse", "v3.0^{commit}")
+            db.insert_rows("m_commit", ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+                           [(10, 1, bytes.fromhex(old_sha), 1, 0, 1, 0, "v3.0", "")])
+            db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(1, 1, 1, "v3.0", 10), (2, 1, 2, "master", 10)])
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 10, ingest_state.INGEST_DONE, 1)])
+
+            enq = sync_and_enqueue_repo_tasks(
+                db, 1, 1, "linux", mirror, start_ref="v3.0", delegate_stable=True, delegate_branches=["master"], enqueue_preparse=True, is_kernel=True
+            )
+            self.assertGreaterEqual(enq["main"], 1)
+            self.assertGreaterEqual(enq["stable"], 1)
+            self.assertGreaterEqual(enq["preparse"], 1)
+            by_key = {(t["task_type"], t["ref_name"]): t for t in db.dist_tasks}
+            self.assertEqual((by_key[("main", "v3.0")]["status"], by_key[("main", "v3.0")]["priority"]), ("completed", 10))
+            self.assertEqual((by_key[("stable", "v3.0.1")]["status"], by_key[("stable", "v3.0.1")]["priority"]), ("pending", 5))
+            self.assertEqual((by_key[("branch", "master")]["status"], by_key[("branch", "master")]["commit_id"]), ("pending", 0))
+            self.assertEqual(by_key[("preparse", "v3.0.1")]["priority"], 1)
+
+            # Daemon loop runs once cleanly without ever invoking update()
+            import main as main_mod
+            args = mock.MagicMock()
+            args.git_auto_update = True
+            args.no_git_update = False
+            args.git_update_interval = 300
+            args.delegate_stable = True
+            args.delegate_branches = []
+            args.include_pre_releases = True
+            with mock.patch.object(main_mod, "G") as mock_g, \
+                 mock.patch("pipeline.daemon.G") as mock_dg, \
+                 mock.patch("pipeline.update.update") as mock_update, \
+                 mock.patch("pipeline.daemon.resolve_git_network_and_repo", return_value=(1, 1)):
+                mock_dg.DB = lambda: mock.MagicMock(__enter__=lambda s: db, __exit__=lambda s, e, t, b: None)
+                mock_dg.is_deadline_exceeded.return_value = False
+                mock_g.is_deadline_exceeded.return_value = False
+                rc = run_daemon_loop(args, [{"name": "linux", "path": str(mirror), "start_ref": "v3.0", "project": "linux", "enabled": True}],
+                                     node_id="daemon:test:1", once=True)
+            self.assertEqual(rc, 0)
+            mock_update.assert_not_called()
+
+    def test_discover_local_repo_capabilities_includes_pre_v3_and_historical_tags(self) -> None:
+        """Capabilities must span pre-v3.0 and historical unparsed tags, and mainline chaining must stay intact."""
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from pipeline.git_sync import discover_local_repo_capabilities, sync_and_enqueue_repo_tasks
+        from pipeline.scheduler import DistributedTaskScheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "linux"
+            subprocess.run(["git", "init", "--initial-branch=master", str(repo)], check=True, capture_output=True)
+            tags = ["0.01", "0.10", "0.95", "0.95a", "v2.6.12", "v3.0", "v3.0.1", "v3.1"]
+            for idx, tag in enumerate(tags):
+                (repo / "f.c").write_text(f"int v(void) {{ return {idx}; }}\n")
+                self._git(repo, "add", "f.c")
+                self._git(repo, "commit", "-m", tag)
+                self._git(repo, "tag", tag)
+
+            caps = discover_local_repo_capabilities(repo, 1, "linux", include_pre_releases=True)
+            by_track = {c["track_name"]: c for c in caps}
+            self.assertIn("mainline", by_track)
+            self.assertEqual(by_track["mainline"]["min_ref"], "0.01")
+            self.assertEqual(by_track["mainline"]["max_ref"], "v3.1")
+            self.assertIn("stable:v3.0", by_track)
+            self.assertEqual((by_track["stable:v3.0"]["min_ref"], by_track["stable:v3.0"]["max_ref"]), ("v3.0.1", "v3.0.1"))
+
+            db = DistDB(full_schema=True)
+            enq = sync_and_enqueue_repo_tasks(
+                db, 1, 1, "linux", repo, start_ref="0.01", delegate_stable=True, delegate_branches=[],
+                enqueue_main=True, enqueue_preparse=False, is_kernel=True,
+            )
+            self.assertEqual(enq["main"], 7)
+            self.assertEqual(enq["stable"], 1)
+
+            main_tasks = {r["ref_name"]: r for r in db.dist_tasks if r["task_type"] == "main"}
+            self.assertEqual(main_tasks["0.01"]["base_ref_name"], "")
+            self.assertEqual(main_tasks["0.10"]["base_ref_name"], "0.01")
+            self.assertEqual(main_tasks["0.95"]["base_ref_name"], "0.10")
+            self.assertEqual(main_tasks["0.95a"]["base_ref_name"], "0.95")
+            self.assertEqual(main_tasks["v2.6.12"]["base_ref_name"], "0.95a")
+            self.assertEqual(main_tasks["v3.0"]["base_ref_name"], "v2.6.12")
+            self.assertEqual(main_tasks["v3.1"]["base_ref_name"], "v3.0")
+
+            sched = DistributedTaskScheduler(lambda: db, 1, "master-1", distributed.ROLE_MASTER, min_priority=10)
+            sched.register_capabilities(caps, db=db)
+
+            claimed_order: list[str] = []
+            for idx in range(7):
+                task = sched.claim_next(db=db)
+                self.assertIsNotNone(task, f"expected mainline task at step {idx}")
+                claimed_order.append(task["ref_name"])
+                sched.complete(task["task_id"], 100 + idx, ref_name=task["ref_name"], db=db)
+            self.assertEqual(claimed_order, ["0.01", "0.10", "0.95", "0.95a", "v2.6.12", "v3.0", "v3.1"])
+
+    def test_sync_and_enqueue_delta_only_and_preserves_failed_and_completed_preparse(self) -> None:
+        """Repeated syncs publish delta-only rows, keeping unchanged failed and completed preparse tasks closed."""
+        import tempfile
+        from pipeline.git_sync import sync_and_enqueue_repo_tasks, sync_git_repository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, work, mirror = self._make_upstream_and_mirror(tmp)
+            (work / "stable.c").write_text("int s(void) { return 1; }\n")
+            self._git(work, "add", "stable.c")
+            self._git(work, "commit", "-m", "v3.0.1")
+            self._git(work, "tag", "v3.0.1")
+            self._git(work, "push", "origin", "master", "--tags")
+            self._git(work, "push", "origin", ":topic/prune-me")
+            self.assertTrue(sync_git_repository(mirror, raise_on_error=True).updated)
+
+            db = DistDB(full_schema=True)
+            db.insert_rows("m_project", ["project_id", "name", "slug"], [(1, "Linux", "linux")])
+            db.insert_rows("m_git_network", ["network_id", "project_id", "name", "root_commit_hash"], [(1, 1, "linux-network", b"\x01" * 20)])
+            db.insert_rows("m_repository", ["repo_id", "network_id", "name", "git_url", "default_branch"], [(1, 1, "linux", str(mirror), "master")])
+
+            first = sync_and_enqueue_repo_tasks(
+                db, 1, 1, "linux", mirror, start_ref="v3.0", delegate_stable=True, delegate_branches=["master"],
+                enqueue_preparse=True, is_kernel=True,
+            )
+            self.assertEqual(first["enqueued"], first["total"])
+            self.assertEqual(first["unchanged"], 0)
+
+            second = sync_and_enqueue_repo_tasks(
+                db, 1, 1, "linux", mirror, start_ref="v3.0", delegate_stable=True, delegate_branches=["master"],
+                enqueue_preparse=True, is_kernel=True,
+            )
+            self.assertEqual(second["enqueued"], 0)
+            self.assertEqual(second["unchanged"], second["total"])
+
+            db.update_rows("distributed_tasks", {"status": "failed", "error_msg": "perm failure"}, {"task_type": "stable", "ref_name": "v3.0.1"})
+            db.update_rows("distributed_tasks", {"status": "completed"}, {"task_type": "preparse", "ref_name": "v3.0"})
+
+            # Advance master branch upstream and sync mirror
+            (work / "moved.c").write_text("int moved(void) { return 2; }\n")
+            self._git(work, "add", "moved.c")
+            self._git(work, "commit", "-m", "advance master")
+            self._git(work, "push", "origin", "master")
+            self.assertTrue(sync_git_repository(mirror, raise_on_error=True).updated)
+
+            with mock.patch("core.distributed._resolve_branch_merge_base", wraps=distributed._resolve_branch_merge_base) as mb_spy:
+                third = sync_and_enqueue_repo_tasks(
+                    db, 1, 1, "linux", mirror, start_ref="v3.0", delegate_stable=True, delegate_branches=["master"],
+                    enqueue_preparse=True, is_kernel=True,
+                )
+            mb_spy.assert_called_once()
+            self.assertEqual(third["enqueued"], 1)
+
+            by_key = {(r["task_type"], r["ref_name"]): r for r in db.dist_tasks}
+            self.assertEqual(by_key[("stable", "v3.0.1")]["status"], "failed")
+            self.assertEqual(by_key[("preparse", "v3.0")]["status"], "completed")
+            self.assertEqual(by_key[("branch", "master")]["status"], "pending")
+
+
+class TestMainDistributedRouting(unittest.TestCase):
+    """Verify Master incremental base propagation, exclusive distributed_tasks publishing, and Worker capability strictness."""
+
+    def test_master_queue_sets_incremental_base_and_skips_legacy_table(self) -> None:
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from main import G, gp, main
+        from pipeline.git_ingest import EMPTY_TREE
+
+        saved = (getattr(G, "distributed_role", None), getattr(G, "distributed", False), getattr(G, "node_id", None), G.DB,
+                 getattr(gp, "VID", 0), getattr(gp, "Old_VID", 0), getattr(gp, "Old_Version_Name", None))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "linux"
+            lock_dir = Path(tmp) / "locks"
+            subprocess.run(["git", "init", "--initial-branch=master", str(repo)], check=True, capture_output=True)
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+            }
+            for idx, tag in enumerate(["0.01", "0.10", "v3.0", "v3.0.1"]):
+                (repo / "f.c").write_text(f"int f(void) {{ return {idx}; }}\n")
+                subprocess.run(["git", "-C", str(repo), "add", "f.c"], check=True, env=env, capture_output=True)
+                subprocess.run(["git", "-C", str(repo), "commit", "-m", tag], check=True, env=env, capture_output=True)
+                subprocess.run(["git", "-C", str(repo), "tag", tag], check=True, env=env, capture_output=True)
+
+            db = DistDB(full_schema=True)
+            seen_updates: list[tuple[str, int, str]] = []
+
+            def fake_update(ref_name: str, repo_path=None) -> bool:
+                seen_updates.append((ref_name, gp.Old_VID, gp.Old_Version_Name))
+                cid = 100 + len(seen_updates)
+                gp.VID = cid
+                gp.Version_Name = ref_name
+                db.insert_rows(
+                    "m_commit",
+                    ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+                    [(cid, 1, bytes([len(seen_updates)]) * 20, 1, 0, 1, 0, ref_name, "")],
+                )
+                db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(len(seen_updates), 1, 1, ref_name, cid)])
+                ingest_state.set_status(db, 1, cid, ingest_state.INGEST_DONE)
+                return True
+
+            mock_args = mock.MagicMock()
+            mock_args.role = "master"
+            mock_args.worker_id = "test-master"
+            mock_args.repo = str(repo)
+            mock_args.ref = None
+            mock_args.single_version = False
+            mock_args.include_pre_releases = True
+            mock_args.delegate_stable = True
+            mock_args.delegate_branches = []
+            mock_args.branches = False
+            mock_args.mem_max = 0.0
+            mock_args.lock_dir = str(lock_dir)
+            mock_args.force_singleton = False
+            mock_args.poll_interval = 60
+            mock_args.git_update_interval = 300
+            mock_args.no_git_update = True
+            mock_args.git_auto_update = False
+            mock_args.backfill = None
+            for flag in ("reset", "Drop", "cve", "clean_temp", "resolve_ml", "detect_repos", "release_stats", "preparse", "no_cve", "no_release_stats", "repair", "dry_run"):
+                setattr(mock_args, flag, False)
+
+            with mock.patch("main.arg_handling", return_value=mock_args), \
+                 mock.patch("main.get_repository", return_value={"name": "linux", "path": str(repo), "start_ref": "0.01", "project": "linux", "enabled": True}), \
+                 mock.patch("main.setup_memory_limit"), \
+                 mock.patch("main._apply_db_server_tuning"), \
+                 mock.patch("main._preflight_libclang"), \
+                 mock.patch("main.ensure_db_instance"), \
+                 mock.patch("main.ensure_db_views"), \
+                 mock.patch("main.ensure_declared_indexes"), \
+                 mock.patch("main.refresh_person_identities"), \
+                 mock.patch("main.processing_cve_list"), \
+                 mock.patch("main.processing_release_stats"), \
+                 mock.patch("main.processing_cve_releases"), \
+                 mock.patch("main.run_requested_backfills", return_value=False), \
+                 mock.patch("main.run_automatic_backfills"), \
+                 mock.patch("main.get_mailing_list_config", return_value={"enabled": False}), \
+                 mock.patch("main.resolve_git_network_and_repo", return_value=(1, 1)), \
+                 mock.patch("main.update", side_effect=fake_update):
+                G.DB = lambda: mock.MagicMock(__enter__=lambda s: db, __exit__=lambda s, e, t, b: None)
+                try:
+                    with self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertEqual(ctx.exception.code, 0)
+                finally:
+                    G.distributed_role, G.distributed, G.node_id, G.DB, gp.VID, gp.Old_VID, gp.Old_Version_Name = saved
+
+            self.assertEqual(seen_updates, [("0.01", 0, EMPTY_TREE), ("0.10", 101, "0.01"), ("v3.0", 102, "0.10")])
+            self.assertEqual(db.count_rows("m_parse_task"), 0, "Master must publish exclusively to distributed_tasks")
+
+    def test_worker_does_not_bypass_capabilities_via_legacy_queue(self) -> None:
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from main import G, gp, main
+
+        saved = (getattr(G, "distributed_role", None), getattr(G, "distributed", False), getattr(G, "node_id", None), G.DB)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "linux"
+            subprocess.run(["git", "init", "--initial-branch=master", str(repo)], check=True, capture_output=True)
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+            }
+            (repo / "f.c").write_text("int f(void) { return 0; }\n")
+            subprocess.run(["git", "-C", str(repo), "add", "f.c"], check=True, env=env, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "v3.0"], check=True, env=env, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "tag", "v3.0"], check=True, env=env, capture_output=True)
+
+            db = DistDB(full_schema=True)
+            db.add_dist_tasks({
+                "task_id": 1, "network_id": 1, "repo_name": "linux", "task_type": "stable",
+                "track_name": "stable:v6.6", "ref_name": "v6.6.1", "priority": 5, "seq_order": 1, "status": "pending",
+            })
+            db.add_tasks({
+                "task_id": 99, "network_id": 1, "chain_name": "stable:v3.0", "chain_kind": "stable",
+                "ref_name": "v3.0.1", "status": distributed.TASK_ELIGIBLE,
+            })
+
+            mock_args = mock.MagicMock()
+            mock_args.role = "worker"
+            mock_args.worker_id = "test-worker"
+            mock_args.worker_once = True
+            mock_args.repo = str(repo)
+            mock_args.ref = None
+            mock_args.single_version = False
+            mock_args.include_pre_releases = True
+            mock_args.delegate_stable = True
+            mock_args.delegate_branches = []
+            mock_args.branches = False
+            mock_args.mem_max = 0.0
+            mock_args.lock_dir = None
+            mock_args.force_singleton = False
+            mock_args.poll_interval = 60
+            mock_args.git_update_interval = 300
+            mock_args.no_git_update = True
+            mock_args.git_auto_update = False
+            for flag in ("reset", "Drop", "cve", "clean_temp", "resolve_ml", "detect_repos", "release_stats", "preparse"):
+                setattr(mock_args, flag, False)
+
+            with mock.patch("main.arg_handling", return_value=mock_args), \
+                 mock.patch("main.get_repository", return_value={"name": "linux", "path": str(repo), "project": "linux", "enabled": True}), \
+                 mock.patch("main.setup_memory_limit"), \
+                 mock.patch("main._apply_db_server_tuning"), \
+                 mock.patch("main._preflight_libclang"), \
+                 mock.patch("main.get_mailing_list_config", return_value={"enabled": False}), \
+                 mock.patch("main.resolve_git_network_and_repo", return_value=(1, 1)), \
+                 mock.patch("core.ingest_state.fetch_repo_version_states", return_value={}), \
+                 mock.patch("core.distributed.NodeHeartbeatDaemon"), \
+                 mock.patch("main.update") as mock_update:
+                G.DB = lambda: mock.MagicMock(__enter__=lambda s: db, __exit__=lambda s, e, t, b: None)
+                try:
+                    with self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertEqual(ctx.exception.code, 0)
+                finally:
+                    G.distributed_role, G.distributed, G.node_id, G.DB = saved
+
+            mock_update.assert_not_called()
+
+
+class TestIngestBugFixes(unittest.TestCase):
+    """Verify deadline abort and moved-ref fixes in update() and ingest_git_dag()."""
+
+    def test_update_deadline_exceeded_returns_false(self) -> None:
+        from pipeline import update as upd_mod
+
+        with mock.patch("pipeline.update.MF"), \
+             mock.patch("pipeline.update.gp"), \
+             mock.patch("pipeline.update.git_repo_lock"), \
+             mock.patch("pipeline.update.create_new_vid", return_value=False), \
+             mock.patch.object(upd_mod.G, "is_deadline_exceeded", return_value=True):
+            self.assertIs(upd_mod.update("v3.0"), False)
+
+    def test_ingest_git_dag_does_not_skip_moved_ref(self) -> None:
+        from pipeline.git_ingest import ingest_git_dag
+        from main import G, gp
+
+        db = DistDB(full_schema=True)
+        db.insert_rows("m_commit", ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+                       [(10, 1, b"\x11" * 20, 1, 0, 1, 0, "old", "")])
+        db.insert_rows("m_git_ref", ["ref_id", "repo_id", "ref_type", "ref_name", "commit_id"], [(1, 1, 2, "master", 10)])
+        db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 10, ingest_state.INGEST_DONE, 1)])
+
+        new_hex = "22" * 20
+        mock_git_parser = mock.MagicMock()
+        mock_git_parser.get_commit_hash.return_value = new_hex
+        mock_git_parser.parse_version_commits.return_value = []
+
+        orig_db = G.DB
+        orig_vid = getattr(gp, "VID", 0)
+        G.DB = lambda: mock.MagicMock(__enter__=lambda s: db, __exit__=lambda s, e, t, b: None)
+        try:
+            with mock.patch("parser.git_ast.GitCommitParser", return_value=mock_git_parser), \
+                 mock.patch("pipeline.git_ingest.sp.run") as mock_sp:
+                mock_sp.return_value = mock.MagicMock(stdout="refs/heads/master\n", returncode=0)
+                cid, _chk, already = ingest_git_dag("master", 1, 1, "repos/linux")
+        finally:
+            G.DB = orig_db
+            gp.VID = orig_vid
+
+        self.assertFalse(already, "moved branch pointing to unparsed commit must not be skipped as done")
+        self.assertGreater(cid, 10)
 
 
 if __name__ == "__main__":

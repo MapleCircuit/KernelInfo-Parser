@@ -6,8 +6,8 @@
 Always enforce these invariants when modifying `core/`:
 
 1. **Canonical Database Schema Authority (`core/DBLayout.py`)**:
-   - `core/DBLayout.py` is the single authoritative source of truth for all 65 tables (`Table_Array` / `TABLES`).
-   - The module docstring contains the complete relational entity-relationship graph across git DAG, content-addressable blobs, code tags, symbols, Kconfig, maintainers, and distributed tasks.
+   - `core/DBLayout.py` is the single authoritative source of truth for all 77 tables (`Table_Array` / `TABLES`).
+   - The module docstring contains the complete relational entity-relationship graph across git DAG, content-addressable blobs, code tags, symbols, Kconfig, maintainers, and distributed coordination tables.
    - When adding or altering a table, update the docstring graph, the `Table(...)` definition, and the table's registration in `Table_Array` / `TABLES`.
 2. **Database View & Migration Lifecycle (`pipeline/db_setup.py`)**:
    - Tables in `Table_Array` are auto-created by the engine.
@@ -21,12 +21,12 @@ Always enforce these invariants when modifying `core/`:
    - Never mutate `Table` column schema tuples at runtime.
 5. **Pure Extractor Reuse**:
    - Parsers feeding `m_blob_facts` (calls/ops tables `1`, Kernel API `2`, includes `3`, Kconfig definitions `4`, doc labels `5`, man pages `6`) must keep extraction logic in pure functions under `parser/` so `core/` persists them during ingestion and `webapp/` can invoke them for unparsed revisions.
-6. **Distributed Multi-Computer Invariants (`core/distributed.py`, `main.py`)**:
+6. **Distributed Multi-Computer Invariants (`core/distributed.py`, `pipeline/scheduler.py`, `pipeline/git_sync.py`, `pipeline/daemon.py`, `main.py`)**:
    - **Sequence block leasing**: Always lease primary key ID blocks using `db.reserve_id_block(table, block_size, commit_id)` in distributed mode (`G.distributed == True`, e.g. in `_ingest_commit_range` for `m_commit` and `m_maintainer_person`); never use raw `db.get_next_id()`.
    - **Active worker states**: In `_previous_ingest`, check `m_parse_node.heartbeat_at >= now - 180` before treating `m_ingest_state.status == INGEST_PARSING` as interrupted to prevent premature rollback of in-flight peer runs.
-   - **Dependency unlocking**: Master unlocks in `finish_version_ingest()`; Workers unlock exclusively in `mark_task_done()` after verifying lease validity.
-   - **Delegable task updates**: `publish_delegable_chains()` must conditionally assign `commit_id` and `base_commit_id` (`IF(VALUES(...) > 0, VALUES(...), ...)`) to preserve resolved IDs.
-   - **Heartbeat daemon propagation**: Propagate `role` and `network_id` into `NodeHeartbeatDaemon` to maintain node registration on heartbeat renewals.
+   - **Dependency unlocking & capability matching**: Claim `distributed_tasks` strictly through `BaseDBEngine.claim_distributed_task()` / `DistributedTaskScheduler.claim_next()` joined against `distributed_worker_capabilities`, unlock dependents / backfill `base_commit_id` only after verified claim ownership in `finish_version_ingest()` / `complete_distributed_task()`, and protect Git mirror operations with `git_repo_lock()`.
+   - **Singleton security**: Enforce `SingletonProcessLock` (`flock` PID lock file) and DB heartbeat checks for both `master` and `daemon` roles unless overridden with `--force-singleton`.
+   - **Heartbeat daemon propagation**: Propagate `role`, `network_id`, and `singleton_lock` into `NodeHeartbeatDaemon` to renew node registration, `distributed_tasks.heartbeat_ts`, and lock timestamps.
 7. **Documentation & Tests**:
    - Update `core/API.md` in declarative present-tense (§4 for schema, §5 for ChangeSet routing, §11 for distributed, §12 for backfills).
    - Run targeted unit tests:

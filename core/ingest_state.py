@@ -44,8 +44,18 @@ logger = logging.getLogger(__name__)
 INGEST_PARSING = 1
 INGEST_DONE = 2
 
-# Single-id tables whose rows are not created by a version run (seeds and repository registry)
-_STATIC_TABLES = {"m_type_descriptor", "m_project", "m_git_network", "m_repository", "m_git_ref"}
+# Single-id tables whose rows are not created by a version run (seeds, registry, and coordination queues)
+_STATIC_TABLES = {
+    "m_type_descriptor",
+    "m_project",
+    "m_git_network",
+    "m_repository",
+    "m_git_ref",
+    "m_table_sequence",
+    "m_parse_task",
+    "distributed_tasks",
+    "distributed_worker_capabilities",
+}
 # Tables referencing blobs from a commit's point of view (rows of other versions point at the blob too)
 _COMMIT_SCOPED = {"m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_blob_transition"}
 # Rows describing the version's head commit itself (written by the run, whatever the commit's id)
@@ -388,6 +398,7 @@ def rollback_id_ranges(
     commit_id: int,
     tables: Sequence[Any],
     id_ranges: list[tuple[int, int, int]],
+    network_id: int | None = None,
 ) -> int:
     """Range-isolated rollback for an interrupted run that leased discrete ID blocks.
 
@@ -458,7 +469,8 @@ def rollback_id_ranges(
         total += int(db.delete_rows(tbl.table_name, {pk: between(start_id, end_id)}) or 0)
 
     # 4. Clean up state and marks
-    db.delete_rows("m_ingest_state", {"commit_id": commit_id})
+    state_where = {"network_id": network_id, "commit_id": commit_id} if network_id is not None else {"commit_id": commit_id}
+    db.delete_rows("m_ingest_state", state_where)
     discard_marks(db, commit_id)
     logger.info(
         f"Rolled back interrupted run of commit_id {commit_id} using leased ID ranges: "
@@ -473,7 +485,7 @@ def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[
     back to a version-scoped purge); raises RecoveryError when older rows reference rows of the run."""
     id_ranges = fetch_id_ranges(db, commit_id)
     if id_ranges:
-        rollback_id_ranges(db, commit_id, tables, id_ranges)
+        rollback_id_ranges(db, commit_id, tables, id_ranges, network_id=network_id)
         return True
     marks = _fetch_marks(db, commit_id, tables)
     if not marks:
@@ -609,6 +621,53 @@ def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temp
     return removed
 
 
+def _commit_hash_hex(val: Any) -> str:
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return bytes(val).hex()
+    return str(val).lower() if val else ""
+
+
+def _classify_repo_refs(
+    db: Any,
+    rows: Sequence[Sequence[Any]],
+    *,
+    with_hash: bool = False,
+) -> dict[str, Any]:
+    """Classify `(ref_name, commit_id, status[, commit_hash])` rows into done/interrupted/legacy/new."""
+    states: dict[str, Any] = {}
+    legacy_candidates: list[tuple[str, int, str]] = []
+    for row in rows:
+        ref_name = row[0]
+        if isinstance(ref_name, (bytes, bytearray)):
+            ref_name = ref_name.decode("utf-8", errors="replace")
+        commit_id = int(row[1])
+        status = row[2]
+        sha_hex = _commit_hash_hex(row[3]) if with_hash else ""
+        if status == INGEST_DONE:
+            states[ref_name] = (commit_id, "done", sha_hex) if with_hash else (commit_id, "done")
+        elif status == INGEST_PARSING:
+            states[ref_name] = (commit_id, "interrupted", sha_hex) if with_hash else (commit_id, "interrupted")
+        else:
+            legacy_candidates.append((ref_name, commit_id, sha_hex))
+
+    # One query per 1000 refs (the primary key's commit_id prefix answers it) instead of a COUNT(*) per ref
+    checkpointed: set[int] = set()
+    cids = sorted({cid for _name, cid, _sha in legacy_candidates})
+    for i in range(0, len(cids), _IN_CHUNK):
+        res = db.select_rows(
+            "m_bridge_checkpoint",
+            ["commit_id"],
+            {"commit_id": cids[i:i + _IN_CHUNK]},
+            distinct=True,
+            as_dict=False,
+        )
+        checkpointed.update(int(r[0]) for r in res)
+    for rname, cid, sha_hex in legacy_candidates:
+        st = "legacy" if cid in checkpointed else "new"
+        states[rname] = (cid, st, sha_hex) if with_hash else (cid, st)
+    return states
+
+
 def fetch_repo_version_states(db: Any, repo_id: int, network_id: int) -> dict[str, tuple[int, str]]:
     """Return map of ref_name -> (commit_id, state) for all registered refs of the repository.
 
@@ -619,10 +678,8 @@ def fetch_repo_version_states(db: Any, repo_id: int, network_id: int) -> dict[st
             complete is decided by `main._previous_ingest()` (at least 90% of the tree checkpointed)
         "new": registered ref that has not been ingested yet
     """
-    states: dict[str, tuple[int, str]] = {}
     if db is None:
-        return states
-    legacy_candidates: list[tuple[str, int]] = []
+        return {}
     rows = db.select_rows(
         ("m_git_ref", "r"),
         ["r.ref_name", "r.commit_id", "s.status"],
@@ -630,29 +687,24 @@ def fetch_repo_version_states(db: Any, repo_id: int, network_id: int) -> dict[st
         joins=[Join(("m_ingest_state", "s"), {"s.commit_id": "r.commit_id", "s.network_id": Value(network_id)}, "left")],
         as_dict=False,
     )
-    for row in rows:
-        ref_name = row[0]
-        if isinstance(ref_name, (bytes, bytearray)):
-            ref_name = ref_name.decode("utf-8", errors="replace")
-        commit_id = int(row[1])
-        status = row[2]
-        if status == INGEST_DONE:
-            states[ref_name] = (commit_id, "done")
-        elif status == INGEST_PARSING:
-            states[ref_name] = (commit_id, "interrupted")
-        else:
-            legacy_candidates.append((ref_name, commit_id))
+    return _classify_repo_refs(db, rows, with_hash=False)
 
-    # One query per 1000 refs (the primary key's commit_id prefix answers it) instead of a COUNT(*) per ref
-    checkpointed: set[int] = set()
-    cids = sorted({cid for _name, cid in legacy_candidates})
-    for i in range(0, len(cids), _IN_CHUNK):
-        res = db.select_rows("m_bridge_checkpoint", ["commit_id"], {"commit_id": cids[i:i + _IN_CHUNK]},
-                             distinct=True, as_dict=False)
-        checkpointed.update(int(r[0]) for r in res)
-    for rname, cid in legacy_candidates:
-        states[rname] = (cid, "legacy" if cid in checkpointed else "new")
-    return states
+
+def fetch_repo_ref_hashes(db: Any, repo_id: int, network_id: int) -> dict[str, tuple[int, str, str]]:
+    """Return map of ref_name -> (commit_id, state, commit_hash_hex) for all registered refs of the repository."""
+    if db is None:
+        return {}
+    rows = db.select_rows(
+        ("m_git_ref", "r"),
+        ["r.ref_name", "r.commit_id", "s.status", "c.commit_hash"],
+        {"r.repo_id": repo_id, "r.commit_id": gt(0)},
+        joins=[
+            Join(("m_ingest_state", "s"), {"s.commit_id": "r.commit_id", "s.network_id": Value(network_id)}, "left"),
+            Join(("m_commit", "c"), {"c.commit_id": "r.commit_id"}, "left"),
+        ],
+        as_dict=False,
+    )
+    return _classify_repo_refs(db, rows, with_hash=True)
 
 
 def purge_version_differential_rows(db: Any, commit_id: int, pred_commit_id: int | None = None) -> int:

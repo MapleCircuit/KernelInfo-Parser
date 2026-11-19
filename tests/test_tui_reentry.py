@@ -279,6 +279,12 @@ class TestParserDistributedReentry(_ReentryCase):
         self.assertFalse(screen.chk_dist_enabled.is_checked())
         self.assertTrue(screen.chk_delegate_stable.is_checked())
 
+    def test_daemon_role_round_trip(self) -> None:
+        self.round_trip({"chk_dist_enabled": True, "sel_role": "daemon"})
+        disk = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(disk["parser"]["distributed"]["role"], "daemon")
+        self.assertIs(disk["parser"]["distributed"]["enabled"], True)
+
     def test_invalid_number_keeps_screen_open_and_reports(self) -> None:
         app = self.new_app()
         screen = self.open_screen(app)
@@ -399,7 +405,7 @@ class TestDatabaseSSHReentry(_ReentryCase):
     screen_cls = DatabaseSSHScreen
 
     DB_FIELDS = {
-        "engine": "sqlite",
+        "engine": "mariadb",
         "host": "db.internal",
         "port": "3310",
         "user": "kinfo",
@@ -426,12 +432,27 @@ class TestDatabaseSSHReentry(_ReentryCase):
         db = json.loads(self.config_path.read_text(encoding="utf-8"))["database"]
         self.assertEqual(db["port"], 3310)
         self.assertEqual(db["unix_socket"], "")
-        self.assertEqual(db["engine"], "sqlite")
+        self.assertEqual(db["engine"], "mariadb")
         self.assertIs(db["ssh_tunnel"]["enabled"], False)
         self.assertEqual(db["ssh_tunnel"]["local_port"], 3399)
         # Fields without a widget survive the save.
         self.assertEqual(db["server_tuning"]["innodb_log_file_size"], "2G")
         self.assertEqual(db["ssh_tunnel"]["connect_timeout"], 10)
+
+    def test_sqlite_engine_round_trip_hides_server_fields(self) -> None:
+        values = {"engine": "sqlite", "database": "local.db"}
+        values.update(self.SSH_FIELDS_DISABLED)
+        fresh = self.round_trip(values)
+        db = json.loads(self.config_path.read_text(encoding="utf-8"))["database"]
+        self.assertEqual(db["engine"], "sqlite")
+        self.assertEqual(db["database"], "local.db")
+
+        screen = self.open_screen(fresh)
+        for hidden in (screen.host, screen.port, screen.user, screen.password, screen.unix_socket):
+            self.assertNotIn(hidden, screen.widgets)
+        self.choose(fresh, screen.engine, "mariadb")
+        for restored in (screen.host, screen.port, screen.user, screen.password, screen.unix_socket):
+            self.assertIn(restored, screen.widgets)
 
     def test_tunnel_enabled_with_matching_ports_round_trip(self) -> None:
         values = {

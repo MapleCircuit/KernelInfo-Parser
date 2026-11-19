@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+DAEMON_CONFIG_FILENAME = "config_daemon.json"
+WEBAPP_CONFIG_FILENAME = "config_webapp.json"
+_SERVICE_CONFIG_FILENAMES: dict[str, str] = {
+    "daemon": DAEMON_CONFIG_FILENAME,
+    "webapp": WEBAPP_CONFIG_FILENAME,
+}
+
 DEFAULT_SSH_TUNNEL_CONFIG: dict[str, Any] = {
     "enabled": False,
     "host": "",
@@ -286,18 +293,22 @@ def find_config_path(custom_path: str | Path | None = None) -> Path | None:
     """Resolve the path to the configuration file based on priority.
 
     1. Explicit custom_path argument (CLI flag -c / --config)
-    2. Environment variable CONFIG_FILE or CONFIG_PATH
+    2. Environment variable CONFIG_FILE, CONFIG_PATH, or KERNELINFO_CONFIG
     3. Default repo-root config.json
     """
     if custom_path:
-        p = Path(custom_path).resolve()
+        p = Path(custom_path).expanduser().resolve()
         if not p.is_file():
             raise FileNotFoundError(f"Specified configuration file not found: {p}")
         return p
 
-    env_path = _get_user_env("CONFIG_FILE") or _get_user_env("CONFIG_PATH")
+    env_path = (
+        _get_user_env("CONFIG_FILE")
+        or _get_user_env("CONFIG_PATH")
+        or _get_user_env("KERNELINFO_CONFIG")
+    )
     if env_path:
-        p = Path(env_path).resolve()
+        p = Path(env_path).expanduser().resolve()
         if not p.is_file():
             raise FileNotFoundError(f"Configuration file from environment variable not found: {p}")
         return p
@@ -1847,6 +1858,263 @@ def update_repository_branches(name_or_path: str | None = None, write: bool = Tr
             os.replace(tmp, target)
             logger.info("Updated %d branches for repository '%s' in %s", len(branches), repo.get("name"), target)
     return branches
+
+
+def _normalize_service_name(service: str) -> str:
+    """Return canonical service key (`'daemon'` or `'webapp'`); raise ValueError otherwise."""
+    key = str(service or "").strip().lower()
+    if key not in _SERVICE_CONFIG_FILENAMES:
+        valid = ", ".join(sorted(_SERVICE_CONFIG_FILENAMES))
+        raise ValueError(f"Unknown service {service!r}; expected one of: {valid}")
+    return key
+
+
+def get_service_config_path(service: str) -> Path:
+    """Return the standalone configuration path under REPO_ROOT for `'daemon'` or `'webapp'`."""
+    key = _normalize_service_name(service)
+    return REPO_ROOT / _SERVICE_CONFIG_FILENAMES[key]
+
+
+def prune_webapp_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied config dict with parser-only sections and fields removed."""
+    out = copy.deepcopy(dict(cfg))
+    out.pop("parser", None)
+
+    legacy_tunnel = out.pop("ssh_tunnel", None)
+    db_sec = out.get("database")
+    if isinstance(db_sec, dict):
+        if isinstance(legacy_tunnel, dict) and "ssh_tunnel" not in db_sec:
+            db_sec["ssh_tunnel"] = copy.deepcopy(legacy_tunnel)
+        db_sec.pop("server_tuning", None)
+        db_sec.pop("resolved_unix_socket", None)
+
+    log_sec = out.get("logging")
+    if isinstance(log_sec, dict):
+        log_sec.pop("parser", None)
+
+    repos = out.get("repositories")
+    if isinstance(repos, list):
+        for entry in repos:
+            if isinstance(entry, dict):
+                entry.pop("preparse", None)
+
+    return out
+
+
+def ensure_standalone_config(
+    service: str,
+    *,
+    config_path: Path | None = None,
+    base_config_path: Path | None = None,
+) -> tuple[Path, bool]:
+    """Seed a standalone config file for `'daemon'` or `'webapp'` if it does not exist yet.
+
+    Never overwrites or merges into an existing target file. Returns `(target_path, created)`.
+    """
+    key = _normalize_service_name(service)
+    target_path = (
+        Path(config_path).expanduser().resolve()
+        if config_path is not None
+        else get_service_config_path(key).resolve()
+    )
+    if target_path.exists():
+        return target_path, False
+
+    base_path = (
+        Path(base_config_path).expanduser().resolve()
+        if base_config_path is not None
+        else (REPO_ROOT / "config.json")
+    )
+    seed: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+    if base_path.is_file():
+        try:
+            with open(base_path, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Failed to parse base JSON configuration file at '{base_path}': {exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Error reading base configuration file at '{base_path}': {exc}") from exc
+        if not isinstance(file_data, dict):
+            raise RuntimeError(
+                f"Base configuration root element in '{base_path}' must be a JSON object, got {type(file_data).__name__}"
+            )
+        file_copy = copy.deepcopy(file_data)
+        if isinstance(file_copy.get("ssh_tunnel"), dict):
+            db_data = file_copy.setdefault("database", {})
+            if isinstance(db_data, dict) and "ssh_tunnel" not in db_data:
+                db_data["ssh_tunnel"] = copy.deepcopy(file_copy["ssh_tunnel"])
+        file_copy.pop("ssh_tunnel", None)
+        _deep_merge(seed, file_copy)
+
+    if isinstance(seed.get("database"), dict) and isinstance(seed["database"].get("ssh_tunnel"), dict):
+        seed.pop("ssh_tunnel", None)
+
+    if key == "daemon":
+        parser_sec = seed.get("parser")
+        if not isinstance(parser_sec, dict):
+            parser_sec = copy.deepcopy(DEFAULT_CONFIG["parser"])
+            seed["parser"] = parser_sec
+        dist_sec = parser_sec.get("distributed")
+        if not isinstance(dist_sec, dict):
+            dist_sec = {}
+            parser_sec["distributed"] = dist_sec
+        dist_sec["enabled"] = True
+        dist_sec["role"] = "daemon"
+    else:
+        seed = prune_webapp_config(seed)
+        webapp_sec = seed.get("webapp")
+        if not isinstance(webapp_sec, dict):
+            webapp_sec = copy.deepcopy(DEFAULT_CONFIG["webapp"])
+            seed["webapp"] = webapp_sec
+        webapp_sec["reload"] = False
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(seed, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+    return target_path, True
+
+
+def _parse_strict_int(val: Any) -> int | None:
+    """Parse an exact integer (rejecting booleans and non-numeric strings); return None if invalid."""
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            return int(val.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def validate_service_config(
+    service: str,
+    config_path: str | Path,
+) -> tuple[bool, list[str], dict[str, Any] | None]:
+    """Validate a standalone `'daemon'` or `'webapp'` config file without mutating global config state."""
+    key = _normalize_service_name(service)
+    path = Path(config_path).expanduser().resolve()
+    if not path.is_file():
+        return False, [f"Configuration file not found: {path}"], None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except json.JSONDecodeError as exc:
+        return False, [f"Failed to parse JSON configuration file '{path}': {exc}"], None
+    except OSError as exc:
+        return False, [f"Error reading configuration file '{path}': {exc}"], None
+
+    if not isinstance(raw_data, dict):
+        return False, [f"Root JSON element must be an object, got {type(raw_data).__name__}"], None
+
+    global _LOADED_CONFIG_PATH, _EXPORTED_ENV_VARS
+    prev_loaded_path = _LOADED_CONFIG_PATH
+    prev_env = dict(os.environ)
+    prev_exported = dict(_EXPORTED_ENV_VARS)
+    try:
+        loaded = load_config(path)
+    except Exception as exc:
+        return False, [str(exc)], None
+    finally:
+        for env_key in list(_EXPORTED_ENV_VARS.keys()):
+            if env_key in prev_env:
+                os.environ[env_key] = prev_env[env_key]
+            else:
+                os.environ.pop(env_key, None)
+        _EXPORTED_ENV_VARS = prev_exported
+        _LOADED_CONFIG_PATH = prev_loaded_path
+
+    errors: list[str] = []
+
+    raw_db = raw_data.get("database")
+    if "database" in raw_data and not isinstance(raw_db, dict):
+        errors.append("database section must be a JSON object")
+    db_cfg = loaded.get("database")
+    if not isinstance(db_cfg, dict):
+        errors.append("database section must be a JSON object")
+        db_cfg = {}
+
+    engine = str(db_cfg.get("engine") or "").strip()
+    if not engine:
+        errors.append("database.engine must not be empty")
+    else:
+        from db_engine import get_db_engine
+
+        try:
+            get_db_engine(engine)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if isinstance(raw_db, dict) and "port" in raw_db and raw_db["port"] is not None:
+        raw_db_port = _parse_strict_int(raw_db["port"])
+        if raw_db_port is None or not (1 <= raw_db_port <= 65535):
+            errors.append("database.port must be an integer between 1 and 65535")
+
+    if key == "webapp":
+        raw_wa = raw_data.get("webapp")
+        if "webapp" in raw_data and not isinstance(raw_wa, dict):
+            errors.append("webapp section must be a JSON object")
+        if isinstance(raw_wa, dict) and "port" in raw_wa:
+            raw_wa_port = _parse_strict_int(raw_wa["port"])
+            if raw_wa_port is None or not (1 <= raw_wa_port <= 65535):
+                errors.append("webapp.port must be an integer between 1 and 65535")
+        wa_cfg = loaded.get("webapp")
+        if not isinstance(wa_cfg, dict):
+            errors.append("webapp section must be a JSON object")
+        else:
+            wa_port = _parse_strict_int(wa_cfg.get("port"))
+            if wa_port is None or not (1 <= wa_port <= 65535):
+                errors.append("webapp.port must be an integer between 1 and 65535")
+    else:
+        raw_parser = raw_data.get("parser")
+        if "parser" in raw_data and not isinstance(raw_parser, dict):
+            errors.append("parser section must be a JSON object")
+        parser_cfg = loaded.get("parser")
+        if not isinstance(parser_cfg, dict) or not parser_cfg:
+            errors.append("parser section must be a non-empty JSON object")
+        if isinstance(raw_parser, dict):
+            if "mem_max" in raw_parser and raw_parser["mem_max"] is not None:
+                mem_val = raw_parser["mem_max"]
+                if isinstance(mem_val, bool):
+                    errors.append("parser.mem_max must be a non-negative number")
+                else:
+                    try:
+                        if float(mem_val) < 0:
+                            errors.append("parser.mem_max must be a non-negative number")
+                    except (TypeError, ValueError):
+                        errors.append("parser.mem_max must be a non-negative number")
+            if "table_engine" in raw_parser and raw_parser["table_engine"] is not None:
+                te_val = str(raw_parser["table_engine"]).strip().lower()
+                if te_val not in ("cached", "direct"):
+                    errors.append(f"parser.table_engine must be 'cached' or 'direct', got {te_val!r}")
+            if "distributed" in raw_parser and raw_parser["distributed"] is not None:
+                dist_val = raw_parser["distributed"]
+                if not isinstance(dist_val, dict):
+                    errors.append("parser.distributed must be a JSON object")
+                elif "role" in dist_val and dist_val["role"] is not None:
+                    role_val = str(dist_val["role"]).strip().lower()
+                    if role_val not in ("standalone", "master", "worker", "daemon"):
+                        errors.append(
+                            f"parser.distributed.role must be standalone, master, worker, or daemon; got {role_val!r}"
+                        )
+
+    if errors:
+        return False, errors, None
+    return True, [], loaded
 
 
 def reset_config() -> None:

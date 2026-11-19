@@ -33,7 +33,25 @@ from db_engine.spec import (
     Value,
     Where,
 )
-from db_engine.spec import Case, Incoming, Length, Order, Pred, Substr, add, ge, gt, in_select, is_null, ne
+from db_engine.spec import (
+    Case,
+    Incoming,
+    Length,
+    NullIf,
+    Order,
+    Pred,
+    Substr,
+    add,
+    ge,
+    gt,
+    in_select,
+    is_null,
+    le,
+    lt,
+    ne,
+    not_null,
+    sub,
+)
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -1400,6 +1418,460 @@ class BaseDBEngine(ABC):
             as_dict=False,
         )
         return [tuple(r) for r in rows]
+
+    _DISTRIBUTED_TASK_COLUMNS = (
+        "task_id",
+        "network_id",
+        "repo_id",
+        "repo_name",
+        "task_type",
+        "track_name",
+        "ref_name",
+        "target_sha",
+        "commit_id",
+        "base_ref_name",
+        "base_commit_id",
+        "priority",
+        "seq_order",
+        "status",
+        "worker_id",
+        "heartbeat_ts",
+        "created_ts",
+        "updated_ts",
+        "retry_count",
+        "error_msg",
+    )
+
+    def enqueue_distributed_tasks(self, rows: Sequence[Sequence[Any]]) -> int:
+        """Publish prioritized tasks into `distributed_tasks`; returns how many rows were written.
+
+        Each row is `(network_id, repo_id, repo_name, task_type, track_name, ref_name, target_sha,
+        commit_id, base_ref_name, base_commit_id, priority, seq_order, status, created_ts, updated_ts)`.
+        Unique key `(network_id, repo_name, task_type, ref_name)` identifies a task. Failed tasks,
+        completed tasks reopened as non-completed, and non-claimed tasks whose `target_sha` moved reset
+        their retry/worker/heartbeat fields cleanly while in-flight `claimed` tasks retain their owner.
+        """
+        if not rows:
+            return 0
+        sha_changed = [
+            {"status": ne("claimed")},
+            {"target_sha": ne("")},
+            Pred(Incoming("target_sha"), ne("")),
+            Pred(NullIf(Incoming("target_sha"), "target_sha"), not_null()),
+        ]
+        reopened = AnyOf(
+            {"status": "failed"},
+            [{"status": "completed"}, Pred(Incoming("status"), ne("completed"))],
+            sha_changed,
+        )
+        update_exprs = {
+            "commit_id": Case(
+                [([reopened], Incoming("commit_id")), (Pred(Incoming("commit_id"), gt(0)), Incoming("commit_id"))],
+                "commit_id",
+            ),
+            "base_commit_id": Case(
+                [(Pred(Incoming("base_commit_id"), gt(0)), Incoming("base_commit_id"))],
+                "base_commit_id",
+            ),
+            "retry_count": Case([([reopened], 0)], "retry_count"),
+            "error_msg": Case([([reopened], Value(""))], "error_msg"),
+            "worker_id": Case([([reopened], Value(""))], "worker_id"),
+            "heartbeat_ts": Case([([reopened], 0)], "heartbeat_ts"),
+            "created_ts": Case([({"created_ts": gt(0)}, "created_ts")], Incoming("created_ts")),
+            "status": Case(
+                [
+                    (
+                        {"status": "claimed"},
+                        Case([(Pred(Incoming("status"), "completed"), Value("completed"))], "status"),
+                    ),
+                    ([reopened], Incoming("status")),
+                ],
+                Incoming("status"),
+            ),
+        }
+        columns = [
+            "network_id",
+            "repo_id",
+            "repo_name",
+            "task_type",
+            "track_name",
+            "ref_name",
+            "target_sha",
+            "commit_id",
+            "base_ref_name",
+            "base_commit_id",
+            "priority",
+            "seq_order",
+            "status",
+            "created_ts",
+            "updated_ts",
+        ]
+        tuples = [tuple(row) for row in rows]
+        target_sha_exprs = {
+            "target_sha": Case(
+                [
+                    (
+                        [
+                            AnyOf({"status": ne("claimed")}, Pred(Incoming("status"), "completed")),
+                            Pred(Incoming("target_sha"), ne("")),
+                        ],
+                        Incoming("target_sha"),
+                    )
+                ],
+                "target_sha",
+            ),
+        }
+        with self.transaction():
+            # Split `status` and `target_sha` updates across two statements so MariaDB's
+            # left-to-right ON DUPLICATE KEY UPDATE never creates a mutual read-before-write cycle.
+            written = self.insert_rows(
+                "distributed_tasks",
+                columns,
+                tuples,
+                on_conflict="update",
+                update_columns=["repo_id", "track_name", "base_ref_name", "priority", "seq_order", "updated_ts"],
+                update_exprs=update_exprs,
+            )
+            if any(row[6] for row in tuples):
+                self.insert_rows(
+                    "distributed_tasks",
+                    columns,
+                    tuples,
+                    on_conflict="update",
+                    update_columns=[],
+                    update_exprs=target_sha_exprs,
+                )
+            return written
+
+    def register_worker_capabilities(
+        self,
+        worker_id: str,
+        network_id: int,
+        capabilities: Sequence[Mapping[str, Any]],
+        *,
+        role: str = "worker",
+        now: int | None = None,
+    ) -> int:
+        """Replace `distributed_worker_capabilities` entries for `(worker_id, network_id)` atomically."""
+        ts = int(time.time()) if now is None else int(now)
+        deduped: dict[tuple[str, str], tuple[Any, ...]] = {}
+        for cap in capabilities:
+            repo_name = str(cap.get("repo_name", "") or "")
+            track_name = str(cap.get("track_name", "") or "")
+            if not repo_name or not track_name:
+                continue
+            deduped[(repo_name, track_name)] = (
+                worker_id,
+                int(network_id),
+                repo_name,
+                track_name,
+                int(cap.get("min_seq_order", 0) or 0),
+                int(cap.get("max_seq_order", 0) or 0),
+                str(cap.get("min_ref", "") or "")[:128],
+                str(cap.get("max_ref", "") or "")[:128],
+                1 if cap.get("supports_preparse", 1) else 0,
+                str(cap.get("role", role) or role)[:32],
+                str(cap.get("local_repo_path", "") or "")[:512],
+                int(cap.get("updated_ts", ts) or ts),
+            )
+        cols = [
+            "worker_id",
+            "network_id",
+            "repo_name",
+            "track_name",
+            "min_seq_order",
+            "max_seq_order",
+            "min_ref",
+            "max_ref",
+            "supports_preparse",
+            "role",
+            "local_repo_path",
+            "updated_ts",
+        ]
+        with self.transaction():
+            self.delete_rows("distributed_worker_capabilities", {"worker_id": worker_id, "network_id": int(network_id)})
+            if not deduped:
+                return 0
+            return self.insert_rows(
+                "distributed_worker_capabilities",
+                cols,
+                list(deduped.values()),
+                on_conflict="update",
+            )
+
+    def unregister_worker_capabilities(self, worker_id: str) -> int:
+        """Remove all capability rows registered for `worker_id`."""
+        if not worker_id:
+            return 0
+        return self.delete_rows("distributed_worker_capabilities", {"worker_id": worker_id})
+
+    def claim_distributed_task(
+        self,
+        network_id: int,
+        worker_id: str,
+        *,
+        min_priority: int | None = None,
+        max_priority: int | None = None,
+        task_types: Sequence[str] | None = None,
+        repo_name: str | None = None,
+        preferred_track: str | None = None,
+        now: int | None = None,
+        scan_limit: int = 20,
+    ) -> dict[str, Any] | None:
+        """Atomically claim the highest-priority pending task matching `worker_id`'s capabilities.
+
+        Joins `distributed_tasks` with `distributed_worker_capabilities` so a node only claims tasks for
+        repositories, tracks, and ref ordinal ranges (`min_seq_order`..`max_seq_order`) it holds locally,
+        and whose base dependency (when non-empty) has already completed.
+        """
+        ts = int(time.time()) if now is None else int(now)
+        base_filter: dict[str, Any] = {"t.network_id": int(network_id), "t.status": "pending"}
+        pri_conds = []
+        if min_priority is not None:
+            pri_conds.append(ge(int(min_priority)))
+        if max_priority is not None:
+            pri_conds.append(le(int(max_priority)))
+        if len(pri_conds) == 1:
+            base_filter["t.priority"] = pri_conds[0]
+        elif len(pri_conds) > 1:
+            base_filter["t.priority"] = pri_conds
+        if task_types:
+            base_filter["t.task_type"] = list(task_types)
+        if repo_name:
+            base_filter["t.repo_name"] = repo_name
+
+        base_ready = AnyOf(
+            {"t.base_ref_name": ""},
+            [
+                {"t.base_commit_id": gt(0)},
+                Exists(("m_ingest_state", "bs"), {"bs.network_id": "t.network_id", "bs.commit_id": "t.base_commit_id"}, {"bs.status": 2}),
+            ],
+            Exists(
+                ("distributed_tasks", "bt"),
+                {"bt.network_id": "t.network_id", "bt.repo_name": "t.repo_name", "bt.ref_name": "t.base_ref_name"},
+                {"bt.status": "completed", "bt.task_type": ne("preparse")},
+            ),
+        )
+        where_terms: list[Any] = [
+            base_filter,
+            AnyOf(
+                {"c.track_name": Col("t.track_name")},
+                {"c.track_name": "*"},
+                [{"t.task_type": "preparse"}, {"c.track_name": "preparse"}],
+            ),
+            AnyOf({"t.task_type": ne("preparse")}, {"c.supports_preparse": 1}),
+            AnyOf({"c.min_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("t.seq_order", "c.min_seq_order"), ge(0))),
+            AnyOf({"c.max_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("c.max_seq_order", "t.seq_order"), ge(0))),
+            base_ready,
+        ]
+        cap_join = [
+            Join(
+                ("distributed_worker_capabilities", "c"),
+                {"c.worker_id": Value(worker_id), "c.network_id": "t.network_id", "c.repo_name": "t.repo_name"},
+                "inner",
+            )
+        ]
+
+        def _scan(extra_where: dict[str, Any] | None, limit: int) -> list[int]:
+            terms = list(where_terms)
+            if extra_where:
+                terms.append(extra_where)
+            rows = self.select_rows(
+                ("distributed_tasks", "t"),
+                ["t.task_id", "t.priority", "t.seq_order"],
+                terms,
+                joins=cap_join,
+                distinct=True,
+                order_by=["-t.priority", "t.seq_order", "t.task_id"],
+                limit=limit,
+                as_dict=False,
+            )
+            return [int(r[0]) for r in rows]
+
+        seen: set[int] = set()
+        if preferred_track:
+            pref_ids = _scan({"t.track_name": preferred_track}, min(5, max(1, int(scan_limit))))
+            for tid in pref_ids:
+                seen.add(tid)
+                with self.transaction():
+                    rc = self.update_rows(
+                        "distributed_tasks",
+                        {"status": "claimed", "worker_id": worker_id, "heartbeat_ts": ts, "updated_ts": ts},
+                        {"task_id": tid, "status": "pending"},
+                    )
+                    if rc and rc > 0:
+                        row = self.select_one(
+                            "distributed_tasks",
+                            list(self._DISTRIBUTED_TASK_COLUMNS),
+                            {"task_id": tid},
+                            as_dict=True,
+                        )
+                        if row is not None:
+                            return dict(row)
+
+        for tid in _scan(None, max(1, int(scan_limit))):
+            if tid in seen:
+                continue
+            seen.add(tid)
+            with self.transaction():
+                rc = self.update_rows(
+                    "distributed_tasks",
+                    {"status": "claimed", "worker_id": worker_id, "heartbeat_ts": ts, "updated_ts": ts},
+                    {"task_id": tid, "status": "pending"},
+                )
+                if rc and rc > 0:
+                    row = self.select_one(
+                        "distributed_tasks",
+                        list(self._DISTRIBUTED_TASK_COLUMNS),
+                        {"task_id": tid},
+                        as_dict=True,
+                    )
+                    if row is not None:
+                        return dict(row)
+        return None
+
+    def heartbeat_distributed_task(self, task_id: int, worker_id: str, *, now: int | None = None) -> int:
+        """Renew `heartbeat_ts` on an actively claimed task owned by `worker_id`."""
+        ts = int(time.time()) if now is None else int(now)
+        return self.update_rows(
+            "distributed_tasks",
+            {"heartbeat_ts": ts, "updated_ts": ts},
+            {"task_id": int(task_id), "worker_id": worker_id, "status": "claimed"},
+        )
+
+    def reset_zombie_distributed_tasks(
+        self,
+        network_id: int,
+        timeout_seconds: int,
+        *,
+        now: int | None = None,
+        task_ids: Sequence[int] | None = None,
+    ) -> int:
+        """Reset expired `claimed` tasks whose `heartbeat_ts` fell behind `now - timeout_seconds` to `pending`."""
+        ts = int(time.time()) if now is None else int(now)
+        cutoff = ts - max(1, int(timeout_seconds))
+        where: list[Any] = [
+            {"network_id": int(network_id), "status": "claimed"},
+            AnyOf({"heartbeat_ts": lt(cutoff)}, {"heartbeat_ts": 0, "updated_ts": lt(cutoff)}),
+        ]
+        if task_ids is not None:
+            ids = [int(tid) for tid in task_ids]
+            if not ids:
+                return 0
+            where.append({"task_id": ids})
+        return self.update_rows(
+            "distributed_tasks",
+            {
+                "status": "pending",
+                "worker_id": "",
+                "heartbeat_ts": 0,
+                "updated_ts": ts,
+                "error_msg": "Zombie task recovered after heartbeat expiration",
+            },
+            where,
+        )
+
+    def complete_distributed_task(
+        self,
+        task_id: int,
+        commit_id: int,
+        *,
+        worker_id: str | None = None,
+        ref_name: str | None = None,
+        network_id: int | None = None,
+        now: int | None = None,
+    ) -> bool:
+        """Mark a claimed task `completed` (checking `worker_id` if given) and backfill dependent `base_commit_id`."""
+        ts = int(time.time()) if now is None else int(now)
+        where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
+        if worker_id:
+            where["worker_id"] = worker_id
+        with self.transaction():
+            rc = self.update_rows(
+                "distributed_tasks",
+                {"status": "completed", "commit_id": int(commit_id), "error_msg": "", "updated_ts": ts},
+                where,
+            )
+            if not (rc and rc > 0):
+                return False
+            if int(commit_id) > 0:
+                task_row = self.select_one(
+                    "distributed_tasks",
+                    ["network_id", "repo_name", "ref_name", "task_type"],
+                    {"task_id": int(task_id)},
+                    as_dict=False,
+                )
+                t_repo = str(task_row[1]) if task_row else ""
+                t_type = str(task_row[3]) if task_row else ""
+                if task_row and ref_name is None:
+                    ref_name = str(task_row[2])
+                if task_row and network_id is None:
+                    network_id = int(task_row[0])
+                if ref_name and network_id is not None and t_type != "preparse":
+                    backfill_where: dict[str, Any] = {
+                        "network_id": int(network_id),
+                        "status": "pending",
+                        "base_ref_name": ref_name,
+                        "base_commit_id": 0,
+                    }
+                    if t_repo:
+                        backfill_where["repo_name"] = t_repo
+                    self.update_rows(
+                        "distributed_tasks",
+                        {"base_commit_id": int(commit_id), "updated_ts": ts},
+                        backfill_where,
+                    )
+        return True
+
+    def fail_distributed_task(
+        self,
+        task_id: int,
+        error_msg: str,
+        *,
+        worker_id: str | None = None,
+        max_attempts: int = 3,
+        now: int | None = None,
+    ) -> int:
+        """Record a failure on a claimed task; retries as `pending` until `max_attempts`, then sets `failed`."""
+        ts = int(time.time()) if now is None else int(now)
+        where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
+        if worker_id:
+            where["worker_id"] = worker_id
+        return self.update_rows(
+            "distributed_tasks",
+            {
+                "status": Case([(Pred(add("retry_count", 1), ge(int(max_attempts))), Value("failed"))], Value("pending")),
+                "retry_count": add("retry_count", 1),
+                "error_msg": str(error_msg)[:1000],
+                "worker_id": "",
+                "heartbeat_ts": 0,
+                "updated_ts": ts,
+            },
+            where,
+        )
+
+    def release_distributed_task(
+        self,
+        task_id: int,
+        reason: str,
+        worker_id: str,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Return a claimed task to `pending` without incrementing `retry_count`."""
+        ts = int(time.time()) if now is None else int(now)
+        rc = self.update_rows(
+            "distributed_tasks",
+            {
+                "status": "pending",
+                "worker_id": "",
+                "heartbeat_ts": 0,
+                "updated_ts": ts,
+                "error_msg": str(reason)[:1000],
+            },
+            {"task_id": int(task_id), "status": "claimed", "worker_id": worker_id},
+        )
+        return bool(rc and rc > 0)
 
     def symbol_refs_of_targets(
         self,

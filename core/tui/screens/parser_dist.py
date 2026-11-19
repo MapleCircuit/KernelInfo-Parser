@@ -66,11 +66,12 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
         ]),
     "distributed": ("Distributed (TL;DR)", [
             "Several machines parse into one shared database (directly or via the SSH tunnel).",
-            "- master: parses mainline in order, runs global jobs, posts other branches as tasks. One per network.",
+            "- master: parses mainline in order, runs global jobs, posts other branches as tasks. Singleton per network (PID lock + DB check).",
             "- worker: leases ready tasks, parses them, exits when all work is done.",
+            "- daemon: continuous background service polling git updates, scheduling tasks, and recovering zombie leases. Singleton per network (PID lock + DB check).",
             "- standalone / unchecked: one machine, no coordination.",
-            "Node ID names this node (empty: role:host:pid). Delegate stable: the master hands stable chains (vX.Y.z) to "
-            "workers.",
+            "Node ID names this node (empty: role:host:pid). Master and daemon enforce singleton locking (--force-singleton overrides). "
+            "Delegate stable: the master hands stable chains (vX.Y.z) to workers.",
         ]),
     "overview": (
         "Help",
@@ -157,7 +158,7 @@ class ParserDistributedScreen(BaseScreen):
 
         cur_dist_enabled = _coerce_bool(self.dist_cfg.get("enabled"), False)
 
-        role_opts = ["standalone", "master", "worker"]
+        role_opts = ["standalone", "master", "worker", "daemon"]
         cur_role = str(self._dist_value("role", "standalone")).strip().lower()
         idx_role = role_opts.index(cur_role) if cur_role in role_opts else 0
 

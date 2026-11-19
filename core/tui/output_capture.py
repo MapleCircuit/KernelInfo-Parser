@@ -105,6 +105,21 @@ class TerminalOutputCapture:
     def __exit__(self, *exc: Any) -> None:
         self.stop()
 
+    def pause(self) -> bool:
+        """Temporarily restore terminal output streams/fd2 without discarding buffered output.
+
+        Returns True if capture was active and was paused, False if it was already inactive.
+        """
+        if not self._active:
+            return False
+        self.stop()
+        return True
+
+    def resume(self) -> None:
+        """Resume output capture after `pause()` while preserving previously buffered output."""
+        if not self._active:
+            self.start()
+
     def start(self) -> None:
         if self._active:
             return

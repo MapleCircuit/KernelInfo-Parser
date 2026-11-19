@@ -433,5 +433,39 @@ class TestDiagnosticsScreen(unittest.TestCase):
         self.assertTrue(any("No diagnostic tests" in text for text in addstr_calls))
 
 
+class TestDistributedRoleCLIAndTUI(unittest.TestCase):
+    """Verify daemon role support in ParserDistributedScreen and pipeline/cli.py."""
+
+    def test_parser_screen_includes_daemon_role_and_saves(self) -> None:
+        app = MockApp({"parser": {"distributed": {"enabled": True, "role": "daemon"}}})
+        win = MockCursesWindow(24, 120)
+        screen = ParserDistributedScreen(win, app)
+        self.assertEqual(screen.sel_role.options, ["standalone", "master", "worker", "daemon"])
+        self.assertEqual(screen.sel_role.get_selected(), "daemon")
+        self.assertTrue(screen.save())
+        self.assertEqual(app.config["parser"]["distributed"]["role"], "daemon")
+
+    def test_cli_arg_parser_accepts_daemon_and_singleton_flags(self) -> None:
+        from pipeline.cli import build_arg_parser
+
+        parser = build_arg_parser()
+        ns = parser.parse_args([
+            "--role", "daemon",
+            "--force-singleton",
+            "--lock-dir", "/tmp/kip-locks",
+            "--poll-interval", "15",
+            "--daemon-once",
+            "--no-git-update",
+            "--git-update-interval", "120",
+        ])
+        self.assertEqual(ns.role, "daemon")
+        self.assertTrue(ns.force_singleton)
+        self.assertEqual(ns.lock_dir, "/tmp/kip-locks")
+        self.assertEqual(ns.poll_interval, 15)
+        self.assertTrue(ns.daemon_once)
+        self.assertTrue(ns.no_git_update)
+        self.assertEqual(ns.git_update_interval, 120)
+
+
 if __name__ == "__main__":
     unittest.main()

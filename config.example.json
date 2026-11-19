@@ -46,7 +46,11 @@
       "delegate_stable": true,
       "delegate_branches": [],
       "lease_ttl_seconds": 180,
-      "heartbeat_seconds": 30
+      "heartbeat_seconds": 30,
+      "poll_interval_seconds": 60,
+      "git_auto_update": true,
+      "git_update_interval_seconds": 300,
+      "lock_dir": ""
     }
   },
   "mailing_list": {

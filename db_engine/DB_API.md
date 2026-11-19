@@ -11,7 +11,7 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L596]
+- 2. Core Method Specifications [L148-L600]
   - 2.1. Lifecycle, Session & Health [L150-L210]
   - 2.2. Sequence Tracking & Single-Row CRUD [L211-L258]
   - 2.3. Multi-Table Relational Views [L259-L268]
@@ -22,13 +22,13 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - 2.8. Spec Write Primitives [L429-L445]
   - 2.9. Catalog & Server Introspection [L446-L461]
   - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L462-L478]
-  - 2.11. Pipeline Intent Methods [L479-L492]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L493-L518]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L519-L530]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L531-L538]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L539-L596]
-- 3. Factory Resolver (`get_db_engine`) [L597-L618]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L619-L645]
+  - 2.11. Pipeline Intent Methods [L479-L496]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L497-L522]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L523-L534]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L535-L542]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L543-L600]
+- 3. Factory Resolver (`get_db_engine`) [L601-L622]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L623-L649]
 <!-- toc:end -->
 
 ---
@@ -487,6 +487,10 @@ Specialized high-level database operations driving parser pipeline workers.
   - One conditional `update_rows` on a LEASED / RECLAIMING task (of `worker_id` when given): `status` becomes FAILED when `retry_count + 1 >= max_attempts`, else ELIGIBLE (assigned before `retry_count` is incremented, reading the stored count), `error_msg` is cut to 1000 characters, `worker_id` cleared. Returns the rows changed (0: not leased or not this worker's). Implemented once in `BaseDBEngine`.
 - **`next_eligible_parse_tasks(network_id: int, status: int, *, limit: int = 10) -> list[tuple]`**
   - `(task_id, chain_name, chain_kind, ref_name, commit_id, base_ref_name, base_commit_id)` of the tasks of `status`: stable chains first, then shorter then alphabetical chain names, by `seq_order`. Implemented once in `BaseDBEngine`.
+- **`enqueue_distributed_tasks(rows) -> int`** / **`register_worker_capabilities(worker_id, network_id, capabilities, *, role="worker", now=None) -> int`** / **`unregister_worker_capabilities(worker_id) -> int`**
+  - Publishes prioritized work items into `distributed_tasks` (reopening failed/completed rows on status change or upstream `target_sha` movement while keeping claimed rows intact) and atomically replaces or clears a node's repository/track/ordinal capability rows in `distributed_worker_capabilities`. Implemented once in `BaseDBEngine`.
+- **`claim_distributed_task(...) -> dict | None`** / **`heartbeat_distributed_task(...) -> int`** / **`reset_zombie_distributed_tasks(...) -> int`** / **`complete_distributed_task(...) -> bool`** / **`fail_distributed_task(...) -> int`** / **`release_distributed_task(...) -> bool`**
+  - Pure-DB coordination primitives over `distributed_tasks` joined with `distributed_worker_capabilities`: capability-matched CAS claiming (`pending` $\to$ `claimed`), `heartbeat_ts` lease renewals, zombie timeout sweeps, completion with dependent `base_commit_id` backfilling, bounded retries (`retry_count` $\to$ `failed`), and unpenalized lease release. Implemented once in `BaseDBEngine`.
 - **`symbol_refs_of_targets(ast_ids, *, role=None, with_caller=False, limit=None) -> list[dict]`** / **`symbol_def_blobs_of_targets(ast_ids) -> set[tuple[int, int]]`**
   - References (`role, line, char_s, fid, tag_id, ast_id` + `caller`) and definition `(ast_id, blob_id)` pairs of target ASTs, read key first (`m_blob_symbol.target_ast_id` -> shared `m_tag_ref` / `m_tag_def` rows through their placements, skipping placements marked in `m_symbol_own`, plus the per-blob rows) with query specs in `db_engine/symbol_rows.py` (`symbol_refs_of_targets(reader, ...)`, `symbol_def_blobs_of_targets(reader, ...)` take anything with `select_rows`). Implemented once in `BaseDBEngine`, and through `ReadIntents` on every read session (§2.12).
 

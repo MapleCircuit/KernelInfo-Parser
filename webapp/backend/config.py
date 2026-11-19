@@ -36,6 +36,13 @@ LINUX_REPO_DIR = get_default_repo_path().resolve()
 _ACTIVE_REPO: ContextVar[dict[str, Any] | None] = ContextVar("active_repo", default=None)
 
 
+def refresh_default_repo_dir() -> Path:
+    """Recompute and return LINUX_REPO_DIR from the currently active configuration."""
+    global LINUX_REPO_DIR
+    LINUX_REPO_DIR = get_default_repo_path().resolve()
+    return LINUX_REPO_DIR
+
+
 def list_repositories() -> list[dict[str, Any]]:
     """Enabled repositories from config (including ones auto-detected under workspace.repos_dir)."""
     return get_repositories_config()
@@ -44,7 +51,7 @@ def list_repositories() -> list[dict[str, Any]]:
 def get_active_repository() -> dict[str, Any]:
     """Repository entry for the current request (the configured default when none was selected)."""
     repo = _ACTIVE_REPO.get() or get_repository()
-    return repo or {"name": "linux", "path": str(LINUX_REPO_DIR)}
+    return repo or {"name": "linux", "path": str(get_default_repo_path().resolve())}
 
 
 def repository_project_slug(repo: dict[str, Any] | None) -> str:
@@ -102,8 +109,8 @@ def get_active_repo_name() -> str:
 
 def get_repo_dir() -> Path:
     """Absolute Git work tree of the repository selected for the current request."""
-    repo = _ACTIVE_REPO.get()
-    return resolve_repo_path(repo).resolve() if repo else LINUX_REPO_DIR
+    repo = _ACTIVE_REPO.get() or get_repository()
+    return resolve_repo_path(repo).resolve() if repo else get_default_repo_path().resolve()
 
 
 def set_active_repository(name: str | None):

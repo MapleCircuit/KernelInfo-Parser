@@ -14,6 +14,7 @@ from core import checkpoints
 from core.TableHandling import Table
 from db_engine import (
     Join,
+    MissingTableError,
     ge,
     gt,
     ne,
@@ -270,16 +271,17 @@ def ingest_git_dag(
         ref_row = db.select(m_git_ref, (None, repo_id, None, version_or_ref, None, None, None, None))
         commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None))
         head_commit_id = commit_row[0] if commit_row else None
-        known_cid = ref_row[4] if ref_row else head_commit_id
+        ref_moved = bool(ref_row and ref_row[4] != head_commit_id)
+        known_cid = head_commit_id if (ref_moved or not ref_row) else ref_row[4]
         state = _previous_ingest(db, network_id, known_cid, version_or_ref) if known_cid is not None and is_checkpoint else "new"
         if state == "done":
-            if ref_row:
+            if ref_row and not ref_moved:
                 gp.Old_VID = gp.VID
                 gp.VID = known_cid
                 gp.Old_Version_Name = gp.Version_Name
                 gp.Version_Name = version_or_ref
                 return known_cid, is_checkpoint, True
-            # Another ref (e.g. v2.6.32-rc1 for v2.6.32-rc2) already ingested this commit: only register the ref
+            # Another ref (e.g. v2.6.32-rc1 for v2.6.32-rc2) already ingested this commit, or ref moved to it: register/update it
             already_ingested = True
             logger.info(
                 f"Ref '{version_or_ref}' points to commit_id {known_cid}, already ingested by another ref; "
@@ -382,6 +384,12 @@ def ingest_git_dag(
                 heartbeat_daemon.set_active(head_commit_id)
             if getattr(gp, "_active_task_id", None) and db is not None:
                 db.update_rows("m_parse_task", {"commit_id": head_commit_id}, {"task_id": gp._active_task_id})
+            if getattr(gp, "_active_dist_task_id", None) and db is not None:
+                db.update_rows(
+                    "distributed_tasks",
+                    {"commit_id": head_commit_id, "updated_ts": int(time.time())},
+                    {"task_id": gp._active_dist_task_id},
+                )
 
     if not preset_base:
         gp.Old_VID = base_vid
@@ -493,12 +501,57 @@ def finish_version_ingest(commit_id: int | None) -> None:
                 )
                 if not leased:
                     raise RuntimeError(f"Worker lease for task {gp._active_task_id} expired or was revoked; aborting completion.")
+            if getattr(gp, "_active_dist_task_id", None):
+                claimed = db.row_exists(
+                    "distributed_tasks",
+                    {
+                        "task_id": gp._active_dist_task_id,
+                        "worker_id": getattr(G, "node_id", "") or "",
+                        "status": "claimed",
+                    },
+                )
+                if not claimed:
+                    raise RuntimeError(
+                        f"Distributed task {gp._active_dist_task_id} claim was lost or revoked; aborting completion."
+                    )
             ingest_state.set_status(db, getattr(gp, "network_id", 1), commit_id, ingest_state.INGEST_DONE)
             refresh_person_identities(db, "version ingested", only_if_incomplete=True)
             _compact_checkpoint(db, getattr(gp, "Old_VID", 0), commit_id)
             if getattr(G, "distributed", False) and getattr(G, "distributed_role", None) != distributed.ROLE_WORKER:
                 from core.distributed import unlock_dependent_tasks
-                unlock_dependent_tasks(db, getattr(gp, "network_id", 1), commit_id, base_ref_name=getattr(gp, "Version_Name", None))
+                network_id = getattr(gp, "network_id", 1)
+                version_name = getattr(gp, "Version_Name", None)
+                unlock_dependent_tasks(db, network_id, commit_id, base_ref_name=version_name)
+                if version_name:
+                    now_ts = int(time.time())
+                    try:
+                        db.update_rows(
+                            "distributed_tasks",
+                            {"base_commit_id": int(commit_id), "updated_ts": now_ts},
+                            {
+                                "network_id": int(network_id),
+                                "status": "pending",
+                                "base_ref_name": version_name,
+                                "base_commit_id": 0,
+                            },
+                        )
+                        if not getattr(gp, "_active_dist_task_id", None):
+                            db.update_rows(
+                                "distributed_tasks",
+                                {
+                                    "status": distributed.DIST_STATUS_COMPLETED,
+                                    "commit_id": int(commit_id),
+                                    "updated_ts": now_ts,
+                                },
+                                {
+                                    "network_id": int(network_id),
+                                    "ref_name": version_name,
+                                    "task_type": ne("preparse"),
+                                    "status": "pending",
+                                },
+                            )
+                    except MissingTableError:
+                        pass
 
 
 def refresh_person_identities(db: Any, reason: str, only_if_incomplete: bool = False) -> int | None:
