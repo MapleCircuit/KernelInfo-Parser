@@ -12,6 +12,7 @@ import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
 import { branchPicker, branchSourceOf } from "./components/branch_picker.js";
 import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
+import { headerLayout } from "./components/header_layout.js";
 import { shortcuts } from "./utils/shortcuts.js";
 import { showShortcutsOverlay } from "./components/shortcuts_overlay.js";
 import { showPatchModal } from "./components/patch_modal.js";
@@ -258,6 +259,14 @@ class KernelIdeApp {
         this.tabsComponent.render();
       }
     });
+
+    // Measurement-driven header collapse and reduced version selector (§5.13): viewport, UI Scale and
+    // label changes all re-evaluate the tier (ResizeObserver / MutationObserver inside, events here)
+    headerLayout.init(document);
+    for (const ev of ["repo:synced", "version:selected", "version:synced", "version:changed", "branch:selected",
+      "tabs:changed", "pane:activated", "session:adopted", "projects:updated"]) {
+      state.subscribe(ev, () => headerLayout.schedule());
+    }
 
     // Synchronize top selectors when a tab with a different version is selected
     state.subscribe("version:synced", async () => {
@@ -1659,6 +1668,7 @@ class KernelIdeApp {
     }
     const newTabBtn = document.getElementById("version-newtab-btn");
     if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
+    headerLayout.schedule();
   }
 
   /**
