@@ -50,6 +50,7 @@ from core.globalstuff import (
     JoinsType,
     PointerGetter,
 )
+from db_engine import subprocess_quiet
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -294,7 +295,11 @@ class TEDirectDB:
             self.async_commits = False
         self.close()
         self._pending_error = None
-        self.db = db()
+        if is_worker:
+            with subprocess_quiet():
+                self.db = db()
+        else:
+            self.db = db()
         self.queued_view = {}
         self._committed_unique_keys = {}
         self._join_tables_cache = {}

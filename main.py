@@ -35,7 +35,7 @@ from core.config import (
     resolve_repo_path,
 )
 from core.ssh_tunnel import start_ssh_tunnel
-from db_engine import ge, gt
+from db_engine import BaseDBEngine, close_engine_pools, ge, gt, pooled_engine
 from pipeline.backfill_steps import run_automatic_backfills, run_requested_backfills
 from pipeline.cli import arg_handling
 from pipeline.daemon import run_daemon_loop
@@ -285,17 +285,46 @@ def _shutdown_node() -> None:
             singleton_lock.release()
 
 
+def _shutdown_db_pools() -> None:
+    """Close TableEngine DB handle and all pooled parent DB_engine instances cleanly."""
+    te = getattr(G, "TE", None)
+    if te is not None and hasattr(te, "close"):
+        with contextlib.suppress(Exception):
+            te.close()
+    if close_engine_pools is not None:
+        with contextlib.suppress(Exception):
+            close_engine_pools()
+    db = getattr(G, "DB", None)
+    raw_cls = getattr(db, "engine_class", None)
+    if raw_cls is not None:
+        G.DB = raw_cls
+
+
+def _shutdown_runtime() -> None:
+    """Run node unregistration first, then close all pooled DB_engine handles."""
+    _shutdown_node()
+    _shutdown_db_pools()
+
+
 def main() -> None:
     """Set the plan for what version to parse."""
     try:
         _run()
     finally:
-        _shutdown_node()
+        _shutdown_runtime()
 
 
 def _run() -> None:
     """Apply the arguments and run the requested mode."""
     args = arg_handling()
+    if (
+        pooled_engine is not None
+        and isinstance(G.DB, type)
+        and issubclass(G.DB, BaseDBEngine)
+    ):
+        G.DB = pooled_engine(G.DB)
+        if _shutdown_runtime not in G.shutdown_hooks:
+            G.shutdown_hooks.append(_shutdown_runtime)
     if args.mem_max > 0:
         setup_memory_limit(float(args.mem_max))
     role = getattr(args, "role", "standalone") or "standalone"
@@ -463,8 +492,10 @@ def _run() -> None:
         network_id, _repo_id = resolve_git_network_and_repo(repo_path)
         node_id = distributed.get_default_node_id(role, _arg_path_str(args, "worker_id"))
         G.node_id = node_id
-        if _shutdown_node not in G.shutdown_hooks:
-            G.shutdown_hooks.append(_shutdown_node)
+        if _shutdown_node in G.shutdown_hooks:
+            G.shutdown_hooks.remove(_shutdown_node)
+        if _shutdown_runtime not in G.shutdown_hooks:
+            G.shutdown_hooks.append(_shutdown_runtime)
         try:
             singleton_lock = distributed.acquire_singleton_lock(
                 role, network_id, node_id, lock_dir=lock_dir, force=force_singleton
@@ -573,8 +604,10 @@ def _run() -> None:
     if is_distributed:
         node_id = distributed.get_default_node_id(role, getattr(args, "worker_id", None))
         G.node_id = node_id
-        if _shutdown_node not in G.shutdown_hooks:
-            G.shutdown_hooks.append(_shutdown_node)
+        if _shutdown_node in G.shutdown_hooks:
+            G.shutdown_hooks.remove(_shutdown_node)
+        if _shutdown_runtime not in G.shutdown_hooks:
+            G.shutdown_hooks.append(_shutdown_runtime)
         singleton_lock = None
         try:
             if role in distributed.SINGLETON_ROLES:

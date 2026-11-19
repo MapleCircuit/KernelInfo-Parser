@@ -25,24 +25,24 @@ agents.
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L849-L871]
   - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L872-L895]
 - 6. End-to-End Inter-Module Execution Lifecycle [L896-L1043]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1044-L1424]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1044-L1426]
   - 7.1. Unified Configuration Hierarchy [L1046-L1156]
   - 7.1.1. Repository Auto-Detection & Selection [L1157-L1222]
   - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1223-L1273]
   - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1274-L1321]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1322-L1424]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1425-L1695]
-  - 8.1. High-Level Architecture [L1427-L1470]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1471-L1496]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1497-L1695]
-- 9. CVE List Ingestion (`parser/cve/`) [L1696-L1751]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1752-L1819]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1820-L1950]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1828-L1859]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1860-L1900]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1901-L1933]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1934-L1950]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1951-L1996]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1322-L1426]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1427-L1697]
+  - 8.1. High-Level Architecture [L1429-L1472]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1473-L1498]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1499-L1697]
+- 9. CVE List Ingestion (`parser/cve/`) [L1698-L1753]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1754-L1821]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1822-L1952]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1830-L1861]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1862-L1902]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1903-L1935]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1936-L1952]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1953-L1998]
 <!-- toc:end -->
 
 ---
@@ -1416,9 +1416,11 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Multiprocessing Socket Refresh**:
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
     resets in-memory caches and destroys preloaded table state.
-  - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db =
-    G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging
-    queues.
+  - Before `fork()`, `_close_parent_db()` detaches `G.TE.db` and calls `db.close()` (returning the handle to
+    the parent `EnginePool` without closing the underlying socket); `os.register_at_fork` clears inherited
+    pool entries in the child without closing parent sockets and demotes worker `DB_engine` lifecycle logs to
+    `DEBUG`; after `fork()`, the parent re-acquires a live, ping-verified handle via `G.TE.db = G.DB()` without
+    altering cached state or staging queues.
 
 ---
 

@@ -386,6 +386,22 @@ class MariaDBConnection:
 
         return mysql.connector.connect(**conn_kwargs)
 
+    def ping(self) -> bool:
+        """Run a lightweight COM_PING liveness check on the underlying connection (True when live)."""
+        pid = getattr(self, "_pid", None)
+        if pid is not None and pid != os.getpid():
+            return False
+        if getattr(self, "cnx", None) is None:
+            return False
+        try:
+            self.cnx.ping(reconnect=False)
+            if getattr(self, "_cur", None) is None:
+                self._cur = self.cnx.cursor()
+            self._last_ok = time.monotonic()
+            return True
+        except Exception:
+            return False
+
     def check_if_connected(self) -> None:
         """Make sure the instance has a usable connection, reconnecting if it was dropped.
 
@@ -481,12 +497,19 @@ class MariaDBConnection:
 
     def _lease_writer(self) -> Any:
         """A dedicated writer connection (a separate `MariaDB` instance) for one table of `commit_tables_parallel()`."""
+        pool = getattr(self, "_engine_pool", None)
+        if pool is not None and not getattr(pool, "_closed", False):
+            return pool.acquire()
         from db_engine.DBHandling import MariaDB  # the composed driver class (mixins cannot import it at load)
 
         return MariaDB()
 
     def _release_writer(self, writer: Any, healthy: bool) -> None:
         """Give back a connection of `_lease_writer()`."""
+        pool = getattr(self, "_engine_pool", None)
+        if pool is not None:
+            pool.release(writer, broken=not healthy)
+            return
         writer.close()
 
     @contextlib.contextmanager

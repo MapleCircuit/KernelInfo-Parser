@@ -1655,6 +1655,188 @@ class TestMariaDBReserveIdBlockSql(unittest.TestCase):
         self.assertIsInstance(translate_mysql_error(err_1020_msg), DeadlockError)
 
 
+class _FakePoolEngineBase(BaseDBEngine):
+    """Minimal BaseDBEngine stub for EnginePool lifecycle tests."""
+
+    def __enter__(self): return self
+    def __exit__(self, *exc) -> None: return None
+    def get_next_id(self, table): return 1
+    def select(self, table, data): return None
+    def view_select(self, tables, joins, columns): return None
+    def view_select_multiple(self, tables, joins, columns): return []
+    def select_preload(self, table, cached_columns=None, min_vid=None): return []
+    def table_size(self, table, cached_columns=None, min_vid=None): return 0
+    def insert(self, table, data): return None
+    def update(self, table, data): return None
+    def commit_tables_parallel(self, tables_data, max_workers=None, dedicated=False): return []
+    def create_table(self, tables): return None
+    def drop_table(self, tables): return None
+    def index_exists(self, index_name, table): return False
+    def create_index(self, index_name, table, rows): return None
+    def remove_index(self, index_name, table): return None
+    def create_indexes(self, indexes, max_workers=None): return None
+    def remove_indexes(self, indexes, max_workers=None): return None
+    def test_tables(self, tables): return None
+    def verify_relational_integrity(self, tables): return {}
+    def check_if_connected(self) -> None: return None
+    def commit(self) -> None: return None
+    def rollback(self) -> None: return None
+
+
+class TestEnginePoolAndLifecycleLogging(unittest.TestCase):
+    """Parent-process EnginePool reuse, liveness reconnect, shutdown cleanup, and subprocess log demotion."""
+
+    def test_parent_pool_reuses_engine_and_closes_on_shutdown(self) -> None:
+        import logging
+        from db_engine import close_engine_pools, pooled_engine
+
+        stats = {"created": 0, "pings": 0, "closed": 0}
+
+        class _PooledFakeEngine(_FakePoolEngineBase):
+            display_name = "TestPooled"
+
+            def __init__(self) -> None:
+                stats["created"] += 1
+                self.alive = True
+
+            def ping(self) -> bool:
+                stats["pings"] += 1
+                return self.alive
+
+            def close(self) -> None:
+                stats["closed"] += 1
+
+        factory = pooled_engine(_PooledFakeEngine)
+        try:
+            with self.assertLogs("kernelinfo.db_engine", level=logging.DEBUG) as logs:
+                with factory() as db1:
+                    self.assertIsNotNone(db1)
+                with factory() as db2:
+                    self.assertIsNotNone(db2)
+                with factory() as db3:
+                    self.assertIsNotNone(db3)
+                self.assertEqual(stats, {"created": 1, "pings": 2, "closed": 0})
+                self.assertEqual(factory.pool.idle_count, 1)
+                close_engine_pools()
+
+            self.assertEqual(stats["closed"], 1)
+            self.assertEqual(factory.pool.idle_count, 0)
+            info_msgs = [r.getMessage() for r in logs.records if r.levelno == logging.INFO]
+            debug_msgs = [r.getMessage() for r in logs.records if r.levelno == logging.DEBUG]
+            self.assertEqual(info_msgs, ["DB_engine TestPooled Started.", "DB_engine TestPooled Closed."])
+            self.assertTrue(any("Reusing pooled DB_engine TestPooled" in m for m in debug_msgs))
+        finally:
+            close_engine_pools()
+
+    def test_liveness_check_failure_triggers_automatic_reconnect(self) -> None:
+        import logging
+        from db_engine import close_engine_pools, pooled_engine
+
+        created: list[Any] = []
+        closed: list[Any] = []
+
+        class _FlakyEngine(_FakePoolEngineBase):
+            display_name = "TestFlaky"
+
+            def __init__(self) -> None:
+                self.alive = True
+                self.id = len(created) + 1
+                created.append(self)
+
+            def ping(self) -> bool:
+                return self.alive
+
+            def close(self) -> None:
+                closed.append(self)
+
+        factory = pooled_engine(_FlakyEngine)
+        try:
+            with self.assertLogs("kernelinfo.db_engine", level=logging.INFO) as logs:
+                with factory() as db1:
+                    self.assertEqual(db1.id, 1)
+                created[0].alive = False
+                with factory() as db2:
+                    self.assertEqual(db2.id, 2)
+                self.assertEqual(len(created), 2)
+                self.assertEqual(closed, [created[0]])
+
+                # Concurrent second handle dead while first stays leased: reconnect still logs INFO
+                with factory() as live_lease:
+                    extra = factory()
+                    extra_id = extra.id
+                    extra.close()
+                    created[extra_id - 1].alive = False
+                    with factory() as replaced:
+                        self.assertGreater(replaced.id, extra_id)
+                        self.assertIsNotNone(live_lease)
+                close_engine_pools()
+
+            info_msgs = [r.getMessage() for r in logs.records if r.levelno == logging.INFO]
+            self.assertEqual(info_msgs.count("DB_engine TestFlaky Started."), 2)
+            self.assertTrue(any("Started. (reconnected)" in m for m in info_msgs))
+            self.assertEqual(info_msgs[-1], "DB_engine TestFlaky Closed.")
+        finally:
+            close_engine_pools()
+
+    def test_subprocess_quiet_demotes_started_and_closed_to_debug(self) -> None:
+        import logging
+        from db_engine import MockDB, SQLiteDB, subprocess_quiet
+
+        with self.assertLogs("kernelinfo.db_engine", level=logging.DEBUG) as logs:
+            with subprocess_quiet():
+                db = MockDB(use_global=False)
+                self.assertTrue(db.ping())
+            db.close()
+
+            sqldb = SQLiteDB(":memory:")
+            self.assertTrue(sqldb.ping())
+            sqldb.close()
+            self.assertFalse(sqldb.ping())
+
+        mock_info = [r.getMessage() for r in logs.records if r.levelno == logging.INFO and "MockDB" in r.getMessage()]
+        mock_debug = [r.getMessage() for r in logs.records if r.levelno == logging.DEBUG and "MockDB" in r.getMessage()]
+        self.assertEqual(mock_info, [])
+        self.assertIn("DB_engine MockDB Started.", mock_debug)
+        self.assertIn("DB_engine MockDB Closed.", mock_debug)
+
+    def test_mariadb_ping_and_parallel_writer_pool_reuse(self) -> None:
+        from db_engine.pool import EnginePool
+
+        server = _Server()
+
+        def _make_writer() -> MariaDB:
+            w = _scripted_mariadb(server)
+            del w._lease_writer
+            del w._release_writer
+            return w
+
+        pool = EnginePool(_make_writer, max_size=4)
+        try:
+            writer = pool.acquire()
+            self.assertTrue(writer.ping())
+            t1 = _scratch_table("t_pool_1", 9101)
+            t2 = _scratch_table("t_pool_2", 9102)
+            writer.commit_tables_parallel([(t1, ((1, 10),), ()), (t2, ((2, 20),), ())])
+            pool.release(writer)
+            conns_after_first = len(server.connections)
+            self.assertGreaterEqual(conns_after_first, 2)
+            self.assertLessEqual(conns_after_first, 3)
+            self.assertEqual(pool.idle_count, conns_after_first)
+
+            # Second parallel commit reuses pooled connections with zero new connections opened
+            writer2 = pool.acquire()
+            writer2.commit_tables_parallel([(t1, ((3, 30),), ()), (t2, ((4, 40),), ())])
+            pool.release(writer2)
+            self.assertEqual(len(server.connections), conns_after_first)
+            self.assertEqual(pool.idle_count, conns_after_first)
+
+            pool._idle[-1].cnx.dead = True
+            self.assertFalse(pool._idle[-1].ping())
+        finally:
+            pool.close()
+        self.assertEqual(pool.idle_count, 0)
+
+
 _generate_engine_test_classes()
 
 

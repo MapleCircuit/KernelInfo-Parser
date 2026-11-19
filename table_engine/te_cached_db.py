@@ -38,6 +38,7 @@ from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from core.globalstuff import SafeDataType
+from db_engine import subprocess_quiet
 from table_engine.shared_buffer import (
     estimate_packed_bytes,
     SharedTableBuilder,
@@ -484,7 +485,8 @@ class TECachedDB(TEDirectDB):
                     self.db.close()
                 except Exception:
                     pass
-            self.db = db()
+            with subprocess_quiet():
+                self.db = db()
             self.queued_view = {}
             self._nodup_neg.clear()
             self._upkeep_due = True

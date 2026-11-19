@@ -335,6 +335,18 @@ class SQLiteDB(BaseDBEngine):
         if exception_type is not None:
             self.rollback()
 
+    def ping(self) -> bool:
+        """Return True if the SQLite connection is open and answers a trivial query."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return False
+            try:
+                conn.execute("SELECT 1")
+                return True
+            except Exception:
+                return False
+
     def close(self) -> None:
         with self._lock:
             conn, self._conn = self._conn, None

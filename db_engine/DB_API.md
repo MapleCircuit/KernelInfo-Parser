@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L612]
-  - 2.1. Lifecycle, Session & Health [L150-L222]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L223-L270]
-  - 2.3. Multi-Table Relational Views [L271-L280]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L281-L319]
-  - 2.5. DDL & Index Management [L320-L361]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L362-L412]
-  - 2.7. Spec Read Primitives [L413-L440]
-  - 2.8. Spec Write Primitives [L441-L457]
-  - 2.9. Catalog & Server Introspection [L458-L473]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L474-L490]
-  - 2.11. Pipeline Intent Methods [L491-L508]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L509-L534]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L535-L546]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L547-L554]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L555-L612]
-- 3. Factory Resolver (`get_db_engine`) [L613-L634]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L635-L661]
+- 2. Core Method Specifications [L148-L615]
+  - 2.1. Lifecycle, Session & Health [L150-L225]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L226-L273]
+  - 2.3. Multi-Table Relational Views [L274-L283]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L284-L322]
+  - 2.5. DDL & Index Management [L323-L364]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L365-L415]
+  - 2.7. Spec Read Primitives [L416-L443]
+  - 2.8. Spec Write Primitives [L444-L460]
+  - 2.9. Catalog & Server Introspection [L461-L476]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L477-L493]
+  - 2.11. Pipeline Intent Methods [L494-L511]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L512-L537]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L538-L549]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L550-L557]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L558-L615]
+- 3. Factory Resolver (`get_db_engine`) [L616-L637]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L638-L664]
 <!-- toc:end -->
 
 ---
@@ -159,14 +159,17 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - Context manager lifecycle; rolls back pending transaction on unhandled exception.
 - **`close() -> None`**
   - Safely releases cursor and database connection socket handles.
+- **`ping() -> bool`**
+  - Lightweight connection liveness check (`True` when live and usable, `False` when closed or dead). `MariaDB` issues `COM_PING` (`cnx.ping(reconnect=False)`) and ensures `_pid == os.getpid()`; `SQLiteDB` / `MockDB` check `SELECT 1`.
 - **Lifecycle logging** *(all engines, `BaseDBEngine.__init_subclass__`, `note_engine_started` / `note_engine_closed`)*
   - Open engine handles are counted per process and engine name: the first successful `__init__` logs one `INFO` line
     `DB_engine <name> Started.`, and the `close()` that releases the last handle logs `DB_engine <name> Closed.` (repeat
     `close()` calls stay silent). Helper connections opened while another handle is live (`create_indexes` /
-    `remove_indexes` workers, per-session SQLite readers) therefore log nothing, and each forked worker process logs its
-    own pair. The webapp reader pool (`db_engine/pool.py`) counts as one `MariaDB` handle from its first connection to
+    `remove_indexes` workers, per-session SQLite readers) therefore log nothing. The webapp reader pool (`db_engine/pool.py`) counts as one `MariaDB` handle from its first connection to
     `close_db_pool()`; pooled `ReadSession`s do not count. `<name>` is the engine's `display_name`, or its class name when
     it keeps the base default (`MariaDB`).
+  - **Subprocess log demotion**: `subprocess_quiet()` (context manager, used by `TableEngine.start_new_db(..., is_worker=True)`) and `set_subprocess_quiet(True)` (automatically set in forked children by `EnginePool` fork hooks) demote `DB_engine <name> Started.` / `Closed.` in worker subprocesses from `INFO` to `DEBUG`.
+  - **Parent-process `EnginePool`** (`db_engine/pool.py`, exported via `pooled_engine`, `close_engine_pools`, `EnginePool`, `PooledEngineFactory`, `PooledEngineLease`): wraps `G.DB` in `main.py` so parent-process `with G.DB() as db:`, `TableEngine` handles, and `MariaDB._lease_writer()` parallel commit/index workers reuse live `DB_engine` instances across stages and versions. Each checkout runs `ping()` (recreating/reconnecting dead handles automatically and logging reconnects at `INFO`, while routine reuse logs at `DEBUG`). `os.register_at_fork` protects pool locks across `fork()` and clears inherited handles in children without closing parent sockets; `close_engine_pools()` closes every pooled handle at shutdown (`main._shutdown_runtime()`).
   - `close()` is the public shutdown. MariaDB's drop-and-retry paths (`check_if_connected`, `_reconnect`, connection-lost
     retries in writes and `reserve_id_block`) release the socket through the private `_drop_connection()`, which leaves
     the lifecycle count unchanged.

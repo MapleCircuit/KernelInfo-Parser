@@ -21,8 +21,8 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - 4.3. Multi-Table Relational Views (`view_get`, `view_get_multiple`, `view_set`) [L447-L521]
   - 4.4. Transaction Commit Protocol (`commit`, `commit_all`) [L522-L599]
 - 5. Expected Database Driver Interface (`G.DB` / `BaseDBEngine`) [L600-L619]
-- 6. Critical Invariants for Custom Implementations [L620-L710]
-- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L711-L738]
+- 6. Critical Invariants for Custom Implementations [L620-L713]
+- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L714-L741]
 <!-- toc:end -->
 
 ---
@@ -668,11 +668,14 @@ Any backend passed to `TableEngine` must implement:
     (`_db_read()`), and code reading the database directly must call `wait_for_commit()` first. Forked
     children never own a writer (`start_new_db(..., is_worker=True)` drops `_pending`), and the parent joins
     before forking.
-12. **Parent Process Fork Socket Refresh**: The parent process must never invoke `start_new_db(...,
-    is_worker=True)` after forking workers. Calling `is_worker=True` without shared huge pages resets and
-    wipes in-memory table caches, causing subsequent operations (e.g. `processing_unchanges()`) to treat
-    existing records as missing. The parent process must only refresh its DB connection handle (`if G.TE.db:
-    G.TE.db.close(); G.TE.db = G.DB()`) without modifying cached table state or staging queues.
+12. **Parent Process Fork Socket Refresh & Worker Quiet Lifecycle**: The parent process must never invoke
+    `start_new_db(..., is_worker=True)` after forking workers. Calling `is_worker=True` without shared huge
+    pages resets and wipes in-memory table caches, causing subsequent operations (e.g. `processing_unchanges()`)
+    to treat existing records as missing. The parent process detaches its handle via `_close_parent_db()`
+    (returning its pooled `DB_engine` lease to the parent `EnginePool` without closing the underlying socket)
+    and re-acquires a ping-checked handle via `G.TE.db = G.DB()` after `fork()` without modifying cached table
+    state or staging queues. Worker subprocesses call `start_new_db(G.DB, is_worker=True)` inside
+    `subprocess_quiet()` so their dedicated connection `Started.` / `Closed.` logs emit at `DEBUG`.
 13. **Zero-Copy Shared Memory Views & Heap Cache Eviction**: When `_shared_buffer` is constructed via
     `SharedTableBuilder`, preloaded table row heap collections (`_cached_rows`) and primary key indices
     (`_pk_index`) are immediately replaced with `SharedTableRowSequenceView` and `SharedTablePKView`. These
