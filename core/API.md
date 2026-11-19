@@ -1417,9 +1417,9 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
     resets in-memory caches and destroys preloaded table state.
   - Before `fork()`, `_close_parent_db()` detaches `G.TE.db` and calls `db.close()` (returning the handle to
-    the parent `EnginePool` without closing the underlying socket); `os.register_at_fork` clears inherited
-    pool entries in the child without closing parent sockets and demotes worker `DB_engine` lifecycle logs to
-    `DEBUG`; after `fork()`, the parent re-acquires a live, ping-verified handle via `G.TE.db = G.DB()` without
+    the parent `EnginePool` without closing the underlying socket); `os.register_at_fork` hooks set inherited
+    pool entries aside in the child and release every inherited MariaDB connection without COM_QUIT or socket
+    shutdown (either would end the parent's session), and demote worker `DB_engine` lifecycle logs to `DEBUG`; after `fork()`, the parent re-acquires a live, ping-verified handle via `G.TE.db = G.DB()` without
     altering cached state or staging queues.
 
 ---

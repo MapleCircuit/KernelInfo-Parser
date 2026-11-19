@@ -5,6 +5,7 @@ import contextlib
 import os
 import re
 import time
+import weakref
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, Self
 from types import TracebackType
@@ -46,6 +47,46 @@ def _is_connection_lost(exc: BaseException) -> bool:
     if getattr(exc, "errno", None) in _LOST_ERRNOS:
         return True
     return isinstance(exc, OSError)
+
+
+# Every live driver instance, so a forked child can let go of the connections it inherited
+_LIVE_CONNECTIONS: weakref.WeakSet[MariaDBConnection] = weakref.WeakSet()
+# Inherited connection objects a forked child keeps referenced until it exits (never finalized there)
+_INHERITED_HANDLES: list[Any] = []
+
+
+def _release_inherited(cnx: Any, cur: Any) -> None:
+    """Let go of a connection opened by the parent process without ending the parent's session.
+
+    `mysql.connector` finalizes its socket with `shutdown(SHUT_RDWR)` (and `close()` sends COM_QUIT); both
+    act on the TCP connection itself, which the parent shares, so a child that drops, garbage-collects or
+    closes an inherited handle ends the parent's session (the parent's next statement then fails with
+    `2055 ... Broken pipe` / `Connection reset by peer`). The child's copy of the socket descriptor is
+    closed without a shutdown, and the handle objects stay referenced until the child exits.
+    """
+    wrapper = getattr(cnx, "_socket", None)
+    sock = getattr(wrapper, "sock", None)
+    if sock is not None:
+        try:
+            wrapper.sock = None
+            sock.close()  # only this process' descriptor: the connection stays open for the parent
+        except Exception:
+            pass
+    if cnx is not None or cur is not None:
+        _INHERITED_HANDLES.append((cnx, cur))
+
+
+def _release_inherited_connections() -> None:
+    """`os.register_at_fork` child hook: release every connection the new process inherited."""
+    for engine in list(_LIVE_CONNECTIONS):
+        try:
+            engine._release_if_inherited()
+        except Exception:
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_release_inherited_connections)
 
 
 
@@ -119,6 +160,23 @@ class MariaDBConnection:
         self._init_session()
         self._pid = os.getpid()
         self._last_ok = time.monotonic()
+        _LIVE_CONNECTIONS.add(self)
+
+    def _release_if_inherited(self) -> bool:
+        """In a forked child, let go of the connection opened by the parent (see `_release_inherited()`).
+
+        Returns:
+            True when the instance held a connection of another process (it now holds none).
+        """
+        pid = getattr(self, "_pid", None)
+        if pid is None or pid == os.getpid():
+            return False
+        _release_inherited(getattr(self, "cnx", None), getattr(self, "_cur", None))
+        self.cnx = None
+        self._cur = None
+        self._pid = None
+        self._last_ok = 0.0
+        return True
 
     def apply_server_tuning(
         self,
@@ -304,7 +362,13 @@ class MariaDBConnection:
         self._drop_connection()
 
     def _drop_connection(self) -> None:
-        """Close cursor and connection handles without ending the engine's lifecycle (drop-and-retry paths)."""
+        """Close cursor and connection handles without ending the engine's lifecycle (drop-and-retry paths).
+
+        A connection opened by another process (an inherited handle in a forked child) is released without
+        COM_QUIT or socket shutdown, which would end the parent's session.
+        """
+        if self._release_if_inherited():
+            return
         if getattr(self, "_cur", None):
             try:
                 self._cur.close()
@@ -408,8 +472,9 @@ class MariaDBConnection:
         Process:
             A connection used successfully within `IDLE_PING_S` seconds is trusted as is (no round trip); an
             idle one is checked with one `ping()`. A missing or dead connection is replaced by `_reconnect()`
-            (new connection, new cursor, `_init_session()`; 3 attempts). A forked child drops the connection
-            it inherited (without closing it, which would end the parent's session) and opens its own.
+            (new connection, new cursor, `_init_session()`; 3 attempts). A forked child releases the
+            connection it inherited (`_release_if_inherited()`: no COM_QUIT, no socket shutdown, which would
+            end the parent's session) and opens its own.
             Inside `transaction()` nothing is checked: a dead connection makes the next statement fail, the
             server has rolled the transaction back and the caller retries all of it.
 
@@ -417,11 +482,7 @@ class MariaDBConnection:
             ConnectionLostError: If no connection can be opened after 3 attempts, or there is none inside a
                 transaction.
         """
-        pid = getattr(self, "_pid", None)
-        if pid is not None and pid != os.getpid():
-            self.cnx = None
-            self._cur = None
-            self._pid = None
+        self._release_if_inherited()
         in_txn = getattr(self, "_in_txn", False)
         if getattr(self, "cnx", None) is not None:
             if in_txn:
@@ -451,6 +512,7 @@ class MariaDBConnection:
                 self._init_session()
                 self._pid = os.getpid()
                 self._last_ok = time.monotonic()
+                _LIVE_CONNECTIONS.add(self)
                 return
             except ConfigurationError:
                 raise

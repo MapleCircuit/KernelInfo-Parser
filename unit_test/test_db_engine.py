@@ -1234,6 +1234,75 @@ class TestMariaDBRoundTrips(unittest.TestCase):
         self.assertEqual(db.sessions, 1)
 
 
+class _SocketCnx:
+    """Connection double on a real socket wrapped in mysql-connector's `MySQLTCPSocket` (whose finalizer shuts it down)."""
+
+    def __init__(self, sock: Any) -> None:
+        from mysql.connector.network import MySQLTCPSocket
+
+        self._socket = MySQLTCPSocket(host="127.0.0.1", port=0)
+        self._socket.sock = sock
+
+    def cursor(self) -> object:
+        return object()
+
+    def close(self) -> None:
+        # like MySQLConnection.close(): COM_QUIT, then shutdown of the socket
+        self._socket.sock.sendall(b"QUIT")
+        self._socket.shutdown()
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "needs fork()")
+class TestMariaDBForkSafety(unittest.TestCase):
+    """A forked child never ends the parent's sessions: not by close(), not by finalizing inherited handles."""
+
+    def _engine(self) -> tuple[MariaDB, Any]:
+        import socket
+        from db_engine.mariadb_connection import _LIVE_CONNECTIONS
+
+        ours, peer = socket.socketpair()
+        peer.settimeout(5.0)
+        self.addCleanup(peer.close)
+        db = MariaDB.__new__(MariaDB)
+        db.cnx = _SocketCnx(ours)
+        db._cur = db.cnx.cursor()
+        db._pid = os.getpid()
+        db._in_txn = False
+        _LIVE_CONNECTIONS.add(db)
+        return db, peer
+
+    def test_child_close_and_pool_reset_keep_parent_sessions(self) -> None:
+        import gc
+        from db_engine.pool import EnginePool
+
+        held, held_peer = self._engine()
+        pooled, pooled_peer = self._engine()
+        pool = EnginePool(lambda: pooled)
+        self.addCleanup(pool.close)
+        pool.release(pool.acquire())
+        self.assertEqual(pool.idle_count, 1)
+        del pooled                                        # the pool holds the only reference to this engine
+
+        pid = os.fork()
+        if pid == 0:                                      # child: close what it inherited, collect the rest
+            code = 0
+            try:
+                held.close()
+                if held.cnx is not None or pool.idle_count != 0:
+                    code = 2
+                gc.collect()
+            except BaseException:
+                code = 1
+            os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+
+        for db, peer in ((held, held_peer), (pool._idle[0], pooled_peer)):
+            db.cnx._socket.sock.sendall(b"ping")
+            self.assertEqual(peer.recv(16), b"ping", "the parent's connection is still open, no COM_QUIT was sent")
+        self.assertTrue(pool._idle[0].cnx is not None and pool._idle[0]._pid == os.getpid())
+
+
 class TestMariaDBNeutralErrors(unittest.TestCase):
     """Driver errors of `transaction()`, `commit()` and `commit_tables_parallel()` leave as `db_engine.errors` types."""
 

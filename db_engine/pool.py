@@ -129,6 +129,8 @@ class EnginePool:
         self.max_size = max(1, int(max_size))
         self._idle: list[BaseDBEngine] = []
         self._leased: set[BaseDBEngine] = set()
+        # Forked child only: the parent's handles, kept referenced and never used or closed here
+        self._inherited: list[BaseDBEngine] = []
         self._lock = threading.Lock()
         self._closed = False
         self._owner_pid = os.getpid()
@@ -147,7 +149,13 @@ class EnginePool:
             return len(self._leased)
 
     def _reset_after_fork(self) -> None:
-        """Drop parent-inherited handles in a forked child without closing their sockets."""
+        """Set aside parent-inherited handles in a forked child without closing or finalizing them.
+
+        The handles stay referenced (`_inherited`) until the child exits: a finalized driver connection may
+        shut its socket down, which ends the session the parent keeps using over the same connection.
+        """
+        self._inherited.extend(self._idle)
+        self._inherited.extend(self._leased)
         self._idle.clear()
         self._leased.clear()
         self._forked_child = True
@@ -236,6 +244,8 @@ class EnginePool:
         if engine is None:
             return
         if self._forked_child or os.getpid() != self._owner_pid:
+            if any(engine is inherited for inherited in self._inherited):
+                return
             pid = getattr(engine, "_pid", None)
             if pid is None or pid == os.getpid():
                 self._close_quietly(engine)

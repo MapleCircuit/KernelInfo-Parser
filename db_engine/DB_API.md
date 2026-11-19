@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L619]
-  - 2.1. Lifecycle, Session & Health [L150-L226]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L227-L274]
-  - 2.3. Multi-Table Relational Views [L275-L284]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L285-L323]
-  - 2.5. DDL & Index Management [L324-L365]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L366-L416]
-  - 2.7. Spec Read Primitives [L417-L444]
-  - 2.8. Spec Write Primitives [L445-L461]
-  - 2.9. Catalog & Server Introspection [L462-L477]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L478-L494]
-  - 2.11. Pipeline Intent Methods [L495-L512]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L513-L538]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L539-L550]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L551-L558]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L559-L619]
-- 3. Factory Resolver (`get_db_engine`) [L620-L641]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L642-L668]
+- 2. Core Method Specifications [L148-L622]
+  - 2.1. Lifecycle, Session & Health [L150-L229]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L230-L277]
+  - 2.3. Multi-Table Relational Views [L278-L287]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L288-L326]
+  - 2.5. DDL & Index Management [L327-L368]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L369-L419]
+  - 2.7. Spec Read Primitives [L420-L447]
+  - 2.8. Spec Write Primitives [L448-L464]
+  - 2.9. Catalog & Server Introspection [L465-L480]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L481-L497]
+  - 2.11. Pipeline Intent Methods [L498-L515]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L516-L541]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L542-L553]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L554-L561]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L562-L622]
+- 3. Factory Resolver (`get_db_engine`) [L623-L644]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L645-L671]
 <!-- toc:end -->
 
 ---
@@ -169,7 +169,7 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
     `close_db_pool()`; pooled `ReadSession`s do not count. `<name>` is the engine's `display_name`, or its class name when
     it keeps the base default (`MariaDB`).
   - **Subprocess log demotion**: `subprocess_quiet()` (context manager, used by `TableEngine.start_new_db(..., is_worker=True)`) and `set_subprocess_quiet(True)` (automatically set in forked children by `EnginePool` fork hooks) demote `DB_engine <name> Started.` / `Closed.` in worker subprocesses from `INFO` to `DEBUG`.
-  - **Parent-process `EnginePool`** (`db_engine/pool.py`, exported via `pooled_engine`, `close_engine_pools`, `EnginePool`, `PooledEngineFactory`, `PooledEngineLease`): wraps `G.DB` in `main.py` so parent-process `with G.DB() as db:`, `TableEngine` handles, and `MariaDB._lease_writer()` parallel commit/index workers reuse live `DB_engine` instances across stages and versions. Each checkout runs `ping()` (recreating/reconnecting dead handles automatically and logging reconnects at `INFO`, while routine reuse logs at `DEBUG`). `os.register_at_fork` protects pool locks across `fork()` and clears inherited handles in children without closing parent sockets; `close_engine_pools()` closes every pooled handle at shutdown (`main._shutdown_runtime()`).
+  - **Parent-process `EnginePool`** (`db_engine/pool.py`, exported via `pooled_engine`, `close_engine_pools`, `EnginePool`, `PooledEngineFactory`, `PooledEngineLease`): wraps `G.DB` in `main.py` so parent-process `with G.DB() as db:`, `TableEngine` handles, and `MariaDB._lease_writer()` parallel commit/index workers reuse live `DB_engine` instances across stages and versions. Each checkout runs `ping()` (recreating/reconnecting dead handles automatically and logging reconnects at `INFO`, while routine reuse logs at `DEBUG`). `os.register_at_fork` protects pool locks across `fork()`; in a child the pool keeps the inherited handles referenced (`_inherited`) and never reuses, releases or closes them, since a finalized `mysql.connector` socket runs `shutdown(SHUT_RDWR)` on the connection the parent shares; `close_engine_pools()` closes every pooled handle at shutdown (`main._shutdown_runtime()`).
   - **Worker-process engines**: `BaseDBEngine.worker_factory()` returns a picklable zero-argument constructor of a new, independent connection to the same database (default: the engine class, configured from the environment like `MariaDB`; `SQLiteDB`: the same file). `worker_engine_factory(db)` accepts an engine, a `PooledEngineLease` (forwarded to its engine's `worker_factory()`), an engine class or a `PooledEngineFactory` (its `engine_class`). `ProcessPoolExecutor` initializers receive it instead of `type(db)`, since a lease wraps a parent-process pool and cannot be constructed in a child; they close the worker's engine through `multiprocessing.util.Finalize(..., exitpriority=...)`, which runs when a worker exits cleanly on every supported Python (plain `atexit` hooks of forked children run only from 3.14 on).
   - `close()` is the public shutdown. MariaDB's drop-and-retry paths (`check_if_connected`, `_reconnect`, connection-lost
     retries in writes and `reserve_id_block`) release the socket through the private `_drop_connection()`, which leaves
@@ -194,8 +194,11 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - A connection that completed a statement within `IDLE_PING_S` (30 s) is used without any round trip; an idle
     one is checked with one `ping()`. A missing or dead connection is replaced (`_reconnect()`: new connection,
     new cursor, `_init_session()`, up to 3 attempts, then `ConnectionLostError`), so a new session always has
-    `sql_mode` and the disabled checks. A forked child drops the connection it inherited without closing it (that
-    would end the parent's session) and opens its own.
+    `sql_mode` and the disabled checks. A forked child releases every connection it inherited (`_release_if_inherited()`, also run for all
+    live instances by an `os.register_at_fork` child hook and by `close()` / `_drop_connection()`): it closes only
+    the child's copy of the socket descriptor, with no COM_QUIT and no `shutdown()` (either would end the parent's
+    session, whose next statement then fails with `2055 ... Broken pipe`), keeps the handle objects referenced until
+    the child exits, and opens its own connection on first use.
   - Inside `transaction()` it checks nothing: a dead connection makes the next statement fail, the server has
     already rolled the transaction back, and the caller retries all of it.
   - Reads (`select`, `select_in`, `select_preload`, `table_size`, `get_next_id`, `view_select*`, `test_tables`,
