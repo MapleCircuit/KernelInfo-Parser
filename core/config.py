@@ -148,8 +148,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # current by the operator (git pull). The parser ingests it into m_cve / m_cve_commit when its HEAD changed
     # (at the start of every run, or alone with --cve; core/API.md section 9); the webapp reads those tables
     # (webapp/API.md section 4.11). A relative path is under the project root; empty, or no clone there: off.
+    # In distributed mode the master and the daemon publish the CVE list as a `repo_cve` task (pipeline/step_tasks.py):
+    # it reopens when the kernel tags or the local clone's HEAD moved, and at least every `task_interval` seconds
+    # (0: never on time alone); a worker running it pulls the clone first when `pull` is set.
     "cve": {
         "repo_dir": "cvelistV5",
+        "pull": False,
+        "task_interval": 86400,
     },
     "parser": {
         "table_engine": "cached",

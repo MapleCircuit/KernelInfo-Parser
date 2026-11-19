@@ -3,7 +3,7 @@ from core.globalstuff import (
     G,
     COLOR,
 )
-from core import ingest_state
+from core.backfills import interrupted_ingests
 from core.config import (
     get_repository,
     resolve_repo_insights,
@@ -176,7 +176,8 @@ def processing_cve_releases(
 
 def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | None:
     """Summarize the release tags of the repository not summarized yet (parser/git_ast/release_stats.py,
-    core/API.md section 10). Skipped while a version ingestion is interrupted: its rollback deletes the
+    core/API.md section 10). Skipped while a version ingestion is interrupted (`interrupted_ingests()`: a peer
+    node still heartbeating its version is in progress, not interrupted): its rollback deletes the
     persons created after its watermark, with every row naming them, so no row may name them before it ran.
     Never blocks parsing: a failure is logged and the run goes on."""
     if not (feature_enabled("commits") or feature_enabled("insights")):
@@ -187,7 +188,7 @@ def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | N
         with G.DB() as db:
             if db is None:
                 return None
-            interrupted = db.count_rows("m_ingest_state", {"status": ingest_state.INGEST_PARSING})
+            interrupted = interrupted_ingests(db)
             if interrupted:
                 logger.info(COLOR.yellow(
                     f"[Release stats] Skipped: {interrupted} version ingestion(s) interrupted; "
@@ -788,7 +789,7 @@ def processing_unified_preparse(
 
         existing_tables = _preparse_existing_tables(db)
         interrupted = (
-            db.count_rows("m_ingest_state", {"status": ingest_state.INGEST_PARSING})
+            interrupted_ingests(db)
             if "m_ingest_state" in existing_tables
             else 0
         )

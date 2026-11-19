@@ -30,14 +30,15 @@ from core.DBLayout import (
 from core import checkpoints, distributed, ingest_state
 from db_engine import MockDB, SQLiteDB
 from tests.db_fixtures import DIST_TABLES, DistDB
+from pipeline.step_tasks import STATUS_OK, StepResult
 from table_engine.te_direct_db import TEDirectDB
 from table_engine.te_cached_db import TECachedDB
 
 
 class TestDistributedParsing(unittest.TestCase):
     def test_schema_tables_registered(self):
-        """Verify all 77 tables including distributed coordination tables are registered."""
-        self.assertEqual(len(TABLES), 77)
+        """Verify all 78 tables including distributed coordination tables are registered."""
+        self.assertEqual(len(TABLES), 78)
         names = {t.table_name for t in TABLES}
         for expected in (
             "m_table_sequence",
@@ -46,6 +47,7 @@ class TestDistributedParsing(unittest.TestCase):
             "m_parse_task",
             "distributed_tasks",
             "distributed_worker_capabilities",
+            "distributed_worker_step_caps",
         ):
             self.assertIn(expected, names)
         # Verify unique_keys on m_parse_task uses ("network_id", "ref_name")
@@ -1920,6 +1922,12 @@ class TestMainDistributedRouting(unittest.TestCase):
 
             db = DistDB(full_schema=True)
             seen_updates: list[tuple[str, int, str]] = []
+            for patcher in (mock.patch("pipeline.step_tasks.probe_step", return_value=(True, "")),):
+                patcher.start()
+                self.addCleanup(patcher.stop)
+            run_patch = mock.patch("pipeline.step_tasks.run_step_task", return_value=StepResult(STATUS_OK))
+            run_step = run_patch.start()
+            self.addCleanup(run_patch.stop)
 
             def fake_update(ref_name: str, repo_path=None) -> bool:
                 seen_updates.append((ref_name, gp.Old_VID, gp.Old_Version_Name))
@@ -1983,6 +1991,12 @@ class TestMainDistributedRouting(unittest.TestCase):
 
             self.assertEqual(seen_updates, [("0.01", 0, EMPTY_TREE), ("0.10", 101, "0.01"), ("v3.0", 102, "0.10")])
             self.assertEqual(db.count_rows("m_parse_task"), 0, "Master must publish exclusively to distributed_tasks")
+            # The CVE list and release statistics are published as repository tasks, not run inline; with no
+            # worker to take them, the master runs them before it exits
+            repo_tasks = {t["task_type"]: t["status"] for t in db.dist_tasks if t["ref_name"] == distributed.REPO_TASK_REF}
+            self.assertEqual(repo_tasks, {distributed.TASK_TYPE_REPO_CVE: "completed",
+                                          distributed.TASK_TYPE_REPO_RELEASE_STATS: "completed"})
+            self.assertEqual(run_step.call_count, 2)
 
     def test_worker_does_not_bypass_capabilities_via_legacy_queue(self) -> None:
         import subprocess

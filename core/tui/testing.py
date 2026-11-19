@@ -756,6 +756,83 @@ def _probe_ml_health(port: int, timeout: float = 1.5) -> tuple[bool, str]:
         return False, ""
 
 
+def _summarize_ml_archive(latest: dict[str, Any], detail: dict[str, Any] | None) -> tuple[bool, str, str]:
+    """Judge one newest-message read: its overview row plus its raw RFC-822 payload from all.git."""
+    num = latest.get("num")
+    date_iso = str(latest.get("date_iso") or "")
+    lines = [
+        f"Newest message: #{num} ({date_iso or 'no date'})",
+        f"Subject: {latest.get('subject', '')}",
+        f"Author: {latest.get('author', '')}",
+        f"Message-ID: {latest.get('message_id', '')}",
+    ]
+    if not detail:
+        return False, f"newest message #{num} could not be fetched", "\n".join(lines)
+    raw = str(detail.get("raw") or "")
+    if not raw:
+        lines.append("Raw message: unavailable (all.git missing or blob not found)")
+        return False, "overview readable but the raw message is unavailable (all.git)", "\n".join(lines)
+    lines.append(f"Raw message: {len(raw)} bytes read from all.git")
+    return True, f"newest message {date_iso[:10] or f'#{num}'}", "\n".join(lines)
+
+
+def _probe_ml_archive_http(port: int, timeout: float = 15.0) -> tuple[bool, str, str]:
+    """Read the newest archive message through a daemon on 127.0.0.1:<port>.
+
+    `GET /search` with an empty query returns the newest overview row (indexed `ds` order, one row),
+    then `GET /message` reads that message in full, which goes through all.git.
+    """
+    base = f"http://127.0.0.1:{port}"
+
+    def _get(path: str) -> dict[str, Any]:
+        with urllib.request.urlopen(urllib.request.Request(base + path), timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        search = _get("/search?q=&limit=1")
+        results = search.get("results") or []
+        if not results:
+            return False, "archive returned no messages", f"GET /search?q=&limit=1 answered: {search}"
+        latest = results[0]
+        detail = _get(f"/message?num={int(latest.get('num') or 0)}").get("message")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        finally:
+            exc.close()
+        return False, f"archive query failed (HTTP {exc.code})", f"{exc.geturl()}\n{body}".strip()
+    except Exception as exc:
+        return False, f"archive query failed: {exc}", traceback.format_exc()
+    return _summarize_ml_archive(latest, detail)
+
+
+def _probe_ml_archive_local(storage_dir: str) -> tuple[bool, str, str]:
+    """Open the public-inbox archive under `storage_dir` in-process and read its newest message."""
+    from parser.mailing_list.ml_store import PublicInboxLocalStore
+
+    try:
+        store = PublicInboxLocalStore(storage_dir)
+    except Exception as exc:
+        return False, f"not a usable public-inbox archive: {exc}", traceback.format_exc()
+    try:
+        header = f"Index: {store.idx_dir}\nXapian shards: {store.shard_count}"
+        results = store.search_emails("", limit=1).get("results") or []
+        if not results:
+            return False, "archive holds no messages", header
+        latest = results[0]
+        ok, summary, details = _summarize_ml_archive(latest, store.get_email_detail(int(latest.get("num") or 0)))
+        return ok, summary, f"{header}\n{details}"
+    except Exception as exc:
+        return False, f"archive read failed: {exc}", traceback.format_exc()
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
 def _test_mailing_list_tunnel(ml_cfg: dict[str, Any], ssh_cfg: dict[str, Any], test_name: str) -> DiagnosticResult:
     """Remote mode: open the mailing list SSH forward and probe the daemon through it."""
     t0 = time.perf_counter()
@@ -772,9 +849,12 @@ def _test_mailing_list_tunnel(ml_cfg: dict[str, Any], ssh_cfg: dict[str, Any], t
 
     remote_host = str(ssh_cfg.get("remote_host", "") or "127.0.0.1")
     remote_port = _tunnel_remote_port(ssh_cfg, "mailing_list")
+    archive: tuple[bool, str, str] | None = None
     try:
         with open_test_tunnel(ssh_cfg, "mailing_list") as local_port:
             healthy, health_details = _probe_ml_health(local_port, timeout=3.0)
+            if healthy:
+                archive = _probe_ml_archive_http(local_port)
     except Exception as exc:
         return DiagnosticResult(
             name=test_name,
@@ -786,21 +866,32 @@ def _test_mailing_list_tunnel(ml_cfg: dict[str, Any], ssh_cfg: dict[str, Any], t
 
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     forward = f"Forward: 127.0.0.1:{local_port} -> {remote_host}:{remote_port} via {ssh_host}:{ssh_port}"
-    if healthy:
+    if healthy and archive is not None:
+        archive_ok, archive_summary, archive_details = archive
+        if archive_ok:
+            message = f"Remote mailing list archive readable through SSH tunnel ({ssh_host}): {archive_summary}"
+        else:
+            message = f"Remote daemon responding through SSH tunnel ({ssh_host}) but {archive_summary}"
         return DiagnosticResult(
             name=test_name,
-            passed=True,
+            passed=archive_ok,
             latency_ms=latency_ms,
-            message=f"Remote mailing list daemon responding through SSH tunnel ({ssh_host})",
-            details=f"{forward}\n{health_details}",
+            message=message,
+            details=f"{forward}\n{health_details}\n\nArchive check:\n{archive_details}",
         )
     if ml_cfg.get("auto_start_daemon", True):
         return DiagnosticResult(
             name=test_name,
             passed=True,
             latency_ms=latency_ms,
-            message=f"SSH tunnel to {ssh_host} established; remote daemon is not running yet (auto-started on ingest)",
-            details=f"{forward}\nNo daemon answered on remote port {remote_port}; auto_start_daemon launches it over SSH.",
+            message=(
+                f"SSH tunnel to {ssh_host} established; remote daemon is not running yet "
+                "(auto-started on ingest, archive access not verified)"
+            ),
+            details=(
+                f"{forward}\nNo daemon answered on remote port {remote_port}; auto_start_daemon launches it over SSH.\n"
+                "The archive itself is read only once a daemon answers; start it and re-run the test to verify it."
+            ),
         )
     return DiagnosticResult(
         name=test_name,
@@ -816,7 +907,9 @@ def test_mailing_list(ml_cfg: dict[str, Any]) -> DiagnosticResult:
 
     With `ssh_tunnel.enabled`, opens the forward (`open_test_tunnel`) and probes the remote
     daemon's /health through it. Otherwise probes a local daemon on 127.0.0.1:<port> and
-    falls back to checking `storage_dir` readability.
+    falls back to opening the archive under `storage_dir` in-process. Whichever backend
+    answers, the test then reads the archive's newest message (overview row plus raw
+    RFC-822 from all.git) and fails when that read fails.
 
     Args:
         ml_cfg: Mailing list configuration mapping (storage_dir, port, ssh_tunnel, etc.).
@@ -847,13 +940,18 @@ def test_mailing_list(ml_cfg: dict[str, Any]) -> DiagnosticResult:
         daemon_healthy, daemon_details = _probe_ml_health(port)
 
         if daemon_healthy:
+            archive_ok, archive_summary, archive_details = _probe_ml_archive_http(port)
             latency_ms = (time.perf_counter() - t0) * 1000.0
             return DiagnosticResult(
                 name=test_name,
-                passed=True,
+                passed=archive_ok,
                 latency_ms=round(latency_ms, 2),
-                message=f"Mailing list daemon responding on port {port}",
-                details=daemon_details,
+                message=(
+                    f"Mailing list archive readable through daemon on port {port}: {archive_summary}"
+                    if archive_ok
+                    else f"Mailing list daemon responding on port {port} but {archive_summary}"
+                ),
+                details=f"{daemon_details}\n\nArchive check:\n{archive_details}",
             )
 
         # Daemon is not active; inspect local storage_dir
@@ -888,13 +986,18 @@ def test_mailing_list(ml_cfg: dict[str, Any]) -> DiagnosticResult:
                 details=f"Read permission denied for '{p}'.",
             )
 
+        archive_ok, archive_summary, archive_details = _probe_ml_archive_local(storage_dir)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return DiagnosticResult(
             name=test_name,
-            passed=True,
+            passed=archive_ok,
             latency_ms=round(latency_ms, 2),
-            message=f"Local mailing list store accessible ({storage_dir})",
-            details=f"Storage directory: {p.resolve()}\nReadable: True",
+            message=(
+                f"Local mailing list archive readable ({storage_dir}): {archive_summary}"
+                if archive_ok
+                else f"Local mailing list store at {storage_dir}: {archive_summary}"
+            ),
+            details=f"Storage directory: {p.resolve()}\n{archive_details}",
         )
     except Exception as exc:
         return DiagnosticResult(

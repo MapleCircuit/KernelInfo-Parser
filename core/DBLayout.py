@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 77 core relational database tables used across the parser
+This module defines the 78 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 COLUMN DEFINITIONS are neutral `(name, ColumnSpec)` pairs built with the constructors of `db_engine.spec`
@@ -117,9 +117,12 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
                  base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg) -- secondary work queue
    distributed_tasks (task_id, network_id, repo_id, repo_name, task_type, track_name, ref_name, target_sha,
                       commit_id, base_ref_name, base_commit_id, priority, seq_order, status, worker_id,
-                      heartbeat_ts, created_ts, updated_ts, retry_count, error_msg) -- pure-DB coordination queue
+                      heartbeat_ts, created_ts, updated_ts, retry_count, error_msg, required_capability,
+                      available_ts) -- pure-DB coordination queue (version, preparse, step and repo tasks)
    distributed_worker_capabilities (worker_id, network_id, repo_name, track_name, min_seq_order, max_seq_order,
                                     min_ref, max_ref, supports_preparse, role, local_repo_path, updated_ts) -- worker local repo/track registry
+     └── distributed_worker_step_caps (worker_id, network_id, repo_name, capability, detail, updated_ts)
+                                    -- per-repo step capabilities a worker advertises (mailing_list, kapi, cve, ...)
 ===============================================================================
 """
 from __future__ import annotations
@@ -2132,8 +2135,11 @@ insights_stable_version_delta = Table(
 
 # -----------------------------------------------------------------------------
 # 75. distributed_tasks (table_id=75): Pure-DB Distributed Coordination Queue
-#     Coordinates main release tags, stable tracks, branches, and pre-parsing tasks
-#     across standalone/master/worker/daemon roles with priority weighting and heartbeat recovery.
+#     Coordinates main release tags, stable tracks, branches, pre-parsing tasks, and auxiliary
+#     step/repo tasks (pipeline/step_tasks.py) across standalone/master/worker/daemon roles with
+#     priority weighting and heartbeat recovery. An auxiliary task names its `required_capability`
+#     (a distributed_worker_step_caps capability); version and preparse tasks leave it empty.
+#     `available_ts` holds a task back from claiming until that time (retry backoff).
 # -----------------------------------------------------------------------------
 distributed_tasks = Table(
     table_id=75,
@@ -2159,6 +2165,8 @@ distributed_tasks = Table(
         ("updated_ts", BIGINT(unsigned=True, default=0)),
         ("retry_count", SMALLINT(unsigned=True, default=0)),
         ("error_msg", TEXT(null=None, default="", bin_collation=True)),
+        ("required_capability", VARCHAR(32, default="", bin_collation=True)),
+        ("available_ts", BIGINT(unsigned=True, default=0)),
     ),
     primary=("task_id",),
     foreign=(("network_id", "m_git_network", "network_id"),),
@@ -2203,6 +2211,35 @@ distributed_worker_capabilities = Table(
     indexes=(
         ("dist_cap_lookup_idx", ("worker_id", "network_id", "repo_name")),
         ("dist_cap_net_repo_track_idx", ("network_id", "repo_name", "track_name")),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 77. distributed_worker_step_caps (table_id=77): Worker Step Capability Registry
+#     The independent steps (pipeline/step_tasks.py STEPS) a node can run for a repository: its feature
+#     is enabled on the node and its resource (mailing list archive, CVE list clone, ...) is reachable.
+#     Claiming a task with a `required_capability` requires a matching row; version tasks never do.
+# -----------------------------------------------------------------------------
+distributed_worker_step_caps = Table(
+    table_id=77,
+    table_name="distributed_worker_step_caps",
+    columns=(
+        ("worker_id", VARCHAR(128, bin_collation=True)),
+        ("network_id", INT(default=1)),
+        ("repo_name", VARCHAR(128, bin_collation=True)),
+        ("capability", VARCHAR(32, bin_collation=True)),
+        ("detail", VARCHAR(255, default="", bin_collation=True)),
+        ("updated_ts", BIGINT(unsigned=True, default=0)),
+    ),
+    primary=("worker_id", "network_id", "repo_name", "capability"),
+    foreign=(("network_id", "m_git_network", "network_id"),),
+    indexes=(
+        ("dist_step_cap_idx", ("network_id", "repo_name", "capability")),
     ),
     initial_insert=None,
     no_duplicate=False,
@@ -2292,19 +2329,20 @@ TABLES: tuple[Table, ...] = (
     insights_stable_version_delta,     # 74
     distributed_tasks,                 # 75
     distributed_worker_capabilities,   # 76
+    distributed_worker_step_caps,      # 77
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 77 schema tables.
+    """Initialize and populate gp.Table_Array with all 78 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 77 Table schema objects.
+        Immutable tuple of all 78 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

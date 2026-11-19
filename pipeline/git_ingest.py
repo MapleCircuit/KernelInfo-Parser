@@ -546,7 +546,8 @@ def finish_version_ingest(commit_id: int | None) -> None:
                                 {
                                     "network_id": int(network_id),
                                     "ref_name": version_name,
-                                    "task_type": ne("preparse"),
+                                    "task_type": ne(distributed.TASK_TYPE_PREPARSE),
+                                    "required_capability": "",
                                     "status": "pending",
                                 },
                             )

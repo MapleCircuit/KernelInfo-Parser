@@ -34,6 +34,42 @@ def _fake_tunnel(local_port: int = 40001, exc: Exception | None = None, calls: l
     return _cm
 
 
+_ML_LATEST = {
+    "num": 7, "subject": "[PATCH] mm: fix leak", "author": "Dev <dev@example.org>",
+    "date_iso": "2026-11-18 10:00:00", "message_id": "20261118.1@example.org",
+}
+
+
+def _fake_ml_daemon(search: dict | None = None, message: dict | None = None, search_error: int | None = None):
+    """urlopen side effect answering /health, /search and /message like the mailing list daemon."""
+    import io
+    import json
+    import urllib.error
+
+    def _resp(payload: dict):
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = json.dumps(payload).encode()
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        return cm
+
+    def _urlopen(req, timeout=None):
+        url = req.full_url
+        if "/health" in url:
+            return _resp({"status": "ok", "version": "1.4.6"})
+        if "/search" in url:
+            if search_error:
+                raise urllib.error.HTTPError(url, search_error, "err", {},
+                                             io.BytesIO(b'{"error": "Daemon is above its memory soft limit"}'))
+            return _resp(search if search is not None else {"results": [dict(_ML_LATEST)]})
+        if "/message" in url:
+            return _resp(message if message is not None else {"message": {"num": 7, "raw": "From: a@b\n\nbody"}})
+        raise AssertionError(f"unexpected URL {url}")
+
+    return _urlopen
+
+
 class TestOpenTestTunnel(unittest.TestCase):
     """Test open_test_tunnel lifecycle."""
 
@@ -543,20 +579,60 @@ class TestMailingListDiagnostic(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_mailing_list_daemon_healthy(self, mock_urlopen) -> None:
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = b'{"status": "ok", "rss_mb": 128}'
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
-
+        mock_urlopen.side_effect = _fake_ml_daemon()
         res = test_mailing_list({"port": 8192, "storage_dir": "/nonexistent"})
-        self.assertTrue(res.passed)
-        self.assertIn("Mailing list daemon responding on port 8192", res.message)
+        self.assertTrue(res.passed, res.details)
+        self.assertIn("archive readable through daemon on port 8192", res.message)
+        self.assertIn("newest message 2026-11-18", res.message)
+        self.assertIn("Subject: [PATCH] mm: fix leak", res.details)
+        urls = [call.args[0].full_url for call in mock_urlopen.call_args_list]
+        self.assertEqual(urls, [
+            "http://127.0.0.1:8192/health",
+            "http://127.0.0.1:8192/search?q=&limit=1",
+            "http://127.0.0.1:8192/message?num=7",
+        ])
 
-    def test_mailing_list_local_storage_valid(self) -> None:
+    @patch("urllib.request.urlopen")
+    def test_mailing_list_daemon_healthy_but_archive_empty(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _fake_ml_daemon(search={"results": []})
+        res = test_mailing_list({"port": 8192})
+        self.assertFalse(res.passed)
+        self.assertIn("daemon responding on port 8192 but archive returned no messages", res.message)
+
+    @patch("urllib.request.urlopen")
+    def test_mailing_list_daemon_healthy_but_raw_missing(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _fake_ml_daemon(message={"message": {"num": 7, "raw": ""}})
+        res = test_mailing_list({"port": 8192})
+        self.assertFalse(res.passed)
+        self.assertIn("raw message is unavailable (all.git)", res.message)
+
+    @patch("urllib.request.urlopen")
+    def test_mailing_list_daemon_archive_http_error(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _fake_ml_daemon(search_error=503)
+        res = test_mailing_list({"port": 8192})
+        self.assertFalse(res.passed)
+        self.assertIn("archive query failed (HTTP 503)", res.message)
+        self.assertIn("memory soft limit", res.details)
+
+    def test_mailing_list_local_storage_not_an_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             res = test_mailing_list({"port": 54321, "storage_dir": tmpdir})
-            self.assertTrue(res.passed)
-            self.assertIn("Local mailing list store accessible", res.message)
+        self.assertFalse(res.passed)
+        self.assertIn("not a usable public-inbox archive", res.message)
+
+    def test_mailing_list_local_storage_valid(self) -> None:
+        store = MagicMock(idx_dir="/srv/lore/all/ei15", shard_count=4)
+        store.search_emails.return_value = {"results": [dict(_ML_LATEST)]}
+        store.get_email_detail.return_value = {"num": 7, "raw": "From: a@b\n\nbody"}
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("parser.mailing_list.ml_store.PublicInboxLocalStore", return_value=store) as mock_cls:
+            res = test_mailing_list({"port": 54321, "storage_dir": tmpdir})
+        self.assertTrue(res.passed, res.details)
+        self.assertIn("Local mailing list archive readable", res.message)
+        self.assertIn("Xapian shards: 4", res.details)
+        mock_cls.assert_called_once_with(tmpdir)
+        store.get_email_detail.assert_called_once_with(7)
+        store.close.assert_called_once()
 
     def test_mailing_list_storage_missing_local(self) -> None:
         res = test_mailing_list({"port": 54321, "storage_dir": "/nonexistent/lore/dir"})
@@ -575,16 +651,26 @@ class TestMailingListDiagnostic(unittest.TestCase):
         self.assertIn("SSH host is not configured", res.message)
         mock_tunnel.assert_not_called()
 
+    @patch("core.tui.testing._probe_ml_archive_http", return_value=(True, "newest message 2026-11-18", "Subject: x"))
     @patch("core.tui.testing._probe_ml_health", return_value=(True, "Health: ok"))
-    def test_mailing_list_tunnel_daemon_healthy(self, mock_probe) -> None:
+    def test_mailing_list_tunnel_daemon_healthy(self, mock_probe, mock_archive) -> None:
         cfg = {"port": 8192, "ssh_tunnel": {"enabled": True, "host": "lore.host"}}
         calls: list = []
         with patch("core.tui.testing.open_test_tunnel", _fake_tunnel(42000, calls=calls)):
             res = test_mailing_list(cfg)
         self.assertTrue(res.passed)
-        self.assertIn("responding through SSH tunnel", res.message)
+        self.assertIn("archive readable through SSH tunnel (lore.host): newest message 2026-11-18", res.message)
         self.assertEqual(calls[0][1], "mailing_list")
         self.assertEqual(mock_probe.call_args[0][0], 42000)
+        self.assertEqual(mock_archive.call_args[0][0], 42000)
+
+    @patch("core.tui.testing._probe_ml_archive_http", return_value=(False, "archive returned no messages", ""))
+    @patch("core.tui.testing._probe_ml_health", return_value=(True, "Health: ok"))
+    def test_mailing_list_tunnel_daemon_healthy_archive_unreadable(self, _mock_probe, _mock_archive) -> None:
+        with patch("core.tui.testing.open_test_tunnel", _fake_tunnel(42000)):
+            res = test_mailing_list({"ssh_tunnel": {"enabled": True, "host": "lore.host"}})
+        self.assertFalse(res.passed)
+        self.assertIn("responding through SSH tunnel (lore.host) but archive returned no messages", res.message)
 
     @patch("core.tui.testing._probe_ml_health", return_value=(False, ""))
     def test_mailing_list_tunnel_daemon_down(self, _mock_probe) -> None:
@@ -593,6 +679,7 @@ class TestMailingListDiagnostic(unittest.TestCase):
             manual = test_mailing_list({"auto_start_daemon": False, "ssh_tunnel": {"enabled": True, "host": "h"}})
         self.assertTrue(auto.passed)
         self.assertIn("auto-started", auto.message)
+        self.assertIn("archive access not verified", auto.message)
         self.assertFalse(manual.passed)
         self.assertIn("no daemon is listening", manual.message)
 

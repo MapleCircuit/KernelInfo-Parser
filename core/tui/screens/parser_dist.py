@@ -66,9 +66,12 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
         ]),
     "distributed": ("Distributed (TL;DR)", [
             "Several machines parse into one shared database (directly or via the SSH tunnel).",
-            "- master: parses mainline in order, runs global jobs, posts other branches as tasks. Singleton per network (PID lock + DB check).",
-            "- worker: leases ready tasks, parses them, exits when all work is done.",
+            "- master: parses mainline in order, posts other branches and the CVE list / release statistics as tasks, "
+            "runs the leftover ones before it exits. Singleton per network (PID lock + DB check).",
+            "- worker: leases ready tasks (CVE list and release statistics first), parses them, exits when all work is done.",
             "- daemon: continuous background service polling git updates, scheduling tasks, and recovering zombie leases. Singleton per network (PID lock + DB check).",
+            "A node missing a step (no mailing list archive, no CVE clone) still parses versions: the step is queued "
+            "as a follow-up task that only a node able to run it claims.",
             "- standalone / unchecked: one machine, no coordination.",
             "Node ID names this node (empty: role:host:pid). Master and daemon enforce singleton locking (--force-singleton overrides). "
             "Delegate stable: the master hands stable chains (vX.Y.z) to workers.",

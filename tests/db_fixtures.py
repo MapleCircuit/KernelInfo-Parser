@@ -35,6 +35,7 @@ from core.DBLayout import (
     TABLES,
     distributed_tasks,
     distributed_worker_capabilities,
+    distributed_worker_step_caps,
     m_bridge_checkpoint,
     m_checkpoint_base,
     m_commit,
@@ -155,6 +156,7 @@ DIST_TABLES = (
     m_checkpoint_base,
     distributed_tasks,
     distributed_worker_capabilities,
+    distributed_worker_step_caps,
 )
 _TASK_COLUMNS = [c[0] for c in m_parse_task.init_columns]
 _DIST_TASK_COLUMNS = [c[0] for c in distributed_tasks.init_columns]

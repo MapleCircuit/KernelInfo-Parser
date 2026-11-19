@@ -29,6 +29,7 @@ from pipeline.git_commit_worker import _collect_git_commit_result
 from pipeline.git_network import _lookup_commit_ids
 from pipeline.mailing_list_steps import resolve_version_mailing_list_commits
 from pipeline.state import MF, gp, logger
+from pipeline.step_tasks import STATUS_FAILED, STATUS_OK, StepResult, inline_step_gate, record_step_outcome
 
 
 
@@ -363,8 +364,13 @@ def processing_git_commits(version: str) -> None:
                         f"staged them from the version's blob map."
                     )
 
-    # Step 6.5: Resolve mailing list emails for ingested commits
-    try:
-        resolve_version_mailing_list_commits(commits, commit_hash_to_id, repo_path)
-    except Exception as e:
-        logger.warning(f"Mailing list email resolution skipped or encountered error: {e}")
+    # Step 6.5: Resolve mailing list emails for ingested commits. A disabled step is skipped silently; a node
+    # without the archive, or an error, is recorded so a capable node resolves the version in a follow-up task
+    # (pipeline/step_tasks.py)
+    if inline_step_gate("mailing_list", repo_path) is None:
+        try:
+            staged = resolve_version_mailing_list_commits(commits, commit_hash_to_id, repo_path)
+            record_step_outcome("mailing_list", StepResult(STATUS_OK, f"{staged} row(s)"))
+        except Exception as e:
+            logger.warning(f"Mailing list email resolution skipped or encountered error: {e}")
+            record_step_outcome("mailing_list", StepResult(STATUS_FAILED, str(e)))

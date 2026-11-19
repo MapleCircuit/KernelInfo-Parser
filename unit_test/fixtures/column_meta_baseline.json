@@ -1841,7 +1841,9 @@
       8,
       8,
       2,
-      512
+      512,
+      34,
+      8
     ],
     "has_auto_increment": true,
     "large": [
@@ -1866,7 +1868,9 @@
       15,
       16,
       17,
-      18
+      18,
+      20,
+      21
     ],
     "primary": [
       0
@@ -1903,6 +1907,33 @@
       9,
       10,
       11
+    ],
+    "primary": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "distributed_worker_step_caps": {
+    "binary": [],
+    "est_bytes": [
+      130,
+      4,
+      130,
+      34,
+      257,
+      8
+    ],
+    "has_auto_increment": false,
+    "large": [],
+    "not_null": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
     ],
     "primary": [
       0,

@@ -203,32 +203,37 @@ def resolve_version_mailing_list_commits(
     return total_staged
 
 
-def standalone_resolve_mailing_list(
+def resolve_mailing_list_range(
     repo_path: str,
     commit_range: str,
     storage_dir: str | None = None,
-) -> None:
-    """Standalone CLI resolution of commits to mailing list emails."""
+    *,
+    network_id: int | None = None,
+) -> int | None:
+    """Resolve the mailing list emails of the already-ingested commits of `commit_range` (`old..new`, or one
+    ref for its whole history) and store their m_commit_email rows. Returns the staged row count, or None when
+    no commit of the range is in m_commit. A missing archive or unreachable daemon raises
+    (`FileNotFoundError` / `ConnectionError` / `RuntimeError`); the `step_mailing_list` task (pipeline/step_tasks.py)
+    and `standalone_resolve_mailing_list` run it."""
     from parser.git_ast import GitCommitParser
 
-    logger.info(f"Starting standalone mailing list resolution for range '{commit_range}' in '{repo_path}'...")
     git_parser = GitCommitParser(repo_dir=repo_path)
     if ".." in commit_range:
         old_rev, new_rev = commit_range.split("..", 1)
     else:
         old_rev, new_rev = None, commit_range
 
-    commits = git_parser.parse_version_commits(old_rev, new_rev, with_files=False)
+    commits = git_parser.parse_version_commits(old_rev or None, new_rev, with_files=False)
     if not commits:
         logger.warning(f"No commits found in range '{commit_range}'.")
-        return
+        return None
 
     logger.info(f"Parsed {len(commits)} commits for mailing list resolution.")
-    network_id = getattr(gp, "network_id", 1)
+    net_id = int(network_id if network_id is not None else getattr(gp, "network_id", 1))
     commit_hashes = [c.commit_hash for c in commits]
     commit_hash_to_id: dict[str, int] = {}
     with G.DB() as db:
-        commit_hash_to_id = _lookup_commit_ids(db, network_id, commit_hashes)
+        commit_hash_to_id = _lookup_commit_ids(db, net_id, commit_hashes)
 
     unregistered = [c for c in commits if c.commit_hash not in commit_hash_to_id]
     if unregistered:
@@ -237,11 +242,13 @@ def standalone_resolve_mailing_list(
     target_commits = [c for c in commits if c.commit_hash in commit_hash_to_id]
     if not target_commits:
         logger.warning("No commits from the specified range exist in m_commit. Ingest git DAG first.")
-        return
+        return None
 
+    started_te = False
+    if hasattr(G, "TE") and G.TE is not None and not getattr(G.TE, "tables", None):
+        G.TE.start([m_commit_email], G.DB)
+        started_te = True
     try:
-        if hasattr(G, "TE") and G.TE is not None and not getattr(G.TE, "tables", None):
-            G.TE.start([m_commit_email], G.DB)
         staged = resolve_version_mailing_list_commits(
             target_commits,
             commit_hash_to_id,
@@ -252,7 +259,24 @@ def standalone_resolve_mailing_list(
             G.TE.commit_all()
         elif hasattr(G.TE, "commit"):
             G.TE.commit(m_commit_email.table_id)
-        logger.info(f"Standalone mailing list resolution complete: staged {staged} m_commit_email entries.")
+    finally:
+        if started_te and hasattr(G.TE, "close"):
+            G.TE.close()
+    return staged
+
+
+def standalone_resolve_mailing_list(
+    repo_path: str,
+    commit_range: str,
+    storage_dir: str | None = None,
+) -> None:
+    """Standalone CLI resolution of commits to mailing list emails (`--resolve-ml`); a missing archive exits 1."""
+    logger.info(f"Starting standalone mailing list resolution for range '{commit_range}' in '{repo_path}'...")
+    try:
+        staged = resolve_mailing_list_range(repo_path, commit_range, storage_dir)
     except (FileNotFoundError, ConnectionError, RuntimeError) as exc:
         logger.error(f"[Mailing List] {exc}")
         G.emergency_shutdown(1)
+        return
+    if staged is not None:
+        logger.info(f"Standalone mailing list resolution complete: staged {staged} m_commit_email entries.")

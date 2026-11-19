@@ -14,4 +14,6 @@ on the module that looks it up.
 - Git and per-version steps: `git_network`, `git_ingest`, `git_commit_worker`, `commits`, `mailing_list_steps`,
   `unchanged`, `file_references`, `maintainers`, `arch_layouts`, `external_steps` (source facts, CVE, release
   statistics), `backfill_steps`.
+- `step_tasks`: registry of the independent steps (mailing list, KAPI, insights, release statistics, CVE list), their
+  worker capabilities, follow-up / repository-level distributed tasks, and how a claimed one runs.
 """

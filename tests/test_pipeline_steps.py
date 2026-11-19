@@ -12,6 +12,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -910,13 +911,22 @@ class TestUnifiedPreparseCLIAndOrchestration(unittest.TestCase):
             summary_filtered = ext.processing_unified_preparse(
                 repo, 1, tags=["v3.0", "v3.0.1", "v3.1"], from_tag="v3.0.1", workers=2
             )
+            # A version a heartbeating peer node is parsing is in progress, not interrupted: writes go on
+            db.insert_rows("m_parse_node", ["node_id", "network_id", "role", "hostname", "pid", "heartbeat_at"],
+                           [("peer", 1, "worker", "h", 1, int(time.time()))])
+            db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at", "worker_id"],
+                           [(1, 11, 1, 1, "peer")])
+            db.delete_rows("m_release_segment", {"repo_id": 1, "tag": "v3.1"})
+            write_delta_records.clear()
+            summary_peer = ext.processing_unified_preparse(repo, 1, tags=["v3.1"], force=True, workers=1)
             # Verify interrupted ingest skips m_release_segment writes
             db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at"], [(1, 10, 1, 1)])
             write_delta_records.clear()
             write_kapi_records.clear()
             summary_interrupted = ext.processing_unified_preparse(repo, 1, tags=["v3.1"], force=True, workers=1)
 
-        self.assertEqual(len(pool_calls), 3, "each call must execute in a single unified pool pass")
+        self.assertEqual(len(pool_calls), 4, "each call must execute in a single unified pool pass")
+        self.assertEqual(summary_peer["segments_built"], 1, "a heartbeating peer ingest must not defer segment writes")
         self.assertEqual(summary["state"], "updated")
         self.assertEqual(summary["insights_built"], 2)
         self.assertEqual(summary["stable_built"], 1)

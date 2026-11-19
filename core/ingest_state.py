@@ -55,6 +55,7 @@ _STATIC_TABLES = {
     "m_parse_task",
     "distributed_tasks",
     "distributed_worker_capabilities",
+    "distributed_worker_step_caps",
 }
 # Tables referencing blobs from a commit's point of view (rows of other versions point at the blob too)
 _COMMIT_SCOPED = {"m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_blob_transition"}

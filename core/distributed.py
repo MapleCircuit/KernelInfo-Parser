@@ -54,9 +54,32 @@ DIST_STATUS_CLAIMED = "claimed"
 DIST_STATUS_COMPLETED = "completed"
 DIST_STATUS_FAILED = "failed"
 
-# Task priorities in distributed_tasks
+# Task types in distributed_tasks. Version tasks ingest a ref (update()) and carry the base dependency
+# chain; auxiliary tasks (pipeline/step_tasks.py STEPS) run one independent step and name the worker step
+# capability claiming them requires (`required_capability`).
+TASK_TYPE_MAIN = "main"
+TASK_TYPE_STABLE = "stable"
+TASK_TYPE_NEXT = "next"
+TASK_TYPE_BRANCH = "branch"
+TASK_TYPE_PREPARSE = "preparse"
+VERSION_TASK_TYPES = (TASK_TYPE_MAIN, TASK_TYPE_STABLE, TASK_TYPE_NEXT, TASK_TYPE_BRANCH)
+TASK_TYPE_STEP_MAILING_LIST = "step_mailing_list"
+TASK_TYPE_STEP_KAPI = "step_kapi"
+TASK_TYPE_STEP_INSIGHTS = "step_insights"
+TASK_TYPE_REPO_CVE = "repo_cve"
+TASK_TYPE_REPO_RELEASE_STATS = "repo_release_stats"
+STEP_TASK_TYPES = (TASK_TYPE_STEP_MAILING_LIST, TASK_TYPE_STEP_KAPI, TASK_TYPE_STEP_INSIGHTS)
+REPO_TASK_TYPES = (TASK_TYPE_REPO_CVE, TASK_TYPE_REPO_RELEASE_STATS)
+AUX_TASK_TYPES = STEP_TASK_TYPES + REPO_TASK_TYPES
+REPO_TASK_REF = "@repo"  # ref_name of a repository-level task (one per repository and task type)
+
+# Task priorities in distributed_tasks. The master claims PRIORITY_MAIN and above; workers claim up to
+# PRIORITY_WORKER_MAX, repository-level tasks (CVE list, release statistics) first.
 PRIORITY_MAIN = 10
+PRIORITY_WORKER_MAX = PRIORITY_MAIN - 1
+PRIORITY_REPO = 8
 PRIORITY_STABLE = 5
+PRIORITY_FOLLOWUP = 3
 PRIORITY_PREPARSE = 1
 
 DEFAULT_LEASE_TTL = 180
@@ -334,6 +357,7 @@ def ensure_distributed_tables(db: Any) -> None:
             "m_parse_task",
             "distributed_tasks",
             "distributed_worker_capabilities",
+            "distributed_worker_step_caps",
         )
     ]
     missing = db.test_tables(needed)

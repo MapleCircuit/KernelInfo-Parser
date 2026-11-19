@@ -12,7 +12,7 @@ import subprocess as sp
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -787,12 +787,19 @@ def sync_and_enqueue_repo_tasks(
     enqueue_main: bool = True,
     enqueue_preparse: bool = True,
     is_kernel: bool = True,
+    repo_feature_lookup: Callable[[str], bool] | None = None,
+    skip_repo_steps: Collection[str] = (),
 ) -> dict[str, int]:
-    """Discover local tags/branches, detect moved refs, and publish prioritized delta rows to `distributed_tasks`."""
+    """Discover local tags/branches, detect moved refs, and publish prioritized delta rows to `distributed_tasks`.
+
+    With `repo_feature_lookup` (the repository's feature flags), the repository-level step tasks (CVE list,
+    release statistics; `pipeline/step_tasks.py` `enqueue_repo_tasks()`) not in `skip_repo_steps` are published
+    too, reopened only when their fingerprint moved (`repo` count)."""
     counts = {
         "total": 0,
         "enqueued": 0,
         "unchanged": 0,
+        "repo": 0,
         "main": 0,
         "stable": 0,
         "next": 0,
@@ -981,4 +988,11 @@ def sync_and_enqueue_repo_tasks(
     counts["unchanged"] = len(rows) - len(delta_rows)
     if delta_rows:
         counts["enqueued"] = int(db.enqueue_distributed_tasks(delta_rows) or 0)
+    if repo_feature_lookup is not None:
+        from pipeline.step_tasks import enqueue_repo_tasks
+        counts["repo"] = int(enqueue_repo_tasks(
+            db, network_id, repo_id, repo_name, str(repo_dir),
+            feature_lookup=repo_feature_lookup, is_kernel=is_kernel, skip_steps=skip_repo_steps,
+        ) or 0)
+        counts["enqueued"] += counts["repo"]
     return counts

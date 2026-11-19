@@ -14,6 +14,7 @@ from core.config import (
     get_repository,
     is_kernel_project,
     repository_project,
+    resolve_repo_features,
     resolve_repo_path,
 )
 from core.distributed import ROLE_DAEMON
@@ -23,6 +24,7 @@ from pipeline.git_network import repo_project_slug, resolve_git_network_and_repo
 from pipeline.git_sync import sync_and_enqueue_repo_tasks, sync_git_repository
 from pipeline.scheduler import DistributedTaskScheduler
 from pipeline.state import logger
+from pipeline.step_tasks import STEPS
 
 
 def _repo_entry_details(entry: Any) -> tuple[str, str, str | None, str | None]:
@@ -52,8 +54,10 @@ def run_daemon_cycle(
     delegate_branches: Sequence[str] | None = None,
     include_pre_releases: bool = True,
     enqueue_preparse: bool = True,
+    enqueue_repo_tasks: bool = True,
 ) -> dict[str, Any]:
-    """Execute one Daemon coordination cycle: sync Git mirrors, sweep zombie tasks, and enqueue work.
+    """Execute one Daemon coordination cycle: sync Git mirrors, sweep zombie tasks, and enqueue work
+    (version, pre-parse, and - with `enqueue_repo_tasks` - the repository-level CVE / release statistics tasks).
 
     Never executes heavy source file parsing (`update()`) or libclang initialization.
     """
@@ -116,6 +120,9 @@ def run_daemon_cycle(
                 recovered = scheduler.sweep_zombies(db)
                 summary["zombies_recovered"] += int(recovered or 0)
 
+                repo_features = (
+                    resolve_repo_features(entry) if isinstance(entry, dict) else default_project_features(slug)
+                )
                 enq_res = sync_and_enqueue_repo_tasks(
                     db,
                     network_id,
@@ -127,8 +134,10 @@ def run_daemon_cycle(
                     delegate_stable=delegate_stable,
                     delegate_branches=delegate_branches,
                     enqueue_main=True,
-                    enqueue_preparse=enqueue_preparse and bool(default_project_features(slug).get("insights", is_kernel)),
+                    enqueue_preparse=enqueue_preparse and bool(repo_features.get("insights", is_kernel)),
                     is_kernel=is_kernel,
+                    repo_feature_lookup=lambda f, feats=repo_features: bool(feats.get(f, False)),
+                    skip_repo_steps=() if enqueue_repo_tasks else tuple(STEPS),
                 )
                 summary["tasks_enqueued"] += int(enq_res.get("enqueued", 0) or 0)
         except Exception as exc:

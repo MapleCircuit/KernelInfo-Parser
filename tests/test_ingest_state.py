@@ -131,7 +131,7 @@ class TestRollbackPlan(unittest.TestCase):
         self.assertFalse(names & {"m_type_descriptor", "m_git_ref", "m_repository", "m_bridge_tag",
                                   "m_ast_include", "m_ingest_state", "m_ingest_watermark", "m_ingest_blob",
                                   "m_table_sequence", "m_parse_task", "distributed_tasks",
-                                  "distributed_worker_capabilities"})
+                                  "distributed_worker_capabilities", "distributed_worker_step_caps"})
 
     def test_children_are_deleted_before_their_parents(self) -> None:
         plan = I.rollback_plan(TABLES, MARKS, 10, [3])

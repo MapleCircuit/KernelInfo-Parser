@@ -42,7 +42,7 @@ from pipeline.daemon import run_daemon_loop
 from pipeline.db_setup import drop_familyless_blob_facts, drop_legacy_symbol_tables, drop_obsolete_kconfig_tables, drop_outdated_derived_tables, ensure_db_instance, ensure_db_views, ensure_declared_indexes, outdated_layout
 from pipeline.external_steps import processing_cve_list, processing_cve_releases, processing_release_stats, processing_unified_preparse
 from pipeline.git_ingest import EMPTY_TREE, _forget_rolled_back_rows, _purge_partial_version, _resolve_legacy_state, refresh_person_identities
-from pipeline.git_network import repo_project_slug, resolve_git_network_and_repo
+from pipeline.git_network import feature_enabled, repo_project_slug, resolve_git_network_and_repo
 from pipeline.git_sync import (
     discover_local_repo_capabilities,
     git_repo_lock,
@@ -55,6 +55,8 @@ from pipeline.multicore import _apply_db_server_tuning, _preflight_libclang
 from pipeline.repair import orchestrate_repair_pipeline
 from pipeline.scheduler import DistributedTaskScheduler
 from pipeline.state import MF, gp, logger
+from pipeline import step_tasks
+from pipeline.step_tasks import local_step_capabilities
 from pipeline.systemic import SystemicParseError
 from pipeline.update import update
 
@@ -131,6 +133,43 @@ def _collect_local_repo_entries(repo_entry: dict | None, repo_path: str, explici
     return entries, repo_meta_by_name
 
 
+def _skipped_repo_steps(args: object) -> tuple[str, ...]:
+    """Repository-level steps (pipeline/step_tasks.py) the run's `--no-cve` / `--no-release-stats` leave out."""
+    skipped: list[str] = []
+    if getattr(args, "no_cve", False) is True:
+        skipped.append("cve")
+    if getattr(args, "no_release_stats", False) is True:
+        skipped.append("release_stats")
+    return tuple(skipped)
+
+
+def _drain_master_aux_tasks(
+    network_id: int,
+    node_id: str,
+    role: str,
+    repo_name: str,
+    repo_path: str,
+    repo_id: int,
+    lease_ttl: int,
+    should_stop: object,
+    heartbeat_daemon: object,
+) -> int:
+    """Before a master shuts down, run the auxiliary tasks of its repository (CVE list, release statistics,
+    step follow-ups) that it can claim and no worker took, so a cluster without capable workers still gets them."""
+    sched = DistributedTaskScheduler(
+        G.DB, network_id, node_id, role, heartbeat_timeout=lease_ttl, repo_name=repo_name,
+        task_types=distributed.AUX_TASK_TYPES,
+    )
+    try:
+        ran = step_tasks.drain_aux_tasks(sched, repo_path, repo_id, should_stop=should_stop, heartbeat_daemon=heartbeat_daemon)
+    except Exception as exc:  # noqa: BLE001 - the leftover tasks stay queued for the next run or a worker
+        logger.warning(COLOR.yellow(f"[Master] Running the remaining auxiliary tasks failed: {exc}"))
+        return 0
+    if ran:
+        logger.info(COLOR.cyan(f"[Master] Ran {ran} auxiliary task(s) no worker had claimed."))
+    return ran
+
+
 def _register_node_capabilities(
     db: object,
     node_id: str,
@@ -161,6 +200,9 @@ def _register_node_capabilities(
                 supports_preparse=True,
             )
             if discovered:
+                # The independent steps this node runs for the repository (pipeline/step_tasks.py); a missing
+                # one only keeps the node from claiming that step's tasks, never version tasks
+                discovered[0]["steps"] = local_step_capabilities(r_path, entry)
                 caps_by_net.setdefault(net_id, []).extend(discovered)
     total_tracks = 0
     for net_id, net_caps in caps_by_net.items():
@@ -334,8 +376,10 @@ def _run() -> None:
         cve_enabled = repo_feature_enabled(repo_entry, "cve")
     if not kernel_repo and getattr(args, "cve", False):
         logger.warning(COLOR.yellow(f"[CVE] '{repo_path}' is not a kernel repository; --cve has nothing to resolve in it."))
-    if kernel_repo and role not in (distributed.ROLE_WORKER, distributed.ROLE_DAEMON) and (
-        getattr(args, "cve", False) or (cve_enabled and not getattr(args, "no_cve", False))
+    # A master publishes the CVE list as a `repo_cve` task that a worker with the clone runs (pipeline/step_tasks.py)
+    if kernel_repo and (
+        getattr(args, "cve", False)
+        or (role == distributed.ROLE_STANDALONE and cve_enabled and not getattr(args, "no_cve", False))
     ):
         _cve_net, cve_repo_id = resolve_git_network_and_repo(repo_path)
         cve_pull = bool(getattr(args, "cve_pull", False))
@@ -598,7 +642,7 @@ def _run() -> None:
                 node_id,
                 role,
                 heartbeat_timeout=lease_ttl,
-                max_priority=distributed.PRIORITY_STABLE,
+                max_priority=distributed.PRIORITY_WORKER_MAX,
             )
             for net_id in worker_nets
         ]
@@ -643,7 +687,13 @@ def _run() -> None:
                         t_repo_name, (repo_path, network_id, repo_id)
                     )
 
-                    if _is_git_repo_dir(task_repo_path) and not verify_local_ref_exists(task_repo_path, ref_name):
+                    aux_step = step_tasks.step_for_task_type(t_type)
+                    is_repo_task = aux_step is not None and aux_step.scope == step_tasks.SCOPE_REPO
+                    if (
+                        not is_repo_task
+                        and _is_git_repo_dir(task_repo_path)
+                        and not verify_local_ref_exists(task_repo_path, ref_name)
+                    ):
                         logger.warning(COLOR.yellow(
                             f"[Worker] Ref '{ref_name}' not found locally in '{task_repo_path}'; releasing task {t_id}."
                         ))
@@ -665,7 +715,7 @@ def _run() -> None:
                         released_missing_worker.add(t_id)
                         continue
 
-                    if t_type != "preparse" and b_name and b_cid <= 0:
+                    if t_type in distributed.VERSION_TASK_TYPES and b_name and b_cid <= 0:
                         with G.DB() as db:
                             b_cid = _resolve_base_commit_id_for_task(
                                 db, task_net_id, task_repo_id, t_repo_name or fallback_repo_name, b_name, b_cid
@@ -682,11 +732,30 @@ def _run() -> None:
                     ))
                     parse_finished = False
                     try:
-                        if t_type == "preparse":
-                            with git_repo_lock(task_repo_path, exclusive=False):
-                                processing_unified_preparse(task_repo_path, task_repo_id, tags=[ref_name])
+                        if aux_step is not None:
+                            # An independent step (pipeline/step_tasks.py): the version it belongs to is ingested
+                            # already, so a failure is retried with backoff and never rolls anything back
+                            resolve_git_network_and_repo(task_repo_path, repo_name=t_repo_name or None)
+                            step_result = step_tasks.run_step_task(task, task_repo_path, task_repo_id)
                             parse_finished = True
                             heartbeat_daemon.clear_active()
+                            with G.DB() as db:
+                                action = step_tasks.finish_step_task(active_scheduler, task, step_result, db=db)
+                                if step_result.status in (step_tasks.STATUS_INCAPABLE, step_tasks.STATUS_DISABLED):
+                                    _register_node_capabilities(
+                                        db, node_id, network_id, role, repo_entries, repo_path, cap_include_rc,
+                                        repo_meta_by_name=repo_meta_by_name,
+                                    )
+                            logger.info(
+                                f"[Worker] Step task {t_id} ({t_type}: '{ref_name}') {step_result.status}"
+                                f"{': ' + step_result.detail if step_result.detail else ''} -> {action}."
+                            )
+                        elif t_type == distributed.TASK_TYPE_PREPARSE:
+                            with git_repo_lock(task_repo_path, exclusive=False):
+                                pp_summary = processing_unified_preparse(task_repo_path, task_repo_id, tags=[ref_name])
+                            parse_finished = True
+                            heartbeat_daemon.clear_active()
+                            step_tasks.queue_followups_safely(task, cid, step_tasks.preparse_outcomes(pp_summary))
                             ok = active_scheduler.complete(t_id, cid, ref_name=ref_name)
                             if not ok:
                                 logger.warning(COLOR.yellow(f"[Worker] Distributed pre-parse task {t_id} claim was lost before completion."))
@@ -704,6 +773,8 @@ def _run() -> None:
                                 break
                             parse_finished = True
                             heartbeat_daemon.clear_active()
+                            # Steps that failed or cannot run here become follow-up tasks; the version completes
+                            step_tasks.queue_followups_safely(task, getattr(gp, "VID", cid))
                             ok = active_scheduler.complete(t_id, getattr(gp, "VID", cid), ref_name=ref_name)
                             if not ok:
                                 logger.warning(COLOR.yellow(f"[Worker] Distributed task {t_id} claim was lost/revoked before completion."))
@@ -859,12 +930,14 @@ def _run() -> None:
                     enqueue_main=True,
                     enqueue_preparse=bool(kernel_repo),
                     is_kernel=kernel_repo,
+                    repo_feature_lookup=None if getattr(args, "dry_run", False) else feature_enabled,
+                    skip_repo_steps=_skipped_repo_steps(args),
                 )
                 logger.info(COLOR.cyan(
                     f"[Distributed] Queue sync for '{master_repo_name}': {enq['total']} task(s) "
                     f"({enq['enqueued']} new/updated, {enq['unchanged']} unchanged; "
                     f"main={enq['main']}, stable={enq['stable']}, next={enq['next']}, "
-                    f"branch={enq['branch']}, preparse={enq['preparse']})."
+                    f"branch={enq['branch']}, preparse={enq['preparse']}, repo={enq['repo']})."
                 ))
         # The master keeps what is not delegated: mainline release tags, trunk branches and refs that are no
         # release tag (core/distributed.py partition_master_refs)
@@ -915,7 +988,8 @@ def _run() -> None:
         G.emergency_shutdown(0)
         return
 
-    if not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
+    # A master publishes them as repository-level tasks instead (sync_and_enqueue_repo_tasks above)
+    if role != distributed.ROLE_MASTER and not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
         processing_release_stats(repo_path, repo_id)
         if kernel_repo and cve_enabled and not getattr(args, "no_cve", False):
             processing_cve_releases(repo_path, repo_id)
@@ -1157,6 +1231,7 @@ def _run() -> None:
                     parse_finished = True
                     if heartbeat_daemon is not None:
                         heartbeat_daemon.clear_active()
+                    step_tasks.queue_followups_safely(task, getattr(gp, "VID", cid))
                     master_scheduler.complete(t_id, getattr(gp, "VID", cid), ref_name=ref)
                 except SystemicParseError as exc:
                     with G.DB() as db:
@@ -1206,13 +1281,30 @@ def _run() -> None:
                 if total_targets > 1:
                     label = "branch" if is_branch_pipeline else "version"
                     logger.info(COLOR.cyan(f"[Release Pipeline] Progress: {label} {ref_idx + 1}/{total_targets} ('{ref}')"))
+                # A master's follow-up tasks of this version (no queue row: built from the version and its base)
+                followup_task = {
+                    "network_id": network_id,
+                    "repo_id": repo_id,
+                    "repo_name": master_repo_name,
+                    "ref_name": ref,
+                    "base_ref_name": "" if gp.Old_Version_Name == EMPTY_TREE else str(gp.Old_Version_Name or ""),
+                    "base_commit_id": int(gp.Old_VID or 0),
+                }
                 try:
                     completed = update(ref, repo_path=repo_path)
                     if completed is False:
                         break
+                    if role == distributed.ROLE_MASTER:
+                        step_tasks.queue_followups_safely(followup_task, getattr(gp, "VID", 0))
                 finally:
                     if heartbeat_daemon is not None:
                         heartbeat_daemon.clear_active()
+        if role == distributed.ROLE_MASTER and node_id:
+            _drain_master_aux_tasks(
+                network_id, node_id, role, master_repo_name, repo_path, repo_id, lease_ttl,
+                lambda: G.is_deadline_exceeded() or quit_listener.requested.is_set(),
+                heartbeat_daemon,
+            )
     except MemoryError:
         logger.critical(COLOR.red("FATAL: Memory limit of 60.0 GB (RLIMIT_AS) exceeded! Terminating execution cleanly."))
         sys.exit(1)
@@ -1229,8 +1321,9 @@ def _run() -> None:
             print(G.STAGE_PROFILER.format_stage_report())
 
     # Again after the versions: a run that recovered an interrupted version skipped it at the start,
-    # and tags fetched while it ran are picked up (nothing is read when every tag is summarized)
-    if not getattr(args, "no_release_stats", False):
+    # and tags fetched while it ran are picked up (nothing is read when every tag is summarized). A master
+    # ran the repository-level tasks no worker took before it shut down (_drain_master_aux_tasks)
+    if role != distributed.ROLE_MASTER and not getattr(args, "no_release_stats", False):
         processing_release_stats(repo_path, repo_id)
         if kernel_repo and cve_enabled and not getattr(args, "no_cve", False):
             processing_cve_releases(repo_path, repo_id)

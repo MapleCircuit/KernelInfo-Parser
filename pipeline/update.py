@@ -28,6 +28,7 @@ from pipeline.maintainers import processing_maintainer_files
 from pipeline.multicore import trigger_multicore
 from pipeline.scheduler import DependencyScheduler
 from pipeline.state import MF, gp, logger
+from pipeline.step_tasks import kapi_outcome, record_step_outcome, reset_step_outcomes, summarize_standalone_failures
 from pipeline.unchanged import processing_symlinks
 from pipeline.worker_stage import WORKER_SYMBOL_STATS, _log_symbol_stats
 
@@ -72,9 +73,12 @@ def update(version: str, repo_path: str | None = None) -> bool:
     5. Spawn parallel worker processes (`trigger_multicore()`) to parse file diffs into ChangeSets.
     6. Enqueue all generated `ChangeSet` objects into `cs_queue` and resolve operations sequentially.
     7. Remove temporary indexes, commit table transactions (`G.TE.commit()`), and reset state.
+    8. Mark the version done, then pre-parse its KAPI catalog. The outcomes of the independent steps (Step 6.5
+       mailing list, KAPI) are recorded in `gp.step_outcomes` (pipeline/step_tasks.py) for follow-up tasks.
     """
     if repo_path:
         MF.set_repo_dir(repo_path)
+    reset_step_outcomes()
 
     # -------------------------------------------------------------------------
     # STEP 1: Register or synchronize active ref/commit in m_git_ref
@@ -326,6 +330,9 @@ def update(version: str, repo_path: str | None = None) -> bool:
         G.TE.update_in_mem_indexes = True
     finish_version_ingest(gp.VID)
     with git_repo_lock(MF.get_repo_dir(), exclusive=False):
-        processing_kapi(str(MF.repo_dir), getattr(gp, "repo_id", None), version, commit_id=gp.VID)
+        kapi_summary = processing_kapi(str(MF.repo_dir), getattr(gp, "repo_id", None), version, commit_id=gp.VID)
+    record_step_outcome("kapi", kapi_outcome(kapi_summary))
+    if not getattr(G, "distributed", False):
+        summarize_standalone_failures(version)
     reclaim_system_memory()
     return True

@@ -1461,16 +1461,21 @@ class BaseDBEngine(ABC):
         "updated_ts",
         "retry_count",
         "error_msg",
+        "required_capability",
+        "available_ts",
     )
 
     def enqueue_distributed_tasks(self, rows: Sequence[Sequence[Any]]) -> int:
         """Publish prioritized tasks into `distributed_tasks`; returns how many rows were written.
 
         Each row is `(network_id, repo_id, repo_name, task_type, track_name, ref_name, target_sha,
-        commit_id, base_ref_name, base_commit_id, priority, seq_order, status, created_ts, updated_ts)`.
+        commit_id, base_ref_name, base_commit_id, priority, seq_order, status, created_ts, updated_ts)`,
+        optionally followed by `required_capability, available_ts` (default `""`, `0`; auxiliary step and repo
+        tasks name the worker step capability claiming them requires).
         Unique key `(network_id, repo_name, task_type, ref_name)` identifies a task. Failed tasks,
         completed tasks reopened as non-completed, and non-claimed tasks whose `target_sha` moved reset
-        their retry/worker/heartbeat fields cleanly while in-flight `claimed` tasks retain their owner.
+        their retry/worker/heartbeat fields (and take the incoming `available_ts`) cleanly while in-flight
+        `claimed` tasks retain their owner.
         """
         if not rows:
             return 0
@@ -1498,6 +1503,7 @@ class BaseDBEngine(ABC):
             "error_msg": Case([([reopened], Value(""))], "error_msg"),
             "worker_id": Case([([reopened], Value(""))], "worker_id"),
             "heartbeat_ts": Case([([reopened], 0)], "heartbeat_ts"),
+            "available_ts": Case([([reopened], Incoming("available_ts"))], "available_ts"),
             "created_ts": Case([({"created_ts": gt(0)}, "created_ts")], Incoming("created_ts")),
             "status": Case(
                 [
@@ -1526,8 +1532,10 @@ class BaseDBEngine(ABC):
             "status",
             "created_ts",
             "updated_ts",
+            "required_capability",
+            "available_ts",
         ]
-        tuples = [tuple(row) for row in rows]
+        tuples = [tuple(row) + ("", 0)[max(0, len(row) - 15):] for row in rows]
         target_sha_exprs = {
             "target_sha": Case(
                 [
@@ -1550,7 +1558,9 @@ class BaseDBEngine(ABC):
                 columns,
                 tuples,
                 on_conflict="update",
-                update_columns=["repo_id", "track_name", "base_ref_name", "priority", "seq_order", "updated_ts"],
+                update_columns=[
+                    "repo_id", "track_name", "base_ref_name", "priority", "seq_order", "updated_ts", "required_capability",
+                ],
                 update_exprs=update_exprs,
             )
             if any(row[6] for row in tuples):
@@ -1575,12 +1585,25 @@ class BaseDBEngine(ABC):
         role: str = "worker",
         now: int | None = None,
     ) -> int:
-        """Replace `distributed_worker_capabilities` entries for `(worker_id, network_id)` atomically."""
+        """Replace `distributed_worker_capabilities` entries for `(worker_id, network_id)` atomically.
+
+        A capability may carry `steps`: the step capabilities (names, or `{"capability", "detail"}` mappings)
+        the worker runs for that repository; they replace its `distributed_worker_step_caps` rows of the
+        network in the same transaction."""
         ts = int(time.time()) if now is None else int(now)
         deduped: dict[tuple[str, str], tuple[Any, ...]] = {}
+        step_rows: dict[tuple[str, str], tuple[Any, ...]] = {}
         for cap in capabilities:
             repo_name = str(cap.get("repo_name", "") or "")
             track_name = str(cap.get("track_name", "") or "")
+            for step in cap.get("steps") or ():
+                name, detail = (
+                    (step.get("capability"), step.get("detail")) if isinstance(step, Mapping) else (step, "")
+                )
+                if repo_name and name:
+                    step_rows[(repo_name, str(name))] = (
+                        worker_id, int(network_id), repo_name, str(name)[:32], str(detail or "")[:255], ts,
+                    )
             if not repo_name or not track_name:
                 continue
             deduped[(repo_name, track_name)] = (
@@ -1613,6 +1636,14 @@ class BaseDBEngine(ABC):
         ]
         def _op() -> int:
             self.delete_rows("distributed_worker_capabilities", {"worker_id": worker_id, "network_id": int(network_id)})
+            self.delete_rows("distributed_worker_step_caps", {"worker_id": worker_id, "network_id": int(network_id)})
+            if step_rows:
+                self.insert_rows(
+                    "distributed_worker_step_caps",
+                    ["worker_id", "network_id", "repo_name", "capability", "detail", "updated_ts"],
+                    list(step_rows.values()),
+                    on_conflict="update",
+                )
             if not deduped:
                 return 0
             return self.insert_rows(
@@ -1625,32 +1656,28 @@ class BaseDBEngine(ABC):
         return int(self._run_tx_with_retry(_op) or 0)
 
     def unregister_worker_capabilities(self, worker_id: str) -> int:
-        """Remove all capability rows registered for `worker_id`."""
+        """Remove all capability rows (tracks and step capabilities) registered for `worker_id`."""
         if not worker_id:
             return 0
+        self.delete_rows("distributed_worker_step_caps", {"worker_id": worker_id})
         return self.delete_rows("distributed_worker_capabilities", {"worker_id": worker_id})
 
-    def claim_distributed_task(
+    def _distributed_claim_terms(
         self,
         network_id: int,
         worker_id: str,
         *,
-        min_priority: int | None = None,
-        max_priority: int | None = None,
-        task_types: Sequence[str] | None = None,
-        repo_name: str | None = None,
-        preferred_track: str | None = None,
-        now: int | None = None,
-        scan_limit: int = 20,
-    ) -> dict[str, Any] | None:
-        """Atomically claim the highest-priority pending task matching `worker_id`'s capabilities.
-
-        Joins `distributed_tasks` with `distributed_worker_capabilities` so a node only claims tasks for
-        repositories, tracks, and ref ordinal ranges (`min_seq_order`..`max_seq_order`) it holds locally,
-        and whose base dependency (when non-empty) has already completed.
-        """
-        ts = int(time.time()) if now is None else int(now)
+        min_priority: int | None,
+        max_priority: int | None,
+        task_types: Sequence[str] | None,
+        repo_name: str | None,
+        available_before: int | None,
+    ) -> tuple[list[Any], list[Join]]:
+        """Where terms and capability join selecting the pending tasks `worker_id` may claim (see
+        `claim_distributed_task`); `available_before=None` also counts tasks held back by `available_ts`."""
         base_filter: dict[str, Any] = {"t.network_id": int(network_id), "t.status": "pending"}
+        if available_before is not None:
+            base_filter["t.available_ts"] = le(int(available_before))
         pri_conds = []
         if min_priority is not None:
             pri_conds.append(ge(int(min_priority)))
@@ -1674,7 +1701,7 @@ class BaseDBEngine(ABC):
             Exists(
                 ("distributed_tasks", "bt"),
                 {"bt.network_id": "t.network_id", "bt.repo_name": "t.repo_name", "bt.ref_name": "t.base_ref_name"},
-                {"bt.status": "completed", "bt.task_type": ne("preparse")},
+                {"bt.status": "completed", "bt.task_type": ne("preparse"), "bt.required_capability": ""},
             ),
         )
         where_terms: list[Any] = [
@@ -1682,9 +1709,18 @@ class BaseDBEngine(ABC):
             AnyOf(
                 {"c.track_name": Col("t.track_name")},
                 {"c.track_name": "*"},
+                {"t.track_name": ""},
                 [{"t.task_type": "preparse"}, {"c.track_name": "preparse"}],
             ),
             AnyOf({"t.task_type": ne("preparse")}, {"c.supports_preparse": 1}),
+            AnyOf(
+                {"t.required_capability": ""},
+                Exists(
+                    ("distributed_worker_step_caps", "ws"),
+                    {"ws.network_id": "t.network_id", "ws.repo_name": "t.repo_name", "ws.capability": "t.required_capability"},
+                    {"ws.worker_id": worker_id},
+                ),
+            ),
             AnyOf({"c.min_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("t.seq_order", "c.min_seq_order"), ge(0))),
             AnyOf({"c.max_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("c.max_seq_order", "t.seq_order"), ge(0))),
             base_ready,
@@ -1696,6 +1732,55 @@ class BaseDBEngine(ABC):
                 "inner",
             )
         ]
+        return where_terms, cap_join
+
+    def has_claimable_distributed_task(
+        self,
+        network_id: int,
+        worker_id: str,
+        *,
+        min_priority: int | None = None,
+        max_priority: int | None = None,
+        task_types: Sequence[str] | None = None,
+        repo_name: str | None = None,
+        include_delayed: bool = True,
+    ) -> bool:
+        """True when a pending task `claim_distributed_task` would hand `worker_id` exists; `include_delayed`
+        also counts tasks whose `available_ts` (retry backoff) is not due yet."""
+        where_terms, cap_join = self._distributed_claim_terms(
+            network_id, worker_id, min_priority=min_priority, max_priority=max_priority, task_types=task_types,
+            repo_name=repo_name, available_before=None if include_delayed else int(time.time()),
+        )
+        return bool(self.row_exists(("distributed_tasks", "t"), where_terms, joins=cap_join))
+
+    def claim_distributed_task(
+        self,
+        network_id: int,
+        worker_id: str,
+        *,
+        min_priority: int | None = None,
+        max_priority: int | None = None,
+        task_types: Sequence[str] | None = None,
+        repo_name: str | None = None,
+        preferred_track: str | None = None,
+        now: int | None = None,
+        scan_limit: int = 20,
+    ) -> dict[str, Any] | None:
+        """Atomically claim the highest-priority pending task matching `worker_id`'s capabilities.
+
+        Joins `distributed_tasks` with `distributed_worker_capabilities` so a node only claims tasks for
+        repositories, tracks, and ref ordinal ranges (`min_seq_order`..`max_seq_order`) it holds locally,
+        whose base dependency (when non-empty) has already completed as a version task (a task with no
+        `required_capability`, not `preparse`), and whose `available_ts` is due. A task naming a
+        `required_capability` also needs that capability in the worker's `distributed_worker_step_caps`
+        rows for the repository; a task with no `track_name` (a repository-level task) only needs the
+        repository. Tasks without a `required_capability` are never filtered by step capabilities.
+        """
+        ts = int(time.time()) if now is None else int(now)
+        where_terms, cap_join = self._distributed_claim_terms(
+            network_id, worker_id, min_priority=min_priority, max_priority=max_priority,
+            task_types=task_types, repo_name=repo_name, available_before=ts,
+        )
 
         def _scan(extra_where: dict[str, Any] | None, limit: int) -> list[int]:
             terms = list(where_terms)
@@ -1812,7 +1897,8 @@ class BaseDBEngine(ABC):
         network_id: int | None = None,
         now: int | None = None,
     ) -> bool:
-        """Mark a claimed task `completed` (checking `worker_id` if given) and backfill dependent `base_commit_id`."""
+        """Mark a claimed task `completed` (checking `worker_id` if given); a version task (no
+        `required_capability`, not `preparse`) also backfills its dependents' `base_commit_id`."""
         ts = int(time.time()) if now is None else int(now)
         where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
         if worker_id:
@@ -1831,12 +1917,14 @@ class BaseDBEngine(ABC):
             if int(commit_id) > 0:
                 task_row = self.select_one(
                     "distributed_tasks",
-                    ["network_id", "repo_name", "ref_name", "task_type"],
+                    ["network_id", "repo_name", "ref_name", "task_type", "required_capability"],
                     {"task_id": int(task_id)},
                     as_dict=False,
                 )
                 t_repo = str(task_row[1]) if task_row else ""
                 t_type = str(task_row[3]) if task_row else ""
+                if task_row and task_row[4]:
+                    return True
                 if task_row and eff_ref is None:
                     eff_ref = str(task_row[2])
                 if task_row and eff_net is None:
@@ -1870,9 +1958,11 @@ class BaseDBEngine(ABC):
         *,
         worker_id: str | None = None,
         max_attempts: int = 3,
+        retry_delay: int = 0,
         now: int | None = None,
     ) -> int:
-        """Record a failure on a claimed task; retries as `pending` until `max_attempts`, then sets `failed`."""
+        """Record a failure on a claimed task; retries as `pending` (claimable again `retry_delay` seconds
+        later) until `max_attempts`, then sets `failed`."""
         ts = int(time.time()) if now is None else int(now)
         where: dict[str, Any] = {"task_id": int(task_id), "status": "claimed"}
         if worker_id:
@@ -1890,6 +1980,7 @@ class BaseDBEngine(ABC):
                         "worker_id": "",
                         "heartbeat_ts": 0,
                         "updated_ts": ts,
+                        "available_ts": ts + int(retry_delay) if int(retry_delay) > 0 else 0,
                     },
                     where,
                 )
@@ -1903,9 +1994,11 @@ class BaseDBEngine(ABC):
         reason: str,
         worker_id: str,
         *,
+        retry_delay: int = 0,
         now: int | None = None,
     ) -> bool:
-        """Return a claimed task to `pending` without incrementing `retry_count`."""
+        """Return a claimed task to `pending` without incrementing `retry_count` (claimable again
+        `retry_delay` seconds later)."""
         ts = int(time.time()) if now is None else int(now)
         rc = self._retry_deadlock(
             lambda: self.update_rows(
@@ -1915,6 +2008,7 @@ class BaseDBEngine(ABC):
                     "worker_id": "",
                     "heartbeat_ts": 0,
                     "updated_ts": ts,
+                    "available_ts": ts + int(retry_delay) if int(retry_delay) > 0 else 0,
                     "error_msg": str(reason)[:1000],
                 },
                 {"task_id": int(task_id), "status": "claimed", "worker_id": worker_id},

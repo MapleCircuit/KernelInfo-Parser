@@ -6,7 +6,7 @@
 Always enforce these invariants when modifying `core/`:
 
 1. **Canonical Database Schema Authority (`core/DBLayout.py`)**:
-   - `core/DBLayout.py` is the single authoritative source of truth for all 77 tables (`Table_Array` / `TABLES`).
+   - `core/DBLayout.py` is the single authoritative source of truth for all 78 tables (`Table_Array` / `TABLES`).
    - The module docstring contains the complete relational entity-relationship graph across git DAG, content-addressable blobs, code tags, symbols, Kconfig, maintainers, and distributed coordination tables.
    - When adding or altering a table, update the docstring graph, the `Table(...)` definition, and the table's registration in `Table_Array` / `TABLES`.
 2. **Database View & Migration Lifecycle (`pipeline/db_setup.py`)**:
@@ -26,6 +26,7 @@ Always enforce these invariants when modifying `core/`:
    - **Active worker states**: In `_previous_ingest`, check `m_parse_node.heartbeat_at >= now - 180` before treating `m_ingest_state.status == INGEST_PARSING` as interrupted to prevent premature rollback of in-flight peer runs.
    - **Dependency unlocking & capability matching**: Claim `distributed_tasks` strictly through `BaseDBEngine.claim_distributed_task()` / `DistributedTaskScheduler.claim_next()` joined against `distributed_worker_capabilities`, unlock dependents / backfill `base_commit_id` only after verified claim ownership in `finish_version_ingest()` / `complete_distributed_task()`, and protect Git mirror operations with `git_repo_lock()`.
    - **Singleton security**: Enforce `SingletonProcessLock` (`flock` PID lock file) and DB heartbeat checks for both `master` and `daemon` roles unless overridden with `--force-singleton`.
+   - **Auxiliary step tasks** (`pipeline/step_tasks.py`, `core/API.md` §11.4): an independent step that fails or cannot run on a node becomes a capability-gated follow-up task while its version task completes; auxiliary tasks (non-empty `required_capability`) never roll back, complete, unlock, or cascade-fail a version, and a missing step capability never keeps a node from claiming version tasks.
    - **Heartbeat daemon propagation**: Propagate `role`, `network_id`, and `singleton_lock` into `NodeHeartbeatDaemon` to renew node registration, `distributed_tasks.heartbeat_ts`, and lock timestamps.
 7. **Documentation & Tests**:
    - Update `core/API.md` in declarative present-tense (§4 for schema, §5 for ChangeSet routing, §11 for distributed, §12 for backfills).

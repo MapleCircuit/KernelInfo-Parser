@@ -15,11 +15,12 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from core import ingest_state
+from core.distributed import TASK_TYPE_PREPARSE
 from core.DBLayout import TABLES
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import ChangeSet, is_data_unsafe
 from db_engine.errors import DeadlockError
-from db_engine.spec import AnyOf, Col, Exists, Join, Pred, Value, ge, gt, le, lt, ne, sub
+from db_engine.spec import AnyOf, Join, ge, gt, lt, ne
 from pipeline.changesets import execute_and_purge, extract_tags_and_evacuate_cs
 from pipeline.state import logger
 from pipeline.worker_stage import _commit_all_with_retry
@@ -620,7 +621,10 @@ class DistributedTaskScheduler:
         return 1 if (reset_rc and reset_rc > 0) else 0
 
     def sweep_zombies(self, db: Any = None, now: int | None = None) -> int:
-        """Recover expired claimed tasks, rolling back partial version writes before resetting to pending."""
+        """Recover expired claimed tasks, rolling back partial version writes before resetting to pending.
+
+        Only version tasks roll back (or, already ingested, complete): a `preparse` or auxiliary task (one with
+        a `required_capability`) shares its version's `commit_id` but never wrote it, so it is reset plainly."""
         with self._with_db(db) as conn:
             if conn is None:
                 return 0
@@ -629,7 +633,7 @@ class DistributedTaskScheduler:
             expired_filter = AnyOf({"heartbeat_ts": lt(cutoff)}, {"heartbeat_ts": 0, "updated_ts": lt(cutoff)})
             expired_rows = conn.select_rows(
                 "distributed_tasks",
-                ["task_id", "task_type", "ref_name", "commit_id", "worker_id"],
+                ["task_id", "task_type", "ref_name", "commit_id", "worker_id", "required_capability"],
                 [{"network_id": self.network_id, "status": "claimed"}, expired_filter],
                 as_dict=True,
             )
@@ -640,7 +644,7 @@ class DistributedTaskScheduler:
             plain_ids: list[int] = []
             for row in expired_rows:
                 tid = int(row["task_id"])
-                if str(row.get("task_type") or "") == "preparse":
+                if str(row.get("task_type") or "") == TASK_TYPE_PREPARSE or row.get("required_capability"):
                     plain_ids.append(tid)
                     continue
                 cid = self._resolve_task_commit_id(conn, row)
@@ -719,14 +723,17 @@ class DistributedTaskScheduler:
             )
 
     def _cascade_failed_dependents(self, conn: Any, initial_task_id: int, ts: int) -> int:
-        """Iteratively fail downstream pending tasks whose base matches a failed task in the same repo."""
+        """Iteratively fail downstream pending version tasks whose base matches a failed version task in the same repo.
+
+        `preparse` and auxiliary tasks (a `required_capability`) neither start nor join a cascade: a step that
+        fails leaves its completed version and every dependent version untouched."""
         row = conn.select_one(
             "distributed_tasks",
-            ["network_id", "repo_name", "task_type", "commit_id", "ref_name"],
+            ["network_id", "repo_name", "task_type", "commit_id", "ref_name", "required_capability"],
             {"task_id": int(initial_task_id)},
             as_dict=False,
         )
-        if not row or str(row[2] or "") == "preparse":
+        if not row or str(row[2] or "") == TASK_TYPE_PREPARSE or row[5]:
             return 0
         net_id = int(row[0])
         repo_name = str(row[1] or "")
@@ -755,7 +762,16 @@ class DistributedTaskScheduler:
                 down_rows = conn.select_rows(
                     "distributed_tasks",
                     ["task_id", "task_type", "commit_id", "ref_name"],
-                    [{"network_id": net_id, "repo_name": repo_name, "status": "pending"}, AnyOf(*branches)],
+                    [
+                        {
+                            "network_id": net_id,
+                            "repo_name": repo_name,
+                            "status": "pending",
+                            "task_type": ne(TASK_TYPE_PREPARSE),
+                            "required_capability": "",
+                        },
+                        AnyOf(*branches),
+                    ],
                     as_dict=False,
                 )
                 if not down_rows:
@@ -774,9 +790,7 @@ class DistributedTaskScheduler:
                     break
                 next_cids: set[int] = set()
                 next_refs: set[str] = set()
-                for _tid, d_type, d_cid, d_ref in down_rows:
-                    if str(d_type or "") == "preparse":
-                        continue
+                for _tid, _d_type, d_cid, d_ref in down_rows:
                     dc = int(d_cid) if d_cid and int(d_cid) > 0 else 0
                     dr = str(d_ref or "")
                     if dc > 0 and dc not in seen_cids:
@@ -803,10 +817,12 @@ class DistributedTaskScheduler:
         error_msg: str,
         *,
         max_attempts: int = 3,
+        retry_delay: int = 0,
         db: Any = None,
         now: int | None = None,
     ) -> bool:
-        """Record a task failure; on terminal `"failed"` status, cascade failure to downstream dependents."""
+        """Record a task failure (claimable again `retry_delay` seconds later); on terminal `"failed"` status,
+        cascade failure to downstream dependent version tasks."""
         with self._with_db(db) as conn:
             if conn is None:
                 return False
@@ -816,6 +832,7 @@ class DistributedTaskScheduler:
                 error_msg,
                 worker_id=self.node_id,
                 max_attempts=max_attempts,
+                retry_delay=retry_delay,
                 now=ts,
             )
             if not (rc and rc > 0):
@@ -825,12 +842,15 @@ class DistributedTaskScheduler:
                 self._cascade_failed_dependents(conn, int(task_id), ts)
             return True
 
-    def release(self, task_id: int, reason: str, *, db: Any = None, now: int | None = None) -> bool:
-        """Return a claimed task to `pending` without incrementing `retry_count`."""
+    def release(
+        self, task_id: int, reason: str, *, retry_delay: int = 0, db: Any = None, now: int | None = None,
+    ) -> bool:
+        """Return a claimed task to `pending` without incrementing `retry_count` (claimable again `retry_delay`
+        seconds later)."""
         with self._with_db(db) as conn:
             if conn is None:
                 return False
-            return bool(conn.release_distributed_task(task_id, reason, self.node_id, now=now))
+            return bool(conn.release_distributed_task(task_id, reason, self.node_id, retry_delay=retry_delay, now=now))
 
     def is_queue_drained(self, db: Any = None, *, coordinator_timeout: int = 120) -> bool:
         """True only when tasks exist, none are claimed, no master/daemon is active, and no matching task is claimable."""
@@ -849,54 +869,11 @@ class DistributedTaskScheduler:
             ):
                 return False
 
-            base_filter: dict[str, Any] = {"t.network_id": self.network_id, "t.status": "pending"}
-            pri_conds = []
-            if self.min_priority is not None:
-                pri_conds.append(ge(int(self.min_priority)))
-            if self.max_priority is not None:
-                pri_conds.append(le(int(self.max_priority)))
-            if len(pri_conds) == 1:
-                base_filter["t.priority"] = pri_conds[0]
-            elif len(pri_conds) > 1:
-                base_filter["t.priority"] = pri_conds
-            if self.task_types:
-                base_filter["t.task_type"] = list(self.task_types)
-            if self.repo_name:
-                base_filter["t.repo_name"] = self.repo_name
-
-            base_ready = AnyOf(
-                {"t.base_ref_name": ""},
-                [
-                    {"t.base_commit_id": gt(0)},
-                    Exists(
-                        ("m_ingest_state", "bs"),
-                        {"bs.network_id": "t.network_id", "bs.commit_id": "t.base_commit_id"},
-                        {"bs.status": ingest_state.INGEST_DONE},
-                    ),
-                ],
-                Exists(
-                    ("distributed_tasks", "bt"),
-                    {"bt.network_id": "t.network_id", "bt.repo_name": "t.repo_name", "bt.ref_name": "t.base_ref_name"},
-                    {"bt.status": "completed", "bt.task_type": ne("preparse")},
-                ),
+            return not conn.has_claimable_distributed_task(
+                self.network_id,
+                self.node_id,
+                min_priority=self.min_priority,
+                max_priority=self.max_priority,
+                task_types=self.task_types,
+                repo_name=self.repo_name,
             )
-            where_terms: list[Any] = [
-                base_filter,
-                AnyOf(
-                    {"c.track_name": Col("t.track_name")},
-                    {"c.track_name": "*"},
-                    [{"t.task_type": "preparse"}, {"c.track_name": "preparse"}],
-                ),
-                AnyOf({"t.task_type": ne("preparse")}, {"c.supports_preparse": 1}),
-                AnyOf({"c.min_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("t.seq_order", "c.min_seq_order"), ge(0))),
-                AnyOf({"c.max_seq_order": 0}, {"t.seq_order": 0}, Pred(sub("c.max_seq_order", "t.seq_order"), ge(0))),
-                base_ready,
-            ]
-            cap_join = [
-                Join(
-                    ("distributed_worker_capabilities", "c"),
-                    {"c.worker_id": Value(self.node_id), "c.network_id": "t.network_id", "c.repo_name": "t.repo_name"},
-                    "inner",
-                )
-            ]
-            return not conn.row_exists(("distributed_tasks", "t"), where_terms, joins=cap_join)

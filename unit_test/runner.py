@@ -130,6 +130,7 @@ DEFAULT_MODULES = [
     "tests.test_db_content_screen",
     "tests.test_git_select_screen",
     "tests.test_distributed_parsing",
+    "tests.test_step_tasks",
     "tests.test_linux_branches_distributed",
     "tests.test_max_allowed_packet",
     "tests.test_resume_pipeline",
