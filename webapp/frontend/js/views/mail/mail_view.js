@@ -129,7 +129,7 @@ export class MailView {
           <div class="mail-list-pane" id="mail-search-pane" ${treeActive ? 'hidden' : ''}>
             <div class="mail-search-bar">
               <div style="display:flex;gap:6px;align-items:center;">
-                <span style="font-size:14px;">✉</span>
+                <span style="font-size:var(--fs-14, 14px);">✉</span>
                 <input type="text" id="mail-search-input" class="mail-search-input" placeholder="Search LKML subject, author, s:, f:, m:..." />
                 <button id="mail-search-clear-btn" class="mail-clear-btn" title="Clear search" style="display:none;">&times;</button>
               </div>
@@ -158,7 +158,7 @@ export class MailView {
         <!-- Right Column: Thread Conversation & Patch Viewer -->
         <div class="mail-detail-col" id="mail-detail-container">
           <div class="mail-empty-state">
-            <span style="font-size:28px;">✉</span>
+            <span style="font-size:var(--fs-28, 28px);">✉</span>
             <p>Select a thread from the list or search the Linux Kernel Mailing List to view conversations, patches, and replies.</p>
           </div>
         </div>
@@ -626,11 +626,11 @@ export class MailView {
       if (!st.available) {
         banner.style.display = "flex";
         banner.innerHTML = `
-          <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--accent-yellow);flex:1;">
+          <div style="display:flex;align-items:center;gap:8px;font-size:var(--fs-11, 11px);color:var(--accent-yellow);flex:1;">
             <span>⚠️</span>
             <span>Mailing list backend is offline (${escapeHtml(st.reason || 'Not reachable')}). Showing cached threads.</span>
           </div>
-          <button class="code-btn" id="mail-retry-status-btn" style="font-size:10px;padding:2px 8px;">Retry</button>
+          <button class="code-btn" id="mail-retry-status-btn" style="font-size:var(--fs-10, 10px);padding:2px 8px;">Retry</button>
         `;
         const retryBtn = banner.querySelector("#mail-retry-status-btn");
         if (retryBtn) {
@@ -698,7 +698,7 @@ export class MailView {
     } catch (e) {
       if (reset) {
         listContainer.innerHTML = `
-          <div style="padding:16px;color:var(--accent-red);font-size:12px;">
+          <div style="padding:16px;color:var(--accent-red);font-size:var(--fs-12, 12px);">
             Search failed: ${escapeHtml(e.message)}
           </div>
         `;
@@ -715,7 +715,7 @@ export class MailView {
 
     if (!this.results.length) {
       listContainer.innerHTML = `
-        <div style="padding:24px 16px;text-align:center;color:var(--text-muted);font-size:12px;">
+        <div style="padding:24px 16px;text-align:center;color:var(--text-muted);font-size:var(--fs-12, 12px);">
           ${this.currentQuery ? `No emails matching "${escapeHtml(this.currentQuery)}"` : 'No emails found.'}
         </div>
       `;
@@ -1189,7 +1189,7 @@ export class MailView {
       this.renderCardContent(bodyEl, detail, isRaw);
     } catch (e) {
       bodyEl.innerHTML = `
-        <div style="padding:16px;color:var(--accent-red);font-size:12px;">
+        <div style="padding:16px;color:var(--accent-red);font-size:var(--fs-12, 12px);">
           Failed to load message: ${escapeHtml(e.message)}
         </div>
       `;
@@ -1205,12 +1205,12 @@ export class MailView {
             <span>⚠️</span>
             <span>Content currently unavailable from local archive</span>
           </div>
-          <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">
+          <div style="font-size:var(--fs-12, 12px);color:var(--text-secondary);margin-bottom:10px;">
             ${escapeHtml(detail?.error || "The message content could not be located in the local public-inbox mirror.")}
           </div>
           <div style="display:flex;gap:10px;align-items:center;">
-            ${detail?.lore_url ? `<a href="${escapeHtml(detail.lore_url)}" target="_blank" rel="noopener noreferrer" class="lore-link" style="font-size:12px;">View on lore.kernelinfo.org ↗</a>` : ""}
-            <button class="code-btn mail-retry-msg-btn" style="font-size:11px;padding:3px 10px;">Retry</button>
+            ${detail?.lore_url ? `<a href="${escapeHtml(detail.lore_url)}" target="_blank" rel="noopener noreferrer" class="lore-link" style="font-size:var(--fs-12, 12px);">View on lore.kernelinfo.org ↗</a>` : ""}
+            <button class="code-btn mail-retry-msg-btn" style="font-size:var(--fs-11, 11px);padding:3px 10px;">Retry</button>
           </div>
         </div>
       `;
@@ -1273,13 +1273,13 @@ export class MailView {
 
     let extraPatchMetaHtml = "";
     if (detail.base_commit) {
-      extraPatchMetaHtml += `<div style="margin:6px 0;font-size:12px;color:var(--text-muted);"><strong>Base commit:</strong> <code style="color:var(--accent-cyan);">${escapeHtml(detail.base_commit)}</code></div>`;
+      extraPatchMetaHtml += `<div style="margin:6px 0;font-size:var(--fs-12, 12px);color:var(--text-muted);"><strong>Base commit:</strong> <code style="color:var(--accent-cyan);">${escapeHtml(detail.base_commit)}</code></div>`;
     }
     if (detail.commentary) {
-      extraPatchMetaHtml += `<div class="mail-commentary" style="margin:8px 0;padding:8px 12px;border-left:3px solid var(--accent-orange);background:var(--bg-secondary);font-size:12px;border-radius:0 4px 4px 0;"><strong style="color:var(--accent-orange);">Author Notes (under ---):</strong><div style="white-space:pre-wrap;margin-top:4px;">${escapeHtml(detail.commentary)}</div></div>`;
+      extraPatchMetaHtml += `<div class="mail-commentary" style="margin:8px 0;padding:8px 12px;border-left:3px solid var(--accent-orange);background:var(--bg-secondary);font-size:var(--fs-12, 12px);border-radius:0 4px 4px 0;"><strong style="color:var(--accent-orange);">Author Notes (under ---):</strong><div style="white-space:pre-wrap;margin-top:4px;">${escapeHtml(detail.commentary)}</div></div>`;
     }
     if (detail.diffstat) {
-      extraPatchMetaHtml += `<pre class="mail-diffstat" style="font-size:11px;color:var(--text-muted);padding:8px;background:var(--bg-tertiary);border-radius:4px;overflow-x:auto;margin:8px 0;">${escapeHtml(detail.diffstat)}</pre>`;
+      extraPatchMetaHtml += `<pre class="mail-diffstat" style="font-size:var(--fs-11, 11px);color:var(--text-muted);padding:8px;background:var(--bg-tertiary);border-radius:4px;overflow-x:auto;margin:8px 0;">${escapeHtml(detail.diffstat)}</pre>`;
     }
 
     bodyEl.innerHTML = `

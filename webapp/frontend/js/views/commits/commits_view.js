@@ -877,10 +877,10 @@ export class CommitsView {
             <div class="commit-release" id="commit-release-badge"><span class="release-badge pending">First released in …</span></div>
             ${c.lore_url ? `<div><a href="${escapeHtml(c.lore_url)}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-              <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
+              <button class="code-btn active" id="btn-explore-commit" style="font-size:var(--fs-11, 11px);padding:4px 10px;">
                 🔍 Explore Files at this Commit (${escapeHtml(c.commit_hash.slice(0, 8))})
               </button>
-              <button class="code-btn" id="btn-copy-commit-link" style="font-size:11px;padding:4px 10px;" title="Copy versionless deep link to this commit">
+              <button class="code-btn" id="btn-copy-commit-link" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Copy versionless deep link to this commit">
                 🔗 Copy link
               </button>
             </div>
@@ -891,11 +891,11 @@ export class CommitsView {
         ${hasFeature(this.api?.repo, "mail") ? `<div class="m-card" style="margin-bottom:16px;" id="commit-mail-card">
           <div class="m-card-title" style="display:flex;justify-content:space-between;align-items:center;">
             <span>✉ Mailing List Discussions &amp; Patches (${(c.linked_emails || []).length})</span>
-            <button class="code-btn" id="btn-open-ml-search" style="font-size:10px;padding:2px 8px;" title="Search LKML for this commit subject">
+            <button class="code-btn" id="btn-open-ml-search" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Search LKML for this commit subject">
               Search LKML ↗
             </button>
           </div>
-          <div id="commit-linked-emails-body" style="display:flex;flex-direction:column;gap:6px;font-size:11px;">
+          <div id="commit-linked-emails-body" style="display:flex;flex-direction:column;gap:6px;font-size:var(--fs-11, 11px);">
             ${this.renderLinkedEmailsHtml(c)}
           </div>
         </div>` : ""}
@@ -907,7 +907,7 @@ export class CommitsView {
           return `
             <div class="m-card" style="margin-bottom:16px;">
               <div class="m-card-title">Contributors &amp; Signoffs (${contribList.length})</div>
-              <div style="display:flex;flex-direction:column;gap:6px;font-size:11px;">
+              <div style="display:flex;flex-direction:column;gap:6px;font-size:var(--fs-11, 11px);">
                 ${contribList.map((contrib) => {
                   const roles = Array.isArray(contrib.roles) ? contrib.roles : [contrib.role_name || (contrib.role_type === 4 ? "Signed-off-by" : (contrib.role_type === 5 ? "Reviewed-by" : (contrib.role_type === 6 ? "Acked-by" : (contrib.role_type === 8 ? "Reported-by" : "Contributor"))))];
                   const badgesHtml = roles.map((role) => {
@@ -915,7 +915,7 @@ export class CommitsView {
                     if (role.toLowerCase().includes("signed-off")) color = "var(--accent-green)";
                     else if (role.toLowerCase().includes("reported") || role.toLowerCase().includes("suggested")) color = "var(--accent-orange)";
                     else if (role.toLowerCase().includes("co-developed")) color = "var(--diff-rename-fg)";
-                    return `<span style="color:${color};font-weight:bold;font-size:10px;background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">${escapeHtml(role)}</span>`;
+                    return `<span style="color:${color};font-weight:bold;font-size:var(--fs-10, 10px);background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">${escapeHtml(role)}</span>`;
                   }).join(" ");
 
                   const contribId = contrib.email || contrib.name;
@@ -934,7 +934,7 @@ export class CommitsView {
         <!-- Full Commit Message -->
         <div class="m-card">
           <div class="m-card-title">Commit Message</div>
-          <pre style="font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;color:var(--text-primary);line-height:1.4;">${escapeHtml(c.message || c.subject)}</pre>
+          <pre style="font-family:var(--font-mono);font-size:var(--fs-12, 12px);white-space:pre-wrap;color:var(--text-primary);line-height:1.4;">${escapeHtml(c.message || c.subject)}</pre>
         </div>
 
         <!-- Relations: Fixes / Fixed by / Reverts / backports (H1, H2) -->
@@ -947,9 +947,9 @@ export class CommitsView {
         <div class="m-card">
           <div class="m-card-title">
             Modified Files (${c.files?.length || 0}${c.files_truncated ? "+" : ""})
-            ${c.files_source === "git" ? `<span style="color:var(--text-muted);font-weight:normal;font-size:10px;margin-left:6px;" title="A merge records no tree delta of its own, so its change set is resolved from Git against the first parent - the same comparison the diff below shows">resolved from Git${c.is_merge ? " (merge, vs first parent)" : ""}</span>` : ""}
+            ${c.files_source === "git" ? `<span style="color:var(--text-muted);font-weight:normal;font-size:var(--fs-10, 10px);margin-left:6px;" title="A merge records no tree delta of its own, so its change set is resolved from Git against the first parent - the same comparison the diff below shows">resolved from Git${c.is_merge ? " (merge, vs first parent)" : ""}</span>` : ""}
           </div>
-          <div style="display:flex;flex-direction:column;gap:6px;font-family:var(--font-mono);font-size:11px;">
+          <div style="display:flex;flex-direction:column;gap:6px;font-family:var(--font-mono);font-size:var(--fs-11, 11px);">
             ${
               Array.isArray(c.files) && c.files.length > 0
                 ? c.files.map((f) => `
@@ -1073,7 +1073,7 @@ export class CommitsView {
       return `
         <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;color:var(--text-muted);">
           <span>No pre-indexed patch emails found for this commit.</span>
-          <button class="code-btn" id="btn-resolve-mail" style="font-size:10px;padding:2px 8px;" title="Query LKML archive live for this commit">
+          <button class="code-btn" id="btn-resolve-mail" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Query LKML archive live for this commit">
             🔍 Auto-resolve from LKML
           </button>
         </div>
@@ -1099,11 +1099,11 @@ export class CommitsView {
         <div class="commit-linked-mail-row" data-tid="${item.thread_id || 0}" data-mid="${escapeHtml(item.message_id || '')}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg-tertiary);border-radius:4px;cursor:pointer;transition:background 0.15s;" title="Click to open this email and thread in Mailing List tab">
           <div style="display:flex;gap:8px;align-items:center;">
             <span class="mail-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
-            <code style="font-size:11px;color:var(--accent-blue);font-family:var(--font-mono);">${escapeHtml(item.message_id)}</code>
+            <code style="font-size:var(--fs-11, 11px);color:var(--accent-blue);font-family:var(--font-mono);">${escapeHtml(item.message_id)}</code>
           </div>
           <div style="display:flex;gap:6px;align-items:center;">
-            <span style="font-size:10px;color:var(--text-muted);background:rgba(255,255,255,0.05);padding:1px 6px;border-radius:3px;">${escapeHtml(item.match_tier_name || 'Matched')}</span>
-            <span style="font-size:10px;color:var(--text-secondary);">Open ↗</span>
+            <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);background:rgba(255,255,255,0.05);padding:1px 6px;border-radius:3px;">${escapeHtml(item.match_tier_name || 'Matched')}</span>
+            <span style="font-size:var(--fs-10, 10px);color:var(--text-secondary);">Open ↗</span>
           </div>
         </div>
       `;

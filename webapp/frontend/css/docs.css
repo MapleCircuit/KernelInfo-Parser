@@ -37,7 +37,7 @@
  * Sidebar (Alabaster "sphinxsidebar")
  * ------------------------------------------------------------------------- */
 .kdoc-sidebar {
-  flex: 0 0 280px;
+  flex: 0 0 calc(280px * var(--ui-layout-scale, 1));
   overflow-y: auto;
   padding: 22px 20px 32px;
   background: var(--kdoc-sidebar-bg);
@@ -178,7 +178,7 @@
 }
 
 .kdoc-body {
-  max-width: 940px;
+  max-width: calc(940px * var(--ui-layout-scale, 1));
   padding: 30px 48px 40px;
   font-size: var(--fs-16-5, 16.5px);
   line-height: 1.6;
@@ -649,7 +649,7 @@
 }
 
 .kdoc-footer {
-  max-width: 940px;
+  max-width: calc(940px * var(--ui-layout-scale, 1));
   padding: 18px 48px 30px;
   border-top: 1px solid var(--kdoc-rule);
   font-size: var(--fs-13, 13px);
@@ -758,7 +758,7 @@
 
 /* DocBook XML Template (.tmpl) elements */
 .kdoc-body .kdoc-book-title {
-  font-size: 2rem;
+  font-size: 2em;
   font-weight: 700;
   margin: 0 0 16px 0;
   padding-bottom: 10px;
@@ -768,7 +768,7 @@
 
 .kdoc-body .kdoc-meta-authors,
 .kdoc-body .kdoc-copyright {
-  font-size: 0.9rem;
+  font-size: 0.9em;
   color: var(--text-muted, #8b949e);
   margin-bottom: 12px;
 }

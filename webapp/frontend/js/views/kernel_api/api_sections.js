@@ -105,7 +105,7 @@ registerApiSection({
   },
   rowKey: (r) => r.key,
   rowText: (r) => `${r.nr ?? ""} ${r.name} ${r.entry} ${(r.definition?.args || []).map((a) => a.type).join(" ")}${r.nr == null ? ` ${syscallArches(r).join(" ")}` : ""}`,
-  rowHtml: (r) => `<span class="sv-row-sub" style="min-width:34px;text-align:right">${r.nr ?? "—"}</span><span class="sv-row-main">${escapeHtml(r.name)}<span class="sv-row-sub"> (${(r.definition?.args || []).length})</span></span>`
+  rowHtml: (r) => `<span class="sv-row-sub" style="min-width:calc(34px * var(--ui-layout-scale, 1));text-align:right">${r.nr ?? "—"}</span><span class="sv-row-main">${escapeHtml(r.name)}<span class="sv-row-sub"> (${(r.definition?.args || []).length})</span></span>`
     + `${r.abi ? `<span class="sv-tag info">${escapeHtml(r.abi)}</span>` : ""}${r.status !== "defined" ? `<span class="sv-tag ${r.status === "ni_syscall" ? "warn" : "bad"}">${escapeHtml(r.status.replace("_", " "))}</span>` : ""}`,
   chips: [
     { id: "defined", label: "defined", test: (r) => r.status === "defined" },
@@ -213,7 +213,7 @@ registerApiSection({
   },
   rowKey: (r) => r.name,
   rowText: (r) => `${r.system} ${r.name} ${r.class}`,
-  rowHtml: (r) => `<span class="sv-row-sub" style="min-width:90px">${escapeHtml(r.system)}</span><span class="sv-row-main">${escapeHtml(r.name)}</span>${r.kind !== "event" ? `<span class="sv-tag info">${escapeHtml(r.kind)}</span>` : ""}`,
+  rowHtml: (r) => `<span class="sv-row-sub" style="min-width:calc(90px * var(--ui-layout-scale, 1))">${escapeHtml(r.system)}</span><span class="sv-row-main">${escapeHtml(r.name)}</span>${r.kind !== "event" ? `<span class="sv-tag info">${escapeHtml(r.kind)}</span>` : ""}`,
   chips: [{ id: "event", label: "events", test: (r) => r.kind === "event" }, { id: "class", label: "classes", test: (r) => r.kind === "class" }, { id: "raw", label: "raw", test: (r) => r.kind === "raw" }],
   async fetchDetail(ctx, key, row) {
     const sites = row?.kind === "class" ? null : await (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/tracepoints/${encodeURIComponent(key)}`).catch(() => null);

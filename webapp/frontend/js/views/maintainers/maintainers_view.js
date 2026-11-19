@@ -379,7 +379,7 @@ export class MaintainersView {
       detailEl.innerHTML = `
         <div class="m-section-header">
           <div class="m-section-title">${escapeHtml(sec.name)}</div>
-          <div style="font-size:12px;color:var(--accent-cyan);margin-top:4px;">Status: ${escapeHtml(sec.status || "Maintained")}</div>
+          <div style="font-size:var(--fs-12, 12px);color:var(--accent-cyan);margin-top:4px;">Status: ${escapeHtml(sec.status || "Maintained")}</div>
         </div>
 
         <div class="m-grid-2col">
@@ -396,7 +396,7 @@ export class MaintainersView {
                           <span class="person-email">${escapeHtml(m.email || '')}</span>
                         </div>
 
-                        <span style="font-size:10px;padding:1px 5px;background:var(--bg-tertiary);border-radius:3px;">
+                        <span style="font-size:var(--fs-10, 10px);padding:1px 5px;background:var(--bg-tertiary);border-radius:3px;">
                           ${escapeHtml(m.role_name || (m.role_type === 1 ? "Maintainer" : "Reviewer"))}
                         </span>
                       </div>
@@ -409,7 +409,7 @@ export class MaintainersView {
           <!-- Section Metadata -->
           <div class="m-card">
             <div class="m-card-title">Subsystem Metadata</div>
-            <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
+            <div style="display:flex;flex-direction:column;gap:8px;font-size:var(--fs-12, 12px);">
               <div><strong style="color:var(--text-muted);">Mailing List:</strong> ${escapeHtml(sec.mailing_list || "None")}</div>
               <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? `<a href="${escapeHtml(sec.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.web_page)}</a>` : "None"}</div>
               <div><strong style="color:var(--text-muted);">SCM Tree:</strong> ${escapeHtml(sec.scm_tree || "None")}</div>
@@ -424,7 +424,7 @@ export class MaintainersView {
         <!-- Files & Match Rules -->
         <div class="m-card">
           <div class="m-card-title">File Matching Rules (F: / X: / N: / K: / D:)</div>
-          <div style="display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:11px;">
+          <div style="display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:var(--fs-11, 11px);">
             ${
               Array.isArray(sec.patterns) && sec.patterns.length > 0
                 ? sec.patterns.map((p) => `
@@ -441,7 +441,7 @@ export class MaintainersView {
         <!-- Matched Repository Files Roster -->
         <div class="m-card" style="margin-top:16px;">
           <div class="m-card-title">Matched Repository Files (${Array.isArray(sec.files) ? sec.files.length : 0})</div>
-          <div style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:11px;">
+          <div style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:var(--fs-11, 11px);">
             ${
               Array.isArray(sec.files) && sec.files.length > 0
                 ? sec.files.map((f) => `
@@ -552,17 +552,17 @@ export class MaintainersView {
       detailEl.innerHTML = `
         <div class="m-section-header">
           <div class="m-section-title">${escapeHtml(p.name)}</div>
-          <div style="font-size:12px;color:var(--text-muted);">${escapeHtml(p.email || "")}</div>
+          <div style="font-size:var(--fs-12, 12px);color:var(--text-muted);">${escapeHtml(p.email || "")}</div>
         </div>
 
         <div class="m-grid-2col">
           <!-- Biographical / CREDITS -->
           <div class="m-card">
             <div class="m-card-title">CREDITS Record</div>
-            <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
+            <div style="display:flex;flex-direction:column;gap:8px;font-size:var(--fs-12, 12px);">
               <div><strong style="color:var(--text-muted);">Description:</strong> ${escapeHtml(p.credits?.description || "Not in CREDITS")}</div>
               ${p.credits?.web_page ? `<div><strong style="color:var(--text-muted);">Web Page:</strong> <a href="${escapeHtml(p.credits.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(p.credits.web_page)}</a></div>` : ""}
-              ${p.credits?.pgp_key ? `<div><strong style="color:var(--text-muted);">PGP Key:</strong> <code style="font-size:11px;color:var(--accent-orange);">${escapeHtml(p.credits.pgp_key)}</code></div>` : ""}
+              ${p.credits?.pgp_key ? `<div><strong style="color:var(--text-muted);">PGP Key:</strong> <code style="font-size:var(--fs-11, 11px);color:var(--accent-orange);">${escapeHtml(p.credits.pgp_key)}</code></div>` : ""}
               <div><strong style="color:var(--text-muted);">Snail Mail:</strong> ${p.credits?.snail_mail ? `<pre style="font-family:inherit;margin-top:2px;white-space:pre-wrap;">${escapeHtml(p.credits.snail_mail)}</pre>` : "None"}</div>
             </div>
           </div>
@@ -570,7 +570,7 @@ export class MaintainersView {
           <!-- Git Contribution Stats -->
           <div class="m-card">
             <div class="m-card-title">Git Contribution Stats</div>
-            <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
+            <div style="display:flex;flex-direction:column;gap:6px;font-size:var(--fs-12, 12px);">
               <div><strong style="color:var(--text-muted);">Authored Commits:</strong> ${stats.authored_commits || 0}</div>
               <div><strong style="color:var(--text-muted);">Signed-off Commits:</strong> ${stats.signed_off_commits || 0}</div>
               <div><strong style="color:var(--text-muted);">Reviewed Commits:</strong> ${stats.reviewed_commits || 0}</div>
@@ -581,7 +581,7 @@ export class MaintainersView {
         <!-- Maintained Subsystems -->
         <div class="m-card" style="margin-top:16px;">
           <div class="m-card-title">Maintained Subsystems (${sections.length})</div>
-          <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
+          <div style="display:flex;flex-direction:column;gap:6px;font-size:var(--fs-12, 12px);">
             ${
               sections.length > 0
                 ? sections.map((s) => `
@@ -596,7 +596,7 @@ export class MaintainersView {
         </div>
 
         <div style="margin-top:16px;display:flex;gap:8px;">
-          <button id="btn-view-person-commits" class="code-btn active" style="font-size:12px;padding:6px 12px;cursor:pointer;">
+          <button id="btn-view-person-commits" class="code-btn active" style="font-size:var(--fs-12, 12px);padding:6px 12px;cursor:pointer;">
             View Commits by ${escapeHtml(p.name || p.email)}
           </button>
         </div>
@@ -652,7 +652,7 @@ export class MaintainersView {
 
     detailEl.innerHTML = `
       <div class="patch-analyzer-box">
-        <div style="font-weight:600;font-size:14px;color:var(--accent-orange);">Patch Reviewer (get_maintainer.pl Simulator)</div>
+        <div style="font-weight:600;font-size:var(--fs-14, 14px);color:var(--accent-orange);">Patch Reviewer (get_maintainer.pl Simulator)</div>
         <textarea class="patch-input-textarea" id="patch-text-input" placeholder="Paste git format-patch or unified diff here..."></textarea>
         <button class="code-btn active" id="btn-run-match" style="align-self:flex-start;">Analyze Recipients</button>
         <div id="patch-match-results" style="margin-top:12px;"></div>

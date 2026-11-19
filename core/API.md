@@ -18,31 +18,31 @@ agents.
   - Relational Table Families (`core/DBLayout.py`) [L531-L600]
   - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L601-L684]
   - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L685-L711]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L712-L892]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L712-L895]
   - 5.1. Data Sanitization Helpers [L714-L720]
   - 5.2. `Table` Class Interface [L721-L749]
   - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L750-L848]
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L849-L871]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L872-L892]
-- 6. End-to-End Inter-Module Execution Lifecycle [L893-L1040]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1041-L1419]
-  - 7.1. Unified Configuration Hierarchy [L1043-L1153]
-  - 7.1.1. Repository Auto-Detection & Selection [L1154-L1219]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1220-L1270]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1271-L1318]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1319-L1419]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1420-L1674]
-  - 8.1. High-Level Architecture [L1422-L1465]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1466-L1491]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1492-L1674]
-- 9. CVE List Ingestion (`parser/cve/`) [L1675-L1730]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1731-L1798]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1799-L1929]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1807-L1838]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1839-L1879]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1880-L1912]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1913-L1929]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1930-L1975]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L872-L895]
+- 6. End-to-End Inter-Module Execution Lifecycle [L896-L1043]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1044-L1424]
+  - 7.1. Unified Configuration Hierarchy [L1046-L1156]
+  - 7.1.1. Repository Auto-Detection & Selection [L1157-L1222]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1223-L1273]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1274-L1321]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1322-L1424]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1425-L1679]
+  - 8.1. High-Level Architecture [L1427-L1470]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1471-L1496]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1497-L1679]
+- 9. CVE List Ingestion (`parser/cve/`) [L1680-L1735]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1736-L1803]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1804-L1934]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1812-L1843]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1844-L1884]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1885-L1917]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1918-L1934]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1935-L1980]
 <!-- toc:end -->
 
 ---
@@ -886,7 +886,10 @@ Comprehensive unit testing and behavioral verification of `TableHandling.py` is 
   `tests.require_indexed_ref`) skip with one line. Without the flag they skip when the database does not answer.
 - `--isolate`, `--timeout S` (default 300): every module in its own subprocess, sequentially (database tunnel
   port 3308); a module exceeding the timeout is killed and reported as an error. `--summary`, `--changed`,
-  `--modules` imply isolation; plain `-u` stays in-process.
+  `--modules` imply isolation; plain `-u` stays in-process. Workers run with stdin closed and the repository first
+  on `PYTHONPATH` (`PYTHONSAFEPATH`, `PYTHONINSPECT`, `PYTHONSTARTUP` dropped), so inherited interpreter state
+  cannot swap out `unit_test.runner`. A worker that exits without writing its result is an error that names the
+  cause (`worker never started`, `worker exited 0 without reporting`, or `module crashed`), along with the last line of its output.
 
 ---
 
@@ -1406,8 +1409,10 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Per-File Checkpoint Check (`pipeline/commits.py`)**:
   - `processing_git_commits()` reads stored `m_bridge_checkpoint.fnid` values for `checkpoint_cid`
     (`gp.VID`, falling back to `head_commit_id`) and checks every file in `gp.file_blob_ids` (or
-    `gp.Change_List`); any file missing from both stored rows and `G.TE` staging is staged into
-    `m_bridge_checkpoint` and logged as a warning.
+    `gp.Change_List`) that is part of the version's tree (`gp.file_blob_hashes`, when known); any file missing
+    from both stored rows and `G.TE` staging is staged into `m_bridge_checkpoint` and logged as a warning.
+    Deleted files never enter `gp.file_blob_ids` (`extract_tags_and_evacuate_cs()` registers no blob for a `D`
+    ChangeSet), so they stay out of the version's checkpoint.
 - **Multiprocessing Socket Refresh**:
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
     resets in-memory caches and destroys preloaded table state.

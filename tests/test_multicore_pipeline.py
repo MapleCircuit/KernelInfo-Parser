@@ -184,6 +184,21 @@ class TestEvacuationBookkeeping(unittest.TestCase):
             main.gp.file_pre_extracted_tags.clear()
             main.gp.completed_paths.discard("Documentation/foo.txt")
 
+    def test_deleted_changeset_registers_no_blob(self) -> None:
+        """A deleted file's previous blob must not enter file_blob_ids, or the checkpoint check re-adds the path."""
+        main.gp.file_blob_ids.clear()
+        cs = ChangeSet("D\tdrivers/net/3c505dta.h")
+        cs.gp = None
+        cs.blob_id = 7
+        cs.cs_processed = True
+        try:
+            with mock.patch("pipeline.changesets.get_fid_for_path", return_value=7):
+                pipeline.changesets.extract_tags_and_evacuate_cs(cs)
+            self.assertNotIn("drivers/net/3c505dta.h", main.gp.file_blob_ids)
+        finally:
+            main.gp.file_blob_ids.clear()
+            main.gp.completed_paths.discard("drivers/net/3c505dta.h")
+
 
 class TestSharedSymbols(unittest.TestCase):
     def _chain(self, *file_maps: dict) -> SharedSymbolChain:

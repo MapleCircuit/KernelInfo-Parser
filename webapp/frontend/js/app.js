@@ -12,6 +12,7 @@ import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
 import { branchPicker, branchSourceOf } from "./components/branch_picker.js";
 import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
+import { headerLayout } from "./components/header_layout.js";
 import { shortcuts } from "./utils/shortcuts.js";
 import { showShortcutsOverlay } from "./components/shortcuts_overlay.js";
 import { showPatchModal } from "./components/patch_modal.js";
@@ -58,6 +59,7 @@ import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
 import "./routes.js";
 import { exportDocument, importUserDataText } from "./utils/user_records.js";
 import { THEMES, applyTheme, savedTheme } from "./utils/theme.js";
+import { computeUiScale, getUiFontScale, getUiLayoutScale, scaleUiPx } from "./utils/ui_scale.js";
 
 /** Settings → Export User Data (S06): every user record as a `kip-user` JSON document. */
 async function exportUserData() {
@@ -257,6 +259,14 @@ class KernelIdeApp {
         this.tabsComponent.render();
       }
     });
+
+    // Measurement-driven header collapse and reduced version selector (§5.13): viewport, UI Scale and
+    // label changes all re-evaluate the tier (ResizeObserver / MutationObserver inside, events here)
+    headerLayout.init(document);
+    for (const ev of ["repo:synced", "version:selected", "version:synced", "version:changed", "branch:selected",
+      "tabs:changed", "pane:activated", "session:adopted", "projects:updated"]) {
+      state.subscribe(ev, () => headerLayout.schedule());
+    }
 
     // Synchronize top selectors when a tab with a different version is selected
     state.subscribe("version:synced", async () => {
@@ -474,10 +484,10 @@ class KernelIdeApp {
       menu.className = "session-dropdown-menu";
       menu.innerHTML = `
         <div class="session-dropdown-header">
-          <div style="font-weight: 600; color: var(--text-primary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+          <div style="font-weight: 600; color: var(--text-primary); font-size: var(--fs-12, 12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
             ${escapeHtml(state.currentSessionName || "Current Session")}
           </div>
-          <div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); user-select: all; word-break: break-all;" title="Session ID: ${escapeHtml(state.currentSessionId || '')}">
+          <div style="font-size: var(--fs-10, 10px); color: var(--text-muted); font-family: var(--font-mono); user-select: all; word-break: break-all;" title="Session ID: ${escapeHtml(state.currentSessionId || '')}">
             ID: <span style="color: var(--accent-blue);">${escapeHtml(state.currentSessionId || "none")}</span>
           </div>
         </div>
@@ -682,7 +692,7 @@ class KernelIdeApp {
         <div class="settings-popover-title">
           <span>⚙️ Settings &amp; Local Storage</span>
         </div>
-        <button id="close-settings-btn" style="background:none;border:none;color:var(--text-muted);font-size:16px;cursor:pointer;">&times;</button>
+        <button id="close-settings-btn" style="background:none;border:none;color:var(--text-muted);font-size:var(--fs-16, 16px);cursor:pointer;">&times;</button>
       </div>
 
       <div class="settings-popover-body">
@@ -693,33 +703,33 @@ class KernelIdeApp {
             <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${connColor};"></span>
-                <span style="font-weight:600;color:var(--text-primary);font-size:11px;">${connLabel}</span>
+                <span style="font-weight:600;color:var(--text-primary);font-size:var(--fs-11, 11px);">${connLabel}</span>
               </div>
-              <span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${connDetail}</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);font-family:var(--font-mono);">${connDetail}</span>
             </div>
 
             <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);" title="Database Instance: ${cachedHash}">
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent-blue);"></span>
-                <span style="font-size:11px;color:var(--text-secondary);">DB Instance:</span>
-                <code style="font-family:var(--font-mono);font-size:11px;color:var(--accent-blue);">${shortHash}</code>
+                <span style="font-size:var(--fs-11, 11px);color:var(--text-secondary);">DB Instance:</span>
+                <code style="font-family:var(--font-mono);font-size:var(--fs-11, 11px);color:var(--accent-blue);">${shortHash}</code>
               </div>
-              <span style="font-size:10px;color:var(--accent-green);font-weight:500;">● Synced</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--accent-green);font-weight:500;">● Synced</span>
             </div>
 
             <button class="settings-btn" id="btn-parser-status" title="Open the parser status page (G11)">
-              <span id="settings-parser-line" style="font-size:11px;">⛏ Parser: …</span>
-              <span style="font-size:10px;color:var(--text-muted);">status page &rarr;</span>
+              <span id="settings-parser-line" style="font-size:var(--fs-11, 11px);">⛏ Parser: …</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">status page &rarr;</span>
             </button>
 
             <button class="settings-btn" id="btn-keyboard-shortcuts" title="List every keyboard shortcut and rebind them">
               <span>⌨ Keyboard Shortcuts</span>
-              <span style="font-size:10px;color:var(--text-muted);">${escapeHtml(shortcuts.label("help.shortcuts") || "?")}</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">${escapeHtml(shortcuts.label("help.shortcuts") || "?")}</span>
             </button>
 
             <button class="settings-btn" id="btn-check-updates" ${isOnline ? "" : "disabled"} title="Sync with the server now (frontend build, database, parsed versions, Git refs, repositories) and restart the page when an update is found">
               <span>🔄 Check for Updates</span>
-              <span id="check-updates-status" style="font-size:10px;color:var(--text-muted);">${isOnline ? "&rarr;" : linkDown ? "Offline" : "Unreachable"}</span>
+              <span id="check-updates-status" style="font-size:var(--fs-10, 10px);color:var(--text-muted);">${isOnline ? "&rarr;" : linkDown ? "Offline" : "Unreachable"}</span>
             </button>
           </div>
         </div>
@@ -736,13 +746,13 @@ class KernelIdeApp {
         <div>
           <div class="settings-section-title">Hover Cards</div>
           <div style="display:flex;flex-direction:column;gap:8px;background:var(--bg-primary);padding:10px 12px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
-            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-secondary);cursor:pointer;">
+            <label style="display:flex;align-items:center;gap:6px;font-size:var(--fs-11, 11px);color:var(--text-secondary);cursor:pointer;">
               <input type="checkbox" id="setting-hover-enabled" ${localStorage.getItem("kip-hover-cards") === "0" ? "" : "checked"} /> Show a card when the pointer rests on a symbol
             </label>
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                <label for="setting-hover-delay" style="font-size:11px;font-weight:600;color:var(--text-secondary);">Delay</label>
-                <span id="setting-hover-delay-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);">${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)} ms</span>
+                <label for="setting-hover-delay" style="font-size:var(--fs-11, 11px);font-weight:600;color:var(--text-secondary);">Delay</label>
+                <span id="setting-hover-delay-val" style="font-size:var(--fs-11, 11px);font-family:var(--font-mono);color:var(--accent-blue);">${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)} ms</span>
               </div>
               <input type="range" id="setting-hover-delay" min="300" max="1000" step="50" value="${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)}" style="width:100%;cursor:pointer;" />
             </div>
@@ -756,11 +766,11 @@ class KernelIdeApp {
             <!-- Code View Font Size -->
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                <label for="setting-code-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">Code View Font Size</label>
-                <span id="setting-code-font-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curCodeFontSize}px</span>
+                <label for="setting-code-font-slider" style="font-size:var(--fs-11, 11px);font-weight:600;color:var(--text-secondary);">Code View Font Size</label>
+                <span id="setting-code-font-val" style="font-size:var(--fs-11, 11px);font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curCodeFontSize}px</span>
               </div>
               <input type="range" id="setting-code-font-slider" min="10" max="26" step="1" value="${curCodeFontSize}" style="width:100%;cursor:pointer;" />
-              <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;">
+              <div style="display:flex;justify-content:space-between;font-size:var(--fs-9, 9px);color:var(--text-muted);margin-top:2px;">
                 <span>10px</span>
                 <span>Default: 12px</span>
                 <span>26px</span>
@@ -770,22 +780,22 @@ class KernelIdeApp {
             <!-- UI Relative Scale -->
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                <label for="setting-ui-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">UI Scale</label>
-                <span id="setting-ui-font-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curUiFontScale}%</span>
+                <label for="setting-ui-font-slider" style="font-size:var(--fs-11, 11px);font-weight:600;color:var(--text-secondary);">UI Scale</label>
+                <span id="setting-ui-font-val" style="font-size:var(--fs-11, 11px);font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curUiFontScale}%</span>
               </div>
               <input type="range" id="setting-ui-font-slider" min="80" max="160" step="5" value="${curUiFontScale}" style="width:100%;cursor:pointer;" />
-              <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;">
+              <div style="display:flex;justify-content:space-between;font-size:var(--fs-9, 9px);color:var(--text-muted);margin-top:2px;">
                 <span>80%</span>
                 <span>Default: 100%</span>
                 <span>160%</span>
               </div>
             </div>
 
-            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-secondary);cursor:pointer;" title="Pin the first line of the function or struct being read at the top of the code view (G03)">
+            <label style="display:flex;align-items:center;gap:6px;font-size:var(--fs-11, 11px);color:var(--text-secondary);cursor:pointer;" title="Pin the first line of the function or struct being read at the top of the code view (G03)">
               <input type="checkbox" id="setting-sticky-scroll" ${stickyEnabled() ? "checked" : ""} /> Sticky scroll (pin the enclosing definition)
             </label>
 
-            <button class="settings-reset-font-btn" id="btn-reset-fonts" style="align-self:flex-start;padding:3px 8px;font-size:10px;cursor:pointer;border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:var(--radius-sm);transition:var(--transition-fast);">Reset to Defaults</button>
+            <button class="settings-reset-font-btn" id="btn-reset-fonts" style="align-self:flex-start;padding:3px 8px;font-size:var(--fs-10, 10px);cursor:pointer;border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:var(--radius-sm);transition:var(--transition-fast);">Reset to Defaults</button>
           </div>
         </div>
 
@@ -793,7 +803,7 @@ class KernelIdeApp {
         <div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
             <span class="settings-section-title" style="margin-bottom:0;">Cached Data Stores</span>
-            <span style="font-size:10px;color:var(--text-muted);">${totalCachedItems} entries ${usedMB ? `(${usedMB} MB)` : ''}</span>
+            <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">${totalCachedItems} entries ${usedMB ? `(${usedMB} MB)` : ''}</span>
           </div>
           <div class="settings-metric-grid" style="grid-template-columns: repeat(3, 1fr);">
             <div class="settings-metric-card">
@@ -847,23 +857,23 @@ class KernelIdeApp {
           <div class="settings-actions">
             <button class="settings-btn" id="btn-clear-cache">
               <span>🧹 Clear All Offline Cache (IndexedDB)</span>
-              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-export-user" title="Download your bookmarks, notes, tours and watches as JSON">
               <span id="settings-export-user-label">⬇ Export User Data (${userCount})</span>
-              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-import-user" title="Add bookmarks, notes, tours and watches from an export (existing ones are kept)">
               <span>⬆ Import User Data…</span>
-              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-reset-tabs">
               <span>📑 Reset Tabs &amp; Workspace State (${tabsCount} open)</span>
-              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+              <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn danger" id="btn-full-reset">
               <span>⚠️ Full Local Reset &amp; Reload</span>
-              <span style="font-size:10px;">&rarr;</span>
+              <span style="font-size:var(--fs-10, 10px);">&rarr;</span>
             </button>
           </div>
         </div>
@@ -1658,6 +1668,7 @@ class KernelIdeApp {
     }
     const newTabBtn = document.getElementById("version-newtab-btn");
     if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
+    headerLayout.schedule();
   }
 
   /**
@@ -2180,25 +2191,20 @@ export function applyTypographySettings(codeFontSize = null, uiFontScale = null)
   }
   cfs = Math.max(10, Math.min(26, Number.isFinite(cfs) ? cfs : 12));
 
-  let ufs = uiFontScale;
-  if (ufs === null) {
-    const raw = localStorage.getItem("kip-ui-font-scale");
-    ufs = raw ? parseInt(raw, 10) : 100;
-  }
-  ufs = Math.max(80, Math.min(160, Number.isFinite(ufs) ? ufs : 100));
+  const { uiFontScale: ufs, fontScale, layoutScale } = computeUiScale(uiFontScale);
 
   localStorage.setItem("kip-code-font-size", String(cfs));
   localStorage.setItem("kip-ui-font-scale", String(ufs));
 
   const rowHeight = Math.max(16, Math.round(cfs * 1.667));
-  const fontScale = ufs / 100;
-  const layoutScale = 1 + (fontScale - 1) * 0.5;
   document.documentElement.style.setProperty("--code-font-size", `${cfs}px`);
   document.documentElement.style.setProperty("--code-row-height", `${rowHeight}px`);
   document.documentElement.style.setProperty("--ui-font-scale", fontScale.toString());
   document.documentElement.style.setProperty("--ui-layout-scale", layoutScale.toString());
 
   state.emit("codeview:font-changed", { fontSize: cfs, rowHeight });
+  state.emit("ui:scale-changed", { uiFontScale: ufs, fontScale, layoutScale });
+  return { codeFontSize: cfs, rowHeight, uiFontScale: ufs, fontScale, layoutScale };
 }
 
 function escapeAttr(str) {
@@ -2218,7 +2224,7 @@ function describeUpdates(r) {
   return parts.join(", ");
 }
 
-export { DEFAULT_TAG_VIEWS, KernelIdeApp };
+export { DEFAULT_TAG_VIEWS, KernelIdeApp, getUiFontScale, getUiLayoutScale, scaleUiPx };
 
 // Bootstrap on DOM ready (boot.js imports this module, possibly after DOMContentLoaded fired)
 function startApp() {

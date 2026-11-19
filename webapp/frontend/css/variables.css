@@ -89,6 +89,7 @@
   --fs-18: calc(18px * var(--ui-font-scale, 1));
   --fs-20: calc(20px * var(--ui-font-scale, 1));
   --fs-24: calc(24px * var(--ui-font-scale, 1));
+  --fs-28: calc(28px * var(--ui-font-scale, 1));
 
   --code-font-size: 12px;
   --code-row-height: 20px;
@@ -379,6 +380,7 @@ body {
 [style*="font-size: 18px"], [style*="font-size:18px"] { font-size: var(--fs-18, 18px) !important; }
 [style*="font-size: 20px"], [style*="font-size:20px"] { font-size: var(--fs-20, 20px) !important; }
 [style*="font-size: 24px"], [style*="font-size:24px"] { font-size: var(--fs-24, 24px) !important; }
+[style*="font-size: 28px"], [style*="font-size:28px"] { font-size: var(--fs-28, 28px) !important; }
 
 /* Keep code viewer tokens respected */
 .code-viewer-container .code-row,

@@ -301,6 +301,10 @@ class MariaDBConnection:
         Outputs:
             None.
         """
+        self._drop_connection()
+
+    def _drop_connection(self) -> None:
+        """Close cursor and connection handles without ending the engine's lifecycle (drop-and-retry paths)."""
         if getattr(self, "_cur", None):
             try:
                 self._cur.close()
@@ -415,14 +419,14 @@ class MariaDBConnection:
                 self._last_ok = time.monotonic()
                 return
             except Exception:
-                self.close()
+                self._drop_connection()
         if in_txn:
             raise ConnectionLostError("Database connection lost inside a transaction")
         self._reconnect()
 
     def _reconnect(self) -> None:
         """Replace the connection with a new one (new cursor, `_init_session()`), up to 3 attempts."""
-        self.close()
+        self._drop_connection()
         for attempt in range(3):
             logger.warning("No SQL connection. Reconnection attempt %d/3...", attempt + 1)
             try:
@@ -517,7 +521,7 @@ class MariaDBConnection:
             try:
                 self.cnx.autocommit = True
             except Exception:
-                self.close()  # a connection that cannot leave the transaction is not reused
+                self._drop_connection()  # a connection that cannot leave the transaction is not reused
 
     def _require_writable(self) -> None:
         """Raise `ReadOnlyViolation` on a driver that backs a read-only session."""
@@ -713,7 +717,7 @@ class MariaDBConnection:
                 except Exception:
                     pass
                 if _is_connection_lost(e):
-                    self.close()
+                    self._drop_connection()
                 logger.warning(f"[DB] reserve_id_block attempt {attempt + 1}/3 failed for {table.table_name}: {e}")
                 if attempt == 2:
                     raise

@@ -117,7 +117,9 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
                     file_tags.append((tag_id, fid, line_s, line_e))
         cs_obj.pre_extracted_tags = file_tags
 
-    blob_id = getattr(cs_obj, "blob_id", 0) or fid or 0
+    # A deleted file has no blob in this version: `fid` is its previous version's blob (Old_VID fallback), and
+    # registering it would make the checkpoint check stage the deleted path into this version's tree
+    blob_id = 0 if cs_obj.file_operation == "D" else (getattr(cs_obj, "blob_id", 0) or fid or 0)
     if blob_id:
         cs_obj.blob_id = blob_id
         gp_ref.file_blob_ids[c_path] = blob_id

@@ -232,7 +232,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 170px;
+  max-width: calc(170px * var(--ui-layout-scale, 1));
 }
 
 .mail-result-date {
@@ -406,7 +406,7 @@
   cursor: pointer;
   padding: 0 2px;
   flex-shrink: 0;
-  width: 14px;
+  width: calc(14px * var(--ui-layout-scale, 1));
   text-align: center;
 }
 
@@ -455,7 +455,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 150px;
+  max-width: calc(150px * var(--ui-layout-scale, 1));
 }
 
 .mail-tree-replies {
@@ -833,14 +833,14 @@
   min-width: 0;
 }
 /* Merged commits of a thread (P2, webapp/API.md §5.22) */
-.mail-merged-badge { padding: 0 8px; border-radius: 10px; border: 1px solid var(--border-color); color: var(--text-muted); font-size: 11px; }
+.mail-merged-badge { padding: 0 8px; border-radius: 10px; border: 1px solid var(--border-color); color: var(--text-muted); font-size: var(--fs-11, 11px); }
 .mail-merged-badge.merged { border-color: var(--accent-green); color: var(--accent-green); }
 .mail-merged-badge.partial { border-color: var(--accent-yellow); color: var(--accent-yellow); }
-.mail-merged-list { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.mail-merged-list { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-12, 12px); }
 .mail-merged-row a { color: var(--accent-blue); text-decoration: none; }
 .mail-merged-row a:hover { text-decoration: underline; }
-.mail-merged-rel { color: var(--accent-green); font-family: var(--font-mono, monospace); font-size: 11px; }
-.mail-merged-as { font-size: 11px; color: var(--accent-green); margin-right: 8px; text-decoration: none; font-family: var(--font-mono, monospace); }
+.mail-merged-rel { color: var(--accent-green); font-family: var(--font-mono, monospace); font-size: var(--fs-11, 11px); }
+.mail-merged-as { font-size: var(--fs-11, 11px); color: var(--accent-green); margin-right: 8px; text-decoration: none; font-family: var(--font-mono, monospace); }
 
 /* Try a patch on a revision (P1, §5.22) */
 .ptry-patch { margin-bottom: 12px; }

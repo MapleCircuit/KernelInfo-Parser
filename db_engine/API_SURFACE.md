@@ -16,6 +16,8 @@ def get_db_engine(name: str | None=None) -> type[BaseDBEngine]  # Retrieve datab
 ## db_engine/base.py
 
 ```python
+def note_engine_started(name: str) -> int  # Count one open handle of engine `name` in this process; the first one logs `DB_engine <...
+def note_engine_closed(name: str, pid: int) -> None  # Release a handle counted by `note_engine_started`; the last one logs `DB_engine <name>...
 CAP_PERSISTENT
 CAP_SERVER_TUNING
 CAP_BACKGROUND_COMMIT

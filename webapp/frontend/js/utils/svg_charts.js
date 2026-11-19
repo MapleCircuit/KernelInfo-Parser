@@ -2,6 +2,8 @@
  * svg_charts.js - Hand-built SVG charts drawn with the design tokens (no chart library; webapp/API.md
  * §5.30). Strings in, SVG strings out (webapp/frontend/tests/svg_charts.test.mjs).
  */
+import { getUiFontScale, getUiLayoutScale } from "./ui_scale.js";
+
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -18,8 +20,11 @@ export function barChartSvg(points, { width = 560, height = 140, x0 = null, x1 =
   const hi = x1 ?? Math.max(...xs);
   const span = Math.max(1, hi - lo + 1);
   const max = Math.max(1, ...points.map((p) => p.value));
-  const padL = 34;
-  const padB = 18;
+  const ratio = getUiFontScale() / getUiLayoutScale();
+  const fs = +(10 * ratio).toFixed(1);
+  const padL = Math.round(34 * ratio);
+  const padB = Math.round(18 * ratio);
+  const topY = Math.round(14 * ratio);
   const w = width - padL - 6;
   const h = height - padB - 6;
   const bw = Math.max(1, w / span - 1);
@@ -38,13 +43,13 @@ export function barChartSvg(points, { width = 560, height = 140, x0 = null, x1 =
     const rightSide = x > padL + w * 0.78;
     const lx = rightSide ? x - 3 : x + 3;
     const anchor = rightSide ? ' text-anchor="end"' : "";
-    const ly = m.y ?? 14;
-    return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="4" y2="${6 + h}" stroke="${color}"${dash}${sw}/><text x="${lx.toFixed(1)}" y="${ly}" fill="${color}" font-size="10"${anchor}>${esc(m.label)}</text>`;
+    const ly = m.y ?? topY;
+    return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="4" y2="${6 + h}" stroke="${color}"${dash}${sw}/><text x="${lx.toFixed(1)}" y="${ly}" fill="${color}" font-size="${fs}"${anchor}>${esc(m.label)}</text>`;
   }).join("");
   const axis = `<line x1="${padL}" x2="${padL + w}" y1="${6 + h}" y2="${6 + h}" stroke="var(--border-color)"/>`
-    + `<text x="${padL - 4}" y="14" fill="var(--text-muted)" font-size="10" text-anchor="end">${max}</text>`
-    + `<text x="${padL}" y="${height - 4}" fill="var(--text-muted)" font-size="10">${esc(lo)}</text>`
-    + `<text x="${padL + w}" y="${height - 4}" fill="var(--text-muted)" font-size="10" text-anchor="end">${esc(hi)}</text>`;
+    + `<text x="${padL - 4}" y="${topY}" fill="var(--text-muted)" font-size="${fs}" text-anchor="end">${max}</text>`
+    + `<text x="${padL}" y="${height - 4}" fill="var(--text-muted)" font-size="${fs}">${esc(lo)}</text>`
+    + `<text x="${padL + w}" y="${height - 4}" fill="var(--text-muted)" font-size="${fs}" text-anchor="end">${esc(hi)}</text>`;
   return `<svg class="sv-chart" viewBox="0 0 ${width} ${height}" width="100%" role="img" preserveAspectRatio="none">${axis}${bars}${marks}</svg>`;
 }
 

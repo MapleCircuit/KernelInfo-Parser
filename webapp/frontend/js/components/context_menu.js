@@ -1358,35 +1358,35 @@ class ContextMenu {
     box.innerHTML = `
       <div style="padding:14px 16px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:flex-start;">
         <div>
-          <div style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:8px;">
+          <div style="font-size:var(--fs-11, 11px);color:var(--text-muted);display:flex;align-items:center;gap:8px;">
             <span>Line ${line || 1} modified in:</span>
             <code style="background:var(--bg-tertiary);padding:2px 6px;border-radius:4px;color:var(--accent-blue);font-family:var(--font-mono);">${shortHash}</code>
           </div>
-          <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-top:6px;line-height:1.3;">
+          <div style="font-size:var(--fs-15, 15px);font-weight:600;color:var(--text-primary);margin-top:6px;line-height:1.3;">
             ${this.escapeHtml(subject)}
           </div>
         </div>
-        <button id="close-commit-btn" style="color:var(--text-muted);font-size:18px;background:none;border:none;cursor:pointer;padding:0 4px;">&times;</button>
+        <button id="close-commit-btn" style="color:var(--text-muted);font-size:var(--fs-18, 18px);background:none;border:none;cursor:pointer;padding:0 4px;">&times;</button>
       </div>
 
-      <div style="padding:10px 16px;background:var(--bg-primary);border-bottom:1px solid var(--border-color);display:flex;gap:20px;font-size:11px;color:var(--text-secondary);">
+      <div style="padding:10px 16px;background:var(--bg-primary);border-bottom:1px solid var(--border-color);display:flex;gap:20px;font-size:var(--fs-11, 11px);color:var(--text-secondary);">
         <div><strong style="color:var(--text-primary);">Author:</strong> <span class="commit-popover-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${this.escapeHtml(author)}</span></div>
         <div><strong style="color:var(--text-primary);">Date:</strong> ${this.escapeHtml(dateStr)}</div>
       </div>
 
       ${body ? `
-        <div style="max-height:140px;overflow-y:auto;padding:12px 16px;font-size:12px;line-height:1.5;color:var(--text-secondary);white-space:pre-wrap;border-bottom:1px solid var(--border-color);background:var(--bg-secondary);">
+        <div style="max-height:140px;overflow-y:auto;padding:12px 16px;font-size:var(--fs-12, 12px);line-height:1.5;color:var(--text-secondary);white-space:pre-wrap;border-bottom:1px solid var(--border-color);background:var(--bg-secondary);">
           ${this.escapeHtml(body)}
         </div>
       ` : ""}
 
       <div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:center;background:var(--bg-secondary);">
-        <div style="font-size:11px;color:var(--text-muted);">
+        <div style="font-size:var(--fs-11, 11px);color:var(--text-muted);">
           ${files.length > 0 ? `${files.length} touched files` : `${this.escapeHtml(filePath || '')}`}
         </div>
         <div style="display:flex;gap:8px;">
-          <button id="copy-hash-btn" class="code-btn" style="padding:4px 10px;font-size:11px;">Copy Hash</button>
-          <button id="open-commit-tab-btn" class="code-btn active" style="padding:4px 12px;font-size:11px;">Open Full Diff in Commits Tab &rarr;</button>
+          <button id="copy-hash-btn" class="code-btn" style="padding:4px 10px;font-size:var(--fs-11, 11px);">Copy Hash</button>
+          <button id="open-commit-tab-btn" class="code-btn active" style="padding:4px 12px;font-size:var(--fs-11, 11px);">Open Full Diff in Commits Tab &rarr;</button>
         </div>
       </div>
     `;
@@ -1445,7 +1445,7 @@ class ContextMenu {
 
     const box = document.createElement("div");
     box.className = "palette-box";
-    box.style.width = "540px";
+    box.style.width = "calc(540px * var(--ui-layout-scale, 1))";
     box.onclick = (e) => e.stopPropagation();
 
     const allDefs = (xref && (xref.definitions || (xref.definition ? [xref.definition] : []))) || [];
@@ -1467,14 +1467,14 @@ class ContextMenu {
                 <span>${this.escapeHtml(name)}</span>
                 <span class="xref-def-badge">${this.escapeHtml(this.formatTypeName(d.type_name))}</span>
               </div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:3px;">
+              <div style="font-size:var(--fs-11, 11px);color:var(--text-muted);font-family:var(--font-mono);margin-top:3px;">
                 ${this.escapeHtml(d.file)}:${d.line_s || 1}
               </div>
             </div>
-            <span style="font-size:11px;color:var(--accent-purple);font-weight:500;">Jump &rarr;</span>
+            <span style="font-size:var(--fs-11, 11px);color:var(--accent-purple);font-weight:500;">Jump &rarr;</span>
           </div>
         `).join("")
-      : `<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-style:italic;">${noDefsNote}</div>`;
+      : `<div style="font-size:var(--fs-11, 11px);color:var(--text-muted);margin-bottom:12px;font-style:italic;">${noDefsNote}</div>`;
 
     const refsHtml = refs.length > 0
       ? refs.map((r) => `
@@ -1493,7 +1493,7 @@ class ContextMenu {
     box.innerHTML = `
       <div style="padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
         <span style="font-weight:bold;color:var(--accent-blue);">${this.escapeHtml(title)}</span>
-        <button id="close-xref-btn" style="color:var(--text-muted);font-size:18px;background:none;border:none;cursor:pointer;padding:0 4px;">&times;</button>
+        <button id="close-xref-btn" style="color:var(--text-muted);font-size:var(--fs-18, 18px);background:none;border:none;cursor:pointer;padding:0 4px;">&times;</button>
       </div>
 
       <div style="max-height:420px;overflow-y:auto;padding:12px 16px;">
@@ -1548,7 +1548,7 @@ class ContextMenu {
     modal.innerHTML = `
       <div class="ast-modal-header">
         <span>AST Structure: ${this.escapeHtml(name)}</span>
-        <button id="close-ast-btn" style="color:var(--text-muted);font-size:16px;">&times;</button>
+        <button id="close-ast-btn" style="color:var(--text-muted);font-size:var(--fs-16, 16px);">&times;</button>
       </div>
       <div class="ast-tree-content" id="ast-tree-root"></div>
     `;
@@ -1585,7 +1585,7 @@ class ContextMenu {
     if (Array.isArray(node.attributes) && node.attributes.length > 0) {
       const attrSpan = document.createElement("span");
       attrSpan.style.color = "var(--text-muted)";
-      attrSpan.style.fontSize = "11px";
+      attrSpan.style.fontSize = "var(--fs-11, 11px)";
       attrSpan.style.marginLeft = "6px";
       attrSpan.textContent = "{" + node.attributes.map(a => `${a.name}: ${a.val}`).join(", ") + "}";
       row.appendChild(attrSpan);

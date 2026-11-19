@@ -31,7 +31,7 @@ export class PaholeView {
           <div class="pahole-header">
             <div>
               <div class="pahole-title">Pahole Struct Layout: struct ${escapeHtml(this.structName)}</div>
-              <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+              <div style="font-size:var(--fs-12, 12px);color:var(--text-muted);margin-top:4px;">
                 Visualizes 64-byte cacheline boundaries, alignment holes, and packing efficiency.
               </div>
               <div id="pahole-def-link-container"></div>
@@ -183,7 +183,7 @@ export class PaholeView {
       // Link to definition in Code View
       if (defLinkContainer && res.file_path) {
         defLinkContainer.innerHTML = `
-          <div style="font-size:11px;color:var(--accent-blue);cursor:pointer;margin-top:4px;" id="pahole-open-src">
+          <div style="font-size:var(--fs-11, 11px);color:var(--accent-blue);cursor:pointer;margin-top:4px;" id="pahole-open-src">
             📄 Open Definition in Code View (${escapeHtml(res.file_path)}:${res.line_s || 1})
           </div>
         `;
@@ -285,7 +285,7 @@ export class PaholeView {
       });
 
       const estimateNote = res.is_estimate
-        ? `<div class="m-card" style="margin-bottom:12px;font-size:12px;color:var(--accent-yellow);">
+        ? `<div class="m-card" style="margin-bottom:12px;font-size:var(--fs-12, 12px);color:var(--accent-yellow);">
             Estimated layout: ${res.estimated_members} of ${members.length} members (typedefs, arrays, embedded structs, unsigned types) are counted as 8 bytes, because the index records only their type category. Offsets after the first estimated member are approximate.
           </div>`
         : "";
@@ -294,7 +294,7 @@ export class PaholeView {
         <div class="m-grid-2col" style="margin-bottom:16px;">
           <div class="m-card">
             <div class="m-card-title">Layout Metrics</div>
-            <div style="font-size:12px;display:flex;flex-direction:column;gap:4px;">
+            <div style="font-size:var(--fs-12, 12px);display:flex;flex-direction:column;gap:4px;">
               <div><strong>Total Size:</strong> ${res.is_estimate ? "~" : ""}${res.total_size || 0} bytes</div>
               <div><strong>Cachelines Spanned:</strong> ${res.cache_lines_used ?? res.cachelines ?? 1} (64-byte lines)</div>
               <div><strong>Padding Holes:</strong> ${res.holes_count || 0}</div>
@@ -303,7 +303,7 @@ export class PaholeView {
           </div>
           <div class="m-card">
             <div class="m-card-title">Optimization Assessment</div>
-            <div style="font-size:12px;color:var(--accent-green);">
+            <div style="font-size:var(--fs-12, 12px);color:var(--accent-green);">
               ${res.holes_count > 0 ? "Potential cacheline re-ordering identified to eliminate alignment holes." : "Struct packing is optimal."}
             </div>
           </div>

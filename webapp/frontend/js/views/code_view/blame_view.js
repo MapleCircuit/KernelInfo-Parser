@@ -70,7 +70,7 @@ export class BlameView {
       <div class="gutter-blame${from ? " blame-moved" : ""}" title="${cleanSubject} (${cleanAuthor})${fromTitle}" data-commit="${cleanCommit}" style="border-left:2px solid ${authorColor};">${from ? `<span class="blame-moved-mark" title="moved from ${escapeHtml(from)}">↪</span>` : ""}
         <span style="color:${authorColor};font-family:var(--font-mono);font-weight:600;">${escapeHtml(hashShort)}</span>
         <span class="blame-author-link" style="cursor:pointer;" data-author="${cleanAuthor}" title="Click to view developer profile: ${cleanAuthor}">${cleanAuthor}</span>
-        <span style="font-size:9px;color:var(--text-muted);">${escapeHtml(dateStr)}</span>
+        <span style="font-size:0.8em;color:var(--text-muted);">${escapeHtml(dateStr)}</span>
       </div>
     `;
   }

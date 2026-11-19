@@ -2,6 +2,8 @@
  * pahole_compare.js - Struct layout over time (N3, webapp/API.md §4.7): the two-revision comparison table and the
  * size history chart of the Pahole view. DOM-free (HTML strings), tested.
  */
+import { getUiFontScale, getUiLayoutScale } from "../../utils/ui_scale.js";
+
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const signed = (n) => (n > 0 ? `+${n}` : String(n));
 
@@ -29,8 +31,13 @@ export function historySvg(stops, { width = 640, height = 170 } = {}) {
   if (!pts.length) return "";
   const max = Math.max(...pts.map((p) => p.total_size), 1);
   const maxHoles = Math.max(...pts.map((p) => p.holes_count || 0), 1);
-  const padL = 44;
-  const padB = 30;
+  const ratio = getUiFontScale() / getUiLayoutScale();
+  const fsLabel = +(9 * ratio).toFixed(1);
+  const fsAxis = +(10 * ratio).toFixed(1);
+  const padL = Math.round(44 * ratio);
+  const padB = Math.round(30 * ratio);
+  const axisY = Math.round(16 * ratio);
+  const labelY = height - Math.round(8 * ratio);
   const w = width - padL - 10;
   const h = height - padB - 10;
   const x = (i) => padL + (stops.length === 1 ? w / 2 : (i / (stops.length - 1)) * w);
@@ -41,7 +48,7 @@ export function historySvg(stops, { width = 640, height = 170 } = {}) {
   }).join("");
   const line = pts.map((p, k) => `${k ? "L" : "M"}${x(p.i).toFixed(1)},${y(p.total_size).toFixed(1)}`).join(" ");
   const dots = pts.map((p) => `<circle data-version="${esc(p.version)}" cx="${x(p.i).toFixed(1)}" cy="${y(p.total_size).toFixed(1)}" r="4" fill="${p.is_estimate ? "var(--bg-primary)" : "var(--accent-blue)"}" stroke="var(--accent-blue)" stroke-width="2" style="cursor:pointer"><title>${esc(p.version)}: ${p.total_size} bytes, ${p.holes_count} holes, ${p.cache_lines_used} cachelines${p.is_estimate ? " (estimate)" : ""}</title></circle>`).join("");
-  const labels = stops.map((s, i) => `<text x="${x(i).toFixed(1)}" y="${height - 8}" font-size="9" fill="${s.available ? "var(--text-muted)" : "var(--accent-red)"}" text-anchor="middle">${esc(s.version)}</text>`).join("");
-  const axis = `<line x1="${padL}" x2="${padL + w}" y1="${10 + h}" y2="${10 + h}" stroke="var(--border-color)"/><text x="${padL - 4}" y="16" font-size="10" fill="var(--text-muted)" text-anchor="end">${max} B</text>`;
+  const labels = stops.map((s, i) => `<text x="${x(i).toFixed(1)}" y="${labelY}" font-size="${fsLabel}" fill="${s.available ? "var(--text-muted)" : "var(--accent-red)"}" text-anchor="middle">${esc(s.version)}</text>`).join("");
+  const axis = `<line x1="${padL}" x2="${padL + w}" y1="${10 + h}" y2="${10 + h}" stroke="var(--border-color)"/><text x="${padL - 4}" y="${axisY}" font-size="${fsAxis}" fill="var(--text-muted)" text-anchor="end">${max} B</text>`;
   return `<svg class="pcmp-chart" viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="Size history">${axis}${holes}<path d="${line}" fill="none" stroke="var(--accent-blue)" stroke-width="2"/>${dots}${labels}</svg>`;
 }

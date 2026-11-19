@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import random
 import re
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator, Sequence
 import time
@@ -58,6 +60,77 @@ if TYPE_CHECKING:
     from core.TableHandling import Table
 
 logger = logging.getLogger("kernelinfo.db_engine")
+
+# mysql-connector logs its auth-plugin loading at INFO on every connect; engine lifecycle is reported by the
+# single `DB_engine <name> Started.` / `Closed.` lines below instead.
+logging.getLogger("mysql.connector").setLevel(logging.WARNING)
+
+_LIFECYCLE_WRAPPED = "__kip_lifecycle_wrapped__"
+_LIFECYCLE_LOCK = threading.Lock()
+_LIFECYCLE_OPEN: dict[tuple[int, str], int] = {}  # (pid, engine name) -> open handles in that process
+
+
+def note_engine_started(name: str) -> int:
+    """Count one open handle of engine `name` in this process; the first one logs `DB_engine <name> Started.`.
+
+    Returns the pid the handle belongs to (pass it back to `note_engine_closed`)."""
+    pid = os.getpid()
+    with _LIFECYCLE_LOCK:
+        count = _LIFECYCLE_OPEN.get((pid, name), 0) + 1
+        _LIFECYCLE_OPEN[(pid, name)] = count
+    if count == 1:
+        logger.info("DB_engine %s Started.", name)
+    return pid
+
+
+def note_engine_closed(name: str, pid: int) -> None:
+    """Release a handle counted by `note_engine_started`; the last one logs `DB_engine <name> Closed.`.
+
+    A handle inherited across `fork()` (`pid` is the parent's) is ignored."""
+    if pid != os.getpid():
+        return
+    with _LIFECYCLE_LOCK:
+        count = _LIFECYCLE_OPEN.get((pid, name), 0) - 1
+        if count > 0:
+            _LIFECYCLE_OPEN[(pid, name)] = count
+        else:
+            _LIFECYCLE_OPEN.pop((pid, name), None)
+    if count == 0:
+        logger.info("DB_engine %s Closed.", name)
+
+
+def _engine_label(engine: BaseDBEngine) -> str:
+    """Name used in lifecycle log lines: `display_name` when the engine sets one, else its class name."""
+    cls = type(engine)
+    return cls.display_name if cls.display_name != BaseDBEngine.display_name else cls.__name__
+
+
+def _wrap_lifecycle_init(init: Callable[..., None]) -> Callable[..., None]:
+    def __init__(self: BaseDBEngine, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        if "_engine_started" not in self.__dict__:  # outermost wrapper of a super().__init__() chain counts once
+            self.__dict__["_engine_started"] = note_engine_started(_engine_label(self))
+
+    setattr(__init__, _LIFECYCLE_WRAPPED, True)
+    __init__.__wrapped__ = init  # type: ignore[attr-defined]
+    __init__.__doc__ = init.__doc__
+    return __init__
+
+
+def _wrap_lifecycle_close(close: Callable[..., None]) -> Callable[..., None]:
+    def close_(self: BaseDBEngine) -> None:
+        try:
+            close(self)
+        finally:
+            pid = self.__dict__.pop("_engine_started", None)
+            if pid is not None:
+                note_engine_closed(_engine_label(self), pid)
+
+    setattr(close_, _LIFECYCLE_WRAPPED, True)
+    close_.__wrapped__ = close  # type: ignore[attr-defined]
+    close_.__name__ = close_.__qualname__ = "close"
+    close_.__doc__ = close.__doc__
+    return close_
 
 
 # Capability flags (`BaseDBEngine.capabilities`). Callers branch on these instead of `isinstance(db, MockDB)`.
@@ -263,6 +336,17 @@ class BaseDBEngine(ABC):
     """
 
     supports_background_commit = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Wrap each engine's `__init__` / `close` with the per-process lifecycle count (`note_engine_started`).
+
+        `close()` is the public shutdown; engine-internal drop-and-retry paths release handles without calling it."""
+        super().__init_subclass__(**kwargs)
+        for attr, wrap in (("__init__", _wrap_lifecycle_init), ("close", _wrap_lifecycle_close)):
+            func = getattr(cls, attr, None)
+            if func is None or getattr(func, "__isabstractmethod__", False) or getattr(func, _LIFECYCLE_WRAPPED, False):
+                continue
+            setattr(cls, attr, wrap(func))
 
     #: Human-readable engine name used in diagnostics ("Connected to <display_name> successfully").
     display_name: str = "database"

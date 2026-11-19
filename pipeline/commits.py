@@ -345,9 +345,11 @@ def processing_git_commits(version: str) -> None:
             except Exception as e:
                 logger.warning(f"Could not read the checkpoint rows of commit {checkpoint_cid} ({e}); checkpoint check skipped.")
             if stored_fnids is not None:
+                # Only paths of the version's tree belong in its checkpoint (`git ls-tree` blobs, symlinks included)
+                tree_paths = getattr(gp, "file_blob_hashes", None) or None
                 staged_count = 0
                 for f_path, b_id in blob_items:
-                    if not b_id:
+                    if not b_id or (tree_paths is not None and f_path not in tree_paths):
                         continue
                     f_nid = get_fnid_for_path(f_path)
                     if f_nid is None or f_nid in stored_fnids:

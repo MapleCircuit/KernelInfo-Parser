@@ -25,10 +25,10 @@ export class CallgraphView {
       <div class="tools-view-container">
         <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:12px;">
           <div>
-            <div style="font-size:18px;font-weight:600;color:var(--accent-purple);">
+            <div style="font-size:var(--fs-18, 18px);font-weight:600;color:var(--accent-purple);">
               Callgraph: <span class="callgraph-header-name" style="font-family:var(--font-mono);">${escapeHtml(this.functionName)}()</span>
             </div>
-            <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+            <div style="font-size:var(--fs-12, 12px);color:var(--text-muted);margin-top:4px;">
               Bidirectional caller/callee cross-reference explorer.
             </div>
           </div>
@@ -277,10 +277,10 @@ export class CallgraphView {
                     <div class="callgraph-node-item" style="display:flex;justify-content:space-between;align-items:center;">
                       <div class="callgraph-jump" data-func="${safeFunc}" style="cursor:pointer;flex:1;">
                         <span style="font-weight:500;">${safeFunc}()</span>
-                        ${(c.call_count && c.call_count > 1) ? `<span style="font-size:10px;padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-orange);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
+                        ${(c.call_count && c.call_count > 1) ? `<span style="font-size:var(--fs-10, 10px);padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-orange);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
                         <span class="callgraph-node-file">${safeFile}</span>
                       </div>
-                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line_s || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
+                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line_s || 1}" style="color:var(--accent-blue);font-size:var(--fs-10, 10px);cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
                     </div>
                   `;
                   }).join("")
@@ -306,10 +306,10 @@ export class CallgraphView {
                     <div class="callgraph-node-item" style="display:flex;justify-content:space-between;align-items:center;">
                       <div class="callgraph-jump" data-func="${safeFunc}" style="cursor:pointer;flex:1;">
                         <span style="font-weight:500;">${safeFunc}()</span>
-                        ${(c.call_count && c.call_count > 1) ? `<span style="font-size:10px;padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-blue);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
+                        ${(c.call_count && c.call_count > 1) ? `<span style="font-size:var(--fs-10, 10px);padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-blue);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
                         <span class="callgraph-node-file">${safeFile}</span>
                       </div>
-                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
+                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line || 1}" style="color:var(--accent-blue);font-size:var(--fs-10, 10px);cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
                     </div>
                   `;
                   }).join("")

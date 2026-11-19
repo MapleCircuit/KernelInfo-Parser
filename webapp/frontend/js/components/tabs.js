@@ -271,7 +271,7 @@ export class TabsComponent {
         contentEl.innerHTML = `
           <div style="display:flex;height:100%;align-items:center;justify-content:center;flex-direction:column;color:var(--text-muted);gap:12px;">
             <p>No tab open in this pane.</p>
-            <p style="font-size:11px;">Select a file from the sidebar, drop a tab here, or press <kbd style="background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;border:1px solid var(--border-color);">Ctrl+K</kbd> to search.</p>
+            <p style="font-size:var(--fs-11, 11px);">Select a file from the sidebar, drop a tab here, or press <kbd style="background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;border:1px solid var(--border-color);">Ctrl+K</kbd> to search.</p>
           </div>
         `;
       }

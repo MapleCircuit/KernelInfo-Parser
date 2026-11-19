@@ -10,10 +10,23 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from unit_test import runner
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _full_log(summary: str) -> str:
+    """Contents of the `full log: PATH` file named in a `run_isolated()` summary (empty when absent)."""
+    lines = [ln for ln in summary.splitlines() if ln.startswith("full log: ")]
+    path = Path(lines[0][len("full log: "):]) if lines else None
+    return path.read_text(encoding="utf-8") if path and path.exists() else ""
+
+
+def _with_full_log(summary: str) -> str:
+    """Assertion message: the summary plus the full log, so a failure stays diagnosable after the temp dir is gone."""
+    return f"{summary}\n----- full log -----\n{_full_log(summary)[-8000:]}"
 
 
 def _load_affected():
@@ -156,14 +169,58 @@ class TestRunner(unittest.TestCase):
                 timeout=3, summary=True, out=buf,
             )
             text = buf.getvalue()
-            self.assertEqual(code, 1)
-            self.assertIn("FAIL kip_tmp_tests.test_bad.T.test_fail", text)
-            self.assertIn("ERROR kip_tmp_tests.test_bad.T.test_err", text)
-            self.assertIn("ValueError: boom", text)
-            self.assertIn("TIMEOUT after 3s", text)
-            self.assertIn("ran=4 failures=1 errors=2 skipped=1", text)
-            log_line = [ln for ln in text.splitlines() if ln.startswith("full log: ")][0]
-            self.assertIn("Traceback", Path(log_line[len("full log: "):]).read_text())
+            diag = _with_full_log(text)
+            self.assertEqual(code, 1, diag)
+            self.assertIn("FAIL kip_tmp_tests.test_bad.T.test_fail", text, diag)
+            self.assertIn("ERROR kip_tmp_tests.test_bad.T.test_err", text, diag)
+            self.assertIn("ValueError: boom", text, diag)
+            self.assertIn("TIMEOUT after 3s", text, diag)
+            self.assertIn("ran=4 failures=1 errors=2 skipped=1", text, diag)
+            self.assertIn("Traceback", _full_log(text), diag)
+
+    def test_isolated_run_ignores_inherited_python_path_state(self) -> None:
+        """A foreign `unit_test` package on `PYTHONPATH` plus `PYTHONSAFEPATH` must not replace the worker.
+
+        Without `runner.child_env()` the child imports the decoy `unit_test.runner`, exits 0 at once and never
+        writes its result, even for a module that would hang: the "exit 0 before reporting" symptom.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            decoy = Path(tmp) / "decoy" / "unit_test"
+            decoy.mkdir(parents=True)
+            (decoy / "__init__.py").write_text("")
+            (decoy / "runner.py").write_text("print('decoy runner')\n")
+            pkg = Path(tmp) / "kip_tmp_env_tests"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("")
+            (pkg / "test_one.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n")
+            env_old = dict(os.environ)
+            self.addCleanup(lambda: (os.environ.clear(), os.environ.update(env_old)))
+            os.environ["PYTHONPATH"] = os.pathsep.join([str(decoy.parent), tmp])
+            os.environ["PYTHONSAFEPATH"] = "1"
+            os.environ["PYTHONINSPECT"] = "1"
+            os.environ["KIP_TEST_LOG_DIR"] = str(Path(tmp) / "logs")
+            buf = io.StringIO()
+            code = runner.run_isolated(["kip_tmp_env_tests.test_one"], timeout=60, summary=True, out=buf)
+            text = buf.getvalue()
+            self.assertEqual(code, 0, _with_full_log(text))
+            self.assertIn("ran=1 failures=0 errors=0", text, _with_full_log(text))
+
+    def test_child_env_puts_repository_first(self) -> None:
+        env = runner.child_env({"PYTHONPATH": os.pathsep.join(["/elsewhere", ""]), "PYTHONSAFEPATH": "1", "X": "y"})
+        self.assertEqual(env["PYTHONPATH"].split(os.pathsep), [str(ROOT), "/elsewhere"])
+        self.assertNotIn("PYTHONSAFEPATH", env)
+        self.assertEqual(env["X"], "y")
+
+    def test_worker_that_never_starts_is_reported_with_its_output(self) -> None:
+        """A child that exits 0 before reaching `worker()` is an error naming the cause, not a silent pass or timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake_python"
+            fake.write_text("#!/bin/sh\necho 'interpreter refused to start'\nexit 0\n")
+            fake.chmod(0o755)
+            with mock.patch.object(runner.sys, "executable", str(fake)):
+                res = runner.run_module("kip_tmp_tests.test_hang", 30, Path(tmp), dict(os.environ))
+        self.assertEqual((res["ran"], res["errors"], res["timeout"]), (0, 1, False))
+        self.assertEqual(res["problems"][0]["message"], "worker never started (exit 0): interpreter refused to start")
 
     def test_live_db_marker_honours_env(self) -> None:
         from tests.db_fixtures import requires_live_db

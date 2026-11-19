@@ -110,6 +110,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_pahole_compare",
     "tests.test_webapp_watch",
     "tests.test_webapp_theme_contrast",
+    "tests.test_webapp_ui_scale",
     "tests.test_webapp_features",
     "tests.test_webapp_frontend_js",
     "tests.test_tui",
@@ -228,8 +229,8 @@ def run_module(module: str, timeout: int, work: Path, env: dict[str, str]) -> di
     out, log = work / f"{safe}.json", work / f"{safe}.log"
     cmd = [sys.executable, "-m", "unit_test.runner", "--worker", module, "--out", str(out), "--log", str(log)]
     start = time.time()
-    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=child_env(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         output, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -244,7 +245,27 @@ def run_module(module: str, timeout: int, work: Path, env: dict[str, str]) -> di
         data["log"] = str(log)
         data["output"] = output
         return data
-    return _synthetic(module, f"module crashed (exit {proc.returncode}) before reporting", output, start, log)
+    if not log.exists():
+        reason = f"worker never started (exit {proc.returncode})"
+    elif proc.returncode == 0:
+        reason = "worker exited 0 without reporting (exit status lost or worker cut short)"
+    else:
+        reason = f"module crashed (exit {proc.returncode}) before reporting"
+    last = first_line(output)
+    return _synthetic(module, f"{reason}: {last}" if last else reason, output, start, log)
+
+
+def child_env(env: dict[str, str]) -> dict[str, str]:
+    """`env` for a worker subprocess: the repository first on `PYTHONPATH`, interactive-mode variables dropped.
+
+    `-m unit_test.runner` then resolves to this checkout whatever the inherited environment holds
+    (`PYTHONSAFEPATH`, a `PYTHONPATH` with another `unit_test` package, `PYTHONINSPECT`/`PYTHONSTARTUP`).
+    """
+    env = dict(env)
+    for key in ("PYTHONSAFEPATH", "PYTHONINSPECT", "PYTHONSTARTUP"):
+        env.pop(key, None)
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
+    return env
 
 
 def _synthetic(module: str, message: str, output: str, start: float, log: Path) -> dict:

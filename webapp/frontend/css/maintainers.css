@@ -310,7 +310,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 190px;
+  max-width: calc(190px * var(--ui-layout-scale, 1));
 }
 
 .dev-badges-group {

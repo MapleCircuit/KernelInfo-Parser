@@ -6,6 +6,7 @@
  * activates it; the active row is announced through `aria-activedescendant`. The viewport carries
  * `data-scroll-restore="off"` (§5.28): the owner keeps the position itself (`scrollTop`).
  */
+import { getUiLayoutScale, onUiScaleChanged, scaleUiPx } from "../utils/ui_scale.js";
 
 /** [start, end) of the rows to render for a viewport. Pure (webapp/frontend/tests/virtual_list.test.mjs). */
 export function visibleRange(scrollTop, viewportHeight, rowHeight, total, overscan = 8) {
@@ -45,7 +46,8 @@ let listSeq = 0;
 export class VirtualList {
   constructor(hostEl, { rowHeight = 28, renderRow, rowKey = (r, i) => String(i), onSelect = null, onActivate = null, label = "List" }) {
     this.host = hostEl;
-    this.rowHeight = rowHeight;
+    this.baseRowHeight = rowHeight;
+    this.rowHeight = scaleUiPx(rowHeight, getUiLayoutScale());
     this.renderRow = renderRow;
     this.rowKey = rowKey;
     this.onSelect = onSelect;
@@ -68,6 +70,23 @@ export class VirtualList {
       this.ro = new ResizeObserver(() => this.paint());
       this.ro.observe(this.viewport);
     }
+    this._offScale = onUiScaleChanged(({ layoutScale } = {}) => {
+      this.updateScale(layoutScale);
+    });
+  }
+
+  updateScale(layoutScale = getUiLayoutScale()) {
+    const nextHeight = scaleUiPx(this.baseRowHeight, layoutScale);
+    if (nextHeight === this.rowHeight) return;
+    const prevHeight = this.rowHeight || this.baseRowHeight || 1;
+    const prevTop = this.viewport.scrollTop || 0;
+    const firstRowFrac = prevTop / prevHeight;
+    this.rowHeight = nextHeight;
+    this.spacer.style.height = `${this.rows.length * this.rowHeight}px`;
+    if (prevTop > 0) {
+      this.viewport.scrollTop = Math.round(firstRowFrac * this.rowHeight);
+    }
+    this.paint();
   }
 
   setRows(rows, { keepScroll = false, selectKey = null } = {}) {
@@ -128,5 +147,7 @@ export class VirtualList {
 
   dispose() {
     this.ro?.disconnect();
+    this._offScale?.();
+    this._offScale = null;
   }
 }

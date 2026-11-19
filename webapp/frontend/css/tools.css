@@ -165,7 +165,7 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  min-width: 120px;
+  min-width: calc(120px * var(--ui-layout-scale, 1));
   padding: 4px 10px;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
@@ -299,7 +299,7 @@
 }
 
 .compare-filter {
-  width: 260px;
+  width: calc(260px * var(--ui-layout-scale, 1));
   max-width: 100%;
   padding: 4px 8px;
   border: 1px solid var(--border-color);
@@ -367,11 +367,11 @@
 }
 
 #cmp-rename-sim {
-  width: 56px;
+  width: calc(56px * var(--ui-layout-scale, 1));
 }
 
 #cmp-rename-scope {
-  width: 240px;
+  width: calc(240px * var(--ui-layout-scale, 1));
   max-width: 100%;
 }
 
@@ -427,7 +427,7 @@
 
 .compare-status {
   flex-shrink: 0;
-  width: 18px;
+  width: calc(18px * var(--ui-layout-scale, 1));
   text-align: center;
   font-weight: 700;
 }
@@ -564,7 +564,7 @@
   padding-top: 6px;
 }
 .compare-sym-change { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
-.compare-sym-field { color: var(--text-muted); min-width: 110px; }
+.compare-sym-field { color: var(--text-muted); min-width: calc(110px * var(--ui-layout-scale, 1)); }
 .compare-sym-change code { font-family: var(--font-mono); padding: 0 4px; border-radius: 3px; overflow-wrap: anywhere; }
 
 /* Treemap view */
@@ -678,7 +678,7 @@
 .treemap-tooltip {
   position: absolute;
   z-index: 5;
-  max-width: 250px;
+  max-width: calc(250px * var(--ui-layout-scale, 1));
   padding: 6px 9px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
@@ -693,9 +693,9 @@
 }
 
 /* Compare view, API mode (A6, webapp/API.md §5.11) */
-.compare-api-arch { display: flex; gap: 8px; align-items: center; padding: 6px 0; font-size: 12px; }
+.compare-api-arch { display: flex; gap: 8px; align-items: center; padding: 6px 0; font-size: var(--fs-12, 12px); }
 /* Compare view, Man pages mode */
-.compare-man-section { padding: 4px 6px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-primary); font-size: var(--fs-12, 12px); max-width: 240px; }
+.compare-man-section { padding: 4px 6px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-primary); font-size: var(--fs-12, 12px); max-width: calc(240px * var(--ui-layout-scale, 1)); }
 .compare-man-summary-bar { margin-bottom: 8px; font-size: var(--fs-12, 12px); color: var(--text-muted); }
 .compare-man-name { flex-shrink: 0; font-weight: 600; color: var(--text-primary); }
 .compare-man-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: var(--font-sans); }
@@ -704,8 +704,8 @@
 .compare-man-badge.kind-so { color: var(--accent-purple); border-color: rgba(163, 113, 247, 0.35); }
 .compare-man-badge.kind-moved { color: var(--text-muted); }
 .api-diff-sep { width: 12px; }
-.api-diff-list { display: flex; flex-direction: column; font-size: 12px; }
-.api-diff-row { display: grid; grid-template-columns: 18px 92px minmax(160px, 30%) 1fr; gap: 8px; padding: 3px 8px; border-bottom: 1px solid var(--border-color); cursor: pointer; }
+.api-diff-list { display: flex; flex-direction: column; font-size: var(--fs-12, 12px); }
+.api-diff-row { display: grid; grid-template-columns: calc(18px * var(--ui-layout-scale, 1)) calc(92px * var(--ui-layout-scale, 1)) minmax(calc(160px * var(--ui-layout-scale, 1)), 30%) 1fr; gap: 8px; padding: 3px 8px; border-bottom: 1px solid var(--border-color); cursor: pointer; }
 .api-diff-row:hover { background: var(--bg-hover); }
 .api-diff-row.status-added .api-diff-status { color: var(--accent-green); }
 .api-diff-row.status-removed .api-diff-status { color: var(--accent-red); }
@@ -715,7 +715,7 @@
 .api-diff-detail { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Treemap build overlay (K4, webapp/API.md §5.17) */
-.treemap-legend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 4px 12px; font-size: 11px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); }
+.treemap-legend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 4px 12px; font-size: var(--fs-11, 11px); color: var(--text-secondary); border-bottom: 1px solid var(--border-color); }
 .treemap-legend-item i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 .treemap-legend-total { margin-left: auto; color: var(--text-primary); }
 

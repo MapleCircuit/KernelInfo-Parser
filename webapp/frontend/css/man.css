@@ -24,7 +24,7 @@
 }
 .man-toolbar .man-title { font-family: var(--font-mono); }
 .man-tag-label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); }
-.man-tag { max-width: 170px; font-size: var(--fs-12, 12px); }
+.man-tag { max-width: calc(170px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px); }
 .man-mode { display: inline-flex; gap: 0; isolation: isolate; }
 .man-mode .code-btn { position: relative; z-index: 0; }
 .man-mode .code-btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }

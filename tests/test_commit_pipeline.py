@@ -536,9 +536,20 @@ class TestStageTimeSplit(unittest.TestCase):
         self.assertEqual(result.split["worker_db_reads"], 10)
         self.assertGreaterEqual(result.split["ingest_s"], 0.0)
         self.assertFalse(G.TE.async_commits, "background commits end with the stage")
+        # Tail idle comes from the real wall-clock exit times of the two workers, so it varies with machine load
+        tail = result.split["worker_tail_idle_s"]
+        self.assertGreaterEqual(tail, 0.0)
+        busy = 100.0 * 6.0 / (8.0 + tail)
         text = pipeline.worker_stage._format_time_split(result.split)
+        self.assertIn(f"workers {busy:.0f}% parsing", text)
+        self.assertIn(f"{100.0 - busy:.0f}% without a task", text)
+        # Deterministic split: 6s busy + 2s waiting for a task, plus a fixed tail-idle share
+        text = pipeline.worker_stage._format_time_split(dict(result.split, worker_tail_idle_s=0.0))
         self.assertIn("workers 75% parsing", text)
         self.assertIn("25% without a task", text)
+        text = pipeline.worker_stage._format_time_split(dict(result.split, worker_tail_idle_s=4.0))
+        self.assertIn("workers 50% parsing", text)
+        self.assertIn("50% without a task (or exited)", text)
         self.assertEqual(pipeline.worker_stage.WORKER_SYMBOL_STATS["refs reused"], 4)
         with self.assertLogs(main.logger, "INFO") as logs:
             pipeline.worker_stage._log_symbol_stats("v-test", Counter(SYMBOL_STATS))

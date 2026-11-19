@@ -197,7 +197,7 @@
 .diff-content {
   font-family: var(--font-mono);
   font-size: var(--fs-11, 11px);
-  line-height: 18px;
+  line-height: 1.636;
   padding: 8px 12px;
   white-space: pre;
   overflow-x: auto;
@@ -325,7 +325,7 @@
   overflow: auto;
   font-family: var(--font-mono);
   font-size: var(--fs-11, 11px);
-  line-height: 17px;
+  line-height: 1.545;
 }
 
 .cdiff-hunk {
@@ -360,7 +360,7 @@
 }
 
 .cdiff-ln {
-  width: 44px;
+  width: calc(44px * var(--ui-layout-scale, 1));
   flex-shrink: 0;
   padding-right: 6px;
   text-align: right;
@@ -369,7 +369,7 @@
 }
 
 .cdiff-sign {
-  width: 14px;
+  width: calc(14px * var(--ui-layout-scale, 1));
   flex-shrink: 0;
   text-align: center;
   user-select: none;
@@ -391,15 +391,15 @@
 /* First release badge, Relations card and timeline chips (H1-H3, webapp/API.md §5.12) */
 .commit-release { margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap; }
 .release-badge {
-  display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; cursor: pointer;
+  display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: var(--fs-11, 11px); cursor: pointer;
   border: 1px solid var(--accent-green); color: var(--accent-green); background: rgba(63, 185, 80, 0.08);
 }
 .release-badge.stable { border-color: var(--accent-cyan); color: var(--accent-cyan); background: rgba(57, 197, 187, 0.08); }
 .release-badge.unreleased { border-color: var(--accent-yellow); color: var(--accent-yellow); background: rgba(210, 153, 34, 0.08); cursor: default; }
 .release-badge.pending, .release-badge.unknown { border-color: var(--border-color); color: var(--text-muted); background: none; cursor: default; }
-.rel-body { display: flex; flex-direction: column; gap: 8px; font-size: 11px; }
+.rel-body { display: flex; flex-direction: column; gap: 8px; font-size: var(--fs-11, 11px); }
 .rel-section { display: flex; flex-direction: column; gap: 3px; }
-.rel-title { font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; font-size: 10px; }
+.rel-title { font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; font-size: var(--fs-10, 10px); }
 .rel-title span { color: var(--text-muted); font-weight: 400; }
 .rel-row { display: flex; gap: 8px; align-items: baseline; padding: 3px 8px; background: var(--bg-tertiary); border-radius: 4px; flex-wrap: wrap; }
 .rel-subject { color: var(--accent-blue); text-decoration: none; flex: 1 1 200px; min-width: 0; }
@@ -412,7 +412,7 @@
 .rel-loading, .rel-none { color: var(--text-muted); }
 .rel-mail { color: var(--accent-blue); font-family: var(--font-mono, monospace); }
 .rel-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-.rel-chip { font-size: 10px; padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; }
+.rel-chip { font-size: var(--fs-10, 10px); padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; }
 .rel-chip.fixed { color: var(--accent-orange); }
 .rel-chip.reverted { color: var(--accent-red); }
 .rel-chip.fixes { color: var(--accent-green); }
@@ -422,13 +422,13 @@
 .commit-query-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
 .commit-query-chips[hidden] { display: none; }
 .cq-chip {
-  display: inline-flex; align-items: center; gap: 3px; padding: 1px 2px 1px 7px; border-radius: 10px; font-size: 11px;
+  display: inline-flex; align-items: center; gap: 3px; padding: 1px 2px 1px 7px; border-radius: 10px; font-size: var(--fs-11, 11px);
   background: rgba(88, 166, 255, 0.12); border: 1px solid var(--accent-blue); color: var(--text-primary);
   font-family: var(--font-mono, monospace);
 }
 .cq-chip b { color: var(--accent-blue); font-weight: 600; }
 .cq-chip.text { border-color: var(--border-color); background: var(--bg-tertiary); padding-right: 7px; }
-.cq-chip button { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 12px; padding: 0 4px; }
+.cq-chip button { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: var(--fs-12, 12px); padding: 0 4px; }
 .cq-chip button:hover { color: var(--accent-red); }
 .commit-query-help { padding: 2px 8px; }
 
@@ -437,7 +437,7 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-width: 920px;
+  max-width: calc(920px * var(--ui-layout-scale, 1));
 }
 .cq-help-title-row {
   display: flex;
@@ -527,7 +527,7 @@
   font-size: var(--fs-11, 11px);
 }
 .cq-help-key-col {
-  flex: 0 0 185px;
+  flex: 0 0 calc(185px * var(--ui-layout-scale, 1));
   min-width: 0;
 }
 .cq-help-key-btn {

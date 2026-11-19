@@ -45,34 +45,42 @@
           <span class="brand-title">KernelInfo IDE</span>
         </div>
         <div class="version-selector-container">
-          <label for="project-select">Project:</label>
-          <select id="project-select" style="max-width: 130px; font-size: 12px;">
-            <option value="1">Linux Kernel</option>
-          </select>
-          <label for="branch-picker-btn">Branch:</label>
-          <button id="branch-picker-btn" class="branch-picker-btn" type="button" title="Scope the Tag and Release lists to the releases on one branch or tag view">
-            <span id="branch-picker-label">— any branch —</span>
-            <span class="branch-picker-caret">▾</span>
+          <button id="version-summary-btn" class="version-summary-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="version-selector-controls" title="Edit the revision selection">
+            <span id="version-summary-label" class="version-summary-label">—</span>
+            <span class="version-summary-caret">▾</span>
           </button>
-          <label for="version-select">Tag:</label>
-          <select id="version-select" style="max-width: 130px; font-size: 12px;">
-            <option value="v3.0">v3.0</option>
-          </select>
-          <label for="rc-select" id="rc-select-label" hidden>Release:</label>
-          <select id="rc-select" style="max-width: 120px; font-size: 12px;" title="Releases and release candidates of the selected release" hidden></select>
-          <label for="commit-picker-btn">Commit:</label>
-          <button id="commit-picker-btn" class="commit-picker-btn" type="button" title="Select a specific commit">
-            <span id="commit-picker-label">—</span>
-            <span class="commit-picker-caret">▾</span>
-          </button>
-          <button id="version-apply-btn" class="version-apply-btn" type="button" title="Switch the current tab to the selected revision">Apply</button>
-          <button id="version-newtab-btn" class="version-newtab-btn" type="button" title="Open a repository explorer on the selected revision in a new tab">New Tab</button>
+          <div id="version-selector-controls" class="version-selector-controls">
+            <label for="project-select">Project:</label>
+            <select id="project-select" style="max-width: calc(130px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);">
+              <option value="1">Linux Kernel</option>
+            </select>
+            <label for="branch-picker-btn">Branch:</label>
+            <button id="branch-picker-btn" class="branch-picker-btn" type="button" title="Scope the Tag and Release lists to the releases on one branch or tag view">
+              <span id="branch-picker-label">— any branch —</span>
+              <span class="branch-picker-caret">▾</span>
+            </button>
+            <label for="version-select">Tag:</label>
+            <select id="version-select" style="max-width: calc(130px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);">
+              <option value="v3.0">v3.0</option>
+            </select>
+            <label for="rc-select" id="rc-select-label" hidden>Release:</label>
+            <select id="rc-select" style="max-width: calc(120px * var(--ui-layout-scale, 1)); font-size: var(--fs-12, 12px);" title="Releases and release candidates of the selected release" hidden></select>
+            <label for="commit-picker-btn">Commit:</label>
+            <button id="commit-picker-btn" class="commit-picker-btn" type="button" title="Select a specific commit">
+              <span id="commit-picker-label">—</span>
+              <span class="commit-picker-caret">▾</span>
+            </button>
+            <div class="version-selector-actions">
+              <button id="version-apply-btn" class="version-apply-btn" type="button" title="Switch the current tab to the selected revision">Apply</button>
+              <button id="version-newtab-btn" class="version-newtab-btn" type="button" title="Open a repository explorer on the selected revision in a new tab">New Tab</button>
+            </div>
+          </div>
         </div>
         <div class="session-selector-container" id="session-selector-container">
           <button id="session-picker-btn" class="session-picker-btn" type="button" title="Workspace Sessions">
             <span>🗂</span>
             <span id="session-picker-label">Default Session</span>
-            <span style="font-size: 9px; color: var(--text-muted);">▾</span>
+            <span style="font-size: var(--fs-9, 9px); color: var(--text-muted);">▾</span>
           </button>
         </div>
       </div>
