@@ -170,12 +170,56 @@ def process_c_ast(CS: Any) -> None:
     Ast_Manager(CS)
 
 
-def map_direct_includes(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any) -> list[cc.Cursor]:
+def map_direct_includes(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any,
+                        include_tu: cc.TranslationUnit | None = None) -> list[cc.Cursor]:
     """Record the repository path libclang opened for each direct `#include` line of the file
-    (`CS.resolved_includes_by_line`) and return the file's pre-filtered top-level declaration cursors for
-    TokenList processing."""
+    (`CS.resolved_includes_by_line`, read from `include_tu` when given: the parse without the header prelude) and
+    return the file's pre-filtered top-level declaration cursors of `parsed_tu` for TokenList processing."""
     CS.resolved_includes_by_line = {}
+    _record_direct_includes(include_tu if include_tu is not None else parsed_tu, fullfilename, CS)
 
+    target_file = cc.File.from_name(parsed_tu, fullfilename)
+    target_ptr = ctypes.cast(target_file._as_parameter_, ctypes.c_void_p).value if target_file else None
+    target_real = os.path.realpath(fullfilename)
+    real_cache: dict[str, str] = {fullfilename: target_real}
+
+    def get_real(fname: str) -> str:
+        r = real_cache.get(fname)
+        if r is None:
+            r = os.path.realpath(fname)
+            real_cache[fname] = r
+        return r
+
+    # Walk the TU's top-level cursors with clang_visitChildren directly: thousands of them come from headers,
+    # and cindex's get_children() spends two extra C calls per child on a null-cursor assertion
+    top_decl_cursors: list[cc.Cursor] = []
+    walk_errors: list[Exception] = []
+    f_ptr = ctypes.c_void_p()
+    f_ref = ctypes.byref(f_ptr)
+    get_loc = _CLANG_GET_CURSOR_LOC
+    get_file_loc = _CLANG_GET_FILE_LOC
+
+    def top_level_visitor(c: Any, parent: Any, client_data: Any) -> int:
+        try:
+            get_file_loc(get_loc(c), f_ref, None, None, None)
+            if f_ptr.value == target_ptr or (target_ptr is None and c.location.file and (c.location.file.name == fullfilename or get_real(c.location.file.name) == target_real)):
+                if c.kind in _VALID_TOP_KINDS:
+                    c._tu = parsed_tu
+                    top_decl_cursors.append(c)
+        except Exception as e:
+            walk_errors.append(e)
+            return 0  # CXChildVisit_Break
+        return 1  # CXChildVisit_Continue
+
+    _CLANG_VISIT_CHILDREN(parsed_tu.cursor, cc.cursor_visit_callback(top_level_visitor), None)
+    if walk_errors:
+        logger.debug(f"Error walking file-bounded top-level cursors: {walk_errors[0]}")
+
+    return filter_enclosing_cursors(top_decl_cursors)
+
+
+def _record_direct_includes(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any) -> None:
+    """Fill `CS.resolved_includes_by_line` from the depth-1 inclusions of `fullfilename` in `parsed_tu`."""
     target_file = cc.File.from_name(parsed_tu, fullfilename)
     target_ptr = ctypes.cast(target_file._as_parameter_, ctypes.c_void_p).value if target_file else None
 
@@ -216,33 +260,6 @@ def map_direct_includes(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: An
                 rel_inc = inc_name
         if rel_inc and not rel_inc.startswith(".."):
             CS.resolved_includes_by_line[line] = rel_inc
-
-    # Walk the TU's top-level cursors with clang_visitChildren directly: thousands of them come from headers,
-    # and cindex's get_children() spends two extra C calls per child on a null-cursor assertion
-    top_decl_cursors: list[cc.Cursor] = []
-    walk_errors: list[Exception] = []
-    f_ptr = ctypes.c_void_p()
-    f_ref = ctypes.byref(f_ptr)
-    get_loc = _CLANG_GET_CURSOR_LOC
-    get_file_loc = _CLANG_GET_FILE_LOC
-
-    def top_level_visitor(c: Any, parent: Any, client_data: Any) -> int:
-        try:
-            get_file_loc(get_loc(c), f_ref, None, None, None)
-            if f_ptr.value == target_ptr or (target_ptr is None and c.location.file and (c.location.file.name == fullfilename or get_real(c.location.file.name) == target_real)):
-                if c.kind in _VALID_TOP_KINDS:
-                    c._tu = parsed_tu
-                    top_decl_cursors.append(c)
-        except Exception as e:
-            walk_errors.append(e)
-            return 0  # CXChildVisit_Break
-        return 1  # CXChildVisit_Continue
-
-    _CLANG_VISIT_CHILDREN(parsed_tu.cursor, cc.cursor_visit_callback(top_level_visitor), None)
-    if walk_errors:
-        logger.debug(f"Error walking file-bounded top-level cursors: {walk_errors[0]}")
-
-    return filter_enclosing_cursors(top_decl_cursors)
 
 
 class TokenList(TokenStream):
@@ -428,20 +445,29 @@ class Ast_Manager:
         CS.compile_env = env
         env_args, extra_options, arch_env = env.args_for(self.filename, asm=False)
         CS.compile_arch = arch_env
-        translation_unit = index.parse(
-            self.fullfilename,
-            args=[
-                "-ferror-limit=0",
-                "-w",
-                *env_args,
-                *_CLANG_KERNEL_MACRO_DEFINES,
-            ],
-            options=_CLANG_PARSE_OPTIONS | extra_options,
-        )
+        clang_args = ["-ferror-limit=0", "-w", *env_args, *_CLANG_KERNEL_MACRO_DEFINES]
+        translation_unit = index.parse(self.fullfilename, args=clang_args, options=_CLANG_PARSE_OPTIONS | extra_options)
         CS.parse_diagnostics = compile_env.diagnostics_fact(translation_unit, arch_env)
+        # A header that is not self-contained (an unknown type name in its own lines) is parsed again after the
+        # header prelude (compile_env.header_prelude()); the retry stands when it has fewer errors. Its
+        # #include lines are those of the parse without the prelude: a forced copy hides a header behind its guard.
+        include_tu = None
+        if self.filename.endswith(".h") and compile_env.has_unknown_type(translation_unit, self.fullfilename):
+            prelude = env.header_prelude(self.filename, arch_env)
+            if prelude:
+                retry = index.parse(self.fullfilename, args=[*clang_args, *prelude],
+                                    options=_CLANG_PARSE_OPTIONS | extra_options)
+                retry_fact = compile_env.diagnostics_fact(retry, arch_env)
+                if retry_fact["errors"] < CS.parse_diagnostics["errors"]:
+                    retry_fact["prelude"] = compile_env.HEADER_PRELUDE
+                    CS.parse_diagnostics = retry_fact
+                    include_tu, translation_unit = translation_unit, retry
+                else:
+                    del retry
         t_includes_0 = time.perf_counter() if prof is not None else 0.0
 
-        top_cursors = map_direct_includes(translation_unit, self.fullfilename, CS)
+        top_cursors = map_direct_includes(translation_unit, self.fullfilename, CS, include_tu=include_tu)
+        include_tu = None
 
         if prof is not None:
             prof.clang_parse_tu_s = t_includes_0 - t_parse_0

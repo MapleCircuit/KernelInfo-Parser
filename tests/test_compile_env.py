@@ -13,6 +13,7 @@ from parser import compile_env
 from parser.compile_env import KEEP_GOING, CompileEnv
 from parser.generated_headers import (
     autoconf_text,
+    bounds_aliases,
     default_defconfig,
     generated_headers,
     kernel_release,
@@ -296,6 +297,52 @@ class TestHistoricalCompileEnv(unittest.TestCase):
         self.assertEqual((includes, errors), ({"include/linux/sched.h", "include/asm/system.h"}, 0))
 
 
+class TestHeaderPrelude(unittest.TestCase):
+    """compile_env.header_prelude(): the retry prelude of a header that is not self-contained."""
+
+    def setUp(self) -> None:
+        self.tree = dict(TREE)
+        self.tree["include/linux/types.h"] = "#ifndef _T\n#define _T\n#include <asm/atomic.h>\ntypedef unsigned int u32;\n#endif\n"
+        self.tree["include/linux/lockd/bind.h"] = "struct b { u32 cookie; };\n"
+        self.root = tempfile.mkdtemp(prefix="kip-env-", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        for path, text in self.tree.items():
+            dest = os.path.join(self.root, path)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="latin-1") as fh:
+                fh.write(text)
+        self.base = tempfile.mkdtemp(prefix="kip-build-")
+        self.env = CompileEnv(self.root, set(self.tree), self.tree.get, None, key="prelude", build_base=self.base)
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.addCleanup(self.env.cleanup)
+
+    def test_prelude_applies_to_headers_outside_its_closure(self) -> None:
+        arch_env = self.env.env("x86_64")
+        prelude = ["-include", os.path.join(self.root, compile_env.HEADER_PRELUDE)]
+        self.assertEqual(self.env.header_prelude("include/linux/lockd/bind.h", arch_env), prelude)
+        self.assertEqual(self.env.header_prelude("fs/x.c", arch_env), [])                       # not a header
+        self.assertEqual(self.env.header_prelude("include/linux/types.h", arch_env), [])         # the prelude itself
+        self.assertEqual(self.env.header_prelude("include/asm-x86_64/atomic.h", arch_env), [])   # read by the prelude
+        self.assertEqual(self.env.header_prelude("include/linux/lockd/bind.h", None), [])        # no ARCH build
+        # The closure survives the pickling a parse worker receives
+        import pickle
+        clone = pickle.loads(pickle.dumps(self.env))
+        self.assertEqual(clone._prelude_closure, self.env._prelude_closure)
+        self.assertEqual(clone.header_prelude("include/linux/lockd/bind.h", arch_env), prelude)
+
+    def test_unknown_type_detection(self) -> None:
+        path = "include/linux/lockd/bind.h"
+        args, options, arch_env = self.env.args_for(path)
+        full = os.path.join(self.root, path)
+        index = cc.Index.create()
+        plain = index.parse(full, args=["-w", *args], options=options)
+        self.assertTrue(compile_env.has_unknown_type(plain, full))
+        retry = index.parse(full, args=["-w", *args, *self.env.header_prelude(path, arch_env)], options=options)
+        self.assertFalse(compile_env.has_unknown_type(retry, full))
+        self.assertLess(compile_env.diagnostics_fact(retry, arch_env)["errors"],
+                        compile_env.diagnostics_fact(plain, arch_env)["errors"])
+
+
 class TestGeneratedHeaders(unittest.TestCase):
     def test_helpers(self) -> None:
         self.assertEqual(kernel_release("VERSION = 6\nPATCHLEVEL = 19\nSUBLEVEL = 0\nEXTRAVERSION =\n"), (6, 19, 0, ""))
@@ -309,6 +356,13 @@ class TestGeneratedHeaders(unittest.TestCase):
                      "#define CONFIG_I 3"):
             self.assertIn(line, auto)
         self.assertNotIn("CONFIG_C", auto)
+        bounds = "DEFINE(NR_PAGEFLAGS, __NR_PAGEFLAGS);\nDEFINE(MAX_NR_ZONES, __MAX_NR_ZONES);\nDEFINE(SPINLOCK_SIZE, sizeof(spinlock_t));\n"
+        self.assertEqual(bounds_aliases(bounds), {"NR_PAGEFLAGS": "__NR_PAGEFLAGS", "MAX_NR_ZONES": "__MAX_NR_ZONES"})
+        text = generated_headers({"Makefile", "kernel/bounds.c"}, {"Makefile": "VERSION = 3\n", "kernel/bounds.c": bounds}.get,
+                                 "x86_64", "x86", {})["include/generated/bounds.h"]
+        # An enumerator value reads as 0 in #if and as the enum's value in C; an expression value stays 0
+        for line in ("#define MAX_NR_ZONES __MAX_NR_ZONES", "#define NR_PAGEFLAGS __NR_PAGEFLAGS", "#define SPINLOCK_SIZE 0"):
+            self.assertIn(line, text)
 
     def test_default_defconfig_and_tree_files_win(self) -> None:
         files = {"arch/x86/Makefile", "arch/x86/configs/x86_64_defconfig", "arch/x86/configs/i386_defconfig"}

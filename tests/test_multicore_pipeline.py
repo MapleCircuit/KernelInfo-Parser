@@ -121,6 +121,36 @@ def _unstartable_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     conn.close()
 
 
+class TestHeaderPreludeWorkerResult(unittest.TestCase):
+    """A header parsed again after the header prelude (parser/compile_env.py `header_prelude()`) returns a worker
+    result like any other: no translation unit or environment on the ChangeSet, the retry noted in its facts."""
+
+    def test_prelude_retry_changeset_pickles(self) -> None:
+        import parser.c_ast.c_ast as c_ast_mod
+        from parser import compile_env
+        from tests.test_c_ast import parse_snippet
+        from tests.test_compile_env import TREE
+
+        facts: list[dict] = []
+        real_stage = c_ast_mod.stage_parse_diagnostics
+
+        def stage(cs):
+            facts.append(dict(cs.parse_diagnostics or {}))
+            real_stage(cs)
+
+        def inspect(cs):
+            for name in ("compile_env", "compile_arch", "parse_diagnostics"):
+                self.assertIsNone(getattr(cs, name, None))
+            clone = pickle.loads(pickle.dumps(cs))
+            self.assertEqual(clone.current_path, "include/linux/lockd/bind.h")
+
+        extra = {k: v for k, v in TREE.items() if k != "fs/x.c"}
+        with mock.patch.object(c_ast_mod, "stage_parse_diagnostics", stage):
+            parse_snippet("struct b { u32 cookie; };\n", "include/linux/lockd/bind.h", extra_files=extra, inspect=inspect)
+        self.assertEqual(facts[0].get("prelude"), compile_env.HEADER_PRELUDE)
+        self.assertEqual(facts[0]["errors"], 0)
+
+
 class TestWorkerChangeSelection(unittest.TestCase):
     def setUp(self) -> None:
         self._saved = (main.gp.worker_change_list, main.gp.Change_List)

@@ -1686,6 +1686,23 @@ class Ast_MacroRefExpr(Ast):
             CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0]))
 
 
+class Ast_TypeRefExpr(Ast):
+    """A type named inside an expression (`TYPE_REF` of `sizeof(struct T)`, `(T *)x`, `offsetof(struct T, f)`,
+    a compound literal): a `SymbolRole.TypeUsage` reference of the record / enum / typedef, no AST node."""
+
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_SCtypedef
+        self.name = name
+        self.cursor = cursor
+
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        from parser.c_ast.cursor_tree import resolve_cursor_type_ast
+        t_id, ref_ast_id = resolve_cursor_type_ast(CS, getattr(self, "cursor", None))
+        if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
+            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.TypeUsage), self.extent.line_pos[0], self.extent.char_pos[0]))
+
+
 class Ast_BinaryOperator(Ast):
     def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
         super().__init__(extent, end_mode)

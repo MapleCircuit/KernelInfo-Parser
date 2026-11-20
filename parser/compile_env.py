@@ -62,6 +62,9 @@ DIAG_FAMILY = 7             # m_blob_facts family of the parse diagnostics
 DIAG_FORMAT = 1
 _MAX_MISSING = 64
 _C_ONLY_FORCED = ("include/linux/compiler_types.h",)
+HEADER_PRELUDE = "include/linux/types.h"   # retry prelude of a header that is not self-contained (header_prelude())
+_INCLUDE_LINE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*([<"])([^>"]+)[>"]', re.M)
+_UNKNOWN_TYPE = "unknown type name"
 
 # --target of an ARCH tree: (64-bit triple, 32-bit triple); None keeps libclang's host target
 _TARGETS: dict[str, tuple[str | None, str | None]] = {
@@ -235,6 +238,7 @@ class CompileEnv:
         self._dir_own_includes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
         self._dir_includes_cache: dict[str, tuple[str, ...]] = {}
         self._resolvers: dict[str, IncludeResolver] = {}
+        self._prelude_closure: dict[str, frozenset[str]] = {}
         if layouts is not None:
             self.arch_values = sorted(layouts)
             self._layouts: dict[str, ArchLayout | None] = dict(layouts)
@@ -416,6 +420,7 @@ class CompileEnv:
         self.__dict__.update(state)
         self._lock = threading.Lock()
         self.__dict__.setdefault("_resolvers", {})
+        self.__dict__.setdefault("_prelude_closure", {})
 
     def _pick_default(self, preferred: str) -> str | None:
         for name in (preferred, "x86_64", "i386", "x86", *self.arch_values):
@@ -594,6 +599,40 @@ class CompileEnv:
             args += ["-include", src]
         return args, KEEP_GOING, env
 
+    def header_prelude(self, path: str, arch_env: ArchEnv | None) -> list[str]:
+        """`-include` arguments of the header prelude (`HEADER_PRELUDE`) for a C header `path`, [] when none applies.
+
+        A header the kernel only reaches after `<linux/types.h>` (`u32` in `include/linux/lockd/bind.h`) is not
+        self-contained; parsed alone, its primitive kernel types are unknown and every declaration using one is a
+        syntax error. The prelude is the retry of such a parse (`parser/c_ast/c_ast.py`): never for a non-header,
+        without an ARCH build, or for a file the prelude itself reads (its static `#include` closure, which a
+        forced copy would hide behind its include guard)."""
+        if arch_env is None or not path.endswith(".h") or HEADER_PRELUDE not in self.files:
+            return []
+        if path in self._prelude_files(arch_env):
+            return []
+        return ["-include", os.path.join(self.root, HEADER_PRELUDE)]
+
+    def _prelude_files(self, arch_env: ArchEnv) -> frozenset[str]:
+        """Tree files `HEADER_PRELUDE` reaches through `#include` lines (every branch of `#if`: a superset)."""
+        closure = self._prelude_closure.get(arch_env.arch)
+        if closure is not None:
+            return closure
+        seen: set[str] = set()
+        todo = [HEADER_PRELUDE]
+        while todo:
+            current = todo.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for quote, name in _INCLUDE_LINE.findall(self.read(current) or ""):
+                hit = self.resolve_include(name, current, quoted=quote == '"', arch_env=arch_env)
+                if hit and hit not in seen:
+                    todo.append(hit)
+        closure = frozenset(seen)
+        self._prelude_closure[arch_env.arch] = closure
+        return closure
+
     # ------------------------------------------------------------------ paths
     def resolve_include(self, name: str, including_file: str, quoted: bool = False,
                         arch_env: ArchEnv | None = None) -> str | None:
@@ -674,7 +713,8 @@ _MISSING_RE = re.compile(r"'([^']+)' file not found")
 
 
 def diagnostics_fact(tu: Any, env: ArchEnv | None, asm: bool = False) -> dict[str, Any]:
-    """Family 7 record of a translation unit: {arch, defconfig, config, libclang, errors, missing}.
+    """Family 7 record of a translation unit: {arch, defconfig, config, libclang, errors, missing} (the C parser
+    adds `prelude`, the `HEADER_PRELUDE` path, to the record of a header parsed after it).
 
     For assembly (`asm`), libclang reads the preprocessed text as C: only preprocessor errors count.
     """
@@ -699,6 +739,19 @@ def diagnostics_fact(tu: Any, env: ArchEnv | None, asm: bool = False) -> dict[st
         "errors": errors,
         "missing": missing,
     }
+
+
+def has_unknown_type(tu: Any, main_file: str) -> bool:
+    """True when libclang reports an unknown type name in `main_file` itself (a header that is not self-contained)."""
+    try:
+        for d in tu.diagnostics:
+            if d.severity >= 3 and d.spelling.startswith(_UNKNOWN_TYPE):
+                f = d.location.file
+                if f is not None and f.name == main_file:
+                    return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def encode_fact(record: dict[str, Any]) -> bytes:

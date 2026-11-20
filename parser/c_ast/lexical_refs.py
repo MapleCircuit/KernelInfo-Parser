@@ -167,9 +167,15 @@ def _build_token_scopes(
             # Sort innermost (smallest line span, deepest sid) first
             spans.sort(key=lambda item: (item[2], -item[3]))
 
+            # Spans covering each line, innermost first (a token tests only the spans of its own line)
+            spans_by_line: dict[int, list[tuple[tuple[int, int], tuple[int, int], int, int]]] = {}
+            for span in spans:
+                for span_line in range(span[0][0], span[1][0] + 1):
+                    spans_by_line.setdefault(span_line, []).append(span)
+
             def scope_at(line: int, col: int) -> int:
                 pos = (line, col)
-                for start, end, _len, sid in spans:
+                for start, end, _len, sid in spans_by_line.get(line, ()):
                     if start <= pos <= end:
                         return sid
                 return 0
@@ -318,6 +324,14 @@ def _is_declared_in_scope(name: str, scope_id: int, parents: list[int | None], d
     return False
 
 
+def _is_candidate(text: str, kind: str, line: int, col: int, state: int, covered: set[tuple[int, int]],
+                  directive_lines: set[int]) -> bool:
+    """The token-local conditions of a candidate (the scope and neighbour checks of `lexical_refs()` only drop more)."""
+    return (kind == KIND_IDENTIFIER and state in (CUR_NONE, CUR_UNRESOLVED) and line not in directive_lines
+            and (line, col) not in covered and text not in _NOT_NAMES and text not in STANDARD_C_KEYWORDS
+            and _is_name(text))
+
+
 def lexical_refs(tokens: list[tuple[str, str, int, int, int]], covered: set[tuple[int, int]],
                  directive_lines: set[int],
                  rawfile: Iterable[str] | None = None) -> list[tuple[str, int, int, int, int]]:
@@ -328,6 +342,9 @@ def lexical_refs(tokens: list[tuple[str, str, int, int, int]], covered: set[tupl
     """
     out: list[tuple[str, int, int, int, int]] = []
     n = len(tokens)
+    if not any(_is_candidate(text, kind, line, col, state, covered, directive_lines)
+               for text, kind, line, col, state in tokens):
+        return out  # every identifier is explained: no scope model needed
     parents, decls, tok_scope, extra_decl_indices = _build_token_scopes(tokens, directive_lines, rawfile)
     for i, (text, kind, line, col, state) in enumerate(tokens):
         if kind != KIND_IDENTIFIER or state in (CUR_RESOLVED, CUR_DECL, CUR_PARAM_DECL) or i in extra_decl_indices or line in directive_lines:
@@ -414,20 +431,44 @@ def record_lexical_refs(CS: Any, tokens_array: list[Any], rawfile: Iterable[str]
     from parser.c_ast.tokenizer import AST_KIND
     from core.SymbolRows import collector
 
-    kinds = {AST_KIND.identifier: KIND_IDENTIFIER, AST_KIND.keyword: KIND_KEYWORD, AST_KIND.punctuation: KIND_PUNCT}
-    toks: list[tuple[str, str, int, int, int]] = []
-    for tok in tokens_array:
-        kind = kinds.get(tok.ast_kind, KIND_OTHER)
-        if kind == KIND_OTHER and tok.ast_kind == AST_KIND.comment:
-            continue
-        state = _cursor_state(tok._cursor, tok.spelling_str) if kind == KIND_IDENTIFIER else CUR_RESOLVED
-        toks.append((tok.spelling_str, kind, int(tok.line.line_pos[0]), int(tok.line.char_pos[0]), state))
     col = collector(CS)
     covered: set[tuple[int, int]] = set()
     for p in col.placements.values():
         covered.update((item[3], item[4]) for item in p.refs)
     covered.update((item[3], item[4]) for _tag, item in col.loose_refs)
-    found = lexical_refs(toks, covered, directive_lines_of(rawfile), rawfile)
+    directive_lines = directive_lines_of(rawfile)
+
+    # Fast path: the cursor state (libclang calls) of only the identifiers no reference covers; when none of them
+    # is unexplained, the file has no lexical reference and the full token conversion and scope model are skipped
+    identifier = AST_KIND.identifier
+    states: dict[int, int] = {}
+    for idx, tok in enumerate(tokens_array):
+        if tok.ast_kind != identifier:
+            continue
+        text = tok.spelling_str
+        line = int(tok.line.line_pos[0])
+        column = int(tok.line.char_pos[0])
+        if (line in directive_lines or (line, column) in covered or text in _NOT_NAMES or text in STANDARD_C_KEYWORDS
+                or not _is_name(text)):
+            continue
+        states[idx] = _cursor_state(tok._cursor, text)
+    if not any(state in (CUR_NONE, CUR_UNRESOLVED) for state in states.values()):
+        return 0
+
+    kinds = {AST_KIND.identifier: KIND_IDENTIFIER, AST_KIND.keyword: KIND_KEYWORD, AST_KIND.punctuation: KIND_PUNCT}
+    toks: list[tuple[str, str, int, int, int]] = []
+    for idx, tok in enumerate(tokens_array):
+        kind = kinds.get(tok.ast_kind, KIND_OTHER)
+        if kind == KIND_OTHER and tok.ast_kind == AST_KIND.comment:
+            continue
+        if kind == KIND_IDENTIFIER:
+            state = states.get(idx)
+            if state is None:
+                state = _cursor_state(tok._cursor, tok.spelling_str)
+        else:
+            state = CUR_RESOLVED
+        toks.append((tok.spelling_str, kind, int(tok.line.line_pos[0]), int(tok.line.char_pos[0]), state))
+    found = lexical_refs(toks, covered, directive_lines, rawfile)
     if not found:
         return 0
     # Innermost tag around each line (the references are stored with that tag's items)

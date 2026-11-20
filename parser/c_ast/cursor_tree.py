@@ -50,6 +50,7 @@ from parser.c_ast.ctypes_bindings import (
     _CLANG_VISIT_CHILDREN,
     _CLANG_GET_CURSOR_REFERENCED,
     _CLANG_CURSOR_IS_NULL,
+    _CLANG_MACRO_IS_FUNCTION_LIKE,
 )
 from parser.c_ast.tokenizer import (
     Line,
@@ -95,6 +96,7 @@ from parser.c_ast.ast_nodes import (
     Ast_MemberRefExpr,
     Ast_DeclRefExpr,
     Ast_MacroRefExpr,
+    Ast_TypeRefExpr,
 )
 
 logger = logging.getLogger(__name__)
@@ -333,6 +335,33 @@ _KNOWN_MACRO_FUNCS = frozenset({
     *_DEVICE_TABLE_MACROS,
     *_SYSFS_ATTR_MACROS,
 })
+
+_TYPE_REF_TARGET_KINDS = frozenset({2, 3, 5, 20})  # STRUCT_DECL, UNION_DECL, ENUM_DECL, TYPEDEF_DECL
+
+
+def _type_ref_target(cursor: Any) -> bool:
+    """True when a `TYPE_REF` cursor names a resolved record / enum / typedef (unresolved names: lexical_refs.py)."""
+    try:
+        ref = _CLANG_GET_CURSOR_REFERENCED(cursor)
+        return not _CLANG_CURSOR_IS_NULL(ref) and ref._kind_id in _TYPE_REF_TARGET_KINDS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_renamed_function_name(token: Any, cursor: Any, fn_cur: Any) -> bool:
+    """True when `token` is the declarator name of `fn_cur` spelled through an object-like macro: its cursor is the
+    `MACRO_INSTANTIATION` at the function's location (function-like wrappers such as `SYSCALL_DEFINE3` excluded)."""
+    try:
+        if getattr(cursor, "_kind_id", None) != 502:  # MACRO_INSTANTIATION
+            return False
+        loc = fn_cur.location
+        if (loc.line, loc.column) != (int(token.line.line_pos[0]), int(token.line.char_pos[0])):
+            return False
+        macro = _CLANG_GET_CURSOR_REFERENCED(cursor)
+        return not _CLANG_CURSOR_IS_NULL(macro) and not _CLANG_MACRO_IS_FUNCTION_LIKE(macro)
+    except Exception:  # noqa: BLE001
+        return False
+
 
 _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_INSTANTIATION,
@@ -1247,6 +1276,50 @@ def resolve_linkage(node: Any, default_linkage: int = SymbolLinkage.ExternalDef)
     return int(SymbolLinkage.ExternalDef)
 
 
+def _collect_expr_ref(node: Any, token: Any, cursor: Any) -> None:
+    """Queue the reference an identifier token of an expression makes on `node` (`call_exprs`, `member_refs`,
+    `decl_refs`, `macro_refs`, `type_refs`; staged by `_extract_expr_refs()`): a call, a member, a variable /
+    parameter / enumerator / function named without a call, a macro expansion, or a type."""
+    k = getattr(cursor, "kind", None)
+    if k == cc.CursorKind.CALL_EXPR:
+        node.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
+        node.call_exprs[-1].callee_cursor = cursor
+    elif k == cc.CursorKind.MEMBER_REF_EXPR:
+        node.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
+        node.member_refs[-1].member_cursor = cursor
+    elif k == cc.CursorKind.MACRO_INSTANTIATION:
+        if token.spelling_str == getattr(cursor, "spelling", ""):
+            node.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
+    elif k == cc.CursorKind.TYPE_REF:
+        # A type named in an expression: sizeof(struct T), (T *)x, offsetof(struct T, f), (struct T){...}
+        if _type_ref_target(cursor):
+            node.type_refs.append(Ast_TypeRefExpr(token.line, token.spelling_str, cursor=cursor))
+    elif k is not None and k not in _SKIP_REF_KINDS:
+        ref = getattr(cursor, "referenced", None)
+        ref_k = getattr(ref, "kind", None) if ref is not None else None
+        if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
+            node.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
+            node.call_exprs[-1].callee_cursor = cursor
+        elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
+            node.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.decl_refs[-1].decl_cursor = cursor
+        elif ref_k == cc.CursorKind.FIELD_DECL:
+            node.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.member_refs[-1].member_cursor = cursor
+        elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
+            node.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.decl_refs[-1].decl_cursor = cursor
+
+
+def _extract_expr_refs(node: Any, CS: Any) -> None:
+    """Stage the references `_collect_expr_ref()` queued on `node`."""
+    for group in (node.call_exprs, node.member_refs, node.decl_refs, node.macro_refs, node.type_refs):
+        for ref in group:
+            with CS(REF_NO_REF):
+                ref.extract(CS)
+
+
 class Ast_Statement(Ast):
     """Base class for C statement AST nodes."""
     type_id: int = ASTT.C_CompoundStmt
@@ -1263,6 +1336,7 @@ class Ast_Statement(Ast):
         self.member_refs: list[Any] = []
         self.decl_refs: list[Any] = []
         self.macro_refs: list[Any] = []
+        self.type_refs: list[Any] = []
         self._compound_kids: list[Any] = []
 
         if cursor is not None:
@@ -1335,32 +1409,7 @@ class Ast_Statement(Ast):
         for zone in reversed(self.zones):
             if not zone.completed and zone.check_exec(token, cursor, AST_KIND.identifier):
                 return
-        k = getattr(cursor, "kind", None)
-        if k == cc.CursorKind.CALL_EXPR:
-            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-            self.call_exprs[-1].callee_cursor = cursor
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-            self.member_refs[-1].member_cursor = cursor
-        elif k == cc.CursorKind.MACRO_INSTANTIATION:
-            if token.spelling_str == getattr(cursor, "spelling", ""):
-                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
-        elif k is not None and k not in _SKIP_REF_KINDS:
-            ref = getattr(cursor, "referenced", None)
-            ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
-                self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-                self.call_exprs[-1].callee_cursor = cursor
-            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
-                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
-            elif ref_k == cc.CursorKind.FIELD_DECL:
-                self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
+        _collect_expr_ref(self, token, cursor)
         self.operands.append(token.spelling_str)
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
@@ -1399,6 +1448,9 @@ class Ast_Statement(Ast):
         for macro_ref in self.macro_refs:
             with CS(REF_NO_REF):
                 macro_ref.extract(CS, create_tag=create_tags)
+        for type_ref in self.type_refs:
+            with CS(REF_NO_REF):
+                type_ref.extract(CS)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
@@ -1954,6 +2006,7 @@ class AST_Initializer(AST_Expression):
         self.member_refs: list[Ast_MemberRefExpr] = []
         self.decl_refs: list[Ast_DeclRefExpr] = []
         self.macro_refs: list[Ast_MacroRefExpr] = []
+        self.type_refs: list[Ast_TypeRefExpr] = []
         self.entries: list[InitializerEntry] = []
         self.cur_entry: InitializerEntry | None = None
         self.entry_state: int = 0
@@ -1993,32 +2046,7 @@ class AST_Initializer(AST_Expression):
         return True
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
-        k = getattr(cursor, "kind", None)
-        if k == cc.CursorKind.CALL_EXPR:
-            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-            self.call_exprs[-1].callee_cursor = cursor
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-            self.member_refs[-1].member_cursor = cursor
-        elif k == cc.CursorKind.MACRO_INSTANTIATION:
-            if token.spelling_str == getattr(cursor, "spelling", ""):
-                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
-        elif k is not None and k not in _SKIP_REF_KINDS:
-            ref = getattr(cursor, "referenced", None)
-            ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
-                self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-                self.call_exprs[-1].callee_cursor = cursor
-            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
-                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
-            elif ref_k == cc.CursorKind.FIELD_DECL:
-                self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
+        _collect_expr_ref(self, token, cursor)
         self.data.append(token.spelling_str)
 
     def exec_filter(self, token: Any, cursor: Any, ast_kind: int) -> None:
@@ -2171,6 +2199,9 @@ class AST_Initializer(AST_Expression):
                     macro_ref.extract(CS, create_tag=False)
                 except TypeError:
                     macro_ref.extract(CS)
+        for type_ref in self.type_refs:
+            with CS(REF_NO_REF):
+                type_ref.extract(CS)
 
 
 class AST_Enum_Equal(AST_Expression):
@@ -2798,10 +2829,10 @@ class C_Type(Ast):
             if (self.cursor is not None and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD})
             else cursor
         )
-        if (
-            fn_cur.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
-            and tspelling == safe_cursor_spelling(fn_cur)
+        if fn_cur.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD} and (
+            tspelling == safe_cursor_spelling(fn_cur) or _is_renamed_function_name(token, cursor, fn_cur)
         ):
+            # Also the name of a function an object-like macro renames (`#define vnic_set_nic_cfg fnic_set_nic_cfg`)
             self.name = tspelling
             tt = TypeToken(token, ASTT.C_functionproto)
             tt.is_definition = True
@@ -4418,7 +4449,9 @@ class C_Type(Ast):
                         ast_name=safe_name,
                         ast_type=main_t_id,
                     )
-                if not is_param and safe_name and not is_demoted_macro:
+                # A declarator names an identifier: a literal split off as one (the `128` of
+                # `extern DECLARE_BITMAP(map, 128);`) defines nothing
+                if not is_param and safe_name and not is_demoted_macro and (safe_name[0].isalpha() or safe_name[0] == "_"):
                     with CS(REF_POS):
                         record_symbol_def(
                             CS,
@@ -5030,6 +5063,31 @@ def _named_node(cls: type) -> Callable[[Line, Any, str], Ast]:
     return make
 
 
+class Ast_CallStmt(Ast_CallExpr):
+    """A call that is a statement of a compound statement (`Zone` child of `CALL_EXPR`): the `C_CallExpr` node and
+    `SymbolRole.Call` reference of `Ast_CallExpr`, plus the references of the argument tokens (`_collect_expr_ref()`)."""
+
+    def __init__(self, extent: Line, callee: str = "", end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode=end_mode, cursor=cursor)
+        self.callee = callee
+        self.call_exprs: list[Any] = []
+        self.member_refs: list[Any] = []
+        self.decl_refs: list[Any] = []
+        self.macro_refs: list[Any] = []
+        self.type_refs: list[Any] = []
+        self._callee_seen = False
+
+    def exec_identifier(self, token: Any, cursor: Any) -> None:
+        if not self._callee_seen and token.spelling_str == self.callee:
+            self._callee_seen = True  # the callee: the call's own reference (Ast_CallExpr.extract)
+            return
+        _collect_expr_ref(self, token, cursor)
+
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        super().extract(CS, create_tag=create_tag)
+        _extract_expr_refs(self, CS)
+
+
 def _unary_expr_node(extent: Line, cursor: Any, sp: str) -> Ast:
     """sizeof / alignof (`UNARY_EXPR`): alignof when the spelling or the first token says so."""
     if cursor is not None:
@@ -5066,7 +5124,7 @@ def _child_node_factories() -> dict[Any, Callable[[Line, Any, str], Ast]]:
         "CONTINUE_STMT": plain(Ast_ContinueStmt),
         "GOTO_STMT": plain(Ast_GotoStmt),
         "LABEL_STMT": plain(Ast_LabelStmt),
-        "CALL_EXPR": plain(Ast_CallExpr),
+        "CALL_EXPR": lambda extent, cursor, sp: Ast_CallStmt(extent, sp, end_mode=End_Mode.Extent, cursor=cursor),
         "MEMBER_REF_EXPR": plain(Ast_MemberRefExpr),
         "DECL_REF_EXPR": plain(Ast_DeclRefExpr),
         "MACRO_INSTANTIATION": lambda extent, cursor, sp: Ast_MacroRefExpr(extent, sp, end_mode=End_Mode.Extent, cursor=cursor),

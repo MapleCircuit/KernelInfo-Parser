@@ -14,8 +14,10 @@ sys.setrecursionlimit(50000)
 import time
 import shutil
 import unittest
+from unittest import mock
 import subprocess
 import multiprocessing
+import contextlib
 import hashlib
 from typing import Any
 
@@ -4173,9 +4175,11 @@ def run_c_ast_tests(
         return 1
 
 
-def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[tuple], list[tuple]]:
+def parse_snippet(code: str, path: str = "include/linux/snip.h", extra_files: dict[str, str] | None = None,
+                  inspect: Any = None) -> tuple[list[tuple], list[tuple]]:
     """Parse one C file in a sandbox tree (MockDB): ([(line, col, role name, target name, target type name)],
-    [(line_s, name, type name, linkage name)])."""
+    [(line_s, name, type name, linkage name)]). `extra_files` adds tree files (a Makefile gives the tree a build
+    layout); `inspect(cs)` sees the ChangeSet after the parse."""
     import shutil
     import tempfile
     from core.globalstuff import SymbolLinkage, SymbolRole
@@ -4192,6 +4196,11 @@ def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[t
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, "w", encoding="latin-1") as fh:
             fh.write(code)
+        for extra_path, extra_text in (extra_files or {}).items():
+            extra_dest = os.path.join(root, extra_path)
+            os.makedirs(os.path.dirname(extra_dest), exist_ok=True)
+            with open(extra_dest, "w", encoding="latin-1") as fh:
+                fh.write(extra_text)
         mf = MasterFile()
         mf.version_dict["v3.0"] = root
         G.MF = mf
@@ -4204,6 +4213,8 @@ def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[t
         G.CURRENT_PARSING_FILE = path
         default_processing(cs, gp)
         cs.parse()
+        if inspect is not None:
+            inspect(cs)
         cs.execute()
         G.TE.commit_all()
         st = MockDB.store
@@ -4220,6 +4231,11 @@ def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[t
         return refs, defs
     finally:
         clear_tu_caches()
+        if extra_files:
+            from parser import compile_env
+            for env in list(compile_env._TREE_ENVS.values()):
+                if env.root == os.path.abspath(root).rstrip("/"):
+                    env.cleanup()
         shutil.rmtree(root, ignore_errors=True)
         G.CURRENT_PARSING_FILE = None
         if G.TE:
@@ -4480,6 +4496,101 @@ class TestHeaderReferenceCompleteness(unittest.TestCase):
         self.assertIn((10, "DeclRef", "proto_only"), by_line_name)
         self.assertIn((10, "DeclRef", "field_only"), by_line_name)
         self.assertIn((12, "DeclRef", "local_y"), by_line_name)
+
+
+class TestExpressionReferences(unittest.TestCase):
+    """References inside expressions (parser/c_ast/cursor_tree.py `_collect_expr_ref()`), declarations libclang
+    spells through macros, the lexical fast path and the header prelude (parser/compile_env.py `header_prelude()`)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_type_names_in_expressions(self) -> None:
+        refs, _defs = parse_snippet(
+            "#define offsetof(T, m) __builtin_offsetof(T, m)\n"
+            "#define container_of(p, T, m) ((T *)((char *)(p) - offsetof(T, m)))\n"
+            "typedef unsigned int u32;\nstruct foo { int a; struct foo *next; };\nunion bar { int x; };\nenum col { RED };\n"
+            "static unsigned long f(void *p, struct foo *q)\n{\n"
+            "\tunsigned long n = sizeof(struct foo) + sizeof(union bar) + sizeof(u32);\n"
+            "\tstruct foo *x = (struct foo *)p;\n"
+            "\tstruct foo *z = container_of(&q->next, struct foo, next);\n"
+            "\tn += offsetof(struct foo, a) + (enum col)0;\n"
+            "\treturn n + ((struct foo){ .a = 1 }).a + (unsigned long)x + (unsigned long)z;\n}\n"
+            "static int g = sizeof(struct foo);\n", "kernel/expr.c")
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((9, 34, "TypeUsage", "foo"), (9, 54, "TypeUsage", "bar"), (9, 68, "TypeUsage", "u32"),  # sizeof
+                     (10, 26, "TypeUsage", "foo"),                                                          # (T *)x
+                     (11, 48, "TypeUsage", "foo"),                                                          # container_of
+                     (12, 23, "TypeUsage", "foo"), (12, 39, "TypeUsage", "col"),                            # offsetof, enum cast
+                     (13, 22, "TypeUsage", "foo"),                                                          # compound literal
+                     (15, 30, "TypeUsage", "foo")):                                                         # initializer
+            self.assertIn(item, got)
+
+    def test_arguments_of_a_call_statement(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct s { int f; };\nvoid use(int a, int b);\nint helper(int v);\n"
+            "void g(struct s *p, int n)\n{\n\tuse(p->f, helper(n));\n\tuse(n, sizeof(struct s));\n}\n", "kernel/call.c")
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((6, 2, "Call", "use"), (6, 6, "DeclRef", "p"), (6, 9, "MemberRef", "f"), (6, 12, "Call", "helper"),
+                     (6, 19, "DeclRef", "n"), (7, 6, "DeclRef", "n"), (7, 23, "TypeUsage", "s")):
+            self.assertIn(item, got)
+        self.assertEqual(sum(1 for line, col, role, *_x in got if (line, col, role) == (6, 2, "Call")), 1)
+
+    def test_function_renamed_by_a_macro_and_literal_declarators(self) -> None:
+        refs, defs = parse_snippet(
+            "typedef unsigned char u8;\n#define vset fset\nstatic inline void vset(u8 *p, u8 a)\n{\n\t*p = a;\n}\n"
+            "#define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]\nextern DECLARE_BITMAP(zmap, 128);\n",
+            "drivers/x/rename.h")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        self.assertIn((3, "vset", "C_functionprotodecl"), found)
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((3, 25, "TypeUsage", "u8"), (3, 32, "TypeUsage", "u8"), (5, 3, "DeclRef", "p"), (5, 7, "DeclRef", "a")):
+            self.assertIn(item, got)
+        names = {name for _l, name, _t, _k in defs}
+        self.assertIn("zmap", names)
+        self.assertNotIn("128", names)  # a literal is no declarator name
+
+    def test_lexical_fast_path_skips_the_scope_model(self) -> None:
+        from unittest import mock
+        from parser.c_ast import c_scope
+        from parser.c_ast.lexical_refs import CUR_NONE, CUR_RESOLVED, KIND_IDENTIFIER, KIND_PUNCT, lexical_refs
+
+        resolved = [("x", KIND_IDENTIFIER, 1, 1, CUR_RESOLVED), (";", KIND_PUNCT, 1, 2, CUR_RESOLVED),
+                    ("y", KIND_IDENTIFIER, 2, 1, CUR_NONE), (";", KIND_PUNCT, 2, 2, CUR_RESOLVED)]
+        with mock.patch.object(c_scope, "extract_scopes", wraps=c_scope.extract_scopes) as scopes:
+            # y is covered by a parser reference: no candidate, no scope model
+            self.assertEqual(lexical_refs(resolved, {(2, 1)}, set(), ("x;", "y;")), [])
+            self.assertEqual(scopes.call_count, 0)
+            # y on a directive line: no candidate either
+            self.assertEqual(lexical_refs(resolved, set(), {2}, ("x;", "y;")), [])
+            self.assertEqual(scopes.call_count, 0)
+            out = lexical_refs(resolved, set(), set(), ("x;", "y;"))
+            self.assertEqual([name for name, *_x in out], ["y"])
+            self.assertEqual(scopes.call_count, 1)
+
+    def test_header_prelude_retry(self) -> None:
+        from parser import compile_env
+        from tests.test_compile_env import TREE
+
+        extra = {k: v for k, v in TREE.items() if k != "fs/x.c"}
+        extra["include/linux/types.h"] = "#ifndef _LINUX_TYPES_H\n#define _LINUX_TYPES_H\ntypedef unsigned int u32;\n#endif\n"
+        code = ("struct nlm_host;\nstruct nlmsvc_binding {\n\tu32 (*fopen)(struct nlm_host *, u32);\n};\n"
+                "static inline u32 nlm_next(u32 v, struct nlm_host *h)\n{\n\treturn v + 1;\n}\n#include <linux/types.h>\n")
+        includes: dict[str, dict[int, str]] = {}
+        results = {}
+        for label in ("plain", "prelude"):
+            def inspect(cs: Any, label: str = label) -> None:
+                includes[label] = dict(cs.resolved_includes_by_line)
+            with mock.patch.object(compile_env.CompileEnv, "header_prelude", return_value=[]) if label == "plain" else contextlib.nullcontext():
+                results[label] = parse_snippet(code, "include/linux/lockd/bind.h", extra_files=extra, inspect=inspect)
+        plain = {(line, col, role, name) for line, col, role, name, _t in results["plain"][0]}
+        prelude = {(line, col, role, name) for line, col, role, name, _t in results["prelude"][0]}
+        self.assertTrue(plain < prelude)
+        self.assertIn((3, 34, "TypeUsage", "u32"), prelude - plain)  # the parameter after the unknown type
+        self.assertIn((7, 9, "DeclRef", "v"), prelude - plain)
+        # The header's own #include stays mapped: the include map is read from the parse without the prelude
+        self.assertEqual(includes["plain"], {9: "include/linux/types.h"})
+        self.assertEqual(includes["prelude"], includes["plain"])
 
 
 if __name__ == "__main__":
