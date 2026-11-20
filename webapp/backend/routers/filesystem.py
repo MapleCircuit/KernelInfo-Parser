@@ -8,7 +8,9 @@ from fastapi.responses import JSONResponse, Response
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.filesystem_service import FilesystemService
 from webapp.backend.services.grep_service import grep_service
+from webapp.backend.services.imports_service import imports_service
 from webapp.backend.services.outline_service import outline_service
+from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
 
 router = APIRouter(prefix="/api", tags=["filesystem"])
 fs_service = FilesystemService()
@@ -123,6 +125,17 @@ def get_outline(
     """Definitions of one file (functions, types, macros, variables, kernel API entries, Kconfig entries,
     Rust items) sorted by line and nested by containment, for the code view's outline and sticky scroll."""
     return outline_service.get_outline(version_name, path)
+
+
+@router.get("/fs/imports/{version_name}")
+def get_imports(
+    version_name: str,
+    path: Annotated[str, Query(description="Repository-relative C, header or assembly file path")] = "",
+    arch: Annotated[str, Query(description="ARCH whose build layout resolves #include (default x86_64)")] = DEFAULT_DEFINITION_ARCH,
+) -> dict[str, Any]:
+    """Symbols a C / header / assembly file references that headers on its #include chain define, with each
+    header's include chain, for the code view's Imports panel."""
+    return imports_service.get_imports(version_name, path, arch)
 
 
 @router.post("/version/{version_name}/treemap/build")

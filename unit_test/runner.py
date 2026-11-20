@@ -79,6 +79,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_grep",
     "tests.test_webapp_blame",
     "tests.test_webapp_outline",
+    "tests.test_webapp_imports",
     "tests.test_webapp_rust_refs",
     "tests.test_webapp_release_index",
     "tests.test_webapp_commit_query",

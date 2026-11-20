@@ -106,9 +106,18 @@ export class OutlinePanel {
 
   toggle() {
     const next = !this.open;
+    // The Imports panel shares the side of the editor (imports_panel.js)
+    if (next) this.editor.imports?.close?.();
     this.editor.persistTab({ outlineOpen: next || null });
     if (next) this.showPanel();
     else this.hidePanel();
+    this.updateButton();
+  }
+
+  close() {
+    if (!this.open && !this.panelEl) return;
+    this.editor.persistTab({ outlineOpen: null });
+    this.hidePanel();
     this.updateButton();
   }
 

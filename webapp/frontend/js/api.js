@@ -695,6 +695,15 @@ class ApiClient {
     return this.request(`/api/fs/outline/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `outline_${this._vk(ver)}_${path}`);
   }
 
+  /** Symbols a C / header / assembly file imports through its `#include` chain for ARCH=`arch`
+   * (`GET /api/fs/imports`, §4.2): the code view's Imports panel. */
+  async getFileImports(version, path, arch = "x86_64") {
+    const ver = this._sanitizeVer(version);
+    const a = arch || "x86_64";
+    const q = new URLSearchParams({ path, arch: a }).toString();
+    return this.request(`/api/fs/imports/${encodeURIComponent(ver)}?${q}`, {}, "files", `imports_${this._vk(ver)}_${a}_${path}`);
+  }
+
   async searchFiles(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit }).toString();
