@@ -30,11 +30,14 @@ the parse workers fork); without one, `for_tree()` builds and caches one from a 
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
 import glob
 import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import tempfile
@@ -44,8 +47,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.FileHandler import mark_owner
+from core.globalstuff import G
 from parser.arch_layout import ArchLayout, arch_values, layout_for, path_arch
-from parser.make_eval import Tree
+from parser.make_eval import SRC_ROOT, UNKNOWN, MakeEvaluator, Tree, tree_path
 from parser.generated_headers import config_digest, defconfig_values, generated_headers
 
 logger = logging.getLogger(__name__)
@@ -75,49 +80,92 @@ _LOCK = threading.Lock()
 _RESOURCE: list[str | None] = []
 _VERSION: list[str] = []
 
+_DIR_OWN_VARS = ("ccflags-y", "ccflags-m", "ccflags-", "EXTRA_CFLAGS")
+_DIR_SUBDIR_VARS = ("subdir-ccflags-y", "subdir-ccflags-m", "subdir-ccflags-")
+
+
+def _reset_locks_in_child() -> None:
+    global _LOCK
+    _LOCK = threading.Lock()
+    if _ACTIVE is not None:
+        _ACTIVE._lock = threading.Lock()
+    for env in list(_TREE_ENVS.values()):
+        env._lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_locks_in_child)
+
+
+def _atexit_cleanup() -> None:
+    pid = os.getpid()
+    envs: list[CompileEnv] = []
+    if _ACTIVE is not None:
+        envs.append(_ACTIVE)
+    envs.extend(_TREE_ENVS.values())
+    for env in envs:
+        if getattr(env, "_owner_pid", pid) == pid:
+            with contextlib.suppress(Exception):
+                env.cleanup()
+
+
+atexit.register(_atexit_cleanup)
+
 
 def clang_resource_include() -> str | None:
     """The `include/` of the loaded libclang's resource directory (stddef.h, stdarg.h), None when not found."""
     if _RESOURCE:
         return _RESOURCE[0]
-    found = None
-    try:
-        import clang.cindex as cc
-        lib = cc.conf.lib._name if hasattr(cc.conf.lib, "_name") else ""
-    except Exception:  # noqa: BLE001
-        lib = ""
-    m = re.search(r"libclang-(\d+)", lib or "")
-    majors = [m.group(1)] if m else []
-    patterns = []
-    for major in majors:
-        patterns += [f"/usr/lib/llvm-{major}/lib/clang/*/include", f"/usr/lib/clang/{major}*/include",
-                     f"/usr/include/clang/{major}*/include", f"/usr/lib64/clang/{major}*/include"]
-    patterns += ["/usr/lib/llvm-*/lib/clang/*/include", "/usr/lib/clang/*/include", "/usr/lib64/clang/*/include"]
-    for pattern in patterns:
-        hits = sorted(h for h in glob.glob(pattern) if os.path.isfile(os.path.join(h, "stddef.h")))
-        if hits:
-            found = hits[-1]
-            break
-    _RESOURCE.append(found)
-    return found
+    with _LOCK:
+        if _RESOURCE:
+            return _RESOURCE[0]
+        found = None
+        try:
+            import clang.cindex as cc
+            lib = cc.conf.lib._name if hasattr(cc.conf.lib, "_name") else ""
+        except Exception:  # noqa: BLE001
+            lib = ""
+        m = re.search(r"libclang-(\d+)", lib or "")
+        majors = [m.group(1)] if m else []
+        patterns = []
+        for major in majors:
+            patterns += [f"/usr/lib/llvm-{major}/lib/clang/*/include", f"/usr/lib/clang/{major}*/include",
+                         f"/usr/include/clang/{major}*/include", f"/usr/lib64/clang/{major}*/include"]
+        patterns += ["/usr/lib/llvm-*/lib/clang/*/include", "/usr/lib/clang/*/include", "/usr/lib64/clang/*/include"]
+        for pattern in patterns:
+            hits = sorted(h for h in glob.glob(pattern) if os.path.isfile(os.path.join(h, "stddef.h")))
+            if hits:
+                found = hits[-1]
+                break
+        _RESOURCE.append(found)
+        return found
 
 
 def libclang_version() -> str:
     """The loaded libclang: library name and resource directory version ("libclang-20.so/20"), "" when unknown."""
     if _VERSION:
         return _VERSION[0]
-    try:
-        import clang.cindex as cc
-        name = os.path.basename(getattr(cc.conf.lib, "_name", "") or "")
-    except Exception:  # noqa: BLE001
-        name = ""
     resource = clang_resource_include() or ""
-    _VERSION.append(f"{name}/{os.path.basename(os.path.dirname(resource))}" if name or resource else "")
-    return _VERSION[0]
+    with _LOCK:
+        if _VERSION:
+            return _VERSION[0]
+        try:
+            import clang.cindex as cc
+            name = os.path.basename(getattr(cc.conf.lib, "_name", "") or "")
+        except Exception:  # noqa: BLE001
+            name = ""
+        _VERSION.append(f"{name}/{os.path.basename(os.path.dirname(resource))}" if name or resource else "")
+        return _VERSION[0]
 
 
 def _build_base() -> str:
-    base = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else tempfile.gettempdir()
+    ramdisk = getattr(G, "RAMDISK", None)
+    if ramdisk and os.path.isdir(ramdisk) and os.access(ramdisk, os.W_OK):
+        base = ramdisk
+    elif os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        base = "/dev/shm"
+    else:
+        base = tempfile.gettempdir()
     return os.path.join(base, "kip_build")
 
 
@@ -158,15 +206,20 @@ class CompileEnv:
                  build_base: str | None = None, configure: bool = True) -> None:
         """`layouts`: the revision's layouts by ARCH; None evaluates them from the tree's Makefiles on first use."""
         self.root = os.path.abspath(root).rstrip("/")
+        self._real_root = os.path.realpath(self.root).rstrip("/")
         self.files = files if isinstance(files, set) else set(files)
         self.read = read
         self.key = key or self.root
         self.configure = configure
-        self.build_base = build_base or _build_base()
+        self.build_base = os.path.abspath(build_base or _build_base()).rstrip("/")
+        self._real_build_base = os.path.realpath(self.build_base).rstrip("/")
+        self._owner_pid = os.getpid()
         self._lock = threading.Lock()
         self._envs: dict[str, ArchEnv] = {}
         self._tree: Tree | None = None
         self._parsed: dict = {}
+        self._dir_own_includes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        self._dir_includes_cache: dict[str, tuple[str, ...]] = {}
         if layouts is not None:
             self.arch_values = sorted(layouts)
             self._layouts: dict[str, ArchLayout | None] = dict(layouts)
@@ -185,20 +238,138 @@ class CompileEnv:
         """Layout of an ARCH value (evaluated once), None when the revision does not build it."""
         if not arch or arch not in self.arch_values:
             return None
-        if arch not in self._layouts:
-            try:
-                self._layouts[arch] = layout_for(arch, self._tree_view(), self.read, parsed=self._parsed)
-            except Exception as exc:  # noqa: BLE001 - one ARCH's Makefiles must not stop the parse
-                logger.warning("ARCH=%s: Makefile evaluation failed: %s", arch, exc)
-                self._layouts[arch] = None
-        return self._layouts[arch]
+        if arch in self._layouts:
+            return self._layouts[arch]
+        with self._lock:
+            if arch not in self._layouts:
+                try:
+                    self._layouts[arch] = layout_for(arch, self._tree_view(), self.read, parsed=self._parsed)
+                except Exception as exc:  # noqa: BLE001 - one ARCH's Makefiles must not stop the parse
+                    logger.warning("ARCH=%s: Makefile evaluation failed: %s", arch, exc)
+                    self._layouts[arch] = None
+            return self._layouts[arch]
+
+    # ------------------------------------------------------------------ per-directory -I flags
+    @staticmethod
+    def _extract_inc_dirs(text: str, directory: str, tree: Tree) -> list[str]:
+        if not text:
+            return []
+        tokens = [w for w in text.split() if UNKNOWN not in w]
+        out: list[str] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("-I", "-iquote", "-isystem") and i + 1 < len(tokens):
+                raw_val, i = tokens[i + 1], i + 2
+            elif tok.startswith("-I") and len(tok) > 2:
+                raw_val, i = tok[2:], i + 1
+            elif tok.startswith("-iquote") and len(tok) > 7:
+                raw_val, i = tok[7:], i + 1
+            else:
+                i += 1
+                continue
+            val = raw_val.strip().strip("\"'")
+            if not val or "$" in val or UNKNOWN in val:
+                continue
+            while val.startswith(f"{SRC_ROOT}/{SRC_ROOT}"):
+                val = val[len(SRC_ROOT) + 1:]
+            anchored = val.startswith((SRC_ROOT, "/"))
+            candidates: list[str | None] = []
+            if anchored:
+                candidates.append(tree_path(val))
+            else:
+                candidates.append(tree_path(val))
+                if directory:
+                    candidates.append(tree_path(val, directory))
+            resolved: str | None = None
+            for cand in candidates:
+                if cand is not None and (cand == "" or tree.is_dir(cand) or "generated" in cand.split("/")):
+                    resolved = cand
+                    break
+            if resolved is None and candidates and candidates[0] is not None and not directory:
+                resolved = candidates[0]
+            if resolved is not None and resolved not in out:
+                out.append(resolved)
+        return out
+
+    def _eval_dir_includes(self, directory: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """(own -I dirs from ccflags-y/EXTRA_CFLAGS, inheritable -I dirs from subdir-ccflags-y) of `directory`."""
+        if not directory:
+            return (), ()
+        kbuild_path = f"{directory}/Kbuild"
+        makefile_path = f"{directory}/Makefile"
+        has_kbuild = kbuild_path in self.files
+        has_makefile = makefile_path in self.files
+        if not has_kbuild and not has_makefile:
+            return (), ()
+        tree = self._tree_view()
+        cmdline = {
+            "srctree": SRC_ROOT,
+            "objtree": SRC_ROOT,
+            "TOPDIR": SRC_ROOT,
+            "CURDIR": SRC_ROOT,
+            "src": directory,
+            "obj": directory,
+        }
+        ev = MakeEvaluator(tree, self.read, cmdline, {}, parsed={})
+        try:
+            # In kbuild (scripts/Makefile.build), Kbuild is included first if present, else Makefile
+            primary = kbuild_path if has_kbuild else makefile_path
+            ev.include(primary)
+            if has_kbuild and has_makefile and makefile_path not in ev. words("MAKEFILE_LIST"):
+                ev.include(makefile_path)
+        except (RecursionError, Exception) as exc:  # noqa: BLE001
+            logger.debug("Directory Makefile evaluation failed for %s: %s", directory, exc)
+            return (), ()
+        own_text = " ".join(ev.value(v) for v in _DIR_OWN_VARS if ev.defined(v))
+        sub_text = " ".join(ev.value(v) for v in _DIR_SUBDIR_VARS if ev.defined(v))
+        own_dirs = tuple(self._extract_inc_dirs(own_text, directory, tree))
+        sub_dirs = tuple(self._extract_inc_dirs(sub_text, directory, tree))
+        return own_dirs, sub_dirs
+
+    def _dir_includes(self, directory: str) -> tuple[str, ...]:
+        """All local `-I` directories for `directory` (inherited `subdir-ccflags-y` from ancestors + own flags)."""
+        directory = (directory or "").strip("/")
+        if not directory:
+            return ()
+        cached = self._dir_includes_cache.get(directory)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = self._dir_includes_cache.get(directory)
+            if cached is not None:
+                return cached
+            parts = directory.split("/")
+            ancestors = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+            merged: list[str] = []
+            for idx, anc in enumerate(ancestors):
+                pair = self._dir_own_includes.get(anc)
+                if pair is None:
+                    pair = self._eval_dir_includes(anc)
+                    self._dir_own_includes[anc] = pair
+                own_dirs, sub_dirs = pair
+                for d in sub_dirs:
+                    if d not in merged:
+                        merged.append(d)
+                if idx == len(ancestors) - 1:
+                    for d in own_dirs:
+                        if d not in merged:
+                            merged.append(d)
+            res = tuple(merged)
+            self._dir_includes_cache[directory] = res
+            return res
 
     # ------------------------------------------------------------------ construction
     @classmethod
     def for_tree(cls, root: str, key: str = "", configure: bool = True) -> CompileEnv:
         """Environment of an extracted tree on disk (cached per directory and key)."""
         root = os.path.abspath(root).rstrip("/")
-        cache_key = f"{root}\0{key}\0{configure}"
+        eff_key = key
+        if not eff_key:
+            with contextlib.suppress(OSError):
+                st = os.stat(os.path.join(root, "Makefile"))
+                eff_key = f"{root}:{st.st_mtime_ns}:{st.st_size}"
+        cache_key = f"{root}\0{eff_key}\0{configure}"
         with _LOCK:
             env = _TREE_ENVS.get(cache_key)
             if env is not None:
@@ -217,8 +388,11 @@ class CompileEnv:
             except OSError:
                 return None
 
-        env = cls(root, files, read, None, key=key or root, configure=configure)
+        env = cls(root, files, read, None, key=eff_key or root, configure=configure)
         with _LOCK:
+            existing = _TREE_ENVS.get(cache_key)
+            if existing is not None:
+                return existing
             _TREE_ENVS[cache_key] = env
         return env
 
@@ -280,39 +454,59 @@ class CompileEnv:
         stamp = os.path.join(build, ".kip_complete")
         if os.path.exists(stamp):
             return
-        tmp = f"{build}.tmp{os.getpid()}"
+        tmp = f"{build}.tmp.{os.getpid()}.{threading.get_ident()}"
         shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp, exist_ok=True)
-
-        def put(path: str, text: str) -> None:
-            dest = os.path.join(tmp, path)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="latin-1", errors="replace") as fh:
-                fh.write(text)
-
-        for link, target in sorted(env.layout.links.items()):
-            dest = os.path.join(tmp, link.rstrip("/"))
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if not os.path.lexists(dest):
-                os.symlink(os.path.join(self.root, target.rstrip("/")), dest)
-        for wrapper, target in sorted(env.layout.wrappers.items()):
-            if wrapper not in self.files:
-                put(wrapper, f"#include <{_include_name(target)}>\n")
-        for path, text in generated_headers(self.files, self.read, env.arch, env.srcarch, env.config).items():
-            if not os.path.lexists(os.path.join(tmp, path)):
-                put(path, text)
-        with open(os.path.join(tmp, ".kip_complete"), "w") as fh:
-            fh.write(json.dumps({"arch": env.arch, "defconfig": env.defconfig, "config": env.config_hash}))
         try:
-            os.rename(tmp, build)
-        except OSError:  # another process materialized it first
+            os.makedirs(tmp, exist_ok=True)
+            mark_owner(self.build_base)
+            mark_owner(tmp)
+
+            def put(path: str, text: str) -> None:
+                dest = os.path.join(tmp, path)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "w", encoding="latin-1", errors="replace") as fh:
+                    fh.write(text)
+
+            for link, target in sorted(env.layout.links.items()):
+                dest = os.path.join(tmp, link.rstrip("/"))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if not os.path.lexists(dest):
+                    os.symlink(os.path.join(self.root, target.rstrip("/")), dest)
+            for wrapper, target in sorted(env.layout.wrappers.items()):
+                if wrapper not in self.files:
+                    put(wrapper, f"#include <{_include_name(target)}>\n")
+            for path, text in generated_headers(self.files, self.read, env.arch, env.srcarch, env.config).items():
+                if not os.path.lexists(os.path.join(tmp, path)):
+                    put(path, text)
+            with open(os.path.join(tmp, ".kip_complete"), "w") as fh:
+                fh.write(json.dumps({"arch": env.arch, "defconfig": env.defconfig, "config": env.config_hash, "key": self.key}))
+            try:
+                os.rename(tmp, build)
+            except OSError:  # another process materialized it first
+                shutil.rmtree(tmp, ignore_errors=True)
+        except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
+            raise
 
     def cleanup(self) -> None:
-        """Remove the build directories this environment created."""
-        for env in self._envs.values():
+        """Remove the build directories this environment created (including any materialized by forked workers)."""
+        with self._lock:
+            envs = list(self._envs.values())
+            self._envs.clear()
+        for env in envs:
             shutil.rmtree(env.build_dir, ignore_errors=True)
-        self._envs.clear()
+        if os.path.isdir(self.build_base):
+            for entry in glob.glob(os.path.join(self.build_base, "*")):
+                stamp = os.path.join(entry, ".kip_complete")
+                if not os.path.isfile(stamp):
+                    continue
+                try:
+                    with open(stamp, encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    if meta.get("key") == self.key:
+                        shutil.rmtree(entry, ignore_errors=True)
+                except (OSError, ValueError, TypeError):
+                    pass
 
     # ------------------------------------------------------------------ arguments
     def args_for(self, path: str, asm: bool = False, arch: str | None = None) -> tuple[list[str], int, ArchEnv | None]:
@@ -332,6 +526,9 @@ class CompileEnv:
             # No layout (a tree without Makefiles): the source directory and include/
             inc_dir = path.rpartition("/")[0]
             args += ["-D__KERNEL__", f"-I{self.root}/{inc_dir}" if inc_dir else f"-I{self.root}", f"-I{self.root}/include"]
+            for d in self._dir_includes(inc_dir):
+                if d not in (inc_dir, "include"):
+                    args.append(f"-I{self.root}/{d}" if d else f"-I{self.root}")
             if not asm:
                 args.append("-std=gnu89")
             return args, KEEP_GOING, None
@@ -352,8 +549,17 @@ class CompileEnv:
                  f'-DKBUILD_MODFILE="{path.rsplit(".", 1)[0]}"']
         inc_dir = path.rpartition("/")[0]
         args += ["-iquote", f"{self.root}/{inc_dir}" if inc_dir else self.root]
+        seen_inc: set[str] = set()
         for d in env.layout.includes:
             d = d.rstrip("/")
+            seen_inc.add(d)
+            args.append(f"-I{self.root}/{d}" if d else f"-I{self.root}")
+            args.append(f"-I{env.build_dir}/{d}" if d else f"-I{env.build_dir}")
+        for d in self._dir_includes(inc_dir):
+            d = d.rstrip("/")
+            if d in seen_inc:
+                continue
+            seen_inc.add(d)
             args.append(f"-I{self.root}/{d}" if d else f"-I{self.root}")
             args.append(f"-I{env.build_dir}/{d}" if d else f"-I{env.build_dir}")
         for forced in env.layout.forced:
@@ -373,15 +579,17 @@ class CompileEnv:
         if not file_path:
             return None
         real = os.path.realpath(file_path)
-        if real.startswith(self.root + "/"):
-            return real[len(self.root) + 1:]
+        for rroot in (self._real_root, self.root):
+            if rroot and real.startswith(rroot + "/"):
+                return real[len(rroot) + 1:]
         absolute = os.path.abspath(file_path)
         if absolute.startswith(self.root + "/"):
             return absolute[len(self.root) + 1:]
-        base = self.build_base.rstrip("/") + "/"
-        if absolute.startswith(base):
-            rest = absolute[len(base):]
-            return rest.split("/", 1)[1] if "/" in rest else None
+        for bbase, candidate in ((self.build_base, absolute), (self._real_build_base, real)):
+            base = bbase.rstrip("/") + "/"
+            if candidate.startswith(base):
+                rest = candidate[len(base):]
+                return rest.split("/", 1)[1] if "/" in rest else None
         return None
 
 

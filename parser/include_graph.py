@@ -37,8 +37,8 @@ def _strip_comments(text: str) -> str:
 
 def _logical_lines(text: str) -> list[str]:
     """Comment-free source lines with backslash continuations joined (lines split on `\\n` only)."""
-    flat = _strip_comments((text or "").replace("\r\n", "\n")).replace("\\\n", " ")
-    return flat.split("\n")
+    joined = (text or "").replace("\r\n", "\n").replace("\\\n", "")
+    return _strip_comments(joined).split("\n")
 
 
 def include_directives(content: str) -> list[tuple[str, bool]]:
@@ -345,8 +345,11 @@ class IncludeResolver:
         asked for (the webapp loads one level's stored directives in one query)."""
         parents: dict[str, str | None] = {}
         level: list[str] = []
-        for path in [*self.layout.forced, start]:
-            if path and path not in parents and self.is_file(path):
+        for raw_path in [*self.layout.forced, start]:
+            if not raw_path:
+                continue
+            path = self.materialize(raw_path) or (raw_path if self.is_file(raw_path) else None)
+            if path and path not in parents:
                 parents[path] = None
                 level.append(path)
         while level and len(parents) < limit:

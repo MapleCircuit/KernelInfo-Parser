@@ -138,6 +138,75 @@ class TestCompileEnv(unittest.TestCase):
         self.assertIn("-nostdinc", args)
         self.assertIn(f"-I{bare}/include", args)
 
+    def test_per_directory_ccflags_and_subdir_ccflags_includes(self) -> None:
+        extra_tree = {
+            **TREE,
+            "drivers/gpu/drm/Makefile": (
+                "subdir-ccflags-y += -I$(srctree)/drivers/gpu/drm/include -I$(src)/shared\n"
+                "ccflags-y += -I$(src)/local_only\n"
+            ),
+            "drivers/gpu/drm/amd/Kbuild": (
+                "ccflags-y += -I$(src)/inc -I$(srctree)/$(src)/uapi -I/outside/escape -I$(src)/../../../../etc\n"
+            ),
+            "fs/xfs/Makefile": "EXTRA_CFLAGS += -I$(TOPDIR)/fs/xfs/libxfs -I$(obj)/scrub\n",
+            "drivers/gpu/drm/include/drm_ common.h": "",
+            "drivers/gpu/drm/shared/drm_shared.h": "",
+            "drivers/gpu/drm/local_only/drm_local.h": "",
+            "drivers/gpu/drm/amd/inc/amd_inc.h": "",
+            "drivers/gpu/drm/amd/uapi/amd_uapi.h": "",
+            "drivers/gpu/drm/amd/amd.c": "",
+            "drivers/gpu/drm/drm_drv.c": "",
+            "fs/xfs/libxfs/xfs_fs.h": "",
+            "fs/xfs/scrub/scrub.h": "",
+            "fs/xfs/xfs_super.c": "",
+        }
+        env = CompileEnv(self.root, set(extra_tree), extra_tree.get, None, key="test-ccflags", build_base=self.base)
+
+        drm_args, _, _ = env.args_for("drivers/gpu/drm/drm_drv.c")
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/include", drm_args)
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/shared", drm_args)
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/local_only", drm_args)
+
+        # Subdirectory inherits subdir-ccflags-y from drivers/gpu/drm/Makefile, plus its own Kbuild ccflags-y,
+        # but NOT drivers/gpu/drm's local-only ccflags-y or outside-repo paths
+        amd_args, _, _ = env.args_for("drivers/gpu/drm/amd/amd.c")
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/include", amd_args)
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/shared", amd_args)
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/amd/inc", amd_args)
+        self.assertIn(f"-I{self.root}/drivers/gpu/drm/amd/uapi", amd_args)
+        self.assertNotIn(f"-I{self.root}/drivers/gpu/drm/local_only", amd_args)
+        self.assertFalse(any("outside" in a or "etc" in a for a in amd_args))
+
+        # EXTRA_CFLAGS with $(TOPDIR) and $(obj)
+        xfs_args, _, _ = env.args_for("fs/xfs/xfs_super.c")
+        self.assertIn(f"-I{self.root}/fs/xfs/libxfs", xfs_args)
+        self.assertIn(f"-I{self.root}/fs/xfs/scrub", xfs_args)
+
+    def test_cleanup_lifecycle_and_owner_tracking(self) -> None:
+        from core.FileHandler import OWNER_FILE, owner_alive
+        from core.ingest_state import cleanup_ramdisk_artifacts
+
+        arch_env = self.env.env("x86_64")
+        self.assertIsNotNone(arch_env)
+        self.assertTrue(os.path.isfile(os.path.join(arch_env.build_dir, OWNER_FILE)))
+        self.assertTrue(owner_alive(arch_env.build_dir))
+
+        # Simulated crashed worker build directory inside kip_build with dead PID is cleaned by cleanup_ramdisk_artifacts
+        kip_root = os.path.join(self.base, "kip_build")
+        stale_dir = os.path.join(kip_root, "deadbeef-arm64")
+        live_dir = os.path.join(kip_root, "cafebabe-x86_64")
+        os.makedirs(stale_dir, exist_ok=True)
+        os.makedirs(live_dir, exist_ok=True)
+        with open(os.path.join(stale_dir, OWNER_FILE), "w") as fh:
+            fh.write("999999999")
+        with open(os.path.join(live_dir, OWNER_FILE), "w") as fh:
+            fh.write(str(os.getpid()))
+
+        removed = cleanup_ramdisk_artifacts(self.base, search_system_temps=False)
+        self.assertGreaterEqual(removed, 1)
+        self.assertFalse(os.path.exists(stale_dir))
+        self.assertTrue(os.path.exists(live_dir))
+
 
 class TestGeneratedHeaders(unittest.TestCase):
     def test_helpers(self) -> None:

@@ -59,7 +59,11 @@ _BUILD_ENV = {"MAKEFLAGS": "--no-print-directory"}
 def path_arch(path: str) -> str | None:
     """Architecture tree holding `path`: `arch/<a>/...`, or `include/asm-<a>/...` (the arch headers
     before they moved to arch/<a>/include/asm/, 2.6.x); None for generic code and include/asm-generic/."""
-    parts = (path or "").split("/")
+    clean = (path or "").replace("\\", "/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    clean = clean.lstrip("/")
+    parts = clean.split("/")
     if len(parts) >= 2:
         if parts[0] == "arch" and parts[1] and parts[1] != "Kconfig" and "." not in parts[1]:
             return parts[1]
@@ -232,10 +236,10 @@ def _shell_segments(command: str) -> list[str]:
         segments = [part for seg in segments for part in seg.split(sep)]
     out = []
     for seg in segments:
-        seg = seg.strip().lstrip("@-+").strip()
+        seg = seg.strip().lstrip("@-+(").rstrip(")").strip()
         for kw in ("then ", "else ", "do "):
             if seg.startswith(kw):
-                seg = seg[len(kw):].strip()
+                seg = seg[len(kw):].strip().lstrip("(").strip()
         if seg:
             out.append(seg)
     return out
@@ -350,13 +354,18 @@ def layout_for(arch: str, tree: Tree, read: Callable[[str], str | None], host_ma
     if UNKNOWN in srcarch or not tree.is_file(f"arch/{srcarch}/Makefile"):
         return None
     ev.include("scripts/Makefile.lib")
+    links = _links(ev, tree)
     includes, forced = _include_flags(ev)
-    includes = [d for d in includes if tree.is_dir(d) or "generated" in d.split("/")]
-    # A forced header the build generates (include/generated/autoconf.h) is kept: parser/compile_env.py writes it
+    includes = [d for d in includes if tree.is_dir(d) or "generated" in d.split("/") or d in links]
+    # A forced header the build generates (include/generated/autoconf.h, include/linux/autoconf.h) is kept:
+    # parser/compile_env.py writes it
+    kept_forced = [
+        f for f in forced
+        if tree.is_file(f) or "generated" in f.split("/") or f in links or f == "include/linux/autoconf.h"
+    ]
     layout = ArchLayout(arch, srcarch, sources=_sources(ev, srcarch, tree), includes=includes,
-                        forced=[f for f in forced if tree.is_file(f) or "generated" in f.split("/")],
-                        flags=_kept_flags(ev))
-    layout.links = _links(ev, tree)
+                        forced=kept_forced, flags=_kept_flags(ev))
+    layout.links = links
     layout.wrappers = _wrappers(ev, tree, read, includes, parsed)
     return layout
 

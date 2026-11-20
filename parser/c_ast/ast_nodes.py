@@ -588,15 +588,26 @@ class CPPro(Ast):
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
             return False
-        if ast_kind == AST_KIND.comment:
-            return False
         t_line = token.line.line_pos[0]
         cur_line = self.extent.line_pos[1]
+        rawfile = getattr(G, "CURRENT_RAWFILE", None)
+        if ast_kind == AST_KIND.comment:
+            if not rawfile or not str(getattr(G, "CURRENT_PARSING_FILE", "") or "").endswith((".S", ".s")):
+                return False
+            if t_line > cur_line:
+                for l in range(cur_line - 1, t_line - 1):
+                    if not (0 <= l < len(rawfile) and rawfile[l].rstrip().endswith("\\")):
+                        return False
+            end_line = token.line.line_pos[1]
+            end_col = token.line.char_pos[1]
+            if 0 <= end_line - 1 < len(rawfile) and rawfile[end_line - 1][max(0, end_col - 1):].strip():
+                self.extent.grow(token.line)
+                return True
+            return False
         if t_line <= cur_line:
             self.extent.grow(token.line)
             return True
         # Check backslash continuation from rawfile
-        rawfile = getattr(G, "CURRENT_RAWFILE", None)
         if rawfile:
             all_continued = True
             for l in range(cur_line - 1, t_line - 1):
@@ -930,24 +941,48 @@ class CPPro_define(CPPro):
         # Names of the replacement list: (name, line, column, target type); the last token's kind for context
         self.body_names: list[tuple[str, int, int, int]] = []
         self._body_prev = ""
+        self._body_line = 0
+        self._pasted_comment = False
 
     def _note_body_name(self, token: Any) -> None:
         names = self.__dict__.setdefault("body_names", [])
         prev = self.__dict__.get("_body_prev", "")
+        prev_line = self.__dict__.get("_body_line", 0)
+        tok_line = int(token.line.line_pos[0])
         name = token.spelling_str
+        self._body_line = tok_line
+        if self.__dict__.get("_pasted_comment"):
+            self._pasted_comment = False
+            if names and prev == names[-1][0]:
+                names.pop()
+            self._body_prev = name
+            return
         if prev in ("##", ".", "->", "#"):
             self._body_prev = name
             return
         # An assembly macro body holds instructions: registers (`%eax`) and the mnemonic or directive opening a
-        # statement (start of the body, after `;`) are no names
+        # statement (start of the body, after `;` or `:`, or at the start of a continued line) are no names
         if self.__dict__.get("_asm_body") is None:
             self._asm_body = str(getattr(G, "CURRENT_PARSING_FILE", "") or "").endswith((".S", ".s"))
-        if self._asm_body and (prev in ("%", "", ";", "\\") or not names and prev == self.identifier):
-            self._body_prev = name
-            return
+        if self._asm_body:
+            if prev == "%" or name.lower() in _ASM_REGISTER_NAMES:
+                self._body_prev = name
+                return
+            at_stmt_start = (
+                prev in ("", ";", "\\", ":")
+                or (prev_line and tok_line > prev_line)
+                or (not names and prev == self.identifier)
+            )
+            if at_stmt_start and not any(c.isupper() or c == "_" for c in name):
+                self._body_prev = name
+                return
         target = _TAG_KEYWORD_TARGET.get(prev, ASTT.C_DeclRefExpr)
         names.append((name, *_tok_pos(token), int(target)))
         self._body_prev = name
+
+    def exec_comment(self, token: Any, cursor: Any) -> None:
+        if token.spelling_str == "/**/" and self.__dict__.get("body_names") and self.__dict__.get("_body_prev") == self.body_names[-1][0]:
+            self._pasted_comment = True
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -964,6 +999,7 @@ class CPPro_define(CPPro):
             self.replacement += " " + token.spelling_str
 
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if self.identifier and not self.has_args and self.replacement is None:
             if token.spelling_str == "(" and self.id_extent is not None:
                 if (token.line.line_pos[0] == self.id_extent.line_pos[1] and 
@@ -984,12 +1020,14 @@ class CPPro_define(CPPro):
         if spelling == "##" and self.__dict__.get("body_names") and self.__dict__.get("_body_prev") == self.body_names[-1][0]:
             self.body_names.pop()  # a fragment pasted into another name
         self._body_prev = spelling
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
             self.replacement += " " + token.spelling_str
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if not self.identifier:
             self.identifier = token.spelling_str
             self.id_extent = token.line
@@ -997,14 +1035,18 @@ class CPPro_define(CPPro):
         if self.in_args:
             return
         self._body_prev = token.spelling_str
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
             self.replacement += " " + token.spelling_str
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if self.in_args:
             return
+        self._body_prev = token.spelling_str
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:

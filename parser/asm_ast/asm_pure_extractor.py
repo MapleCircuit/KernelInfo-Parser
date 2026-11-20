@@ -23,6 +23,9 @@ _END_MACRO = re.compile(
 _MACRO_START = re.compile(r"^[ \t]*\.macro\s+([A-Za-z0-9_]+)")
 _MACRO_END = re.compile(r"^[ \t]*\.endm\b")
 _LABEL = re.compile(r"^[ \t]*([A-Za-z_]\w*):")
+_CPP_DEFINE = re.compile(r"^[ \t]*#[ \t]*define\b")
+_EQU_START = re.compile(r"^[ \t]*\.(?:equ|set|equiv)\s+([A-Za-z_]\w*)\s*,")
+_ASSIGN_START = re.compile(r"^[ \t]*([A-Za-z_]\w*)\s*=\s*(?!=)")
 
 _X86_TREES = ("arch/x86/", "arch/i386/", "arch/x86_64/", "include/asm-i386/", "include/asm-x86_64/", "include/asm-x86/")
 # Path prefixes of the architectures whose GAS line comment starts with a character other than `//`.
@@ -101,10 +104,15 @@ def extract_asm_outline(source_bytes: bytes, path: str = "") -> list[dict[str, A
             roots.append(item)
 
     in_multiline_comment = False
+    in_cpp_define = False
     line_comment_chars = tuple(c for c in asm_comment_chars(path) if c not in ("#", "//"))
 
     for idx, raw in enumerate(raw_lines):
         line = idx + 1
+        if in_cpp_define:
+            in_cpp_define = raw.rstrip().endswith("\\")
+            continue
+
         line_clean = raw
 
         # Handle multi-line /* ... */
@@ -130,6 +138,10 @@ def extract_asm_outline(source_bytes: bytes, path: str = "") -> list[dict[str, A
             line_clean = strip_line_comment(line_clean, line_comment_chars)
         text = _STRIP_COMMENT.sub("", line_clean).strip()
         if not text:
+            continue
+
+        if _CPP_DEFINE.match(text):
+            in_cpp_define = raw.rstrip().endswith("\\")
             continue
 
         # 1. Function start: SYM_FUNC_START*(name) or ENTRY(name)
@@ -206,5 +218,19 @@ def extract_asm_outline(source_bytes: bytes, path: str = "") -> list[dict[str, A
                     "children": [],
                 }
                 push(item)
+            continue
+
+        # 6. Constant assignments: .equ/.set/.equiv SYM, expr or SYM = expr
+        m = _EQU_START.match(text) or _ASSIGN_START.match(text)
+        if m:
+            push({
+                "name": m.group(1),
+                "kind": "constant",
+                "type_name": "ASM_Label",
+                "line_s": line,
+                "line_e": line,
+                "linkage": int(SymbolLinkage.InternalStaticDef),
+                "children": [],
+            })
 
     return roots

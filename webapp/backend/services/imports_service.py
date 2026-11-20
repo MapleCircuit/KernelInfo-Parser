@@ -27,7 +27,10 @@ without a Git fallback.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import re
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
@@ -35,13 +38,17 @@ from fastapi import HTTPException
 
 from core.globalstuff import ASTT, FileRefType, SymbolLinkage, SymbolRole
 from db_engine.spec import Join
+from parser.arch_layout import path_arch
+from parser.kconfig_ast import kconfig_definitions as kd
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.helpers import safe_decode
 from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import is_valid_identifier
+from webapp.backend.services import kconfig_facts
 from webapp.backend.services.arch_layout_service import arch_layout_service
+from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.outline_service import outline_kind
 from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, GitTreeResolver, git_tree_resolver
 
@@ -63,16 +70,16 @@ _STRUCT = {"C_structdecl", "C_structnotbind"}
 _TYPE = {"C_uniondecl", "C_unionnotbind", "C_enumdecl", "C_enumnotbind", "C_SCtypedef"}
 # Forward declarations (`struct foo;`) rank like prototypes, after the full definition
 _FORWARD = {"C_structnotbind", "C_unionnotbind", "C_enumnotbind", "C_functionprotnotbind"}
-KIND_ORDER = ("function", "prototype", "struct", "type", "macro", "variable")
+KIND_ORDER = ("function", "prototype", "struct", "type", "macro", "variable", "config")
 _KIND_RANK = {k: i for i, k in enumerate(KIND_ORDER)}
 # Kinds a reference role can name; a definition of a fitting kind ranks before one that only shares the name
 _ROLE_KINDS = {
     int(SymbolRole.TypeUsage): {"struct", "type", "macro"},
     int(SymbolRole.Call): {"function", "prototype", "macro", "variable"},
-    int(SymbolRole.DeclRef): {"function", "prototype", "macro", "variable"},
-    int(SymbolRole.MacroExpansion): {"macro"},
-    int(SymbolRole.MacroBodyRef): {"function", "prototype", "macro", "variable", "type", "struct"},
-    int(SymbolRole.CondRef): {"macro"},
+    int(SymbolRole.DeclRef): {"function", "prototype", "macro", "variable", "config"},
+    int(SymbolRole.MacroExpansion): {"macro", "config"},
+    int(SymbolRole.MacroBodyRef): {"function", "prototype", "macro", "variable", "type", "struct", "config"},
+    int(SymbolRole.CondRef): {"macro", "config"},
 }
 
 # C name spaces of definitions and references
@@ -81,8 +88,11 @@ _ALL_NS = frozenset({NS_TAG, NS_MACRO, NS_ORDINARY})
 _TAG_TYPES = frozenset({"C_structdecl", "C_structnotbind", "C_uniondecl", "C_unionnotbind", "C_enumdecl",
                         "C_enumnotbind", "C_struct", "C_union", "C_enum"})
 _MACRO_ROLES = frozenset({int(SymbolRole.MacroExpansion), int(SymbolRole.CondRef)})
-MAX_CONTEXT_INCLUDERS = 4
-MAX_INCLUDER_ROWS = 5000
+MAX_CONTEXT_INCLUDERS = 24
+MAX_INCLUDER_ROWS = 20_000
+_KCONFIG_DEF_TYPES = [int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig)]
+_IS_ENABLED_HELPERS = frozenset({"IS_ENABLED", "IS_BUILTIN", "IS_MODULE", "IS_REACHABLE"})
+_IS_ENABLED_ARG_RE = re.compile(r"\b(?:IS_ENABLED|IS_BUILTIN|IS_MODULE|IS_REACHABLE)\s*\(\s*(CONFIG_[A-Za-z0-9_]+)\s*\)")
 
 
 def _type_name(type_id: Any) -> str:
@@ -182,7 +192,7 @@ class ImportsService:
         key = (git_tree_resolver.resolve_commit_sha(rev) or rev, arch, clean, blob_sha)
         cached = self._cache.get(key)
         if cached is not None:
-            return {**base, **cached}
+            return {**base, **cached, "items": list(cached["items"]), "context": list(cached["context"])}
         try:
             with get_reader() as reader:
                 blob_id = GitTreeResolver.map_blob_hashes(reader, [blob_sha]).get(blob_sha, (0, 0))[0]
@@ -190,36 +200,41 @@ class ImportsService:
                     return {**base, **empty, "reason": "unindexed"}
                 refs = self._references(reader, blob_id)
                 if refs:
+                    self._augment_is_enabled_refs(rev, clean, refs)
                     self._mask_own(refs, self._own_defs(reader, blob_id, list(refs)))
+                kconfig_items = self._kconfig_items(reader, rev, arch, clean, tree, refs) if refs else []
             # The walk reads include facts through its own reader
             arch_used, reached = self._reach(rev, arch, clean)
             headers = [p for p in reached if p != clean]
             blob_paths: dict[int, list[str]] = {}
             defs: list[dict[str, Any]] = []
-            if headers and refs:
+            resolved_kconfig = {it["name"] for it in kconfig_items}
+            header_refs = {n: r for n, r in refs.items() if n not in resolved_kconfig}
+            if headers and header_refs:
                 with get_reader() as reader:
                     blob_paths = self._header_blobs(reader, tree, headers, blob_id)
                     if blob_paths:
-                        defs = self._definitions(reader, self._ordered_blobs(blob_paths, reached), sorted(refs))
+                        defs = self._definitions(reader, self._ordered_blobs(blob_paths, reached), sorted(header_refs))
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - an unreachable database leaves the panel empty
             logger.debug("imports of %s unavailable: %s", clean, exc)
             return {**base, **empty, "reason": "database unavailable"}
-        body = self._build(clean, refs, reached, blob_paths, defs)
-        found = {it["name"] for it in body["items"]}
+        body = self._build(clean, header_refs, reached, blob_paths, defs)
+        found = {it["name"] for it in body["items"]} | resolved_kconfig
         context: list[str] = []
         unresolved = {n: r for n, r in refs.items() if n not in found}
+        extra: list[dict[str, Any]] = []
         if unresolved and arch_used:
             try:
                 extra, context = self._context_items(rev, arch_used, clean, tree, blob_id, unresolved, set(reached))
             except Exception as exc:  # noqa: BLE001 - context imports are best effort over the stored rows
                 logger.debug("context imports of %s unavailable: %s", clean, exc)
                 extra = []
-            if extra:
-                items = body["items"] + extra
-                items.sort(key=lambda it: (_KIND_RANK[it["kind"]], it["name"], it["header_path"], it["line"]))
-                body = {"total": len(items), "truncated": len(items) > MAX_ITEMS, "items": items[:MAX_ITEMS]}
+        if extra or kconfig_items:
+            items = body["items"] + extra + kconfig_items
+            items.sort(key=lambda it: (_KIND_RANK[it["kind"]], it["name"], it["header_path"], it["line"]))
+            body = {"total": len(items), "truncated": len(items) > MAX_ITEMS, "items": items[:MAX_ITEMS]}
         body.update({"indexed": True, "layout": bool(reached), "reachable": len(headers), "reason": None,
                      "arch_used": arch_used, "context": context})
         self._cache[key] = body
@@ -279,6 +294,182 @@ class ImportsService:
         return refs
 
     @staticmethod
+    def _augment_is_enabled_refs(rev: str, path: str, refs: dict[str, dict[str, Any]]) -> None:
+        """Ensure `CONFIG_*` arguments inside `IS_ENABLED(CONFIG_*)` / `IS_BUILTIN` / `IS_MODULE` / `IS_REACHABLE`
+        in C statements are present in `refs` even when the blob was indexed without macro-argument lexical refs."""
+        if not (_IS_ENABLED_HELPERS & set(refs)):
+            return
+        try:
+            raw, is_dir, _ = git_reader.read_file(rev, path)
+        except Exception:  # noqa: BLE001
+            return
+        if not raw or is_dir:
+            return
+        for idx, line_text in enumerate(raw.decode("latin-1", errors="replace").replace("\r\n", "\n").split("\n"), 1):
+            if "CONFIG_" not in line_text:
+                continue
+            for m in _IS_ENABLED_ARG_RE.finditer(line_text):
+                cname = m.group(1)
+                entry = refs.setdefault(cname, {"lines": set(), "roles": set(), "spaces": set()})
+                entry["lines"].add(idx)
+                entry["roles"].add(int(SymbolRole.MacroExpansion))
+                entry["spaces"].add(NS_MACRO)
+
+    @staticmethod
+    def _kconfig_rank(kpath: str, file_path: str, arch: str) -> tuple[int, int, int, str]:
+        """Rank candidate Kconfig files for `(file_path, arch)`: same subsystem tree first, then generic or
+        target-arch Kconfig files ahead of foreign `arch/*/` trees, then shorter paths."""
+        karch = path_arch(kpath)
+        arch_norm = "x86" if arch in ("x86_64", "i386") else arch
+        if karch is None:
+            arch_tier = 0
+        elif karch in (arch, arch_norm):
+            arch_tier = 0
+        else:
+            arch_tier = 1
+        fparts = file_path.split("/")[:-1]
+        kparts = kpath.split("/")[:-1]
+        common = 0
+        for a, b in zip(fparts, kparts):
+            if a != b:
+                break
+            common += 1
+        return (arch_tier, -common, kpath.count("/"), kpath)
+
+    @classmethod
+    def _kconfig_items(cls, reader: Any, rev: str, arch: str, path: str, tree: dict[str, str],
+                       refs: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        """Resolve `CONFIG_*` references in `refs` against Kconfig definitions in `m_symbol_def` and
+        `m_blob_facts` family 4 (`kconfig_facts`), returning items of kind `"config"`."""
+        sym_to_refs: dict[str, list[str]] = defaultdict(list)
+        for name, entry in refs.items():
+            if not name.startswith("CONFIG_") or len(name) <= 7:
+                continue
+            if NS_MACRO not in entry.get("spaces", ()) and NS_ORDINARY not in entry.get("spaces", ()):
+                continue
+            bare = name[7:]
+            sym_to_refs[bare].append(name)
+            if bare.endswith("_MODULE") and len(bare) > 7:
+                sym_to_refs[bare[:-7]].append(name)
+        if not sym_to_refs:
+            return []
+
+        kconfig_paths = [p for p in tree if kd.applies(p)]
+        if not kconfig_paths:
+            return []
+
+        wanted_syms = sorted(sym_to_refs)
+        # 1. Query m_symbol_def for Kconfig_Config / Kconfig_Menuconfig rows
+        def_rows: list[dict[str, Any]] = []
+        for chunk in _chunks(wanted_syms):
+            try:
+                def_rows.extend(reader.select_rows(
+                    ("m_symbol_def", "s"),
+                    {"name": "s.name", "blob_id": "s.blob_id", "type_name": "t.name",
+                     "line_s": "s.line_s", "line_e": "s.line_e"},
+                    {"s.name": chunk, "s.type_id": _KCONFIG_DEF_TYPES},
+                    joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
+                ))
+            except Exception:  # noqa: BLE001
+                break
+
+        candidates: dict[str, list[tuple[tuple, dict[str, Any]]]] = defaultdict(list)
+        seen: set[tuple[str, str, int]] = set()
+
+        def add_cand(ref_name: str, kpath: str, line_s: int, line_e: int, type_name: str) -> None:
+            if line_s <= 0:
+                return
+            key = (ref_name, kpath, line_s)
+            if key in seen:
+                return
+            seen.add(key)
+            is_mod_alias = ref_name.endswith("_MODULE") and not kpath.endswith("_MODULE") and ref_name[7:] not in sym_exact.get(ref_name, ())
+            rank = (1 if is_mod_alias else 0, *cls._kconfig_rank(kpath, path, arch), line_s)
+            candidates[ref_name].append((rank, {
+                "kind": "config",
+                "type_name": type_name or "Kconfig_Config",
+                "header_path": kpath,
+                "line": line_s,
+                "line_e": max(line_s, line_e),
+                "chain": [path, kpath],
+            }))
+
+        sym_exact: dict[str, set[str]] = defaultdict(set)
+        if def_rows:
+            kshas = {p: tree[p] for p in kconfig_paths}
+            mapped = GitTreeResolver.map_blob_hashes(reader, list(kshas.values()))
+            blob_to_kpaths: dict[int, list[str]] = defaultdict(list)
+            for kp, sha in kshas.items():
+                bid = mapped.get(sha, (0, 0))[0]
+                if bid:
+                    blob_to_kpaths[bid].append(kp)
+            for r in def_rows:
+                sym = safe_decode(r.get("name"))
+                for rn in sym_to_refs.get(sym, ()):
+                    if rn[7:] == sym:
+                        sym_exact[rn].add(sym)
+            for r in def_rows:
+                sym = safe_decode(r.get("name"))
+                bid = int(r.get("blob_id") or 0)
+                kpaths = blob_to_kpaths.get(bid)
+                if not sym or not kpaths:
+                    continue
+                line_s = int(r.get("line_s") or 0)
+                line_e = int(r.get("line_e") or line_s)
+                tname = safe_decode(r.get("type_name")) or "Kconfig_Config"
+                for rn in sym_to_refs.get(sym, ()):
+                    for kp in kpaths:
+                        add_cand(rn, kp, line_s, line_e, tname)
+
+        # 2. Check m_blob_facts family 4 (via kconfig_facts.load_stored) for any CONFIG_* still unresolved
+        missing_refs = {rn for rn_list in sym_to_refs.values() for rn in rn_list if rn not in candidates}
+        if missing_refs:
+            sha_to_kpaths: dict[str, list[str]] = defaultdict(list)
+            for kp in kconfig_paths:
+                sha = tree.get(kp)
+                if sha and len(sha) == 40:
+                    sha_to_kpaths[sha].append(kp)
+            if sha_to_kpaths:
+                with contextlib.suppress(Exception):
+                    kconfig_facts.load_stored(sha_to_kpaths.keys())
+                for sha, kpaths in sha_to_kpaths.items():
+                    bdefs = kconfig_facts.cached(sha)
+                    if not bdefs:
+                        continue
+                    for sym, facts_list in bdefs.items():
+                        rnames = [rn for rn in sym_to_refs.get(sym, ()) if rn in missing_refs]
+                        if not rnames:
+                            continue
+                        for rn in rnames:
+                            if rn[7:] == sym:
+                                sym_exact[rn].add(sym)
+                        for f in facts_list:
+                            ls = int(f.get("line_s") or 0)
+                            le = int(f.get("line_e") or ls)
+                            tn = "Kconfig_Menuconfig" if f.get("kind") == "menuconfig" else "Kconfig_Config"
+                            for rn in rnames:
+                                for kp in kpaths:
+                                    add_cand(rn, kp, ls, le, tn)
+
+        items: list[dict[str, Any]] = []
+        for ref_name, cands in candidates.items():
+            cands.sort(key=lambda c: c[0])
+            best = dict(cands[0][1])
+            lines = sorted(refs[ref_name]["lines"])
+            others = {c[1]["header_path"] for c in cands} - {best["header_path"]}
+            items.append({
+                "name": ref_name,
+                **best,
+                "forced": False,
+                "via": "kconfig",
+                "ref_line": lines[0] if lines else 0,
+                "ref_lines": lines[:MAX_REF_LINES],
+                "ref_count": len(lines),
+                "alternatives": len(others),
+            })
+        return items
+
+    @staticmethod
     def _own_defs(reader: Any, blob_id: int, names: list[str]) -> dict[str, set[str]]:
         """{name: name spaces} the file itself defines among `names` (prototypes, extern declarations and
         forward declarations do not count)."""
@@ -316,13 +507,16 @@ class ImportsService:
         rows: list[dict[str, Any]] = []
         for blobs in _chunks(blob_ids):
             for chunk in _chunks(names):
+                rem = MAX_DEF_ROWS - len(rows)
+                if rem <= 0:
+                    return rows
                 rows.extend(reader.select_rows(
                     ("m_symbol_def", "s"),
                     {"name": "s.name", "blob_id": "s.blob_id", "type_name": "t.name", "line_s": "s.line_s",
                      "line_e": "s.line_e", "linkage": "s.linkage"},
                     {"s.blob_id": blobs, "s.name": chunk},
                     joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"})],
-                    limit=MAX_DEF_ROWS,
+                    limit=rem,
                 ))
                 if len(rows) >= MAX_DEF_ROWS:
                     return rows
@@ -331,36 +525,100 @@ class ImportsService:
     # ------------------------------------------------------------------ context imports
     def _context_items(self, rev: str, arch: str, path: str, tree: dict[str, str], blob_id: int,
                        unresolved: dict[str, dict[str, Any]], searched: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
-        """Items for `unresolved` names defined by what the files including `path` include before it."""
+        """Items for `unresolved` names defined by what the files including `path` include before it, or
+        forward-declared tag types completed later in a direct includer header itself."""
         with get_reader() as reader:
             includers = self._includers(reader, path, tree)
         if not includers:
             return [], []
-        best: dict[str, dict[str, Any]] = {}
-        used: list[str] = []
+        best: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        used_order: list[str] = []
+        tag_unresolved = {n: r for n, r in unresolved.items() if NS_TAG in r.get("spaces", ())}
         for includer in includers[:MAX_CONTEXT_INCLUDERS]:
             walk = arch_layout_service.reachable_before(rev, arch, includer, path)
             headers = [p for p in walk if p not in (includer, path)]
-            if not headers:
+            include_self = includer.endswith(".h") and bool(tag_unresolved) and includer in walk
+            query_headers = [*headers, includer] if include_self else headers
+            if not query_headers:
                 continue
             with get_reader() as reader:
-                blob_paths = self._header_blobs(reader, tree, headers, blob_id)
+                blob_paths = self._header_blobs(reader, tree, query_headers, blob_id)
                 if not blob_paths:
                     continue
                 defs = self._definitions(reader, self._ordered_blobs(blob_paths, walk), sorted(unresolved))
+            if include_self:
+                # Direct includer header itself can only complete forward-declared tag types (`struct foo`)
+                self_blobs = {b for b, ps in blob_paths.items() if includer in ps}
+                filtered_defs = []
+                for d in defs:
+                    if int(d.get("blob_id") or 0) in self_blobs:
+                        tname = safe_decode(d.get("type_name"))
+                        if def_namespace(tname) != NS_TAG or tname in _FORWARD:
+                            if blob_paths.get(int(d.get("blob_id") or 0)) == [includer]:
+                                continue
+                    filtered_defs.append(d)
+                defs = filtered_defs
             body = self._build(includer, unresolved, walk, blob_paths, defs)
-            if body["items"]:
-                used.append(includer)
+            if body["items"] and includer not in used_order:
+                used_order.append(includer)
             for item in body["items"]:
+                weak = item["kind"] == "prototype" or item["type_name"] in _FORWARD
                 item = {**item, "via": "context", "context": includer, "forced": item["chain"][0] != includer}
+                rank = (1 if weak else 0, len(item["chain"]), item["header_path"], item["line"])
                 cur = best.get(item["name"])
-                if cur is None or (len(item["chain"]), item["header_path"]) < (len(cur["chain"]), cur["header_path"]):
-                    best[item["name"]] = item
-        return list(best.values()), used
+                if cur is None or rank < cur[0]:
+                    best[item["name"]] = (rank, item)
+            if all(n in best and best[n][0][0] == 0 for n in unresolved):
+                break
+        items = [pair[1] for pair in best.values()]
+        winning_contexts = {it["context"] for it in items}
+        used = [inc for inc in used_order if inc in winning_contexts] or used_order[:1] if items else []
+        return items, used
 
     @staticmethod
-    def _includers(reader: Any, path: str, tree: dict[str, str]) -> list[str]:
-        """Files of the revision that `#include` `path` (the parser's resolved include rows), `.c` files first."""
+    def _diversify_includers(paths: Iterable[str]) -> list[str]:
+        """Prioritize `.c` callers first, interleaved round-robin across distinct directories/subsystems,
+        followed by `.h` / `.S` includers also interleaved across directories."""
+        c_by_dir: dict[str, list[str]] = defaultdict(list)
+        h_by_dir: dict[str, list[str]] = defaultdict(list)
+        for p in sorted(paths, key=lambda x: (x.count("/"), x)):
+            d = p.rsplit("/", 1)[0] if "/" in p else ""
+            if p.endswith(".c"):
+                c_by_dir[d].append(p)
+            else:
+                h_by_dir[d].append(p)
+
+        def round_robin(buckets: dict[str, list[str]]) -> list[str]:
+            ordered_dirs = sorted(buckets, key=lambda d: (d.count("/"), d))
+            out: list[str] = []
+            idx = 0
+            while True:
+                added = False
+                for d in ordered_dirs:
+                    lst = buckets[d]
+                    if idx < len(lst):
+                        out.append(lst[idx])
+                        added = True
+                if not added:
+                    break
+                idx += 1
+            return out
+
+        c_list = round_robin(c_by_dir)
+        h_list = round_robin(h_by_dir)
+        if not h_list:
+            return c_list
+        if not c_list:
+            return h_list
+        # Place the first wave of distinct-directory .c callers and direct .h includers up front
+        first_c_wave = min(len(c_by_dir), len(c_list))
+        first_h_wave = min(len(h_by_dir), len(h_list))
+        return c_list[:first_c_wave] + h_list[:first_h_wave] + c_list[first_c_wave:] + h_list[first_h_wave:]
+
+    @classmethod
+    def _includers(cls, reader: Any, path: str, tree: dict[str, str]) -> list[str]:
+        """Files of the revision that `#include` `path` (the parser's resolved include rows), diversified
+        across directories with `.c` files and direct `.h` includers prioritized."""
         fn = reader.select_rows("m_file_name", ["fnid"], {"fname": path}, limit=1)
         if not fn:
             return []
@@ -381,7 +639,7 @@ class ImportsService:
                 wanted[src] = int(r["source_blob_id"])
         mapped = GitTreeResolver.map_blob_hashes(reader, [tree[p] for p in wanted])
         current = [p for p, b in wanted.items() if mapped.get(tree[p], (0, 0))[0] == b]
-        return sorted(current, key=lambda p: (not p.endswith(".c"), p.count("/"), p))
+        return cls._diversify_includers(current)
 
     @staticmethod
     def _build(start: str, refs: dict[str, dict[str, Any]], reached: dict[str, str | None],

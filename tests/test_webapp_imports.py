@@ -314,6 +314,108 @@ class TestImportsNameSpacesAndContext(unittest.TestCase):
         out = svc.get_imports("v2.6.0", "h.h", "x86")
         self.assertEqual((out["arch_used"], out["layout"], out["items"], out["context"]), (None, False, [], []))
 
+    def test_diversified_includers_and_forward_decl_completed_in_includer_header(self) -> None:
+        # bind.h forward-declares `struct nlm_host;` and references `struct svc_rqst` and `CONFIG_LOCKD_V4`.
+        # 5 client .c files in fs/nfs/ do not include svc.h; fs/nfsd/nfssvc.c includes svc.h;
+        # include/linux/lockd/lockd.h includes bind.h and defines `struct nlm_host` later in lockd.h itself;
+        # fs/lockd/Kconfig defines LOCKD_V4.
+        paths = [
+            "include/linux/lockd/bind.h",
+            "include/linux/lockd/lockd.h",
+            "include/linux/sunrpc/svc.h",
+            "fs/nfs/a.c", "fs/nfs/b.c", "fs/nfs/c.c", "fs/nfs/d.c", "fs/nfs/e.c",
+            "fs/nfsd/nfssvc.c",
+            "fs/lockd/Kconfig",
+            "arch/arm/Kconfig",
+        ]
+        shas = {p: f"{i + 20:040x}" for i, p in enumerate(paths)}
+        blobs = {p: i + 20 for i, p in enumerate(paths)}
+        ids = {shas[p]: (blobs[p], 1) for p in paths}
+        ast = {"nlm_host": 1, "svc_rqst": 2, "CONFIG_LOCKD_V4": 3, "LOCKD_V4": 4}
+        fnids = {p: i + 1 for i, p in enumerate(paths)}
+        includers = ["fs/nfs/a.c", "fs/nfs/b.c", "fs/nfs/c.c", "fs/nfs/d.c", "fs/nfs/e.c",
+                     "fs/nfsd/nfssvc.c", "include/linux/lockd/lockd.h"]
+        db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+            "m_ast": [
+                {"ast_id": 1, "name": "nlm_host", "type_id": ASTT.C_structnotbind.value},
+                {"ast_id": 2, "name": "svc_rqst", "type_id": ASTT.C_structnotbind.value},
+                {"ast_id": 3, "name": "CONFIG_LOCKD_V4", "type_id": ASTT.CPPro_define.value},
+                {"ast_id": 4, "name": "LOCKD_V4", "type_id": ASTT.Kconfig_Config.value},
+            ],
+            "m_blob_symbol_def": [
+                # Forward decl in bind.h itself (must not mask external full definition)
+                {"def_id": 1, "blob_id": blobs["include/linux/lockd/bind.h"], "tag_id": 1, "ast_id": 1,
+                 "name": "nlm_host", "type_id": ASTT.C_structnotbind.value, "linkage": 0, "line_s": 18, "line_e": 18},
+                # Full definition of nlm_host later in direct includer lockd.h
+                {"def_id": 2, "blob_id": blobs["include/linux/lockd/lockd.h"], "tag_id": 1, "ast_id": 1,
+                 "name": "nlm_host", "type_id": ASTT.C_structdecl.value, "linkage": 0, "line_s": 42, "line_e": 75},
+                # Full definition of svc_rqst in svc.h (reached via fs/nfsd/nfssvc.c)
+                {"def_id": 3, "blob_id": blobs["include/linux/sunrpc/svc.h"], "tag_id": 1, "ast_id": 2,
+                 "name": "svc_rqst", "type_id": ASTT.C_structdecl.value, "linkage": 0, "line_s": 110, "line_e": 160},
+                # Kconfig definition of LOCKD_V4 in fs/lockd/Kconfig (and an alternative in arch/arm/Kconfig)
+                {"def_id": 4, "blob_id": blobs["fs/lockd/Kconfig"], "tag_id": 1, "ast_id": 4,
+                 "name": "LOCKD_V4", "type_id": ASTT.Kconfig_Config.value, "linkage": 0, "line_s": 25, "line_e": 31},
+                {"def_id": 5, "blob_id": blobs["arch/arm/Kconfig"], "tag_id": 1, "ast_id": 4,
+                 "name": "LOCKD_V4", "type_id": ASTT.Kconfig_Config.value, "linkage": 0, "line_s": 99, "line_e": 102},
+            ],
+            "m_blob_symbol_ref": [
+                {"ref_id": 1, "blob_id": blobs["include/linux/lockd/bind.h"], "tag_id": 1, "ast_id": 1,
+                 "target_fnid": 0, "role": TYPE, "line": 28, "char_s": 1},
+                {"ref_id": 2, "blob_id": blobs["include/linux/lockd/bind.h"], "tag_id": 1, "ast_id": 2,
+                 "target_fnid": 0, "role": TYPE, "line": 30, "char_s": 1},
+                {"ref_id": 3, "blob_id": blobs["include/linux/lockd/bind.h"], "tag_id": 1, "ast_id": 3,
+                 "target_fnid": 0, "role": int(SymbolRole.CondRef), "line": 15, "char_s": 1},
+            ],
+            "m_file_name": [{"fnid": fid, "fname": p} for p, fid in fnids.items()],
+            "m_file_reference": [
+                {"ref_id": i + 1, "source_blob_id": blobs[inc], "source_fnid": fnids[inc],
+                 "target_fnid": fnids["include/linux/lockd/bind.h"], "ref_type": 1, "line_no": 12, "details": ""}
+                for i, inc in enumerate(includers)
+            ],
+        })
+
+        def reach_before(_rev: str, _arch: str, includer: str, _target: str):
+            if includer == "fs/nfsd/nfssvc.c":
+                return {"fs/nfsd/nfssvc.c": None, "include/linux/sunrpc/svc.h": "fs/nfsd/nfssvc.c"}
+            return {includer: None}
+
+        with patch_reader(db), \
+                patch.object(isvc.git_tree_resolver, "list_tree", return_value=shas), \
+                patch.object(isvc.git_tree_resolver, "resolve_commit_sha", return_value="f" * 40), \
+                patch.object(isvc.GitTreeResolver, "map_blob_hashes",
+                             side_effect=lambda _r, s_list: {s: ids[s] for s in s_list if s in ids}), \
+                patch.object(isvc.arch_layout_service, "layout", return_value=object()), \
+                patch.object(isvc.arch_layout_service, "reachable",
+                             return_value={"include/linux/lockd/bind.h": None}), \
+                patch.object(isvc.arch_layout_service, "reachable_before", side_effect=reach_before):
+            out = ImportsService().get_imports("v6.19", "include/linux/lockd/bind.h", "x86_64")
+
+        items = {it["name"]: it for it in out["items"]}
+        self.assertEqual(set(items), {"nlm_host", "svc_rqst", "CONFIG_LOCKD_V4"})
+        # Forward-declared nlm_host resolved from direct includer header lockd.h itself
+        self.assertEqual(
+            (items["nlm_host"]["kind"], items["nlm_host"]["header_path"], items["nlm_host"]["line"],
+             items["nlm_host"]["via"], items["nlm_host"]["context"], items["nlm_host"]["chain"]),
+            ("struct", "include/linux/lockd/lockd.h", 42, "context", "include/linux/lockd/lockd.h",
+             ["include/linux/lockd/lockd.h"]),
+        )
+        # svc_rqst resolved via diversified includer fs/nfsd/nfssvc.c despite 5 fs/nfs/*.c files sorting earlier
+        self.assertEqual(
+            (items["svc_rqst"]["kind"], items["svc_rqst"]["header_path"], items["svc_rqst"]["line"],
+             items["svc_rqst"]["via"], items["svc_rqst"]["context"], items["svc_rqst"]["chain"]),
+            ("struct", "include/linux/sunrpc/svc.h", 110, "context", "fs/nfsd/nfssvc.c",
+             ["fs/nfsd/nfssvc.c", "include/linux/sunrpc/svc.h"]),
+        )
+        # CONFIG_LOCKD_V4 resolved to fs/lockd/Kconfig with kind="config", via="kconfig", alternatives=1
+        self.assertEqual(
+            (items["CONFIG_LOCKD_V4"]["kind"], items["CONFIG_LOCKD_V4"]["header_path"],
+             items["CONFIG_LOCKD_V4"]["line"], items["CONFIG_LOCKD_V4"]["via"],
+             items["CONFIG_LOCKD_V4"]["chain"], items["CONFIG_LOCKD_V4"]["alternatives"]),
+            ("config", "fs/lockd/Kconfig", 25, "kconfig",
+             ["include/linux/lockd/bind.h", "fs/lockd/Kconfig"], 1),
+        )
+
 
 class TestContextWalk(unittest.TestCase):
     """arch_layout_service.reachable_before() and the walk's condition filter."""

@@ -234,7 +234,9 @@ export class ImportsPanel {
     }).join('<span class="code-imports-arrow">→</span>');
     const context = item.via === "context"
       ? `<span class="code-imports-context" title="${escapeHtml(`Defined by what ${item.context || "an including file"} includes before this file (this file relies on its includer)`)}">context</span>` : "";
-    const badge = context + (item.forced ? '<span class="code-imports-forced" title="Reached through a compiler-forced -include header">-include</span>' : "");
+    const kconfig = item.via === "kconfig" || item.kind === "config"
+      ? '<span class="code-imports-kconfig" title="Defined in Kconfig">kconfig</span>' : "";
+    const badge = context + kconfig + (item.forced ? '<span class="code-imports-forced" title="Reached through a compiler-forced -include header">-include</span>' : "");
     return `<div class="code-imports-chain" title="${escapeHtml(formatChain(item, { full: true }))}">${badge}${links}</div>`;
   }
 

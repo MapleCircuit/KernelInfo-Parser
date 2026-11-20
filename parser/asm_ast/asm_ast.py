@@ -8,12 +8,13 @@ import time
 from pathlib import Path
 import clang.cindex as cc
 
-from core.SymbolRows import finish as finish_symbol_rows
+from core.SymbolRows import finish as finish_symbol_rows, record_def as record_symbol_def
 from core.globalstuff import (
     G,
     COLOR,
     REF_ROOT,
     REF_OLD,
+    REF_POS,
     REF_C_AST,
     REF_NO_REF,
     FILE_ERROR,
@@ -29,6 +30,7 @@ from parser.c_ast.ast_nodes import _ASM_BRANCH_MNEMONICS, _ASM_REGISTER_NAMES, r
 
 ChangeSetType = Any
 from parser.c_ast.c_ast import stage_parse_diagnostics
+from parser.c_ast.cursor_tree import clear_tu_caches
 from parser.c_ast import (
     AST_KIND,
     Line,
@@ -162,21 +164,40 @@ def asm_node_refs(
         directive = ""
         if stmt[0].kind == "p" and stmt[0].text == "." and len(stmt) > 1 and stmt[1].kind == "id":
             directive = stmt[1].text.lower()
-            idx = 2
-            mode = "data" if directive in _DATA_DIRECTIVES else "skip"
+            if (
+                directive in ("equ", "set", "equiv")
+                and len(stmt) > 3
+                and stmt[2].kind == "id"
+                and stmt[3].kind == "p"
+                and stmt[3].text == ","
+            ):
+                idx = 4
+                mode = "data"
+            else:
+                idx = 2
+                mode = "data" if directive in _DATA_DIRECTIVES else "skip"
         elif stmt[0].kind == "id":
-            while stmt[idx].text.lower() in _INSTRUCTION_PREFIXES and idx + 1 < len(stmt) and stmt[idx + 1].kind == "id":
+            if (
+                len(stmt) >= 2
+                and stmt[1].kind == "p"
+                and stmt[1].text == "="
+                and not (len(stmt) >= 3 and stmt[2].kind == "p" and stmt[2].text == "=")
+            ):
+                idx = 2
+                mode = "operands"
+            else:
+                while stmt[idx].text.lower() in _INSTRUCTION_PREFIXES and idx + 1 < len(stmt) and stmt[idx + 1].kind == "id":
+                    idx += 1
+                lead = stmt[idx]
                 idx += 1
-            lead = stmt[idx]
-            idx += 1
-            if lead.macro:
-                mode = "skip"
-            elif lead.text in gas_macros or (lead.text not in _ASM_BRANCH_MNEMONICS and looks_like_gas_macro(lead.text)
-                                             and lead.text.lower() not in _ASM_REGISTER_NAMES):
-                add(lead, int(SymbolRole.MacroExpansion), int(ASTT.ASM_Macro))
-                mode = "args"
-            elif lead.text.lower() in _ASM_BRANCH_MNEMONICS:
-                mode = "branch"
+                if lead.macro:
+                    mode = "skip"
+                elif lead.text in gas_macros or (lead.text not in _ASM_BRANCH_MNEMONICS and looks_like_gas_macro(lead.text)
+                                                 and lead.text.lower() not in _ASM_REGISTER_NAMES):
+                    add(lead, int(SymbolRole.MacroExpansion), int(ASTT.ASM_Macro))
+                    mode = "args"
+                elif lead.text.lower() in _ASM_BRANCH_MNEMONICS:
+                    mode = "branch"
         if mode == "skip":
             continue
         for j in range(idx, len(stmt)):
@@ -194,11 +215,10 @@ def asm_node_refs(
                 continue
             if t.text.isupper() and nxt is not None and nxt.text == "(" and _adjacent(t, nxt):
                 continue   # an upper-case function-like macro use libclang could not resolve
-            if mode == "branch":
-                if not t.text.startswith("L"):
-                    add(t, int(SymbolRole.Call), int(ASTT.ASM_Instruction))
-            elif len(t.text) > 1 and t.text[0] == "L" and t.text[1].isdigit():
+            if len(t.text) > 1 and t.text[0] == "L" and t.text[1].isdigit():
                 continue
+            if mode == "branch":
+                add(t, int(SymbolRole.Call), int(ASTT.ASM_Instruction))
             else:
                 add(t, int(SymbolRole.DeclRef), int(ASTT.ASM_Label))
     return out
@@ -255,6 +275,22 @@ class Asm_Directive(_TokenRefs, Ast_ASM_Directive):
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
         self.extract_1arg(CS, ASTT.ASM_Directive, (self.payload or self.extent.code)[:255], self.extent, create_tag=create_tag)
+        def_sym = getattr(self, "def_sym", None)
+        if create_tag and def_sym and not def_sym.isdigit():
+            safe_sym = str(def_sym)[:255]
+            if hasattr(CS, "symbol_dict") and isinstance(self.ast_ref, tuple) and len(self.ast_ref) == 3:
+                CS.symbol_dict[(safe_sym, ASTT.ASM_Label)] = self.ast_ref[2][1]
+            with CS(REF_POS):
+                record_symbol_def(
+                    CS,
+                    getattr(self, "tag_ref", 0),
+                    self.ast_ref,
+                    safe_sym,
+                    ASTT.ASM_Label,
+                    int(SymbolLinkage.InternalStaticDef),
+                    self.extent.line_pos[0],
+                    self.extent.line_pos[1],
+                )
         self._record_refs(CS)
 
 
@@ -310,57 +346,66 @@ class Asm_Manager:
         self.Init_Parse(CS)
 
     def Init_Parse(self, CS: ChangeSetType) -> None:
+        parsed_tu = None
+        TL = None
+        clear_tu_caches()
         try:
-            self.unsplit_rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
-        except Exception as e:
-            raise FILE_ERROR(e)
+            try:
+                self.unsplit_rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
+            except Exception as e:
+                raise FILE_ERROR(e)
 
-        self.rawfile = tuple(self.unsplit_rawfile.replace("\r\n", "\n").split("\n"))
+            self.rawfile = tuple(self.unsplit_rawfile.replace("\r\n", "\n").split("\n"))
 
-        global _WORKER_ASM_CLANG_INDEX
-        if _WORKER_ASM_CLANG_INDEX is None:
-            _WORKER_ASM_CLANG_INDEX = cc.Index.create()
-        index = _WORKER_ASM_CLANG_INDEX
+            global _WORKER_ASM_CLANG_INDEX
+            if _WORKER_ASM_CLANG_INDEX is None:
+                _WORKER_ASM_CLANG_INDEX = cc.Index.create()
+            index = _WORKER_ASM_CLANG_INDEX
 
-        prof = getattr(CS, "profiler", None)
-        if prof is not None:
-            t_parse_0 = time.perf_counter()
+            prof = getattr(CS, "profiler", None)
+            if prof is not None:
+                t_parse_0 = time.perf_counter()
 
-        G.CURRENT_RAWFILE = self.rawfile
-        # The assembler-with-cpp compilation `make ARCH=<arch>` runs (parser/compile_env.py)
-        from parser import compile_env  # lazy: parser.arch_layout imports the C parser through kconfig_ast
+            G.CURRENT_RAWFILE = self.rawfile
+            # The assembler-with-cpp compilation `make ARCH=<arch>` runs (parser/compile_env.py)
+            from parser import compile_env  # lazy: parser.arch_layout imports the C parser through kconfig_ast
 
-        env = compile_env.env_for(self.mfdir)
-        CS.compile_env = env
-        env_args, extra_options, arch_env = env.args_for(self.filename, asm=True)
-        CS.compile_arch = arch_env
-        parsed_tu = index.parse(
-            self.fullfilename,
-            args=["-w", *env_args],
-            options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768) | extra_options,
-        )
-        CS.parse_diagnostics = compile_env.diagnostics_fact(parsed_tu, arch_env, asm=True)
+            env = compile_env.env_for(self.mfdir)
+            CS.compile_env = env
+            env_args, extra_options, arch_env = env.args_for(self.filename, asm=True)
+            CS.compile_arch = arch_env
+            parsed_tu = index.parse(
+                self.fullfilename,
+                args=["-w", *env_args],
+                options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768) | extra_options,
+            )
+            CS.parse_diagnostics = compile_env.diagnostics_fact(parsed_tu, arch_env, asm=True)
 
-        if prof is not None:
-            prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
-            t_tok_0 = time.perf_counter()
+            if prof is not None:
+                prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
+                t_tok_0 = time.perf_counter()
 
-        TL = TokenList(parsed_tu, self.fullfilename, self.rawfile)
+            TL = TokenList(parsed_tu, self.fullfilename, self.rawfile)
 
-        if prof is not None:
-            prof.clang_tokenize_s = time.perf_counter() - t_tok_0
-            t_proc_0 = time.perf_counter()
+            if prof is not None:
+                prof.clang_tokenize_s = time.perf_counter() - t_tok_0
+                t_proc_0 = time.perf_counter()
 
-        self.process_tokens(TL.tokens_array, TL.cursors_array)
+            self.process_tokens(TL.tokens_array, TL.cursors_array)
 
-        if prof is not None:
-            prof.token_processing_s = time.perf_counter() - t_proc_0
-            t_extract_0 = time.perf_counter()
+            if prof is not None:
+                prof.token_processing_s = time.perf_counter() - t_proc_0
+                t_extract_0 = time.perf_counter()
 
-        self.extract(CS)
+            self.extract(CS)
 
-        if prof is not None:
-            prof.ast_extraction_s = time.perf_counter() - t_extract_0
+            if prof is not None:
+                prof.ast_extraction_s = time.perf_counter() - t_extract_0
+        finally:
+            TL = None
+            parsed_tu = None
+            cc.Cursor._tu = None
+            clear_tu_caches()
 
     def process_tokens(self, tokens_array: list, cursors_array: list) -> None:
         """Process assembly and preprocessor tokens into AST nodes."""
@@ -374,7 +419,9 @@ class Asm_Manager:
             "SYM_FUNC_START_ALIAS", "SYM_FUNC_START_WEAK_ALIAS",
             "SYM_CODE_START", "SYM_CODE_START_NOALIGN", "SYM_CODE_START_LOCAL", "SYM_CODE_START_LOCAL_NOALIGN", "SYM_CODE_START_WEAK",
             "SYM_TYPED_FUNC_START", "SYM_DATA_START", "SYM_DATA_START_LOCAL", "SYM_DATA_START_WEAK", "WEAK",
+            "SYM_INNER_LABEL", "SYM_DATA", "SYM_DATA_LOCAL",
         })
+        SINGLE_LINE_LINKAGE_MACROS = frozenset({"SYM_INNER_LABEL", "SYM_DATA", "SYM_DATA_LOCAL"})
 
         LINKAGE_END_MACROS = frozenset({
             "SYM_FUNC_END", "SYM_FUNC_END_ALIAS", "SYM_CODE_END", "SYM_DATA_END", "SYM_DATA_END_LABEL", "ENDPROC", "END",
@@ -409,15 +456,16 @@ class Asm_Manager:
             tspelling = token.spelling_str
             tline = token.line
 
-            # Comments
-            if ast_kind == AST_KIND.comment:
-                self.children.append(Ast_ASM_Comment(tline, tspelling))
+            # Check if previous child can continue absorbing token (before comment handling so /* ... */
+            # inside a multiline #define is absorbed by CPPro instead of splitting the #define)
+            if self.children and self.children[-1].within_range(token, ast_kind):
+                self.children[-1].exec_filter(token, cursor, ast_kind)
                 i += 1
                 continue
 
-            # Check if previous child can continue absorbing token
-            if self.children and self.children[-1].within_range(token, ast_kind):
-                self.children[-1].exec_filter(token, cursor, ast_kind)
+            # Comments
+            if ast_kind == AST_KIND.comment:
+                self.children.append(Ast_ASM_Comment(tline, tspelling))
                 i += 1
                 continue
 
@@ -482,20 +530,51 @@ class Asm_Manager:
             if ast_kind == AST_KIND.punctuation and tspelling == ".":
                 if macro_stack and i + 1 < n and tokens_array[i + 1].spelling_str == "endm":
                     macro_stack.pop()[0].extent.grow(tokens_array[i + 1].line)
-                self.children.append(make(Asm_Directive, tline, ".", i))
+                dir_node = make(Asm_Directive, tline, ".", i)
+                if (
+                    i + 3 < n
+                    and tokens_array[i + 1].spelling_str.lower() in ("equ", "set", "equiv")
+                    and tokens_array[i + 2].ast_kind in (AST_KIND.identifier, AST_KIND.keyword)
+                    and tokens_array[i + 3].spelling_str == ","
+                    and tokens_array[i + 3].line.line_pos[0] == tline.line_pos[0]
+                ):
+                    dir_node.def_sym = tokens_array[i + 2].spelling_str
+                self.children.append(dir_node)
                 i += 1
                 continue
 
-            # Linkage macros: ENTRY(name), GLOBAL(name), SYM_FUNC_START*(name), SYM_CODE_START*(name)
-            if tspelling in LINKAGE_START_MACROS and i + 2 < n and tokens_array[i + 1].spelling_str == "(":
+            # Linkage macros: ENTRY(name), GLOBAL(name), SYM_FUNC_START*(name), SYM_CODE_START*(name),
+            # SYM_INNER_LABEL(name, linkage), SYM_DATA(name, ...), SYM_DATA_LOCAL(name, ...)
+            if (
+                tspelling in LINKAGE_START_MACROS
+                and i + 2 < n
+                and tokens_array[i + 1].spelling_str == "("
+                and tokens_array[i + 2].ast_kind in (AST_KIND.identifier, AST_KIND.keyword)
+            ):
                 sym_name = tokens_array[i + 2].spelling_str
-                close_idx = i + 3
-                while close_idx < n and tokens_array[close_idx].spelling_str != ")" and tokens_array[close_idx].line.line_pos[0] == tline.line_pos[0]:
+                close_idx = i + 2
+                depth = 1
+                while close_idx < n and tokens_array[close_idx].line.line_pos[0] == tline.line_pos[0]:
+                    sp = tokens_array[close_idx].spelling_str
+                    if sp == "(":
+                        depth += 1
+                    elif sp == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
                     close_idx += 1
-                if close_idx < n and tokens_array[close_idx].spelling_str == ")":
+                if close_idx < n and depth == 0 and tokens_array[close_idx].spelling_str == ")":
                     entry_ext = Line(tline)
                     entry_ext.grow(tokens_array[close_idx].line)
-                    if "LOCAL" in tspelling:
+                    if tspelling == "SYM_INNER_LABEL":
+                        arg_text = " ".join(tokens_array[k].spelling_str for k in range(i + 3, close_idx))
+                        if "LOCAL" in arg_text:
+                            linkage = SymbolLinkage.InternalStaticDef
+                        elif "WEAK" in arg_text:
+                            linkage = SymbolLinkage.WeakOrAliasDef
+                        else:
+                            linkage = SymbolLinkage.ExternalDef
+                    elif "LOCAL" in tspelling:
                         linkage = SymbolLinkage.InternalStaticDef
                     elif "WEAK" in tspelling or tspelling == "WEAK":
                         linkage = SymbolLinkage.WeakOrAliasDef
@@ -505,7 +584,8 @@ class Asm_Manager:
                     open_func.extra_refs.append((tspelling, int(tline.line_pos[0]), int(tline.char_pos[0]), int(SymbolRole.MacroExpansion), int(ASTT.CPPro_define)))
                     open_func.toks = []
                     self.children.append(open_func)
-                    func_stack.append(open_func)
+                    if tspelling not in SINGLE_LINE_LINKAGE_MACROS:
+                        func_stack.append(open_func)
                     i = close_idx + 1
                     continue
 
@@ -529,14 +609,62 @@ class Asm_Manager:
                     i = close_idx + 1
                     continue
 
-            # Labels (token followed by ':' on the same line)
-            if i + 1 < n and tokens_array[i + 1].spelling_str == ":" and tokens_array[i + 1].line.line_pos[0] == tline.line_pos[0]:
+            # Labels (identifier/keyword or numeric literal followed by ':' on the same line, not preceded by '\')
+            if (
+                (ast_kind in (AST_KIND.identifier, AST_KIND.keyword) or (ast_kind == AST_KIND.literal and tspelling.isdigit()))
+                and not (i > 0 and tokens_array[i - 1].spelling_str == "\\" and tokens_array[i - 1].line.line_pos[0] == tline.line_pos[0])
+                and i + 1 < n
+                and tokens_array[i + 1].spelling_str == ":"
+                and tokens_array[i + 1].line.line_pos[0] == tline.line_pos[0]
+            ):
                 label_ext = Line(tline)
                 label_ext.grow(tokens_array[i + 1].line)
                 is_num = tspelling.isdigit()
                 self.children.append(make(Asm_Label, label_ext, tspelling, i, is_numeric=is_num))
                 self.children[-1].toks = []
                 i += 2
+                continue
+
+            # Symbol assignment: SYM = expr (not ==)
+            if (
+                ast_kind in (AST_KIND.identifier, AST_KIND.keyword)
+                and (
+                    first_on_line(i)
+                    or (i > 0 and tokens_array[i - 1].spelling_str == ";" and tokens_array[i - 1].line.line_pos[0] == tline.line_pos[0])
+                )
+                and i + 1 < n
+                and tokens_array[i + 1].spelling_str == "="
+                and tokens_array[i + 1].line.line_pos[0] == tline.line_pos[0]
+                and not (i + 2 < n and tokens_array[i + 2].spelling_str == "=" and tokens_array[i + 2].line.line_pos[0] == tline.line_pos[0])
+            ):
+                assign_ext = Line(tline)
+                assign_node = make(Asm_Label, assign_ext, tspelling, i, linkage=SymbolLinkage.InternalStaticDef)
+                j = i + 1
+                last_line = assign_ext.line_pos[1]
+                while j < n:
+                    nt = tokens_array[j]
+                    nl = nt.line.line_pos[0]
+                    if nl != last_line and not (
+                        hasattr(self, "rawfile") and self.rawfile
+                        and all(0 <= l < len(self.rawfile) and self.rawfile[l].rstrip().endswith("\\") for l in range(last_line - 1, nl - 1))
+                    ):
+                        break
+                    if nt.ast_kind == AST_KIND.comment:
+                        if nt.spelling_str.startswith("//"):
+                            break
+                        j += 1
+                        continue
+                    if nt.ast_kind == AST_KIND.punctuation and nt.spelling_str == ";":
+                        j += 1
+                        break
+                    if nt.ast_kind == AST_KIND.punctuation and nt.spelling_str in line_comment_chars and nt.spelling_str != ";":
+                        break
+                    assign_ext.grow(nt.line)
+                    assign_node.toks.append(_tok(nt, cursors_array[j]))
+                    last_line = nt.line.line_pos[1]
+                    j += 1
+                self.children.append(assign_node)
+                i = j
                 continue
 
             # General assembly statement / instruction

@@ -34,6 +34,7 @@ def prepare_compile_env(version: str, change_lines: list[str] | None) -> compile
         return None
     started = time.perf_counter()
     env = compile_env.CompileEnv(root, set(files), _reader(root), None, key=f"{root}:{version}")
+    compile_env.set_active(env)
     arches = {env.default_arch}
     for line in change_lines or ():
         parts = line.split("\t") if line else []
@@ -43,8 +44,11 @@ def prepare_compile_env(version: str, change_lines: list[str] | None) -> compile
         if path.endswith((".c", ".h", ".S", ".s")):
             arches.add(env.arch_for(path))
     arches.discard(None)
-    env.prepare(sorted(arches))
-    compile_env.set_active(env)
+    try:
+        env.prepare(sorted(arches))
+    except BaseException:
+        release_compile_env()
+        raise
     logger.info(f"[Compile Env] '{version}': ARCH {env.default_arch} (+{len(arches) - 1} file ARCHes) prepared "
                 f"in {time.perf_counter() - started:.1f}s.")
     return env

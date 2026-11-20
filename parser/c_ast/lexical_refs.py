@@ -42,6 +42,7 @@ CUR_NONE = 0          # no cursor (skipped code)
 CUR_UNRESOLVED = 1    # a reference / macro instantiation whose target is null
 CUR_RESOLVED = 2      # anything else (resolved references, expressions)
 CUR_DECL = 3          # the name a declaration introduces (its cursor is the declaration)
+CUR_PARAM_DECL = 4    # the name a parameter declaration (PARM_DECL) introduces
 
 _TAG_KEYWORDS = {"struct": ASTT.C_structnotbind, "union": ASTT.C_unionnotbind, "enum": ASTT.C_enumnotbind}
 _NOT_NAMES = frozenset({
@@ -87,8 +88,239 @@ def _type_position(tokens: list[tuple[str, str, int, int, int]], i: int) -> bool
     return False
 
 
+def _build_token_scopes(
+    tokens: list[tuple[str, str, int, int, int]],
+    directive_lines: set[int],
+    rawfile: Iterable[str] | None = None,
+) -> tuple[list[int | None], list[set[str]], list[int], set[int]]:
+    """Build a scope tree `(parents, decls_by_scope, token_scope, extra_decl_indices)` over `tokens`.
+
+    Scope 0 is file scope. Function parameters and locals live in their function/block scopes (and prototype
+    parameters or struct/union field declarations never enter file or function scopes), so a parameter or local
+    in one function never masks an unresolved reference with the same name in another function or at file scope.
+    """
+    n = len(tokens)
+
+    # Identify which token indices are declaration names via _type_position or (*name)(
+    _TYPE_KW = frozenset({"void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "_Bool", "bool"})
+    _QUAL_OR_PTR = frozenset({"*", "const", "volatile", "restrict", "__restrict", "__restrict__", "__user", "__iomem", "__rcu", "__percpu"})
+    extra_decl_indices: set[int] = set()
+    fn_ptr_indices: set[int] = set()
+    for i in range(n):
+        if tokens[i][2] in directive_lines:
+            continue
+        if tokens[i][1] == KIND_IDENTIFIER and tokens[i][4] != CUR_RESOLVED and _type_position(tokens, i):
+            j = i + 1
+            while j < n and tokens[j][0] in _QUAL_OR_PTR:
+                j += 1
+            if j < n and tokens[j][1] == KIND_IDENTIFIER:
+                extra_decl_indices.add(j)
+        if (tokens[i][1] == KIND_IDENTIFIER and 1 < i < n - 2 and tokens[i - 1][0] == "*" and tokens[i - 2][0] == "("
+                and tokens[i + 1][0] == ")" and tokens[i + 2][0] in ("(", "[")):
+            extra_decl_indices.add(i)
+            fn_ptr_indices.add(i)
+            if tokens[i + 2][0] == "(":
+                depth = 1
+                k = i + 3
+                while k < n and depth > 0:
+                    if tokens[k][0] == "(":
+                        depth += 1
+                    elif tokens[k][0] == ")":
+                        depth -= 1
+                    elif depth == 1 and (
+                        tokens[k][0] in _TYPE_KW
+                        or (tokens[k][0] in ("struct", "union", "enum") and k + 1 < n and tokens[k + 1][1] == KIND_IDENTIFIER)
+                    ):
+                        m = k + 2 if tokens[k][0] in ("struct", "union", "enum") else k + 1
+                        while m < n and (tokens[m][0] in _TYPE_KW or tokens[m][0] in _QUAL_OR_PTR):
+                            m += 1
+                        if m < n and tokens[m][1] == KIND_IDENTIFIER and tokens[m][4] != CUR_RESOLVED:
+                            if m + 1 >= n or tokens[m + 1][0] in _DECL_END:
+                                extra_decl_indices.add(m)
+                    k += 1
+
+    # When rawfile is available, use c_scope.extract_scopes for #if/#else-balanced function and block spans
+    if rawfile is not None:
+        try:
+            from parser.c_ast.c_scope import extract_scopes
+            raw_list = rawfile if isinstance(rawfile, (list, tuple)) else list(rawfile)
+            model = extract_scopes("\n".join(raw_list))
+        except Exception:  # noqa: BLE001
+            model = None
+        if model and model.get("scopes"):
+            cs_scopes = model["scopes"]
+            cs_funcs = model.get("functions") or []
+            parents = [s.get("parent") for s in cs_scopes]
+            decls: list[set[str]] = [set() for _ in cs_scopes]
+            spans: list[tuple[tuple[int, int], tuple[int, int], int, int]] = []
+            for sid, s in enumerate(cs_scopes):
+                if sid == 0:
+                    continue
+                sp = s.get("span") or [0, 0, 0, 0]
+                ls, cs_col, le, ce_col = int(sp[0] or 0), int(sp[1] or 1), int(sp[2] or 0), int(sp[3] or 1)
+                fn_idx = s.get("fn")
+                if s.get("kind") == "function" and isinstance(fn_idx, int) and 0 <= fn_idx < len(cs_funcs):
+                    fn_ls = int(cs_funcs[fn_idx].get("line_s") or ls)
+                    if fn_ls < ls:
+                        ls, cs_col = fn_ls, 1
+                spans.append(((ls, cs_col), (le, ce_col), le - ls, sid))
+            # Sort innermost (smallest line span, deepest sid) first
+            spans.sort(key=lambda item: (item[2], -item[3]))
+
+            def scope_at(line: int, col: int) -> int:
+                pos = (line, col)
+                for start, end, _len, sid in spans:
+                    if start <= pos <= end:
+                        return sid
+                return 0
+
+            for v in model.get("vars") or ():
+                if v.get("kind") in ("param", "local", "static_local"):
+                    sc = v.get("scope")
+                    vname = v.get("name")
+                    if vname and isinstance(sc, int) and 0 <= sc < len(decls):
+                        decls[sc].add(vname)
+
+            # Track struct/union body spans and top-level parentheses so struct fields and prototype params
+            # never enter file scope decls[0], while function names declared at paren_depth == 0 enter decls[0]
+            tok_scope = [0] * n
+            in_struct_depth = 0
+            pending_struct = False
+            paren_depth = 0
+            for i, (text, kind, line, col, state) in enumerate(tokens):
+                if line in directive_lines:
+                    continue
+                sid = scope_at(line, col)
+                tok_scope[i] = sid
+                if kind == KIND_KEYWORD and text in ("struct", "union") and paren_depth == 0 and sid == 0:
+                    j = i + 1
+                    if j < n and tokens[j][1] == KIND_IDENTIFIER:
+                        j += 1
+                    if j < n and tokens[j][0] == "{":
+                        pending_struct = True
+                elif kind == KIND_PUNCT:
+                    if text == "(":
+                        paren_depth += 1
+                    elif text == ")" and paren_depth > 0:
+                        paren_depth -= 1
+                    elif text == "{":
+                        paren_depth = 0
+                        if sid == 0 and (pending_struct or in_struct_depth > 0):
+                            in_struct_depth += 1
+                            pending_struct = False
+                    elif text == "}":
+                        paren_depth = 0
+                        if sid == 0 and in_struct_depth > 0:
+                            in_struct_depth -= 1
+                    elif text == ";" and paren_depth == 0:
+                        pending_struct = False
+                if kind == KIND_IDENTIFIER and (state in (CUR_DECL, CUR_PARAM_DECL) or i in extra_decl_indices):
+                    if sid == 0:
+                        if in_struct_depth > 0 or state == CUR_PARAM_DECL:
+                            continue
+                        if paren_depth > 0 and state != CUR_DECL and i not in fn_ptr_indices:
+                            continue
+                        decls[0].add(text)
+                    else:
+                        if state != CUR_PARAM_DECL and paren_depth == 0 and cs_scopes[sid].get("kind") == "function":
+                            fn_idx = cs_scopes[sid].get("fn")
+                            body = cs_funcs[fn_idx].get("body") if isinstance(fn_idx, int) and 0 <= fn_idx < len(cs_funcs) else None
+                            if body and (line, col) < (int(body[0] or 0), int(body[1] or 1)):
+                                decls[0].add(text)
+                                continue
+                        decls[sid].add(text)
+            return parents, decls, tok_scope, extra_decl_indices
+
+    parents = [None]
+    kinds: list[str] = ["file"]
+    decls = [set()]
+    tok_scope = [0] * n
+    cur = 0
+    paren_depth = 0
+    pending_params: set[str] = set()
+    pending_param_indices: list[int] = []
+    pending_tag_kind: str = ""
+
+    for i, (text, kind, line, _col, state) in enumerate(tokens):
+        if line in directive_lines:
+            tok_scope[i] = cur
+            continue
+        if kind == KIND_KEYWORD and text in ("struct", "union", "enum") and paren_depth == 0:
+            j = i + 1
+            if j < n and tokens[j][1] == KIND_IDENTIFIER:
+                j += 1
+            if j < n and tokens[j][0] == "{":
+                pending_tag_kind = text
+        elif kind == KIND_PUNCT:
+            if text == "(":
+                paren_depth += 1
+            elif text == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif text == "{":
+                paren_depth = 0
+                if pending_tag_kind in ("struct", "union"):
+                    new_kind = "struct"
+                    pending_tag_kind = ""
+                elif pending_tag_kind == "enum":
+                    new_kind = "enum"
+                    pending_tag_kind = ""
+                elif kinds[cur] == "file":
+                    new_kind = "func"
+                else:
+                    new_kind = "block"
+                new_id = len(parents)
+                parents.append(cur)
+                kinds.append(new_kind)
+                if new_kind in ("func", "block"):
+                    decls.append(set(pending_params))
+                    extra_decl_indices.update(pending_param_indices)
+                    pending_params.clear()
+                    pending_param_indices.clear()
+                else:
+                    decls.append(set())
+                cur = new_id
+            elif text == "}":
+                paren_depth = 0
+                pending_tag_kind = ""
+                if parents[cur] is not None:
+                    cur = parents[cur]  # type: ignore[assignment]
+            elif text == ";" and paren_depth == 0:
+                pending_tag_kind = ""
+                if kinds[cur] == "file":
+                    pending_params.clear()
+                    pending_param_indices.clear()
+
+        tok_scope[i] = cur
+        if kind == KIND_IDENTIFIER and (state in (CUR_DECL, CUR_PARAM_DECL) or i in extra_decl_indices):
+            if kinds[cur] == "struct":
+                continue
+            if kinds[cur] == "enum":
+                decls[0].add(text)
+            elif state == CUR_PARAM_DECL or (paren_depth > 0 and kinds[cur] == "file" and state != CUR_DECL and i not in fn_ptr_indices):
+                if kinds[cur] in ("func", "block"):
+                    decls[cur].add(text)
+                else:
+                    pending_params.add(text)
+                    pending_param_indices.append(i)
+            else:
+                decls[cur].add(text)
+
+    return parents, decls, tok_scope, extra_decl_indices
+
+
+def _is_declared_in_scope(name: str, scope_id: int, parents: list[int | None], decls: list[set[str]]) -> bool:
+    cur: int | None = scope_id
+    while cur is not None:
+        if name in decls[cur]:
+            return True
+        cur = parents[cur]
+    return False
+
+
 def lexical_refs(tokens: list[tuple[str, str, int, int, int]], covered: set[tuple[int, int]],
-                 directive_lines: set[int]) -> list[tuple[str, int, int, int, int]]:
+                 directive_lines: set[int],
+                 rawfile: Iterable[str] | None = None) -> list[tuple[str, int, int, int, int]]:
     """(name, line, column, role, target type) of the unresolved identifiers of a token stream.
 
     `tokens`: (spelling, kind, line, column, cursor state) in file order; `covered`: (line, column) of the
@@ -96,22 +328,9 @@ def lexical_refs(tokens: list[tuple[str, str, int, int, int]], covered: set[tupl
     """
     out: list[tuple[str, int, int, int, int]] = []
     n = len(tokens)
-    # Names the file declares itself (parameters and locals included, even when their type is unresolved):
-    # a use of one is no reference to something defined elsewhere
-    declared = {t[0] for t in tokens if t[1] == KIND_IDENTIFIER and t[4] == CUR_DECL}
-    for i in range(n):
-        if tokens[i][1] == KIND_IDENTIFIER and tokens[i][4] != CUR_RESOLVED and _type_position(tokens, i):
-            j = i + 1
-            while j < n and tokens[j][0] in ("*", "const", "volatile", "__user", "__iomem", "__rcu", "__percpu"):
-                j += 1
-            if j < n and tokens[j][1] == KIND_IDENTIFIER:
-                declared.add(tokens[j][0])
-        # A function-pointer declarator `(*name)(` names a field, parameter or variable being declared
-        if (tokens[i][1] == KIND_IDENTIFIER and 1 < i < n - 2 and tokens[i - 1][0] == "*" and tokens[i - 2][0] == "("
-                and tokens[i + 1][0] == ")" and tokens[i + 2][0] in ("(", "[")):
-            declared.add(tokens[i][0])
+    parents, decls, tok_scope, extra_decl_indices = _build_token_scopes(tokens, directive_lines, rawfile)
     for i, (text, kind, line, col, state) in enumerate(tokens):
-        if kind != KIND_IDENTIFIER or state in (CUR_RESOLVED, CUR_DECL) or line in directive_lines:
+        if kind != KIND_IDENTIFIER or state in (CUR_RESOLVED, CUR_DECL, CUR_PARAM_DECL) or i in extra_decl_indices or line in directive_lines:
             continue
         if (line, col) in covered or text in _NOT_NAMES or text in STANDARD_C_KEYWORDS or not _is_name(text):
             continue
@@ -125,7 +344,7 @@ def lexical_refs(tokens: list[tuple[str, str, int, int, int]], covered: set[tupl
             out.append((text, line, col, int(SymbolRole.TypeUsage), int(_TAG_KEYWORDS[prev])))
         elif text.isupper() and any(c.isalpha() for c in text):
             out.append((text, line, col, int(SymbolRole.MacroExpansion), int(ASTT.CPPro_define)))
-        elif text in declared:
+        elif _is_declared_in_scope(text, tok_scope[i], parents, decls):
             continue
         elif nxt == "(":
             out.append((text, line, col, int(SymbolRole.Call), int(ASTT.C_functionprotnotbind)))
@@ -180,6 +399,10 @@ def _cursor_state(cursor: Any, text: str) -> int:
         spelling = cursor.spelling
     except Exception:  # noqa: BLE001
         spelling = ""
+    if kind_id == 6:  # FIELD_DECL: struct/union field declarations do not bind variable names in scope
+        return CUR_RESOLVED
+    if kind_id == 10 and spelling == text:  # PARM_DECL: function parameter declaration
+        return CUR_PARAM_DECL
     if spelling == text and (cursor.kind.is_declaration() or kind_id in (501, 503, 201, 202)):
         return CUR_DECL  # the name a declaration / macro definition / label introduces
     return CUR_NONE
@@ -204,7 +427,7 @@ def record_lexical_refs(CS: Any, tokens_array: list[Any], rawfile: Iterable[str]
     for p in col.placements.values():
         covered.update((item[3], item[4]) for item in p.refs)
     covered.update((item[3], item[4]) for _tag, item in col.loose_refs)
-    found = lexical_refs(toks, covered, directive_lines_of(rawfile))
+    found = lexical_refs(toks, covered, directive_lines_of(rawfile), rawfile)
     if not found:
         return 0
     # Innermost tag around each line (the references are stored with that tag's items)

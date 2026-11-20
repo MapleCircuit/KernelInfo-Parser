@@ -109,41 +109,41 @@
   },
   "arch/x86/kernel/entry_64.S": {
     "full": {
-      "ops_count": 8053,
-      "ops_hash": "75ed673f633964d65a65917d5ff8b5e754a5d539b1530c04f9a180981ef25ac9",
+      "ops_count": 8044,
+      "ops_hash": "952aaa49b53706367c39623913b58d50fe757d4416762a8e6cc022ae06d0fb49",
       "store_hashes": {
-        "m_ast": "4ffa8c31cf831c9a",
+        "m_ast": "b20bf8dc6b43ebbd",
         "m_ast_attribute": "e140b030b7173b26",
         "m_ast_container": "99863fdc99516527",
-        "m_ast_hash": "02dfff89c2c801d7",
+        "m_ast_hash": "9167176cf283bc8a",
         "m_ast_include": "0e12637f6cf5696b",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_tag": "2278a10d7c6eb814",
+        "m_bridge_tag": "b40c070d37663bc7",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "3a188a9a271d0cca",
-        "m_map_ast": "bfb2f9a7a5473d73",
-        "m_symbol_def": "978b3cc4f40d9551",
-        "m_symbol_ref": "d2fb8fcbc214f4fa",
-        "m_tag": "ba2e4ff75ca1a685"
+        "m_map_ast": "9d4ab98d4b292ed8",
+        "m_symbol_def": "dea977aa29410eff",
+        "m_symbol_ref": "c0e4a160e01b5055",
+        "m_tag": "c0d8fb0007ca20bc"
       }
     },
     "isolated": {
-      "ops_count": 7679,
-      "ops_hash": "0fcab180638d053aa11f6b2ac992e7042f83221dee7749087d615135f3ff64f3",
+      "ops_count": 7670,
+      "ops_hash": "448c6af019341f26f8e4651b255ebdc0e26a7b7e08b39ec415180a838bd4359c",
       "store_hashes": {
-        "m_ast": "b00da535429545dd",
-        "m_ast_attribute": "83650c293beee6ab",
-        "m_ast_container": "1a63d7800e4e4a25",
-        "m_ast_hash": "c921ea293691e7be",
+        "m_ast": "50475667a4576ddc",
+        "m_ast_attribute": "66ec407cce51dffe",
+        "m_ast_container": "e467374d5b5aeca7",
+        "m_ast_hash": "d7d5e010c8a0ded3",
         "m_ast_include": "0e12637f6cf5696b",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_tag": "2278a10d7c6eb814",
+        "m_bridge_tag": "b40c070d37663bc7",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "d0838655a3eeaef0",
-        "m_map_ast": "28de0b65a6adf333",
-        "m_symbol_def": "32c1151be0ad482d",
-        "m_symbol_ref": "a4bc537bd667681d",
-        "m_tag": "0d7b526276364c40"
+        "m_map_ast": "9286055478add4be",
+        "m_symbol_def": "067562712d12fc55",
+        "m_symbol_ref": "ee8e2109ae46f232",
+        "m_tag": "e868f475a803421f"
       }
     }
   },
@@ -208,13 +208,13 @@
       }
     },
     "isolated": {
-      "ops_count": 3083,
-      "ops_hash": "eec9c647bb4831fc16175f550af2666cc689b8aa31d768b04df18ebaea43cbaf",
+      "ops_count": 3062,
+      "ops_hash": "1a0aed7efe0c7b6293e085290a618a7e424c2433ccaac26939c85919b68dd429",
       "store_hashes": {
-        "m_ast": "e89022eacb6be5c6",
+        "m_ast": "81e639708e6f69ef",
         "m_ast_attribute": "57588d0b3a515a7c",
         "m_ast_container": "45e737bf93d0601e",
-        "m_ast_hash": "82560dae2bd3533f",
+        "m_ast_hash": "2b986c95f1243410",
         "m_ast_include": "9d7f8ec7c8e40139",
         "m_bridge_checkpoint": "028ab3525e29917f",
         "m_bridge_tag": "cfbcb9bcd5346fe9",
@@ -222,7 +222,7 @@
         "m_file_name": "4bbf01c2275cc717",
         "m_map_ast": "b0c70acb049994cc",
         "m_symbol_def": "4c8b0f87753f32eb",
-        "m_symbol_ref": "7bd3ef1b639fde4f",
+        "m_symbol_ref": "3f108af0052deb6a",
         "m_tag": "90c95bf19b70b3d4"
       }
     }
@@ -488,13 +488,13 @@
       }
     },
     "isolated": {
-      "ops_count": 9995,
-      "ops_hash": "2332f9ead08595ff674a945978568dda38cc82932ef5487b534f259378fdb4ff",
+      "ops_count": 10040,
+      "ops_hash": "4eb99f5d30c8391c7cb6967cf6143c232fa5641bec71ede12814976c12c79863",
       "store_hashes": {
-        "m_ast": "c6b7dc72f9d37b5d",
+        "m_ast": "ff71f0849999813e",
         "m_ast_attribute": "5112449af3cfc1d7",
         "m_ast_container": "c3913f02d8b8a1e0",
-        "m_ast_hash": "70c773e800c2b0e3",
+        "m_ast_hash": "a47957bd62936397",
         "m_ast_include": "d23274a48a2da30a",
         "m_bridge_checkpoint": "028ab3525e29917f",
         "m_bridge_tag": "7c943b9390aca704",
@@ -502,7 +502,7 @@
         "m_file_name": "c3d5a4edb135b8f3",
         "m_map_ast": "d373228f4c7d470f",
         "m_symbol_def": "20ed45201206e786",
-        "m_symbol_ref": "cd8fd0977175ae1f",
+        "m_symbol_ref": "88868d6058b6bfe5",
         "m_tag": "4976b1c74c89a8ca"
       }
     }
@@ -528,13 +528,13 @@
       }
     },
     "isolated": {
-      "ops_count": 26751,
-      "ops_hash": "0b21abd05e9e47c4a5a9363455a1b73f91e4f1a2e18aeae45b4e659d718b78f2",
+      "ops_count": 26788,
+      "ops_hash": "7591fb9f8577624512a4589d98734ae1c5634b608c44214df2f0ab74add1ad80",
       "store_hashes": {
-        "m_ast": "902f6fe7c2f15f28",
+        "m_ast": "3987466279c0f42a",
         "m_ast_attribute": "88a20571b002d4d1",
         "m_ast_container": "b2e907763d162cd4",
-        "m_ast_hash": "f5af41a7fec26c31",
+        "m_ast_hash": "fd724c44249b32a4",
         "m_ast_include": "7751ae14b2b67993",
         "m_bridge_checkpoint": "028ab3525e29917f",
         "m_bridge_tag": "99dba2b85e18a304",
@@ -542,7 +542,7 @@
         "m_file_name": "a6e1d033e7f22a3f",
         "m_map_ast": "2a8102810c48702e",
         "m_symbol_def": "6c779feb22df09bb",
-        "m_symbol_ref": "4b9cfb6e227f96e9",
+        "m_symbol_ref": "a447c19e23466eda",
         "m_tag": "a348d587d9a310f6"
       }
     }

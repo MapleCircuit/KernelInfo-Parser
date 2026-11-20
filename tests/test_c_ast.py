@@ -4291,6 +4291,34 @@ class TestHeaderReferenceCompleteness(unittest.TestCase):
                                ("call_me", int(R.Call)), ("obj", int(R.DeclRef))})
         self.assertEqual(lexical_refs(stream, set(), {1}), [])  # a directive line
 
+    def test_scope_isolated_lexical_declarations(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct holder { int field_only; };\n"
+            "int proto_fn(int proto_only);\n"
+            "static int fn_a(int param_x)\n"
+            "{\n"
+            "\tu32 local_y = (u32)param_x;\n"
+            "\treturn local_y + param_x;\n"
+            "}\n"
+            "static int fn_b(void)\n"
+            "{\n"
+            "\treturn param_x + local_y + proto_only + field_only;\n"
+            "}\n"
+            "int file_scope_val = sizeof(local_y);\n",
+            "fs/scope_iso.c",
+        )
+        by_line_name = {(line, role, name) for line, _col, role, name, _typ in refs}
+        # Inside fn_a (lines 5-6), param_x and local_y are in scope and must not emit unresolved DeclRefs
+        self.assertNotIn((5, "DeclRef", "param_x"), by_line_name)
+        self.assertNotIn((6, "DeclRef", "local_y"), by_line_name)
+        self.assertNotIn((6, "DeclRef", "param_x"), by_line_name)
+        # Inside fn_b (line 10) and at file scope (line 12), param_x, local_y, proto_only, and field_only are unresolved
+        self.assertIn((10, "DeclRef", "param_x"), by_line_name)
+        self.assertIn((10, "DeclRef", "local_y"), by_line_name)
+        self.assertIn((10, "DeclRef", "proto_only"), by_line_name)
+        self.assertIn((10, "DeclRef", "field_only"), by_line_name)
+        self.assertIn((12, "DeclRef", "local_y"), by_line_name)
+
 
 if __name__ == "__main__":
     import argparse

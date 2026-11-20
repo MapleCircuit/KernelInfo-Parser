@@ -58,7 +58,7 @@ _VERSION_LINE = re.compile(r"^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)\s*=\s*(
 
 def kernel_release(makefile: str) -> tuple[int, int, int, str]:
     """(VERSION, PATCHLEVEL, SUBLEVEL, EXTRAVERSION) of the top Makefile (0 for a missing number)."""
-    vals = {k: v.strip() for k, v in _VERSION_LINE.findall(makefile or "")}
+    vals = {k: v.split("#", 1)[0].strip() for k, v in _VERSION_LINE.findall(makefile or "")}
 
     def num(key: str) -> int:
         m = re.match(r"\d+", vals.get(key, ""))
@@ -157,7 +157,8 @@ def config_digest(values: dict[str, tuple[str, str]]) -> str:
     """Short identity of a configuration (fact family 7, build directory names)."""
     h = hashlib.sha256()
     for name in sorted(values):
-        h.update(f"{name}={values[name][1]}\n".encode("utf-8", "surrogatepass"))
+        sym_type, val = values[name]
+        h.update(f"{name}:{sym_type}={val}\n".encode("utf-8", "surrogatepass"))
     return h.hexdigest()[:16]
 
 
@@ -218,10 +219,10 @@ def generated_headers(files: set[str] | Iterable[str], read: Callable[[str], str
     out["include/linux/compile.h"] = compile_h
     out["include/generated/compile.h"] = compile_h
 
-    # asm-offsets: arch/<srcarch>/kernel/asm-offsets*.c (2.6.x writes include/asm-<arch>/asm-offsets.h)
+    # asm-offsets: arch/<srcarch>/**/asm-offsets*.c (2.6.x writes include/asm-<arch>/asm-offsets.h)
     offsets: list[str] = []
-    prefix = f"arch/{srcarch}/kernel/asm-offsets"
-    for path in sorted(n for n in names if n.startswith(prefix) and n.endswith(".c")):
+    arch_prefix = f"arch/{srcarch}/"
+    for path in sorted(n for n in names if n.startswith(arch_prefix) and n.endswith(".c") and "/asm-offsets" in n):
         offsets += [n for n in offset_names(read(path) or "") if n not in offsets]
     if offsets:
         text = _defines_text(offsets, "__ASM_OFFSETS_H__")
@@ -249,19 +250,21 @@ def generated_headers(files: set[str] | Iterable[str], read: Callable[[str], str
         for tdir in ("arch/x86/entry/syscalls", "arch/x86/syscalls"):
             t32, t64 = f"{tdir}/syscall_32.tbl", f"{tdir}/syscall_64.tbl"
             if t64 in names or t32 in names:
-                tables = {"unistd_32.h": (read(t32) or "", ("i386",)),
-                          "unistd_64.h": (read(t64) or "", ("common", "64")),
-                          "unistd_x32.h": (read(t64) or "", ("common", "x32"))}
+                raw32 = read(t32) or ""
+                raw64 = read(t64) or ""
+                tables = {"unistd_32.h": (raw32, ("i386",)),
+                          "unistd_64.h": (raw64, ("common", "64")),
+                          "unistd_x32.h": (raw64, ("common", "x32"))}
                 for name, (table, abis) in tables.items():
                     out[f"arch/x86/include/generated/uapi/asm/{name}"] = syscall_header(table, abis)
                 # Kernel-internal variants (arch/x86/entry/syscalls/Makefile: prefix ia32_ / x32_)
-                out["arch/x86/include/generated/asm/unistd_32_ia32.h"] = syscall_header(read(t32) or "", ("i386",), "__NR_ia32_")
-                out["arch/x86/include/generated/asm/unistd_64_x32.h"] = syscall_header(read(t64) or "", ("x32",), "__NR_x32_")
+                out["arch/x86/include/generated/asm/unistd_32_ia32.h"] = syscall_header(raw32, ("i386",), "__NR_ia32_")
+                out["arch/x86/include/generated/asm/unistd_64_x32.h"] = syscall_header(raw64, ("x32",), "__NR_x32_")
                 break
 
     for path in EMPTY_STUBS:
         out.setdefault(path, "")
-    if srcarch == "x86":
+    if srcarch:
         for path in ARCH_EMPTY_STUBS:
             out.setdefault(f"arch/{srcarch}/{path}", "")
     # A tree file always wins over a generated one (older trees keep some of these in Git)

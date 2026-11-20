@@ -224,9 +224,9 @@ def update(version: str, repo_path: str | None = None) -> bool:
     symbols_base = Counter(SYMBOL_STATS)
     WORKER_SYMBOL_STATS.clear()
     # Step 4.6: layouts, defconfig and build directories of the ARCHes the parse uses (inherited by the workers)
-    with G.measure_stage("Step 4.6: Compilation Environment"):
-        prepare_compile_env(version, gp.worker_change_list if gp.worker_change_list is not None else gp.Change_List)
     try:
+        with G.measure_stage("Step 4.6: Compilation Environment"):
+            prepare_compile_env(version, gp.worker_change_list if gp.worker_change_list is not None else gp.Change_List)
         trigger_multicore(scheduler=scheduler)
         scheduler.finalize()
     finally:

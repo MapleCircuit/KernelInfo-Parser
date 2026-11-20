@@ -30,6 +30,7 @@ DEFAULT_MODULES = [
     "unit_test.test_table_handling",
     "unit_test.test_raw_parser",
     "unit_test.test_c_parser",
+    "tests.test_asm_ast",
     "tests.test_maintainer_ast",
     "tests.test_maintainer_files",
     "tests.test_credits_lifecycle",
