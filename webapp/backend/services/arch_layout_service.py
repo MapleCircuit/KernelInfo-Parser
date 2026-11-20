@@ -6,9 +6,12 @@ The parser stores, for the head commit of every ingested version, what `make ARC
 without rows (branches, commits never ingested) are evaluated from their Git tree with the same code.
 Layouts depend only on the commit's files, so they are cached per (commit, ARCH).
 
-`reachable()` / `resolve_include()` follow `#include` directives with that layout
+`reachable()` / `resolve_include()` follow `#include` directives with that layout; `reachable_before()` walks an
+including file only up to its `#include` of a given header (the context that header is compiled in)
 (`parser/include_graph.py`); each blob's directives are read once (cached by blob SHA) and each walk
-is cached per (commit, ARCH, start file). Directives come from the parser's per-blob facts
+is cached per (commit, ARCH, start file). A walk skips the `#include` lines of `#if` branches the compilation
+cannot take on `__KERNEL__` / `__ASSEMBLY__` (`condition_filter()`: an assembly file never reads the C-only part
+of a header); a condition on anything else keeps its includes. Directives come from the parser's per-blob facts
 (`m_blob_facts` family 3, one query per walk level) before Git.
 """
 from __future__ import annotations
@@ -18,7 +21,7 @@ import threading
 from collections import OrderedDict
 
 from parser.arch_layout import ArchLayout, compute_layouts
-from parser.include_graph import IncludeResolver, include_directives
+from parser.include_graph import ConditionEvaluator, IncludeResolver, include_directives_with_conditions
 from db_engine.spec import Join
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.git_reader import git_reader
@@ -29,12 +32,23 @@ logger = logging.getLogger(__name__)
 _CACHE_SIZE = 64
 _DIRECTIVES_CACHE_SIZE = 50_000
 _WALK_CACHE_SIZE = 32
+# Macros whose value every compilation knows: an `#if` on them is decided; any other name leaves it open
+_KNOWN_MACROS = frozenset({"__KERNEL__", "__ASSEMBLY__", "__ASSEMBLER__"})
+
+
+def condition_filter(start: str) -> ConditionEvaluator:
+    """`reachable(filter_cond=...)` of a walk from `start`: `__KERNEL__` is defined, `__ASSEMBLY__` only for an
+    assembly file (`.S` / `.s`); a condition on anything else (CONFIG_*, header guards) keeps its includes."""
+    defines = {"__KERNEL__": "1"}
+    if start.endswith((".S", ".s")):
+        defines.update({"__ASSEMBLY__": "1", "__ASSEMBLER__": "1"})
+    return ConditionEvaluator(defines, _KNOWN_MACROS.__contains__)
 
 
 class ArchLayoutService:
     def __init__(self) -> None:
         self._cache: OrderedDict[tuple[str, str], ArchLayout | None] = OrderedDict()
-        self._directives: OrderedDict[str, list[tuple[str, bool]]] = OrderedDict()
+        self._directives: OrderedDict[str, list[tuple[str, bool, list[str]]]] = OrderedDict()
         self._walks: OrderedDict[tuple[str, str, str], dict[str, str | None]] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -91,6 +105,7 @@ class ArchLayoutService:
                 self._walks.move_to_end(key)
                 return self._walks[key]
         walk = resolver.reachable(start, lambda path: self._file_directives(sha, path, files),
+                                  filter_cond=condition_filter(start),
                                   prefetch=lambda paths: self._prefetch_directives(paths, files))
         with self._lock:
             self._walks[key] = walk
@@ -98,7 +113,40 @@ class ArchLayoutService:
                 self._walks.popitem(last=False)
         return walk
 
-    def _remember(self, blob: str, directives: list[tuple[str, bool]]) -> None:
+    def reachable_before(self, rev: str, arch: str, includer: str, target: str) -> dict[str, str | None]:
+        """Files the compilation of `includer` reads before its `#include` of `target` (the context `target` is
+        compiled in): the walk of `includer` with its own directives cut at the first one resolving to `target`,
+        and `target` itself left out. Empty without a layout."""
+        found = self.resolver(rev, arch)
+        if not found:
+            return {}
+        resolver, sha, files = found
+        key = (sha, arch, f"{includer}\0{target}")
+        with self._lock:
+            if key in self._walks:
+                self._walks.move_to_end(key)
+                return self._walks[key]
+
+        def directives(path: str):
+            items = self._file_directives(sha, path, files)
+            if path != includer:
+                return [d for d in items if resolver.resolve(d[0], path, d[1]) != target]
+            out = []
+            for d in items:
+                if resolver.resolve(d[0], path, d[1]) == target:
+                    break
+                out.append(d)
+            return out
+
+        walk = resolver.reachable(includer, directives, filter_cond=condition_filter(includer),
+                                  prefetch=lambda paths: self._prefetch_directives(paths, files))
+        with self._lock:
+            self._walks[key] = walk
+            while len(self._walks) > _WALK_CACHE_SIZE:
+                self._walks.popitem(last=False)
+        return walk
+
+    def _remember(self, blob: str, directives: list[tuple[str, bool, list[str]]]) -> None:
         with self._lock:
             self._directives[blob] = directives
             self._directives.move_to_end(blob)
@@ -117,7 +165,7 @@ class ArchLayoutService:
         for blob, directives in db_facts(want, include_facts.FAMILY, include_facts.FORMAT, include_facts.decode).items():
             self._remember(blob, directives)
 
-    def _file_directives(self, sha: str, path: str, files: dict[str, str]) -> list[tuple[str, bool]]:
+    def _file_directives(self, sha: str, path: str, files: dict[str, str]) -> list[tuple[str, bool, list[str]]]:
         """The `#include` directives of a file of the walk: in-process cache (filled level by level from the
         parser's stored ones, family 3, by _prefetch_directives()), else the file read from Git."""
         blob = files.get(path)
@@ -133,7 +181,7 @@ class ArchLayoutService:
         except Exception as exc:
             logger.debug("git read %s:%s failed: %s", sha, path, exc)
             raw, is_dir = None, False
-        directives = include_directives(raw.decode("utf-8", errors="replace")) if raw and not is_dir else []
+        directives = include_directives_with_conditions(raw.decode("latin-1")) if raw and not is_dir else []
         self._remember(blob, directives)
         return directives
 

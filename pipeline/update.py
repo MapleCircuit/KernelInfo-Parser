@@ -19,6 +19,7 @@ from pipeline.arch_layouts import processing_arch_layouts
 from pipeline.blob_reuse import _log_preload_summary, _record_reparsed_blobs, _reuse_parsed_blobs
 from pipeline.changesets import file_fid_cache, file_fnid_cache
 from pipeline.commits import processing_git_commits
+from pipeline.compile_envs import prepare_compile_env, release_compile_env
 from pipeline.external_steps import processing_kapi, processing_source_facts
 from pipeline.file_references import processing_file_references
 from pipeline.git_commit_worker import _start_git_commit_worker
@@ -70,6 +71,8 @@ def update(version: str, repo_path: str | None = None) -> bool:
     4. Generate git diff change list (`MF.generate_change_list()`) & extract Git blob hashes.
     4.4 Start the TableEngine (preload cached tables).
     4.5 Deduplicate files against `m_file_blob` across trees sharing root commit (TableEngine caches).
+    4.6 Build the version's compilation environment (`pipeline/compile_envs.py`: layouts, defconfig, build
+        directories) that the forked workers parse C and assembly files with.
     5. Spawn parallel worker processes (`trigger_multicore()`) to parse file diffs into ChangeSets.
     6. Enqueue all generated `ChangeSet` objects into `cs_queue` and resolve operations sequentially.
     7. Remove temporary indexes, commit table transactions (`G.TE.commit()`), and reset state.
@@ -220,8 +223,14 @@ def update(version: str, repo_path: str | None = None) -> bool:
     scheduler = DependencyScheduler(gp, chunk_commit_interval=chunk_commit_interval, streaming=True)
     symbols_base = Counter(SYMBOL_STATS)
     WORKER_SYMBOL_STATS.clear()
-    trigger_multicore(scheduler=scheduler)
-    scheduler.finalize()
+    # Step 4.6: layouts, defconfig and build directories of the ARCHes the parse uses (inherited by the workers)
+    with G.measure_stage("Step 4.6: Compilation Environment"):
+        prepare_compile_env(version, gp.worker_change_list if gp.worker_change_list is not None else gp.Change_List)
+    try:
+        trigger_multicore(scheduler=scheduler)
+        scheduler.finalize()
+    finally:
+        release_compile_env()
     _log_symbol_stats(version, symbols_base)
 
     # scheduler.finalize() already committed and reclaimed memory; the caches stay for Step 6.1, which stages

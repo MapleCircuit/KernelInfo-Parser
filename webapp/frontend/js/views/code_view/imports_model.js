@@ -4,8 +4,9 @@
  * (webapp/frontend/tests/imports_model.test.mjs).
  *
  * Items come from GET /api/fs/imports/{version}?path=&arch= ({name, kind, type_name, header_path, line, chain,
- * forced, ref_line, ref_lines, ref_count, alternatives}). When `forced` is true, `chain[0]` is the
- * compiler-forced `-include` header; otherwise `chain[0]` is the current file and the last element is `header_path`.
+ * forced, via, context, ref_line, ref_lines, ref_count, alternatives}). When `forced` is true, `chain[0]` is the
+ * compiler-forced `-include` header; for a context import (`via: "context"`) `chain[0]` is the file including the
+ * current one (`context`); otherwise `chain[0]` is the current file. The last element is `header_path`.
  */
 
 /** File extensions (case-sensitive) for which the imports panel is available. */
@@ -128,12 +129,14 @@ export function chainSegments(item) {
   }));
 }
 
-/** Chain as text (basenames, or full paths when `full`); forced includes get an "-include " prefix. */
+/** Chain as text (basenames, or full paths when `full`); forced includes get an "-include " prefix, context
+ * imports (defined by what the including file includes first) a "context " prefix. */
 export function formatChain(item, { arrow = " → ", full = false } = {}) {
   const chain = (item && item.chain) || [];
   if (!chain.length) return "";
   const text = chain.map((p) => (full ? p : basename(p))).join(arrow);
-  return item.forced ? `-include ${text}` : text;
+  const forced = item.forced ? `-include ${text}` : text;
+  return item.via === "context" ? `context ${forced}` : forced;
 }
 
 /** Message shown instead of the list, or null when the list should render (or is still loading). */

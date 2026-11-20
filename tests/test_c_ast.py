@@ -4173,6 +4173,125 @@ def run_c_ast_tests(
         return 1
 
 
+def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[tuple], list[tuple]]:
+    """Parse one C file in a sandbox tree (MockDB): ([(line, col, role name, target name, target type name)],
+    [(line_s, name, type name, linkage name)])."""
+    import shutil
+    import tempfile
+    from core.globalstuff import SymbolLinkage, SymbolRole
+
+    MockDB.store.clear()
+    G.DB = MockDB
+    G.TE = get_table_engine("cached")()
+    gp = GreatProcessor()
+    init_db_layout(gp)
+    G.TE.start(gp.Table_Array, G.DB)
+    root = tempfile.mkdtemp(dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+    try:
+        dest = os.path.join(root, path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="latin-1") as fh:
+            fh.write(code)
+        mf = MasterFile()
+        mf.version_dict["v3.0"] = root
+        G.MF = mf
+        gp.Version_Name = "v3.0"
+        gp.VID = 1
+        cs = ChangeSet(f"A\t{path}")
+        cs.current_vid = 1
+        cs.gp = gp
+        cs.mf = mf
+        G.CURRENT_PARSING_FILE = path
+        default_processing(cs, gp)
+        cs.parse()
+        cs.execute()
+        G.TE.commit_all()
+        st = MockDB.store
+        ast = {r[0]: r for r in st.get("m_ast", {}).values()}
+        roles = {int(v): k for k, v in SymbolRole.__members__.items()}
+        links = {int(v): k for k, v in SymbolLinkage.__members__.items()}
+
+        def tname(t: int) -> str:
+            return ASTT(t).name if t in ASTT._value2member_map_ else str(t)
+
+        refs = sorted((r[6], r[7], roles.get(r[5], r[5]), ast.get(r[3], (0, None, 0))[1], tname(ast.get(r[3], (0, None, 0))[2]))
+                      for r in symbol_view_rows(st, "m_symbol_ref"))
+        defs = sorted((r[7], r[4], tname(r[5]), links.get(r[6], r[6])) for r in symbol_view_rows(st, "m_symbol_def"))
+        return refs, defs
+    finally:
+        clear_tu_caches()
+        shutil.rmtree(root, ignore_errors=True)
+        G.CURRENT_PARSING_FILE = None
+        if G.TE:
+            G.TE.close()
+
+
+class TestHeaderReferenceCompleteness(unittest.TestCase):
+    """Definitions and references of header constructs: macro-prefixed prototypes, #define bodies, #if tests and
+    names libclang leaves unresolved (parser/c_ast/lexical_refs.py)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_macro_prefixed_prototypes_are_definitions(self) -> None:
+        _refs, defs = parse_snippet(
+            "#define NORET_TYPE\n#define ATTRIB_NORET __attribute__((noreturn))\n"
+            "NORET_TYPE void panic(const char *fmt, ...);\nNORET_TYPE void do_exit(long code)\n\tATTRIB_NORET;\n"
+            "void plain(int y) ATTRIB_NORET;\nNORET_TYPE int body(void) { return 0; }\n")
+        found = {(name, typ, link) for _l, name, typ, link in defs}
+        for name in ("panic", "do_exit", "plain"):
+            self.assertIn((name, "C_functionprotodecl", "PrototypeDecl"), found)
+        self.assertIn(("body", "C_functionprotodecl", "ExternalDef"), found)
+
+    def test_define_bodies_and_conditions(self) -> None:
+        refs, _defs = parse_snippet(
+            "#ifndef GUARD_H\n#define GUARD_H\n"
+            "#define WRAP(x) helper_fn(x, struct foo_s, BAR_CONST, p->member, pre_##x)\n"
+            "#if defined(CONFIG_SMP) && NR_CPUS > 1\nint a;\n#elif IS_ENABLED(CONFIG_X)\nint b;\n#endif\n"
+            "#ifdef CONFIG_Y\nint c;\n#endif\n#endif\n")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in ((3, 17, "MacroBodyRef", "helper_fn", "C_DeclRefExpr"), (3, 37, "MacroBodyRef", "foo_s", "C_structnotbind"),
+                     (3, 44, "MacroBodyRef", "BAR_CONST", "C_DeclRefExpr"), (4, 13, "CondRef", "CONFIG_SMP", "CPPro_define"),
+                     (4, 28, "CondRef", "NR_CPUS", "CPPro_define"), (6, 18, "CondRef", "CONFIG_X", "CPPro_define"),
+                     (9, 8, "CondRef", "CONFIG_Y", "CPPro_define"), (1, 9, "CondRef", "GUARD_H", "CPPro_define")):
+            self.assertIn(item, got)
+        names = {name for *_x, name, _t in refs}
+        # Macro parameters, member names and pasted fragments are not references
+        for absent in ("x", "member", "pre_", "WRAP", "defined"):
+            self.assertNotIn(absent, names)
+
+    def test_unresolved_and_skipped_names(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct s { int f; };\nstatic int g(struct s *p, int n)\n{\n\tu32 v = (u32)n;\n"
+            "\tif (UNKNOWN_FLAG & n)\n\t\tmissing_fn(p->f, n);\n#ifdef CONFIG_NOT_SET\n\tother_fn(thing);\n"
+            "\tstruct hidden *h = 0;\n#endif\nout:\n\treturn v + known_var;\n}\n", "fs/snip.c")
+        got = {(line, role, name, typ) for line, _c, role, name, typ in refs}
+        for item in ((4, "TypeUsage", "u32", "C_SCtypedef"), (5, "MacroExpansion", "UNKNOWN_FLAG", "CPPro_define"),
+                     (6, "Call", "missing_fn", "C_functionprotnotbind"), (8, "Call", "other_fn", "C_functionprotnotbind"),
+                     (8, "DeclRef", "thing", "C_DeclRefExpr"), (9, "TypeUsage", "hidden", "C_structnotbind"),
+                     (12, "DeclRef", "known_var", "C_DeclRefExpr")):
+            self.assertIn(item, got)
+        names = [name for *_x, name, _t in refs]
+        self.assertNotIn("out", names)          # a label
+        self.assertEqual(names.count("f"), 1)   # the member reference only, not a lexical duplicate
+
+    def test_lexical_classifier(self) -> None:
+        from parser.c_ast.lexical_refs import CUR_NONE, CUR_RESOLVED, KIND_IDENTIFIER, KIND_KEYWORD, KIND_PUNCT, lexical_refs
+
+        def toks(*items):
+            return [(t, k, 1, i + 1, st) for i, (t, k, st) in enumerate(items)]
+
+        I, K, P = KIND_IDENTIFIER, KIND_KEYWORD, KIND_PUNCT
+        stream = toks(("struct", K, CUR_RESOLVED), ("tag_t", I, CUR_NONE), (";", P, 0), ("u8", I, CUR_NONE), ("x", I, CUR_RESOLVED),
+                      (";", P, 0), ("FOO", I, CUR_NONE), ("(", P, 0), ("call_me", I, CUR_NONE), ("(", P, 0), (")", P, 0), (")", P, 0),
+                      (";", P, 0), ("obj", I, CUR_NONE), ("->", P, 0), ("field", I, CUR_NONE), (";", P, 0), ("seen", I, CUR_NONE))
+        out = {(name, role) for name, _l, _c, role, _t in lexical_refs(stream, {(1, 18)}, set())}
+        from core.globalstuff import SymbolRole as R
+        self.assertEqual(out, {("tag_t", int(R.TypeUsage)), ("u8", int(R.TypeUsage)), ("FOO", int(R.MacroExpansion)),
+                               ("call_me", int(R.Call)), ("obj", int(R.DeclRef))})
+        self.assertEqual(lexical_refs(stream, set(), {1}), [])  # a directive line
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")

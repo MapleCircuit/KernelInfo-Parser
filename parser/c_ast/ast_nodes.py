@@ -536,6 +536,36 @@ class Ast_ASM_Label(Ast):
 
 # --- C Preprocessor Subsystem (CPPro) ---
 
+_PP_NOT_NAMES = frozenset({
+    "defined", "sizeof", "typeof", "__typeof__", "__typeof", "_Alignof", "__alignof__", "__has_include",
+    "__has_include_next", "__has_attribute", "__has_builtin", "__has_feature", "__has_extension",
+    "__has_cpp_attribute", "__has_c_attribute", "__is_identifier", "__VA_ARGS__", "__VA_OPT__",
+})
+_TAG_KEYWORD_TARGET = {"struct": ASTT.C_structnotbind, "union": ASTT.C_unionnotbind, "enum": ASTT.C_enumnotbind}
+
+
+def record_name_refs(CS: Any, tag_ref: Any, names: list[tuple[str, int, int, int]], role: int) -> None:
+    """Record a reference of `role` at each (name, line, column, target type) of a preprocessor directive.
+
+    The target is the name's unbound AST node (`m_ast.view` of the name and target type: `CPPro_define` for a
+    tested macro, `C_structnotbind` & co. after `struct`/`union`/`enum`, `C_DeclRefExpr` otherwise), so readers of
+    `m_symbol_ref` see the name; which definition it means is decided where the macro expands or the test runs.
+    """
+    seen: set[tuple[str, int, int]] = set()
+    for name, line, col, target_type in names:
+        if not name or name in _PP_NOT_NAMES or (name, line, col) in seen:
+            continue
+        seen.add((name, line, col))
+        with CS(REF_POS):
+            CS.store(m_ast.view(((m_ast.ast_id,),), None, name[:255], int(target_type)))
+            route = CS.get_route_parse()
+        record_symbol_ref(CS, tag_ref or 0, CS.ref(m_ast.ast_id, *route), 0, int(role), int(line), int(col))
+
+
+def _tok_pos(token: Any) -> tuple[int, int]:
+    return int(token.line.line_pos[0]), int(token.line.char_pos[0])
+
+
 class CPPro(Ast):
     """Root C Preprocessor Directive."""
 
@@ -675,6 +705,7 @@ class CPPro_if(CPPro):
     def init_subclass(self) -> None:
         self.expression = ""
         self.type_id = ASTT.CPPro_if
+        self.cond_names: list[tuple[str, int, int, int]] = []
 
     def _append_tok(self, spelling: str) -> None:
         if self.expression and (self.expression[-1].isalnum() or self.expression[-1] == '_') and (spelling and (spelling[0].isalnum() or spelling[0] == '_')):
@@ -690,12 +721,16 @@ class CPPro_if(CPPro):
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
+        if not hasattr(self, "cond_names"):
+            self.cond_names = []
+        self.cond_names.append((token.spelling_str, *_tok_pos(token), int(ASTT.CPPro_define)))
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_if, self.expression[:255], self.extent, create_tag=create_tag)
+        record_name_refs(CS, getattr(self, "tag_ref", 0), getattr(self, "cond_names", []), SymbolRole.CondRef)
 
 
 class CPPro_elif(CPPro):
@@ -724,12 +759,16 @@ class CPPro_elif(CPPro):
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
+        if not hasattr(self, "cond_names"):
+            self.cond_names = []
+        self.cond_names.append((token.spelling_str, *_tok_pos(token), int(ASTT.CPPro_define)))
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elif, self.expression[:255], self.extent, create_tag=create_tag)
+        record_name_refs(CS, getattr(self, "tag_ref", 0), getattr(self, "cond_names", []), SymbolRole.CondRef)
 
 
 class CPPro_else(CPPro):
@@ -775,6 +814,7 @@ class CPPro_ifdef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -782,6 +822,10 @@ class CPPro_ifdef(CPPro):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_ifdef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_ifndef(CPPro):
@@ -799,6 +843,7 @@ class CPPro_ifndef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -806,6 +851,10 @@ class CPPro_ifndef(CPPro):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_ifndef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_elifdef(CPPro):
@@ -823,9 +872,14 @@ class CPPro_elifdef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elifdef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_elifndef(CPPro):
@@ -843,9 +897,14 @@ class CPPro_elifndef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elifndef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_define(CPPro):
@@ -868,6 +927,27 @@ class CPPro_define(CPPro):
         self.in_args = False
         self.has_args = False
         self.type_id = ASTT.CPPro_define
+        # Names of the replacement list: (name, line, column, target type); the last token's kind for context
+        self.body_names: list[tuple[str, int, int, int]] = []
+        self._body_prev = ""
+
+    def _note_body_name(self, token: Any) -> None:
+        names = self.__dict__.setdefault("body_names", [])
+        prev = self.__dict__.get("_body_prev", "")
+        name = token.spelling_str
+        if prev in ("##", ".", "->", "#"):
+            self._body_prev = name
+            return
+        # An assembly macro body holds instructions: registers (`%eax`) and the mnemonic or directive opening a
+        # statement (start of the body, after `;`) are no names
+        if self.__dict__.get("_asm_body") is None:
+            self._asm_body = str(getattr(G, "CURRENT_PARSING_FILE", "") or "").endswith((".S", ".s"))
+        if self._asm_body and (prev in ("%", "", ";", "\\") or not names and prev == self.identifier):
+            self._body_prev = name
+            return
+        target = _TAG_KEYWORD_TARGET.get(prev, ASTT.C_DeclRefExpr)
+        names.append((name, *_tok_pos(token), int(target)))
+        self._body_prev = name
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -877,6 +957,7 @@ class CPPro_define(CPPro):
         if self.in_args:
             self.func_args.append(token.spelling_str)
             return
+        self._note_body_name(token)
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
@@ -899,6 +980,10 @@ class CPPro_define(CPPro):
                 else:
                     self.func_args.append("...")
             return
+        spelling = token.spelling_str
+        if spelling == "##" and self.__dict__.get("body_names") and self.__dict__.get("_body_prev") == self.body_names[-1][0]:
+            self.body_names.pop()  # a fragment pasted into another name
+        self._body_prev = spelling
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
@@ -911,6 +996,7 @@ class CPPro_define(CPPro):
             return
         if self.in_args:
             return
+        self._body_prev = token.spelling_str
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
@@ -972,15 +1058,6 @@ class CPPro_define(CPPro):
         if self.replacement:
             with CS(REF_POS):
                 CS.store(m_ast_attribute.set(self.ast_ref, 0, "replacement", str(self.replacement)[:255]))
-            import re
-            words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", self.replacement))
-            ignored = set(self.func_args) | {self.identifier, "defined", "sizeof", "typeof", "__typeof__"}
-            tag_ref = getattr(self, "tag_ref", 0)
-            if tag_ref:
-                for w in words:
-                    if w not in ignored:
-                        with CS(REF_POS):
-                            record_symbol_ref(CS, tag_ref, w, 0, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0])
 
         if create_tag:
             with CS(REF_NO_REF):
@@ -1009,6 +1086,10 @@ class CPPro_define(CPPro):
                 CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
+        # Names the replacement list uses (not its parameters, nor the macro itself): resolved where it expands
+        ignored = {str(p).strip().rstrip(".") for p in self.func_args} | {self.identifier}
+        record_name_refs(CS, getattr(self, "tag_ref", 0),
+                         [n for n in self.__dict__.get("body_names", ()) if n[0] not in ignored], SymbolRole.MacroBodyRef)
 
 
 class CPPro_undef(CPPro):

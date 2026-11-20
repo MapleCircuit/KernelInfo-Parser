@@ -14,7 +14,13 @@ from core import DBLayout as D
 from core.globalstuff import ASTT, SymbolRole
 from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.services import imports_service as isvc
-from webapp.backend.services.imports_service import ImportsService, import_kind, include_chain
+from webapp.backend.services.imports_service import (
+    ImportsService,
+    def_namespace,
+    import_kind,
+    include_chain,
+    ref_namespaces,
+)
 
 CALL, TYPE, DECL, MACRO, MEMBER = (int(SymbolRole.Call), int(SymbolRole.TypeUsage), int(SymbolRole.DeclRef),
                                    int(SymbolRole.MacroExpansion), int(SymbolRole.MemberRef))
@@ -190,6 +196,152 @@ class TestImportsService(unittest.TestCase):
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.json()["path"], "a.c")
             self.assertEqual(client.get("/api/fs/imports/v3.0", params={"path": "../x.c"}).status_code, 400)
+
+
+# A header compiled in its includer's context (2.6.0 include/linux/lockd/bind.h): h.h includes nothing that
+# defines what it uses; x.c includes fs.h, then h.h
+CSHA = {"h.h": "a" * 40, "x.c": "b" * 40, "fs.h": "c" * 40, "late.h": "d" * 40}
+CBLOB = {"h.h": 10, "x.c": 11, "fs.h": 12, "late.h": 13}
+# (name, header, type name, line, linkage)
+CDEFS = [
+    ("file", "fs.h", "C_structdecl", 20, 0),
+    ("file", "fs.h", "C_functionprotodecl", 30, 2),     # an ordinary `file()` must not answer `struct file`
+    ("u32", "fs.h", "C_SCtypedef", 5, 0),
+    ("own_tag", "fs.h", "C_structdecl", 40, 0),
+    ("own_tag", "h.h", "C_functionprotodecl", 3, 0),    # h.h defines a function own_tag: the tag stays an import
+    ("own_fn", "h.h", "C_functionprotodecl", 4, 0),
+    ("own_fn", "fs.h", "C_functionprotodecl", 50, 2),
+    ("CONFIG_FOO", "fs.h", "CPPro_define", 60, 5),
+    ("body_fn", "fs.h", "C_functionprotodecl", 61, 2),
+    ("late_fn", "late.h", "C_functionprotodecl", 1, 2),  # included after h.h: not context
+]
+# (name, role, line, target type)
+CREFS = [
+    ("file", TYPE, 7, "C_structnotbind"), ("u32", TYPE, 8, "C_SCtypedef"), ("own_tag", TYPE, 9, "C_structnotbind"),
+    ("own_fn", CALL, 10, "C_functionprotodecl"), ("helper", CALL, 11, "C_functionprotnotbind"),
+    ("CONFIG_FOO", int(SymbolRole.CondRef), 12, "CPPro_define"), ("body_fn", int(SymbolRole.MacroBodyRef), 13, "C_DeclRefExpr"),
+    ("late_fn", CALL, 14, "C_functionprotnotbind"),
+]
+
+
+def _context_db():
+    names = sorted({n for n, *_ in CDEFS} | {n for n, *_ in CREFS})
+    ast = {n: i + 1 for i, n in enumerate(names)}
+    target = {n: t for n, _r, _l, t in CREFS}
+    return make_db("mock", rows={
+        "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+        "m_ast": [{"ast_id": i, "name": n, "type_id": ASTT[target[n]].value if n in target else 0} for n, i in ast.items()],
+        "m_blob_symbol_def": [
+            {"def_id": i + 1, "blob_id": CBLOB[h], "tag_id": 1, "ast_id": ast[n], "name": n, "type_id": ASTT[t].value,
+             "linkage": lk, "line_s": line, "line_e": line}
+            for i, (n, h, t, line, lk) in enumerate(CDEFS)
+        ],
+        "m_blob_symbol_ref": [
+            {"ref_id": i + 1, "blob_id": CBLOB["h.h"], "tag_id": 1, "ast_id": ast[n], "target_fnid": 0, "role": role,
+             "line": line, "char_s": 1}
+            for i, (n, role, line, _t) in enumerate(CREFS)
+        ],
+        "m_file_name": [{"fnid": 1, "fname": "h.h"}, {"fnid": 2, "fname": "x.c"}, {"fnid": 3, "fname": "gone.c"}],
+        "m_file_reference": [
+            {"ref_id": 1, "source_blob_id": CBLOB["x.c"], "source_fnid": 2, "target_fnid": 1, "ref_type": 1, "line_no": 3, "details": ""},
+            # An includer whose stored blob is not the revision's (another version) is ignored
+            {"ref_id": 2, "source_blob_id": 99, "source_fnid": 3, "target_fnid": 1, "ref_type": 1, "line_no": 3, "details": ""},
+        ],
+    })
+
+
+class TestImportsNameSpacesAndContext(unittest.TestCase):
+    def _svc(self, own_reach=None, layouts=("x86_64",)):
+        ids = {CSHA[p]: (b, 1) for p, b in CBLOB.items()}
+        tree = {**CSHA, "gone.c": "e" * 40}
+        own = {"h.h": None} if own_reach is None else own_reach
+        patches = [
+            patch_reader(_context_db()),
+            patch.object(isvc.git_tree_resolver, "list_tree", return_value=tree),
+            patch.object(isvc.git_tree_resolver, "resolve_commit_sha", return_value="f" * 40),
+            patch.object(isvc.GitTreeResolver, "map_blob_hashes", side_effect=lambda _r, shas: {s: ids[s] for s in shas if s in ids}),
+            patch.object(isvc.arch_layout_service, "layout", side_effect=lambda _rev, arch: object() if arch in layouts else None),
+            patch.object(isvc.arch_layout_service, "reachable", side_effect=lambda _rev, arch, _p: dict(own) if arch in layouts else {}),
+            patch.object(isvc.arch_layout_service, "reachable_before", return_value={"x.c": None, "fs.h": "x.c"}),
+        ]
+        mocks = [p.start() for p in patches]
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+        return ImportsService(), mocks
+
+    def test_name_spaces(self) -> None:
+        self.assertEqual(ref_namespaces(TYPE, "C_structnotbind"), {"tag"})
+        self.assertEqual(ref_namespaces(MACRO, "CPPro_define"), {"macro"})
+        self.assertEqual(ref_namespaces(int(SymbolRole.CondRef), "CPPro_define"), {"macro"})
+        self.assertEqual(ref_namespaces(CALL, "C_functionprotnotbind"), {"ordinary", "macro"})
+        self.assertEqual(ref_namespaces(CALL, ""), {"tag", "macro", "ordinary"})
+        self.assertEqual((def_namespace("C_uniondecl"), def_namespace("CPPro_define_macro"), def_namespace("C_SCtypedef")),
+                         ("tag", "macro", "ordinary"))
+
+    def test_context_imports_of_a_header_compiled_in_its_includer(self) -> None:
+        svc, mocks = self._svc()
+        out = svc.get_imports("v2.6.0", "h.h")
+        items = {it["name"]: it for it in out["items"]}
+        self.assertEqual(out["context"], ["x.c"])
+        mocks[-1].assert_called_once_with("v2.6.0", "x86_64", "x.c", "h.h")
+        self.assertEqual(set(items), {"file", "u32", "own_tag", "CONFIG_FOO", "body_fn"})
+        # struct file, not the function file()
+        self.assertEqual((items["file"]["kind"], items["file"]["line"], items["file"]["via"], items["file"]["context"]),
+                         ("struct", 20, "context", "x.c"))
+        self.assertEqual(items["file"]["chain"], ["x.c", "fs.h"])
+        self.assertFalse(items["file"]["forced"])
+        # h.h's function own_tag does not mask the struct tag; its own_fn masks the prototype in fs.h
+        self.assertEqual(items["own_tag"]["kind"], "struct")
+        self.assertNotIn("own_fn", items)
+        # Tested macros and names used in macro bodies are imports too
+        self.assertEqual((items["CONFIG_FOO"]["kind"], items["body_fn"]["kind"]), ("macro", "prototype"))
+        # Declared nowhere before the include, or after it
+        self.assertNotIn("helper", items)
+        self.assertNotIn("late_fn", items)
+
+    def test_own_chain_wins_over_context(self) -> None:
+        svc, mocks = self._svc(own_reach={"h.h": None, "fs.h": "h.h"})
+        out = svc.get_imports("v2.6.0", "h.h")
+        items = {it["name"]: it for it in out["items"]}
+        self.assertEqual((items["file"]["via"], items["file"]["chain"]), ("include", ["h.h", "fs.h"]))
+        # Only names the own chain leaves unresolved (helper, late_fn) are looked up in the context
+        self.assertEqual({n for n, it in items.items() if it["via"] == "context"}, set())
+
+    def test_arch_fallback(self) -> None:
+        svc, _ = self._svc(layouts=("x86_64",))
+        out = svc.get_imports("v2.6.0", "h.h", "x86")
+        self.assertEqual((out["arch"], out["arch_used"]), ("x86", "x86_64"))
+        svc, _ = self._svc(layouts=())
+        out = svc.get_imports("v2.6.0", "h.h", "x86")
+        self.assertEqual((out["arch_used"], out["layout"], out["items"], out["context"]), (None, False, [], []))
+
+
+class TestContextWalk(unittest.TestCase):
+    """arch_layout_service.reachable_before() and the walk's condition filter."""
+
+    def test_reachable_before_and_assembly_filter(self) -> None:
+        from parser.arch_layout import ArchLayout
+        from parser.include_graph import IncludeResolver
+        from webapp.backend.services.arch_layout_service import ArchLayoutService, condition_filter
+
+        layout = ArchLayout("x86_64", "x86", includes=["include/"])
+        files = {p: f"{i:040x}" for i, p in enumerate(["x.c", "include/fs.h", "include/h.h", "include/late.h",
+                                                       "include/c_only.h", "e.S"])}
+        directives = {
+            "x.c": [("fs.h", False, []), ("h.h", False, []), ("late.h", False, [])],
+            "include/fs.h": [("h.h", False, [])],  # h.h itself is never part of its context
+            "e.S": [("c_only.h", False, ["!defined(__ASSEMBLY__)"]), ("fs.h", False, ["defined(CONFIG_X)"])],
+        }
+        svc = ArchLayoutService()
+        with patch.object(svc, "resolver", return_value=(IncludeResolver(layout, files.__contains__), "f" * 40, files)), \
+                patch.object(svc, "_file_directives", side_effect=lambda _sha, path, _f: directives.get(path, [])), \
+                patch.object(svc, "_prefetch_directives"):
+            self.assertEqual(svc.reachable_before("v1", "x86_64", "x.c", "include/h.h"), {"x.c": None, "include/fs.h": "x.c"})
+            walk = svc.reachable("v1", "x86_64", "e.S")
+        # An assembly file skips the C-only branch; a CONFIG_ condition stays open
+        self.assertEqual(set(walk), {"e.S", "include/fs.h", "include/h.h"})
+        self.assertTrue(condition_filter("a.c")(["!defined(__ASSEMBLY__)"]))
+        self.assertFalse(condition_filter("a.S")(["!defined(__ASSEMBLY__)"]))
+        self.assertTrue(condition_filter("a.S")(["defined(CONFIG_SMP)"]))
 
 
 if __name__ == "__main__":

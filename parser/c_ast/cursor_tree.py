@@ -749,6 +749,14 @@ def get_rel_file_for_cursor(CS: Any, cursor: Any) -> str | None:
         if cached is not None or file_path in cache:
             return cached
 
+    # The compilation environment knows the tree and the build directory (symlinks, wrappers, generated headers)
+    env = getattr(CS, "compile_env", None) if CS is not None else None
+    if env is not None and os.path.isabs(file_path):
+        res = env.repo_path(file_path)
+        if cache is not None:
+            cache[file_path] = res
+        return res
+
     # Exclude host system headers (server include directories)
     if file_path.startswith(("/usr/", "/etc/", "/opt/", "/var/", "/lib/", "/bin/", "/dev/")):
         # Exception: /dev/shm workspace used for repository checkouts
@@ -1117,6 +1125,44 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
     return (ASTT.Undefined, 0)
 
 
+def _tu_cursor_at(CS: Any, extent: Any) -> Any:
+    """The libclang cursor at the start of `extent` in the file being parsed (None outside a live C parse)."""
+    am = getattr(CS, "parsers", {}).get("C_AM") if CS is not None else None
+    tl = getattr(am, "TL", None)
+    tu = getattr(tl, "parsed_tu", None)
+    if tu is None or extent is None:
+        return None
+    try:
+        line, col = extent.line_pos[0], extent.char_pos[0]
+        loc = tu.get_location(am.fullfilename, (int(line), int(col)))
+        cursor = cc.Cursor.from_location(tu, loc)
+    except Exception:  # noqa: BLE001
+        return None
+    if cursor is None or cursor.kind == cc.CursorKind.NO_DECL_FOUND:
+        return None
+    cursor._tu = tu
+    return cursor
+
+
+def _own_file_name_pos(CS: Any) -> int | None:
+    """Root position of the parsed file's own m_file_name operation (the file prelude stages it, first in the
+    pipeline's `default_processing()`), None when the ChangeSet has none."""
+    pos = getattr(CS, "_own_fnid_pos", -1)
+    if pos != -1:
+        return pos
+    found = None
+    for idx, op in enumerate(getattr(CS, "cs", ()) or ()):
+        target = op[0] if isinstance(op, tuple) and op else None
+        table_id = target if type(target) is int else (target[0][0][0] if isinstance(target, tuple) and target and
+                                                       isinstance(target[0], tuple) and target[0] and
+                                                       isinstance(target[0][0], tuple) else None)
+        if table_id == m_file_name.table_id:
+            found = idx
+            break
+    CS._own_fnid_pos = found
+    return found
+
+
 def get_target_fnid_for_cursor(CS: Any, cursor: Any) -> Any:
     """Resolve the target repository file name ID (fnid) for a referenced cursor."""
     if cursor is None:
@@ -1130,7 +1176,8 @@ def get_target_fnid_for_cursor(CS: Any, cursor: Any) -> Any:
         return 0
     cur_path = getattr(CS, "current_path", "")
     if rel_path == cur_path:
-        return CS.ref(m_file_name.fnid, REF_POS, 0)
+        pos = _own_file_name_pos(CS)
+        return CS.ref(m_file_name.fnid, REF_POS, pos) if pos is not None else 0
 
     if not hasattr(CS, "_target_fnid_cache"):
         CS._target_fnid_cache = {}
@@ -3565,6 +3612,22 @@ class C_Type(Ast):
             has_pointer = any(
                 token.type == ASTT.C_pointer for ts in final_type for token in ts.content
             )
+            # A declaration starting with a macro that expands to nothing or an attribute (`NORET_TYPE void
+            # panic(...)`, `EXPORT_SYMBOL`-style prefixes) carries the macro's cursor: its function name token
+            # carries the declaration's own FUNCTION_DECL cursor
+            if self.cursor is None or getattr(self.cursor, "kind", None) == cc.CursorKind.MACRO_INSTANTIATION:
+                for ts in final_type:
+                    for tok in ts.content:
+                        if tok.type != ASTT.C_functionproto or not tok.code:
+                            continue
+                        tok_cursor = getattr(tok, "cursor", None) or _tu_cursor_at(CS, tok.extent)
+                        if (tok_cursor is not None and getattr(tok_cursor, "kind", None) == cc.CursorKind.FUNCTION_DECL
+                                and safe_cursor_spelling(tok_cursor) == tok.code):
+                            self.cursor = tok_cursor
+                            break
+                    else:
+                        continue
+                    break
             is_func_decl = (
                 self.cursor is not None
                 and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}

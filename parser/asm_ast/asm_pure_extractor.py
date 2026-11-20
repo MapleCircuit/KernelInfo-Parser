@@ -2,6 +2,10 @@
 
 Free of TableEngine, GreatProcessor, or Database driver dependencies.
 Used by webapp backend (OutlineService) as a fast "git" fallback for unparsed assembly blobs.
+
+Also holds the pure helpers the clang-based parser (`parser/asm_ast/asm_ast.py`) shares: the line-comment
+characters of an architecture (`asm_comment_chars`), the GAS `.macro` name heuristic
+(`looks_like_gas_macro`) and the removal of a trailing line comment from raw text (`strip_line_comment`).
 """
 from __future__ import annotations
 
@@ -19,14 +23,68 @@ _END_MACRO = re.compile(
 _MACRO_START = re.compile(r"^[ \t]*\.macro\s+([A-Za-z0-9_]+)")
 _MACRO_END = re.compile(r"^[ \t]*\.endm\b")
 _LABEL = re.compile(r"^[ \t]*([A-Za-z_]\w*):")
+
+_X86_TREES = ("arch/x86/", "arch/i386/", "arch/x86_64/", "include/asm-i386/", "include/asm-x86_64/", "include/asm-x86/")
+# Path prefixes of the architectures whose GAS line comment starts with a character other than `//`.
+# x86 treats `#` as a comment only mid-line (a leading `#` is a cpp directive); `;` is a statement
+# separator on x86 and a comment on the architectures listed for it.
+_COMMENT_CHARS_BY_TREE: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (_X86_TREES, ("#",)),
+    (("arch/arm/", "include/asm-arm/"), ("@",)),
+    (("arch/sparc/", "arch/sparc64/", "include/asm-sparc/", "include/asm-sparc64/",
+      "arch/sh/", "arch/sh64/", "include/asm-sh/", "include/asm-sh64/"), ("!",)),
+    (("arch/m68k/", "arch/m68knommu/", "include/asm-m68k/", "include/asm-m68knommu/"), ("|",)),
+    (("arch/parisc/", "include/asm-parisc/", "arch/avr32/", "include/asm-avr32/", "arch/h8300/", "include/asm-h8300/"), (";",)),
+    (("arch/mips/", "include/asm-mips/", "arch/powerpc/", "arch/ppc/", "arch/ppc64/", "include/asm-powerpc/", "include/asm-ppc/",
+      "include/asm-ppc64/", "arch/riscv/", "arch/alpha/", "include/asm-alpha/", "arch/s390/", "include/asm-s390/",
+      "arch/loongarch/", "arch/openrisc/", "arch/nios2/", "arch/microblaze/"), ("#",)),
+)
+
+
+def asm_comment_chars(path: str) -> tuple[str, ...]:
+    """The strings that start a GAS line comment in the assembly file `path` (`//` always)."""
+    path = (path or "").replace("\\", "/")
+    for trees, chars in _COMMENT_CHARS_BY_TREE:
+        if path.startswith(trees):
+            return (*chars, "//")
+    return ("//",)
+
+
+def strip_line_comment(text: str, chars: tuple[str, ...]) -> str:
+    """`text` up to the first comment starter of `chars` that is outside a string literal."""
+    quote = ""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c == '"':
+            quote = c
+        elif any(text.startswith(ch, i) for ch in chars):
+            return text[:i]
+        i += 1
+    return text
+
+
+def looks_like_gas_macro(name: str) -> bool:
+    """Whether a statement-leading identifier that no `.macro` of the file defines reads as a GAS macro
+    rather than an instruction mnemonic (a capital letter or an underscore; mnemonics are lowercase words)."""
+    return any(c.isupper() or c == "_" for c in name)
+
+
 _STRIP_COMMENT = re.compile(
     r"/\*.*?\*/|//.*$|#[ \t]*(?!include|define|undef|if|ifdef|ifndef|else|elif|endif|pragma).*$",
     re.DOTALL,
 )
 
 
-def extract_asm_outline(source_bytes: bytes) -> list[dict[str, Any]]:
-    """Extract outline items (functions, macros, labels) from raw assembly source bytes."""
+def extract_asm_outline(source_bytes: bytes, path: str = "") -> list[dict[str, Any]]:
+    """Extract outline items (functions, macros, labels) from raw assembly source bytes; `path` selects the
+    architecture's line-comment characters."""
     if not source_bytes:
         return []
 
@@ -43,6 +101,7 @@ def extract_asm_outline(source_bytes: bytes) -> list[dict[str, Any]]:
             roots.append(item)
 
     in_multiline_comment = False
+    line_comment_chars = tuple(c for c in asm_comment_chars(path) if c not in ("#", "//"))
 
     for idx, raw in enumerate(raw_lines):
         line = idx + 1
@@ -67,6 +126,8 @@ def extract_asm_outline(source_bytes: bytes) -> list[dict[str, Any]]:
                 line_clean = line_clean[:start_pos]
                 break
 
+        if line_comment_chars:
+            line_clean = strip_line_comment(line_clean, line_comment_chars)
         text = _STRIP_COMMENT.sub("", line_clean).strip()
         if not text:
             continue

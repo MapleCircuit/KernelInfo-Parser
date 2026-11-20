@@ -103,6 +103,8 @@ test("formatChain normal vs forced include", () => {
   assert.equal(formatChain(ITEMS[0], { arrow: " > ", full: true }), "kernel/fork.c > include/linux/mm.h > include/linux/slab.h");
   const forced = it("foo", "macro", "include/linux/foo.h", ["include/linux/kconfig.h", "include/linux/foo.h"], { forced: true });
   assert.equal(formatChain(forced), "-include kconfig.h → foo.h");
+  const context = { ...ITEMS[0], via: "context", context: "fs/nfsd/lockd.c", chain: ["fs/nfsd/lockd.c", "include/linux/fs.h"] };
+  assert.equal(formatChain(context), "context lockd.c → fs.h");
   assert.equal(formatChain({}), "");
 });
 

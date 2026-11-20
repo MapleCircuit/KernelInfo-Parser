@@ -1313,7 +1313,8 @@ m_arch_layout = Table(
 # 46. m_arch_layout_entry (table_id=46): Rows of an ARCH Build Layout
 #     role 1 source directory, 2 include directory (priority = -I order), 3 symlink the build creates
 #     (path -> target), 4 generated asm-generic wrapper (path -> the header it includes), 5 forced -include
-#     file. Directories end with "/".
+#     file (a generated one included), 6 compiler flag of c_flags (-D/-U/-std=/char signedness; priority = order).
+#     Directories end with "/".
 # -----------------------------------------------------------------------------
 m_arch_layout_entry = Table(
     table_id=46,
@@ -1369,15 +1370,19 @@ m_checkpoint_base = Table(
 #                 assembled by the webapp's source index (call paths, ops implementations);
 #       family 2: parser/kapi_facts.py extract() of a .c/.h/.S blob (Kernel API macros; empty data for a blob
 #                 without any, else zlib JSON), assembled into the webapp's Kernel API catalogs.
-#       family 3: parser/include_facts.py extract() of a .c/.h/.S blob ([[name, quoted]] #include directives),
-#                 read by the webapp's include walks and its included .c/.S list;
+#       family 3: parser/include_facts.py extract() of a .c/.h/.S/.s blob ([[name, quoted, conds]] #include
+#                 directives with their #if conditions), read by the webapp's include walks and its included
+#                 .c/.S list;
 #       family 4: parser/kconfig_ast/kconfig_definitions.py extract() of a Kconfig blob ({symbol: [facts]}, help
 #                 texts included), read by the webapp's Kconfig history and Compare;
 #       family 5: parser/doc_labels.py extract() of a Documentation/**/*.rst blob ([[label, line, title]]),
 #                 read by the webapp's documentation label index;
 #       family 6: parser/man_ast/man_facts.py extract() of a man page blob (man/manS/name.S or manS/name.S:
 #                 NAME names and summary, .TH header, .so target, cross references, SYNOPSIS functions, headers
-#                 and identifiers; zlib JSON), read by the webapp's man page index.
+#                 and identifiers; zlib JSON), read by the webapp's man page index;
+#       family 7: parser/compile_env.py diagnostics_fact() of a parsed C / assembly blob (parse ARCH, defconfig,
+#                 configuration digest, libclang, error count, missing headers; zlib JSON), written by the
+#                 parsers themselves (parser/c_ast/c_ast.py stage_parse_diagnostics()).
 #     Every family stores empty data for a blob without anything to record. --backfill-facts fills them for
 #     versions ingested earlier (core/backfills.py).
 # -----------------------------------------------------------------------------

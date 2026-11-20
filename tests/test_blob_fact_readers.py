@@ -142,7 +142,7 @@ class TestReaders(unittest.TestCase):
                 mock.patch("webapp.backend.services.arch_layout_service.git_reader.read_file", side_effect=AssertionError("git")):
             svc._prefetch_directives(["kernel/a.c"], files)
             self.assertEqual(svc._file_directives(self.sha, "kernel/a.c", files),
-                             [("linux/a.h", False), ("b.c", True)])
+                             [("linux/a.h", False, []), ("b.c", True, [])])
 
     def test_family_formats_match_the_parser(self) -> None:
         self.assertEqual(facts_ingest.FAMILIES[include_facts.FAMILY], include_facts.FORMAT)

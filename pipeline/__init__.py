@@ -12,7 +12,8 @@ on the module that looks it up.
   `multicore` (`trigger_multicore`, DB tuning), `scheduler` (dependency-driven ChangeSet resolution),
   `source_order` (changed-file ordering and epochs), `file_processing` (worker body), `changesets`, `blob_reuse`.
 - Git and per-version steps: `git_network`, `git_ingest`, `git_commit_worker`, `commits`, `mailing_list_steps`,
-  `unchanged`, `file_references`, `maintainers`, `arch_layouts`, `external_steps` (source facts, CVE, release
+  `unchanged`, `file_references`, `maintainers`, `arch_layouts`, `compile_envs` (Step 4.6: the compilation
+  environment of the version's parse), `external_steps` (source facts, CVE, release
   statistics), `backfill_steps`.
 - `step_tasks`: registry of the independent steps (mailing list, KAPI, insights, release statistics, CVE list), their
   worker capabilities, follow-up / repository-level distributed tasks, and how a claimed one runs.

@@ -46,6 +46,7 @@ DEFAULT_MODULES = [
     "tests.test_kconfig_engine",
     "tests.test_kbuild_conditions",
     "tests.test_arch_layout",
+    "tests.test_compile_env",
     "tests.test_include_graph",
     "tests.test_ingest_state",
     "tests.test_webapp_defconfig",

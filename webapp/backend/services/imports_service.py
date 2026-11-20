@@ -2,22 +2,38 @@
 `#include` chain, for the code view's Imports panel (webapp/API_ENDPOINTS.md section 4.2).
 
 The imported symbols of a file at a revision are the names its blob references (`m_symbol_ref` rows of
-roles TypeUsage, Call, DeclRef and MacroExpansion) that a header the compilation reaches for ARCH=<arch>
-defines (`m_symbol_def` rows of those headers' blobs). Reachability and the include chain of every header
-come from `arch_layout_service.reachable()` (`{header: including file}` in breadth-first order, so
+roles TypeUsage, Call, DeclRef, MacroExpansion, MacroBodyRef and CondRef) that a header the compilation reaches
+for ARCH=<arch> defines (`m_symbol_def` rows of those headers' blobs). Reachability and the include chain of every
+header come from `arch_layout_service.reachable()` (`{header: including file}` in breadth-first order, so
 following the including files back gives a shortest chain); headers reached through a compiler-forced
-`-include` root report `forced: true` and a chain starting at that root. Names the file defines itself are
-not imports. Read with SELECTs only (webapp/API.md section 2.5); revisions whose blob is not indexed answer
-`indexed: false` without a Git fallback.
+`-include` root report `forced: true` and a chain starting at that root. An ARCH the revision does not build
+falls back to the revision's definition ARCH (`arch_used`).
+
+A reference names a symbol in one of C's name spaces, read from its role and its target AST's type: a struct,
+union or enum tag (`struct file` -> `C_structnotbind`), a macro (MacroExpansion, CondRef), or an ordinary
+identifier, which may also be a function-like or object-like macro. A definition matches a reference only in
+the reference's name spaces, and names the file defines itself are not imports in the name spaces it defines
+them in (prototypes, extern declarations and forward declarations do not count).
+
+A header that relies on what its includer included before it (`include/linux/lockd/bind.h` in 2.6.0 uses
+`struct file` without including linux/fs.h) leaves names its own chain does not define. Those resolve through
+**context imports**: the files that include this one at the revision (`m_file_reference` Include rows, the
+parser's resolved `#include` directives) are walked up to their `#include` of this file
+(`arch_layout_service.reachable_before()`); an item found that way has `via: "context"`, `context` (the
+includer) and a chain starting at that includer. Items of the file's own chain have `via: "include"`.
+
+Read with SELECTs only (webapp/API.md section 2.5); revisions whose blob is not indexed answer `indexed: false`
+without a Git fallback.
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from fastapi import HTTPException
 
-from core.globalstuff import SymbolLinkage, SymbolRole
+from core.globalstuff import ASTT, FileRefType, SymbolLinkage, SymbolRole
 from db_engine.spec import Join
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.helpers import safe_decode
@@ -40,7 +56,8 @@ _CHUNK = 1000
 
 # Reference roles that use a name defined elsewhere (Declaration and MemberRef name the file's own
 # declarations and struct members)
-_IMPORT_ROLES = [int(SymbolRole.TypeUsage), int(SymbolRole.Call), int(SymbolRole.DeclRef), int(SymbolRole.MacroExpansion)]
+_IMPORT_ROLES = [int(SymbolRole.TypeUsage), int(SymbolRole.Call), int(SymbolRole.DeclRef), int(SymbolRole.MacroExpansion),
+                 int(SymbolRole.MacroBodyRef), int(SymbolRole.CondRef)]
 
 _STRUCT = {"C_structdecl", "C_structnotbind"}
 _TYPE = {"C_uniondecl", "C_unionnotbind", "C_enumdecl", "C_enumnotbind", "C_SCtypedef"}
@@ -54,7 +71,46 @@ _ROLE_KINDS = {
     int(SymbolRole.Call): {"function", "prototype", "macro", "variable"},
     int(SymbolRole.DeclRef): {"function", "prototype", "macro", "variable"},
     int(SymbolRole.MacroExpansion): {"macro"},
+    int(SymbolRole.MacroBodyRef): {"function", "prototype", "macro", "variable", "type", "struct"},
+    int(SymbolRole.CondRef): {"macro"},
 }
+
+# C name spaces of definitions and references
+NS_TAG, NS_MACRO, NS_ORDINARY = "tag", "macro", "ordinary"
+_ALL_NS = frozenset({NS_TAG, NS_MACRO, NS_ORDINARY})
+_TAG_TYPES = frozenset({"C_structdecl", "C_structnotbind", "C_uniondecl", "C_unionnotbind", "C_enumdecl",
+                        "C_enumnotbind", "C_struct", "C_union", "C_enum"})
+_MACRO_ROLES = frozenset({int(SymbolRole.MacroExpansion), int(SymbolRole.CondRef)})
+MAX_CONTEXT_INCLUDERS = 4
+MAX_INCLUDER_ROWS = 5000
+
+
+def _type_name(type_id: Any) -> str:
+    """ASTT name of an m_ast type id ("" for 0 / unknown: a target of unknown type)."""
+    try:
+        return ASTT(int(type_id)).name if type_id else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def ref_namespaces(role: int, target_type: str) -> frozenset[str]:
+    """Name spaces a reference of `role` to a target AST of type `target_type` can name."""
+    if target_type in _TAG_TYPES:
+        return frozenset({NS_TAG})
+    if int(role) in _MACRO_ROLES:
+        return frozenset({NS_MACRO})
+    if not target_type:
+        return _ALL_NS
+    return frozenset({NS_ORDINARY, NS_MACRO})
+
+
+def def_namespace(type_name: str) -> str:
+    """Name space a definition of type `type_name` is in."""
+    if type_name in _TAG_TYPES:
+        return NS_TAG
+    if type_name.startswith("CPPro_define") or type_name == "ASM_Macro":
+        return NS_MACRO
+    return NS_ORDINARY
 
 
 def import_kind(type_name: str, linkage: int | None = None, line_s: int = 0, line_e: int = 0) -> str | None:
@@ -112,7 +168,8 @@ class ImportsService:
         if not is_valid_identifier(arch) or len(arch) > 32:
             raise HTTPException(status_code=400, detail="Invalid arch")
         base: dict[str, Any] = {"version": version_name, "path": clean, "arch": arch}
-        empty = {"indexed": False, "layout": False, "reachable": 0, "total": 0, "truncated": False, "items": []}
+        empty = {"indexed": False, "layout": False, "reachable": 0, "total": 0, "truncated": False, "items": [],
+                 "arch_used": None, "context": []}
         if not is_imports_path(clean):
             return {**base, "blob": None, **empty, "reason": "unsupported"}
         tree = git_tree_resolver.list_tree(rev)
@@ -132,40 +189,77 @@ class ImportsService:
                 if not blob_id:
                     return {**base, **empty, "reason": "unindexed"}
                 refs = self._references(reader, blob_id)
-                own = self._own_names(reader, blob_id, list(refs)) if refs else set()
-                for name in own:
-                    refs.pop(name, None)
+                if refs:
+                    self._mask_own(refs, self._own_defs(reader, blob_id, list(refs)))
             # The walk reads include facts through its own reader
-            reached = arch_layout_service.reachable(rev, arch, clean)
+            arch_used, reached = self._reach(rev, arch, clean)
             headers = [p for p in reached if p != clean]
             blob_paths: dict[int, list[str]] = {}
             defs: list[dict[str, Any]] = []
             if headers and refs:
                 with get_reader() as reader:
-                    shas = {p: tree[p] for p in headers if p in tree}
-                    mapped = GitTreeResolver.map_blob_hashes(reader, list(shas.values()))
-                    for p, sha in shas.items():
-                        hid = mapped.get(sha, (0, 0))[0]
-                        if hid and hid != blob_id:
-                            blob_paths.setdefault(hid, []).append(p)
+                    blob_paths = self._header_blobs(reader, tree, headers, blob_id)
                     if blob_paths:
-                        defs = self._definitions(reader, sorted(blob_paths), sorted(refs))
+                        defs = self._definitions(reader, self._ordered_blobs(blob_paths, reached), sorted(refs))
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - an unreachable database leaves the panel empty
             logger.debug("imports of %s unavailable: %s", clean, exc)
             return {**base, **empty, "reason": "database unavailable"}
         body = self._build(clean, refs, reached, blob_paths, defs)
-        body.update({"indexed": True, "layout": bool(reached), "reachable": len(headers), "reason": None})
+        found = {it["name"] for it in body["items"]}
+        context: list[str] = []
+        unresolved = {n: r for n, r in refs.items() if n not in found}
+        if unresolved and arch_used:
+            try:
+                extra, context = self._context_items(rev, arch_used, clean, tree, blob_id, unresolved, set(reached))
+            except Exception as exc:  # noqa: BLE001 - context imports are best effort over the stored rows
+                logger.debug("context imports of %s unavailable: %s", clean, exc)
+                extra = []
+            if extra:
+                items = body["items"] + extra
+                items.sort(key=lambda it: (_KIND_RANK[it["kind"]], it["name"], it["header_path"], it["line"]))
+                body = {"total": len(items), "truncated": len(items) > MAX_ITEMS, "items": items[:MAX_ITEMS]}
+        body.update({"indexed": True, "layout": bool(reached), "reachable": len(headers), "reason": None,
+                     "arch_used": arch_used, "context": context})
         self._cache[key] = body
         return {**base, **body}
 
     @staticmethod
+    def _reach(rev: str, arch: str, path: str) -> tuple[str | None, dict[str, str | None]]:
+        """(ARCH walked, walk) of `path`: the requested ARCH, else the revision's definition ARCH when the
+        revision does not build the requested one."""
+        for candidate in dict.fromkeys((arch, DEFAULT_DEFINITION_ARCH, "x86_64", "i386", "x86")):
+            if arch_layout_service.layout(rev, candidate) is None and candidate != arch:
+                continue
+            reached = arch_layout_service.reachable(rev, candidate, path)
+            if reached:
+                return candidate, reached
+        return None, {}
+
+    @staticmethod
+    def _header_blobs(reader: Any, tree: dict[str, str], headers: Iterable[str], own_blob: int) -> dict[int, list[str]]:
+        shas = {p: tree[p] for p in headers if p in tree}
+        mapped = GitTreeResolver.map_blob_hashes(reader, list(shas.values()))
+        out: dict[int, list[str]] = {}
+        for p, sha in shas.items():
+            hid = mapped.get(sha, (0, 0))[0]
+            if hid and hid != own_blob:
+                out.setdefault(hid, []).append(p)
+        return out
+
+    @staticmethod
+    def _ordered_blobs(blob_paths: dict[int, list[str]], reached: dict[str, str | None]) -> list[int]:
+        """Header blobs nearest first (breadth-first order), so a capped read keeps the closest headers."""
+        order = {p: i for i, p in enumerate(reached)}
+        return sorted(blob_paths, key=lambda b: (min(order.get(p, len(order)) for p in blob_paths[b]), b))
+
+    @staticmethod
     def _references(reader: Any, blob_id: int) -> dict[str, dict[str, Any]]:
-        """{name: {"lines": set, "roles": set}} of the names the blob references."""
+        """{name: {"lines": set, "roles": set, "spaces": set}} of the names the blob references."""
         rows = reader.select_rows(
             ("m_symbol_ref", "r"),
-            {"name": "a.name", "line": "r.line", "role": "r.role"},
+            {"name": "a.name", "target_type": "a.type_id", "line": "r.line", "role": "r.role"},
             {"r.blob_id": blob_id, "r.role": _IMPORT_ROLES},
             joins=[Join(("m_ast", "a"), {"a.ast_id": "r.ast_id"})],
             limit=MAX_REF_ROWS,
@@ -175,17 +269,20 @@ class ImportsService:
             name = safe_decode(r.get("name"))
             if not name:
                 continue
-            entry = refs.setdefault(name, {"lines": set(), "roles": set()})
+            role = int(r.get("role") or 0)
+            entry = refs.setdefault(name, {"lines": set(), "roles": set(), "spaces": set()})
             line = int(r.get("line") or 0)
             if line > 0:
                 entry["lines"].add(line)
-            entry["roles"].add(int(r.get("role") or 0))
+            entry["roles"].add(role)
+            entry["spaces"].update(ref_namespaces(role, _type_name(r.get("target_type"))))
         return refs
 
     @staticmethod
-    def _own_names(reader: Any, blob_id: int, names: list[str]) -> set[str]:
-        """Referenced names the file itself defines (prototypes and extern declarations do not count)."""
-        own: set[str] = set()
+    def _own_defs(reader: Any, blob_id: int, names: list[str]) -> dict[str, set[str]]:
+        """{name: name spaces} the file itself defines among `names` (prototypes, extern declarations and
+        forward declarations do not count)."""
+        own: dict[str, set[str]] = {}
         for chunk in _chunks(sorted(names)):
             rows = reader.select_rows(
                 ("m_symbol_def", "s"),
@@ -195,12 +292,24 @@ class ImportsService:
             )
             for r in rows:
                 linkage = r.get("linkage")
+                type_name = safe_decode(r.get("type_name"))
                 if linkage is not None and int(linkage) == SymbolLinkage.PrototypeDecl:
                     continue
-                if safe_decode(r.get("type_name")) in _FORWARD:
+                if type_name in _FORWARD:
                     continue
-                own.add(safe_decode(r.get("name")))
+                own.setdefault(safe_decode(r.get("name")), set()).add(def_namespace(type_name))
         return own
+
+    @staticmethod
+    def _mask_own(refs: dict[str, dict[str, Any]], own: dict[str, set[str]]) -> None:
+        """Drop the name spaces the file defines a referenced name in; a name left with none is no import."""
+        for name, spaces in own.items():
+            entry = refs.get(name)
+            if entry is None:
+                continue
+            entry["spaces"] -= spaces
+            if not entry["spaces"]:
+                refs.pop(name, None)
 
     @staticmethod
     def _definitions(reader: Any, blob_ids: list[int], names: list[str]) -> list[dict[str, Any]]:
@@ -218,6 +327,61 @@ class ImportsService:
                 if len(rows) >= MAX_DEF_ROWS:
                     return rows
         return rows
+
+    # ------------------------------------------------------------------ context imports
+    def _context_items(self, rev: str, arch: str, path: str, tree: dict[str, str], blob_id: int,
+                       unresolved: dict[str, dict[str, Any]], searched: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Items for `unresolved` names defined by what the files including `path` include before it."""
+        with get_reader() as reader:
+            includers = self._includers(reader, path, tree)
+        if not includers:
+            return [], []
+        best: dict[str, dict[str, Any]] = {}
+        used: list[str] = []
+        for includer in includers[:MAX_CONTEXT_INCLUDERS]:
+            walk = arch_layout_service.reachable_before(rev, arch, includer, path)
+            headers = [p for p in walk if p not in (includer, path)]
+            if not headers:
+                continue
+            with get_reader() as reader:
+                blob_paths = self._header_blobs(reader, tree, headers, blob_id)
+                if not blob_paths:
+                    continue
+                defs = self._definitions(reader, self._ordered_blobs(blob_paths, walk), sorted(unresolved))
+            body = self._build(includer, unresolved, walk, blob_paths, defs)
+            if body["items"]:
+                used.append(includer)
+            for item in body["items"]:
+                item = {**item, "via": "context", "context": includer, "forced": item["chain"][0] != includer}
+                cur = best.get(item["name"])
+                if cur is None or (len(item["chain"]), item["header_path"]) < (len(cur["chain"]), cur["header_path"]):
+                    best[item["name"]] = item
+        return list(best.values()), used
+
+    @staticmethod
+    def _includers(reader: Any, path: str, tree: dict[str, str]) -> list[str]:
+        """Files of the revision that `#include` `path` (the parser's resolved include rows), `.c` files first."""
+        fn = reader.select_rows("m_file_name", ["fnid"], {"fname": path}, limit=1)
+        if not fn:
+            return []
+        rows = reader.select_rows("m_file_reference", ["source_blob_id", "source_fnid"],
+                                  {"target_fnid": int(fn[0]["fnid"]), "ref_type": int(FileRefType.Include)},
+                                  limit=MAX_INCLUDER_ROWS)
+        if not rows:
+            return []
+        fnids = sorted({int(r["source_fnid"]) for r in rows})
+        names: dict[int, str] = {}
+        for chunk in _chunks(fnids):
+            for r in reader.select_rows("m_file_name", ["fnid", "fname"], {"fnid": chunk}):
+                names[int(r["fnid"])] = safe_decode(r.get("fname"))
+        wanted: dict[str, int] = {}
+        for r in rows:
+            src = names.get(int(r["source_fnid"]))
+            if src and src != path and src in tree:
+                wanted[src] = int(r["source_blob_id"])
+        mapped = GitTreeResolver.map_blob_hashes(reader, [tree[p] for p in wanted])
+        current = [p for p, b in wanted.items() if mapped.get(tree[p], (0, 0))[0] == b]
+        return sorted(current, key=lambda p: (not p.endswith(".c"), p.count("/"), p))
 
     @staticmethod
     def _build(start: str, refs: dict[str, dict[str, Any]], reached: dict[str, str | None],
@@ -240,6 +404,9 @@ class ImportsService:
             linkage = int(linkage) if linkage is not None else None
             kind = import_kind(type_name, linkage, line_s, line_e)
             if kind is None or line_s <= 0:
+                continue
+            spaces = ref.get("spaces")
+            if spaces and def_namespace(type_name) not in spaces:
                 continue
             fits = any(kind in _ROLE_KINDS.get(role, ()) for role in ref["roles"])
             weak = kind == "prototype" or type_name in _FORWARD
@@ -265,7 +432,7 @@ class ImportsService:
             lines = sorted(refs[name]["lines"])
             others = {c[1]["header_path"] for c in cands} - {best["header_path"]}
             items.append({
-                "name": name, **best, "chain": list(chain), "forced": chain[0] != start,
+                "name": name, **best, "chain": list(chain), "forced": chain[0] != start, "via": "include",
                 "ref_line": lines[0] if lines else 0, "ref_lines": lines[:MAX_REF_LINES], "ref_count": len(lines),
                 "alternatives": len(others),
             })

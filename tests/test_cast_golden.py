@@ -27,12 +27,13 @@ if ROOT not in sys.path:
 import core  # noqa: F401
 from core.globalstuff import G
 from core.GreatProcessor import GreatProcessor
-from core.FileHandler import MasterFile
+from core.FileHandler import MasterFile, _remove_stale_asm_links
 from core.TableHandling import ChangeSet
 from core.DBLayout import init_db_layout
 from core.SymbolRows import symbol_view_rows
 from table_engine import get_table_engine
 from db_engine import MockDB
+from parser import compile_env
 from parser.c_ast.cursor_tree import clear_tu_caches
 from tests.test_c_ast import default_processing
 from core.config import get_default_repo_path
@@ -46,7 +47,11 @@ GOLDEN_CACHE = "/dev/shm/kip_v30_golden_cache"
 
 
 def ensure_golden_tree() -> str:
-    """Ensure Linux v3.0 archive is extracted into /dev/shm for full-mode header resolution."""
+    """Ensure Linux v3.0 archive is extracted into /dev/shm for full-mode header resolution.
+
+    The build's links, wrappers and generated headers come from the tree's compilation environment
+    (`parser/compile_env.py`), never from links inside the tree.
+    """
     if not os.path.exists(os.path.join(GOLDEN_CACHE, "Makefile")):
         os.makedirs(GOLDEN_CACHE, exist_ok=True)
         p_arch = subprocess.Popen(
@@ -55,12 +60,7 @@ def ensure_golden_tree() -> str:
         )
         subprocess.run(["tar", "-x", "-C", GOLDEN_CACHE], stdin=p_arch.stdout, check=True)
         p_arch.wait()
-        asm_path = Path(f"{GOLDEN_CACHE}/include/asm")
-        if not asm_path.exists():
-            os.symlink("asm-generic", asm_path)
-        uapi_asm = Path(f"{GOLDEN_CACHE}/include/uapi/asm")
-        if not uapi_asm.exists() and os.path.exists(f"{GOLDEN_CACHE}/include/uapi"):
-            os.symlink("asm-generic", uapi_asm)
+    _remove_stale_asm_links(GOLDEN_CACHE)
     return GOLDEN_CACHE
 
 
@@ -79,7 +79,10 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
     temp_dir = None
     if mode == "full":
         mf.version_dict["v3.0"] = tree_dir
+        # The compilation environment of the v3.0 tree (layouts, defconfig, build directories)
+        compile_env.set_active(compile_env.CompileEnv.for_tree(tree_dir, key="golden-v3.0"))
     else:
+        compile_env.set_active(None)
         temp_dir = mf.create_temp_dir()
         mf.version_dict["v3.0"] = temp_dir
         dest = os.path.join(temp_dir, file_path)
@@ -123,6 +126,7 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
         clear_tu_caches()
+        compile_env.set_active(None)
         G.CURRENT_PARSING_FILE = None
         G.CURRENT_PARSING_DIR = None
         G.DEBUG_TYPECHECK = saved_typecheck

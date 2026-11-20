@@ -14,7 +14,10 @@ Makefile, `scripts/Makefile.lib`, `scripts/Makefile.asm-generic`):
 - `wrappers`: headers `scripts/Makefile.asm-generic` generates for `generic-y` / `mandatory-y`
   (`arch/x86/include/generated/asm/early_ioremap.h`), each mapped to the header it includes
   (`include/asm-generic/early_ioremap.h`).
-- `forced`: files `-include`d into every compilation (`include/linux/kconfig.h`, ...).
+- `forced`: files `-include`d into every compilation (`include/linux/kconfig.h`, ...), generated ones
+  included (`include/generated/autoconf.h` in 2.6.33-3.6, which only a build creates).
+- `flags`: compiler flags that change how a C or assembly file is read (`-D`/`-U` macros, `-std=`,
+  `-funsigned-char`, ...), in command-line order (`parser/compile_env.py` passes them to libclang).
 
 The only assumption is the build host (`uname -m`, x86_64), which decides ARCH=um's SUBARCH.
 
@@ -37,13 +40,20 @@ from parser.make_eval import SRC_ROOT, UNKNOWN, MakeEvaluator, Tree, tree_path
 
 logger = logging.getLogger(__name__)
 
-ROLE_SOURCE, ROLE_INCLUDE, ROLE_LINK, ROLE_WRAPPER, ROLE_FORCED = 1, 2, 3, 4, 5
-ROLE_NAMES = {ROLE_SOURCE: "source", ROLE_INCLUDE: "include", ROLE_LINK: "link", ROLE_WRAPPER: "wrapper", ROLE_FORCED: "forced"}
+ROLE_SOURCE, ROLE_INCLUDE, ROLE_LINK, ROLE_WRAPPER, ROLE_FORCED, ROLE_FLAG = 1, 2, 3, 4, 5, 6
+ROLE_NAMES = {ROLE_SOURCE: "source", ROLE_INCLUDE: "include", ROLE_LINK: "link", ROLE_WRAPPER: "wrapper", ROLE_FORCED: "forced",
+              ROLE_FLAG: "flag"}
 HOST_MACHINE = "x86_64"
 
 _GOAL_LISTS = ("head-y", "init-y", "core-y", "libs-y", "drivers-y", "net-y", "virt-y")
 _FLAG_VARS = ("LINUXINCLUDE", "CPPFLAGS", "KBUILD_CPPFLAGS", "CFLAGS", "KBUILD_CFLAGS")
+# Compiler flags kept in `ArchLayout.flags`: those that change what the preprocessor or the C parser reads
+_KEPT_FLAG_PREFIXES = ("-D", "-U", "-std=")
+_KEPT_FLAGS = ("-funsigned-char", "-fsigned-char", "-fms-extensions", "-fshort-wchar")
 _SHELL_SEPARATORS = ("&&", "||", ";", "|", "\n")
+# Environment of the evaluated make: the in-tree build as kbuild re-executes it. From v6.5 the top Makefile
+# runs its body only when MAKEFLAGS holds --no-print-directory (else it sets need-sub-make and recurses).
+_BUILD_ENV = {"MAKEFLAGS": "--no-print-directory"}
 
 
 def path_arch(path: str) -> str | None:
@@ -86,6 +96,7 @@ class ArchLayout:
     links: dict[str, str] = field(default_factory=dict)
     wrappers: dict[str, str] = field(default_factory=dict)
     forced: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
 
     def rows(self) -> list[ArchRoot]:
         out = [ArchRoot(self.arch, ROLE_SOURCE, i, p) for i, p in enumerate(self.sources)]
@@ -93,6 +104,7 @@ class ArchLayout:
         out += [ArchRoot(self.arch, ROLE_LINK, 0, p, t) for p, t in sorted(self.links.items())]
         out += [ArchRoot(self.arch, ROLE_WRAPPER, 0, p, t) for p, t in sorted(self.wrappers.items())]
         out += [ArchRoot(self.arch, ROLE_FORCED, i, p) for i, p in enumerate(self.forced)]
+        out += [ArchRoot(self.arch, ROLE_FLAG, i, p) for i, p in enumerate(self.flags)]
         return out
 
     @classmethod
@@ -114,6 +126,8 @@ class ArchLayout:
                 layout.wrappers = {p: t for _, p, t in items}
             elif role == ROLE_FORCED:
                 layout.forced = [p for _, p, _ in items]
+            elif role == ROLE_FLAG:
+                layout.flags = [p for _, p, _ in items]
         if layout.sources:
             layout.srcarch = path_arch(layout.sources[0]) or arch
         return layout
@@ -137,12 +151,32 @@ def _flag_tokens(text: str) -> list[str]:
     return [w for w in text.split() if UNKNOWN not in w]
 
 
-def _include_flags(ev: MakeEvaluator) -> tuple[list[str], list[str]]:
-    """(-I directories, -include files) of the C compilation flags, in command-line order."""
+def _compile_tokens(ev: MakeEvaluator) -> list[str]:
     tokens = _flag_tokens(ev.value("c_flags")) if ev.defined("c_flags") else []
     if not tokens:
         for name in _FLAG_VARS:
             tokens += _flag_tokens(ev.value(name))
+    return tokens
+
+
+def _kept_flags(ev: MakeEvaluator) -> list[str]:
+    """`ArchLayout.flags`: the macro, language-standard and char-signedness flags of the C compilation."""
+    out: list[str] = []
+    for tok in _compile_tokens(ev):
+        # Per-object defines (-DKBUILD_BASENAME=..., -D__KBUILD_MODNAME=...) and shell-quoted values name no layout fact
+        if tok.startswith("-Wp,") or "'" in tok or '"' in tok or tok.lstrip("-DU_").startswith("KBUILD_"):
+            continue
+        if (tok.startswith(_KEPT_FLAG_PREFIXES) and len(tok) > 2) or tok in _KEPT_FLAGS:
+            if tok.startswith("-std="):
+                out = [t for t in out if not t.startswith("-std=")]
+            if tok not in out:
+                out.append(tok)
+    return out
+
+
+def _include_flags(ev: MakeEvaluator) -> tuple[list[str], list[str]]:
+    """(-I directories, -include files) of the C compilation flags, in command-line order."""
+    tokens = _compile_tokens(ev)
     dirs: list[str] = []
     after: list[str] = []
     forced: list[str] = []
@@ -309,7 +343,7 @@ def layout_for(arch: str, tree: Tree, read: Callable[[str], str | None], host_ma
                parsed: dict | None = None) -> ArchLayout | None:
     """Layout of one ARCH value, or None when the tree does not build it."""
     parsed = parsed if parsed is not None else {}
-    ev = MakeEvaluator(tree, read, {"ARCH": arch}, None, host_machine, parsed)
+    ev = MakeEvaluator(tree, read, {"ARCH": arch}, dict(_BUILD_ENV), host_machine, parsed)
     if not ev.include("Makefile"):
         return None
     srcarch = ev.value("SRCARCH").strip() or arch
@@ -318,8 +352,10 @@ def layout_for(arch: str, tree: Tree, read: Callable[[str], str | None], host_ma
     ev.include("scripts/Makefile.lib")
     includes, forced = _include_flags(ev)
     includes = [d for d in includes if tree.is_dir(d) or "generated" in d.split("/")]
+    # A forced header the build generates (include/generated/autoconf.h) is kept: parser/compile_env.py writes it
     layout = ArchLayout(arch, srcarch, sources=_sources(ev, srcarch, tree), includes=includes,
-                        forced=[f for f in forced if tree.is_file(f)])
+                        forced=[f for f in forced if tree.is_file(f) or "generated" in f.split("/")],
+                        flags=_kept_flags(ev))
     layout.links = _links(ev, tree)
     layout.wrappers = _wrappers(ev, tree, read, includes, parsed)
     return layout

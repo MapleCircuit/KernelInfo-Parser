@@ -7,7 +7,8 @@ Families of facts are stored per Git blob SHA, one row each (`(blob_hash, family
 - family 2 (`kapi_facts.FAMILY`): the Kernel API macros of a `.c` / `.h` / `.S` blob (`parser/kapi_facts.py`); the
   webapp assembles the Kernel API catalogs of a revision from them (`webapp/API.md` section 4.9). Most blobs have
   none: their row holds empty data;
-- family 3 (`include_facts.FAMILY`): the `#include` directives of a `.c` / `.h` / `.S` blob (`parser/include_facts.py`):
+- family 3 (`include_facts.FAMILY`): the `#include` directives of a `.c` / `.h` / `.S` / `.s` blob with the `#if`
+  conditions around each (`parser/include_facts.py`):
   the webapp's include walks and its list of included `.c` / `.S` files;
 - family 4 (`kconfig_definitions.FAMILY`): the definitions of a Kconfig blob (`parser/kconfig_ast/kconfig_definitions.py`):
   the webapp's Kconfig history and Compare;
@@ -15,6 +16,9 @@ Families of facts are stored per Git blob SHA, one row each (`(blob_hash, family
   the webapp's documentation label index;
 - family 6 (`man_facts.FAMILY`): the NAME, `.TH` header, `.so` alias, cross references and SYNOPSIS declarations of
   a man page blob (`man/manS/name.S` or `manS/name.S`, `parser/man_ast/man_facts.py`): the webapp's man page index.
+
+Family 7 (`compile_env.DIAG_FAMILY`, the parse diagnostics of a C / assembly blob: parse ARCH, defconfig,
+missing headers) is written by the parsers themselves (`parser/c_ast/c_ast.py` `stage_parse_diagnostics()`), not here.
 
 All of a blob's missing families are read from one text in one pass; the comment/string mask (families 1 and 2) is
 computed once, and only when one of them is requested. A version only extracts the blobs (and families) no earlier
@@ -156,9 +160,9 @@ def extract_rust_includes(text: str) -> list[list[Any]]:
         return []
     out: list[list[Any]] = []
     for m in _RUST_MOD.finditer(text):
-        out.append([m.group(1), False])
+        out.append([m.group(1), False, []])
     for m in _RUST_EXTERN_CRATE.finditer(text):
-        out.append([m.group(1), False])
+        out.append([m.group(1), False, []])
     return out
 
 
@@ -166,7 +170,7 @@ def extract_asm_includes(text: str) -> list[list[Any]]:
     """Extract .include and #include directives from assembly source text."""
     directives = inc.extract(text)
     for m in _ASM_INCLUDE.finditer(text or ""):
-        directives.append([m.group(2).strip(), m.group(1) == '"'])
+        directives.append([m.group(2).strip(), m.group(1) == '"', []])
     return directives
 
 

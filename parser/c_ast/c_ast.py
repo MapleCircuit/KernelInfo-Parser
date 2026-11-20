@@ -18,6 +18,7 @@ from typing import Any
 import clang.cindex as cc
 
 from core.SymbolRows import finish as finish_symbol_rows
+from core.DBLayout import m_blob_facts
 from core.globalstuff import (
     G,
     REF_C_AST,
@@ -111,6 +112,7 @@ from parser.c_ast.tag_tracker import (
     check_exact_match,
 )
 from parser.c_ast.cs_extractor import CSExtractor
+from parser.c_ast.lexical_refs import record_lexical_refs
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +146,23 @@ def c_ast_parse(CS: Any) -> None:
                 logger.error(f"Unsupported file operation '{CS.file_operation}' in c_ast_parse")
         # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
         finish_symbol_rows(CS)
+        stage_parse_diagnostics(CS)
     finally:
         clear_tu_caches()
+
+
+def stage_parse_diagnostics(CS: Any) -> None:
+    """Stage the blob's parse diagnostics (`m_blob_facts` family 7, parser/compile_env.py `diagnostics_fact()`)."""
+    from parser import compile_env
+
+    fact = getattr(CS, "parse_diagnostics", None)
+    blob_hash = getattr(CS, "blob_hash", None)
+    CS.parse_diagnostics = None
+    if fact is None or not blob_hash or not any(blob_hash):
+        return
+    with CS(REF_POS):
+        CS.store(m_blob_facts.set(bytes(blob_hash), compile_env.DIAG_FAMILY, compile_env.DIAG_FORMAT,
+                                  compile_env.encode_fact(fact)))
 
 
 def process_c_ast(CS: Any) -> None:
@@ -224,16 +241,16 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
                     if inc_ptr not in ptr_to_direct_line:
                         ptr_to_direct_line[inc_ptr] = current_direct_line
                     inc_name = inc_file.name
-                    r_inc = get_real(inc_name)
-                    base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-                    if base_dir:
+                    env = getattr(CS, "compile_env", None)
+                    rel_inc = env.repo_path(inc_name) if env is not None else None
+                    if rel_inc is None and env is None:
+                        r_inc = get_real(inc_name)
+                        base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
                         try:
-                            rel_inc = os.path.relpath(r_inc, base_dir)
+                            rel_inc = os.path.relpath(r_inc, base_dir) if base_dir else inc_name
                         except Exception:
                             rel_inc = inc_name
-                    else:
-                        rel_inc = inc_name
-                    if not rel_inc.startswith(".."):
+                    if rel_inc and not rel_inc.startswith(".."):
                         CS.resolved_includes_by_line[current_direct_line] = rel_inc
         elif current_direct_line is not None and inc.depth > 1:
             if inc_ptr not in ptr_to_direct_line:
@@ -352,6 +369,10 @@ class TokenList(TokenStream):
             prof.token_processing_s = time.perf_counter() - t_proc_0
 
         CSExtractor.extract_zone(self.CS, self.main_zone)
+        # Identifiers libclang left unresolved (skipped code, missing definitions): parser/c_ast/lexical_refs.py
+        # (C only: assembly text has no C names)
+        if not self.fullfilename.endswith((".S", ".s")):
+            record_lexical_refs(self.CS, self.tokens_array, self.rawfile)
 
         # Immediate teardown: release Clang AST, token stream, and intermediate structures
         self.main_zone = None
@@ -486,36 +507,25 @@ class Ast_Manager:
         prof = getattr(CS, "profiler", None)
         t_parse_0 = time.perf_counter() if prof is not None else 0.0
 
-        inc_dir = self.filename.rpartition("/")[0]
-        parts = self.filename.split("/")
-        arch = "x86"
-        if len(parts) > 1 and parts[0] == "arch":
-            arch = parts[1]
-        arch_includes = [
-            f"-I{self.mfdir}/arch/{arch}/include",
-            f"-I{self.mfdir}/arch/{arch}/include/uapi",
-            f"-I{self.mfdir}/arch/{arch}/include/generated",
-            f"-I{self.mfdir}/arch/{arch}/include/generated/uapi",
-        ]
-        if arch != "x86":
-            arch_includes.extend([
-                f"-I{self.mfdir}/arch/x86/include",
-                f"-I{self.mfdir}/arch/x86/include/uapi",
-            ])
+        # The compilation `make ARCH=<arch>` runs for this file (parser/compile_env.py): layout include
+        # directories and build directory, forced headers, defconfig, no host header (-nostdinc)
+        from parser import compile_env  # lazy: parser.arch_layout imports the C parser through kconfig_ast
 
+        env = compile_env.env_for(self.mfdir)
+        CS.compile_env = env
+        env_args, extra_options, arch_env = env.args_for(self.filename, asm=False)
+        CS.compile_arch = arch_env
         translation_unit = index.parse(
             self.fullfilename,
             args=[
                 "-ferror-limit=0",
                 "-w",
+                *env_args,
                 *_CLANG_KERNEL_MACRO_DEFINES,
-                f"-I{self.mfdir}/{inc_dir}",
-                *arch_includes,
-                f"-I{self.mfdir}/include",
-                f"-I{self.mfdir}/include/uapi",
             ],
-            options=_CLANG_PARSE_OPTIONS,
+            options=_CLANG_PARSE_OPTIONS | extra_options,
         )
+        CS.parse_diagnostics = compile_env.diagnostics_fact(translation_unit, arch_env)
         t_includes_0 = time.perf_counter() if prof is not None else 0.0
 
         top_cursors = extract_include_symbols(translation_unit, self.fullfilename, CS)

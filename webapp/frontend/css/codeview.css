@@ -991,6 +991,8 @@ a.code-imports-hop:hover { color: var(--accent-blue); text-decoration: underline
 .code-imports-arrow { color: var(--text-muted); }
 .code-imports-forced { margin-right: 4px; padding: 0 4px; border: 1px solid var(--accent-orange); border-radius: 3px; color: var(--accent-orange);
   font-size: var(--fs-10, 10px); }
+.code-imports-context { margin-right: 4px; padding: 0 4px; border: 1px solid var(--accent-blue); border-radius: 3px; color: var(--accent-blue);
+  font-size: var(--fs-10, 10px); }
 .code-imports-empty, .code-imports-note { padding: 12px; color: var(--text-muted); }
 @media (max-width: 700px) { .code-imports { flex-basis: calc(220px * var(--ui-layout-scale, 1)); } }
 

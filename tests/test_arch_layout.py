@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from parser.arch_layout import (
+    ROLE_FLAG,
     ROLE_INCLUDE,
     ROLE_LINK,
     ArchLayout,
@@ -360,6 +361,65 @@ class TestRealKernelLayouts(unittest.TestCase):
              patch.object(main.G, "DB", fake_db):
             with self.assertRaises(RuntimeError):
                 pipeline.arch_layouts.processing_arch_layouts("v2.6.12")
+
+
+# A 6.5-style top Makefile: the body runs only in the make re-executed with --no-print-directory (else it
+# sets need-sub-make and recurses); objtree comes from the in-tree branch
+SUBMAKE_TREE = {
+    "Makefile": (
+        "this-makefile := $(lastword $(MAKEFILE_LIST))\nabs_srctree := $(realpath $(dir $(this-makefile)))\n"
+        "abs_output := $(CURDIR)\n"
+        "ifneq ($(sub_make_done),1)\nMAKEFLAGS += -rR\nobjtree := .\nexport objtree\nendif\n"
+        "ifeq ($(filter --no-print-directory, $(MAKEFLAGS)),)\nneed-sub-make := 1\nendif\n"
+        "ifeq ($(need-sub-make),)\n"
+        "srctree := .\nSRCARCH := $(ARCH)\nifeq ($(ARCH),x86_64)\n        SRCARCH := x86\nendif\n"
+        "LINUXINCLUDE := -I$(srctree)/arch/$(SRCARCH)/include -I$(objtree)/arch/$(SRCARCH)/include/generated "
+        "-I$(srctree)/include -include $(srctree)/include/linux/kconfig.h\n"
+        "KBUILD_CPPFLAGS := -D__KERNEL__ -std=gnu11 -funsigned-char -DKBUILD_MODNAME='\"x\"' -Wall\n"
+        "include $(srctree)/arch/$(SRCARCH)/Makefile\n"
+        "endif # need-sub-make\n"
+    ),
+    "scripts/Makefile.lib": "c_flags = $(LINUXINCLUDE) -include $(srctree)/include/generated/autoconf.h $(KBUILD_CPPFLAGS)\n",
+    "arch/x86/Makefile": "", "arch/x86/include/asm/atomic.h": "", "include/linux/kconfig.h": "",
+}
+
+
+class TestModernTopMakefile(unittest.TestCase):
+    def test_sub_make_body_generated_dirs_flags_and_generated_forced(self) -> None:
+        x86_64 = compute_layouts(SUBMAKE_TREE, SUBMAKE_TREE.get, ["x86_64"])["x86_64"]
+        self.assertEqual(x86_64.srcarch, "x86")
+        self.assertEqual(x86_64.includes, ["arch/x86/include/", "arch/x86/include/generated/", "include/"])
+        # A generated forced header is kept (parser/compile_env.py writes it)
+        self.assertEqual(x86_64.forced, ["include/linux/kconfig.h", "include/generated/autoconf.h"])
+        # Macro, standard and char-signedness flags; per-object defines and warnings are not layout facts
+        self.assertEqual(x86_64.flags, ["-D__KERNEL__", "-std=gnu11", "-funsigned-char"])
+        rows = [(r.role, r.priority, r.path, r.target) for r in x86_64.rows()]
+        self.assertIn((ROLE_FLAG, 1, "-std=gnu11", ""), rows)
+        self.assertEqual(ArchLayout.from_rows("x86_64", rows).flags, x86_64.flags)
+
+
+class TestRealTreeLayouts(unittest.TestCase):
+    """Every era of the local Linux checkout has an x86_64 layout (skipped without the repository)."""
+
+    def test_layout_per_era(self) -> None:
+        from core.config import get_default_repo_path
+        repo = Path(get_default_repo_path())
+        if not (repo / ".git").exists():
+            self.skipTest("no Linux repository")
+        for tag, includes in (("v2.6.0", "include/"), ("v3.0", "arch/x86/include/generated/"),
+                              ("v6.5", "arch/x86/include/generated/"), ("v6.19", "arch/x86/include/generated/uapi/")):
+            names = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", tag], capture_output=True,
+                                   text=True, check=False).stdout.split("\n")
+            if len(names) < 100:
+                self.skipTest(f"{tag} not in the repository")
+
+            def read(path: str, tag=tag) -> str | None:
+                out = subprocess.run(["git", "-C", str(repo), "show", f"{tag}:{path}"], capture_output=True, check=False)
+                return out.stdout.decode("latin-1") if out.returncode == 0 else None
+
+            layout = compute_layouts([n for n in names if n], read, ["x86_64"]).get("x86_64")
+            self.assertIsNotNone(layout, tag)
+            self.assertIn(includes, layout.includes, tag)
 
 
 if __name__ == "__main__":
