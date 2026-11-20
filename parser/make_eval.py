@@ -14,7 +14,9 @@ It evaluates one in-tree `make ARCH=<arch>` with no goal and no `.config`:
 - CONFIG_* variables are undefined (no `include/config/auto.conf`), so config-dependent settings
   take their "not configured" branch.
 - `$(shell uname -m | sed -e s/.../.../ ...)` is computed for the host machine `host_machine`
-  (x86_64 by default), the only fact a make run takes from outside the tree. Other `$(shell)` calls,
+  (x86_64 by default), the only fact a make run takes from outside the tree. The working-directory idioms
+  (`$(shell pwd)`, `$(shell /bin/pwd)`, `$(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)`, the
+  pre-2.6 `TOPDIR`) are `$(CURDIR)`, so `HPATH = $(TOPDIR)/include` is a tree path. Other `$(shell)` calls,
   compiler checks and unknown functions expand to the `UNKNOWN` marker: words containing it are
   unknown, and a conditional testing an unknown value applies both branches.
 """
@@ -34,6 +36,12 @@ _MAX_DEPTH = 120
 _MAX_INCLUDE_DEPTH = 10
 _COND_RE = re.compile(r"^(ifeq|ifneq|ifdef|ifndef)\b\s*(.*)$", re.DOTALL)
 _FUNC_RE = re.compile(r"^([a-z][a-z-]*)[ \t]")
+# `$(shell)` commands printing the working directory (the pre-2.6 `TOPDIR := $(shell ...)` spellings)
+_PWD_CMD = r"(?:(?:/bin/)?pwd|echo\s+\$\{?PWD\}?|echo\s+\$\(pwd\)|cd\s+\.\s*(?:;|&&)\s*(?:/bin/)?pwd)"
+_PWD_RE = re.compile(
+    r"\s*(?:" + _PWD_CMD
+    + r"|if\s+\[\s+\"?\$\{?PWD\}?\"?\s+!=\s+\"\"\s+\]\s*;\s*then\s+" + _PWD_CMD + r"\s*;\s*else\s+" + _PWD_CMD
+    + r"\s*;\s*fi)\s*", re.DOTALL)
 _FUNCS = {
     "subst": 3, "patsubst": 3, "strip": 1, "findstring": 2, "filter": 2, "filter-out": 2, "sort": 1,
     "word": 2, "wordlist": 3, "words": 1, "firstword": 1, "lastword": 1, "dir": 1, "notdir": 1,
@@ -464,9 +472,13 @@ class MakeEvaluator:
         return UNKNOWN
 
     def _shell(self, cmd: str) -> str:
-        """`uname -m [| sed -e s/a/b/ ...]` for the host machine; other commands are unknown."""
+        """`uname -m [| sed -e s/a/b/ ...]` for the host machine, the working-directory idioms (`pwd`,
+        `/bin/pwd`, `echo $PWD`, `if [ "$PWD" != "" ]; then echo $PWD; else pwd; fi`) as `$(CURDIR)`;
+        other commands are unknown."""
         if UNKNOWN in cmd:
             return UNKNOWN
+        if _PWD_RE.fullmatch(cmd):
+            return self.value("CURDIR")
         m = re.fullmatch(r"\s*uname\s+-m\s*(?:\|\s*sed\s+(.*?))?\s*", cmd, re.DOTALL)
         if not m:
             return UNKNOWN

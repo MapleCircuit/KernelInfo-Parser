@@ -27,6 +27,7 @@ from fastapi import HTTPException
 from parser.kbuild_conditions import KbuildConditionResolver, is_other_arch_path
 from parser.kbuild_parser import KbuildParser
 from parser import kbuild_symbols
+from parser.arch_layout import PRE_ARCH_ARCH
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
 from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
 from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
@@ -255,7 +256,9 @@ class KconfigService:
         aliases = arch_aliases(makefile)
         arch_dirs = set(self._tree_listing(rev, "arch"))
         srcarch = aliases.get(arch_id, arch_id)
-        if srcarch not in arch_dirs:
+        # A tree before arch/ (0.01-1.0) builds i386 alone (parser/arch_layout.py PRE_ARCH_ARCH)
+        pre_arch = not arch_dirs and srcarch == PRE_ARCH_ARCH
+        if srcarch not in arch_dirs and not pre_arch:
             raise HTTPException(status_code=404, detail=f"Architecture '{arch_id}' does not exist in {rev}.")
         info = {
             "rev": rev,

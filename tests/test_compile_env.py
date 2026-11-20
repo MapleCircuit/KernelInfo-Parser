@@ -227,6 +227,75 @@ class TestCompileEnv(unittest.TestCase):
         self.assertTrue(os.path.exists(live_dir))
 
 
+# A 2.3.35-style tree: `TOPDIR := $(shell ... pwd ...)`, `CPPFLAGS := -D__KERNEL__ -I$(HPATH)`, include/asm from
+# the `symlinks:` rule
+PRE_2_6_TREE = {
+    "Makefile": (
+        "ARCH := $(shell uname -m | sed -e s/i.86/i386/)\n"
+        'TOPDIR := $(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)\n'
+        "HPATH = $(TOPDIR)/include\nCPPFLAGS := -D__KERNEL__ -I$(HPATH)\nCFLAGS := $(CPPFLAGS) -O2\n"
+        "include arch/$(ARCH)/Makefile\n"
+        "symlinks:\n\trm -f include/asm\n\t( cd include ; ln -sf asm-$(ARCH) asm)\n"
+    ),
+    "arch/i386/Makefile": "CFLAGS := $(CFLAGS) -pipe\n",
+    "include/asm-i386/types.h": "typedef unsigned int __u32;\n",
+    "include/linux/lockd/bind.h": "#include <linux/lockd/nlm.h>\n#include <asm/types.h>\n__u32 nlm_value = NLM_PROGRAM;\n",
+    "include/linux/lockd/nlm.h": "#define NLM_PROGRAM 100021\n",
+}
+
+# A 1.0-style tree: no arch/, include/asm/ a directory of the tree, no -I flag
+PRE_ARCH_TREE = {
+    "Makefile": "CFLAGS = -Wall -O2\nCC = gcc -D__KERNEL__\nCPP = $(CC) -E\n",
+    "kernel/sched.c": "#include <linux/sched.h>\n#include <asm/system.h>\nint x = SCHED_X + SYSTEM_X;\n",
+    "include/linux/sched.h": "#define SCHED_X 1\n", "include/asm/system.h": "#define SYSTEM_X 2\n",
+}
+
+
+class TestHistoricalCompileEnv(unittest.TestCase):
+    """CompileEnv of trees before kbuild's c_flags (2.x) and before arch/ (0.01-1.0)."""
+
+    def env_of(self, tree: dict[str, str]) -> CompileEnv:
+        root = tempfile.mkdtemp(prefix="kip-env-", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        for path, text in tree.items():
+            dest = os.path.join(root, path)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="latin-1") as fh:
+                fh.write(text)
+        base = tempfile.mkdtemp(prefix="kip-build-")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, base, True)
+        env = CompileEnv(root, set(tree), tree.get, None, key=f"test-{id(tree)}", build_base=base, configure=False)
+        self.addCleanup(env.cleanup)
+        return env
+
+    def parsed_includes(self, env: CompileEnv, path: str) -> tuple[set[str], int]:
+        args, options, _ = env.args_for(path)
+        tu = cc.Index.create().parse(os.path.join(env.root, path), args=args, options=options)
+        errors = sum(1 for d in tu.diagnostics if d.severity >= cc.Diagnostic.Error)
+        return {env.repo_path(i.include.name) for i in tu.get_includes()}, errors
+
+    def test_pre_2_6_include_flags_and_symlinks(self) -> None:
+        env = self.env_of(PRE_2_6_TREE)
+        self.assertEqual(env.default_arch, "i386")
+        i386 = env.env("i386")
+        self.assertEqual((i386.layout.includes, i386.layout.links), (["include/"], {"include/asm/": "include/asm-i386/"}))
+        bind = "include/linux/lockd/bind.h"
+        self.assertEqual(env.resolve_include("linux/lockd/nlm.h", bind, arch_env=i386), "include/linux/lockd/nlm.h")
+        self.assertEqual(env.resolve_include("asm/types.h", bind, arch_env=i386), "include/asm-i386/types.h")
+        self.assertIn(f"-I{env.root}/include", env.args_for(bind)[0])
+        includes, errors = self.parsed_includes(env, bind)
+        self.assertEqual((includes, errors), ({"include/linux/lockd/nlm.h", "include/asm-i386/types.h"}, 0))
+
+    def test_tree_before_arch(self) -> None:
+        env = self.env_of(PRE_ARCH_TREE)
+        self.assertEqual((env.arch_values, env.default_arch), (["i386"], "i386"))
+        i386 = env.env("i386")
+        self.assertEqual((i386.layout.sources, i386.layout.includes), ([], ["include/"]))
+        self.assertEqual(env.resolve_include("asm/system.h", "kernel/sched.c", arch_env=i386), "include/asm/system.h")
+        includes, errors = self.parsed_includes(env, "kernel/sched.c")
+        self.assertEqual((includes, errors), ({"include/linux/sched.h", "include/asm/system.h"}, 0))
+
+
 class TestGeneratedHeaders(unittest.TestCase):
     def test_helpers(self) -> None:
         self.assertEqual(kernel_release("VERSION = 6\nPATCHLEVEL = 19\nSUBLEVEL = 0\nEXTRAVERSION =\n"), (6, 19, 0, ""))

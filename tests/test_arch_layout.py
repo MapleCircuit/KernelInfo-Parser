@@ -75,6 +75,15 @@ class TestMakeEvaluator(unittest.TestCase):
         self.assertEqual((ev.value("SUBARCH"), ev.value("RAW")), ("x86", "x86_64"))
         self.assertEqual(ev.value("OTHER"), UNKNOWN)
 
+    def test_shell_working_directory_idioms_are_curdir(self) -> None:
+        ev = evaluator({"Makefile": (
+            'TOPDIR := $(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)\n'
+            "A := $(shell /bin/pwd)\nB := $(shell pwd)\nC := $(shell pwd; ls)\nHPATH = $(TOPDIR)/include\n"
+        )})
+        self.assertEqual((ev.value("TOPDIR"), ev.value("A"), ev.value("B")), (SRC_ROOT, SRC_ROOT, SRC_ROOT))
+        self.assertEqual(ev.value("C"), UNKNOWN)
+        self.assertEqual(tree_path(ev.value("HPATH")), "include")
+
     def test_includes_defines_and_recipes(self) -> None:
         files = {
             "Makefile": (
@@ -165,7 +174,72 @@ NEW_TREE = {
 }
 
 
+# A 2.3/2.4-style tree: TOPDIR from `$(shell ... pwd ...)`, `-I$(HPATH)` in CPPFLAGS, no scripts/Makefile.lib,
+# include/asm made by the `symlinks:` rule from inside include/
+PRE_2_6_TREE = {
+    "Makefile": (
+        "ARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/)\n"
+        'TOPDIR := $(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)\n'
+        "HPATH = $(TOPDIR)/include\nFINDHPATH = $(HPATH)/asm $(HPATH)/linux\n"
+        "CC = $(CROSS_COMPILE)gcc\nCPP = $(CC) -E\n"
+        "CPPFLAGS := -D__KERNEL__ -I$(HPATH)\n"
+        "CFLAGS := $(CPPFLAGS) -Wall -O2\n"
+        "include arch/$(ARCH)/Makefile\n"
+        "symlinks:\n\trm -f include/asm\n\t( cd include ; ln -sf asm-$(ARCH) asm)\n"
+    ),
+    "arch/i386/Makefile": "CFLAGS := $(CFLAGS) -pipe\n",
+    "arch/alpha/Makefile": "",
+    "include/asm-i386/types.h": "", "include/asm-alpha/types.h": "",
+    "include/linux/lockd/bind.h": "#include <linux/lockd/nlm.h>\n", "include/linux/lockd/nlm.h": "",
+}
+
+# A 1.2/2.0-style tree: the -I directory is in CC (`CC = gcc -D__KERNEL__ -I$(HPATH)`)
+CC_FLAGS_TREE = {
+    **PRE_2_6_TREE,
+    "Makefile": (
+        "ARCH = i386\n"
+        'TOPDIR := $(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)\n'
+        "HPATH = $(TOPDIR)/include\nCC = $(CROSS_COMPILE)gcc -D__KERNEL__ -I$(HPATH)\n"
+        "CFLAGS = -Wall -O2\ninclude arch/$(ARCH)/Makefile\n"
+        "symlinks:\n\trm -f include/asm\n\t( cd include ; ln -sf asm-$(ARCH) asm)\n"
+    ),
+}
+
+# A 0.01/1.0-style tree: no arch/ directory, include/asm/ a real directory, no -I flag (1.0 relies on the
+# /usr/include/linux symlink into the tree)
+PRE_ARCH_TREE = {
+    "Makefile": "CFLAGS = -Wall -O2\nCC = gcc -D__KERNEL__\nCPP = $(CC) -E\n",
+    "boot/head.s": "", "kernel/sched.c": "#include <linux/sched.h>\n#include <asm/system.h>\n",
+    "include/linux/sched.h": "", "include/asm/system.h": "",
+}
+
+
 class TestArchLayout(unittest.TestCase):
+    def test_pre_2_6_topdir_hpath_and_symlinks_rule(self) -> None:
+        layouts = compute_layouts(PRE_2_6_TREE, PRE_2_6_TREE.get)
+        self.assertEqual(sorted(layouts), ["alpha", "i386"])
+        i386 = layouts["i386"]
+        self.assertEqual((i386.srcarch, i386.sources), ("i386", ["arch/i386/"]))
+        self.assertEqual(i386.includes, ["include/"])
+        self.assertEqual(i386.links, {"include/asm/": "include/asm-i386/"})
+        self.assertEqual(i386.flags, ["-D__KERNEL__"])
+        self.assertEqual(layouts["alpha"].links, {"include/asm/": "include/asm-alpha/"})
+
+    def test_pre_2_6_include_dir_in_cc(self) -> None:
+        i386 = compute_layouts(CC_FLAGS_TREE, CC_FLAGS_TREE.get, ["i386"])["i386"]
+        self.assertEqual((i386.includes, i386.flags), (["include/"], ["-D__KERNEL__"]))
+        self.assertEqual(i386.links, {"include/asm/": "include/asm-i386/"})
+
+    def test_tree_before_arch_builds_i386(self) -> None:
+        from parser.arch_layout import PRE_ARCH_ARCH, arch_values
+        self.assertEqual(arch_values(Tree(PRE_ARCH_TREE), PRE_ARCH_TREE["Makefile"]), [PRE_ARCH_ARCH])
+        layouts = compute_layouts(PRE_ARCH_TREE, PRE_ARCH_TREE.get)
+        self.assertEqual(sorted(layouts), ["i386"])
+        i386 = layouts["i386"]
+        self.assertEqual((i386.srcarch, i386.sources, i386.includes, i386.links), ("i386", [], ["include/"], {}))
+        self.assertEqual(i386.arch_trees(), {"i386"})
+        self.assertIsNone(compute_layouts(PRE_ARCH_TREE, PRE_ARCH_TREE.get, ["x86_64"]).get("x86_64"))
+
     def test_2_6_symlinked_asm_headers(self) -> None:
         layouts = compute_layouts(OLD_TREE, OLD_TREE.get)
         self.assertEqual(sorted(layouts), ["i386", "um", "x86_64"])
@@ -338,6 +412,20 @@ class TestRealKernelLayouts(unittest.TestCase):
         layout = self.layout("v3.0", "x86_64")
         self.assertEqual((layout.srcarch, layout.includes[:3]), ("x86", ["arch/x86/include/", "arch/x86/include/generated/", "include/"]))
         self.assertEqual(layout.arch_trees(), {"x86"})
+
+    def test_pre_2_6_i386(self) -> None:
+        for version in ("1.2.13", "2.0", "2.2.0", "2.3.35pre2", "2.4.0"):
+            layout = self.layout(version, "i386")
+            self.assertIsNotNone(layout, version)
+            self.assertEqual(layout.includes, ["include/"], version)
+            self.assertEqual(layout.links, {"include/asm/": "include/asm-i386/"}, version)
+            self.assertIn("-D__KERNEL__", layout.flags, version)
+
+    def test_before_arch_i386(self) -> None:
+        for version in ("0.01", "1.0"):
+            layout = self.layout(version, "i386")
+            self.assertIsNotNone(layout, version)
+            self.assertEqual((layout.sources, layout.includes), ([], ["include/"]), version)
 
 
     def test_database_error_propagates(self) -> None:

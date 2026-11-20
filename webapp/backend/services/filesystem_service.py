@@ -636,19 +636,23 @@ class FilesystemService:
                 _INCLUDE_CACHE[cache_key] = res
                 return res
 
-            # 1. Check compiler-verified m_file_reference if current_file is provided
+            # 1. Compiler-verified m_file_reference of current_file whose target is a file of the revision's tree
+            #    (a target the parser could not resolve keeps the written spelling, `linux/lockd/nlm.h`)
             if current_file:
                 fr_row = reader.select_one(
                     (reader.checkpoint_tree_source(), "bc_src"),
                     {"fname": "fn_target.fname"},
                     [
-                        {"bc_src.commit_id": vid, "fn_src.fname": current_file, "fr.ref_type": 1},
+                        {"bc_src.commit_id": vid, "fn_src.fname": current_file, "fr.ref_type": 1,
+                         "bc_tgt.commit_id": vid, "fb_tgt.ftype": ne(0)},
                         AnyOf({"fn_target.fname": clean_header}, {"fn_target.fname": like(f"/{clean_header}", "suffix")}),
                     ],
                     joins=[
                         Join(("m_file_name", "fn_src"), {"fn_src.fnid": "bc_src.fnid"}),
                         Join(("m_file_reference", "fr"), {"fr.source_blob_id": "bc_src.blob_id", "fr.source_fnid": "bc_src.fnid"}),
                         Join(("m_file_name", "fn_target"), {"fn_target.fnid": "fr.target_fnid"}),
+                        Join((reader.checkpoint_tree_source(), "bc_tgt"), {"bc_tgt.fnid": "fr.target_fnid"}),
+                        Join(("m_file_blob", "fb_tgt"), {"fb_tgt.blob_id": "bc_tgt.blob_id"}),
                     ],
                     as_dict=True,
                 )

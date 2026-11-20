@@ -8,7 +8,8 @@ Makefile, `scripts/Makefile.lib`, `scripts/Makefile.asm-generic`):
   directories its goal lists name (`core-y += arch/x86/um/` for ARCH=um).
 - `includes`: the `-I` directories of `c_flags` in search order (`arch/x86/include/`,
   `arch/x86/include/generated/`, `include/`, ...; `include/` alone in 2.6.12, where `<asm/...>` goes
-  through the `include/asm` symlink).
+  through the `include/asm` symlink). Without `c_flags` (before 2.6) they come from `CC` / `CPP` /
+  `CPPFLAGS` / `CFLAGS` (`-I$(HPATH)`, `HPATH = $(TOPDIR)/include`); `include/` is always searched.
 - `links`: symlinks the build creates (`include/asm` -> `include/asm-x86_64/` in 2.6.x,
   `include/asm-um/arch` -> `include/asm-x86_64/` for ARCH=um), from the `ln` commands of the rules.
 - `wrappers`: headers `scripts/Makefile.asm-generic` generates for `generic-y` / `mandatory-y`
@@ -20,6 +21,9 @@ Makefile, `scripts/Makefile.lib`, `scripts/Makefile.asm-generic`):
   `-funsigned-char`, ...), in command-line order (`parser/compile_env.py` passes them to libclang).
 
 The only assumption is the build host (`uname -m`, x86_64), which decides ARCH=um's SUBARCH.
+
+A tree without arch/ (0.01-1.0) builds ARCH=i386 alone (`PRE_ARCH_ARCH`): its layout has no source directory,
+`include/` as include directory and the tree's own `include/asm/` directory.
 
 `arch_trees()` are the architecture trees an ARCH uses (`path_arch()` of its directories): x86_64
 uses `x86_64` (arch/x86_64/, include/asm-x86_64/) at v2.6.12 and `x86` at v3.0; ARCH=um also uses
@@ -46,7 +50,14 @@ ROLE_NAMES = {ROLE_SOURCE: "source", ROLE_INCLUDE: "include", ROLE_LINK: "link",
 HOST_MACHINE = "x86_64"
 
 _GOAL_LISTS = ("head-y", "init-y", "core-y", "libs-y", "drivers-y", "net-y", "virt-y")
-_FLAG_VARS = ("LINUXINCLUDE", "CPPFLAGS", "KBUILD_CPPFLAGS", "CFLAGS", "KBUILD_CFLAGS")
+# Compilation flags without kbuild's `c_flags`: 2.x puts `-D__KERNEL__ -I$(HPATH)` in CC (1.2-2.2) or CPPFLAGS
+# (2.3-2.4), 0.01 its `-Iinclude` in CPP
+_FLAG_VARS = ("LINUXINCLUDE", "CC", "CPP", "CPPFLAGS", "KBUILD_CPPFLAGS", "CFLAGS", "KBUILD_CFLAGS")
+# Linux 0.01-1.0 have no arch/ directory and build i386 only
+PRE_ARCH_ARCH = "i386"
+# The header root every kernel compilation searches: `-I$(TOPDIR)/include`, or before 1.1 the
+# `/usr/include/linux` and `/usr/include/asm` symlinks into the tree that the build instructions require
+_INCLUDE_ROOT = "include/"
 # Compiler flags kept in `ArchLayout.flags`: those that change what the preprocessor or the C parser reads
 _KEPT_FLAG_PREFIXES = ("-D", "-U", "-std=")
 _KEPT_FLAGS = ("-funsigned-char", "-fsigned-char", "-fms-extensions", "-fshort-wchar")
@@ -343,27 +354,39 @@ def _wrappers(ev: MakeEvaluator, tree: Tree, read: Callable[[str], str | None], 
     return out
 
 
+def _pre_arch(tree: Tree) -> bool:
+    """True for a tree before arch/ (0.01-1.0): its architecture code is in boot/, kernel/, mm/, ..."""
+    return not tree.is_dir("arch") and tree.is_dir("include")
+
+
 def layout_for(arch: str, tree: Tree, read: Callable[[str], str | None], host_machine: str = HOST_MACHINE,
                parsed: dict | None = None) -> ArchLayout | None:
-    """Layout of one ARCH value, or None when the tree does not build it."""
+    """Layout of one ARCH value, or None when the tree does not build it. A tree without arch/ builds
+    `PRE_ARCH_ARCH` only (no source directory); every layout searches `include/` (`_INCLUDE_ROOT`)."""
     parsed = parsed if parsed is not None else {}
     ev = MakeEvaluator(tree, read, {"ARCH": arch}, dict(_BUILD_ENV), host_machine, parsed)
     if not ev.include("Makefile"):
         return None
+    pre_arch = _pre_arch(tree)
     srcarch = ev.value("SRCARCH").strip() or arch
-    if UNKNOWN in srcarch or not tree.is_file(f"arch/{srcarch}/Makefile"):
+    if pre_arch:
+        if arch != PRE_ARCH_ARCH:
+            return None
+    elif UNKNOWN in srcarch or not tree.is_file(f"arch/{srcarch}/Makefile"):
         return None
     ev.include("scripts/Makefile.lib")
     links = _links(ev, tree)
     includes, forced = _include_flags(ev)
     includes = [d for d in includes if tree.is_dir(d) or "generated" in d.split("/") or d in links]
+    if _INCLUDE_ROOT not in includes and tree.is_dir(_INCLUDE_ROOT.rstrip("/")):
+        includes.append(_INCLUDE_ROOT)
     # A forced header the build generates (include/generated/autoconf.h, include/linux/autoconf.h) is kept:
     # parser/compile_env.py writes it
     kept_forced = [
         f for f in forced
         if tree.is_file(f) or "generated" in f.split("/") or f in links or f == "include/linux/autoconf.h"
     ]
-    layout = ArchLayout(arch, srcarch, sources=_sources(ev, srcarch, tree), includes=includes,
+    layout = ArchLayout(arch, srcarch, sources=[] if pre_arch else _sources(ev, srcarch, tree), includes=includes,
                         forced=kept_forced, flags=_kept_flags(ev))
     layout.links = links
     layout.wrappers = _wrappers(ev, tree, read, includes, parsed)
@@ -371,7 +394,10 @@ def layout_for(arch: str, tree: Tree, read: Callable[[str], str | None], host_ma
 
 
 def arch_values(tree: Tree, top_makefile: str) -> list[str]:
-    """ARCH values a revision builds: its arch/ directories and the aliases of the top Makefile."""
+    """ARCH values a revision builds: its arch/ directories and the aliases of the top Makefile
+    (`PRE_ARCH_ARCH` for a tree before arch/)."""
+    if _pre_arch(tree):
+        return [PRE_ARCH_ARCH]
     dirs = sorted(d.split("/")[1] for d in tree.dirs if d.count("/") == 1 and d.startswith("arch/"))
     values = [d for d in dirs if tree.is_file(f"arch/{d}/Makefile")]
     for alias, srcarch in sorted(arch_aliases(top_makefile).items()):

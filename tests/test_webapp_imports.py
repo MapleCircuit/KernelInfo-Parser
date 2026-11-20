@@ -657,5 +657,121 @@ class TestContextWalk(unittest.TestCase):
         self.assertTrue(condition_filter("a.S")(["defined(CONFIG_SMP)"]))
 
 
+
+class TestPre26Layout(unittest.TestCase):
+    """Imports and include-line symbols of a 2.3.35-style revision: its layout comes from `-I$(HPATH)` with
+    `TOPDIR := $(shell ... pwd ...)` and the `symlinks:` rule, and it builds i386 only."""
+
+    BIND, NLM, TYPES = "include/linux/lockd/bind.h", "include/linux/lockd/nlm.h", "include/asm-i386/types.h"
+    MAKEFILE = (
+        "ARCH := $(shell uname -m | sed -e s/i.86/i386/)\n"
+        'TOPDIR := $(shell if [ "$$PWD" != "" ]; then echo $$PWD; else pwd; fi)\n'
+        "HPATH = $(TOPDIR)/include\nCPPFLAGS := -D__KERNEL__ -I$(HPATH)\ninclude arch/$(ARCH)/Makefile\n"
+        "symlinks:\n\trm -f include/asm\n\t( cd include ; ln -sf asm-$(ARCH) asm)\n"
+    )
+
+    def setUp(self) -> None:
+        from parser.arch_layout import compute_layouts
+        from webapp.backend.services.arch_layout_service import ArchLayoutService
+
+        files = {"Makefile": self.MAKEFILE, "arch/i386/Makefile": "", self.BIND: "", self.NLM: "", self.TYPES: ""}
+        self.layouts = compute_layouts(files, files.get)
+        self.shas = {p: f"{i + 1:040x}" for i, p in enumerate(files)}
+        directives = {self.BIND: [("linux/lockd/nlm.h", False, []), ("asm/types.h", False, [])]}
+        self.als = ArchLayoutService()
+        blobs = {self.BIND: 1, self.NLM: 2, self.TYPES: 3}
+        ids = {self.shas[p]: (b, 1) for p, b in blobs.items()}
+        names = ["NLM_PROGRAM", "__u32"]
+        self.db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+            "m_ast": [{"ast_id": i + 1, "name": n, "type_id": 0} for i, n in enumerate(names)]
+                     + [{"ast_id": 100, "name": "<linux/lockd/nlm.h>", "type_id": ASTT.CPPro_include.value}],
+            "m_ast_include": [{"ast_id": 100, "fnid": 50}],
+            "m_file_name": [{"fnid": 50, "fname": self.NLM}],
+            "m_blob_symbol_def": [
+                {"def_id": 1, "blob_id": 2, "tag_id": 1, "ast_id": 1, "name": "NLM_PROGRAM",
+                 "type_id": ASTT.CPPro_define_macro.value, "linkage": 5, "line_s": 20, "line_e": 20},
+                {"def_id": 2, "blob_id": 3, "tag_id": 1, "ast_id": 2, "name": "__u32",
+                 "type_id": ASTT.C_SCtypedef.value, "linkage": 0, "line_s": 9, "line_e": 9},
+            ],
+            "m_blob_symbol_ref": [
+                {"ref_id": 1, "blob_id": 1, "tag_id": 1, "ast_id": 1, "target_fnid": 0, "role": MACRO, "line": 14, "char_s": 1},
+                {"ref_id": 2, "blob_id": 1, "tag_id": 1, "ast_id": 2, "target_fnid": 0, "role": TYPE, "line": 14, "char_s": 1},
+            ],
+        })
+        self.blob_paths = {b: [p] for p, b in blobs.items()}
+        patches = [
+            patch_reader(self.db),
+            patch.object(isvc.git_tree_resolver, "list_tree", return_value=dict(self.shas)),
+            patch.object(isvc.git_tree_resolver, "resolve_commit_sha", return_value="f" * 40),
+            patch.object(isvc.GitTreeResolver, "map_blob_hashes", side_effect=lambda _r, s: {x: ids[x] for x in s if x in ids}),
+            patch.object(self.als, "_from_db", return_value=None),
+            patch.object(self.als, "_from_git", side_effect=lambda _sha, arch: self.layouts.get(arch)),
+            patch.object(self.als, "_file_directives", side_effect=lambda _sha, path, _f: directives.get(path, [])),
+            patch.object(self.als, "_prefetch_directives"),
+            patch.object(isvc, "arch_layout_service", self.als),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+
+    def test_layout_and_walk(self) -> None:
+        self.assertEqual(sorted(self.layouts), ["i386"])
+        self.assertIsNone(self.als.layout("2.3.35pre2", "x86_64"))
+        self.assertEqual(self.als.resolve_include("2.3.35pre2", "i386", "linux/lockd/nlm.h", self.BIND, False), self.NLM)
+        self.assertEqual(self.als.reachable("2.3.35pre2", "i386", self.BIND),
+                         {self.BIND: None, self.NLM: self.BIND, self.TYPES: self.BIND})
+
+    def test_imports_fall_back_to_i386(self) -> None:
+        out = ImportsService().get_imports("2.3.35pre2", self.BIND, "x86_64")
+        self.assertEqual((out["arch_used"], out["layout"], out["reachable"]), ("i386", True, 2))
+        self.assertEqual({it["name"]: (it["header_path"], it["chain"]) for it in out["items"]}, {
+            "NLM_PROGRAM": (self.NLM, [self.BIND, self.NLM]),
+            "__u32": (self.TYPES, [self.BIND, self.TYPES]),
+        })
+
+    def test_include_line_symbols(self) -> None:
+        from webapp.backend.services import symbol_service as ssvc
+        from webapp.backend.services.tree_resolver import ArchScope
+
+        with patch.object(ssvc.SymbolService, "_scope", return_value=(1, "2.3.35pre2", self.blob_paths)), \
+                patch.object(ssvc, "definition_arch", return_value=("i386", ArchScope.of("i386"), 32)), \
+                patch.object(ssvc.imports_service, "_cache", isvc.RepoScopedCache(maxsize=4)):
+            out = ssvc.SymbolService().get_include_symbols("2.3.35pre2", 100, file_path=self.BIND, line=12, arch="i386")
+        self.assertEqual(out["header_file"], self.NLM)
+        self.assertEqual([(s["name"], s["def_file"]) for s in out["symbols"]], [("NLM_PROGRAM", self.NLM)])
+
+
+class TestDefinitionArch(unittest.TestCase):
+    """tree_resolver.definition_arch(): a revision without x86_64 ranks definitions for i386."""
+
+    def test_falls_back_to_i386(self) -> None:
+        from fastapi import HTTPException as Missing
+        from webapp.backend.services import tree_resolver as tr
+        from webapp.backend.services.kconfig_service import KconfigService
+
+        def resolve_arch(_self, version, arch):
+            if arch != "i386":
+                raise Missing(status_code=404, detail="no such ARCH")
+            return {"rev": version, "arch": "i386", "srcarch": "i386", "kernelversion": "2.3.35"}
+
+        with patch.object(KconfigService, "resolve_arch", resolve_arch), \
+                patch.object(isvc.arch_layout_service, "layout", return_value=None):
+            arch, scope, bits = tr.definition_arch("2.3.35pre2", None)
+        self.assertEqual((arch, bits), ("i386", 32))
+
+    def test_tree_before_arch_resolves_i386(self) -> None:
+        from webapp.backend.services import kconfig_service as ksvc
+
+        svc = ksvc.KconfigService()
+        with patch.object(svc, "_rev", side_effect=lambda v: v), \
+                patch.object(ksvc.git_tree_resolver, "resolve_commit_sha", return_value=None), \
+                patch.object(svc, "_read", return_value="VERSION = 1\nPATCHLEVEL = 0\n"), \
+                patch.object(svc, "_tree_listing", return_value=[]):
+            self.assertEqual(svc.resolve_arch("1.0", "i386")["srcarch"], "i386")
+            with self.assertRaises(HTTPException):
+                svc.resolve_arch("1.0", "x86_64")
+
+
 if __name__ == "__main__":
     unittest.main()
