@@ -12,7 +12,7 @@ from webapp.backend.database.helpers import (
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import is_valid_identifier
 from webapp.backend.services.arch_layout_service import arch_layout_service
-from webapp.backend.services.imports_service import ImportsService, def_namespace, import_kind, imports_service
+from webapp.backend.services.imports_service import def_namespace, import_kind, imports_service
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
     best_path,
@@ -637,11 +637,12 @@ class SymbolService:
     ) -> dict[str, Any]:
         """Imported symbols and target header file path of a CPPro_include AST node.
 
-        The symbols are the include node's container (the parser's libclang attribution), less the names the
-        referring file's blob at this revision no longer references, plus the Imports panel's items whose
-        `#include` chain passes through this directive's header. Each definition location resolves through
-        the header's reachable `#include` closure for ARCH=<arch>, then the referring file's imports (its own
-        closure and context imports), then the revision's tree.
+        The node stores the directive text and its `m_ast_include` target only. The symbols are the Imports
+        panel's items of the referring file at this revision (`ImportsService.get_imports()`: the names its blob
+        references in `m_symbol_ref`, resolved through its `#include` closure for ARCH=<arch>) whose `#include`
+        chain passes through this directive's header. Each definition location resolves through the header's
+        reachable `#include` closure for ARCH=<arch>, then the referring file's imports (its own closure and
+        context imports), then the revision's tree.
         """
         from core.globalstuff import normalize_repo_path
 
@@ -732,46 +733,25 @@ class SymbolService:
             raw_header = safe_decode(inc_row["fname"]) if inc_row else ""
             header_file = normalize_repo_path(raw_header)
 
-            cont_rows = reader.select_rows(
-                ("m_ast_container", "c"),
-                {"priority": "c.priority", "type_id": "c.type_id", "type_name": "td.name",
-                 "sym_ast_id": "ra.ast_id", "sym_name": "ra.name"},
-                {"c.ast_id": target_ast_id},
-                joins=[
-                    Join(("m_type_descriptor", "td"), {"td.type_id": "c.type_id"}, "left"),
-                    Join(("m_ast", "ra"), {"ra.ast_id": "c.ref_ast_id"}, "left"),
-                ],
-                order_by=["c.priority"],
-            )
-            # Names the referring file references at this revision: the include tag outlives edits elsewhere in
-            # the file, so its container can list names a later revision of the file no longer uses
-            file_refs = ImportsService._references(reader, file_blob) if file_blob else {}
-
         header_file = self._include_header(version_name, arch, header_file, raw_include_text, clean_file, blob_paths)
 
         symbol_rows: list[dict[str, Any]] = []
-        for r in cont_rows:
-            sym_name = safe_decode(r["sym_name"])
-            if not sym_name or (file_refs and sym_name not in file_refs):
-                continue
-            symbol_rows.append({"priority": r["priority"], "ast_id": r["sym_ast_id"], "name": sym_name,
-                                "type_id": r["type_id"], "type_name": safe_decode(r["type_name"])})
-
         file_items: dict[str, dict[str, Any]] = {}
         if clean_file and file_blob:
             try:
                 imports = imports_service.get_imports(version_name, clean_file, arch)
             except HTTPException:
                 imports = {"items": []}
+            listed: set[str] = set()
             for it in imports.get("items") or ():
-                if it.get("kind") != "config":
-                    file_items.setdefault(it["name"], it)
-            # Names the file imports through this directive that the container does not list
-            listed = {row["name"] for row in symbol_rows}
-            for it in imports.get("items") or ():
+                if it.get("kind") == "config":
+                    continue
+                file_items.setdefault(it["name"], it)
+                # Names the file imports through this directive: the item's chain starts at the file itself
+                # and its first hop is the directive's header
                 chain = it.get("chain") or []
-                if (it.get("via") == "include" and len(chain) >= 2 and chain[1] == header_file
-                        and it["name"] not in listed and it.get("kind") != "config"):
+                if (it.get("via") == "include" and len(chain) >= 2 and chain[0] == clean_file
+                        and chain[1] == header_file and it["name"] not in listed):
                     listed.add(it["name"])
                     type_id = int(ASTT[it["type_name"]]) if it.get("type_name") in ASTT.__members__ else 0
                     symbol_rows.append({"priority": len(symbol_rows), "ast_id": None, "name": it["name"],

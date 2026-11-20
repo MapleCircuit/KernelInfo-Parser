@@ -129,6 +129,25 @@ class TestCompileEnv(unittest.TestCase):
         self.assertIn("smp_value", names)  # CONFIG_SMP from the defconfig
         self.assertEqual(compile_env.decode_fact(compile_env.encode_fact(fact)), fact)
 
+    def test_resolve_include_searches_like_the_build(self) -> None:
+        x86 = self.env.env("x86_64")
+        i386 = self.env.env("i386")
+        # The layout's include/asm link, per ARCH
+        self.assertEqual(self.env.resolve_include("asm/atomic.h", "fs/x.c", arch_env=x86), "include/asm-x86_64/atomic.h")
+        self.assertEqual(self.env.resolve_include("asm/atomic.h", "arch/i386/kernel/entry.S", arch_env=i386),
+                         "include/asm-i386/atomic.h")
+        self.assertEqual(self.env.resolve_include("linux/types.h", "fs/x.c", arch_env=x86), "include/linux/types.h")
+        # The quoted form searches the including file's directory first
+        self.assertEqual(self.env.resolve_include("x.c", "fs/other.c", quoted=True, arch_env=x86), "fs/x.c")
+        self.assertIsNone(self.env.resolve_include("x.c", "fs/other.c", arch_env=x86))
+        # Build products and host headers are not tree files
+        self.assertIsNone(self.env.resolve_include("linux/autoconf.h", "fs/x.c", arch_env=x86))
+        self.assertIsNone(self.env.resolve_include("stdio.h", "fs/x.c", arch_env=x86))
+        self.assertIsNone(self.env.resolve_include("/abs.h", "fs/x.c", arch_env=x86))
+        # Without a layout: the file's directory and include/
+        self.assertEqual(self.env.resolve_include("linux/types.h", "fs/x.c"), "include/linux/types.h")
+        self.env.cleanup()
+
     def test_tree_without_makefile(self) -> None:
         bare = tempfile.mkdtemp(prefix="kip-bare-")
         self.addCleanup(shutil.rmtree, bare, True)

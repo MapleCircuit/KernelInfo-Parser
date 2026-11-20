@@ -73,7 +73,7 @@ agents.
   - `G.STAGE_PROFILER`: System-level `PipelineStageProfiler` instance tracking end-to-end stage wall-clock
     timings, items/throughput, parallel worker CPU breakdowns, and top identified bottlenecks. Worker profiles
     with no measured time (e.g. directory ChangeSets) are not counted as parsed files; the CPU breakdown lists
-    only measured components, with `include_symbols_s` (`extract_include_symbols()`) separate from the
+    only measured components, with `include_map_s` (`map_direct_includes()`) separate from the
     libclang parse; percent cells are padded before they are coloured, so columns stay aligned.
   - `G.EXECUTION_DEADLINE`: Optional UNIX timestamp epoch after which pipeline stages halt early and print
     diagnostic profiling summaries.

@@ -1498,6 +1498,7 @@ _PARSE_ONLY_PRIOR_ATTRS = (
     "_prior_tags_by_pos_sorted",
     "_batch_prior_tags",
     "_batch_prior_items",
+    "prior_include_fnids",
     "compile_env",
     "compile_arch",
     "parse_diagnostics",

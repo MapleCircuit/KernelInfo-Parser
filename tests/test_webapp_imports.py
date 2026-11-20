@@ -523,16 +523,12 @@ class TestIncludeSymbols(unittest.TestCase):
             ("nfs_fh", "include/linux/nfs.h", "C_structdecl", 137, 0),
             ("__be32", "include/linux/types.h", "C_SCtypedef", 184, 0),
         ]
-        container = [("u32", "C_SCtypedef"), ("file", "C_struct"), ("inode", "C_struct"), ("svc_rqst", "C_struct"),
-                     ("gone_sym", "C_SCtypedef"), ("nfs_fh", "C_struct")]
         db = make_db("mock", rows={
             "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
             "m_ast": [{"ast_id": i, "name": n, "type_id": 0} for n, i in ast.items()]
                      + [{"ast_id": 100, "name": "<linux/lockd/xdr.h>", "type_id": ASTT.CPPro_include.value}],
             "m_ast_include": [{"ast_id": 100, "fnid": 50}],
             "m_file_name": [{"fnid": 50, "fname": self.XDR}],
-            "m_ast_container": [{"ast_id": 100, "priority": i, "type_id": ASTT[t].value, "ref_ast_id": ast[n]}
-                                for i, (n, t) in enumerate(container)],
             "m_blob_symbol_def": [
                 {"def_id": i + 1, "blob_id": blobs[p], "tag_id": 1, "ast_id": ast[n], "name": n,
                  "type_id": ASTT[t].value, "linkage": lk, "line_s": line, "line_e": line}
@@ -548,13 +544,30 @@ class TestIncludeSymbols(unittest.TestCase):
         closure = {self.XDR: None, "include/linux/fs.h": self.XDR, "include/linux/types.h": "include/linux/fs.h",
                    "include/asm-x86_64/types.h": "include/linux/types.h"}
         reach = {self.XDR: closure, self.BIND: {self.BIND: None, **{k: (v or self.BIND) for k, v in closure.items()}}}
-        imports = {"items": [
+        via_xdr = [self.BIND, self.XDR]
+        all_items = [
+            # Context import (another file's #include): never a symbol of this directive
             {"name": "svc_rqst", "kind": "struct", "type_name": "C_structdecl", "header_path": "include/linux/sunrpc/svc.h",
              "line": 204, "via": "context", "chain": ["fs/nfsd/lockd.c", "include/linux/sunrpc/svc.h"]},
+            {"name": "u32", "kind": "type", "type_name": "C_SCtypedef", "header_path": "include/asm-x86_64/types.h",
+             "line": 43, "via": "include",
+             "chain": [*via_xdr, "include/linux/fs.h", "include/linux/types.h", "include/asm-x86_64/types.h"]},
+            {"name": "file", "kind": "struct", "type_name": "C_structdecl", "header_path": "include/linux/fs.h",
+             "line": 721, "via": "include", "chain": [*via_xdr, "include/linux/fs.h"]},
+            {"name": "inode", "kind": "struct", "type_name": "C_structdecl", "header_path": "include/linux/fs.h",
+             "line": 533, "via": "include", "chain": [*via_xdr, "include/linux/fs.h"]},
+            # Reached through another directive of bind.h
+            {"name": "nfs_fh", "kind": "struct", "type_name": "C_structdecl", "header_path": "include/linux/nfs.h",
+             "line": 137, "via": "include", "chain": [self.BIND, "include/linux/nfs.h"]},
+            # Through a forced header (-include): not this directive
+            {"name": "gone_sym", "kind": "type", "type_name": "C_SCtypedef", "header_path": self.XDR,
+             "line": 3, "via": "include", "forced": True, "chain": ["include/linux/autoconf.h", self.XDR]},
             {"name": "__be32", "kind": "type", "type_name": "C_SCtypedef", "header_path": "include/linux/types.h",
              "line": 184, "via": "include",
-             "chain": [self.BIND, self.XDR, "include/linux/fs.h", "include/linux/types.h"]},
-        ]}
+             "chain": [*via_xdr, "include/linux/fs.h", "include/linux/types.h"]},
+        ]
+        # The Imports panel lists the names bind.h references (m_symbol_ref) at this revision
+        imports = {"items": [it for it in all_items if it["name"] in refs]}
         blob_paths = {b: [p] for p, b in blobs.items()}
         with patch_reader(db), \
                 patch.object(isvc.git_tree_resolver, "list_tree", return_value=dict(shas)), \
@@ -570,7 +583,7 @@ class TestIncludeSymbols(unittest.TestCase):
         return out
 
     def test_definitions_follow_the_include_chain(self) -> None:
-        out = self._run(["u32", "file", "inode", "svc_rqst", "nfs_fh"])
+        out = self._run(["u32", "file", "inode", "svc_rqst", "nfs_fh", "gone_sym", "__be32"])
         self.assertEqual((out["header_file"], out["arch"]), (self.XDR, "x86_64"))
         got = {s["name"]: (s["def_file"], s["def_line_s"]) for s in out["symbols"]}
         self.assertEqual(got, {
@@ -579,22 +592,34 @@ class TestIncludeSymbols(unittest.TestCase):
             # struct file / inode: tag name space, not the macro `file` or a .c file's struct
             "file": ("include/linux/fs.h", 721),
             "inode": ("include/linux/fs.h", 533),
-            # Not in the header's closure: the referring file's (context) import
-            "svc_rqst": ("include/linux/sunrpc/svc.h", 204),
-            # In no closure: the revision's tree, a generic header before .c files and other arches
-            "nfs_fh": ("include/linux/nfs.h", 137),
-            # Imported through this directive though the container does not list it
             "__be32": ("include/linux/types.h", 184),
         })
-        # gone_sym: listed by the include tag's container, no longer referenced by the file
-        self.assertNotIn("gone_sym", got)
+        # svc_rqst (context import), nfs_fh (another directive) and gone_sym (forced header) are not imported
+        # through this directive
         self.assertEqual({s["name"]: s["category"] for s in out["symbols"]}["u32"], "Typedef")
+        self.assertTrue(all(s["ast_id"] is None for s in out["symbols"]))
 
     def test_symbols_of_the_revision(self) -> None:
-        # bind.h no longer uses u32 (v2.6.20+ uses __be32): the stale container entry is dropped
+        # bind.h no longer uses u32 (v2.6.20+ uses __be32): only the names its blob references are listed
         out = self._run(["file", "svc_rqst", "__be32"], arch=None)
-        self.assertEqual([s["name"] for s in out["symbols"]], ["file", "svc_rqst", "__be32"])
+        self.assertEqual([s["name"] for s in out["symbols"]], ["file", "__be32"])
         self.assertEqual(out["arch"], "x86_64")
+
+    def test_unindexed_include_node_with_fallback_params(self) -> None:
+        from webapp.backend.services import symbol_service as ssvc
+        from webapp.backend.services.filesystem_service import filesystem_service
+
+        db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+        })
+        with patch_reader(db), \
+                patch.object(ssvc.git_tree_resolver, "list_tree", return_value={}), \
+                patch.object(ssvc.SymbolService, "_scope", return_value=(1, "v2.6.23", {})), \
+                patch.object(filesystem_service, "resolve_include", return_value={"path": self.XDR}):
+            out = ssvc.SymbolService().get_include_symbols("v2.6.23", 0, file_path=self.BIND, line=14,
+                                                           header="<linux/lockd/xdr.h>")
+        self.assertEqual(out, {"ast_id": 0, "include_text": "<linux/lockd/xdr.h>", "header_file": self.XDR,
+                               "symbols": []})
 
     def test_invalid_arch(self) -> None:
         from webapp.backend.services import symbol_service as ssvc

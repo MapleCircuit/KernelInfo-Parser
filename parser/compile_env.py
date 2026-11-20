@@ -52,6 +52,7 @@ from core.globalstuff import G
 from parser.arch_layout import ArchLayout, arch_values, layout_for, path_arch
 from parser.make_eval import SRC_ROOT, UNKNOWN, MakeEvaluator, Tree, tree_path
 from parser.generated_headers import config_digest, defconfig_values, generated_headers
+from parser.include_graph import IncludeResolver
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ class CompileEnv:
         self._parsed: dict = {}
         self._dir_own_includes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
         self._dir_includes_cache: dict[str, tuple[str, ...]] = {}
+        self._resolvers: dict[str, IncludeResolver] = {}
         if layouts is not None:
             self.arch_values = sorted(layouts)
             self._layouts: dict[str, ArchLayout | None] = dict(layouts)
@@ -405,6 +407,7 @@ class CompileEnv:
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
         state.pop("_lock", None)
+        state["_resolvers"] = {}
         if not isinstance(state.get("read"), TreeFileReader):
             state["read"] = TreeFileReader(self.root)
         return state
@@ -412,6 +415,7 @@ class CompileEnv:
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._lock = threading.Lock()
+        self.__dict__.setdefault("_resolvers", {})
 
     def _pick_default(self, preferred: str) -> str | None:
         for name in (preferred, "x86_64", "i386", "x86", *self.arch_values):
@@ -591,6 +595,43 @@ class CompileEnv:
         return args, KEEP_GOING, env
 
     # ------------------------------------------------------------------ paths
+    def resolve_include(self, name: str, including_file: str, quoted: bool = False,
+                        arch_env: ArchEnv | None = None) -> str | None:
+        """Tree file an `#include` of `name` in `including_file` reads, None when the tree has none.
+
+        Searches what `args_for()` gives libclang: the including file's directory (quoted form), the layout's
+        include directories (through its links and `asm-generic` wrappers, `parser/include_graph.py`
+        `IncludeResolver`), then the directory's own `-I` directories. Without a layout: the including file's
+        directory, `include/` and the directory's `-I` directories.
+        """
+        name = (name or "").strip()
+        if not name or name.startswith("/"):
+            return None
+        inc_dir = (including_file or "").rpartition("/")[0]
+        if arch_env is not None:
+            resolver = self._resolvers.get(arch_env.arch)
+            if resolver is None:
+                resolver = IncludeResolver(arch_env.layout, self.files.__contains__)
+                self._resolvers[arch_env.arch] = resolver
+            hit = resolver.resolve(name, including_file, quoted=quoted)
+            if hit:
+                return hit
+            check = resolver.materialize
+            dirs: tuple[str, ...] = self._dir_includes(inc_dir)
+        else:
+            def check(path: str) -> str | None:
+                return path if path in self.files else None
+            dirs = (inc_dir, "include", *self._dir_includes(inc_dir))
+        for d in dirs:
+            d = d.rstrip("/")
+            candidate = posixpath.normpath(posixpath.join(d, name)) if d else posixpath.normpath(name)
+            if candidate == ".." or candidate.startswith("../"):
+                continue
+            hit = check(candidate)
+            if hit:
+                return hit
+        return None
+
     def repo_path(self, file_path: str) -> str | None:
         """Repository path of a file libclang opened, None for a file outside the tree and the builds."""
         if not file_path:

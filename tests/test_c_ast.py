@@ -4226,6 +4226,168 @@ def parse_snippet(code: str, path: str = "include/linux/snip.h") -> tuple[list[t
             G.TE.close()
 
 
+class TestIncludeTargets(unittest.TestCase):
+    """CPPro_include: canonical m_ast_include targets, no m_ast_container, target-aware Tier 1 recycling."""
+
+    def setUp(self) -> None:
+        MockDB.store.clear()
+        G.DEBUG_TYPECHECK = True
+        G.DB = MockDB
+        G.TE = get_table_engine("cached")()
+        self.gp = GreatProcessor()
+        init_db_layout(self.gp)
+        G.TE.start(self.gp.Table_Array, G.DB)
+        self.mf = MasterFile()
+        G.MF = self.mf
+        self.dirs: list[str] = []
+
+    def tearDown(self) -> None:
+        if G.TE:
+            try:
+                G.TE.close()
+            except Exception:
+                pass
+        MockDB.store.clear()
+        clear_tu_caches()
+        G.CURRENT_PARSING_FILE = None
+        G.CURRENT_PARSING_DIR = None
+        for d in self.dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _parse(self, vid: int, files: dict[str, str], path: str) -> int:
+        """Parse `path` of a tree holding `files` as version `vid` (modified from `vid - 1` when > 1); its fid."""
+        temp_dir = self.mf.create_temp_dir()
+        self.dirs.append(temp_dir)
+        name = f"v3.{vid - 1}"
+        self.mf.version_dict[name] = temp_dir
+        for rel, text in files.items():
+            full = os.path.join(temp_dir, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="latin-1") as f:
+                f.write(text)
+        gp = self.gp
+        gp.Version_Name = name
+        gp.VID = vid
+        gp.Old_VID = vid - 1
+        cs = ChangeSet(f"{'A' if vid == 1 else 'M'}\t{path}")
+        cs.current_vid = vid
+        cs.gp = gp
+        cs.mf = self.mf
+        cs.blob_hash = bytes([vid]) * 20
+        G.CURRENT_PARSING_FILE = path
+        if vid > 1:
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            with cs(REF_OLD):
+                cs.store(m_bridge_file.view(((m_bridge_file.fnid, m_file_name.fnid, 1),), vid - 1,
+                                            cs.ref(m_file_name.fnid, REF_ROOT), None, None, cs.current_path))
+        default_processing(cs, gp)
+        cs.parse()
+        self.assertTrue(cs.execute())
+        G.TE.commit_all()
+        fids = [row[0] for row in MockDB.store.get(m_file.table_name, {}).values() if bytes(row[1]) == cs.blob_hash]
+        self.assertEqual(len(fids), 1)
+        return fids[0]
+
+    def _includes(self, fid: int) -> dict[str, tuple[int, str]]:
+        """{directive text: (tag_id, m_ast_include target)} of the include tags bridged to blob `fid`."""
+        tags = {row[0]: row for row in MockDB.store.get("m_tag", {}).values()}
+        asts = {row[0]: row for row in MockDB.store.get("m_ast", {}).values()}
+        inc = {row[0]: row[1] for row in MockDB.store.get("m_ast_include", {}).values()}
+        names = {row[0]: row[1] for row in MockDB.store.get("m_file_name", {}).values()}
+        out = {}
+        for row in MockDB.store.get("m_bridge_tag", {}).values():
+            if row[0] != fid:
+                continue
+            ast = asts.get(tags[row[1]][2])
+            if ast and ast[2] == int(ASTT.CPPro_include):
+                out[ast[1]] = (row[1], names[inc[ast[0]]])
+        return out
+
+    def test_inactive_branch_include_resolves_canonical_path(self) -> None:
+        files = {
+            "include/linux/foo.h": "#define FOO 1\n",
+            "include/linux/bar.h": "#define BAR 1\n",
+            "drivers/x/local.h": "#define LOCAL 1\n",
+            "drivers/x/a.c": (
+                "#include <linux/foo.h>\n"
+                "#ifdef CONFIG_NEVER_SET\n"
+                "#include <linux/bar.h>\n"
+                "#include \"local.h\"\n"
+                "#endif\n"
+                "#include <linux/autoconf_not_in_tree.h>\n"
+                "int x = FOO;\n"
+            ),
+        }
+        fid = self._parse(1, files, "drivers/x/a.c")
+        got = {text: target for text, (_tag, target) in self._includes(fid).items()}
+        self.assertEqual(got, {
+            "<linux/foo.h>": "include/linux/foo.h",
+            # Inactive branch: libclang opens nothing, the build's search path finds the tree file
+            "<linux/bar.h>": "include/linux/bar.h",
+            '"local.h"': "drivers/x/local.h",
+            # Not in the tree: the written spelling
+            "<linux/autoconf_not_in_tree.h>": "linux/autoconf_not_in_tree.h",
+        })
+        # Directive text and target only: no m_ast_container row on any include node
+        include_ids = {row[0] for row in MockDB.store.get("m_ast", {}).values() if row[2] == int(ASTT.CPPro_include)}
+        self.assertEqual(len(include_ids), 4)
+        containers = [row for row in MockDB.store.get(m_ast_container.table_name, {}).values() if row[0] in include_ids]
+        self.assertEqual(containers, [])
+
+    def test_libclang_miss_falls_back_to_the_build_search_path(self) -> None:
+        """A directive libclang opened nothing for resolves through CompileEnv / IncludeResolver."""
+        import tempfile
+        from types import SimpleNamespace
+        from parser.arch_layout import ArchLayout
+        from parser.c_ast.ast_nodes import CPPro_include
+        from parser.c_ast.tokenizer import Line
+        from parser.compile_env import ArchEnv, CompileEnv
+
+        files = {"include/linux/foo.h", "include/asm-x86_64/atomic.h", "drivers/x/local.h", "drivers/x/a.c"}
+        layout = ArchLayout("x86_64", "x86", includes=["include/"], links={"include/asm/": "include/asm-x86_64/"})
+        root = tempfile.mkdtemp(prefix="kip-inc-")
+        self.dirs.append(root)
+        env = CompileEnv(root, files, lambda _p: None, {"x86_64": layout}, key="inc-test", build_base=root)
+        cs = SimpleNamespace(resolved_includes_by_line={}, compile_env=env, compile_arch=ArchEnv("x86_64", layout),
+                             current_path="drivers/x/a.c", mfdir=root)
+
+        def target(written: str) -> str:
+            node = CPPro_include(Line(3, 3, 1, 20), written)
+            return node.resolve_target(cs)
+
+        # Never the raw spelling when the tree holds the header
+        self.assertEqual(target("<linux/foo.h>"), "include/linux/foo.h")
+        self.assertEqual(target("<asm/atomic.h>"), "include/asm-x86_64/atomic.h")  # through the layout's link
+        self.assertEqual(target('"local.h"'), "drivers/x/local.h")
+        self.assertEqual(target("<local.h>"), "local.h")  # the angle form does not search the file's directory
+        # Build-generated or absent: the written spelling
+        self.assertEqual(target("<linux/autoconf.h>"), "linux/autoconf.h")
+        self.assertEqual(target("<generated/asm-offsets.h>"), "generated/asm-offsets.h")
+        self.assertEqual(target("CONFIG_HEADER"), "CONFIG_HEADER")  # macro include
+        # libclang's line map wins
+        cs.resolved_includes_by_line = {3: "include/linux/other.h"}
+        self.assertEqual(target("<linux/foo.h>"), "include/linux/other.h")
+
+    def test_tier1_recycling_checks_the_include_target(self) -> None:
+        src = '#include "local.h"\n#include <linux/same.h>\nint x;\n'
+        v1 = {"drivers/x/a.c": src, "drivers/x/local.h": "#define L 1\n", "include/local.h": "#define G 1\n",
+              "include/linux/same.h": "#define S 1\n"}
+        fid1 = self._parse(1, v1, "drivers/x/a.c")
+        inc1 = self._includes(fid1)
+        self.assertEqual(inc1['"local.h"'][1], "drivers/x/local.h")
+
+        # v2: identical text, but drivers/x/local.h is gone: "local.h" now reads include/local.h
+        v2 = {k: v for k, v in v1.items() if k != "drivers/x/local.h"}
+        fid2 = self._parse(2, v2, "drivers/x/a.c")
+        inc2 = self._includes(fid2)
+        self.assertEqual(inc2['"local.h"'][1], "include/local.h")
+        # Same code hash, different target: a new tag (moved from the prior one), never the stale one
+        self.assertNotEqual(inc2['"local.h"'][0], inc1['"local.h"'][0])
+        self.assertIn((inc1['"local.h"'][0], inc2['"local.h"'][0]), set(MockDB.store.get("m_moved_tag", {})))
+        # Same text and same target: the prior tag is recycled
+        self.assertEqual(inc2["<linux/same.h>"], inc1["<linux/same.h>"])
+
+
 class TestHeaderReferenceCompleteness(unittest.TestCase):
     """Definitions and references of header constructs: macro-prefixed prototypes, #define bodies, #if tests and
     names libclang leaves unresolved (parser/c_ast/lexical_refs.py)."""

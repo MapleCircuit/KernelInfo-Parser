@@ -40,7 +40,8 @@ def _stage_file(cs: ChangeSet, gp: GreatProcessor) -> None:
 class TestAsmAst(unittest.TestCase):
     """Tests for assembly symbol assignments, multiline #define containment, labels, and outlines."""
 
-    def _parse_asm(self, rel_path: str, source: str) -> tuple[dict[str, Any], list[tuple], list[tuple], list[tuple]]:
+    def _parse_asm(self, rel_path: str, source: str, extra_files: dict[str, str] | None = None
+                   ) -> tuple[dict[str, Any], list[tuple], list[tuple], list[tuple]]:
         mf = None
         try:
             MockDB.store.clear()
@@ -57,10 +58,11 @@ class TestAsmAst(unittest.TestCase):
             G.TE = get_table_engine("cached")()
             G.TE.start(gp.Table_Array, MockDB)
 
-            full_path = os.path.join(temp_dir, rel_path)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w", encoding="latin-1") as f:
-                f.write(source)
+            for path, text in {**(extra_files or {}), rel_path: source}.items():
+                full_path = os.path.join(temp_dir, path)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, "w", encoding="latin-1") as f:
+                    f.write(text)
 
             cs = ChangeSet(f"A\t{rel_path}")
             cs.current_vid = 1
@@ -218,6 +220,32 @@ SYM_FUNC_END(real_fn)
         self.assertEqual(by_name["real_fn"]["kind"], "function")
         self.assertEqual(by_name["real_fn"]["line_s"], 12)
         self.assertEqual(by_name["real_fn"]["line_e"], 14)
+
+    def test_include_targets_are_canonical_repo_paths(self) -> None:
+        source = (
+            "#include <linux/linkage.h>\n"
+            "#ifdef CONFIG_NEVER_SET\n"
+            "#include <asm/never.h>\n"
+            "#endif\n"
+            "#include \"local.h\"\n"
+            "#include <generated/asm-offsets.h>\n"
+            "ENTRY(f)\n\tret\n"
+        )
+        extra = {"include/linux/linkage.h": "#define ENTRY(x) x:\n", "include/asm/never.h": "\n",
+                 "arch/x86/kernel/local.h": "\n"}
+        self._parse_asm("arch/x86/kernel/entry.S", source, extra)
+        names = {row[0]: row[1] for row in MockDB.store.get("m_file_name", {}).values()}
+        inc = {row[0]: names[row[1]] for row in MockDB.store.get("m_ast_include", {}).values()}
+        asts = {row[0]: row for row in MockDB.store.get("m_ast", {}).values()}
+        got = {asts[a][1]: target for a, target in inc.items() if asts[a][2] == int(ASTT.CPPro_include)}
+        self.assertEqual(got, {
+            "<linux/linkage.h>": "include/linux/linkage.h",
+            "<asm/never.h>": "include/asm/never.h",  # inactive branch
+            '"local.h"': "arch/x86/kernel/local.h",
+            "<generated/asm-offsets.h>": "generated/asm-offsets.h",  # build-generated, not in the tree
+        })
+        # Directive text and target only: no m_ast_container row on include nodes
+        self.assertFalse([r for r in MockDB.store.get("m_ast_container", {}).values() if r[0] in inc])
 
 
 if __name__ == "__main__":

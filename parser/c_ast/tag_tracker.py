@@ -14,11 +14,14 @@ Prior tags are immutable content records under the Git DAG: nothing closes them.
 """
 from __future__ import annotations
 import bisect
+from collections.abc import Callable
 from typing import Any
 import logging
 from core.globalstuff import ASTT, OP_REF, REF_POS, REF_ROOT, compute_code_hash
 from db_engine.spec import Join
-from core.DBLayout import m_file_name, m_file_blob, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_map_ast, m_moved_tag
+from core.DBLayout import (
+    m_file_name, m_file_blob, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_ast_include, m_map_ast, m_moved_tag,
+)
 from core.SymbolRows import load_prior_items as load_prior_symbol_items
 
 logger = logging.getLogger(__name__)
@@ -116,6 +119,7 @@ def get_prior_tags(CS: Any, with_indexes: bool = True, with_symbols: bool = True
     CS.prior_tags_by_name = {}
     CS.prior_tags_by_pos = []
     CS.prior_unmatched_symbols = []  # list of (idx, tag_id, name, type_val, line_s, line_e)
+    CS.prior_include_fnids = None  # {ast_id: fnid} of prior include tags, read on first Tier 1 include hit
 
     old_vid = getattr(CS.gp, "Old_VID", 0)
     if old_vid <= 0:
@@ -205,20 +209,74 @@ def get_prior_tags(CS: Any, with_indexes: bool = True, with_symbols: bool = True
         CS.prior_tags_max_span = max((t[1] - t[0] for t in CS.prior_tags_by_pos), default=0)
 
 
-def check_exact_match(CS: Any, code_hash: bytes) -> int | None:
-    """Tier 1: a prior tag with the same code hash not placed yet in this version (marked placed), else None."""
+def check_exact_match(
+    CS: Any, code_hash: bytes, accept: Callable[[Any, tuple[Any, ...]], bool] | None = None
+) -> int | None:
+    """Tier 1: a prior tag with the same code hash not placed yet in this version (marked placed), else None.
+
+    `accept(CS, prior_tag_row)`, when given, must also approve the candidate (`CPPro_include`: same target).
+    """
     lookup = getattr(CS, "prior_tags_map", None) if getattr(CS, "prior_tags", None) else None
     if not lookup or not code_hash:
         return None
     active = CS.active_tag_list
     for x, tag_id in lookup.get(code_hash, ()):
         if x not in active:
+            if accept is not None and not accept(CS, CS.prior_tags[x]):
+                continue
             if isinstance(active, set):
                 active.add(x)
             else:
                 active.append(x)
             return tag_id
     return None
+
+
+def _prior_tag_ast(tag: tuple[Any, ...]) -> tuple[Any, Any]:
+    """(ast_id, ast_type) of a prior tag row (`PRIOR_TAG_COLUMNS` join, or the shorter test shapes)."""
+    if len(tag) >= 14:
+        return tag[8], tag[13]
+    return (tag[10] if len(tag) > 10 else None), (tag[15] if len(tag) >= 16 else None)
+
+
+INCLUDE_TYPES = frozenset({int(ASTT.CPPro_include), int(ASTT.CPPro_include_next)})
+
+
+def prior_include_targets(CS: Any) -> dict[int, int]:
+    """`{ast_id: fnid}` of the prior tags' include directives (`m_ast_include`), read once per file."""
+    targets = getattr(CS, "prior_include_fnids", None)
+    if targets is not None:
+        return targets
+    ast_ids = sorted({
+        int(ast_id) for ast_id, ast_type in map(_prior_tag_ast, CS.prior_tags or ())
+        if ast_id and ast_type is not None and int(ast_type) in INCLUDE_TYPES
+    })
+    targets = {}
+    if ast_ids:
+        from core.globalstuff import G
+
+        try:
+            for row in G.TE.get_in(m_ast_include.table_id, 0, ast_ids) or ():
+                targets[int(row[0])] = row[1]
+        except Exception as e:  # noqa: BLE001 - a failed read falls back to single-row lookups
+            logger.debug(f"Prior include target read failed: {e}")
+        for ast_id in ast_ids:
+            if ast_id not in targets:
+                row = m_ast_include.get(ast_id, None)
+                if row and len(row) >= 3 and row[2]:
+                    targets[ast_id] = row[2][1]
+    CS.prior_include_fnids = targets
+    return targets
+
+
+def prior_include_target_matches(CS: Any, prior_tag: tuple[Any, ...], fnid: int | None) -> bool:
+    """Whether a prior include tag's `m_ast_include` target is `fnid` (False for an unknown target)."""
+    if fnid is None:
+        return False
+    ast_id, _ast_type = _prior_tag_ast(prior_tag)
+    if not ast_id:
+        return False
+    return prior_include_targets(CS).get(int(ast_id)) == fnid
 
 
 def _detect_bulk_rename_candidate(

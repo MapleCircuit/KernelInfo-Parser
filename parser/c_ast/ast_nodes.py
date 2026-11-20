@@ -29,6 +29,7 @@ from parser.c_ast.tokenizer import AST_KIND, Line
 from parser.c_ast.tag_tracker import (
     check_exact_match,
     match_prior_tag_transition,
+    prior_include_target_matches,
     stage_bridge_tag,
     stage_new_tag,
     stage_tag_map,
@@ -228,7 +229,7 @@ class Ast:
 
         # 1. Tier 1: Check exact code hash match against prior version tags
         if ext.code:
-            tag_id = check_exact_match(CS, code_hash)
+            tag_id = check_exact_match(CS, code_hash, getattr(self, "accept_prior_tag", None))
             if tag_id is not None:
                 stage_bridge_tag(CS, tag_id, ext.line_pos, ext.char_pos)
                 self.tag_ref = tag_id
@@ -1162,11 +1163,13 @@ class CPPro_include(CPPro):
         super().__init__(extent)
         self.w_include = written_include
         self.a_include = resolved_path
+        self.inc_file_name = ""
         self.type_id = ASTT.CPPro_include
 
     def init_subclass(self) -> None:
         self.w_include = ""
         self.a_include = ""
+        self.inc_file_name = ""
         self.type_id = ASTT.CPPro_include
 
     def _check_inc_cursor(self, cursor: Any) -> None:
@@ -1174,6 +1177,7 @@ class CPPro_include(CPPro):
             try:
                 inc_file = cursor.get_included_file()
                 if inc_file is not None and inc_file.name:
+                    self.inc_file_name = inc_file.name
                     self.a_include = normalize_repo_path(inc_file.name, getattr(G, "CURRENT_PARSING_DIR", None))
             except Exception:
                 pass
@@ -1194,66 +1198,68 @@ class CPPro_include(CPPro):
         self.w_include += token.spelling_str
         self._check_inc_cursor(cursor)
 
-    def extract(self, CS: Any, create_tag: bool = True) -> None:
+    def resolve_target(self, CS: Any) -> str:
+        """Repository path the directive includes (`m_ast_include` target).
+
+        1. The file libclang opened for the line (C: `CS.resolved_includes_by_line`; assembly: the inclusion
+           cursor's file), as its repository path (`CompileEnv.repo_path()`).
+        2. Not opened (inactive `#if` branch, skipped block, missing header): the written name searched like the
+           build does (`CompileEnv.resolve_include()`, layout of `CS.compile_arch`).
+        3. Not in the tree (build-generated `linux/autoconf.h`, `generated/asm-offsets.h`, macro includes): the
+           written spelling without its delimiters.
+        """
+        resolved = getattr(CS, "resolved_includes_by_line", {}).get(self.extent.line_pos[0])
+        if resolved:
+            return resolved
+        env = getattr(CS, "compile_env", None)
+        if env is not None:
+            if self.inc_file_name:
+                rel = env.repo_path(self.inc_file_name)
+                if rel and not rel.startswith(".."):
+                    return rel
+            written = self.w_include.strip()
+            if len(written) >= 2 and written[0] in "<\"" and written[-1] == (">" if written[0] == "<" else '"'):
+                hit = env.resolve_include(written[1:-1], getattr(CS, "current_path", "") or "",
+                                          quoted=written[0] == '"', arch_env=getattr(CS, "compile_arch", None))
+                if hit:
+                    return hit
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-        resolved_inc = getattr(CS, "resolved_includes_by_line", {}).get(self.extent.line_pos[0])
-        if resolved_inc:
-            clean_target = resolved_inc
-        else:
-            raw_target = self.a_include if self.a_include else self.w_include
-            include_target = normalize_repo_path(raw_target, base_dir)
-            clean_target = str(include_target).strip().strip("<>\"'").strip()
-        safe_target = clean_target[:255]
+        raw_target = self.a_include if (self.a_include and env is None) else self.w_include
+        return str(normalize_repo_path(raw_target, base_dir)).strip().strip("<>\"'").strip()
+
+    def accept_prior_tag(self, CS: Any, prior_tag: tuple[Any, ...]) -> bool:
+        """Tier 1 recycles a prior tag only when its `m_ast_include` target is this directive's target."""
+        return prior_include_target_matches(CS, prior_tag, self.target_fnid(CS))
+
+    def target_fnid(self, CS: Any) -> int | None:
+        row = m_file_name.get(None, self.safe_target)
+        return row[2][0] if row and len(row) >= 3 and row[2] else None
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.safe_target = self.resolve_target(CS)[:255]
 
         with CS(REF_POS):
-            CS.store(m_file_name.get_set(None, safe_target))
+            CS.store(m_file_name.get_set(None, self.safe_target))
             fnid_route = CS.get_route_parse()
 
-        symbols = getattr(CS, "include_symbols", {}).get(self.extent.line_pos[0], [])
-        if symbols:
-            if not hasattr(CS, "include_symbol_refs"):
-                CS.include_symbol_refs = {}
-            flat_container_args = []
-            for priority, (sym_name, sym_type) in enumerate(symbols):
-                sym_key = (sym_name, sym_type)
-                if sym_key not in CS.include_symbol_refs:
-                    with CS(REF_POS):
-                        CS.store(m_ast.view(((m_ast.ast_id,),), None, sym_name[:255], sym_type))
-                        sym_route = CS.get_route_parse()
-                    CS.include_symbol_refs[sym_key] = CS.ref(m_ast.ast_id, *sym_route)
-                flat_container_args.extend([None, priority, int(sym_type), CS.include_symbol_refs[sym_key]])
-
-            joins = ((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, len(symbols)))
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    joins,
-                    None,
-                    self.w_include[:255],
-                    ASTT.CPPro_include,
-                    None,
-                    CS.ref(m_file_name.fnid, *fnid_route),
-                    *flat_container_args
-                ))
-                ast_id_route = CS.get_route_parse()
-            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-        else:
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id, m_ast_include.ast_id, 1),),
-                    None,
-                    self.w_include[:255],
-                    ASTT.CPPro_include,
-                    None,
-                    CS.ref(m_file_name.fnid, *fnid_route),
-                ))
-                ast_id_route = CS.get_route_parse()
-            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        # Directive text and target only (no m_ast_container): included symbols derive from m_symbol_ref
+        with CS(REF_POS):
+            CS.store(m_ast.view(
+                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
+                None,
+                self.w_include[:255],
+                self.type_id,
+                None,
+                CS.ref(m_file_name.fnid, *fnid_route),
+            ))
+            ast_id_route = CS.get_route_parse()
+        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
         if create_tag:
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:
                     self.ast_debug(CS, ast_id_route)
-                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include)
+                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=self.type_id)
 
 
 class CPPro_include_next(CPPro_include):
@@ -1267,34 +1273,17 @@ class CPPro_include_next(CPPro_include):
         super().init_subclass()
         self.type_id = ASTT.CPPro_include_next
 
-    def extract(self, CS: Any, create_tag: bool = True) -> None:
+    def resolve_target(self, CS: Any) -> str:
+        """The file libclang opened (`CompileEnv.repo_path()`), else the written spelling: `#include_next`
+        continues the search after the directory of the including header, which only libclang knows."""
+        env = getattr(CS, "compile_env", None)
+        if env is not None and self.inc_file_name:
+            rel = env.repo_path(self.inc_file_name)
+            if rel and not rel.startswith(".."):
+                return rel
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-        raw_target = self.a_include if self.a_include else self.w_include
-        include_target = normalize_repo_path(raw_target, base_dir)
-        clean_target = str(include_target).strip().strip("<>\"'").strip()
-        safe_target = clean_target[:255]
-
-        with CS(REF_POS):
-            CS.store(m_file_name.get_set(None, safe_target))
-            fnid_route = CS.get_route_parse()
-
-        with CS(REF_POS):
-            CS.store(m_ast.view(
-                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
-                None,
-                self.w_include[:255],
-                ASTT.CPPro_include_next,
-                None,
-                CS.ref(m_file_name.fnid, *fnid_route),
-            ))
-            ast_id_route = CS.get_route_parse()
-        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-
-        if create_tag:
-            with CS(REF_NO_REF):
-                if G.OVERRIDE_FORCE_AST_DEBUG:
-                    self.ast_debug(CS, ast_id_route)
-                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include_next)
+        raw_target = self.a_include if (self.a_include and env is None) else self.w_include
+        return str(normalize_repo_path(raw_target, base_dir)).strip().strip("<>\"'").strip()
 
 
 class CPPro_ident(CPPro):

@@ -446,9 +446,9 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    `include/asm-x86_64/semaphore.h` to `include/asm-x86_64/atomic.h` for x86_64 (through `include/linux/sem.h`
    → `include/asm-um/atomic.h` → `include/asm-um/arch/atomic.h` = `include/asm-x86_64/atomic.h` for ARCH=um),
    and never to the unrelated `net/rxrpc/internal.h`. The walk reads the files themselves rather than
-   `m_ast_include`/`m_file_reference`: those rows come from the parser's own clang run, which links
-   `include/asm` to `asm-generic` and skips the includes of inactive `#if` branches, so they describe no
-   particular ARCH.
+   `m_ast_include`/`m_file_reference`: those rows hold one target per directive, resolved for the single ARCH
+   the parser compiled the blob for (`parser/c_ast/CAST_API.md` §5, `CPPro_include`), so they describe no other
+   ARCH.
 
 ### 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`)
 Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is

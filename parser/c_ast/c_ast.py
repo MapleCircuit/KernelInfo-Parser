@@ -12,7 +12,6 @@ import time
 import ctypes
 import logging
 import os
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 import clang.cindex as cc
@@ -25,8 +24,6 @@ from core.globalstuff import (
     REF_NO_REF,
     REF_POS,
     FILE_ERROR,
-    ASTT,
-    STANDARD_C_KEYWORDS,
 )
 from parser.c_ast.ctypes_bindings import (
     AST_KIND,
@@ -34,8 +31,6 @@ from parser.c_ast.ctypes_bindings import (
     _CLANG_GET_CURSOR_EXTENT,
     _CLANG_GET_CURSOR_LOC,
     _CLANG_GET_FILE_LOC,
-    _CLANG_CURSOR_IS_NULL,
-    _CLANG_GET_CURSOR_REFERENCED,
     _CLANG_VISIT_CHILDREN,
     _CLANG_GET_RANGE_START,
     _CLANG_GET_RANGE_END,
@@ -175,38 +170,10 @@ def process_c_ast(CS: Any) -> None:
     Ast_Manager(CS)
 
 
-_CURSOR_KIND_ID_MAP: dict[int, ASTT] = {
-    cc.CursorKind.FUNCTION_DECL.value: ASTT.C_functionproto,
-    cc.CursorKind.CXX_METHOD.value: ASTT.C_functionproto,
-    cc.CursorKind.STRUCT_DECL.value: ASTT.C_struct,
-    cc.CursorKind.UNION_DECL.value: ASTT.C_union,
-    cc.CursorKind.ENUM_DECL.value: ASTT.C_enum,
-    cc.CursorKind.ENUM_CONSTANT_DECL.value: ASTT.C_enumequal,
-    cc.CursorKind.TYPEDEF_DECL.value: ASTT.C_SCtypedef,
-    cc.CursorKind.VAR_DECL.value: ASTT.C_SCextern,
-    cc.CursorKind.MACRO_DEFINITION.value: ASTT.CPPro_define,
-}
-
-_REFERENCING_KIND_IDS: frozenset[int] = frozenset({
-    43,   # TYPE_REF
-    47,   # MEMBER_REF
-    48,   # LABEL_REF
-    49,   # OVERLOADED_DECL_REF
-    50,   # VARIABLE_REF
-    101,  # DECL_REF_EXPR
-    102,  # MEMBER_REF_EXPR
-    103,  # CALL_EXPR
-    501,  # MACRO_DEFINITION
-    502,  # MACRO_INSTANTIATION
-    503,  # INCLUSION_DIRECTIVE
-})
-
-
-def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any) -> list[cc.Cursor]:
-    """Map direct #includes to the external symbols they import that are directly used in the file,
-    and return pre-filtered top-level declaration cursors for TokenList processing."""
-    CS.include_symbols = defaultdict(list)
-    CS.include_symbol_refs = {}
+def map_direct_includes(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any) -> list[cc.Cursor]:
+    """Record the repository path libclang opened for each direct `#include` line of the file
+    (`CS.resolved_includes_by_line`) and return the file's pre-filtered top-level declaration cursors for
+    TokenList processing."""
     CS.resolved_includes_by_line = {}
 
     target_file = cc.File.from_name(parsed_tu, fullfilename)
@@ -227,112 +194,53 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
     except Exception:
         inclusions = ()
 
-    ptr_to_direct_line: dict[int, int] = {}
-    current_direct_line = None
-
+    env = getattr(CS, "compile_env", None)
+    base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
     for inc in inclusions:
-        inc_file = inc.include
-        if not inc_file:
+        if inc.depth != 1:
             continue
-        inc_ptr = ctypes.cast(inc_file._as_parameter_, ctypes.c_void_p).value
-        if inc.depth == 1:
-            src = inc.source
-            if not src:
-                continue
-            src_ptr = ctypes.cast(src._as_parameter_, ctypes.c_void_p).value
-            if src_ptr == target_ptr or (target_ptr is None and (src.name == fullfilename or get_real(src.name) == target_real)):
-                current_direct_line = inc.location.line if inc.location else None
-                if current_direct_line is not None:
-                    if inc_ptr not in ptr_to_direct_line:
-                        ptr_to_direct_line[inc_ptr] = current_direct_line
-                    inc_name = inc_file.name
-                    env = getattr(CS, "compile_env", None)
-                    rel_inc = env.repo_path(inc_name) if env is not None else None
-                    if rel_inc is None and env is None:
-                        r_inc = get_real(inc_name)
-                        base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-                        try:
-                            rel_inc = os.path.relpath(r_inc, base_dir) if base_dir else inc_name
-                        except Exception:
-                            rel_inc = inc_name
-                    if rel_inc and not rel_inc.startswith(".."):
-                        CS.resolved_includes_by_line[current_direct_line] = rel_inc
-        elif current_direct_line is not None and inc.depth > 1:
-            if inc_ptr not in ptr_to_direct_line:
-                ptr_to_direct_line[inc_ptr] = current_direct_line
-
-    found_symbols_by_line: dict[int, set[tuple[str, int]]] = defaultdict(set)
-    f_ptr = ctypes.c_void_p()
-    u_val = ctypes.c_uint()
-    byref = ctypes.byref
-    get_loc = _CLANG_GET_CURSOR_LOC
-    get_file_loc = _CLANG_GET_FILE_LOC
-    is_null = _CLANG_CURSOR_IS_NULL
-    get_ref = _CLANG_GET_CURSOR_REFERENCED
-    visit_children = _CLANG_VISIT_CHILDREN
-    # Most references in a file point at declarations it already referenced (every call of the same function,
-    # every use of the same type): resolve each referenced cursor once. Key: (ref.data[0], ref.data[1], ref.data[2]).
-    resolved_refs: dict[tuple, tuple[int, tuple[str, ASTT]] | None] = {}
-
-    def visitor(cursor: Any, parent: Any, client_data: Any) -> int:
-        k_id = cursor._kind_id
-        if k_id == 100:  # UNEXPOSED_EXPR
-            return 2  # CXChildVisit_Recurse
-        if k_id in _REFERENCING_KIND_IDS:
-            ref = get_ref(cursor)
-            ref_key = (ref.data[0], ref.data[1], ref.data[2])
-            if ref_key in resolved_refs:
-                found = resolved_refs[ref_key]
-            else:
-                found = None
-                if not is_null(ref):
-                    loc = get_loc(ref)
-                    get_file_loc(loc, byref(f_ptr), byref(u_val), byref(u_val), byref(u_val))
-                    ref_ptr = f_ptr.value
-                    if ref_ptr and ref_ptr != target_ptr:
-                        inc_line = ptr_to_direct_line.get(ref_ptr)
-                        if inc_line is not None:
-                            ast_type = _CURSOR_KIND_ID_MAP.get(ref._kind_id)
-                            if ast_type is not None:
-                                ref._tu = parsed_tu
-                                sym_name = ref.spelling
-                                if sym_name and sym_name not in STANDARD_C_KEYWORDS:
-                                    if not (sym_name.startswith("__builtin_") or sym_name.startswith("__attribute__")):
-                                        found = (inc_line, (sym_name, ast_type))
-                resolved_refs[ref_key] = found
-            if found is not None:
-                found_symbols_by_line[found[0]].add(found[1])
-        return 2  # CXChildVisit_Recurse
-
-    cb_func = cc.cursor_visit_callback(visitor)
+        inc_file = inc.include
+        src = inc.source
+        if not inc_file or not src or not inc.location:
+            continue
+        src_ptr = ctypes.cast(src._as_parameter_, ctypes.c_void_p).value
+        if not (src_ptr == target_ptr or (target_ptr is None and (src.name == fullfilename or get_real(src.name) == target_real))):
+            continue
+        line = inc.location.line
+        inc_name = inc_file.name
+        rel_inc = env.repo_path(inc_name) if env is not None else None
+        if rel_inc is None and env is None:
+            try:
+                rel_inc = os.path.relpath(get_real(inc_name), base_dir) if base_dir else inc_name
+            except Exception:
+                rel_inc = inc_name
+        if rel_inc and not rel_inc.startswith(".."):
+            CS.resolved_includes_by_line[line] = rel_inc
 
     # Walk the TU's top-level cursors with clang_visitChildren directly: thousands of them come from headers,
     # and cindex's get_children() spends two extra C calls per child on a null-cursor assertion
     top_decl_cursors: list[cc.Cursor] = []
     walk_errors: list[Exception] = []
-    f_ref = byref(f_ptr)
-    tu_cursor = parsed_tu.cursor
+    f_ptr = ctypes.c_void_p()
+    f_ref = ctypes.byref(f_ptr)
+    get_loc = _CLANG_GET_CURSOR_LOC
+    get_file_loc = _CLANG_GET_FILE_LOC
 
     def top_level_visitor(c: Any, parent: Any, client_data: Any) -> int:
         try:
             get_file_loc(get_loc(c), f_ref, None, None, None)
             if f_ptr.value == target_ptr or (target_ptr is None and c.location.file and (c.location.file.name == fullfilename or get_real(c.location.file.name) == target_real)):
-                c._tu = parsed_tu
-                visitor(c, tu_cursor, None)
-                visit_children(c, cb_func, None)
                 if c.kind in _VALID_TOP_KINDS:
+                    c._tu = parsed_tu
                     top_decl_cursors.append(c)
         except Exception as e:
             walk_errors.append(e)
             return 0  # CXChildVisit_Break
         return 1  # CXChildVisit_Continue
 
-    visit_children(tu_cursor, cc.cursor_visit_callback(top_level_visitor), None)
+    _CLANG_VISIT_CHILDREN(parsed_tu.cursor, cc.cursor_visit_callback(top_level_visitor), None)
     if walk_errors:
-        logger.debug(f"Error walking file-bounded cursors for include symbols: {walk_errors[0]}")
-
-    for line, syms_set in found_symbols_by_line.items():
-        CS.include_symbols[line] = sorted(syms_set, key=lambda s: (s[1], s[0]))
+        logger.debug(f"Error walking file-bounded top-level cursors: {walk_errors[0]}")
 
     return filter_enclosing_cursors(top_decl_cursors)
 
@@ -533,11 +441,11 @@ class Ast_Manager:
         CS.parse_diagnostics = compile_env.diagnostics_fact(translation_unit, arch_env)
         t_includes_0 = time.perf_counter() if prof is not None else 0.0
 
-        top_cursors = extract_include_symbols(translation_unit, self.fullfilename, CS)
+        top_cursors = map_direct_includes(translation_unit, self.fullfilename, CS)
 
         if prof is not None:
             prof.clang_parse_tu_s = t_includes_0 - t_parse_0
-            prof.include_symbols_s = time.perf_counter() - t_includes_0
+            prof.include_map_s = time.perf_counter() - t_includes_0
             t_tok_0 = time.perf_counter()
 
         self.TL = TokenList(translation_unit, self.fullfilename, self.rawfile, file_size=file_byte_size, top_cursors=top_cursors)
