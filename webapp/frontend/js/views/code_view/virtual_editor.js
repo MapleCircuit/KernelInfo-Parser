@@ -28,6 +28,7 @@ import { escapeHtml } from "../../components/modal.js";
 import { scheduleScrollSave } from "../../components/scroll_memory.js";
 import { FindBar, selectionWithin } from "./find_bar.js";
 import { OutlinePanel } from "./outline_panel.js";
+import { ImportsPanel } from "./imports_panel.js";
 import { registerView, unregisterView } from "../../utils/active_views.js";
 import { formatBlameOpts, parseBlameOpts } from "./blame_options.js";
 import { centeredScrollTop, codeHash, externalLink, fenceLanguage, formatLineSpec, markdownSnippet, pinnedSha } from "./permalink.js";
@@ -67,6 +68,8 @@ export class VirtualEditor {
     this.occurrences = new OccurrenceHighlighter(this);
     // Outline, sticky scroll and the breadcrumb's current definition (G03, §5.21)
     this.outline = new OutlinePanel(this);
+    // Symbols the file imports through its #include chain, beside the outline (§5.21)
+    this.imports = new ImportsPanel(this);
     this.showBlame = false;
     this.currentFilePath = "";
     this.currentVersion = "";
@@ -120,6 +123,7 @@ export class VirtualEditor {
         this.resolveEngineSelection();
         this.updateEngineButton();
         refreshDimming();
+        this.imports.archChanged();
       }),
       state.subscribe("kconfig:assignments:updated", ({ tabId } = {}) => {
         if (tabId && tabId !== this.engineTabId) return;
@@ -169,6 +173,7 @@ export class VirtualEditor {
     }
     this.buildCond = null; // its ARCH decides the Kbuild condition
     this.updateEngineButton();
+    this.imports.archChanged();
     if (this.rawLines.length) {
       this.computeDimming();
       this.updateVisibleLines();
@@ -277,6 +282,7 @@ export class VirtualEditor {
     const priorityButtons = [
       { id: "btn-copy-link", label: "Copy Link to Lines…", icon: "🔗" },
       { id: "btn-outline", label: () => (this.outline.open ? "Hide Outline" : "Show Outline"), icon: "☰" },
+      { id: "btn-imports", label: () => (this.imports.open ? "Hide Imports" : "Show Imports"), icon: "⇲" },
       { id: "btn-file-refs", label: "Referenced by…", icon: "⇇" },
       ...(hasFeature(repo, "patch") ? [{ id: "btn-create-patch", label: "Create Patch", icon: "✎" }] : []),
       { id: "btn-copy-raw", label: "Copy File", icon: "📋" },
@@ -938,6 +944,7 @@ export class VirtualEditor {
             <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" style="display:none;"${commitsOn ? "" : " hidden"} aria-haspopup="true">⚙</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
             <button type="button" class="code-btn" id="btn-outline" title="Outline of this file's definitions">☰ Outline</button>
+            <button type="button" class="code-btn" id="btn-imports" title="Symbols this file uses from its #include chain">⇲ Imports</button>
             <button type="button" class="code-btn" id="btn-file-refs" title="Files including this one, Kconfig sources, Kbuild rules and documents naming it">⇇ Refs<span class="code-btn-badge" id="file-refs-count"></span></button>
             <button type="button" class="code-btn" id="btn-copy-link" title="Copy a link to the selected lines (click line numbers to select; Shift+click extends)">🔗 Link</button>
             <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch"${patchOn ? "" : " hidden"}>✎ Patch</button>
@@ -983,6 +990,7 @@ export class VirtualEditor {
     this.minimapCanvas = containerEl.querySelector("#minimap-canvas");
     this.findBar.mount();
     this.outline.mount();
+    this.imports.mount();
 
     // Attach 100% copy fidelity handler
     // A diff mixes both files' lines: its selections are copied as the browser shows them
@@ -1045,6 +1053,7 @@ export class VirtualEditor {
       await this.setBlame(!this.showBlame);
     };
     containerEl.querySelector("#btn-outline").onclick = () => this.outline.toggle();
+    containerEl.querySelector("#btn-imports").onclick = () => this.imports.toggle();
     const refsBtn = containerEl.querySelector("#btn-file-refs");
     refsBtn.onclick = async (e) => {
       e.stopPropagation();
@@ -1531,6 +1540,7 @@ export class VirtualEditor {
       this.updateMinimapSlider();
       this.findBar.refresh();
       this.outline.load();
+      this.imports.fileChanged();
       this.loadBookmarkMarks();
       // The tab was left with blame on (or a link / "blame before this change" asks for it, H9)
       if (this.tabData.blame && this.docMode === "source" && !this.showBlame) {
