@@ -17,8 +17,9 @@ them in (prototypes, extern declarations and forward declarations do not count).
 
 A header that relies on what its includer included before it (`include/linux/lockd/bind.h` in 2.6.0 uses
 `struct file` without including linux/fs.h) leaves names its own chain does not define. Those resolve through
-**context imports**: the files that include this one at the revision (`m_file_reference` Include rows, the
-parser's resolved `#include` directives) are walked up to their `#include` of this file
+**context imports**: the files that include this one at the revision (`m_file_reference` Include rows of the
+parser's `#include` directives; a row naming the include as written counts when the directive resolves to this
+file for the ARCH) are walked up to their `#include` of this file
 (`arch_layout_service.reachable_before()`); an item found that way has `via: "context"`, `context` (the
 includer) and a chain starting at that includer. Items of the file's own chain have `via: "include"`.
 
@@ -92,6 +93,8 @@ MAX_CONTEXT_INCLUDERS = 24
 MAX_INCLUDER_ROWS = 20_000
 _KCONFIG_DEF_TYPES = [int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig)]
 _IS_ENABLED_HELPERS = frozenset({"IS_ENABLED", "IS_BUILTIN", "IS_MODULE", "IS_REACHABLE"})
+_ARCH_INCLUDE_RE = re.compile(r"^arch/[^/]+/include/(?:generated/(?:uapi/)?)?(?:uapi/)?(.+)$")
+_ASM_DIR_RE = re.compile(r"^asm-(?!generic/)[^/]+/(.+)$")
 _IS_ENABLED_ARG_RE = re.compile(r"\b(?:IS_ENABLED|IS_BUILTIN|IS_MODULE|IS_REACHABLE)\s*\(\s*(CONFIG_[A-Za-z0-9_]+)\s*\)")
 
 
@@ -156,6 +159,26 @@ def include_chain(reached: dict[str, str | None], header: str) -> list[str]:
         cur = reached.get(cur)
     chain.reverse()
     return chain
+
+
+def include_spellings(path: str) -> list[str]:
+    """Names an `#include <...>` of `path` is written as, which the parser keeps as the include's target
+    when it could not resolve the directive: `include/linux/x.h` -> `linux/x.h`,
+    `include/uapi/linux/x.h` -> `linux/x.h`, `arch/<a>/include/asm/x.h` -> `asm/x.h`,
+    `include/asm-<a>/x.h` -> `asm/x.h`."""
+    out: list[str] = []
+    m = _ARCH_INCLUDE_RE.match(path)
+    if m:
+        out.append(m.group(1))
+    elif path.startswith("include/"):
+        rest = path[len("include/"):]
+        out.append(rest)
+        if rest.startswith(("uapi/", "generated/")):
+            out.append(rest.split("/", 1)[1].removeprefix("uapi/"))
+        m = _ASM_DIR_RE.match(rest)
+        if m:
+            out.append("asm/" + m.group(1))
+    return [p for p in dict.fromkeys(out) if p and p != path]
 
 
 def _chunks(values: list[Any], size: int = _CHUNK):
@@ -528,7 +551,7 @@ class ImportsService:
         """Items for `unresolved` names defined by what the files including `path` include before it, or
         forward-declared tag types completed later in a direct includer header itself."""
         with get_reader() as reader:
-            includers = self._includers(reader, path, tree)
+            includers = self._includers(reader, path, tree, rev, arch)
         if not includers:
             return [], []
         best: dict[str, tuple[tuple, dict[str, Any]]] = {}
@@ -616,14 +639,22 @@ class ImportsService:
         return c_list[:first_c_wave] + h_list[:first_h_wave] + c_list[first_c_wave:] + h_list[first_h_wave:]
 
     @classmethod
-    def _includers(cls, reader: Any, path: str, tree: dict[str, str]) -> list[str]:
-        """Files of the revision that `#include` `path` (the parser's resolved include rows), diversified
-        across directories with `.c` files and direct `.h` includers prioritized."""
-        fn = reader.select_rows("m_file_name", ["fnid"], {"fname": path}, limit=1)
-        if not fn:
+    def _includers(cls, reader: Any, path: str, tree: dict[str, str], rev: str | None = None,
+                   arch: str | None = None) -> list[str]:
+        """Files of the revision that `#include` `path` (the parser's include rows), diversified across
+        directories with `.c` files and direct `.h` includers prioritized.
+
+        A row targets `path` itself (an include the parser resolved) or one of its include spellings
+        (`include_spellings()`: an include the parser kept as written); a spelled row counts only when the
+        includer's directive resolves to `path` for ARCH=<arch> at `rev`."""
+        spellings = include_spellings(path) if rev and arch else []
+        fn_rows = reader.select_rows("m_file_name", ["fnid", "fname"], {"fname": [path, *spellings]})
+        exact = {int(r["fnid"]) for r in fn_rows if safe_decode(r.get("fname")) == path}
+        spelled = {int(r["fnid"]) for r in fn_rows} - exact
+        if not exact and not spelled:
             return []
-        rows = reader.select_rows("m_file_reference", ["source_blob_id", "source_fnid"],
-                                  {"target_fnid": int(fn[0]["fnid"]), "ref_type": int(FileRefType.Include)},
+        rows = reader.select_rows("m_file_reference", ["source_blob_id", "source_fnid", "target_fnid", "details"],
+                                  {"target_fnid": sorted(exact | spelled), "ref_type": int(FileRefType.Include)},
                                   limit=MAX_INCLUDER_ROWS)
         if not rows:
             return []
@@ -632,20 +663,62 @@ class ImportsService:
         for chunk in _chunks(fnids):
             for r in reader.select_rows("m_file_name", ["fnid", "fname"], {"fnid": chunk}):
                 names[int(r["fnid"])] = safe_decode(r.get("fname"))
-        wanted: dict[str, int] = {}
+        # Rows of every revision's blob of a path: the includer counts through the row of its current blob
+        by_src: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             src = names.get(int(r["source_fnid"]))
             if src and src != path and src in tree:
-                wanted[src] = int(r["source_blob_id"])
-        mapped = GitTreeResolver.map_blob_hashes(reader, [tree[p] for p in wanted])
-        current = [p for p, b in wanted.items() if mapped.get(tree[p], (0, 0))[0] == b]
+                by_src.setdefault(src, []).append(r)
+        mapped = GitTreeResolver.map_blob_hashes(reader, [tree[p] for p in by_src])
+        current: list[str] = []
+        for src, src_rows in by_src.items():
+            blob = mapped.get(tree[src], (0, 0))[0]
+            for r in src_rows:
+                if int(r["source_blob_id"]) != blob:
+                    continue
+                if int(r["target_fnid"]) not in exact:
+                    written = safe_decode(r.get("details")).strip()
+                    name = written.strip("<>\"")
+                    if not name or arch_layout_service.resolve_include(rev, arch, name, src,
+                                                                       written.startswith('"')) != path:
+                        continue
+                current.append(src)
+                break
         return cls._diversify_includers(current)
+
+    def closure_definitions(self, version_name: str, arch: str, start: str,
+                            wanted: dict[str, str]) -> tuple[str | None, dict[str, dict[str, Any]]]:
+        """(ARCH walked, {name: item}) of the names in `wanted` ({name: type name of the declaration, "" when
+        unknown}) defined by `start` itself or a header its compilation reaches for ARCH=<arch>: the name
+        space of the declaration's type, full definitions before prototypes / forward declarations, then the
+        shortest chain. Items have the `_build()` shape (`header_path`, `line`, `chain`, ...)."""
+        rev = safe_rev(version_name)
+        if not wanted or not is_imports_path(start):
+            return None, {}
+        tree = git_tree_resolver.list_tree(rev)
+        if not tree or start not in tree:
+            return None, {}
+        arch_used, reached = self._reach(rev, arch, start)
+        if not reached:
+            return arch_used, {}
+        roles = set(_IMPORT_ROLES)
+        refs = {name: {"lines": set(), "roles": roles,
+                       "spaces": {def_namespace(type_name)} if type_name else set(_ALL_NS)}
+                for name, type_name in wanted.items()}
+        with get_reader() as reader:
+            blob_paths = self._header_blobs(reader, tree, list(reached), 0)
+            if not blob_paths:
+                return arch_used, {}
+            defs = self._definitions(reader, self._ordered_blobs(blob_paths, reached), sorted(refs))
+        body = self._build(start, refs, reached, blob_paths, defs, prefer_full=True)
+        return arch_used, {it["name"]: it for it in body["items"]}
 
     @staticmethod
     def _build(start: str, refs: dict[str, dict[str, Any]], reached: dict[str, str | None],
-               blob_paths: dict[int, list[str]], defs: list[dict[str, Any]]) -> dict[str, Any]:
+               blob_paths: dict[int, list[str]], defs: list[dict[str, Any]], prefer_full: bool = False) -> dict[str, Any]:
         """Items: per referenced name the best definition (fitting kind, shortest chain, full definition
-        before prototype / forward declaration, then BFS order, path and line)."""
+        before prototype / forward declaration, then BFS order, path and line). `prefer_full` ranks a full
+        definition before a prototype / forward declaration of a shorter chain."""
         order = {p: i for i, p in enumerate(reached)}
         chains: dict[str, list[str]] = {}
         candidates: dict[str, list[tuple[tuple, dict[str, Any]]]] = {}
@@ -676,7 +749,8 @@ class ImportsService:
                 chain = chains.get(header)
                 if chain is None:
                     chain = chains[header] = include_chain(reached, header)
-                rank = (0 if fits else 1, len(chain), 1 if weak else 0, _KIND_RANK[kind],
+                strength = (1 if weak else 0, len(chain)) if prefer_full else (len(chain), 1 if weak else 0)
+                rank = (0 if fits else 1, *strength, _KIND_RANK[kind],
                         order.get(header, len(order)), header, line_s, type_name)
                 candidates.setdefault(name, []).append((rank, {
                     "kind": kind, "type_name": type_name, "header_path": header, "line": line_s, "line_e": line_e,

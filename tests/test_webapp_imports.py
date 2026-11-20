@@ -19,6 +19,7 @@ from webapp.backend.services.imports_service import (
     def_namespace,
     import_kind,
     include_chain,
+    include_spellings,
     ref_namespaces,
 )
 
@@ -415,6 +416,191 @@ class TestImportsNameSpacesAndContext(unittest.TestCase):
             ("config", "fs/lockd/Kconfig", 25, "kconfig",
              ["include/linux/lockd/bind.h", "fs/lockd/Kconfig"], 1),
         )
+
+
+class TestIncluderSpellings(unittest.TestCase):
+    """Includer rows whose target is the include as written, and includers with rows of several blobs."""
+
+    def test_include_spellings(self) -> None:
+        self.assertEqual(include_spellings("include/linux/lockd/bind.h"), ["linux/lockd/bind.h"])
+        self.assertEqual(include_spellings("include/asm-x86_64/types.h"), ["asm-x86_64/types.h", "asm/types.h"])
+        self.assertEqual(include_spellings("include/asm-generic/bug.h"), ["asm-generic/bug.h"])
+        self.assertEqual(include_spellings("arch/x86/include/asm/types.h"), ["asm/types.h"])
+        self.assertEqual(include_spellings("include/uapi/linux/nfs.h"), ["uapi/linux/nfs.h", "linux/nfs.h"])
+        self.assertEqual(include_spellings("fs/nfsd/state.h"), [])
+
+    def test_includers_of_written_targets_and_older_blob_rows(self) -> None:
+        path = "include/linux/lockd/bind.h"
+        tree = {path: "a" * 40, "fs/nfsd/lockd.c": "b" * 40, "fs/other/x.c": "c" * 40, "fs/nfs/client.c": "d" * 40}
+        current = {"b" * 40: (11, 1), "c" * 40: (12, 1), "d" * 40: (13, 1)}
+        db = make_db("mock", rows={
+            "m_file_name": [{"fnid": 1, "fname": path}, {"fnid": 2, "fname": "linux/lockd/bind.h"},
+                            {"fnid": 3, "fname": "fs/nfsd/lockd.c"}, {"fnid": 4, "fname": "fs/other/x.c"},
+                            {"fnid": 5, "fname": "fs/nfs/client.c"}],
+            "m_file_reference": [
+                # Kept as written by the parser; the directive resolves to bind.h
+                {"ref_id": 1, "source_blob_id": 11, "source_fnid": 3, "target_fnid": 2, "ref_type": 1, "line_no": 18,
+                 "details": "<linux/lockd/bind.h>"},
+                # Kept as written; resolves to another file for this ARCH
+                {"ref_id": 2, "source_blob_id": 12, "source_fnid": 4, "target_fnid": 2, "ref_type": 1, "line_no": 3,
+                 "details": "<linux/lockd/bind.h>"},
+                # The current blob's row followed by an older revision's row of the same path
+                {"ref_id": 3, "source_blob_id": 13, "source_fnid": 5, "target_fnid": 1, "ref_type": 1, "line_no": 29,
+                 "details": "<linux/lockd/bind.h>"},
+                {"ref_id": 4, "source_blob_id": 7, "source_fnid": 5, "target_fnid": 1, "ref_type": 1, "line_no": 28,
+                 "details": "<linux/lockd/bind.h>"},
+            ],
+        })
+
+        def resolve(_rev, _arch, name, including, quoted):
+            self.assertFalse(quoted)
+            return path if including == "fs/nfsd/lockd.c" and name == "linux/lockd/bind.h" else "include/other.h"
+
+        with patch.object(isvc.GitTreeResolver, "map_blob_hashes",
+                          side_effect=lambda _r, shas: {x: current[x] for x in shas if x in current}), \
+                patch.object(isvc.arch_layout_service, "resolve_include", side_effect=resolve) as res, \
+                make_db_reader(db) as reader:
+            found = ImportsService._includers(reader, path, tree, "v2.6.23", "x86_64")
+            exact_only = ImportsService._includers(reader, path, tree)
+        self.assertEqual(sorted(found), ["fs/nfs/client.c", "fs/nfsd/lockd.c"])
+        self.assertEqual(exact_only, ["fs/nfs/client.c"])
+        # Only the current blobs' written rows are resolved
+        self.assertEqual(res.call_count, 2)
+
+
+def make_db_reader(db):
+    """`with make_db_reader(db) as reader:` - the webapp read session of `db`."""
+    return _ReaderCtx(db)
+
+
+class _ReaderCtx:
+    def __init__(self, db) -> None:
+        self._patch = patch_reader(db)
+
+    def __enter__(self):
+        self._patch.start()
+        self._ctx = isvc.get_reader()
+        return self._ctx.__enter__()
+
+    def __exit__(self, *exc):
+        try:
+            return self._ctx.__exit__(*exc)
+        finally:
+            self._patch.stop()
+
+
+class TestIncludeSymbols(unittest.TestCase):
+    """symbol_service.get_include_symbols(): symbols of the revision, definitions through the #include chain."""
+
+    XDR = "include/linux/lockd/xdr.h"
+    BIND = "include/linux/lockd/bind.h"
+    PATHS = [BIND, XDR, "include/linux/fs.h", "include/linux/types.h", "include/asm-x86_64/types.h",
+             "arch/powerpc/boot/types.h", "security/selinux/include/av_inherit.h", "fs/jffs2/summary.c",
+             "fs/nfsd/nfsproc.c", "include/linux/sunrpc/svc.h", "fs/nfsd/nfsxdr.c", "include/linux/nfs.h",
+             "arch/arm/include/asm/nfs.h"]
+
+    def _run(self, refs: list[str], arch: str | None = "x86_64") -> dict:
+        from webapp.backend.services import symbol_service as ssvc
+        from webapp.backend.services.tree_resolver import ArchScope
+
+        shas = {p: f"{i + 1:040x}" for i, p in enumerate(self.PATHS)}
+        blobs = {p: i + 1 for i, p in enumerate(self.PATHS)}
+        ids = {shas[p]: (blobs[p], 1) for p in self.PATHS}
+        names = ["u32", "file", "inode", "svc_rqst", "gone_sym", "nfs_fh", "__be32"]
+        ast = {n: i + 1 for i, n in enumerate(names)}
+        # (name, path, type, line, linkage)
+        defs = [
+            ("u32", "arch/powerpc/boot/types.h", "C_SCtypedef", 8, 0),
+            ("u32", "include/asm-x86_64/types.h", "C_SCtypedef", 43, 0),
+            ("file", "security/selinux/include/av_inherit.h", "CPPro_define_macro", 2, 5),
+            ("file", "include/linux/fs.h", "C_structdecl", 721, 0),
+            ("inode", "fs/jffs2/summary.c", "C_structdecl", 120, 0),
+            ("inode", "include/linux/fs.h", "C_structdecl", 533, 0),
+            ("svc_rqst", "fs/nfsd/nfsproc.c", "C_structdecl", 28, 0),
+            ("svc_rqst", "include/linux/sunrpc/svc.h", "C_structdecl", 204, 0),
+            ("nfs_fh", "fs/nfsd/nfsxdr.c", "C_structdecl", 5, 0),
+            ("nfs_fh", "arch/arm/include/asm/nfs.h", "C_structdecl", 3, 0),
+            ("nfs_fh", "include/linux/nfs.h", "C_structdecl", 137, 0),
+            ("__be32", "include/linux/types.h", "C_SCtypedef", 184, 0),
+        ]
+        container = [("u32", "C_SCtypedef"), ("file", "C_struct"), ("inode", "C_struct"), ("svc_rqst", "C_struct"),
+                     ("gone_sym", "C_SCtypedef"), ("nfs_fh", "C_struct")]
+        db = make_db("mock", rows={
+            "m_type_descriptor": [{"type_id": v, "name": n} for v, n in D.m_type_descriptor_insert],
+            "m_ast": [{"ast_id": i, "name": n, "type_id": 0} for n, i in ast.items()]
+                     + [{"ast_id": 100, "name": "<linux/lockd/xdr.h>", "type_id": ASTT.CPPro_include.value}],
+            "m_ast_include": [{"ast_id": 100, "fnid": 50}],
+            "m_file_name": [{"fnid": 50, "fname": self.XDR}],
+            "m_ast_container": [{"ast_id": 100, "priority": i, "type_id": ASTT[t].value, "ref_ast_id": ast[n]}
+                                for i, (n, t) in enumerate(container)],
+            "m_blob_symbol_def": [
+                {"def_id": i + 1, "blob_id": blobs[p], "tag_id": 1, "ast_id": ast[n], "name": n,
+                 "type_id": ASTT[t].value, "linkage": lk, "line_s": line, "line_e": line}
+                for i, (n, p, t, line, lk) in enumerate(defs)
+            ],
+            "m_blob_symbol_ref": [
+                {"ref_id": i + 1, "blob_id": blobs[self.BIND], "tag_id": 1, "ast_id": ast[n], "target_fnid": 0,
+                 "role": TYPE, "line": 26 + i, "char_s": 1}
+                for i, n in enumerate(refs)
+            ],
+        })
+        # xdr.h -> fs.h -> types.h -> asm-x86_64/types.h; svc.h and nfs.h are outside both closures
+        closure = {self.XDR: None, "include/linux/fs.h": self.XDR, "include/linux/types.h": "include/linux/fs.h",
+                   "include/asm-x86_64/types.h": "include/linux/types.h"}
+        reach = {self.XDR: closure, self.BIND: {self.BIND: None, **{k: (v or self.BIND) for k, v in closure.items()}}}
+        imports = {"items": [
+            {"name": "svc_rqst", "kind": "struct", "type_name": "C_structdecl", "header_path": "include/linux/sunrpc/svc.h",
+             "line": 204, "via": "context", "chain": ["fs/nfsd/lockd.c", "include/linux/sunrpc/svc.h"]},
+            {"name": "__be32", "kind": "type", "type_name": "C_SCtypedef", "header_path": "include/linux/types.h",
+             "line": 184, "via": "include",
+             "chain": [self.BIND, self.XDR, "include/linux/fs.h", "include/linux/types.h"]},
+        ]}
+        blob_paths = {b: [p] for p, b in blobs.items()}
+        with patch_reader(db), \
+                patch.object(isvc.git_tree_resolver, "list_tree", return_value=dict(shas)), \
+                patch.object(isvc.GitTreeResolver, "map_blob_hashes",
+                             side_effect=lambda _r, s_list: {s: ids[s] for s in s_list if s in ids}), \
+                patch.object(isvc.arch_layout_service, "layout", return_value=object()), \
+                patch.object(isvc.arch_layout_service, "reachable", side_effect=lambda _rev, _a, start: dict(reach.get(start, {}))), \
+                patch.object(ssvc.SymbolService, "_scope", return_value=(1, "v2.6.23", blob_paths)), \
+                patch.object(ssvc, "definition_arch", return_value=("x86_64", ArchScope.of("x86"), 64)), \
+                patch.object(ssvc.imports_service, "get_imports", return_value=imports) as get_imports:
+            out = ssvc.SymbolService().get_include_symbols("v2.6.23", 100, file_path=self.BIND, line=14, arch=arch)
+        get_imports.assert_called_once_with("v2.6.23", self.BIND, arch or "x86_64")
+        return out
+
+    def test_definitions_follow_the_include_chain(self) -> None:
+        out = self._run(["u32", "file", "inode", "svc_rqst", "nfs_fh"])
+        self.assertEqual((out["header_file"], out["arch"]), (self.XDR, "x86_64"))
+        got = {s["name"]: (s["def_file"], s["def_line_s"]) for s in out["symbols"]}
+        self.assertEqual(got, {
+            # The header's closure for ARCH=x86_64, not arch/powerpc
+            "u32": ("include/asm-x86_64/types.h", 43),
+            # struct file / inode: tag name space, not the macro `file` or a .c file's struct
+            "file": ("include/linux/fs.h", 721),
+            "inode": ("include/linux/fs.h", 533),
+            # Not in the header's closure: the referring file's (context) import
+            "svc_rqst": ("include/linux/sunrpc/svc.h", 204),
+            # In no closure: the revision's tree, a generic header before .c files and other arches
+            "nfs_fh": ("include/linux/nfs.h", 137),
+            # Imported through this directive though the container does not list it
+            "__be32": ("include/linux/types.h", 184),
+        })
+        # gone_sym: listed by the include tag's container, no longer referenced by the file
+        self.assertNotIn("gone_sym", got)
+        self.assertEqual({s["name"]: s["category"] for s in out["symbols"]}["u32"], "Typedef")
+
+    def test_symbols_of_the_revision(self) -> None:
+        # bind.h no longer uses u32 (v2.6.20+ uses __be32): the stale container entry is dropped
+        out = self._run(["file", "svc_rqst", "__be32"], arch=None)
+        self.assertEqual([s["name"] for s in out["symbols"]], ["file", "svc_rqst", "__be32"])
+        self.assertEqual(out["arch"], "x86_64")
+
+    def test_invalid_arch(self) -> None:
+        from webapp.backend.services import symbol_service as ssvc
+        with self.assertRaises(HTTPException) as ctx:
+            ssvc.SymbolService().get_include_symbols("v2.6.23", 100, arch="x86;drop")
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class TestContextWalk(unittest.TestCase):
