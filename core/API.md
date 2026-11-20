@@ -25,24 +25,24 @@ agents.
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L849-L871]
   - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L872-L895]
 - 6. End-to-End Inter-Module Execution Lifecycle [L896-L1043]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1044-L1424]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1044-L1426]
   - 7.1. Unified Configuration Hierarchy [L1046-L1156]
   - 7.1.1. Repository Auto-Detection & Selection [L1157-L1222]
   - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1223-L1273]
   - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1274-L1321]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1322-L1424]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1425-L1679]
-  - 8.1. High-Level Architecture [L1427-L1470]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1471-L1496]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1497-L1679]
-- 9. CVE List Ingestion (`parser/cve/`) [L1680-L1735]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1736-L1803]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1804-L1934]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1812-L1843]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1844-L1884]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1885-L1917]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1918-L1934]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1935-L1980]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1322-L1426]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1427-L1697]
+  - 8.1. High-Level Architecture [L1429-L1472]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1473-L1498]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1499-L1697]
+- 9. CVE List Ingestion (`parser/cve/`) [L1698-L1754]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1755-L1822]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1823-L1953]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1831-L1862]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1863-L1903]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1904-L1936]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1937-L1953]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1954-L1999]
 <!-- toc:end -->
 
 ---
@@ -1314,7 +1314,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     - `test_ssh_tunnel(ssh_cfg, feature_name, establish=True)`: Validates SSH host reachability and key readability, then authenticates and opens the `ssh -L` forward through `open_test_tunnel()` and closes it (`establish=False` limits it to the TCP reachability check).
     - `test_repository()`: Validates git repository paths, verifies default branch and start ref commits via `git rev-parse`, and counts filter-matching branches.
     - `test_cve_catalog()`: Detects catalog layouts (`cvelistV5` vs `vulns.git`) and inspects HEAD commit metadata.
-    - `test_mailing_list()`: With `ssh_tunnel.enabled`, opens the mailing-list forward through `open_test_tunnel()` and probes the remote daemon's `/health` through it. Otherwise it probes a local daemon on `127.0.0.1:<port>`, and without one opens the archive under `storage_dir` in-process (`PublicInboxLocalStore`). Whichever backend answers, the test then confirms real archive access by reading the newest message: through a daemon `GET /search?q=&limit=1` (newest overview row, indexed `ds` order) then `GET /message?num=<num>`; in-process the same `search_emails("", limit=1)` / `get_email_detail()` calls. It fails when the archive returns no message, the message cannot be fetched, its raw RFC-822 payload is missing (`all.git`), or the daemon answers an HTTP error (e.g. `503` above its memory soft limit); the details name the message read (number, date, subject, author, Message-ID, raw size). A stopped remote daemon passes when `auto_start_daemon` is set, with the message stating that archive access is not verified (the test never launches the daemon).
+    - `test_mailing_list()`: With `ssh_tunnel.enabled`, opens the mailing-list forward through `open_test_tunnel()` and probes the remote daemon's `/health` through it. Otherwise it probes a local daemon on `127.0.0.1:<port>`, and without one opens the archive under `storage_dir` in-process (`PublicInboxLocalStore`). Whichever backend answers, the test then confirms real archive access by reading the newest message: through a daemon `GET /search?q=&limit=1` (newest overview row, indexed `ds` order) then `GET /message?num=<num>`; in-process the same `search_emails("", limit=1)` / `get_email_detail()` calls. It fails when the archive returns no message, the message cannot be fetched, its raw RFC-822 payload is missing (`all.git`), or the daemon answers an HTTP error (e.g. `503` above its memory soft limit); a daemon that answers `/health` but times out on the archive read (15s) or answers `503` busy passes with the archive reported as not verified; the details name the message read (number, date, subject, author, Message-ID, raw size). A stopped remote daemon passes when `auto_start_daemon` is set, with the message stating that archive access is not verified (the test never launches the daemon).
     - `run_all_diagnostics()`: Unified health runner for all subsystems.
   - Exposes in-place quick testing (`T` key) within each settings screen, plus a dedicated `DiagnosticsScreen` displaying live pass/fail indicators, durations, and modal detail views.
   - In-place tests paint a busy notice on the bottom row (`BaseScreen.show_busy()`) while a forward is being established; `show_busy()` also requests a full repaint (`BaseScreen.request_full_redraw()`). Temporary test tunnels run `ssh` in its own session (`SSHTunnelManager(detach_tty=True)`), so it never prompts on the controlling terminal. `DatabaseSSHScreen` tests the tunnel first and reports the database probe as skipped when the tunnel fails. `CVEMailingListScreen` merges its tunnel widgets over the stored `mailing_list.ssh_tunnel` section, so fields without a widget (`password`, `remote_host`, `remote_port`, `local_port`) reach the diagnostic.
@@ -1416,9 +1416,11 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Multiprocessing Socket Refresh**:
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
     resets in-memory caches and destroys preloaded table state.
-  - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db =
-    G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging
-    queues.
+  - Before `fork()`, `_close_parent_db()` detaches `G.TE.db` and calls `db.close()` (returning the handle to
+    the parent `EnginePool` without closing the underlying socket); `os.register_at_fork` hooks set inherited
+    pool entries aside in the child and release every inherited MariaDB connection without COM_QUIT or socket
+    shutdown (either would end the parent's session), and demote worker `DB_engine` lifecycle logs to `DEBUG`; after `fork()`, the parent re-acquires a live, ping-verified handle via `G.TE.db = G.DB()` without
+    altering cached state or staging queues.
 
 ---
 
@@ -1508,7 +1510,7 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
   - `all.git`: Persistent `git cat-file --batch` coprocess for RFC822 raw header verification.
 - **Micro-Daemon (`ml_server.py`)**:
   - Standalone multi-threaded HTTP query service (`ThreadingHTTPServer`) listening on localhost port 8192 on
-    the remote storage host (`DAEMON_VERSION = "1.4.6"`).
+    the remote storage host (`DAEMON_VERSION = "1.4.8"`).
   - Endpoints:
     - `GET /health`: Storage status, directory paths, daemon version, and Xapian availability.
     - `POST /resolve_commit`: Single commit resolution.
@@ -1542,11 +1544,15 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
     mid-request — answered as `503` — rather than growing unbounded; the limit covers the heap and private
     anonymous mappings while leaving the Xapian and SQLite file mappings alone. `resolve_batch` also receives
     the guard as a `should_stop` predicate, deferring the rest of a batch into `pending` under memory pressure
-    exactly as it does when the time budget runs out. `/health` reports `rss_mb`, `peak_rss_mb`, and
-    `max_rss_mb`.
+    exactly as it does when the time budget runs out. `/health` reports `rss_mb`, `peak_rss_mb`,
+    `max_rss_mb`, and the client activity `in_flight` / `idle_s` (used by starting clients, below).
   - **Admission control**: `--max-concurrent` (default `DEFAULT_MAX_CONCURRENT = 4`, env `ML_MAX_CONCURRENT`)
     bounds heavy requests in flight through a `BoundedSemaphore` (Xapian access is serialized anyway, so extra
-    concurrency only multiplies the per-request working set); a request body over `MAX_REQUEST_BYTES` (64MB)
+    concurrency only multiplies the per-request working set). `is_heavy_request()` exempts the light browse
+    read — an empty-query `/search` with `offset <= LIGHT_BROWSE_MAX_OFFSET` (1000), one indexed `over` read
+    without Xapian — so the newest-message listing (and the TUI archive check) stays answerable while ingest
+    holds every slot with long `/resolve_batch` calls; `POST /search` bodies are read before admission for
+    that check. A request body over `MAX_REQUEST_BYTES` (64MB)
     is refused with `413` before being read; request threads use a `THREAD_STACK_BYTES` (512KB) stack instead
     of the default 8MB; and each request releases its thread-local SQLite handles when it finishes.
   - Startup: the listen bind retries for `BIND_RETRY_SECONDS` (5s) on `EADDRINUSE`, since a just-stopped
@@ -1584,29 +1590,41 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
     per-version workers, and only activates one itself if none is active.
   - Verifies local archive presence when tunnel is disabled; returns descriptive errors if neither local
     archive nor SSH tunnel is available.
-  - Negotiates daemon version (`DAEMON_VERSION = "1.4.6"`) against `/health`; if inactive or outdated,
-    synchronizes `parser/mailing_list`, `db_engine`, and `core` `.py` modules (excluding `__pycache__`) to
-    `~/KernelInfo-Parser` via a compressed tar stream over SSH, clears remote bytecode caches, and detaches
-    a fresh daemon (`ssh -f -n` + `nohup`), while `db_engine` treats `mysql-connector-python` as optional so
+  - Negotiates daemon version (`DAEMON_VERSION = "1.4.8"`) against `/health` with `auto_start_daemon`, and
+    starts a daemon only when none is usable (`daemon_reuse_reason()`): a responding daemon is reused when
+    it runs this client's version, a newer one, or an older one still in use, meaning a request in flight or
+    `idle_s` under `DAEMON_IDLE_RESTART_SECONDS` (120s) (`/health` reports `in_flight` and `idle_s` from the
+    daemon's `ActivityTracker`). So one machine's start never stops the daemon another machine is querying,
+    and machines on different code versions share one daemon instead of replacing each other's. Reusing an
+    outdated daemon logs a warning. Only when no daemon answers, a listening daemon stays unresponsive, or
+    an outdated one is idle does the client run a single SSH call that streams a compressed tar of the
+    `parser/mailing_list`, `db_engine`, and `core` `.py` modules (excluding `__pycache__`) on stdin and
+    (re)launches the daemon under `nohup`; `db_engine` treats `mysql-connector-python` as optional so
     archive hosts without MariaDB drivers import cleanly. **Any change to the daemon, resolver, or store
     requires bumping `DAEMON_VERSION`**, since a version match is what keeps an already-running daemon (and
-    its stale code) in place.
-  - Remote restart protocol (idempotent and race-free):
+    its stale code) in place; the new version takes over once the old daemon falls idle.
+  - Remote start protocol (`_remote_start_script()`, idempotent and race-free):
     - An advisory `flock` on fd 9 (`/tmp/ml_server.<port>.lock`) serializes concurrent startups from parser
-      workers. A contender waits `LOCK_WAIT_SECONDS` (8s) for the lock instead of giving up, then finds the
-      new daemon healthy and returns without touching it. The lock is held `LOCK_HOLD_SECONDS` (5s) past the
-      launch so a worker arriving right behind cannot kill the daemon just started, and the daemon is launched
-      with `9>&-` so it does not inherit the lock fd and hold the lock for its whole lifetime, which would
-      silently block every later restart.
-    - A retrying `/health` pre-check inside the lock makes a redundant restart a no-op and prevents a
-      momentarily busy daemon from being mistaken for a dead one.
+      workers. A contender waits `LOCK_WAIT_SECONDS` (8s) for the lock instead of giving up (answering
+      `LOCKED` if it never gets it). The lock is held `LOCK_HOLD_SECONDS` (5s) past the launch so a worker
+      arriving right behind finds the daemon just started, and the daemon is launched with `9>&-` so it does
+      not inherit the lock fd and hold the lock for its whole lifetime, which would silently block every
+      later start.
+    - Inside the lock a retrying `/health` probe repeats the reuse judgement and answers `KEEP <reason>`
+      (current, newer, or in use; for daemons older than 1.4.8, which lack `idle_s`, activity is the mtime of
+      `/tmp/ml_server.log`, written on every `POST`). This covers a decision raced by another worker or by
+      resumed traffic, and keeps a momentarily busy daemon from being mistaken for a dead one. The code bundle
+      is unpacked (after clearing remote bytecode caches) only when a launch follows, so a running daemon
+      never lazily imports newer modules; a launch answers `STARTED`.
     - Only the process owning the **listening** socket is stopped (`ss -ltnpH 'sport = :<port>'`, `SIGTERM`
       then `SIGKILL`), and the listening socket is drained before the new daemon binds. `fuser -k <port>/tcp`
       must **not** be used: it also kills every process merely *connected* to the port, including the `sshd`
       serving other workers' tunnels, which tears down their in-flight queries. A `pkill -f` on the module
       path is equally unusable, as it matches the startup shell's own command line.
+    - No client ever stops the daemon when it exits; `close()` releases only the client's own resources.
     - Startup is attempted up to `DAEMON_START_ATTEMPTS` (2) times within `DAEMON_START_TIMEOUT` (30s total),
-      so a launch that lost a lock race is retried rather than reported as unreachable.
+      so a launch that lost a lock race is retried rather than reported as unreachable; if the replacement
+      never comes up while the outdated daemon still answers, the client keeps using the outdated one.
   - Adaptive batch resolution (`mailing_list.batch_size`, default `50`; `mailing_list.request_timeout`,
     default `180` seconds): each `POST /resolve_batch` carries `budget_s` at 80% of the socket timeout so the
     daemon replies with partial results first. Commits reported `pending` are re-queued in half-size chunks
@@ -1719,8 +1737,9 @@ webapp only reads them (`webapp/API_ENDPOINTS.md` §4.11).
   (`CVE_RELEASE_FORMAT = 1`), storing matching `(segment_id, cve_id) -> (state, basis, fixed_here)` rows in
   `m_cve_release` and each segment's evaluated `cve_head` (plus `tag_hash`, `cve_layout`, `cve_format`,
   `rel_format`, and `max_segment_id`, the repository's highest `m_release_segment.segment_id` at evaluation) in
-  `m_cve_release_state` inside batched atomic transactions (executed concurrently across worker connections when
-  the database engine supports `CAP_CONCURRENT_CONNECTIONS`). When `m_cve_source.head` advances
+  `m_cve_release_state` inside batched atomic transactions (executed concurrently by forked worker processes, each on
+  its own engine from `worker_engine_factory(db)`, when the database engine supports `CAP_CONCURRENT_CONNECTIONS`:
+  MariaDB, file-backed SQLite). When `m_cve_source.head` advances
   from `old_head` to `new_head`, `cve_releases.sync()` diffs `old_head..new_head` via `git diff --name-only`
   (plus any CVEs whose abbreviated commit prefixes were newly resolved, and, for a segment whose
   `max_segment_id` lies below the current highest segment, the CVEs whose commits or backports/`Fixes:` relations

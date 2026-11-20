@@ -68,27 +68,63 @@ logging.getLogger("mysql.connector").setLevel(logging.WARNING)
 _LIFECYCLE_WRAPPED = "__kip_lifecycle_wrapped__"
 _LIFECYCLE_LOCK = threading.Lock()
 _LIFECYCLE_OPEN: dict[tuple[int, str], int] = {}  # (pid, engine name) -> open handles in that process
+_SUBPROCESS_QUIET_PID: int | None = None
+_QUIET_CONTEXT = threading.local()
 
 
-def note_engine_started(name: str) -> int:
+def set_subprocess_quiet(enabled: bool = True) -> None:
+    """Demote `DB_engine ... Started.` / `Closed.` logs in the current process to DEBUG."""
+    global _SUBPROCESS_QUIET_PID
+    _SUBPROCESS_QUIET_PID = os.getpid() if enabled else None
+
+
+def is_subprocess_quiet() -> bool:
+    """True when engine lifecycle logging in this process or thread context should use DEBUG instead of INFO."""
+    return _SUBPROCESS_QUIET_PID == os.getpid() or getattr(_QUIET_CONTEXT, "depth", 0) > 0
+
+
+@contextlib.contextmanager
+def subprocess_quiet() -> Iterator[None]:
+    """Context manager marking engines opened within its scope as quiet subprocess handles (DEBUG lifecycle logs)."""
+    depth = getattr(_QUIET_CONTEXT, "depth", 0)
+    _QUIET_CONTEXT.depth = depth + 1
+    try:
+        yield
+    finally:
+        _QUIET_CONTEXT.depth = depth
+
+
+def engine_open_count(name: str) -> int:
+    """Return the number of open handles of engine `name` currently tracked in this process."""
+    with _LIFECYCLE_LOCK:
+        return _LIFECYCLE_OPEN.get((os.getpid(), name), 0)
+
+
+def note_engine_started(name: str, *, quiet: bool | None = None) -> int:
     """Count one open handle of engine `name` in this process; the first one logs `DB_engine <name> Started.`.
 
+    Logs at DEBUG when `quiet` (or `is_subprocess_quiet()`) is True, else INFO.
     Returns the pid the handle belongs to (pass it back to `note_engine_closed`)."""
     pid = os.getpid()
+    is_quiet = is_subprocess_quiet() if quiet is None else quiet
     with _LIFECYCLE_LOCK:
         count = _LIFECYCLE_OPEN.get((pid, name), 0) + 1
         _LIFECYCLE_OPEN[(pid, name)] = count
     if count == 1:
-        logger.info("DB_engine %s Started.", name)
+        if is_quiet:
+            logger.debug("DB_engine %s Started.", name)
+        else:
+            logger.info("DB_engine %s Started.", name)
     return pid
 
 
-def note_engine_closed(name: str, pid: int) -> None:
+def note_engine_closed(name: str, pid: int, *, quiet: bool | None = None) -> None:
     """Release a handle counted by `note_engine_started`; the last one logs `DB_engine <name> Closed.`.
 
     A handle inherited across `fork()` (`pid` is the parent's) is ignored."""
     if pid != os.getpid():
         return
+    is_quiet = is_subprocess_quiet() if quiet is None else quiet
     with _LIFECYCLE_LOCK:
         count = _LIFECYCLE_OPEN.get((pid, name), 0) - 1
         if count > 0:
@@ -96,7 +132,10 @@ def note_engine_closed(name: str, pid: int) -> None:
         else:
             _LIFECYCLE_OPEN.pop((pid, name), None)
     if count == 0:
-        logger.info("DB_engine %s Closed.", name)
+        if is_quiet:
+            logger.debug("DB_engine %s Closed.", name)
+        else:
+            logger.info("DB_engine %s Closed.", name)
 
 
 def _engine_label(engine: BaseDBEngine) -> str:
@@ -109,7 +148,9 @@ def _wrap_lifecycle_init(init: Callable[..., None]) -> Callable[..., None]:
     def __init__(self: BaseDBEngine, *args: Any, **kwargs: Any) -> None:
         init(self, *args, **kwargs)
         if "_engine_started" not in self.__dict__:  # outermost wrapper of a super().__init__() chain counts once
-            self.__dict__["_engine_started"] = note_engine_started(_engine_label(self))
+            quiet = is_subprocess_quiet() or bool(getattr(self, "_quiet_lifecycle", False))
+            self.__dict__["_engine_quiet"] = quiet
+            self.__dict__["_engine_started"] = note_engine_started(_engine_label(self), quiet=quiet)
 
     setattr(__init__, _LIFECYCLE_WRAPPED, True)
     __init__.__wrapped__ = init  # type: ignore[attr-defined]
@@ -123,8 +164,9 @@ def _wrap_lifecycle_close(close: Callable[..., None]) -> Callable[..., None]:
             close(self)
         finally:
             pid = self.__dict__.pop("_engine_started", None)
+            quiet = bool(self.__dict__.pop("_engine_quiet", False))
             if pid is not None:
-                note_engine_closed(_engine_label(self), pid)
+                note_engine_closed(_engine_label(self), pid, quiet=(quiet or is_subprocess_quiet()))
 
     setattr(close_, _LIFECYCLE_WRAPPED, True)
     close_.__wrapped__ = close  # type: ignore[attr-defined]
@@ -370,6 +412,15 @@ class BaseDBEngine(ABC):
         """True when `name` is in `capabilities`."""
         return name in self.capabilities
 
+    def worker_factory(self) -> Callable[[], BaseDBEngine]:
+        """Picklable zero-argument constructor of a new, independent connection to this engine's database.
+
+        Worker processes (`ProcessPoolExecutor` initializers) call it to open their own engine; it holds no live handle
+        of this one. The default is the engine class itself, for engines configured from the environment (`MariaDB`).
+        Engines whose connection depends on constructor arguments override it.
+        """
+        return type(self)
+
     @classmethod
     def probe_connection(cls, cfg: Mapping[str, Any]) -> ProbeResult:
         """Try to connect with the `database` config section `cfg`; never raises. Engines override."""
@@ -448,6 +499,10 @@ class BaseDBEngine(ABC):
         Outputs:
             None.
         """
+
+    def ping(self) -> bool:
+        """Run a lightweight liveness check on this engine handle (True when live and usable)."""
+        return True
 
     @abstractmethod
     def get_next_id(self, table: Table) -> int:

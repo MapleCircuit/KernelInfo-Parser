@@ -110,6 +110,8 @@ def translate_sqlite_error(exc: BaseException) -> DBError | None:
         return ReadOnlyViolation(f"{text}; open the writer engine instead - see DB_API.md 'Webapp Read Session & Query Primitives'")
     if "closed database" in low or "unable to open database" in low or "disk i/o error" in low:
         return ConnectionLostError(text)
+    if "database is locked" in low or "database table is locked" in low:
+        return DeadlockError(text)
     return None
 
 

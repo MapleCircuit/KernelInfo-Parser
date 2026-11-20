@@ -6,14 +6,24 @@ import os
 import ssl
 import threading
 import time
+import weakref
 from collections.abc import Callable, Generator, Iterator, Sequence
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from contextlib import contextmanager, suppress
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Self
 
 import mysql.connector
 import mysql.connector.errors
 
-from db_engine.base import ColumnInfo, TableStats, note_engine_closed, note_engine_started
+from db_engine.base import (
+    BaseDBEngine,
+    ColumnInfo,
+    TableStats,
+    engine_open_count,
+    note_engine_closed,
+    note_engine_started,
+    set_subprocess_quiet,
+)
 from db_engine.errors import ConnectionLostError, ReadOnlyViolation
 from db_engine.read_intents import ReadIntents
 from db_engine.spec import (
@@ -64,9 +74,313 @@ if not hasattr(ssl, "wrap_socket"):
     ssl.wrap_socket = _compat_wrap_socket
 
 logger = logging.getLogger(__name__)
+_db_logger = logging.getLogger("kernelinfo.db_engine")
 
 POOL_WAIT_S = 10.0
 POOL_SIZE = 32
+
+_ENGINE_POOLS_LOCK = threading.Lock()
+_ENGINE_POOLS: weakref.WeakSet[EnginePool] = weakref.WeakSet()
+
+
+def _snapshot_engine_pools() -> list[EnginePool]:
+    with _ENGINE_POOLS_LOCK:
+        pools = list(_ENGINE_POOLS)
+    pools.sort(key=id)
+    return pools
+
+
+def _before_fork_engine_pools() -> None:
+    for pool in _snapshot_engine_pools():
+        pool._lock.acquire()
+
+
+def _after_fork_parent_engine_pools() -> None:
+    for pool in reversed(_snapshot_engine_pools()):
+        with suppress(RuntimeError):
+            pool._lock.release()
+
+
+def _after_fork_child_engine_pools() -> None:
+    any_active = False
+    for pool in reversed(_snapshot_engine_pools()):
+        if not pool._closed:
+            any_active = True
+        pool._reset_after_fork()
+        with suppress(RuntimeError):
+            pool._lock.release()
+    if any_active:
+        set_subprocess_quiet(True)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork_engine_pools,
+        after_in_parent=_after_fork_parent_engine_pools,
+        after_in_child=_after_fork_child_engine_pools,
+    )
+
+
+class EnginePool:
+    """Thread-safe, fork-safe pool of reusable `BaseDBEngine` instances for the parent process."""
+
+    def __init__(self, factory: Callable[[], BaseDBEngine], max_size: int = POOL_SIZE) -> None:
+        self._factory = factory
+        self.max_size = max(1, int(max_size))
+        self._idle: list[BaseDBEngine] = []
+        self._leased: set[BaseDBEngine] = set()
+        # Forked child only: the parent's handles, kept referenced and never used or closed here
+        self._inherited: list[BaseDBEngine] = []
+        self._lock = threading.Lock()
+        self._closed = False
+        self._owner_pid = os.getpid()
+        self._forked_child = False
+        with _ENGINE_POOLS_LOCK:
+            _ENGINE_POOLS.add(self)
+
+    @property
+    def idle_count(self) -> int:
+        with self._lock:
+            return len(self._idle)
+
+    @property
+    def leased_count(self) -> int:
+        with self._lock:
+            return len(self._leased)
+
+    def _reset_after_fork(self) -> None:
+        """Set aside parent-inherited handles in a forked child without closing or finalizing them.
+
+        The handles stay referenced (`_inherited`) until the child exits: a finalized driver connection may
+        shut its socket down, which ends the session the parent keeps using over the same connection.
+        """
+        self._inherited.extend(self._idle)
+        self._inherited.extend(self._leased)
+        self._idle.clear()
+        self._leased.clear()
+        self._forked_child = True
+        self._owner_pid = os.getpid()
+
+    @staticmethod
+    def _engine_label(engine: Any) -> str:
+        cls = type(engine)
+        display = getattr(cls, "display_name", "database")
+        return display if display != BaseDBEngine.display_name else cls.__name__
+
+    def _attach_pool(self, engine: Any) -> None:
+        with suppress(Exception):
+            engine._engine_pool = self
+
+    @staticmethod
+    def _detach_pool(engine: Any) -> None:
+        with suppress(Exception):
+            if getattr(engine, "_engine_pool", None) is not None:
+                engine._engine_pool = None
+
+    @staticmethod
+    def _close_quietly(engine: Any) -> None:
+        EnginePool._detach_pool(engine)
+        with suppress(Exception):
+            engine.close()
+
+    def acquire(self) -> BaseDBEngine:
+        """Return a live `BaseDBEngine` from the pool, running a liveness check before reuse."""
+        if self._forked_child or os.getpid() != self._owner_pid:
+            return self._factory()
+
+        saw_dead = False
+        while True:
+            candidate: BaseDBEngine | None = None
+            with self._lock:
+                if self._closed:
+                    raise ConnectionLostError("Engine pool is closed")
+                if self._idle:
+                    candidate = self._idle.pop()
+
+            if candidate is None:
+                engine = self._factory()
+                self._attach_pool(engine)
+                label = self._engine_label(engine)
+                if saw_dead and engine_open_count(label) != 1:
+                    _db_logger.info("DB_engine %s Started. (reconnected)", label)
+                with self._lock:
+                    if self._closed:
+                        should_close = True
+                    else:
+                        self._leased.add(engine)
+                        should_close = False
+                if should_close:
+                    self._close_quietly(engine)
+                    raise ConnectionLostError("Engine pool is closed")
+                return engine
+
+            label = self._engine_label(candidate)
+            alive = False
+            try:
+                alive = bool(candidate.ping())
+            except Exception:
+                alive = False
+
+            if alive:
+                _db_logger.debug("Reusing pooled DB_engine %s after liveness check.", label)
+                self._attach_pool(candidate)
+                with self._lock:
+                    if self._closed:
+                        should_close = True
+                    else:
+                        self._leased.add(candidate)
+                        should_close = False
+                if should_close:
+                    self._close_quietly(candidate)
+                    raise ConnectionLostError("Engine pool is closed")
+                return candidate
+
+            saw_dead = True
+            _db_logger.debug("Pooled DB_engine %s failed liveness check; closing and reconnecting.", label)
+            self._close_quietly(candidate)
+
+    def release(self, engine: BaseDBEngine | None, *, broken: bool = False) -> None:
+        """Return `engine` to the idle pool, or close it if broken, over capacity, or pool closed."""
+        if engine is None:
+            return
+        if self._forked_child or os.getpid() != self._owner_pid:
+            if any(engine is inherited for inherited in self._inherited):
+                return
+            pid = getattr(engine, "_pid", None)
+            if pid is None or pid == os.getpid():
+                self._close_quietly(engine)
+            return
+
+        if getattr(engine, "_in_txn", False):
+            broken = True
+
+        with self._lock:
+            self._leased.discard(engine)
+            should_close = self._closed or broken or len(self._idle) >= self.max_size
+            if not should_close:
+                self._idle.append(engine)
+                _db_logger.debug(
+                    "Returned DB_engine %s to pool (%d idle).",
+                    self._engine_label(engine),
+                    len(self._idle),
+                )
+                return
+
+        self._close_quietly(engine)
+
+    def lease(self) -> PooledEngineLease:
+        """Acquire a pooled engine wrapped in a context-manager/closeable lease handle."""
+        return PooledEngineLease(self, self.acquire())
+
+    def close(self) -> None:
+        """Cleanly close all pooled (idle and any remaining leased) engine instances."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            engines = list(self._idle) + list(self._leased)
+            self._idle.clear()
+            self._leased.clear()
+        for engine in engines:
+            self._close_quietly(engine)
+
+
+class PooledEngineLease:
+    """Context-manager and closeable handle returning its `BaseDBEngine` to `EnginePool` on exit/close."""
+
+    def __init__(self, pool: EnginePool, engine: BaseDBEngine) -> None:
+        self._pool = pool
+        self._engine: BaseDBEngine | None = engine
+        self._released = False
+        self._lock = threading.Lock()
+
+    def _active_engine(self) -> BaseDBEngine:
+        engine = self._engine
+        if engine is None or self._released:
+            raise ConnectionLostError("Database engine lease has already been closed")
+        return engine
+
+    def __enter__(self) -> Self:
+        self._active_engine().__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        engine = self._engine
+        if engine is None or self._released:
+            return
+        broken = False
+        try:
+            engine.__exit__(exc_type, exc_val, exc_tb)
+        except Exception:
+            broken = True
+        if exc_val is not None and isinstance(exc_val, (ConnectionLostError, ConnectionError, OSError)):
+            broken = True
+        if getattr(engine, "_in_txn", False):
+            broken = True
+        self.close(broken=broken)
+
+    def close(self, *, broken: bool = False) -> None:
+        """Return the underlying `BaseDBEngine` to its `EnginePool` (idempotent)."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            engine, self._engine = self._engine, None
+        self._pool.release(engine, broken=broken)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._active_engine(), name)
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            if not getattr(self, "_released", True) and getattr(self, "_pool", None) is not None:
+                self.close()
+
+
+class PooledEngineFactory:
+    """Callable drop-in replacement for a `BaseDBEngine` class backed by a parent-process `EnginePool`."""
+
+    def __init__(
+        self,
+        engine_class: type[BaseDBEngine] | Callable[[], BaseDBEngine],
+        max_size: int = POOL_SIZE,
+    ) -> None:
+        self.engine_class = engine_class
+        self.pool = EnginePool(engine_class, max_size=max_size)
+
+    def __call__(self) -> Any:
+        if self.pool._forked_child or os.getpid() != self.pool._owner_pid:
+            return self.engine_class()
+        return self.pool.lease()
+
+    def close(self) -> None:
+        """Close all pooled engine instances owned by this factory."""
+        self.pool.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.engine_class, name)
+
+
+def pooled_engine(
+    engine_class: type[BaseDBEngine] | Callable[[], BaseDBEngine],
+    max_size: int = POOL_SIZE,
+) -> PooledEngineFactory:
+    """Wrap `engine_class` in a parent-process `PooledEngineFactory` (idempotent)."""
+    if isinstance(engine_class, PooledEngineFactory):
+        return engine_class
+    return PooledEngineFactory(engine_class, max_size=max_size)
+
+
+def close_engine_pools() -> None:
+    """Close every active parent-process `EnginePool`."""
+    for pool in _snapshot_engine_pools():
+        with suppress(Exception):
+            pool.close()
 
 
 class ConnectionPool:

@@ -119,11 +119,16 @@ class MariaDBIndexes:
 
         def _worker_create(item: tuple[str, Table, tuple[PointerType, ...]]) -> None:
             idx_name, tbl, rows = item
-            worker_db = self.__class__()
+            worker_db = self._lease_writer() if hasattr(self, "_lease_writer") else self.__class__()
+            ok = False
             try:
                 worker_db.create_index(idx_name, tbl, rows)
+                ok = True
             finally:
-                worker_db.close()
+                if hasattr(self, "_release_writer"):
+                    self._release_writer(worker_db, ok)
+                else:
+                    worker_db.close()
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             list(executor.map(_worker_create, indexes))
@@ -155,11 +160,16 @@ class MariaDBIndexes:
 
         def _worker_remove(item: tuple[str, Table]) -> None:
             idx_name, tbl = item
-            worker_db = self.__class__()
+            worker_db = self._lease_writer() if hasattr(self, "_lease_writer") else self.__class__()
+            ok = False
             try:
                 worker_db.remove_index(idx_name, tbl)
+                ok = True
             finally:
-                worker_db.close()
+                if hasattr(self, "_release_writer"):
+                    self._release_writer(worker_db, ok)
+                else:
+                    worker_db.close()
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             list(executor.map(_worker_remove, indexes))

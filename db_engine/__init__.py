@@ -7,6 +7,7 @@ Exports:
     - DBError / UnsupportedOperation: Neutral exceptions raised by drivers (`db_engine/errors.py`).
     - MockDB: Fast in-memory database driver for isolated unit testing.
     - get_db_engine: Factory function to retrieve engine class by name.
+    - worker_engine_factory: Standalone-engine constructor for worker processes (unwraps pool leases/factories).
 """
 from __future__ import annotations
 
@@ -24,6 +25,9 @@ from db_engine.base import (
     CAP_PERSISTENT,
     CAP_SERVER_TUNING,
     tuning_note_is_warning,
+    is_subprocess_quiet,
+    set_subprocess_quiet,
+    subprocess_quiet,
 )
 from db_engine.errors import (
     ConnectionLostError,
@@ -54,15 +58,31 @@ except ModuleNotFoundError as exc:
 from db_engine.mock_db import MockDB, MockReadSession
 
 try:
-    from db_engine.pool import PoolConfigError, ReadAPI, ReadSession, configure_pool, get_db_reader
+    from db_engine.pool import (
+        EnginePool,
+        PoolConfigError,
+        PooledEngineFactory,
+        PooledEngineLease,
+        ReadAPI,
+        ReadSession,
+        close_engine_pools,
+        configure_pool,
+        get_db_reader,
+        pooled_engine,
+    )
 except ModuleNotFoundError as exc:
     if not _is_missing_mysql(exc):
         raise
+    EnginePool = None  # type: ignore[assignment]
     PoolConfigError = ConfigurationError  # type: ignore[assignment]
+    PooledEngineFactory = None  # type: ignore[assignment]
+    PooledEngineLease = None  # type: ignore[assignment]
     ReadAPI = None  # type: ignore[assignment]
     ReadSession = None  # type: ignore[assignment]
+    close_engine_pools = None  # type: ignore[assignment]
     configure_pool = None  # type: ignore[assignment]
     get_db_reader = None  # type: ignore[assignment]
+    pooled_engine = None  # type: ignore[assignment]
 from db_engine.spec import (
     Agg,
     AnyOf,
@@ -197,8 +217,34 @@ def get_db_engine(name: str | None = None) -> type[BaseDBEngine]:
     return DB_ENGINES[key]
 
 
+def worker_engine_factory(db: Any) -> Any:
+    """Zero-argument constructor of a standalone engine on the same database as `db`, for a worker process.
+
+    `db` is an engine instance or a `PooledEngineLease` (its `BaseDBEngine.worker_factory()`: the engine class, or
+    e.g. a `SQLiteDB` bound to the same file), an engine class, or a `PooledEngineFactory` (its `engine_class`);
+    never a pool wrapper that needs constructor arguments. Picklable whenever the engine class is importable.
+    """
+    if PooledEngineFactory is not None and isinstance(db, PooledEngineFactory):
+        return worker_engine_factory(db.engine_class)
+    if isinstance(db, type):
+        return db
+    if isinstance(db, BaseDBEngine) or (PooledEngineLease is not None and isinstance(db, PooledEngineLease)):
+        return db.worker_factory()
+    if callable(db):
+        return db
+    raise TypeError(f"worker_engine_factory() needs a DB engine, engine class, lease or factory, not {type(db).__name__}")
+
+
 __all__ = [
     "PoolConfigError",
+    "EnginePool",
+    "PooledEngineFactory",
+    "PooledEngineLease",
+    "pooled_engine",
+    "close_engine_pools",
+    "is_subprocess_quiet",
+    "set_subprocess_quiet",
+    "subprocess_quiet",
     "configure_pool",
     "DEF_ID_FLAG",
     "KIND_DEFS",
@@ -262,6 +308,7 @@ __all__ = [
     "ReadSession",
     "get_db_reader",
     "get_db_engine",
+    "worker_engine_factory",
     "DB_ENGINES",
     "Source",
     "Where",

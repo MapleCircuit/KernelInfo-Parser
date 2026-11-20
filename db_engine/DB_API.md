@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L612]
-  - 2.1. Lifecycle, Session & Health [L150-L222]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L223-L270]
-  - 2.3. Multi-Table Relational Views [L271-L280]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L281-L319]
-  - 2.5. DDL & Index Management [L320-L361]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L362-L412]
-  - 2.7. Spec Read Primitives [L413-L440]
-  - 2.8. Spec Write Primitives [L441-L457]
-  - 2.9. Catalog & Server Introspection [L458-L473]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L474-L490]
-  - 2.11. Pipeline Intent Methods [L491-L508]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L509-L534]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L535-L546]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L547-L554]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L555-L612]
-- 3. Factory Resolver (`get_db_engine`) [L613-L634]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L635-L661]
+- 2. Core Method Specifications [L148-L622]
+  - 2.1. Lifecycle, Session & Health [L150-L229]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L230-L277]
+  - 2.3. Multi-Table Relational Views [L278-L287]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L288-L326]
+  - 2.5. DDL & Index Management [L327-L368]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L369-L419]
+  - 2.7. Spec Read Primitives [L420-L447]
+  - 2.8. Spec Write Primitives [L448-L464]
+  - 2.9. Catalog & Server Introspection [L465-L480]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L481-L497]
+  - 2.11. Pipeline Intent Methods [L498-L515]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L516-L541]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L542-L553]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L554-L561]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L562-L622]
+- 3. Factory Resolver (`get_db_engine`) [L623-L644]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L645-L671]
 <!-- toc:end -->
 
 ---
@@ -116,7 +116,7 @@ keeping a `failed_table_ids` attribute on the neutral error; `transaction()` tra
 | `persistent` (`CAP_PERSISTENT`) | Data outlives the process; DB-only maintenance steps (layout checks, backfills over stored rows) make sense. | yes | no | file only |
 | `server_tuning` (`CAP_SERVER_TUNING`) | `apply_server_tuning()` can change server variables. | yes | no | no |
 | `background_commit` (`CAP_BACKGROUND_COMMIT`) | `commit_tables_parallel(dedicated=True)` may run on a writer thread (mirrors `supports_background_commit`). | yes | no | no |
-| `concurrent_connections` (`CAP_CONCURRENT_CONNECTIONS`) | Independent connections see one database (parallel workers, reader pool). | yes | no | no |
+| `concurrent_connections` (`CAP_CONCURRENT_CONNECTIONS`) | Independent connections see one database (parallel workers, reader pool). | yes | no | file only |
 
 Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` dialect of the engine) and
 `default_socket_paths` (local server socket candidates; `MariaDB`: `/run/mysqld/mysqld.sock`,
@@ -159,14 +159,18 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - Context manager lifecycle; rolls back pending transaction on unhandled exception.
 - **`close() -> None`**
   - Safely releases cursor and database connection socket handles.
+- **`ping() -> bool`**
+  - Lightweight connection liveness check (`True` when live and usable, `False` when closed or dead). `MariaDB` issues `COM_PING` (`cnx.ping(reconnect=False)`) and ensures `_pid == os.getpid()`; `SQLiteDB` / `MockDB` check `SELECT 1`.
 - **Lifecycle logging** *(all engines, `BaseDBEngine.__init_subclass__`, `note_engine_started` / `note_engine_closed`)*
   - Open engine handles are counted per process and engine name: the first successful `__init__` logs one `INFO` line
     `DB_engine <name> Started.`, and the `close()` that releases the last handle logs `DB_engine <name> Closed.` (repeat
     `close()` calls stay silent). Helper connections opened while another handle is live (`create_indexes` /
-    `remove_indexes` workers, per-session SQLite readers) therefore log nothing, and each forked worker process logs its
-    own pair. The webapp reader pool (`db_engine/pool.py`) counts as one `MariaDB` handle from its first connection to
+    `remove_indexes` workers, per-session SQLite readers) therefore log nothing. The webapp reader pool (`db_engine/pool.py`) counts as one `MariaDB` handle from its first connection to
     `close_db_pool()`; pooled `ReadSession`s do not count. `<name>` is the engine's `display_name`, or its class name when
     it keeps the base default (`MariaDB`).
+  - **Subprocess log demotion**: `subprocess_quiet()` (context manager, used by `TableEngine.start_new_db(..., is_worker=True)`) and `set_subprocess_quiet(True)` (automatically set in forked children by `EnginePool` fork hooks) demote `DB_engine <name> Started.` / `Closed.` in worker subprocesses from `INFO` to `DEBUG`.
+  - **Parent-process `EnginePool`** (`db_engine/pool.py`, exported via `pooled_engine`, `close_engine_pools`, `EnginePool`, `PooledEngineFactory`, `PooledEngineLease`): wraps `G.DB` in `main.py` so parent-process `with G.DB() as db:`, `TableEngine` handles, and `MariaDB._lease_writer()` parallel commit/index workers reuse live `DB_engine` instances across stages and versions. Each checkout runs `ping()` (recreating/reconnecting dead handles automatically and logging reconnects at `INFO`, while routine reuse logs at `DEBUG`). `os.register_at_fork` protects pool locks across `fork()`; in a child the pool keeps the inherited handles referenced (`_inherited`) and never reuses, releases or closes them, since a finalized `mysql.connector` socket runs `shutdown(SHUT_RDWR)` on the connection the parent shares; `close_engine_pools()` closes every pooled handle at shutdown (`main._shutdown_runtime()`).
+  - **Worker-process engines**: `BaseDBEngine.worker_factory()` returns a picklable zero-argument constructor of a new, independent connection to the same database (default: the engine class, configured from the environment like `MariaDB`; `SQLiteDB`: the same file). `worker_engine_factory(db)` accepts an engine, a `PooledEngineLease` (forwarded to its engine's `worker_factory()`), an engine class or a `PooledEngineFactory` (its `engine_class`). `ProcessPoolExecutor` initializers receive it instead of `type(db)`, since a lease wraps a parent-process pool and cannot be constructed in a child; they close the worker's engine through `multiprocessing.util.Finalize(..., exitpriority=...)`, which runs when a worker exits cleanly on every supported Python (plain `atexit` hooks of forked children run only from 3.14 on).
   - `close()` is the public shutdown. MariaDB's drop-and-retry paths (`check_if_connected`, `_reconnect`, connection-lost
     retries in writes and `reserve_id_block`) release the socket through the private `_drop_connection()`, which leaves
     the lifecycle count unchanged.
@@ -190,8 +194,11 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - A connection that completed a statement within `IDLE_PING_S` (30 s) is used without any round trip; an idle
     one is checked with one `ping()`. A missing or dead connection is replaced (`_reconnect()`: new connection,
     new cursor, `_init_session()`, up to 3 attempts, then `ConnectionLostError`), so a new session always has
-    `sql_mode` and the disabled checks. A forked child drops the connection it inherited without closing it (that
-    would end the parent's session) and opens its own.
+    `sql_mode` and the disabled checks. A forked child releases every connection it inherited (`_release_if_inherited()`, also run for all
+    live instances by an `os.register_at_fork` child hook and by `close()` / `_drop_connection()`): it closes only
+    the child's copy of the socket descriptor, with no COM_QUIT and no `shutdown()` (either would end the parent's
+    session, whose next statement then fails with `2055 ... Broken pipe`), keeps the handle objects referenced until
+    the child exits, and opens its own connection on first use.
   - Inside `transaction()` it checks nothing: a dead connection makes the next statement fail, the server has
     already rolled the transaction back, and the caller retries all of it.
   - Reads (`select`, `select_in`, `select_preload`, `table_size`, `get_next_id`, `view_select*`, `test_tables`,
@@ -573,11 +580,14 @@ catalog introspection, `new_checkpoint_pairs`, `enqueue_parse_tasks`, `record_ta
   every write raises `ReadOnlyViolation`) over a fresh `mode=ro` + `query_only` connection of the same file (the instance
   itself for an in-memory database). `SQLiteDB.reader()` on the class uses a process-wide read-only connection to the
   configured path (`warm_up()` opens it, `shutdown()` closes it; a private `:memory:` database has none).
-- **Capabilities**: `persistent` for files only; no `server_tuning`, `background_commit` or
-  `concurrent_connections` (SQLite serializes writers). `probe_connection(cfg)` reports the SQLite version and never creates the file.
+- **Capabilities**: `persistent` and `concurrent_connections` for files only (WAL readers never wait; writers serialize on
+  `BEGIN IMMEDIATE` / `busy_timeout`); no `server_tuning` or `background_commit`. `worker_factory()` returns
+  `functools.partial(type(db), <absolute path bound at open>, read_only=..., foreign_keys=..., timeout=...)`, so a worker
+  process reopens the same file whatever its working directory; an in-memory database raises `UnsupportedOperation`. `probe_connection(cfg)` reports the SQLite version and never creates the file.
 - **Errors**: `translate_sqlite_error(exc)`: UNIQUE / PRIMARY KEY violation -> `DuplicateKeyError`, "no such table" ->
   `MissingTableError`, "too many SQL variables" -> `PacketTooLargeError`, read-only database -> `ReadOnlyViolation`,
-  closed / unreadable database -> `ConnectionLostError`; anything else is a `DBError`.
+  closed / unreadable database -> `ConnectionLostError`, "database is locked" (a write lock still held after
+  `timeout`) -> `DeadlockError`; anything else is a `DBError`.
 - **Backend differences** (everything else is behind the contract in `unit_test/test_db_contract.py`): an upsert conflicts on any unique key, a legacy `update()` on primary key and unique keys alike; integer widths and `UNSIGNED` are not enforced; `BINARY(n)` is an unpadded BLOB; `view_select` joins above 64 tables are unsupported (MariaDB chunks at 50); `table_stats` bytes need the `dbstat` virtual table (0 when absent); legacy raw SQL must be SQLite-valid (`%s` placeholders are rewritten to `?`); `hint="straight_join"` is ignored; registry views (`m_symbol_def`, ...) exist after `ensure_views()` and read the tables they join. Assignment order, NULL comparison, affected-row counts and alias validation are uniform and not listed here.
 
 **MockDB** (`db_engine/mock_db.py`, `from db_engine import MockDB`; factory names `"mock"`, `"mockdb"`, `"inmemory"`)

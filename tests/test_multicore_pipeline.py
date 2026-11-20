@@ -1000,5 +1000,196 @@ class TestUnifiedPreparsePool(unittest.TestCase):
         self.assertEqual(calls, [2, 3])
 
 
+def _quiet_logging_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
+    """Real forked worker invoking `G.TE.start_new_db(G.DB, is_worker=True)` and reporting lifecycle logs."""
+    import logging
+
+    records: list[tuple[int, str]] = []
+
+    class _MemHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append((record.levelno, record.getMessage()))
+
+    db_log = logging.getLogger("kernelinfo.db_engine")
+    old_level = db_log.level
+    db_log.setLevel(logging.DEBUG)
+    handler = _MemHandler()
+    db_log.addHandler(handler)
+    try:
+        G.TE.start_new_db(G.DB, is_worker=True)
+        try:
+            while True:
+                task = pipeline.worker_protocol._recv_task(conn)
+                if task is None:
+                    break
+                batch_id, files = task
+                conn.send_bytes(
+                    pipeline.worker_protocol._encode_batch_result(
+                        batch_id, {f: records[:] for f in files}, [], compress=False
+                    )
+                )
+        finally:
+            if getattr(G.TE, "db", None) is not None:
+                G.TE.db.close()
+                G.TE.db = None
+        # Also test a direct G.DB() inside the forked child
+        with G.DB() as child_db:
+            child_db.ping()
+        conn.send_bytes(pipeline.worker_protocol._FRAME_DONE + pickle.dumps({"worker_logs": records}))
+        conn.close()
+    finally:
+        db_log.removeHandler(handler)
+        db_log.setLevel(old_level)
+
+
+class TestParentPoolAndWorkerLogging(unittest.TestCase):
+    """Parent DB_engine pooling across stages/versions and muted worker subprocess lifecycle logs."""
+
+    def test_parent_reuses_db_engine_across_stages_and_versions(self) -> None:
+        import logging
+        from db_engine import close_engine_pools, pooled_engine
+        from table_engine import TEDirectDB
+
+        counts = {"init": 0, "ping": 0, "close": 0}
+
+        class _TrackedMockDB(MockDB):
+            display_name = "TrackedMock"
+
+            def __init__(self) -> None:
+                counts["init"] += 1
+                super().__init__(use_global=True)
+
+            def ping(self) -> bool:
+                counts["ping"] += 1
+                return super().ping()
+
+            def close(self) -> None:
+                counts["close"] += 1
+                super().close()
+
+        saved = (G.DB, G.TE)
+        MockDB.reset()
+        factory = pooled_engine(_TrackedMockDB)
+        G.DB = factory
+        G.TE = TEDirectDB()
+        try:
+            with self.assertLogs("kernelinfo.db_engine", level=logging.DEBUG) as logs:
+                for _version in range(2):
+                    with G.DB() as db:
+                        self.assertTrue(db.ping())
+                    G.TE.start([m_ast], G.DB)
+                    for _stage in range(2):
+                        pipeline.worker_stage._run_worker_stage(
+                            "[test-stage]", [(0, ["a.c"])], lambda b: None, 1, [], worker_target=_crashing_worker
+                        )
+                        self.assertIsNotNone(G.TE.db)
+                    G.TE.close()
+                self.assertEqual(counts["init"], 1)
+                self.assertEqual(counts["close"], 0)
+                self.assertGreaterEqual(counts["ping"], 7)
+                close_engine_pools()
+
+            self.assertEqual(counts["close"], 1)
+            info_msgs = [r.getMessage() for r in logs.records if r.levelno == logging.INFO]
+            self.assertEqual(info_msgs, ["DB_engine TrackedMock Started.", "DB_engine TrackedMock Closed."])
+        finally:
+            try:
+                G.TE.close()
+            except Exception:
+                pass
+            close_engine_pools()
+            G.DB, G.TE = saved
+            MockDB.reset()
+
+    def test_forked_worker_mutes_db_engine_logs_and_keeps_parent_pool_alive(self) -> None:
+        import logging
+        from db_engine import close_engine_pools, pooled_engine
+        from table_engine import TEDirectDB
+
+        parent_events: list[str] = []
+
+        class _ForkSafeMockDB(MockDB):
+            display_name = "ForkSafeMock"
+
+            def __init__(self) -> None:
+                self._created_pid = os.getpid()
+                parent_events.append(f"init:{os.getpid()}")
+                super().__init__(use_global=True)
+
+            def close(self) -> None:
+                if os.getpid() == self._created_pid:
+                    parent_events.append(f"close:{os.getpid()}")
+                super().close()
+
+        saved = (G.DB, G.TE)
+        MockDB.reset()
+        factory = pooled_engine(_ForkSafeMockDB)
+        G.DB = factory
+        G.TE = TEDirectDB()
+        try:
+            with self.assertLogs("kernelinfo.db_engine", level=logging.INFO) as parent_logs:
+                G.TE.start([m_ast], G.DB)
+                ingested: dict[str, list[tuple[int, str]]] = {}
+                errors: list = []
+                pipeline.worker_stage._run_worker_stage(
+                    "[quiet-worker]",
+                    [(0, ["a.c"])],
+                    ingested.update,
+                    1,
+                    errors,
+                    worker_target=_quiet_logging_worker,
+                )
+                self.assertEqual(errors, [])
+                self.assertEqual(parent_events, [f"init:{os.getpid()}"])
+                self.assertTrue(G.TE.db.ping())
+                G.TE.close()
+                close_engine_pools()
+
+            self.assertEqual(parent_events, [f"init:{os.getpid()}", f"close:{os.getpid()}"])
+            parent_info = [r.getMessage() for r in parent_logs.records if r.levelno == logging.INFO]
+            self.assertEqual(parent_info, ["DB_engine ForkSafeMock Started.", "DB_engine ForkSafeMock Closed."])
+
+            worker_records = ingested["a.c"]
+            worker_info = [msg for lvl, msg in worker_records if lvl >= logging.INFO and "DB_engine" in msg]
+            worker_debug = [msg for lvl, msg in worker_records if lvl == logging.DEBUG and "DB_engine" in msg]
+            self.assertEqual(worker_info, [])
+            self.assertIn("DB_engine ForkSafeMock Started.", worker_debug)
+        finally:
+            try:
+                G.TE.close()
+            except Exception:
+                pass
+            close_engine_pools()
+            G.DB, G.TE = saved
+            MockDB.reset()
+
+    def test_main_shutdown_runtime_unregisters_node_before_closing_pools(self) -> None:
+        from db_engine import close_engine_pools, pooled_engine
+
+        saved = (G.DB, G.TE, getattr(G, "node_id", None), getattr(G, "heartbeat_daemon", None), getattr(G, "singleton_lock", None))
+        events: list[str] = []
+
+        class _ShutdownMockDB(MockDB):
+            display_name = "ShutdownMock"
+
+            def close(self) -> None:
+                events.append("pool_close")
+                super().close()
+
+        G.DB = pooled_engine(_ShutdownMockDB)
+        G.TE = _RecordingTE()
+        G.node_id = "node-test"
+        try:
+            with G.DB():
+                pass
+            with mock.patch("main.distributed.unregister_node", side_effect=lambda db, nid: events.append(f"unregister:{nid}")):
+                main._shutdown_runtime()
+            self.assertEqual(events, ["unregister:node-test", "pool_close"])
+            self.assertIs(G.DB, _ShutdownMockDB)
+        finally:
+            close_engine_pools()
+            G.DB, G.TE, G.node_id, G.heartbeat_daemon, G.singleton_lock = saved
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,24 +7,28 @@ leaves the class as a neutral `db_engine.errors` exception.
 
 Connection model: one connection per instance (`isolation_level=None`, i.e. autocommit unless `transaction()`
 holds a `BEGIN`), guarded by an `RLock` so an instance may be shared by threads. File databases run in WAL mode,
-so any number of read-only sessions (`reader()`) work while a writer is active. A `":memory:"` database is private
+so any number of read-only sessions (`reader()`) work while a writer is active, and independent connections (worker
+processes opened through `worker_factory()`) share the file (`CAP_CONCURRENT_CONNECTIONS`): writers serialize on
+`BEGIN IMMEDIATE` / `busy_timeout`, and a lock still held after `timeout` raises the retryable `DeadlockError`. A `":memory:"` database is private
 to its instance; `":memory:shared"` opens a named shared-cache in-memory database several instances can see.
 """
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, ContextManager, Literal, Mapping, Self
 
 from core.globalstuff import JoinsType, PointerGetter, PointerType, SafeDataType
 from db_engine.base import (
+    CAP_CONCURRENT_CONNECTIONS,
     CAP_PERSISTENT,
     BaseDBEngine,
     ColumnInfo,
@@ -226,6 +230,8 @@ class SQLiteDB(BaseDBEngine):
         self.foreign_keys = foreign_keys
         self.timeout = timeout
         self.memory = self.path.startswith(":memory:")
+        # Bound now: `worker_factory()` reopens this file even after the working directory changes.
+        self._abs_path = self.path if self.memory else str(Path(self.path).resolve())
         self._lock = threading.RLock()
         self._txn_depth = 0
         self._in_txn = False
@@ -273,7 +279,28 @@ class SQLiteDB(BaseDBEngine):
         caps = set(super().capabilities)
         if self.memory:
             caps.discard(CAP_PERSISTENT)
+        else:
+            caps.add(CAP_CONCURRENT_CONNECTIONS)
         return frozenset(caps)
+
+    def worker_factory(self) -> Callable[[], SQLiteDB]:
+        """Constructor reopening this database file (absolute path as opened, same `read_only` / `foreign_keys` / `timeout`).
+
+        An in-memory database (`":memory:"`, `":memory:shared"`) lives inside this process only and raises
+        `UnsupportedOperation`. A subclass with a different constructor signature overrides it.
+        """
+        if self.memory:
+            raise UnsupportedOperation(
+                f"SQLite database {self.path!r} is in-memory and private to this process; worker processes need a "
+                "database file (see DB_API.md 'Capability Flags')"
+            )
+        return functools.partial(
+            type(self),
+            self._abs_path,
+            read_only=self.read_only,
+            foreign_keys=self.foreign_keys,
+            timeout=self.timeout,
+        )
 
     def _require_writable(self) -> None:
         if self.read_only:
@@ -334,6 +361,18 @@ class SQLiteDB(BaseDBEngine):
     ) -> None:
         if exception_type is not None:
             self.rollback()
+
+    def ping(self) -> bool:
+        """Return True if the SQLite connection is open and answers a trivial query."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return False
+            try:
+                conn.execute("SELECT 1")
+                return True
+            except Exception:
+                return False
 
     def close(self) -> None:
         with self._lock:
