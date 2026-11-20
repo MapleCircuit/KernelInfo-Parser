@@ -15,14 +15,8 @@ from parser import compile_env
 from pipeline.state import MF, gp, logger
 
 
-def _reader(root: str):
-    def read(path: str) -> str | None:
-        try:
-            with open(os.path.join(root, path), encoding="latin-1") as fh:
-                return fh.read()
-        except OSError:
-            return None
-    return read
+def _reader(root: str) -> compile_env.TreeFileReader:
+    return compile_env.TreeFileReader(root)
 
 
 def prepare_compile_env(version: str, change_lines: list[str] | None) -> compile_env.CompileEnv | None:
@@ -49,7 +43,8 @@ def prepare_compile_env(version: str, change_lines: list[str] | None) -> compile
     except BaseException:
         release_compile_env()
         raise
-    logger.info(f"[Compile Env] '{version}': ARCH {env.default_arch} (+{len(arches) - 1} file ARCHes) prepared "
+    extra_arches = len(arches - {env.default_arch})
+    logger.info(f"[Compile Env] '{version}': ARCH {env.default_arch} (+{extra_arches} file ARCHes) prepared "
                 f"in {time.perf_counter() - started:.1f}s.")
     return env
 

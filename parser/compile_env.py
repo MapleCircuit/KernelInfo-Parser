@@ -177,6 +177,19 @@ def _include_name(target: str) -> str:
     return target
 
 
+@dataclass(frozen=True)
+class TreeFileReader:
+    """Picklable file reader reading Latin-1 source files relative to `root`."""
+    root: str
+
+    def __call__(self, path: str) -> str | None:
+        try:
+            with open(os.path.join(self.root, path), encoding="latin-1") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+
 @dataclass
 class ArchEnv:
     """The build of one ARCH: layout, defconfig, target and build directory."""
@@ -381,20 +394,24 @@ class CompileEnv:
             for name in filenames:
                 files.add(name if rel == "." else f"{rel}/{name}")
 
-        def read(path: str) -> str | None:
-            try:
-                with open(os.path.join(root, path), encoding="latin-1") as fh:
-                    return fh.read()
-            except OSError:
-                return None
-
-        env = cls(root, files, read, None, key=eff_key or root, configure=configure)
+        env = cls(root, files, TreeFileReader(root), None, key=eff_key or root, configure=configure)
         with _LOCK:
             existing = _TREE_ENVS.get(cache_key)
             if existing is not None:
                 return existing
             _TREE_ENVS[cache_key] = env
         return env
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state.pop("_lock", None)
+        if not isinstance(state.get("read"), TreeFileReader):
+            state["read"] = TreeFileReader(self.root)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
     def _pick_default(self, preferred: str) -> str | None:
         for name in (preferred, "x86_64", "i386", "x86", *self.arch_values):

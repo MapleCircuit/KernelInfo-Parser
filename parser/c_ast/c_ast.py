@@ -148,6 +148,9 @@ def c_ast_parse(CS: Any) -> None:
         finish_symbol_rows(CS)
         stage_parse_diagnostics(CS)
     finally:
+        CS.compile_env = None
+        CS.compile_arch = None
+        CS.parse_diagnostics = None
         clear_tu_caches()
 
 
@@ -158,6 +161,8 @@ def stage_parse_diagnostics(CS: Any) -> None:
     fact = getattr(CS, "parse_diagnostics", None)
     blob_hash = getattr(CS, "blob_hash", None)
     CS.parse_diagnostics = None
+    CS.compile_env = None
+    CS.compile_arch = None
     if fact is None or not blob_hash or not any(blob_hash):
         return
     with CS(REF_POS):

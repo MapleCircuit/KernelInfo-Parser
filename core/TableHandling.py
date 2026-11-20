@@ -1489,7 +1489,7 @@ class ChangeSet:
         return result
 
 
-# Previous-version tag data only parsing reads: never pickled to the parent
+# Previous-version tag data and compilation environment attributes only parsing reads: never pickled to the parent
 _PARSE_ONLY_PRIOR_ATTRS = (
     "prior_tags_by_name",
     "prior_tags_by_pos",
@@ -1498,6 +1498,9 @@ _PARSE_ONLY_PRIOR_ATTRS = (
     "_prior_tags_by_pos_sorted",
     "_batch_prior_tags",
     "_batch_prior_items",
+    "compile_env",
+    "compile_arch",
+    "parse_diagnostics",
 )
 
 

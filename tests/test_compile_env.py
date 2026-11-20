@@ -234,6 +234,35 @@ class TestGeneratedHeaders(unittest.TestCase):
         self.assertIn("#define LINUX_VERSION_CODE 196608", out["include/generated/uapi/linux/version.h"])
         self.assertIn("REQUIRED_MASK_BIT_SET", out["arch/x86/include/generated/asm/cpufeaturemasks.h"])
 
+    def test_changeset_and_compile_env_pickle_cleanly(self):
+        """Worker IPC pickling succeeds after C/ASM parse and CompileEnv itself is picklable."""
+        import pickle
+        from core.TableHandling import ChangeSet
+        from pipeline.compile_envs import _reader
+
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as build:
+            with open(os.path.join(root, "Makefile"), "w") as fh:
+                fh.write("VERSION = 0\nPATCHLEVEL = 1\n")
+            with open(os.path.join(root, "main.c"), "w") as fh:
+                fh.write("int main(void) { return 0; }\n")
+            env = CompileEnv(root, {"Makefile", "main.c"}, _reader(root), build_base=build)
+            try:
+                # Even if CompileEnv itself is pickled, TreeFileReader and __getstate__ must be picklable
+                roundtripped_env = pickle.loads(pickle.dumps(env))
+                self.assertEqual(roundtripped_env.read("Makefile"), "VERSION = 0\nPATCHLEVEL = 1\n")
+
+                cs = ChangeSet("A\tmain.c")
+                cs.compile_env = env
+                cs.compile_arch = None
+                cs.parse_diagnostics = {"arch": None}
+                cs.clear_bloat()
+                self.assertIsNone(getattr(cs, "compile_env", None))
+                self.assertIsNone(getattr(cs, "compile_arch", None))
+                self.assertIsNone(getattr(cs, "parse_diagnostics", None))
+                pickle.loads(pickle.dumps(cs))
+            finally:
+                env.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

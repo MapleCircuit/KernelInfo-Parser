@@ -322,17 +322,22 @@ def asm_ast_parse(CS: ChangeSetType) -> None:
     if CS.file_operation == "R100":
         return
 
-    with CS(REF_C_AST):
-        if CS.file_operation == "A":
-            Asm_Manager(CS)
-        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
-            get_prior_tags(CS)
-            Asm_Manager(CS)
-        elif CS.file_operation == "D":
-            pass  # Tags are immutable content records: a deleted file stages nothing
-    # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
-    finish_symbol_rows(CS)
-    stage_parse_diagnostics(CS)
+    try:
+        with CS(REF_C_AST):
+            if CS.file_operation == "A":
+                Asm_Manager(CS)
+            elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
+                get_prior_tags(CS)
+                Asm_Manager(CS)
+            elif CS.file_operation == "D":
+                pass  # Tags are immutable content records: a deleted file stages nothing
+        # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
+        finish_symbol_rows(CS)
+        stage_parse_diagnostics(CS)
+    finally:
+        CS.compile_env = None
+        CS.compile_arch = None
+        CS.parse_diagnostics = None
 
 
 class Asm_Manager:
