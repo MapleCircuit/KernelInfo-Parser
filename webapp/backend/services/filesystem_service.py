@@ -4,6 +4,7 @@ from collections.abc import Iterator
 import heapq
 import logging
 import os
+import posixpath
 from webapp.backend.config import RepoScopedCache, get_repo_dir
 from typing import Any
 from fastapi import HTTPException
@@ -14,6 +15,7 @@ from webapp.backend.database.helpers import (
     format_stat_label,
     get_version_info,
 )
+from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Bounded: every key below carries a request parameter (a header, a path), so an unbounded cache
 # would grow with each distinct value a caller sends. Treemaps are whole subtrees, so fewer are kept.
 _INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = RepoScopedCache(maxsize=4096)
+_OBJECT_CACHE: dict[tuple[str, str], dict[str, Any]] = RepoScopedCache(maxsize=4096)
 _FILE_TOKENS_CACHE: dict[int, list[list[int]]] = RepoScopedCache(maxsize=512)
 _TREEMAP_CACHE: dict[tuple[str, int, str], dict[str, Any]] = RepoScopedCache(maxsize=64)
 # Only image types are served raw (documentation figures); everything else goes through get_file()
@@ -758,6 +761,82 @@ class FilesystemService:
                 "detail": f"Header '{clean_header}' not found in kernel tree.",
             }
             _INCLUDE_CACHE[cache_key] = res
+            return res
+
+    def resolve_object(
+        self,
+        version_name: str,
+        obj: str,
+        current_file: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a Makefile/Kbuild .o object target into its repository source file path."""
+        safe_rev(version_name)
+        clean_obj = (obj or "").strip().replace("\\", "/")
+        if not clean_obj:
+            raise HTTPException(status_code=400, detail="Empty object specified.")
+        if "\0" in clean_obj or clean_obj.startswith("/"):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+
+        norm_current = ""
+        if current_file:
+            if not is_safe_rel_path(current_file):
+                raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+            norm_current = posixpath.normpath(current_file.strip().replace("\\", "/")).strip("/")
+
+        cur_dir = posixpath.dirname(norm_current) if norm_current else ""
+        joined = posixpath.join(cur_dir, clean_obj) if cur_dir else clean_obj
+        norm_obj = posixpath.normpath(joined)
+        if not is_safe_rel_path(norm_obj):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+
+        cache_key = (version_name, norm_obj)
+        cached = _OBJECT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with get_reader() as reader:
+            vid, vname = get_version_info(reader, version_name)
+            if vid is None:
+                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+
+            if not norm_obj.endswith(".o") or len(norm_obj) <= 2 or norm_obj.endswith("/.o"):
+                res: dict[str, Any] = {"object": norm_obj, "path": None, "resolved": False}
+                _OBJECT_CACHE[cache_key] = res
+                return res
+
+            stem = norm_obj[:-2]
+            candidates = [f"{stem}{ext}" for ext in (".c", ".S", ".s", ".rs")]
+
+            if vid:
+                match_path = reader.checkpoint_find_file(vid, candidates)
+                if match_path:
+                    res = {
+                        "object": norm_obj,
+                        "path": safe_decode(match_path),
+                        "resolved": True,
+                        "method": "checkpoint_tree",
+                    }
+                    _OBJECT_CACHE[cache_key] = res
+                    return res
+
+            tree = git_tree_resolver.list_tree(vname or version_name) or {}
+            for cand in candidates:
+                if cand in tree:
+                    res = {
+                        "object": norm_obj,
+                        "path": cand,
+                        "resolved": True,
+                        "method": "git_tree",
+                    }
+                    _OBJECT_CACHE[cache_key] = res
+                    return res
+
+            res = {
+                "object": norm_obj,
+                "path": None,
+                "resolved": False,
+            }
+            _OBJECT_CACHE[cache_key] = res
             return res
 
 

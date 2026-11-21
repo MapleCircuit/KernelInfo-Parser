@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { HoverIntent, hoverSettings, kindLabel } from "../js/views/code_view/hover_model.js";
+import { HoverIntent, hoverSettings, hoverable, kindLabel } from "../js/views/code_view/hover_model.js";
 
 function clock() {
   let now = 0;
@@ -41,4 +41,21 @@ test("settings and labels", () => {
   assert.deepEqual(hoverSettings({ getItem: (k) => store.get(k) ?? null }), { enabled: false, delay: 450 });
   assert.equal(kindLabel("C_functionprotodecl"), "function");
   assert.equal(kindLabel("CPPro_define_macro"), "macro");
+});
+
+test("hoverable accepts Makefile CONFIG_* tokens and skips comments/objects/non-identifiers", () => {
+  const mkEl = (classes, name, textContent = name, typeId = "") => ({
+    classList: { contains: (c) => classes.includes(c) },
+    dataset: { name, ...(typeId ? { typeId } : {}) },
+    textContent
+  });
+
+  assert.equal(hoverable(mkEl(["tok-variable", "ast-token"], "CONFIG_FOO")), true);
+  assert.equal(hoverable(mkEl(["tok-variable", "ast-token"], "CONFIG_64BIT")), true);
+  assert.equal(hoverable(mkEl(["tok-variable", "ast-token"], "CONFIG_8139TOO")), true);
+  assert.equal(hoverable(mkEl(["tok-identifier", "ast-token"], "CONFIG_SMP")), true);
+
+  assert.equal(hoverable(mkEl(["tok-comment"], "CONFIG_COMMENTED")), false);
+  assert.equal(hoverable(mkEl(["tok-include", "ast-token", "ast-object"], "foo.o")), false);
+  assert.equal(hoverable(mkEl(["tok-variable"], "$(srctree)")), false);
 });

@@ -852,6 +852,17 @@ class ApiClient {
     return this.request(`/api/fs/resolve_include?${params.toString()}`, {}, "files", cacheKey);
   }
 
+  async resolveObject(version, objectPath, currentFile = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({
+      version: ver,
+      obj: objectPath || "",
+    });
+    if (currentFile) params.set("current_file", currentFile);
+    const cacheKey = `obj_res_${this._vk(ver)}_${currentFile || ""}_${objectPath || ""}`;
+    return this.request(`/api/fs/resolve_object?${params.toString()}`, {}, "files", cacheKey);
+  }
+
   async getIncludeSymbols(version, astId, options = {}) {
     const ver = this._sanitizeVer(version);
     const targetId = parseInt(astId || "0", 10);

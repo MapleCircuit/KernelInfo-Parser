@@ -606,6 +606,32 @@ export class VirtualEditor {
     this.findBar.open(selectionWithin(this.linesContainer));
   }
 
+  buildTokenData(tokenSpan, lineNo, { includeTypeClass = false } = {}) {
+    const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
+    const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
+    const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
+    const header = tokenSpan.dataset.header || "";
+    const object = tokenSpan.dataset.object || "";
+    const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
+    const isObject = tokenSpan.classList.contains("ast-object");
+    const { col } = (!isInclude && !isObject && tokenSpan.classList.contains("ast-token")) ? this.tokenPos(tokenSpan) : {};
+    return {
+      name,
+      header,
+      object,
+      isInclude,
+      isObject,
+      ast_id: astId,
+      type_id: typeId,
+      ...(includeTypeClass ? { typeClass: tokenSpan.className || "" } : {}),
+      version: this.currentVersion,
+      filePath: this.currentFilePath,
+      ftype: this.currentFtype,
+      line: lineNo,
+      ...(col ? { col } : {}),
+    };
+  }
+
   /**
    * Token the keyboard shortcuts act on (F12, Shift+F12): an identifier selected in this view, else
    * the token under the pointer. Null when there is none, or it is a comment or a directive.
@@ -626,7 +652,7 @@ export class VirtualEditor {
         if (before >= 0) col = tokenColumn(cell.textContent || "", before + r.startOffset, name);
       }
       return {
-        name, header: "", isInclude: false, ast_id: 0,
+        name, header: "", object: "", isInclude: false, isObject: false, ast_id: 0,
         type_id: text.startsWith("struct ") ? 28 : (text.startsWith("union ") ? 34 : 0),
         version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
         line, ...(col ? { col } : {}),
@@ -636,17 +662,8 @@ export class VirtualEditor {
     if (!span || !span.isConnected || !this.linesContainer.contains(span)) return null;
     if (span.classList.contains("tok-comment") || ["2", "87", "142", "143"].includes(span.dataset.typeId)) return null;
     const row = span.closest(".code-row");
-    const typeId = parseInt(span.dataset.typeId || "0", 10);
-    const name = (span.dataset.name || span.textContent || "").trim();
-    const { col } = this.tokenPos(span);
-    return {
-      name, header: span.dataset.header || "",
-      isInclude: span.classList.contains("ast-include") || typeId === 78 || name.includes(".h"),
-      ast_id: parseInt(span.dataset.astId || "0", 10), type_id: typeId, typeClass: span.className || "",
-      version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
-      line: row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1,
-      ...(col ? { col } : {}),
-    };
+    const line = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
+    return this.buildTokenData(span, line, { includeTypeClass: true });
   }
 
   /** Record view state on the tab without a history entry. */
@@ -1140,26 +1157,13 @@ export class VirtualEditor {
         e.stopPropagation();
         const row = tokenSpan.closest(".code-row");
         const lineNo = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
-        const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
-        const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
-        const name = tokenSpan.dataset.name || tokenSpan.textContent;
-        const header = tokenSpan.dataset.header || "";
-        const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
-        const { col } = this.tokenPos(tokenSpan);
+        const td = this.buildTokenData(tokenSpan, lineNo);
         // A local variable, parameter or field highlights its usages; the menu adds its scope actions
-        const scope = isInclude ? (this.occurrences.clear(), null) : this.occurrences.fromToken(tokenSpan);
+        const scope = (td.isInclude || td.isObject) ? (this.occurrences.clear(), null) : this.occurrences.fromToken(tokenSpan);
 
         contextMenu.show(e.clientX, e.clientY, {
-          name,
-          header,
-          isInclude,
-          ast_id: astId,
-          type_id: typeId,
-          version: this.currentVersion,
-          filePath: this.currentFilePath,
-          ftype: this.currentFtype,
-          line: lineNo,
-          ...(col ? { col, scope, highlight: (s) => this.occurrences.set(s, name) } : {}),
+          ...td,
+          ...(td.col ? { scope, highlight: (s) => this.occurrences.set(s, td.name) } : {}),
         });
       }
     });
@@ -1178,25 +1182,7 @@ export class VirtualEditor {
         e.stopPropagation();
         const row = tokenSpan.closest(".code-row");
         const lineNo = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
-        const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
-        const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
-        const name = tokenSpan.dataset.name || tokenSpan.textContent;
-        const header = tokenSpan.dataset.header || "";
-        const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
-
-        const { col } = this.tokenPos(tokenSpan);
-        contextMenu.executeDefaultAction({
-          name,
-          header,
-          isInclude,
-          ast_id: astId,
-          type_id: typeId,
-          version: this.currentVersion,
-          filePath: this.currentFilePath,
-          ftype: this.currentFtype,
-          line: lineNo,
-          ...(col ? { col } : {}),
-        }, { forceNew: true });
+        contextMenu.executeDefaultAction(this.buildTokenData(tokenSpan, lineNo), { forceNew: true });
       }
     });
 
@@ -1266,24 +1252,10 @@ export class VirtualEditor {
       }
 
       if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2" && tokenSpan.dataset.typeId !== "87" && tokenSpan.dataset.typeId !== "142" && tokenSpan.dataset.typeId !== "143") {
-        const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
-        const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
-        const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
-        const header = tokenSpan.dataset.header || "";
-        const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
-        const { col } = tokenSpan.classList.contains("ast-token") ? this.tokenPos(tokenSpan) : {};
+        const td = this.buildTokenData(tokenSpan, lineNo, { includeTypeClass: true });
         tokenData = {
-          name,
-          header,
-          isInclude,
-          ast_id: astId,
-          type_id: typeId,
-          typeClass: tokenSpan.className || "",
-          version: this.currentVersion,
-          filePath: this.currentFilePath,
-          ftype: this.currentFtype,
-          line: lineNo,
-          ...(col && !isInclude ? { col, highlight: (s) => this.occurrences.set(s, name) } : {}),
+          ...td,
+          ...(td.col && !td.isInclude && !td.isObject ? { highlight: (s) => this.occurrences.set(s, td.name) } : {}),
         };
       }
 
@@ -1293,7 +1265,9 @@ export class VirtualEditor {
         tokenData = {
           name: cleanName,
           header: "",
+          object: "",
           isInclude: false,
+          isObject: false,
           ast_id: 0,
           type_id: selection.startsWith("struct ") ? 28 : (selection.startsWith("union ") ? 34 : 0),
           typeClass: selection.startsWith("struct ") ? "ast-struct tok-type" : (selection.startsWith("union ") ? "ast-struct tok-type" : "tok-identifier"),

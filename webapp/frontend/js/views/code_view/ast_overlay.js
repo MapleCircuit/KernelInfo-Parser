@@ -122,6 +122,7 @@ function getGrammarRegex(grammarId) {
         "\\$\\([a-zA-Z0-9_.-]+\\)|\\$\\{[^}]+\\}|\\$[@<*^?%+]",              // Variables
         "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
         "'[^']*'",                                                           // Chars
+        "(?:(?:\\.\\.?|[a-zA-Z0-9_][a-zA-Z0-9_.-]*)/)*[a-zA-Z0-9_][a-zA-Z0-9_.-]*\\.o(?![a-zA-Z0-9_./-])", // .o object targets
         "\\b\\d+\\b",                                                        // Numbers
         "[a-zA-Z_][\\w-]*",                                                  // Targets / variables
         PUNCT_REGEX                                                          // Punctuation
@@ -588,7 +589,14 @@ export class AstOverlay {
         ((val.startsWith("$") || val.startsWith("@") || val.startsWith("%")) && (this.grammar.id === "shell" || this.grammar.id === "perl" || this.grammar.id === "makefile")) ||
         (val.startsWith("%") && this.grammar.id === "assembly")
       ) {
-        html += `<span class="tok-variable">${this.escapeHtml(val)}</span>`;
+        const cfgMatch = this.grammar.id === "makefile" && (val.match(/^(\$\()(CONFIG_[A-Za-z0-9_]+)(\))$/) || val.match(/^(\$\{)(CONFIG_[A-Za-z0-9_]+)(\})$/));
+        if (cfgMatch) {
+          const [, open, sym, close] = cfgMatch;
+          const escapedSym = this.escapeHtml(sym);
+          html += `<span class="tok-variable">${this.escapeHtml(open)}</span><span class="tok-variable ast-token" data-name="${escapedSym}"${astIdAttr}${typeIdAttr}>${escapedSym}</span><span class="tok-variable">${this.escapeHtml(close)}</span>`;
+        } else {
+          html += `<span class="tok-variable">${this.escapeHtml(val)}</span>`;
+        }
         lastKeyword = null;
       } else if (val.startsWith('"""') || val.startsWith("'''")) {
         html += `<span class="tok-string">${this.escapeHtml(val)}</span>`;
@@ -605,6 +613,10 @@ export class AstOverlay {
         lastKeyword = null;
       } else if (val === ":=" || val === "+=" || val === "?=" || val === "!=") {
         html += `<span class="tok-punct">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (this.grammar.id === "makefile" && /^(?:(?:\.\.?|[a-zA-Z0-9_][a-zA-Z0-9_.-]*)\/)*[a-zA-Z0-9_][a-zA-Z0-9_.-]*\.o$/.test(val)) {
+        const escaped = this.escapeHtml(val);
+        html += `<span class="tok-include ast-token ast-object" data-name="${escaped}" data-object="${escaped}"${astIdAttr}${typeIdAttr}>${escaped}</span>`;
         lastKeyword = null;
       } else if (/^(0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|\d)[\w.]*$/.test(val) && !/^[a-zA-Z_]/.test(val)) {
         html += `<span class="tok-number">${this.escapeHtml(val)}</span>`;

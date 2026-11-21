@@ -114,7 +114,7 @@ export const kindLabel = (kind) => KIND_LABEL[kind] || String(kind || "symbol").
  * (`i`, `p`) only with `shortNames` (C files, where they resolve as local variables, §5.6).
  */
 export function hoverable(el, { shortNames = false } = {}) {
-  if (!el || el.classList.contains("tok-comment") || el.classList.contains("ast-include")) return false;
+  if (!el || el.classList.contains("tok-comment") || el.classList.contains("ast-include") || el.classList.contains("ast-object")) return false;
   if (SKIP_TYPES.has(el.dataset.typeId || "")) return false;
   const name = el.dataset.name || el.textContent || "";
   return /^[A-Za-z_]\w*$/.test(name) && (name.length > 1 || shortNames);

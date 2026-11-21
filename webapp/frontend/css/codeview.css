@@ -392,7 +392,8 @@
   font-weight: 500;
 }
 
-.ast-include {
+.ast-include,
+.ast-object {
   color: var(--syn-string);
 }
 

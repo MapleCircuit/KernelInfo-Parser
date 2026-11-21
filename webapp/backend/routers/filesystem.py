@@ -50,6 +50,16 @@ def resolve_include(
     return fs_service.resolve_include(version, header, ast_id, current_file, arch)
 
 
+@router.get("/fs/resolve_object")
+def resolve_object(
+    version: str = Query("v3.0"),
+    obj: str = Query(...),
+    current_file: str | None = Query(None),
+) -> dict[str, Any]:
+    """Resolve a Makefile/Kbuild .o object target into a repository source file path."""
+    return fs_service.resolve_object(version, obj, current_file)
+
+
 @router.get("/version/{version_name}/treemap")
 def get_codebase_treemap(version_name: str, max_depth: int = Query(3), path: str = Query("")) -> dict[str, Any]:
     """Directory hierarchy weighted by bytes and file counts (squarified treemap)."""

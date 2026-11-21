@@ -285,6 +285,67 @@ class ContextMenu {
   }
 
   /**
+   * Jump to a Kconfig symbol's declaration in its Kconfig file, optionally falling back to Kconfig Viewer.
+   */
+  async jumpToKconfigDeclaration(symbolName, version = null, options = {}) {
+    const v = version || state.currentVersion;
+    const forceNew = options?.forceNew;
+    try {
+      const detail = await api.getSymbolDetail(v, symbolName);
+      if (detail && detail.file_path) {
+        state.openTab({
+          type: "code",
+          title: detail.file_path.split("/").pop(),
+          path: detail.file_path,
+          cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
+          version: v,
+          ...(forceNew !== undefined ? { forceNew: Boolean(forceNew) } : {})
+        });
+        toast.success(`Jumped to Kconfig declaration of ${symbolName}`);
+        return true;
+      }
+      if (!options?.fallbackToViewer) {
+        toast.info(`Could not locate declaration file for ${symbolName}`);
+      }
+    } catch (err) {
+      if (!options?.fallbackToViewer) {
+        toast.error(`Lookup failed: ${err.message}`);
+      }
+    }
+    if (options?.fallbackToViewer) {
+      this.openKconfigViewer(symbolName, v, options);
+    }
+    return false;
+  }
+
+  isObjectToken(token) {
+    return Boolean(token && (token.isObject || token.object || token.typeClass?.includes("ast-object")));
+  }
+
+  async openObjectFile(tokenData, version = null, options = {}) {
+    const v = version || tokenData?.version || state.currentVersion;
+    const objectQuery = tokenData?.object || tokenData?.name || "";
+    try {
+      const res = await api.resolveObject(v, objectQuery, tokenData?.filePath);
+      if (res && res.path) {
+        state.openTab({
+          type: "code",
+          title: res.path.split("/").pop(),
+          path: res.path,
+          cursorLine: 1,
+          version: v,
+          ...(options?.forceNew !== undefined ? { forceNew: Boolean(options.forceNew) } : {}),
+        });
+        toast.success(`Opened source: ${res.path}`);
+      } else {
+        toast.info(`Could not resolve source for: ${objectQuery}`);
+      }
+    } catch (err) {
+      toast.error(`Object lookup failed: ${err.message}`);
+    }
+  }
+
+  /**
    * Execute the first/default action for a token directly in a tab (e.g. on middle-click).
    */
   async executeDefaultAction(tokenData, options = { forceNew: true }) {
@@ -297,6 +358,7 @@ class ContextMenu {
       tokenName.trim().startsWith("#include") ||
       tokenName.includes(".h")
     );
+    const isObject = this.isObjectToken(tokenData);
     const isKconfig = this.isKconfigToken(tokenData, tokenData.filePath, tokenData.ftype);
     const v = tokenData.version || state.currentVersion;
 
@@ -320,23 +382,13 @@ class ContextMenu {
       } catch (err) {
         toast.error(`Header lookup failed: ${err.message}`);
       }
+    } else if (isObject) {
+      await this.openObjectFile(tokenData, v, { forceNew: Boolean(options?.forceNew) });
     } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
-      try {
-        const detail = await api.getSymbolDetail(v, tokenName);
-        if (detail && detail.file_path) {
-          state.openTab({
-            type: "code",
-            title: detail.file_path.split("/").pop(),
-            path: detail.file_path,
-            cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-            version: v,
-            forceNew: Boolean(options?.forceNew)
-          });
-          toast.success(`Jumped to Kconfig declaration of ${tokenName}`);
-          return;
-        }
-      } catch (_) {}
-      this.openKconfigViewer(tokenName, v, options);
+      await this.jumpToKconfigDeclaration(tokenName, v, {
+        forceNew: Boolean(options?.forceNew),
+        fallbackToViewer: true
+      });
     } else {
       await this.goToDefinition(tokenData, v, { forceNew: Boolean(options?.forceNew) });
     }
@@ -354,6 +406,7 @@ class ContextMenu {
       tokenName.trim().startsWith("#include") ||
       tokenName.includes(".h")
     );
+    const isObject = this.isObjectToken(tokenData);
     const isKconfig = this.isKconfigToken(tokenData, tokenData.filePath, tokenData.ftype);
     const v = tokenData.version || state.currentVersion;
 
@@ -402,29 +455,17 @@ class ContextMenu {
           }
         }
       });
+    } else if (isObject) {
+      items.push({
+        label: "Open C File",
+        icon: "📄",
+        onClick: () => this.openObjectFile(tokenData, v)
+      });
     } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
       items.push({
         label: "Jump to Kconfig Declaration",
         icon: "📍",
-        onClick: async () => {
-          try {
-            const detail = await api.getSymbolDetail(v, tokenName);
-            if (detail && detail.file_path) {
-              state.openTab({
-                type: "code",
-                title: detail.file_path.split("/").pop(),
-                path: detail.file_path,
-                cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-                version: v
-              });
-              toast.success(`Jumped to Kconfig declaration of ${tokenName}`);
-            } else {
-              toast.info(`Could not locate declaration file for ${tokenName}`);
-            }
-          } catch (err) {
-            toast.error(`Lookup failed: ${err.message}`);
-          }
-        }
+        onClick: () => this.jumpToKconfigDeclaration(tokenName, v)
       });
       items.push({
         label: "Open in Kconfig Viewer",
@@ -534,8 +575,8 @@ class ContextMenu {
             title: "NodeMap Canvas",
             version: v,
             initialNode: {
-              name: tokenData.header || tokenName,
-              type: isInclude ? "include" : (tokenData.type_id || "symbol"),
+              name: tokenData.header || tokenData.object || tokenName,
+              type: isInclude ? "include" : (isObject ? "object" : (tokenData.type_id || "symbol")),
               astId: tokenData.ast_id
             }
           });
@@ -546,8 +587,8 @@ class ContextMenu {
 
     this.renderMenu(x, y, {
       header: {
-        title: tokenData.header || tokenName,
-        sub: isInclude ? "Include Directive" : (tokenData.filePath || "AST Token")
+        title: tokenData.header || tokenData.object || tokenName,
+        sub: isInclude ? "Include Directive" : (isObject ? "Kbuild Object" : (tokenData.filePath || "AST Token"))
       },
       items
     });
@@ -561,7 +602,7 @@ class ContextMenu {
     const { token, filePath, line, selection, version, blame, ftype } = context;
     const v = version || state.currentVersion;
     const fileName = filePath ? filePath.split("/").pop() : "File";
-    const headerTitle = token ? (token.header || token.name) : `${fileName}:${line || 1}`;
+    const headerTitle = token ? (token.header || token.object || token.name) : `${fileName}:${line || 1}`;
     const headerSub = token ? `${fileName}:${line || 1}` : (filePath || "");
 
     const items = [];
@@ -569,6 +610,7 @@ class ContextMenu {
     // 1. Token Navigation Actions
     if (token) {
       const isKconfig = this.isKconfigToken(token, filePath, ftype ?? token.ftype);
+      const isObject = this.isObjectToken(token);
       if (token.isInclude) {
         items.push({
           label: "Open Header File",
@@ -613,7 +655,18 @@ class ContextMenu {
             }
           }
         });
+      } else if (isObject) {
+        items.push({
+          label: "Open C File",
+          icon: "📄",
+          onClick: () => this.openObjectFile({ ...token, filePath: token.filePath || filePath }, v)
+        });
       } else if (isKconfig && hasFeature(state.activeRepo(), "kconfig")) {
+        items.push({
+          label: "Jump to Kconfig Declaration",
+          icon: "📍",
+          onClick: () => this.jumpToKconfigDeclaration(token.name, v)
+        });
         items.push({
           label: "Open in Kconfig Viewer",
           icon: "⚙️",
@@ -667,7 +720,7 @@ class ContextMenu {
         (token.typeClass && (token.typeClass.includes("ast-func") || token.typeClass.includes("tok-function"))) ||
         (cleanName && lineText && new RegExp(`\\b${cleanName}\\s*\\(`).test(lineText));
 
-      const showStructAction = isStruct || (isCFile && cleanName && /^[a-zA-Z_]\w*$/.test(cleanName) && !isFunction && !token.isInclude);
+      const showStructAction = isStruct || (isCFile && cleanName && /^[a-zA-Z_]\w*$/.test(cleanName) && !isFunction && !token.isInclude && !isObject);
 
       const repo = state.activeRepo();
       if (showStructAction && cleanName && hasFeature(repo, "pahole")) {
@@ -726,8 +779,8 @@ class ContextMenu {
               title: "NodeMap Canvas",
               version: v,
               initialNode: {
-                name: token.header || token.name,
-                type: token.isInclude ? "include" : (token.type_id || "symbol"),
+                name: token.header || token.object || token.name,
+                type: token.isInclude ? "include" : (isObject ? "object" : (token.type_id || "symbol")),
                 astId: token.ast_id
               }
             });
