@@ -9,10 +9,16 @@
  *     changes its membership), resize from 8 handles with per-type limits, optional snap-to-grid;
  *   - Edit Mode (canvas setting, Inspector toggle): node editing controls (struct type / guard / hide
  *     toggles, inline title and note editing) show only in it; folds and header tools always work;
- *   - inline titles (double-click), notes, groups, accent colors (presets or a custom color), align /
- *     distribute, duplicate and copy / paste (Ctrl+D, Ctrl+C, Ctrl+V; a localStorage clipboard shared by
- *     every NodeMap tab), auto-fit nodes whose content scales with aspect-locked resizes;
+ *   - inline titles (double-click), notes, groups, accent colors and node / canvas backgrounds (presets
+ *     or a custom color), hideable node headers, align / distribute, duplicate and copy / paste (Ctrl+D,
+ *     Ctrl+C, Ctrl+V; a localStorage clipboard shared by every NodeMap tab), auto-fit nodes whose content
+ *     scales with aspect-locked resizes;
+ *   - undo / redo (Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z, toolbar ↶ ↷) of every document change: a bounded
+ *     snapshot history (`M.UndoStack`) recorded by `commit()`;
  *   - edges from side ports or struct field ports: anchor sides (or auto), label, arrows, line style, curve;
+ *     ports show only when connected (`.nm-port-connected`), in Edit Mode, or while a wire is dragged;
+ *   - image export (SVG / PNG dialog: transparent background, PNG upscale) with man pages and live tabs
+ *     snapshotted into `<foreignObject>`s (`captureNodeForeignObject`);
  *   - content nodes: struct layouts (`list` / `table` style) with type toggles, `#if` guards and their
  *     scope bars, Kconfig-engine folding of compiled-out branches, hidden items
  *     (`/api/nodemap/{v}/struct/{name}`),
@@ -37,8 +43,8 @@ import * as M from "./canvas_model.js";
 import { computeEdgeGeometry, dashArray } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
 import { findItem, guardAutoCollapsed, renderStructBody, structRows } from "./struct_view.js";
-import { renderNoteMarkdown, renderSourceRows } from "./node_content.js";
-import { canvasToSvg } from "./nodemap_export.js";
+import { headMetaOf, renderNoteMarkdown, renderSourceRows } from "./node_content.js";
+import { PNG_DEFAULT_SCALE, PNG_SCALES, canvasToSvg, captureNodeForeignObject, pngSize, svgSize } from "./nodemap_export.js";
 
 /** Tab types a KernelInfo tab node offers (feature-gated per project). */
 export const EMBED_TAB_TYPES = [
@@ -58,8 +64,10 @@ const DRAG_THRESHOLD = 3;
 
 const isTyping = (el) => Boolean(el && (el.closest?.("input, textarea, select, [contenteditable='true']")));
 // Body buttons that edit a node: they work in Edit Mode only (folds and header tools always do)
-const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards"]);
+const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards", "toggle-header"]);
 const PASTE_STEP = 24;
+const UNDO_LIMIT = 80;
+const cssEsc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
 // Clipboard of this window when localStorage refuses it (shared by the NodeMap tabs of the window)
 let memoryClipboard = null;
 
@@ -94,6 +102,8 @@ export class NodeMapController {
     this.fitQueue = new Set(); // auto-fit nodes to measure on the next commit
     this.pasteStamp = "";
     this.pasteCount = 0;
+    this.history = new M.UndoStack(UNDO_LIMIT); // undo / redo of the document (commit() records)
+    this.connectedPorts = new Set(); // port elements tagged .nm-port-connected
     // Where Kconfig engines come from (tests swap it)
     this.kconfigSource = {
       list: () => (typeof state.kconfigEngineList === "function" ? state.kconfigEngineList() : []),
@@ -112,6 +122,7 @@ export class NodeMapController {
 
     if (!this.canvas) {
       this.canvas = M.loadCanvas(globalThis.localStorage, this.storageKey) || M.emptyCanvas();
+      this.history.reset(M.historySnapshot(this.canvas));
     }
     // Re-activation of the tab: the canvas DOM built before moves into the new container as it is (loaded
     // struct, source and man bodies, scroll positions and listeners kept; browsers reload moved iframes)
@@ -121,7 +132,7 @@ export class NodeMapController {
       this.subscribe();
       this.consumeIncoming(tabData);
       this.applyTransform();
-      this.commit({ save: false });
+      this.commit({ save: false, record: true });
       return;
     }
     this.renderer?.clear();
@@ -142,6 +153,7 @@ export class NodeMapController {
       renderBody: (node, body) => this.renderBody(node, body),
       disposeBody: (id) => this.disposeBody(id),
       headTools: (node, active) => this.headTools(node, active),
+      headMeta: (node) => this.headMeta(node),
       bodyKey: (node) => this.bodyKey(node),
     });
 
@@ -150,7 +162,8 @@ export class NodeMapController {
     this.subscribe();
     this.consumeIncoming(tabData);
     this.applyTransform();
-    this.commit({ save: false });
+    // Nodes handed over by another view are an undoable change of the canvas
+    this.commit({ save: false, record: true });
   }
 
   dispose() {
@@ -166,6 +179,7 @@ export class NodeMapController {
     }
     if (this.onMessage) window.removeEventListener("message", this.onMessage);
     this.onWinMove = this.onWinUp = this.onMessage = null;
+    this.connectedPorts = new Set();
     this.rootEl = null;
   }
 
@@ -386,6 +400,9 @@ export class NodeMapController {
           <button type="button" class="nodemap-btn" data-tb="tool" aria-pressed="${this.tool === "select"}" title="Select tool: drag on the canvas draws a selection box (Shift/Ctrl+drag does it with either tool)">▭ Select</button>
           <button type="button" class="nodemap-btn" data-tb="snap" aria-pressed="${this.canvas.settings.snap}" title="Snap positions and sizes to the grid">Snap</button>
           <div class="nodemap-sep"></div>
+          <button type="button" class="nodemap-btn" data-tb="undo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>↶</button>
+          <button type="button" class="nodemap-btn" data-tb="redo" title="Redo (Ctrl+Y / Ctrl+Shift+Z)" aria-label="Redo" disabled>↷</button>
+          <div class="nodemap-sep"></div>
           <button type="button" class="nodemap-btn" data-tb="zoom-out" title="Zoom out">−</button>
           <span class="nm-zoom-label" title="Zoom">100%</span>
           <button type="button" class="nodemap-btn" data-tb="zoom-in" title="Zoom in">+</button>
@@ -436,6 +453,8 @@ export class NodeMapController {
       } else if (act === "zoom-in") this.adjustZoom(1.2);
       else if (act === "zoom-out") this.adjustZoom(1 / 1.2);
       else if (act === "fit") this.fitView();
+      else if (act === "undo") this.undo();
+      else if (act === "redo") this.redo();
       else if (act === "reset") this.resetTransform();
       else if (act === "layout") this.autoLayoutDAG();
       else if (act === "export") this.showExportMenu(r.left, r.bottom + 4);
@@ -468,8 +487,8 @@ export class NodeMapController {
       header: { title: "Export", sub: "This canvas" },
       items: [
         { label: "Canvas JSON (re-importable)", icon: "{}", onClick: () => this.exportJSON() },
-        { label: "SVG image", icon: "🖼", onClick: () => this.exportSVG() },
-        { label: "PNG image", icon: "🖼", onClick: () => this.exportPNG() },
+        { label: "SVG image…", icon: "🖼", onClick: () => this.openImageExport("svg") },
+        { label: "PNG image…", icon: "🖼", onClick: () => this.openImageExport("png") },
       ],
     });
   }
@@ -640,8 +659,8 @@ export class NodeMapController {
         const hl = r.symbol && (r.symbol.line_s > r.start_line || r.symbol.line_e < r.end_line)
           ? new Set(Array.from({ length: r.symbol.line_e - r.symbol.line_s + 1 }, (_, i) => r.symbol.line_s + i)) : null;
         const lines = Array.isArray(r.lines) ? r.lines : [];
-        body.innerHTML = `<div class="nm-src-meta">${escapeHtml(r.path)} · ${r.start_line}–${r.end_line} of ${r.total_lines}${r.truncated ? " · truncated" : ""}${r.symbol ? ` · ${escapeHtml(r.symbol.kind)} ${escapeHtml(r.symbol.name)}` : ""}</div>
-          <div class="nm-src nm-scroll">${renderSourceRows(lines, r.start_line, r.path, hl)}</div>`;
+        // The slice's path and lines show in the header (headMeta)
+        body.innerHTML = `<div class="nm-src nm-scroll">${renderSourceRows(lines, r.start_line, r.path, hl)}</div>`;
         const src = body.querySelector(".nm-src");
         if (src) src.scrollTop = prevScroll;
       }
@@ -713,9 +732,10 @@ export class NodeMapController {
           body.innerHTML = `<div class="nm-status nm-error">${escapeHtml(d.name)}(${escapeHtml(d.section || "?")}) is not in a configured man-pages repository</div>`;
           return;
         }
-        // Filling in where the page lives changes the content key: the body mounts again with it
+        // Filling in where the page lives changes the content key: the body mounts again with it (not a
+        // user change: undo history takes it as the baseline)
         Object.assign(node.data, { repo: r.repo, version: r.version, path: r.path, name: r.name || d.name, section: r.section || d.section });
-        this.commit();
+        this.commit({ absorb: true });
       } catch (err) {
         if (this.mounts.get(node.id) === token) body.innerHTML = `<div class="nm-status nm-error">${escapeHtml(err.message)}</div>`;
       }
@@ -750,11 +770,23 @@ export class NodeMapController {
   headTools(node, active) {
     const b = (act, label, title) => `<button type="button" class="nm-head-btn" data-act="${act}" title="${escapeHtml(title)}">${label}</button>`;
     let s = "";
+    if (this.canvas?.settings.editMode) {
+      s += node.hideHeader
+        ? b("toggle-header", "◫", "Header hidden in View Mode: click to show it again")
+        : b("toggle-header", "▔", "Hide this header in View Mode (Edit Mode keeps it, dimmed)");
+    }
     if (node.type === "tab") s += active ? b("interact", "✓", "Done interacting (Esc)") : b("interact", "⤢", "Interact with the embedded tab");
     if (node.type === "symbol") s += b("expand", node.data.expanded ? "−" : "+", node.data.expanded ? "Collapse members" : "Expand members");
     if (["struct", "source", "man"].includes(node.type)) s += b("refresh", "⟳", "Load again");
     if (["struct", "source", "man", "tab", "symbol"].includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
     return s;
+  }
+
+  /** Source reference shown at the right of a struct / source header (from its loaded content). */
+  headMeta(node) {
+    if (node.type !== "struct" && node.type !== "source") return null;
+    const entry = this.content.get(this.fetchKeyOf(node));
+    return headMetaOf(node.type, entry?.status === "ok" ? entry.value : null);
   }
 
   // ------------------------------------------------------------------ view / commit
@@ -767,8 +799,15 @@ export class NodeMapController {
     return this.canvas.nodes.filter((n) => this.selected.has(n.id));
   }
 
-  /** Re-render nodes, wires and (unless asked not to) the inspector; persist unless `save` is false. */
-  commit({ save = true, inspector = true } = {}) {
+  /**
+   * Re-render nodes, wires and (unless asked not to) the inspector; persist unless `save` is false.
+   * Undo history: a `record`ed commit (by default every saving one) pushes the document as it was before
+   * when it changed; `coalesce` folds consecutive commits of one live edit (a color drag, typing) into one
+   * step, `coalesceEnd` closes it (the final change event); `absorb` takes a change that is not the
+   * user's (a resolved man page, Edit Mode re-fits, an undo) as the new baseline, as do the auto-fit
+   * size changes of unrecorded commits.
+   */
+  commit({ save = true, inspector = true, record = save, coalesce = null, coalesceEnd = false, absorb = false } = {}) {
     if (!this.renderer) return;
     const ids = new Set(this.canvas.nodes.map((n) => n.id));
     for (const id of [...this.selected]) if (!ids.has(id)) this.selected.delete(id);
@@ -777,10 +816,88 @@ export class NodeMapController {
     this.rootEl?.classList.toggle("nm-edit", Boolean(this.canvas.settings.editMode));
     this.renderer.sync(this.canvas.nodes, this.selected, this.active);
     const fitted = this.autoFitPass();
+    this.applyBackground();
     this.renderWires();
     if (this.hintEl) this.hintEl.hidden = this.canvas.nodes.length > 0;
+    this.trackHistory({ record, coalesce, coalesceEnd, absorb: absorb || (fitted && !record) });
     if (inspector) this.renderInspector();
     if (save || fitted) this.scheduleSave();
+  }
+
+  // ------------------------------------------------------------------ undo / redo
+
+  trackHistory({ record, coalesce, coalesceEnd = false, absorb }) {
+    const h = this.history;
+    if (!h || !this.canvas) return;
+    if (h.base === null) h.absorb(M.historySnapshot(this.canvas));
+    // A gesture in progress keeps the baseline from before it: its end records the whole gesture
+    else if (absorb) {
+      if (!this.gesture) h.absorb(M.historySnapshot(this.canvas));
+    } else if (record) h.record(M.historySnapshot(this.canvas), coalesce, coalesceEnd);
+    this.updateHistoryButtons();
+  }
+
+  updateHistoryButtons() {
+    const tb = this.rootEl?.querySelector?.(".nodemap-toolbar");
+    if (!tb) return;
+    const u = tb.querySelector("[data-tb='undo']");
+    const r = tb.querySelector("[data-tb='redo']");
+    if (u) u.disabled = !this.history.canUndo;
+    if (r) r.disabled = !this.history.canRedo;
+  }
+
+  /** Undo the last document change (false when there is none or a gesture is in progress). */
+  undo() {
+    if (this.gesture) return false;
+    const snap = this.history.undo(M.historySnapshot(this.canvas));
+    if (!snap) return false;
+    this.restoreSnapshot(snap);
+    return true;
+  }
+
+  /** Redo the change undone last (false when there is none). */
+  redo() {
+    if (this.gesture) return false;
+    const snap = this.history.redo(M.historySnapshot(this.canvas));
+    if (!snap) return false;
+    this.restoreSnapshot(snap);
+    return true;
+  }
+
+  /**
+   * Put a history snapshot back: nodes, edges and document settings (view state, Edit Mode and snap
+   * stay). Unchanged nodes keep their elements and bodies (live iframes survive); the selection keeps
+   * the nodes that still exist.
+   */
+  restoreSnapshot(snap) {
+    const doc = JSON.parse(snap);
+    const st = this.canvas.settings || {};
+    // Nodes and edges that still exist keep their object (bodies, man page callbacks and open editors hold
+    // it): their fields are replaced in place
+    const reuse = (list, fresh) => {
+      const byId = new Map(list.map((x) => [x.id, x]));
+      return fresh.map((x) => {
+        const cur = byId.get(x.id);
+        if (!cur) return x;
+        for (const k of Object.keys(cur)) if (!(k in x)) delete cur[k];
+        return Object.assign(cur, x);
+      });
+    };
+    this.canvas.nodes = reuse(this.canvas.nodes, doc.nodes);
+    this.canvas.edges = reuse(this.canvas.edges, doc.edges);
+    this.canvas.settings = { ...doc.settings, editMode: st.editMode, snap: st.snap };
+    for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
+    this.applyTransform();
+    this.commit({ absorb: true });
+  }
+
+  /** Canvas background (`settings.bgColor`) on the canvas wrapper. */
+  applyBackground() {
+    const style = this.wrapEl?.style;
+    if (!style) return;
+    const c = this.canvas.settings.bgColor;
+    if (c) style.setProperty("--nm-canvas-bg", M.bgVar(c, "var(--bg-canvas)"));
+    else style.removeProperty?.("--nm-canvas-bg");
   }
 
   // ------------------------------------------------------------------ auto-fit
@@ -920,8 +1037,7 @@ export class NodeMapController {
   /** Canvas point of a struct field row's port, kept inside the node's visible rows. */
   fieldPoint(node, key, side) {
     const el = this.renderer?.element(node.id);
-    const esc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/"/g, '\\"'));
-    const row = el?.querySelector(`.nm-sf[data-key="${esc(key)}"]`);
+    const row = el?.querySelector(`.nm-sf[data-key="${cssEsc(key)}"]`);
     if (!row) return null;
     const z = this.zoom;
     const nr = el.getBoundingClientRect();
@@ -941,12 +1057,16 @@ export class NodeMapController {
     let s = "";
     const byId = new Map(this.canvas.nodes.map((n) => [n.id, n]));
     this.edgeGeoms = new Map();
+    const ends = [];
     for (const e of this.canvas.edges) {
       const a = byId.get(e.from);
       const b = byId.get(e.to);
       if (!a || !b) continue;
-      const g = computeEdgeGeometry(this.endOf(a, e.fromSide, e.fromField), this.endOf(b, e.toSide, e.toField), { curve: e.curve, arrow: e.arrow });
+      const fromEnd = this.endOf(a, e.fromSide, e.fromField);
+      const toEnd = this.endOf(b, e.toSide, e.toField);
+      const g = computeEdgeGeometry(fromEnd, toEnd, { curve: e.curve, arrow: e.arrow });
       this.edgeGeoms.set(e.id, g);
+      ends.push([a.id, fromEnd.point ? e.fromField : null, g.fromSide], [b.id, toEnd.point ? e.toField : null, g.toSide]);
       const dash = dashArray(e.style);
       const sel = e.id === this.selectedEdge ? " selected" : "";
       s += `<g class="nm-edge${sel}" data-edge-id="${escapeHtml(e.id)}" style="--nm-edge:${M.accentVar(e.color, "var(--accent-blue)")}">
@@ -975,6 +1095,26 @@ export class NodeMapController {
       }
     }
     this.wireSvg.innerHTML = s;
+    this.tagConnectedPorts(ends);
+  }
+
+  /**
+   * Mark the ports wires are attached to (`.nm-port-connected`: the only ports View Mode shows). `ends` is
+   * `[nodeId, fieldKey|null, side]` per wire end: a struct field port, else the node's side port.
+   */
+  tagConnectedPorts(ends) {
+    const next = new Set();
+    for (const [id, field, side] of ends) {
+      const el = this.renderer?.element?.(id);
+      if (!el?.querySelector) continue;
+      let port = null;
+      if (field) port = el.querySelector(`.nm-port-field[data-field="${cssEsc(field)}"][data-side="${side === "left" ? "left" : "right"}"]`);
+      if (!port) port = el.querySelector(`.nm-port-side[data-side="${cssEsc(side)}"]`);
+      if (port) next.add(port);
+    }
+    for (const p of this.connectedPorts) if (!next.has(p)) p.classList?.remove("nm-port-connected");
+    for (const p of next) p.classList?.add("nm-port-connected");
+    this.connectedPorts = next;
   }
 
   // ------------------------------------------------------------------ pointer & keyboard
@@ -991,6 +1131,7 @@ export class NodeMapController {
     this.rootEl.addEventListener("keydown", (e) => this.onKeyDown(e));
     this.rootEl.addEventListener("keyup", (e) => {
       if (e.key === " ") this.spaceDown = false;
+      if (String(e.key).startsWith("Arrow")) this.history.close();
     });
     this.inspectorEl.addEventListener("change", (e) => this.onInspectorInput(e, true));
     this.inspectorEl.addEventListener("input", (e) => this.onInspectorInput(e, false));
@@ -1067,6 +1208,8 @@ export class NodeMapController {
       e.preventDefault();
       e.stopPropagation();
       this.gesture = { kind: "wire", start, from: node.id, side: port.dataset.side || "auto", field: port.dataset.field || null, cur: this.toCanvas(e.clientX, e.clientY), moved: false };
+      // Every port a wire can end on shows while it is dragged
+      this.rootEl?.classList.add("nm-wiring");
     } else if (t.closest(".nm-node-head") && !t.closest("button")) {
       e.preventDefault();
       const toggle = e.shiftKey || e.ctrlKey || e.metaKey;
@@ -1193,7 +1336,12 @@ export class NodeMapController {
       if (node?.type === "group") M.reassignGroups(this.canvas.nodes, this.canvas.nodes.filter((n) => n.id !== node.id));
       this.commit();
     } else if (g.kind === "wire") {
-      this.finishWire(g, e);
+      // Target ports stay hit-testable (.nm-wiring) until the drop point is read
+      try {
+        this.finishWire(g, e);
+      } finally {
+        this.rootEl?.classList.remove("nm-wiring");
+      }
     } else if (g.kind === "marquee") {
       this.marqueeEl.hidden = true;
       if (!g.moved && !g.base.size) this.selected.clear();
@@ -1241,7 +1389,18 @@ export class NodeMapController {
       this.active = this.active === node.id ? null : node.id;
       this.selected = new Set([node.id]);
       this.commit({ save: false });
-    } else if (act === "open-tab") this.openNodeAsTab(node.id);
+      // The embedded tab takes the keyboard at once (Esc inside it gives the pointer back)
+      if (this.active) {
+        const frame = this.renderer?.element?.(node.id)?.querySelector?.("iframe");
+        try {
+          frame?.focus?.();
+          frame?.contentWindow?.focus?.();
+        } catch {
+          // a frame still loading
+        }
+      }
+    } else if (act === "toggle-header") this.setHeaderHidden(node.id, !node.hideHeader);
+    else if (act === "open-tab") this.openNodeAsTab(node.id);
     else if (act === "refresh") this.refreshNode(node.id);
     else if (act === "expand") this.toggleExpandNode(node.id);
     else if (node.type === "struct") this.onStructAction(node, act, btn.dataset.key);
@@ -1273,6 +1432,18 @@ export class NodeMapController {
 
   setEditMode(on) {
     this.canvas.settings.editMode = Boolean(on);
+    // Headers hidden in View Mode change the size of auto-fitted nodes: they measure again (view state,
+    // not an undo step)
+    for (const n of this.canvas.nodes) if (n.autoFit && n.hideHeader) this.fitQueue.add(n.id);
+    this.commit({ absorb: true });
+  }
+
+  /** Hide (View Mode) or restore a node's header. */
+  setHeaderHidden(id, hidden) {
+    const node = this.byId(id);
+    if (!node) return;
+    node.hideHeader = Boolean(hidden);
+    if (node.autoFit) this.fitQueue.add(id);
     this.commit();
   }
 
@@ -1313,7 +1484,13 @@ export class NodeMapController {
     // A focused button keeps Space/Enter, and Delete there is not meant for the selection
     if (e.target.closest?.("button") && [" ", "Enter", "Delete", "Backspace"].includes(e.key)) return;
     const mod = e.ctrlKey || e.metaKey;
-    if (e.key === " ") {
+    const key = String(e.key || "").toLowerCase();
+    if (mod && !e.altKey && (key === "z" || key === "y")) {
+      // Text fields keep their own undo (isTyping above returned already)
+      e.preventDefault();
+      if (key === "y" || e.shiftKey) this.redo();
+      else this.undo();
+    } else if (e.key === " ") {
       this.spaceDown = true;
       e.preventDefault();
     } else if (e.key === "Delete" || e.key === "Backspace") {
@@ -1353,7 +1530,8 @@ export class NodeMapController {
       }
       const ids = new Set(moved.map((n) => n.id));
       M.reassignGroups(this.canvas.nodes, moved.filter((n) => !(n.groupId && ids.has(n.groupId))));
-      this.commit();
+      // Held or repeated arrow keys are one undo step (keyup closes it)
+      this.commit({ coalesce: `arrow:${[...this.selected].join(",")}` });
     }
   }
 
@@ -1497,13 +1675,26 @@ export class NodeMapController {
   }
 
   /** Accent of the selected edge or nodes: a preset id or a custom `#rrggbb`. */
-  setColor(color, { inspector = true } = {}) {
+  setColor(color, { inspector = true, coalesce = null, coalesceEnd = false } = {}) {
     const c = M.normalizeColor(color);
     if (this.selectedEdge) {
       const e = this.canvas.edges.find((x) => x.id === this.selectedEdge);
       if (e) e.color = c;
     } else for (const n of this.selectedNodes()) n.color = c;
-    this.commit({ inspector });
+    this.commit({ inspector, coalesce, coalesceEnd });
+  }
+
+  /** Background of the selected nodes: `""` (theme), a preset id or a custom `#rrggbb`. */
+  setBackground(color, { inspector = true, coalesce = null, coalesceEnd = false } = {}) {
+    const c = M.normalizeColor(color);
+    for (const n of this.selectedNodes()) n.bgColor = c;
+    this.commit({ inspector, coalesce, coalesceEnd });
+  }
+
+  /** Canvas background (`settings.bgColor`). */
+  setCanvasBackground(color, { inspector = true, coalesce = null, coalesceEnd = false } = {}) {
+    this.canvas.settings.bgColor = M.normalizeColor(color);
+    this.commit({ inspector, coalesce, coalesceEnd });
   }
 
   /** Add cloned nodes and edges (cloneSubgraph output), re-derive their groups and select them. */
@@ -1737,12 +1928,16 @@ export class NodeMapController {
 
   renderInspector() {
     if (!this.inspectorEl) return;
-    const swatches = (current, fallback = "var(--accent-blue)") => {
+    // Accent swatches (`act` "color"), or background swatches over the theme token `bg` (`act` "bg" for
+    // the selected nodes, "canvas-bg" for the canvas): presets show as the tint they apply
+    const swatches = (current, fallback = "var(--accent-blue)", { act = "color", bg = null } = {}) => {
       const custom = M.isCustomColor(current);
-      return `<div class="nm-swatches" role="group" aria-label="Accent">${M.ACCENTS.map((a) =>
-        `<button type="button" class="nm-swatch${a.id === current ? " on" : ""}" data-insp="color" data-value="${a.id}" title="${a.label}" style="--nm-sw:${M.accentVar(a.id, "var(--bg-tertiary)")}"></button>`).join("")}` +
-        `<label class="nm-swatch nm-swatch-custom${custom ? " on" : ""}" title="Custom color…" style="--nm-sw:${custom ? escapeHtml(current) : "var(--bg-tertiary)"}"><input type="color" data-insp="color-custom" value="${escapeHtml(this.pickerValue(current, fallback))}" aria-label="Custom color"/></label></div>`;
+      const label = bg ? "Background" : "Accent";
+      return `<div class="nm-swatches" role="group" aria-label="${label}">${M.ACCENTS.map((a) =>
+        `<button type="button" class="nm-swatch${a.id === current ? " on" : ""}" data-insp="${act}" data-value="${a.id}" title="${a.id || !bg ? a.label : "Theme default"}" style="--nm-sw:${bg ? M.bgVar(a.id, bg) : M.accentVar(a.id, "var(--bg-tertiary)")}"></button>`).join("")}` +
+        `<label class="nm-swatch nm-swatch-custom${custom ? " on" : ""}" title="Custom color…" style="--nm-sw:${custom ? escapeHtml(current) : "var(--bg-tertiary)"}"><input type="color" data-insp="${act}-custom" value="${escapeHtml(this.pickerValue(current, fallback))}" aria-label="Custom ${label.toLowerCase()} color"/></label></div>`;
     };
+    const bgRow = (label, current, base, act) => `<div class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span><div class="nm-insp-inline">${swatches(current, base, { act, bg: base })}${current ? `<button type="button" class="nodemap-btn" data-insp="${act}-reset" title="Back to the theme background">Reset</button>` : ""}</div></div>`;
     const sel = (name, value, options, labels = null) => `<select data-insp="${name}">${options.map((o, i) => `<option value="${escapeHtml(o)}"${o === value ? " selected" : ""}>${escapeHtml(labels ? labels[i] : (o || "any"))}</option>`).join("")}</select>`;
     const row = (label, inner) => `<label class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span>${inner}</label>`;
     const input = (name, value, extra = "") => `<input data-insp="${name}" value="${escapeHtml(value ?? "")}" ${extra}/>`;
@@ -1773,6 +1968,8 @@ export class NodeMapController {
         html += row(`Struct style (${structs.length})`, sel("multi-style", cur, cur ? M.STRUCT_STYLES : ["", ...M.STRUCT_STYLES], cur ? null : ["mixed", ...M.STRUCT_STYLES]));
       }
       html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches("")}</div>`;
+      const bgs = new Set(nodes.map((x) => x.bgColor));
+      html += bgRow("Background", bgs.size === 1 ? [...bgs][0] : "", "var(--bg-secondary)", "bg");
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate the selection (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn" data-insp="group">▭ Group</button><button type="button" class="nodemap-btn" data-insp="fit">Fit</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
     } else if (nodes.length === 1) {
       const n = nodes[0];
@@ -1784,6 +1981,8 @@ export class NodeMapController {
         if (n.autoFit) html += `<div class="inspector-field"><span class="inspector-label">Content scale</span><div class="nm-insp-inline"><span class="inspector-val">${Math.round(n.scale * 100)}% of ${n.baseW}×${n.baseH}</span>${n.scale !== 1 ? '<button type="button" class="nodemap-btn" data-insp="scale-reset" title="Back to 100%">100%</button>' : ""}</div></div>`;
       }
       html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(n.color, n.type === "group" ? "var(--text-muted)" : n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)")}</div>`;
+      html += bgRow("Background", n.bgColor, "var(--bg-secondary)", "bg");
+      html += check("hide-header", n.hideHeader, "Hide header in View Mode", "View Mode and exports leave this node's header out; Edit Mode shows it dimmed (drag, rename, restore)");
       if (["struct", "source", "symbol"].includes(n.type)) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
       if (n.type === "struct") {
         html += row("Name", input("d-name", d.name, 'spellcheck="false"'));
@@ -1797,7 +1996,7 @@ export class NodeMapController {
         const loaded = this.content.get(this.fetchKeyOf(n));
         // Items of this revision's layout only (keys of moved lines hide nothing)
         const hidden = loaded?.status === "ok" ? structRows(loaded.value, d, { editMode: true }).hidden : Object.keys(d.hiddenItems || {}).length;
-        if (hidden) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="show-hidden" title="Restore every hidden member, aggregate and #ifdef block">Show all hidden (${hidden})</button></div>`;
+        if (hidden) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="show-hidden" title="Restore every hidden member, aggregate, #ifdef block and the outer conditions">Show all hidden (${hidden})</button></div>`;
         const layout = this.content.get(this.fetchKeyOf(n))?.value;
         if (layout) html += `<div class="inspector-field"><span class="inspector-label">Definition</span><span class="inspector-val">${escapeHtml(`${layout.file_path}:${layout.line_s}-${layout.line_e}`)} · span from ${layout.span_source === "db" ? "the index" : "the source text"}; guards read from the source</span></div>`;
       } else if (n.type === "source") {
@@ -1820,6 +2019,7 @@ export class NodeMapController {
     } else {
       html += `<div class="inspector-field"><span class="inspector-label">Canvas</span><span class="inspector-val">${this.canvas.nodes.length} nodes · ${this.canvas.edges.length} connections</span></div>`;
       html += `<div class="nm-insp-pair">${row("Grid", input("grid", st.grid, 'type="number" min="4" max="200"'))}${check("snap", st.snap, "Snap")}</div>`;
+      html += bgRow("Canvas background", st.bgColor || "", "var(--bg-canvas)", "canvas-bg");
       let engines = [];
       try {
         engines = (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
@@ -1845,6 +2045,7 @@ export class NodeMapController {
         <li>Drag a header to move, a corner or edge to resize; Edit Mode: double-click a title to rename</li>
         <li>Drag from a side dot (or a struct field dot) onto another node to connect</li>
         <li>Ctrl+C / Ctrl+V copy and paste nodes (across NodeMap tabs), Ctrl+D duplicates</li>
+        <li>Ctrl+Z undoes, Ctrl+Y or Ctrl+Shift+Z redoes</li>
         <li>Double-click the background for a note; Delete removes, arrows nudge</li>
       </ul>`;
     }
@@ -1859,10 +2060,16 @@ export class NodeMapController {
     const edge = this.selectedEdge ? this.canvas.edges.find((x) => x.id === this.selectedEdge) : null;
     const node = this.selected.size === 1 ? this.byId([...this.selected][0]) : null;
     const int = (v) => (/^\d+$/.test(String(v).trim()) ? parseInt(v, 10) : null);
-    if (k === "color-custom") {
+    // Live edits (picker drags, typing, then the final change event) are one undo step per field and target
+    const coalesce = `insp:${k}:${edge?.id || node?.id || (this.selected.size ? [...this.selected].join(",") : "canvas")}`;
+    const coalesceEnd = Boolean(final);
+    if (k === "color-custom" || k === "bg-custom" || k === "canvas-bg-custom") {
       // Live while the picker is open; the inspector redraws once it is closed
       if (!M.isCustomColor(val)) return;
-      return this.setColor(val, { inspector: final });
+      const opts = { inspector: final, coalesce, coalesceEnd };
+      if (k === "bg-custom") return this.setBackground(val, opts);
+      if (k === "canvas-bg-custom") return this.setCanvasBackground(val, opts);
+      return this.setColor(val, opts);
     }
     if (k === "kconfig-collapse") {
       this.canvas.settings.kconfigCollapse = Boolean(val);
@@ -1871,6 +2078,9 @@ export class NodeMapController {
     } else if (k === "multi-style") {
       if (!M.STRUCT_STYLES.includes(val)) return;
       for (const n of this.selectedNodes()) if (n.type === "struct") n.data.style = val;
+    } else if (node && k === "hide-header") {
+      node.hideHeader = Boolean(val);
+      if (node.autoFit) this.fitQueue.add(node.id);
     } else if (node && k === "autofit") {
       M.setAutoFit(node, Boolean(val));
       if (node.autoFit) this.fitQueue.add(node.id);
@@ -1904,7 +2114,7 @@ export class NodeMapController {
       if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
     } else return;
     // Typing in a field keeps the inspector (and the caret) as it is
-    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h") });
+    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h"), coalesce, coalesceEnd });
   }
 
   onInspectorClick(e) {
@@ -1914,6 +2124,8 @@ export class NodeMapController {
     const node = this.selected.size === 1 ? this.byId([...this.selected][0]) : null;
     if (k === "edit-mode") this.setEditMode(!this.canvas.settings.editMode);
     else if (k === "color") this.setColor(btn.dataset.value || "");
+    else if (k === "bg" || k === "bg-reset") this.setBackground(k === "bg" ? btn.dataset.value || "" : "");
+    else if (k === "canvas-bg" || k === "canvas-bg-reset") this.setCanvasBackground(k === "canvas-bg" ? btn.dataset.value || "" : "");
     else if (k === "duplicate") this.duplicateSelection();
     else if (k === "show-hidden" && node) this.onStructAction(node, "show-hidden");
     else if (k === "scale-reset" && node?.autoFit) {
@@ -1955,8 +2167,11 @@ export class NodeMapController {
     toast.success("Exported the canvas as JSON");
   }
 
-  /** Options of the vector export: loaded struct / source payloads and the struct rows' view state. */
-  svgOptions() {
+  /**
+   * Options of the export: loaded struct / source payloads, the struct rows' view state and (`foreign`)
+   * DOM snapshots of mounted man pages and live tabs.
+   */
+  svgOptions({ foreign = true } = {}) {
     return {
       editMode: Boolean(this.canvas.settings.editMode),
       content: (n) => {
@@ -1964,41 +2179,113 @@ export class NodeMapController {
         return entry?.status === "ok" ? entry.value : null;
       },
       structOpts: (n) => this.structOpts(n),
+      foreign: foreign ? (n) => captureNodeForeignObject(n, this.renderer?.element?.(n.id)) : null,
     };
   }
 
-  /** The whole canvas as a standalone vector SVG document. */
-  canvasSvg() {
-    return canvasToSvg(this.canvas, (c) => resolveColor(c), this.svgOptions());
+  /** The whole canvas as a standalone SVG document (`opts`: transparent, foreign, pixelScale). */
+  canvasSvg(opts = {}) {
+    return canvasToSvg(this.canvas, (c) => resolveColor(c), {
+      ...this.svgOptions({ foreign: opts.foreign !== false }),
+      transparent: Boolean(opts.transparent),
+      pixelScale: opts.pixelScale || 1,
+    });
   }
 
-  exportSVG() {
-    this.download("nodemap_canvas.svg", new Blob([this.canvasSvg()], { type: "image/svg+xml" }));
+  /**
+   * Image export dialog (Export ▾ → SVG / PNG image): transparent background (both), upscale factor with
+   * the output size in pixels (PNG). Export runs `exportSVG()` / `exportPNG()` with the choices.
+   */
+  openImageExport(kind) {
+    const png = kind === "png";
+    // Size probe without DOM snapshots (they do not change the bounds)
+    const { w, h } = svgSize(this.canvasSvg({ foreign: false }));
+    const open = this.openModalFn || openModal;
+    const modal = open({
+      title: png ? "Export PNG Image" : "Export SVG Image",
+      subtitle: `The whole canvas: ${w} × ${h} canvas units`,
+      width: "420px",
+      footerHtml: '<button type="button" class="code-btn primary" data-act="export">Export</button>',
+    });
+    const scales = PNG_SCALES.map((s) => `<option value="${s}"${s === PNG_DEFAULT_SCALE ? " selected" : ""}>${s}×</option>`).join("");
+    modal.body.innerHTML = `<form class="nm-form">
+        <label class="nm-insp-check"><input type="checkbox" name="transparent"/> <span>Transparent background</span></label>
+        ${png ? `<label class="nm-form-row"><span>Scale (sharper text and lines at higher factors)</span><select name="scale">${scales}</select></label><div class="nm-export-size" aria-live="polite"></div>` : ""}
+      </form>`;
+    const q = (sel) => modal.body.querySelector(sel);
+    const transEl = q("[name='transparent']");
+    const scaleEl = q("[name='scale']");
+    const sizeEl = q(".nm-export-size");
+    const update = () => {
+      if (!sizeEl) return;
+      const z = pngSize(w, h, Number(scaleEl?.value) || PNG_DEFAULT_SCALE);
+      sizeEl.textContent = `Output: ${z.w} × ${z.h} px${z.clamped ? " (reduced to the browser's canvas limit)" : ""}`;
+    };
+    scaleEl?.addEventListener?.("change", update);
+    update();
+    const submit = () => {
+      const opts = { transparent: Boolean(transEl?.checked), scale: Number(scaleEl?.value) || PNG_DEFAULT_SCALE };
+      modal.close();
+      if (png) this.exportPNG(opts);
+      else this.exportSVG(opts);
+    };
+    q("form")?.addEventListener?.("submit", (e) => {
+      e.preventDefault();
+      submit();
+    });
+    const btn = modal.footer?.querySelector?.("[data-act='export']");
+    if (btn) btn.onclick = submit;
+    return modal;
+  }
+
+  exportSVG({ transparent = false } = {}) {
+    const svg = this.canvasSvg({ transparent });
+    this.download("nodemap_canvas.svg", new Blob([svg], { type: "image/svg+xml" }));
     toast.success("Exported SVG image");
+    return svg;
   }
 
-  exportPNG() {
-    const svg = this.canvasSvg();
-    const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
-    const img = new Image();
-    img.onload = () => {
-      const c = document.createElement("canvas");
-      c.width = Math.min(8000, img.width * 2);
-      c.height = Math.min(8000, img.height * 2);
-      const ctx = c.getContext("2d");
-      ctx.scale(c.width / img.width, c.height / img.height);
-      ctx.drawImage(img, 0, 0);
-      URL.revokeObjectURL(url);
-      c.toBlob((blob) => {
-        if (blob) this.download("nodemap_canvas.png", blob);
-      }, "image/png");
-      toast.success("Exported PNG image");
+  /**
+   * PNG of the canvas at `scale` (clamped by `pngSize`): the SVG is rasterized at the output size (its
+   * width/height carry the scale), so text and lines stay sharp. A browser that refuses to rasterize the
+   * man page / tab snapshots (a tainted canvas) gets the image with their placeholder cards.
+   */
+  exportPNG({ transparent = false, scale = PNG_DEFAULT_SCALE } = {}) {
+    const { w, h } = svgSize(this.canvasSvg({ transparent, foreign: false }));
+    const size = pngSize(w, h, scale);
+    const rasterize = (foreign) => {
+      const svg = this.canvasSvg({ transparent, foreign, pixelScale: size.scale });
+      const img = new Image();
+      const fallback = (err) => {
+        if (foreign) {
+          toast.warning("This browser cannot rasterize the live man page / tab contents: the PNG shows placeholders for them");
+          rasterize(false);
+        } else toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
+      };
+      img.onload = () => {
+        try {
+          const c = document.createElement("canvas");
+          c.width = size.w;
+          c.height = size.h;
+          const ctx = c.getContext("2d");
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(img, 0, 0, size.w, size.h);
+          c.toBlob((blob) => {
+            if (!blob) return toast.error("PNG export failed");
+            this.download("nodemap_canvas.png", blob);
+            toast.success(`Exported PNG image (${size.w} × ${size.h} px)`);
+          }, "image/png");
+        } catch (err) {
+          fallback(err);
+        }
+      };
+      img.onerror = () => fallback(null);
+      // A data URL (not a blob URL) keeps a foreignObject SVG from tainting the canvas where browsers allow it
+      img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
     };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      toast.error("PNG export failed");
-    };
-    img.src = url;
+    rasterize(true);
+    return size;
   }
 
   /** Replace the canvas with an exported JSON document (rejected when it is not a NodeMap canvas). */

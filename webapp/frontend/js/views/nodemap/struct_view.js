@@ -9,11 +9,14 @@
  *   collapse     (data-key)  fold a nested struct/union                       (always)
  *   guard-fold   (data-key)  fold / unfold one #if branch                     (always)
  *   toggle-type  (data-key)  one member's type, an aggregate's with its subtree (Edit Mode)
- *   hide-item    (data-key)  hide / restore a member, aggregate or #if block  (Edit Mode)
+ *   hide-item    (data-key)  hide / restore a member, aggregate, #if block or   (Edit Mode)
+ *                           the outer conditions banner (key OUTER_KEY)
  *   all-types, guards        struct-wide type and guard-line toggles         (Edit Mode)
  * Every member row carries `data-key` (canvas_model.structItemKey) so edges can attach to a field.
+ * The toolbar (`.nm-struct-bar`) exists in Edit Mode only; the definition's source shows in the node
+ * header (`node_content.headMetaOf`).
  */
-import { structItemKey, typeVisible } from "./canvas_model.js";
+import { OUTER_KEY, structItemKey, typeVisible } from "./canvas_model.js";
 
 export function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -134,10 +137,12 @@ const condTitle = (conds) => (conds && conds.length ? `Built when: ${conds.join(
  * Display rows of a struct layout under the node's struct state `data`:
  *   opts.editMode   hidden items show dimmed with a restore button (else they are left out)
  *   opts.evaluator  Kconfig evaluator; branches it compiles out start folded (null: no auto-collapse)
- * Returns `{rows, tracks, typeCh, hidden}`: `tracks` is the number of nested `#if` bar tracks,
- * `typeCh` the width (ch) of the type column in table style, `hidden` how many items are hidden.
+ * Returns `{rows, tracks, typeCh, hidden, outerHidden}`: `tracks` is the number of nested `#if` bar
+ * tracks, `typeCh` the width (ch) of the type column in table style, `hidden` how many items are hidden
+ * (the outer conditions banner counts as one), `outerHidden` whether that banner is.
  * Row kinds: field, agg, pp (a directive line), summary (a folded branch). Each row has `depth`
- * (aggregate nesting) and `bars` ([level, "full"|"start"|"mid"|"end"] of the guard tracks it crosses).
+ * (aggregate nesting) and `bars` ([level, "full"|"start"|"mid"|"end"] of the guard tracks it crosses);
+ * directive rows also have `ppLevel`, how many `#if` blocks enclose the directive (its text indent).
  */
 export function structRows(layout, data, opts = {}) {
   const editMode = Boolean(opts.editMode);
@@ -171,7 +176,7 @@ export function structRows(layout, data, opts = {}) {
     for (const node of guardTree(items)) {
       if (node.kind === "guard") block(node, depth, level, eff, dimmed);
       else if (node.kind === "directive") {
-        if (showGuards) rows.push({ kind: "pp", key: structItemKey(node), depth, bars: barsAt(level), text: node.text || `#${node.directive} ${node.expr || ""}`, directive: node.directive, line: node.line, dim: dimmed, dead: eff === F });
+        if (showGuards) rows.push({ kind: "pp", key: structItemKey(node), depth, ppLevel: level, bars: barsAt(level), text: node.text || `#${node.directive} ${node.expr || ""}`, directive: node.directive, line: node.line, dim: dimmed, dead: eff === F });
       } else member(node, depth, level, eff, dimmed);
     }
   };
@@ -209,27 +214,33 @@ export function structRows(layout, data, opts = {}) {
       const cap = i === 0 ? "start" : "mid";
       const text = br.dir.text || `#${br.dir.directive} ${br.dir.expr || ""}`.trim();
       const head = {
-        key: br.key, blockKey: b.key, opener: i === 0, depth, line: br.dir.line, text, directive: br.dir.directive,
+        key: br.key, blockKey: b.key, opener: i === 0, depth, ppLevel: level, line: br.dir.line, text, directive: br.dir.directive,
         truth: TRUTH_NAME[truth], auto, folded, count, hidden: i === 0 && own, dim, dead: eff === F,
       };
       if (folded) rows.push({ ...head, kind: "summary", bars: barsAt(level, cap) });
       else if (showGuards || (i === 0 && own)) rows.push({ ...head, kind: "pp", bars: barsAt(level, cap) });
       if (!folded) walk(br.items, depth, level + 1, truth, dim);
     });
-    if (b.end && showGuards) rows.push({ kind: "pp", key: structItemKey(b.end), blockKey: b.key, closer: true, depth, bars: barsAt(level, "end"), text: b.end.text || "#endif", directive: "endif", line: b.end.line, dim, dead: eff === F });
+    if (b.end && showGuards) rows.push({ kind: "pp", key: structItemKey(b.end), blockKey: b.key, closer: true, depth, ppLevel: level, bars: barsAt(level, "end"), text: b.end.text || "#endif", directive: "endif", line: b.end.line, dim, dead: eff === F });
   };
 
   walk(layout?.items || [], 0, 0, T, false);
+  const outerHidden = Boolean(layout?.outer_conds?.length) && isHidden(OUTER_KEY);
   // `hidden` counts the hidden items this layout reaches (inside a folded part they are not visited)
-  return { rows, tracks, typeCh: Math.max(4, Math.min(48, typeCh + 1)), hidden: hiddenHit };
+  return { rows, tracks, typeCh: Math.max(4, Math.min(48, typeCh + 1)), hidden: hiddenHit, outerHidden };
 }
 
 // ------------------------------------------------------------------ HTML
 
 const BAR_W = 6; // canvas units per #if track (struct rows are zoom-controlled, not UI-scaled)
 
-function barsHtml(bars) {
-  return bars.map(([l, part]) => `<span class="nm-pp-bar nm-pp-${part} nm-pp-l${l % 4}" style="--nm-pp-level:${l}"></span>`).join("");
+/**
+ * Scope bars of a row: absolute in the row's left gutter (list style), or inside the dedicated `#ifdef`
+ * cell that starts every row of a table-style struct with tracks (`cell`).
+ */
+function barsHtml(bars, cell = false) {
+  const html = bars.map(([l, part]) => `<span class="nm-pp-bar nm-pp-${part} nm-pp-l${l % 4}" style="--nm-pp-level:${l}"></span>`).join("");
+  return cell ? `<span class="nm-sf-ppcell" aria-hidden="true">${html}</span>` : html;
 }
 
 function hideBtn(r, editMode, key) {
@@ -241,7 +252,7 @@ function rowClass(r, extra) {
   return `nm-sf ${extra}${r.dim ? " nm-sf-dim" : ""}${r.hidden ? " nm-sf-hidden" : ""}${r.dead ? " nm-sf-dead" : ""}`;
 }
 
-function rowHtml(r, data, editMode, table) {
+function rowHtml(r, data, editMode, table, cell = false) {
   const ports = (key) => [
     `<span class="nm-port nm-port-field nm-port-left" data-field="${esc(key)}" data-side="left"></span>`,
     `<span class="nm-port nm-port-field nm-port-right" data-field="${esc(key)}" data-side="right"></span>`,
@@ -255,8 +266,10 @@ function rowHtml(r, data, editMode, table) {
       ? `<button type="button" class="nm-sf-ppsum-label" data-act="guard-fold" data-key="${esc(r.key)}" title="Show the members of this branch">${r.count} member${r.count === 1 ? "" : "s"}${r.auto ? " · compiled out" : " · folded"}</button>`
       : "";
     const dirClass = r.directive ? ` nm-pp-${esc(r.directive)}` : "";
+    // Nested directives step in, one indent per enclosing #if block (fold chevron and text alike)
+    const indent = r.ppLevel ? `<span class="nm-pp-indent" style="--nm-pp-lvl:${r.ppLevel}"></span>` : "";
     return `<div class="${rowClass(r, `nm-sf-pp${r.kind === "summary" ? " nm-sf-ppsum" : ""}${dirClass}${truth}`)}" data-pp-key="${esc(r.key)}" ${style} title="line ${esc(r.line)}${r.truth === "false" ? " · compiled out by the Kconfig engine" : r.truth === "true" ? " · built by the Kconfig engine" : ""}">
-    ${barsHtml(r.bars)}<span class="nm-sf-ctl">${fold}</span><span class="nm-sf-pptext">${esc(r.text)}</span>${summary}${line}${r.opener ? hideBtn(r, editMode, r.blockKey) : ""}
+    ${barsHtml(r.bars, cell)}${indent}<span class="nm-sf-ctl">${fold}</span><span class="nm-sf-pptext">${esc(r.text)}</span>${summary}${line}${r.opener ? hideBtn(r, editMode, r.blockKey) : ""}
   </div>`;
   }
   const [pl, pr] = ports(r.key);
@@ -269,7 +282,7 @@ function rowHtml(r, data, editMode, table) {
       ? `<span class="nm-sf-type nm-sf-cell"><span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? ` ${esc(r.typeText)}` : ""}</span>`
       : `<span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? `<span class="nm-sf-type">${esc(r.typeText)}</span>` : ""}`;
     return `<div class="${rowClass(r, `nm-sf-agg${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
   }
   const suffix = r.suffix ? `<span class="nm-sf-suffix">${esc(r.suffix)}</span>` : "";
@@ -277,35 +290,46 @@ function rowHtml(r, data, editMode, table) {
     ? `<span class="nm-sf-type nm-sf-cell">${esc(r.type)}</span>`
     : (r.showType ? `<span class="nm-sf-type">${esc(r.type)}</span>` : "");
   return `<div class="${rowClass(r, `nm-sf-field${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
 }
 
 /**
- * Body HTML of a struct node: the toolbar (struct-wide type and guard toggles in Edit Mode, source of
- * the span) and the member rows in the node's style. `layout` is the endpoint's response, `data` the
- * node's struct state, `opts` as for `structRows()`.
+ * The struct-wide conditions banner (`layout.outer_conds`): left out when hidden in View Mode, dimmed
+ * with a restore button in Edit Mode (only the banner dims, never the member rows).
+ */
+function outerHtml(layout, model, editMode) {
+  if (!layout.outer_conds?.length || (model.outerHidden && !editMode)) return "";
+  const h = model.outerHidden;
+  const btn = editMode
+    ? `<button type="button" class="nm-sf-hide${h ? " on" : ""}" data-act="hide-item" data-key="${OUTER_KEY}" title="${h ? "Restore" : "Hide"} the conditions around the whole definition">${h ? "↺" : "✕"}</button>`
+    : "";
+  return `<div class="nm-sf-outer${h ? " nm-sf-dim nm-sf-hidden" : ""}" data-key="${OUTER_KEY}" title="Conditions around the whole definition"><span class="nm-sf-outer-text">${esc(layout.outer_conds.join(" && "))}</span>${btn}</div>`;
+}
+
+/**
+ * Body HTML of a struct node: the toolbar (Edit Mode only: struct-wide type and guard toggles, hidden
+ * count), the outer conditions banner and the member rows in the node's style. `layout` is the
+ * endpoint's response, `data` the node's struct state, `opts` as for `structRows()`.
  */
 export function renderStructBody(layout, data, opts = {}) {
   const editMode = Boolean(opts.editMode);
   const table = data.style === "table";
   const directives = countDirectives(layout.items);
   const model = opts.model || structRows(layout, data, opts);
-  const outer = layout.outer_conds?.length ? `<div class="nm-sf-outer" title="Conditions around the whole definition">${esc(layout.outer_conds.join(" && "))}</div>` : "";
-  const src = `${layout.file_path || ""}:${layout.line_s || ""}`;
+  const outer = outerHtml(layout, model, editMode);
   const chips = editMode
     ? `<button type="button" class="nm-chip${data.showTypes ? " on" : ""}" data-act="all-types" aria-pressed="${data.showTypes}" title="Show or hide every member type">Types</button>
       <button type="button" class="nm-chip${data.showGuards ? " on" : ""}" data-act="guards" aria-pressed="${data.showGuards}" ${directives ? "" : "disabled"} title="${directives ? `Show or hide the ${directives} preprocessor lines` : "No preprocessor lines inside this definition"}">#ifdef${directives ? ` ${directives}` : ""}</button>`
     : "";
   const hiddenNote = editMode && model.hidden ? `<span class="nm-chip nm-chip-note" title="Hidden items show dimmed in Edit Mode">${model.hidden} hidden</span>` : "";
-  const rowsHtml = model.rows.map((r) => rowHtml(r, data, editMode, table)).join("");
+  // Table style with #if tracks: the scope bars get their own bordered column on the left of every row
+  const cell = table && model.tracks > 0;
+  const rowsHtml = model.rows.map((r) => rowHtml(r, data, editMode, table, cell)).join("");
   const vars = `--nm-pp-tracks:${model.tracks};--nm-gutter:${model.tracks ? model.tracks * BAR_W + BAR_W : 0}px;--nm-type-col:${model.typeCh}ch`;
-  return `<div class="nm-struct-bar">
-      ${chips}${hiddenNote}
-      <span class="nm-struct-src" title="${esc(`${src} (span from ${layout.span_source === "db" ? "the index" : "the source text"})`)}">${esc(src)}</span>
-    </div>
-    ${outer}
-    <div class="nm-struct-rows nm-scroll nm-style-${table ? "table" : "list"}" style="${vars}">${rowsHtml || '<div class="nm-empty">No members</div>'}</div>`;
+  const bar = editMode ? `<div class="nm-struct-bar">${chips}${hiddenNote}</div>` : "";
+  return `${bar}${outer}
+    <div class="nm-struct-rows nm-scroll nm-style-${table ? "table" : "list"}${cell ? " nm-pp-cells" : ""}" style="${vars}">${rowsHtml || '<div class="nm-empty">No members</div>'}</div>`;
 }
 
 /** Find a layout item by key (depth first). */

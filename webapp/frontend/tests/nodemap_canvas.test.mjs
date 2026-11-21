@@ -8,8 +8,8 @@ import * as M from "../js/views/nodemap/canvas_model.js";
 import { anchorPoint, arrowHeads, autoSides, computeEdgeGeometry, dashArray, edgePath, resolveEnds } from "../js/views/nodemap/edge_router.js";
 import { branchTruths, countDirectives, findItem, guardAutoCollapsed, guardTree, renderStructBody, structRows } from "../js/views/nodemap/struct_view.js";
 import { DirectiveEvaluator } from "../js/views/kconfig/directive_evaluator.js";
-import { renderNoteMarkdown, renderSourceRows } from "../js/views/nodemap/node_content.js";
-import { canvasToSvg } from "../js/views/nodemap/nodemap_export.js";
+import { headMetaOf, renderNoteMarkdown, renderSourceRows } from "../js/views/nodemap/node_content.js";
+import { canvasToSvg, captureNodeForeignObject, pngSize, svgSize } from "../js/views/nodemap/nodemap_export.js";
 import { contentKey } from "../js/views/nodemap/node_renderer.js";
 
 const memStorage = () => {
@@ -309,7 +309,7 @@ test("SVG export draws groups, nodes, styled edges and labels with resolved colo
 // ------------------------------------------------------------------ NodeMap upgrade: schema, struct rows, export, clipboard
 
 test("settings: Edit Mode off, Kconfig folding on, auto engine by default", () => {
-  assert.deepEqual(M.emptyCanvas().settings, { snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "" });
+  assert.deepEqual(M.emptyCanvas().settings, { snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "", bgColor: "" });
   const st = M.normalizeSettings({ editMode: true, kconfigCollapse: false, kconfigEngine: "tab-7", grid: 2 });
   assert.equal(st.editMode, true);
   assert.equal(st.kconfigCollapse, false);
@@ -623,4 +623,175 @@ test("SVG export stays valid XML: control characters dropped, label extents in t
   const d = structData();
   d.hiddenItems = { "2:a": true, "999:gone": true };
   assert.equal(structRows(NESTED, d, { editMode: true }).hidden, 1, "a key of a moved line is not counted");
+});
+
+test("hideHeader and backgrounds: normalized, persisted, themed defaults without literal colors", () => {
+  const n = M.createNode("note", { hideHeader: true, bgColor: "#AABBCC" });
+  assert.equal(n.hideHeader, true);
+  assert.equal(n.bgColor, "#aabbcc");
+  assert.equal(M.createNode("note", { hideHeader: "yes", bgColor: "nope" }).hideHeader, false, "only a real boolean hides");
+  assert.equal(M.createNode("note", { bgColor: "nope" }).bgColor, "");
+  const c = { ...M.emptyCanvas(), nodes: [n], settings: M.normalizeSettings({ bgColor: "green" }) };
+  const back = M.normalizeCanvas(M.serializeCanvas(c));
+  assert.equal(back.nodes[0].hideHeader, true);
+  assert.equal(back.nodes[0].bgColor, "#aabbcc");
+  assert.equal(back.settings.bgColor, "green");
+  assert.equal(M.bgVar("", "var(--bg-canvas)"), "var(--bg-canvas)", "the theme default");
+  assert.equal(M.bgVar("#102030"), "#102030");
+  assert.match(M.bgVar("blue", "var(--bg-secondary)"), /^color-mix\(in srgb, var\(--accent-blue\) 22%, var\(--bg-secondary\)\)$/, "presets tint the theme background");
+});
+
+test("undo stack: bounded, no-op snapshots skipped, redo cleared by new changes, coalesced live edits", () => {
+  const h = new M.UndoStack(3);
+  assert.equal(h.record("a"), false, "the first snapshot is the baseline");
+  assert.equal(h.record("a"), false, "no-op");
+  assert.equal(h.record("b"), true);
+  assert.equal(h.record("c"), true);
+  assert.equal(h.undo("c"), "b");
+  assert.equal(h.undo("b"), "a");
+  assert.equal(h.undo("a"), null);
+  assert.equal(h.redo("a"), "b");
+  h.record("x");
+  assert.equal(h.canRedo, false, "a new change drops the redo stack");
+  for (const v of ["1", "2", "3", "4", "5"]) h.record(v);
+  assert.equal(h.undoList.length, 3, "bounded");
+  const live = new M.UndoStack();
+  live.record("0");
+  live.record("1", "drag");
+  live.record("2", "drag");
+  live.record("3", "drag");
+  live.record("3"); // the final change event ends the run
+  live.record("4", "drag");
+  assert.deepEqual(live.undoList, ["0", "3"], "one step per live edit");
+  assert.equal(live.undo("9"), "4", "an unrecorded change is recorded before undoing");
+  const gap = new M.UndoStack();
+  gap.record("0");
+  gap.record("1");
+  gap.record("1", "k"); // a no-op of a live edit opens no run
+  gap.record("2", "k");
+  assert.deepEqual(gap.undoList, ["0", "1"], "a real change after a no-op is its own step");
+  gap.absorb("2b");
+  gap.record("3", "k");
+  assert.deepEqual(gap.undoList, ["0", "1", "2b"], "absorb ends a run");
+  const snap = JSON.parse(M.historySnapshot({ ...M.emptyCanvas(), settings: M.normalizeSettings({ editMode: true, snap: true, bgColor: "red" }) }));
+  assert.equal("editMode" in snap.settings || "snap" in snap.settings, false, "view state is not history");
+  assert.equal(snap.settings.bgColor, "red");
+});
+
+test("nested #ifdef directive rows carry their nesting level and indent", () => {
+  const d = M.createNode("struct", { data: { name: "n" } }).data;
+  const { rows } = structRows(NESTED, d);
+  const lvl = (text) => rows.find((r) => r.kind === "pp" && r.text === text).ppLevel;
+  assert.equal(lvl("#ifdef CONFIG_A"), 0);
+  assert.equal(lvl("#if defined(CONFIG_B)"), 1);
+  assert.equal(lvl("#elif IS_ENABLED(CONFIG_C)"), 1);
+  assert.equal(rows.filter((r) => r.kind === "pp" && r.directive === "endif").map((r) => r.ppLevel).sort().join(","), "0,0,1");
+  const html = renderStructBody(NESTED, d);
+  assert.match(html, /data-pp-key="5:if"[^>]*>\s*(<span class="nm-pp-bar[^>]*><\/span>)*<span class="nm-pp-indent" style="--nm-pp-lvl:1">/, "the nested #if steps in");
+  assert.doesNotMatch(html, /data-pp-key="3:ifdef"[^>]*>\s*(<span class="nm-pp-bar[^>]*><\/span>)*<span class="nm-pp-indent"/, "an outermost directive does not");
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("struct", { id: "s", x: 0, y: 0, w: 600, h: 900, data: { name: "n" } })] }, (c) => c, { content: () => NESTED });
+  const xOf = (t) => Number(new RegExp(`<text x="([\\d.]+)"[^>]*>▾ ${t.replace(/[()]/g, "\\$&")}`).exec(svg)?.[1]);
+  assert.equal(xOf("#if defined(CONFIG_B)") - xOf("#ifdef CONFIG_A"), 10, "the export indents by the same step");
+});
+
+test("table style: a bordered #ifdef cell on every row when there are tracks", () => {
+  const d = M.createNode("struct", { data: { name: "n", style: "table" } }).data;
+  const html = renderStructBody(NESTED, d);
+  assert.match(html, /nm-style-table nm-pp-cells/);
+  const rows = html.match(/<div class="nm-sf /g).length;
+  assert.equal((html.match(/class="nm-sf-ppcell"/g) || []).length, rows, "one cell per row, bars inside it");
+  assert.match(html, /<span class="nm-sf-ppcell" aria-hidden="true"><span class="nm-pp-bar/);
+  d.showGuards = false;
+  assert.doesNotMatch(renderStructBody(NESTED, d), /nm-sf-ppcell/, "no tracks, no cell");
+  d.showGuards = true;
+  d.style = "list";
+  assert.doesNotMatch(renderStructBody(NESTED, d), /nm-sf-ppcell/, "list style keeps the gutter bars");
+  const node = M.createNode("struct", { id: "s", x: 0, y: 0, w: 600, h: 900, data: { name: "n", style: "table" } });
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { content: () => NESTED });
+  // The divider closes the cell: gutter (tracks × 6 + 6) + 10, down the whole row block
+  const x = structRows(NESTED, node.data).tracks * 6 + 6 + 10;
+  assert.match(svg, new RegExp(`<line x1="${x}" y1="[\\d.]+" x2="${x}" y2="[\\d.]+" stroke="var\\(--border-muted\\)"/>`));
+});
+
+test("outer #ifdef banner hides like a member; only the banner dims in Edit Mode", () => {
+  const d = M.createNode("struct", { data: { name: "foo" } }).data;
+  assert.match(renderStructBody(LAYOUT, d, { editMode: true }), /data-act="hide-item" data-key="__outer__"/);
+  M.toggleHidden(d, M.OUTER_KEY);
+  const view = renderStructBody(LAYOUT, d);
+  assert.doesNotMatch(view, /nm-sf-outer/, "left out in View Mode");
+  const edit = renderStructBody(LAYOUT, d, { editMode: true });
+  assert.match(edit, /class="nm-sf-outer nm-sf-dim nm-sf-hidden"/);
+  assert.doesNotMatch(edit, /class="nm-sf nm-sf-field nm-sf-dim/, "member rows are not dimmed");
+  const model = structRows(LAYOUT, d, { editMode: true });
+  assert.equal(model.outerHidden, true);
+  assert.equal(model.hidden, 1, "counted for Show all hidden");
+  assert.equal(M.showAllHidden(d), 1);
+  assert.match(renderStructBody(LAYOUT, d), /nm-sf-outer/);
+  M.toggleHidden(d, M.OUTER_KEY);
+  const node = M.createNode("struct", { id: "s", x: 0, y: 0, data: d });
+  const svgView = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { content: () => LAYOUT });
+  assert.doesNotMatch(svgView, /defined\(CONFIG_FOO\)/);
+  const svgEdit = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { editMode: true, content: () => LAYOUT, structOpts: () => ({ editMode: true }) });
+  assert.match(svgEdit, /<g opacity="0\.45"><text[^>]*>defined\(CONFIG_FOO\)/, "the banner alone is dimmed");
+});
+
+test("struct toolbar only in Edit Mode; the source reference is in the header", () => {
+  const d = M.createNode("struct", { data: { name: "foo" } }).data;
+  assert.doesNotMatch(renderStructBody(LAYOUT, d), /nm-struct-bar/);
+  assert.doesNotMatch(renderStructBody(LAYOUT, d), /nm-struct-src|include\/foo\.h/);
+  assert.match(renderStructBody(LAYOUT, d, { editMode: true }), /<div class="nm-struct-bar">[\s\S]*Types/);
+  assert.deepEqual(headMetaOf("struct", LAYOUT), { text: "include/foo.h:10", title: "include/foo.h:10-30 (span from the source text)" });
+  assert.equal(headMetaOf("source", { path: "a.c", start_line: 3, end_line: 9, total_lines: 40, truncated: false, symbol: null }).text, "a.c · 3–9");
+  assert.equal(headMetaOf("struct", null).text, "");
+  const node = M.createNode("struct", { id: "s", x: 0, y: 0, w: 400, data: { name: "foo" } });
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { content: () => LAYOUT });
+  assert.match(svg, /text-anchor="end"[^>]*>include\/foo\.h:10</, "the header shows the reference");
+  assert.doesNotMatch(svg, />Types</, "no toolbar in View Mode");
+  // Rows start right under the header (26) + the outer banner (16) + 2
+  const first = /<text x="[\d.]+" y="([\d.]+)"[^>]*><tspan fill="var\(--syn-type\)">int /.exec(svg);
+  assert.equal(Number(first[1]), 26 + 16 + 2 + 8 + 4, "first row baseline without the toolbar");
+});
+
+test("SVG export: headerless nodes, backgrounds, transparency, pixel scale and foreignObject snapshots", () => {
+  const note = M.createNode("note", { id: "n", x: 0, y: 0, w: 200, h: 100, hideHeader: true, bgColor: "#204060", data: { text: "hello" } });
+  const man = M.createNode("man", { id: "m", x: 400, y: 0, data: { name: "open", section: "2", path: "man2/open.2" } });
+  const tab = M.createNode("tab", { id: "t", x: 0, y: 600, data: { tabType: "commits", hash: "tab=commits" } });
+  const canvas = { ...M.emptyCanvas(), nodes: [note, man, tab], edges: [M.createEdge({ from: "n", to: "m", label: "see" })], settings: M.normalizeSettings({ bgColor: "#112233" }) };
+  const resolve = (c) => ({ "var(--accent-blue)": "#0000ff", "var(--bg-secondary)": "#ffffff" }[c] || c);
+  const svg = canvasToSvg(canvas, resolve, {});
+  assert.doesNotMatch(svg, />NOTE</, "a hidden header is left out in View Mode");
+  assert.match(svg, />hello</);
+  assert.match(svg, /<text x="10" y="18"[^>]*>hello/, "the body starts at the node's top");
+  assert.match(svg, /fill="#204060"/, "node background");
+  assert.match(svg, /<rect x="-?\d+" y="-?\d+" width="\d+" height="\d+" fill="#112233"\/>/, "canvas background");
+  assert.match(svg, /stroke="#112233" stroke-width="4" paint-order="stroke"/, "label halo in the canvas color");
+  assert.match(svg, /Live commits tab/, "no live DOM: placeholder card");
+  assert.match(canvasToSvg(canvas, resolve, { editMode: true }), /<g opacity="0\.45">[\s\S]*?>NOTE</, "Edit Mode draws it dimmed");
+  const tinted = canvasToSvg({ ...canvas, nodes: [{ ...note, bgColor: "blue" }] }, resolve, {});
+  assert.match(tinted, /fill="#c7c7ff"/, "a preset background is the accent tinted into the theme background");
+  const clear = canvasToSvg(canvas, resolve, { transparent: true });
+  assert.doesNotMatch(clear, /fill="#112233"/, "no background rect");
+  assert.doesNotMatch(clear, /paint-order="stroke"/, "no halo on a transparent image");
+  const { w, h } = svgSize(svg);
+  const big = svgSize(canvasToSvg(canvas, resolve, { pixelScale: 3 }));
+  assert.deepEqual([big.w, big.h], [w * 3, h * 3]);
+  assert.match(canvasToSvg(canvas, resolve, { pixelScale: 3 }), new RegExp(`viewBox="-?\\d+ -?\\d+ ${w} ${h}"`), "same viewBox: vectors rasterized larger");
+  const fo = canvasToSvg(canvas, resolve, { foreign: (n) => (n.type === "tab" ? { html: '<div xmlns="http://www.w3.org/1999/xhtml">live \u0001commits</div>' } : n.type === "man" ? { html: "<p>man body</p>" } : null) });
+  assert.match(fo, /<foreignObject x="0" y="26" width="720" height="454"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml" style="width:720px;height:454px;overflow:hidden"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml">live commits<\/div>/);
+  assert.match(fo, /man body/);
+  assert.doesNotMatch(fo, /Live commits tab|\u0001/, "the snapshot replaces the card; XML-illegal characters go");
+  assert.equal(captureNodeForeignObject(tab, null), null, "nothing mounted: no snapshot");
+  assert.equal(captureNodeForeignObject(tab, { querySelector: () => null }), null);
+});
+
+test("PNG upscale: output size per factor, clamped to the canvas limits", () => {
+  assert.deepEqual(pngSize(1000, 500, 3), { w: 3000, h: 1500, scale: 3, clamped: false });
+  assert.deepEqual(pngSize(1000, 500, 1), { w: 1000, h: 500, scale: 1, clamped: false });
+  const z = pngSize(10000, 2000, 4);
+  assert.equal(z.w, 16384);
+  assert.equal(z.clamped, true);
+  assert.ok(z.h <= 16384 && Math.abs(z.w / z.h - 5) < 0.01, "aspect kept");
+  const area = pngSize(15000, 15000, 4);
+  assert.ok(area.w * area.h <= 268435456);
+  assert.deepEqual(svgSize('<svg xmlns="x" width="120" height="80" viewBox="0 0 40 20">'), { w: 120, h: 80 });
 });

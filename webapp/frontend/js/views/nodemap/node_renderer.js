@@ -6,14 +6,17 @@
  * a man page or a scrolled source slice survives drags. Pointer handling is delegated to the controller
  * (one listener set on the canvas); elements only carry `data-*` hooks:
  *   .nm-node[data-node-id]   .nm-node-head (drag handle)   .nm-title (inline title edit)
+ *   .nm-head-meta            source reference (`headMeta` hook) before the header tools
  *   .nm-rz[data-rz]          resize handles (n, s, e, w, ne, nw, se, sw)
  *   .nm-port[data-side]      side ports; struct rows add .nm-port-field[data-field]
  *   [data-act]               header and body buttons
  * An auto-fitted node (`autoFit`) lays out at its natural `baseW`×`baseH` and is drawn scaled by
  * `scale` (transform origin top left), so its on-screen box is `w`×`h` and content grows and shrinks
  * with it; ports, handles and field rows scale along, so wires still meet them.
+ * `hideHeader` sets `.nm-head-hidden` (nodemap.css: dimmed header in Edit Mode, none in View Mode);
+ * `bgColor` sets `--nm-node-bg` (`.nm-has-bg`).
  */
-import { accentVar, displayTitle, paintOrder } from "./canvas_model.js";
+import { accentVar, bgVar, displayTitle, paintOrder } from "./canvas_model.js";
 import { esc } from "./struct_view.js";
 
 const HANDLES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
@@ -40,7 +43,8 @@ export function nodeBox(node) {
 export class NodeRenderer {
   /**
    * @param {HTMLElement} layer  the zoomed canvas layer
-   * @param {{renderBody(node, bodyEl), disposeBody?(nodeId), headTools?(node): string, bodyKey?(node): string}} hooks
+   * @param {{renderBody(node, bodyEl), disposeBody?(nodeId), headTools?(node): string,
+   *          headMeta?(node): {text, title}, bodyKey?(node): string}} hooks
    */
   constructor(layer, hooks) {
     this.layer = layer;
@@ -104,6 +108,7 @@ export class NodeRenderer {
       <div class="nm-node-head">
         <span class="nm-badge">${esc(BADGES[node.type] || node.type)}</span>
         <span class="nm-title" title="Double-click to rename"></span>
+        <span class="nm-head-meta"></span>
         <span class="nm-head-tools"></span>
       </div>
       <div class="nm-node-body"></div>
@@ -119,6 +124,19 @@ export class NodeRenderer {
     el.classList.toggle("nm-has-accent", Boolean(node.color));
     el.classList.toggle("nm-autofit", Boolean(node.autoFit));
     el.style.setProperty("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
+    el.classList.toggle("nm-head-hidden", Boolean(node.hideHeader));
+    el.classList.toggle("nm-has-bg", Boolean(node.bgColor));
+    if (node.bgColor) el.style.setProperty("--nm-node-bg", bgVar(node.bgColor, "var(--bg-secondary)"));
+    else el.style.removeProperty?.("--nm-node-bg");
+    const meta = this.hooks.headMeta ? this.hooks.headMeta(node) : null;
+    const metaEl = el.querySelector(".nm-head-meta");
+    if (metaEl && metaEl.dataset.text !== (meta?.text || "")) {
+      metaEl.dataset.text = meta?.text || "";
+      // An isolated LTR run inside the RTL box: a long path loses its start, never the line numbers
+      metaEl.innerHTML = meta?.text ? `<bdi>${esc(meta.text)}</bdi>` : "";
+      metaEl.title = meta?.title || "";
+      metaEl.hidden = !meta?.text;
+    }
     const titleEl = el.querySelector(".nm-title");
     const title = displayTitle(node);
     if (titleEl && !titleEl.querySelector("input") && titleEl.textContent !== title) titleEl.textContent = title;

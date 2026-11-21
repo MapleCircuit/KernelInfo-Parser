@@ -7,12 +7,17 @@
  *
  * Canvas JSON (`schema: "kip-nodemap-canvas"`, `version: 1`):
  *   { schema, version, nodes: [Node], edges: [Edge], viewport: {x, y, zoom},
- *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine} }
- *   Node  { id, type, x, y, w, h, title, customTitle, color, groupId, version, repo, data,
- *           autoFit, baseW, baseH, scale }
+ *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine, bgColor} }
+ *   Node  { id, type, x, y, w, h, title, customTitle, color, bgColor, hideHeader, groupId, version, repo,
+ *           data, autoFit, baseW, baseH, scale }
  *   Edge  { id, from, to, fromSide, toSide, fromField, toField, label, arrow, style, curve, color }
- * `color` is a preset accent id (`ACCENTS`) or a custom `#rrggbb`. With `autoFit` the node is sized to its
- * content: `baseW`×`baseH` is the natural (unscaled) size and `w`/`h` = base × `scale`.
+ * `color` (accent) and `bgColor` (node / canvas background, `bgVar()`) are a preset accent id (`ACCENTS`)
+ * or a custom `#rrggbb`; `""` is the theme default. `hideHeader` leaves the node header out in View Mode
+ * (Edit Mode shows it dimmed). With `autoFit` the node is sized to its content: `baseW`×`baseH` is the
+ * natural (unscaled) size and `w`/`h` = base × `scale`.
+ *
+ * `UndoStack` / `historySnapshot()` hold the controller's bounded undo / redo history of the document
+ * (nodes, edges, settings; viewport, Edit Mode and snap are view state and stay out of it).
  */
 
 export const CANVAS_SCHEMA = "kip-nodemap-canvas";
@@ -65,6 +70,18 @@ export function normalizeColor(c) {
 export function accentVar(id, fallback = "var(--border-color)") {
   if (isCustomColor(id)) return id.toLowerCase();
   return id && ACCENT_IDS.has(id) ? `var(--accent-${id})` : fallback;
+}
+
+/** Share of a preset accent in a background tint (the rest is the theme background it is mixed into). */
+export const BG_TINT = 0.22;
+
+/**
+ * CSS background of a node or the canvas: `""` the theme `base` token, a custom `#rrggbb` as it is, a
+ * preset accent tinted into `base` (accents are foreground colors; text stays readable on the tint).
+ */
+export function bgVar(id, base = "var(--bg-secondary)") {
+  if (isCustomColor(id)) return id.toLowerCase();
+  return id && ACCENT_IDS.has(id) ? `color-mix(in srgb, var(--accent-${id}) ${Math.round(BG_TINT * 100)}%, ${base})` : base;
 }
 
 /**
@@ -249,6 +266,8 @@ export function normalizeNode(raw) {
     title: str(raw.title, "", 512) || defaultTitle(type, data),
     customTitle: str(raw.customTitle, "", 512),
     color: normalizeColor(raw.color),
+    bgColor: normalizeColor(raw.bgColor),
+    hideHeader: raw.hideHeader === true,
     groupId: typeof raw.groupId === "string" && ID_RE.test(raw.groupId) ? raw.groupId : null,
     version: str(raw.version, "", 256),
     repo: str(raw.repo, "", 128),
@@ -299,7 +318,7 @@ export function emptyCanvas() {
 /**
  * Canvas-wide settings: snap grid; `editMode` (node editing controls shown); `kconfigCollapse` (fold #if
  * branches a Kconfig engine compiles out) and `kconfigEngine` (engine tab id, `""` = the engine of each
- * node's revision).
+ * node's revision); `bgColor` the canvas background (`bgVar()` over `--bg-canvas`).
  */
 export function normalizeSettings(raw) {
   const st = isObj(raw) ? raw : {};
@@ -309,6 +328,7 @@ export function normalizeSettings(raw) {
     editMode: st.editMode === true,
     kconfigCollapse: st.kconfigCollapse !== false,
     kconfigEngine: str(st.kconfigEngine, "", 256),
+    bgColor: normalizeColor(st.bgColor),
   };
 }
 
@@ -812,6 +832,9 @@ export function embedSrc(hash, base = "/") {
   return `${base}?embed=1#${String(hash || "").replace(/^#/, "")}`;
 }
 
+/** `hiddenItems` key of the struct-wide outer conditions banner (`layout.outer_conds`). */
+export const OUTER_KEY = "__outer__";
+
 /** Hide or restore one struct item (member, aggregate with its subtree, or `#if` block by its opening line). */
 export function toggleHidden(structData, key) {
   if (!key) return false;
@@ -838,4 +861,105 @@ export function toggleGuardCollapse(structData, key, autoCollapsed = false) {
   if (next === Boolean(autoCollapsed)) delete structData.collapsedGuards[key];
   else structData.collapsedGuards[key] = next;
   return next;
+}
+
+// ------------------------------------------------------------------ undo / redo
+
+/** Settings that are view state, not document: undo never flips them. */
+const VIEW_SETTINGS = ["editMode", "snap"];
+
+/** Comparable snapshot (JSON text) of what undo restores: nodes, edges and the document settings. */
+export function historySnapshot(canvas) {
+  const settings = { ...(canvas?.settings || {}) };
+  for (const k of VIEW_SETTINGS) delete settings[k];
+  return JSON.stringify({ nodes: canvas?.nodes || [], edges: canvas?.edges || [], settings });
+}
+
+/**
+ * Bounded undo / redo history of snapshots. `base` is the document as last seen; `record(snap)` pushes the
+ * previous base when the document changed (no-op snapshots are not pushed) and clears the redo stack;
+ * consecutive records with the same `coalesce` key (live color drags, typing) fold into one step, up to
+ * and including the record that has `end` set (the final change event of that edit).
+ * `absorb(snap)` takes a change that is not the user's (auto-fit sizes, a resolved man page) into the base.
+ */
+export class UndoStack {
+  constructor(limit = 80) {
+    this.limit = limit;
+    this.undoList = [];
+    this.redoList = [];
+    this.base = null;
+    this.lastKey = null;
+  }
+
+  reset(snap = null) {
+    this.undoList = [];
+    this.redoList = [];
+    this.base = snap;
+    this.lastKey = null;
+  }
+
+  get canUndo() {
+    return this.undoList.length > 0;
+  }
+
+  get canRedo() {
+    return this.redoList.length > 0;
+  }
+
+  absorb(snap) {
+    this.base = snap;
+    this.lastKey = null;
+  }
+
+  /** End a coalescing run (the next record is a step of its own). */
+  close() {
+    this.lastKey = null;
+  }
+
+  /** True when a new step was pushed. */
+  record(snap, coalesce = null, end = false) {
+    if (this.base === null) {
+      this.base = snap;
+      return false;
+    }
+    if (snap === this.base) {
+      // A no-op of another kind, or the `end` of the run, ends a coalescing run
+      if (end || coalesce !== this.lastKey) this.lastKey = null;
+      return false;
+    }
+    const merge = Boolean(coalesce) && coalesce === this.lastKey && this.undoList.length > 0;
+    this.lastKey = end ? null : coalesce || null;
+    this.redoList = [];
+    if (merge) {
+      this.base = snap;
+      return false;
+    }
+    this.undoList.push(this.base);
+    if (this.undoList.length > this.limit) this.undoList.shift();
+    this.base = snap;
+    return true;
+  }
+
+  /** Snapshot to restore (the step before `current`), or null when there is none. */
+  undo(current) {
+    if (current !== undefined && current !== null && current !== this.base) this.record(current);
+    if (!this.undoList.length) return null;
+    this.redoList.push(this.base);
+    this.base = this.undoList.pop();
+    this.lastKey = null;
+    return this.base;
+  }
+
+  /** Snapshot to restore (the step undone last), or null; a change since the undo drops the redo stack. */
+  redo(current) {
+    if (current !== undefined && current !== null && current !== this.base) {
+      this.record(current);
+      return null;
+    }
+    if (!this.redoList.length) return null;
+    this.undoList.push(this.base);
+    this.base = this.redoList.pop();
+    this.lastKey = null;
+    return this.base;
+  }
 }

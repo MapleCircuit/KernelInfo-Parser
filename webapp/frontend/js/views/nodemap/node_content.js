@@ -91,3 +91,23 @@ export function renderSourceRows(lines, startLine, path, highlight = null) {
   }
   return html;
 }
+
+/**
+ * Compact source reference a node header shows on the right (`.nm-head-meta`), with its full form as
+ * the tooltip: a struct's `file:line` of its definition, a source slice's `path · start–end`. `payload`
+ * is the node's loaded content (null while not loaded: no reference).
+ */
+export function headMetaOf(type, payload) {
+  if (!payload) return { text: "", title: "" };
+  if (type === "struct" && payload.file_path) {
+    const text = `${payload.file_path}:${payload.line_s || ""}`;
+    const span = payload.span_source === "db" ? "the index" : "the source text";
+    return { text, title: `${payload.file_path}:${payload.line_s || ""}-${payload.line_e || ""} (span from ${span})` };
+  }
+  if (type === "source" && payload.path) {
+    const text = `${payload.path} · ${payload.start_line}–${payload.end_line}`;
+    const title = `${text} of ${payload.total_lines}${payload.truncated ? " · truncated" : ""}${payload.symbol ? ` · ${payload.symbol.kind} ${payload.symbol.name}` : ""}`;
+    return { text, title };
+  }
+  return { text: "", title: "" };
+}

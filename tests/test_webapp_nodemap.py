@@ -292,5 +292,39 @@ class NodeMapApiTests(unittest.TestCase):
         self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.bin", False, b"\0\0").status_code, 415)
 
 
+class EmbedFramingHeaderTests(unittest.TestCase):
+    """The NodeMap frames the app's own `/?embed=1` shell: same-origin framing only."""
+
+    def _client(self) -> TestClient:
+        from starlette.responses import PlainTextResponse
+
+        from webapp.backend.security.middleware import SecurityHeadersMiddleware
+
+        app = FastAPI()
+
+        @app.get("/")
+        def shell() -> PlainTextResponse:
+            return PlainTextResponse("shell")
+
+        @app.get("/strict")
+        def strict() -> PlainTextResponse:
+            return PlainTextResponse("svg", headers={"Content-Security-Policy": "sandbox; default-src 'none'", "X-Frame-Options": "ALLOWALL"})
+
+        app.add_middleware(SecurityHeadersMiddleware)
+        return TestClient(app)
+
+    def test_default_policy_allows_same_origin_frames_only(self) -> None:
+        r = self._client().get("/?embed=1")
+        csp = r.headers["content-security-policy"]
+        self.assertIn("frame-ancestors 'self'", csp)
+        self.assertNotIn("frame-ancestors 'none'", csp)
+        self.assertEqual(r.headers["x-frame-options"], "SAMEORIGIN")
+
+    def test_route_policy_is_kept(self) -> None:
+        r = self._client().get("/strict")
+        self.assertEqual(r.headers["content-security-policy"], "sandbox; default-src 'none'")
+        self.assertEqual(r.headers.get_list("x-frame-options"), ["SAMEORIGIN"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,24 +4,27 @@ Both are pure ASGI middleware: BaseHTTPMiddleware runs every request through an 
 memory stream, which every API call paid twice.
 """
 from __future__ import annotations
+
 import logging
 import time
 from collections import deque
+
 from starlette.responses import JSONResponse
 
 _CSP = (
-    "default-src 'self'; "
+    b"default-src 'self'; "
     # No frontend module evaluates code from a string (no eval, no new Function), so
     # 'unsafe-eval' would only widen what an injected string could do.
-    "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: blob:; "
-    "connect-src 'self'; "
-    "frame-ancestors 'none';"
-).encode()
+    b"script-src 'self'; "
+    b"style-src 'self' 'unsafe-inline'; "
+    b"img-src 'self' data: blob:; "
+    b"connect-src 'self'; "
+    # NodeMap tab nodes frame the app's own `/?embed=1` shell; other origins stay refused
+    b"frame-ancestors 'self';"
+)
 _FIXED_HEADERS = (
     (b"x-content-type-options", b"nosniff"),
-    (b"x-frame-options", b"DENY"),
+    (b"x-frame-options", b"SAMEORIGIN"),
     (b"referrer-policy", b"strict-origin-when-cross-origin"),
 )
 _FIXED_NAMES = {name for name, _ in _FIXED_HEADERS}
@@ -110,7 +113,8 @@ class RepoContextMiddleware:
             await self.app(scope, receive, send)
             return
         from urllib.parse import parse_qs
-        from webapp.backend.config import set_active_repository, reset_active_repository
+
+        from webapp.backend.config import reset_active_repository, set_active_repository
 
         name = None
         for key, value in scope.get("headers", []):
