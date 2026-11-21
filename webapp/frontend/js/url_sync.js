@@ -568,6 +568,16 @@ class UrlSynchronizer {
     const activeTab = state.getActiveTab();
     if (!activeTab) return;
 
+    const params = this.paramsForTab(activeTab);
+    const newHash = "#" + params.toString();
+    this.commitHash(activeTab, newHash, options);
+  }
+
+  /**
+   * The hash parameters that address `tab` (repository, revision, tab type and what it shows): the
+   * active tab's address bar, and the address a NodeMap tab node embeds (`?embed=1#…`).
+   */
+  paramsForTab(activeTab) {
     const params = new URLSearchParams();
     // The project the tab belongs to, always: a shared link opens in it (§5.26)
     const repo = state.repoOf(activeTab);
@@ -661,8 +671,10 @@ class UrlSynchronizer {
       if (activeTab.functionName) params.set("fn", activeTab.functionName);
       if (activeTab.pathTo) params.set("to", activeTab.pathTo);
     }
+    return params;
+  }
 
-    const newHash = "#" + params.toString();
+  commitHash(activeTab, newHash, options = {}) {
     const currentNavKey = this.getNavKey(activeTab);
     const currentTabId = activeTab.id;
 

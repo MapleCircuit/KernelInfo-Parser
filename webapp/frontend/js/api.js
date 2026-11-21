@@ -1183,6 +1183,34 @@ class ApiClient {
     return this.request(`/api/tools/${encodeURIComponent(ver)}/pahole/${encodeURIComponent(structName)}`, {}, "tools", `pahole_${this._vk(ver)}_${structName}`);
   }
 
+  /** `GET /api/nodemap/{v}/struct/{name}`: members, nested aggregates and `#if` guard lines of a struct/union (§4.14). */
+  async getNodemapStruct(version, name, { path = "", kind = "", line = null, fresh = false } = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams();
+    if (path) params.set("path", path);
+    if (kind) params.set("kind", kind);
+    if (line) params.set("line", String(line));
+    const q = params.toString();
+    return this.request(`/api/nodemap/${encodeURIComponent(ver)}/struct/${encodeURIComponent(name)}${q ? `?${q}` : ""}`, { networkFirst: fresh }, "tools", `nmstruct_${this._vk(ver)}_${name}_${q}`);
+  }
+
+  /** `GET /api/nodemap/{v}/source`: a file, a line range or a symbol's definition slice (§4.14). */
+  async getNodemapSource(version, { path = "", start = null, end = null, symbol = "", kind = "", context = 0, fresh = false } = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams();
+    if (path) params.set("path", path);
+    if (symbol) {
+      params.set("symbol", symbol);
+      if (kind) params.set("kind", kind);
+      if (context) params.set("context", String(context));
+    } else {
+      if (start) params.set("start", String(start));
+      if (end) params.set("end", String(end));
+    }
+    const q = params.toString();
+    return this.request(`/api/nodemap/${encodeURIComponent(ver)}/source?${q}`, { networkFirst: fresh }, "tools", `nmsrc_${this._vk(ver)}_${q}`);
+  }
+
   async getCallgraph(version, functionName) {
     const ver = this._sanitizeVer(version);
     return this.request(`/api/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);

@@ -105,6 +105,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_scope",
     "tests.test_man_ast",
     "tests.test_webapp_man",
+    "tests.test_webapp_nodemap",
     "tests.test_kapi_facts",
     "tests.test_kapi_ingest",
     "tests.test_checkpoints",

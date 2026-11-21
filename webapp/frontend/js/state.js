@@ -5,6 +5,7 @@
 import { canBeVersionlessTab, isAlwaysVersionlessTab, tabRoute } from "./tab_routes.js";
 import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
+import { isEmbedMode } from "./utils/embed_mode.js";
 import { emitUiScaleChanged } from "./utils/ui_scale.js";
 
 // A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
@@ -179,6 +180,11 @@ class GlobalState {
       });
     }
 
+    // An embed shell (NodeMap tab node) starts empty and keeps nothing: the address opens its one tab
+    if (isEmbedMode()) {
+      this._persistenceSuspended = true;
+      return;
+    }
     // Load persisted state if available
     this.loadState();
     sessionManager.requestRemoteEngines();

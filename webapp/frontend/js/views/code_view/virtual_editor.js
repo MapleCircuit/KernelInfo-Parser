@@ -1291,6 +1291,8 @@ export class VirtualEditor {
         blame,
         // Links to the selected lines, or to this line when it is outside the selection (G06)
         linkItems: row?.dataset.lineNo ? this.linkMenuItems(lineNo) : [],
+        // The selected lines (or this one): "Send Lines to NodeMap" (§5.3.5)
+        lineRange: row?.dataset.lineNo ? this.linkRange(lineNo) : null,
       });
     });
 

@@ -5,6 +5,7 @@
  * and real-time cross-tab communication (BroadcastChannel).
  */
 import { localDB } from "./db.js";
+import { isEmbedMode } from "./utils/embed_mode.js";
 
 const SESSIONS_INDEX_KEY = "kip_sessions_index";
 const SESSION_STORAGE_PIN_KEY = "kip_active_session_id";
@@ -18,7 +19,10 @@ const HEARTBEAT_INTERVAL_MS = 10000;
 
 class SessionManager {
   constructor() {
-    this.channel = typeof window !== "undefined" && "BroadcastChannel" in window
+    // An embed shell (`?embed=1`, a NodeMap tab node) is a guest of its host window: no channel, no
+    // presence, no session pinning (utils/embed_mode.js)
+    this.embedded = isEmbedMode();
+    this.channel = !this.embedded && typeof window !== "undefined" && "BroadcastChannel" in window
       ? new BroadcastChannel(BROADCAST_CHANNEL_NAME)
       : null;
 
@@ -36,6 +40,7 @@ class SessionManager {
     this.incomingTabDrag = null;
     this.subscribers = new Map();
 
+    if (this.embedded) return;
     this.getWindowId();
     this.initChannelListeners();
     this.initWindowLifecycle();
@@ -887,6 +892,7 @@ class SessionManager {
 
   _updateSharedEntry(storageKey, entryKey, value) {
     if (!entryKey) return null;
+    if (this.embedded) return value ?? null;
     let map = {};
     try {
       map = JSON.parse(localStorage.getItem(storageKey) || "{}") || {};

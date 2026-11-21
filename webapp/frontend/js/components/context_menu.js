@@ -21,6 +21,8 @@ import { blameBeforeTarget } from "../views/code_view/blame_options.js";
 import { referenceMenuItems } from "./file_references.js";
 import { hasFeature } from "../utils/projects.js";
 import { canBeVersionlessTab, isAlwaysVersionlessTab } from "../tab_routes.js";
+import { urlSync } from "../url_sync.js";
+import { nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
 
 class ContextMenu {
   constructor() {
@@ -565,23 +567,11 @@ class ContextMenu {
       }
     });
 
-    if (hasFeature(state.activeRepo(), "nodemap")) {
+    if (hasFeature(state.activeRepo(), "nodemap") && !isInclude && !isObject) {
       items.push({
-        label: "Open in NodeMap",
+        label: "Send to NodeMap",
         icon: "🗺️",
-        onClick: () => {
-          state.openTab({
-            type: "nodemap",
-            title: "NodeMap Canvas",
-            version: v,
-            initialNode: {
-              name: tokenData.header || tokenData.object || tokenName,
-              type: isInclude ? "include" : (isObject ? "object" : (tokenData.type_id || "symbol")),
-              astId: tokenData.ast_id
-            }
-          });
-          toast.success(`Opened ${tokenName} in NodeMap`);
-        }
+        onClick: () => sendToNodemap(tokenSpec({ name: tokenName, typeId: tokenData.type_id, astId: tokenData.ast_id, path: tokenData.filePath || "", version: v }), { version: v })
       });
     }
 
@@ -769,24 +759,20 @@ class ContextMenu {
         }
       });
 
-      if (hasFeature(repo, "nodemap")) {
+      if (hasFeature(repo, "nodemap") && !token.isInclude && !isObject) {
+        const isAggregate = token.type_id === 28 || token.type_id === 34 || /\bast-struct\b/.test(token.typeClass || "");
         items.push({
-          label: "Open in NodeMap",
+          label: isAggregate ? `Send ${token.type_id === 34 ? "union" : "struct"} ${token.name} to NodeMap` : `Send ${token.name} to NodeMap`,
           icon: "🗺️",
-          onClick: () => {
-            state.openTab({
-              type: "nodemap",
-              title: "NodeMap Canvas",
-              version: v,
-              initialNode: {
-                name: token.header || token.object || token.name,
-                type: token.isInclude ? "include" : (isObject ? "object" : (token.type_id || "symbol")),
-                astId: token.ast_id
-              }
-            });
-            toast.success(`Opened ${token.name} in NodeMap`);
-          }
+          onClick: () => sendToNodemap(tokenSpec({ name: token.name, typeId: isAggregate && token.type_id !== 34 ? 28 : token.type_id, astId: token.ast_id, path: filePath || "", version: v }), { version: v })
         });
+        if (filePath && !isAggregate) {
+          items.push({
+            label: `Send Definition Slice of ${token.name} to NodeMap`,
+            icon: "🗺️",
+            onClick: () => sendToNodemap(sourceSpec({ path: "", version: v, symbol: token.name }), { version: v })
+          });
+        }
       }
 
       if (!isKconfig) {
@@ -856,6 +842,23 @@ class ContextMenu {
           onMiddleClick: () => openBlameBefore(before, true),
         } : { label: "Blame Before This Change (root commit)", icon: "⏮", disabled: true });
       }
+    }
+
+    // Send the file or the selected lines to the canvas (§5.3.5)
+    if (filePath && hasFeature(state.activeRepo(), "nodemap")) {
+      const range = context.lineRange;
+      if (range && range.end > range.start) {
+        items.push({
+          label: `Send Lines ${range.start}–${range.end} to NodeMap`,
+          icon: "🗺️",
+          onClick: () => sendToNodemap(sourceSpec({ path: filePath, version: v, start: range.start, end: range.end }), { version: v })
+        });
+      }
+      items.push({
+        label: `Send ${fileName} to NodeMap`,
+        icon: "🗺️",
+        onClick: () => sendToNodemap(sourceSpec({ path: filePath, version: v }), { version: v })
+      });
     }
 
     items.push({ separator: true });
@@ -994,6 +997,9 @@ class ContextMenu {
         icon: "✎",
         onClick: () => showPatchModal(v, path)
       });
+      if (hasFeature(state.activeRepo(), "nodemap")) {
+        items.push({ label: "Send File to NodeMap", icon: "🗺️", onClick: () => sendToNodemap(sourceSpec({ path, version: v }), { version: v }) });
+      }
       items.push({ separator: true });
       items.push({
         label: "View File Git History",
@@ -1120,6 +1126,19 @@ class ContextMenu {
         shortcut: shortRef(tabRef),
         onClick: () => onClearTag && onClearTag()
       }] : []),
+      ...(tab.type !== "nodemap" && hasFeature(state.repoOf(tab), "nodemap") ? [
+        { separator: true },
+        ...(nodeSpecsForTab(tab, null).length ? [{
+          label: "Send to NodeMap",
+          icon: "🗺️",
+          onClick: () => sendToNodemap(nodeSpecsForTab(tab, (t) => urlSync.paramsForTab(t).toString()), { repo: state.repoOf(tab), version: tab.version || "" })
+        }] : []),
+        {
+          label: "Embed Live Tab in NodeMap",
+          icon: "🗔",
+          onClick: () => sendToNodemap(nodeSpecsForTab(tab, (t) => urlSync.paramsForTab(t).toString(), { live: true }), { repo: state.repoOf(tab), version: tab.version || "" })
+        },
+      ] : []),
       { separator: true },
       {
         label: "Open on New Browser Tab",
@@ -1166,190 +1185,75 @@ class ContextMenu {
   }
 
   /**
-   * Right-click Context Menu for NodeMap Schematic Canvas.
+   * Right-click menu of the NodeMap canvas (§5.3): a node (`node`, optional struct row `fieldKey`), a
+   * connection (`edgeId`) or the background (`isCanvas`, canvas point `at`). Acts through `controller`.
    */
   showNodeMapMenu(x, y, context) {
-    const { node, isCanvas, controller, constituent, constituentIndex } = context;
-    const v = state.activeVersion();
+    const { node, fieldKey, edgeId, isCanvas, at, controller } = context;
+    if (!controller) return;
     const items = [];
-
     if (node) {
-      const nodeName = node.name || node.label || "Symbol";
-
-      // If clicked specifically on a constituent member
-      if (constituent) {
-        const cName = constituent.name || constituent.type || "member";
+      const d = node.data || {};
+      const name = d.name || "";
+      const v = node.version || state.activeVersion();
+      const title = node.customTitle || node.title;
+      items.push({ label: "Rename…", icon: "✎", onClick: () => controller.beginTitleEdit(node.id) });
+      if (fieldKey) items.push({ label: "Attach Node to This Member…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id, fieldKey) });
+      else if (node.type !== "group" && node.type !== "note") items.push({ label: "Attach Connected Node…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id) });
+      if (node.type === "symbol") items.push({ label: d.expanded ? "Collapse Members" : "Expand Members", icon: d.expanded ? "🔼" : "🔽", onClick: () => controller.toggleExpandNode(node.id) });
+      if (["struct", "source", "man", "tab", "symbol"].includes(node.type)) items.push({ label: "Open as Tab", icon: "↗", onClick: () => controller.openNodeAsTab(node.id) });
+      if ((node.type === "struct" || node.type === "symbol") && name) {
+        items.push({ separator: true });
         items.push({
-          label: `Attach Node for "${cName}"`,
-          icon: "🔗",
-          onClick: () => {
-            if (controller && typeof controller.attachNodeToConstituent === "function") {
-              controller.attachNodeToConstituent(node.id, cName, constituentIndex);
+          label: "Go to Definition",
+          icon: "🎯",
+          onClick: async () => {
+            try {
+              if (!(await openDefinition(v, name))) toast.info(`No definition found for ${name}`);
+            } catch (err) {
+              toast.error(`Lookup failed: ${err.message}`);
             }
           }
         });
-        items.push({ separator: true });
-      }
-
-      // Expand / Collapse Constituents
-      items.push({
-        label: node.expanded ? "Collapse Constituents" : "Expand Constituents",
-        icon: node.expanded ? "🔼" : "🔽",
-        onClick: async () => {
-          if (controller && typeof controller.toggleExpandNode === "function") {
-            await controller.toggleExpandNode(node.id);
-          }
+        const repo = node.repo || state.activeRepo();
+        if (node.type === "struct" && hasFeature(repo, "pahole")) {
+          items.push({ label: `Show Struct Layout: ${name}`, icon: "📐", onClick: () => state.openTab({ type: "pahole", title: `struct ${name}`, structName: name, version: v }) });
         }
-      });
-
-      // Attach Connected Node
-      items.push({
-        label: "Attach Connected Node...",
-        icon: "🔗",
-        onClick: () => {
-          if (controller && typeof controller.promptAttachNode === "function") {
-            controller.promptAttachNode(node.id);
-          }
+        if (node.type === "symbol" && d.kind === "func" && hasFeature(repo, "callgraph")) {
+          items.push({ label: `Show Callgraph: ${name}()`, icon: "📊", onClick: () => state.openTab({ type: "callgraph", title: `Callgraph: ${name}`, functionName: name, version: v }) });
         }
-      });
-
-      items.push({ separator: true });
-
-      items.push({
-        label: "Go to Definition",
-        icon: "🎯",
-        onClick: async () => {
-          try {
-            if (await openDefinition(v, nodeName)) {
-              toast.success(`Jumped to definition of ${nodeName}`);
-            } else {
-              toast.info(`No definition found for ${nodeName}`);
-            }
-          } catch (err) {
-            toast.error(`Lookup failed: ${err.message}`);
-          }
-        }
-      });
-      items.push({
-        label: "Inspect AST Structure",
-        icon: "🌳",
-        onClick: async () => {
-          try {
-            const astId = node.astId || node.ast_id || 1;
-            const astTree = await api.getAstTree(v, astId);
-            this.showAstModal(nodeName, astTree);
-          } catch (err) {
-            toast.error(`AST fetch failed: ${err.message}`);
-          }
-        }
-      });
-
-      // Filter Struct Layout / Callgraph per Issue 4
-      const isStruct = node.type === "struct" || nodeName.startsWith("struct ") || nodeName.endsWith("_struct");
-      const isFunction = node.type === "func" || node.type === "function" || nodeName.endsWith("()");
-
-      if (isStruct || isFunction) {
-        items.push({ separator: true });
-      }
-      const repo = state.activeRepo();
-      if (isStruct && hasFeature(repo, "pahole")) {
-        const cleanStruct = nodeName.replace(/^(struct|union)\s+/, "").trim();
-        items.push({
-          label: `Show Struct Layout: struct ${cleanStruct}`,
-          icon: "📐",
-          onClick: () => {
-            state.openTab({
-              type: "pahole",
-              title: `struct ${cleanStruct}`,
-              structName: cleanStruct,
-              version: v
-            });
-          }
-        });
-      }
-      if (isFunction && hasFeature(repo, "callgraph")) {
-        items.push({
-          label: `Show Callgraph: ${nodeName}`,
-          icon: "📊",
-          onClick: () => {
-            state.openTab({
-              type: "callgraph",
-              title: `Callgraph: ${nodeName}`,
-              functionName: nodeName.replace(/\(\)$/, ""),
-              version: v
-            });
-          }
-        });
       }
       items.push({ separator: true });
-      items.push({
-        label: "Center / Focus Node",
-        icon: "🎯",
-        onClick: () => {
-          if (controller && typeof controller.centerOnNode === "function") {
-            controller.centerOnNode(node.id);
-          }
-        }
-      });
-      items.push({
-        label: "Remove Node from Canvas",
-        icon: "🗑️",
-        danger: true,
-        onClick: () => {
-          if (controller && typeof controller.removeNode === "function") {
-            controller.removeNode(node.id);
-            toast.info(`Removed ${nodeName} from canvas`);
-          }
-        }
-      });
-
-      this.renderMenu(x, y, {
-        header: {
-          title: nodeName,
-          sub: `NodeMap [${node.type || "symbol"}]`
-        },
-        items
-      });
+      if (controller.selected?.size > 1) items.push({ label: "Group Selection", icon: "▭", onClick: () => controller.addGroup() });
+      items.push({ label: "Center / Focus Node", icon: "🎯", onClick: () => controller.centerOnNode(node.id) });
+      items.push({ label: controller.selected?.size > 1 ? `Remove ${controller.selected.size} Nodes` : "Remove Node", icon: "🗑️", danger: true, onClick: () => controller.deleteSelection() });
+      this.renderMenu(x, y, { header: { title: title || "Node", sub: `NodeMap [${node.type}]` }, items });
+    } else if (edgeId) {
+      items.push({ label: "Edit Label…", icon: "✎", onClick: () => controller.beginEdgeLabelEdit(edgeId) });
+      items.push({ label: "Remove Connection", icon: "🗑️", danger: true, onClick: () => controller.removeEdge(edgeId) });
+      this.renderMenu(x, y, { header: { title: "Connection", sub: "NodeMap" }, items });
     } else if (isCanvas) {
-      items.push({
-        label: "Add Symbol / Node to Canvas...",
-        icon: "➕",
-        onClick: () => {
-          const sym = prompt("Enter symbol or function name to add to canvas:");
-          if (sym && sym.trim() && controller && typeof controller.addNode === "function") {
-            controller.addNode({ name: sym.trim(), type: "symbol" });
-          }
-        }
-      });
-      items.push({
-        label: "Reset View & Zoom (100%)",
-        icon: "🔄",
-        onClick: () => {
-          if (controller && typeof controller.resetTransform === "function") {
-            controller.resetTransform();
-          }
-        }
-      });
+      items.push({ label: "Add Node…", icon: "➕", onClick: () => controller.showAddMenu(x, y) });
+      if (at) items.push({ label: "Add Note Here", icon: "📝", onClick: () => controller.addNoteAt(Math.round(at.x), Math.round(at.y)) });
+      items.push({ label: "Add Group", icon: "▭", onClick: () => controller.addGroup() });
+      items.push({ separator: true });
+      items.push({ label: "Fit to View", icon: "⤢", onClick: () => controller.fitView() });
+      items.push({ label: "Reset View & Zoom (100%)", icon: "🔄", onClick: () => controller.resetTransform() });
       items.push({ separator: true });
       items.push({
-        label: "Clear Entire Canvas",
+        label: "Clear Entire Canvas…",
         icon: "🧹",
         danger: true,
+        disabled: !controller.canvas?.nodes?.length,
         onClick: () => {
-          if (controller && typeof controller.clearAll === "function") {
+          const n = controller.canvas.nodes.length;
+          if (confirm(`Remove all ${n} nodes and their connections from this canvas? Export it as JSON first to keep a copy.`)) {
             controller.clearAll();
             toast.info("Cleared NodeMap canvas");
           }
         }
       });
-
-      this.renderMenu(x, y, {
-        header: {
-          title: "NodeMap Schematic",
-          sub: "Canvas Controls"
-        },
-        items
-      });
+      this.renderMenu(x, y, { header: { title: "NodeMap", sub: "Canvas" }, items });
     }
   }
 

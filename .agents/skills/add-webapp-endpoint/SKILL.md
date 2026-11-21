@@ -31,6 +31,7 @@ Never read `webapp/API*.md` from line 1. Read a section with `python3 .agents/sc
 | **CVE Records** | `webapp/API_ENDPOINTS.md` §4.11 | `routers/cve.py`, `cve_service.py` | `views/sections/` | `tests/test_webapp_cve.py` | — |
 | **Watch List** | `webapp/API_ENDPOINTS.md` §4.12, `webapp/API_FRONTEND.md` §5.36 | `routers/watch.py`, `watch_service.py` | `views/watch/` | `tests/test_webapp_watch.py` | `watch.test.mjs` |
 | **Man Pages** | `webapp/API.md` §2.20, `webapp/API_ENDPOINTS.md` §4.13, `webapp/API_FRONTEND.md` §5.38 | `routers/man.py`, `man_service.py` | `views/man/man_view.js`, `man_render.js` | `tests/test_webapp_man.py` | `man_render.test.mjs` |
+| **NodeMap Canvas** | `webapp/API_ENDPOINTS.md` §4.14, `webapp/API_FRONTEND.md` §5.3 | `routers/nodemap.py`, `nodemap_service.py`, `parser/struct_source.py` | `views/nodemap/` | `tests/test_webapp_nodemap.py` | `nodemap_canvas.test.mjs`, `nodemap_controller.test.mjs` |
 | **Patch Series** | `webapp/API_FRONTEND.md` §5.33 | `services/patch_series.py` | `views/patch/patch_series_view.js` | `tests/test_webapp_patch_series.py` | `patch_series.test.mjs` |
 | **Checkpatch** | `webapp/API.md` §2.18 | `services/checkpatch_service.py` | `components/checkpatch_panel.js` | `tests/test_webapp_checkpatch.py` | — |
 

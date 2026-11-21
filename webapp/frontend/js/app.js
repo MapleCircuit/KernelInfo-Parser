@@ -59,6 +59,7 @@ import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
 import "./routes.js";
 import { exportDocument, importUserDataText } from "./utils/user_records.js";
 import { THEMES, applyTheme, savedTheme } from "./utils/theme.js";
+import { EMBED_FOLLOWED_KEYS, isEmbedMode } from "./utils/embed_mode.js";
 import { computeUiScale, getUiFontScale, getUiLayoutScale, scaleUiPx } from "./utils/ui_scale.js";
 
 /** Settings → Export User Data (S06): every user record as a `kip-user` JSON document. */
@@ -146,6 +147,7 @@ class KernelIdeApp {
   }
 
   async init() {
+    if (isEmbedMode()) return this.initEmbed();
     console.info("Initializing KernelInfo Developer IDE...");
 
     // 0. Apply persistent font scaling and typography preferences
@@ -284,6 +286,44 @@ class KernelIdeApp {
     });
 
     console.info("KernelInfo Developer IDE fully initialized.");
+  }
+
+  /**
+   * Embed shell (`?embed=1`, a NodeMap tab node, `webapp/API_FRONTEND.md` §5.3.4): the workspace only, no
+   * chrome, no session, no service worker or sync check, nothing persisted. The address opens its tab;
+   * theme and UI scale follow the host window.
+   */
+  async initEmbed() {
+    document.documentElement.classList.add("kip-embed");
+    applyTypographySettings();
+    window.addEventListener("storage", (e) => {
+      if (!EMBED_FOLLOWED_KEYS.includes(e.key)) return;
+      if (e.key === "kip-theme") {
+        document.documentElement.dataset.theme = savedTheme();
+        window.dispatchEvent(new CustomEvent("kip:theme-changed", { detail: { theme: savedTheme() } }));
+      } else {
+        applyTypographySettings();
+      }
+    });
+    await this.initVersionSelector();
+    this.tabsComponent = new TabsComponent(document.getElementById("workspace"), this.viewRenderers);
+    this.tabsComponent.render();
+    urlSync.setRepoHandler((repo) => {
+      const project = (this.projects || []).find((p) => p.repo === repo);
+      return project && project.available !== false ? { repo, version: project.default_branch || "" } : { repo: "", version: "" };
+    });
+    urlSync.init();
+    shortcuts.setContextProvider(() => {
+      const tab = state.getActiveTab();
+      return { tab, tabType: tab?.type || null, view: tab ? this.tabsComponent?.perTabViews?.get(tab.id) || null : null, modal: Boolean(document.querySelector(".ki-modal-backdrop")) };
+    });
+    shortcuts.install(document);
+    state.subscribe("version:changed", () => this.tabsComponent.render());
+    // Esc outside any dialog hands the pointer back to the NodeMap canvas holding this shell
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || window.parent === window || document.querySelector(".ki-modal-backdrop, .context-menu")) return;
+      window.parent.postMessage({ type: "kip-embed-escape" }, location.origin);
+    });
   }
 
   registerServiceWorker() {

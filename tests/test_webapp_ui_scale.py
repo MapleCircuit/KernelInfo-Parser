@@ -19,6 +19,7 @@ ALLOWED_FENCE_PATHS = {
     "css/codeview.css",
     "js/views/nodemap/nodemap_controller.js",
     "js/views/nodemap/node_renderer.js",
+    "js/views/nodemap/nodemap_export.js",
     "js/views/kconfig/kconfig_view.js",
 }
 

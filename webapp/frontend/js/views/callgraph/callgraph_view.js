@@ -203,50 +203,18 @@ export class CallgraphView {
       const nmBtn = this.containerEl.querySelector("#callgraph-btn-nodemap");
       if (nmBtn) {
         nmBtn.onclick = () => {
-          const initialNodes = [
-            {
-              id: "target-root",
-              title: `${this.functionName}()`,
-              type: "func",
-              x: 420,
-              y: 180,
-              color: "var(--accent-purple)"
-            }
-          ];
+          const fn = (name, id, x, y, color) => ({ id, type: "symbol", x, y, color, data: { name, kind: "func" } });
+          const initialNodes = [fn(this.functionName, "target-root", 420, 180, "purple")];
           const initialEdges = [];
-
           callers.forEach((c, idx) => {
             const cId = `caller-${idx}`;
-            const cName = c.name || c.caller_name || c.caller || `caller_${idx}`;
-            initialNodes.push({
-              id: cId,
-              title: `${cName}()`,
-              type: "func",
-              x: 80,
-              y: 80 + idx * 120,
-              color: "var(--accent-purple)"
-            });
-            initialEdges.push({
-              fromNodeId: cId,
-              toNodeId: "target-root"
-            });
+            initialNodes.push(fn(c.name || c.caller_name || c.caller || `caller_${idx}`, cId, 80, 80 + idx * 140, "purple"));
+            initialEdges.push({ from: cId, to: "target-root" });
           });
-
           callees.forEach((c, idx) => {
             const cId = `callee-${idx}`;
-            const cName = c.name || c.callee_name || c.callee || `callee_${idx}`;
-            initialNodes.push({
-              id: cId,
-              title: `${cName}()`,
-              type: "func",
-              x: 760,
-              y: 80 + idx * 120,
-              color: "var(--accent-blue)"
-            });
-            initialEdges.push({
-              fromNodeId: "target-root",
-              toNodeId: cId
-            });
+            initialNodes.push(fn(c.name || c.callee_name || c.callee || `callee_${idx}`, cId, 760, 80 + idx * 140, "blue"));
+            initialEdges.push({ from: "target-root", to: cId });
           });
 
           state.openTab({

@@ -214,24 +214,13 @@ export class PaholeView {
       const nmBtn = this.containerEl.querySelector("#pahole-btn-nodemap");
       if (nmBtn) {
         const openNodeMap = (forceNew = false) => {
-          const constituents = members.map((m) => ({ name: `${m.type} ${m.name}` }));
           state.openTab({
             type: "nodemap",
             title: `struct ${this.structName}`,
             version: this.currentVersion,
             forceNew: Boolean(forceNew),
-            initialNodes: [
-              {
-                id: `struct-${this.structName}`,
-                title: `struct ${this.structName}`,
-                type: "struct",
-                x: 240,
-                y: 120,
-                color: "var(--accent-blue)",
-                expanded: true,
-                constituents
-              }
-            ],
+            // A struct node of the canvas (§5.3): members, nested aggregates and #if guards
+            initialNodes: [{ type: "struct", x: 240, y: 120, color: "blue", data: { name: this.structName, kind: "struct", hint: res.file_path || "" } }],
             initialEdges: []
           });
         };

@@ -1,233 +1,129 @@
 /**
- * node_renderer.js - DOM Node Renderer.
- * Mounts interactive schematic nodes with drag handles, port anchors, and expand buttons.
+ * node_renderer.js - Incremental DOM of NodeMap nodes (`webapp/API_FRONTEND.md` §5.3.2).
+ *
+ * One element per node, kept across updates: moving, resizing, recoloring or retitling a node patches
+ * its element, and the body is rebuilt only when the node's content key changes, so a live tab iframe,
+ * a man page or a scrolled source slice survives drags. Pointer handling is delegated to the controller
+ * (one listener set on the canvas); elements only carry `data-*` hooks:
+ *   .nm-node[data-node-id]   .nm-node-head (drag handle)   .nm-title (inline title edit)
+ *   .nm-rz[data-rz]          resize handles (n, s, e, w, ne, nw, se, sw)
+ *   .nm-port[data-side]      side ports; struct rows add .nm-port-field[data-field]
+ *   [data-act]               header and body buttons
  */
+import { accentVar, displayTitle, paintOrder } from "./canvas_model.js";
+import { esc } from "./struct_view.js";
+
+const HANDLES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
+const SIDE_PORTS = ["top", "right", "bottom", "left"];
+const BADGES = { struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group" };
+
+/** What makes a node's body stale: its payload and revision, not its geometry, title or color. */
+export function contentKey(node) {
+  return JSON.stringify([node.type, node.version, node.repo, node.data]);
+}
 
 export class NodeRenderer {
-  constructor(overlayContainerEl, callbacks) {
-    this.container = overlayContainerEl;
-    this.callbacks = callbacks; // { onDragNode, onSelectNode, onToggleExpand, onStartWire, onRecolor }
+  /**
+   * @param {HTMLElement} layer  the zoomed canvas layer
+   * @param {{renderBody(node, bodyEl), disposeBody?(nodeId), headTools?(node): string}} hooks
+   */
+  constructor(layer, hooks) {
+    this.layer = layer;
+    this.hooks = hooks;
+    this.els = new Map();
+    this.keys = new Map();
   }
 
-  renderNodes(nodes, selectedNodeId) {
-    this.container.innerHTML = "";
+  element(id) {
+    return this.els.get(id) || null;
+  }
 
-    nodes.forEach((node) => {
-      const nodeEl = document.createElement("div");
-      nodeEl.className = `schematic-node ${node.id === selectedNodeId ? "selected" : ""}`;
-      nodeEl.dataset.nodeId = node.id;
-      nodeEl.style.left = `${node.x}px`;
-      nodeEl.style.top = `${node.y}px`;
-      nodeEl.style.width = `${node.width}px`;
-
-      // 1. Header
-      const header = document.createElement("div");
-      header.className = "node-header";
-      header.style.borderTop = `3px solid ${node.color}`;
-
-      const titleGroup = document.createElement("div");
-      titleGroup.className = "node-title-group";
-
-      const badge = document.createElement("span");
-      badge.className = `node-badge ${node.type}`;
-      badge.textContent = node.type;
-
-      const titleText = document.createElement("span");
-      titleText.textContent = node.title;
-
-      titleGroup.appendChild(badge);
-      titleGroup.appendChild(titleText);
-
-      // Header tools
-      const headerTools = document.createElement("div");
-      headerTools.style.display = "flex";
-      headerTools.style.alignItems = "center";
-      headerTools.style.gap = "4px";
-
-      // Recolor button
-      const colorInput = document.createElement("input");
-      colorInput.type = "color";
-      colorInput.value = node.color;
-      colorInput.style.width = "16px";
-      colorInput.style.height = "16px";
-      colorInput.style.padding = "0";
-      colorInput.style.border = "none";
-      colorInput.style.cursor = "pointer";
-      colorInput.onchange = (e) => {
-        if (this.callbacks.onRecolor) this.callbacks.onRecolor(node.id, e.target.value);
-      };
-
-      // Expand / Collapse button
-      const expandBtn = document.createElement("button");
-      expandBtn.style.fontSize = "var(--fs-11, 11px)";
-      expandBtn.style.color = "var(--text-muted)";
-      expandBtn.textContent = node.expanded ? "−" : "+";
-      expandBtn.title = node.expanded ? "Collapse constituents" : "Expand constituents";
-      expandBtn.onclick = (e) => {
-        e.stopPropagation();
-        if (this.callbacks.onToggleExpand) this.callbacks.onToggleExpand(node.id);
-      };
-
-      headerTools.appendChild(colorInput);
-      headerTools.appendChild(expandBtn);
-
-      header.appendChild(titleGroup);
-      header.appendChild(headerTools);
-      nodeEl.appendChild(header);
-
-      // 2. Body
-      const body = document.createElement("div");
-      body.className = "node-body";
-
-      // Input / Output ports
-      const portsRow = document.createElement("div");
-      portsRow.className = "node-ports";
-
-      const inPortAnchor = document.createElement("div");
-      inPortAnchor.className = "port-anchor in-port";
-      inPortAnchor.title = "Input Port";
-      inPortAnchor.dataset.nodeId = node.id;
-      inPortAnchor.dataset.portId = "in";
-
-      const outPortAnchor = document.createElement("div");
-      outPortAnchor.className = "port-anchor out-port";
-      outPortAnchor.title = "Output Port";
-      outPortAnchor.dataset.nodeId = node.id;
-      outPortAnchor.dataset.portId = "out";
-
-      portsRow.appendChild(inPortAnchor);
-      portsRow.appendChild(outPortAnchor);
-      body.appendChild(portsRow);
-
-      // Constituents if expanded
-      if (node.expanded && Array.isArray(node.constituents) && node.constituents.length > 0) {
-        const list = document.createElement("div");
-        list.className = "node-constituents-list";
-
-        node.constituents.forEach((c, idx) => {
-          const item = document.createElement("div");
-          item.className = "node-constituent-item";
-          item.dataset.nodeId = node.id;
-          item.dataset.constituentIndex = idx;
-          const memberName = c.name || c.type || `member_${idx}`;
-          item.dataset.constituentName = memberName;
-
-          const leftPort = document.createElement("div");
-          leftPort.className = "port-anchor in-port constituent-port";
-          leftPort.title = `Input: ${memberName}`;
-          leftPort.dataset.nodeId = node.id;
-          leftPort.dataset.portId = `c_in_${idx}`;
-
-          const nameSpan = document.createElement("span");
-          nameSpan.className = "node-constituent-name";
-          nameSpan.textContent = memberName;
-          nameSpan.title = memberName;
-
-          const rightPort = document.createElement("div");
-          rightPort.className = "port-anchor out-port constituent-port";
-          rightPort.title = `Connect ${memberName} to another node`;
-          rightPort.dataset.nodeId = node.id;
-          rightPort.dataset.portId = `c_out_${idx}`;
-
-          item.appendChild(leftPort);
-          item.appendChild(nameSpan);
-          item.appendChild(rightPort);
-
-          item.addEventListener("contextmenu", (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (this.callbacks.onConstituentContextMenu) {
-              this.callbacks.onConstituentContextMenu(e, node, c, idx);
-            }
-          });
-
-          list.appendChild(item);
-        });
-        body.appendChild(list);
+  /** Bring the DOM in line with `nodes`; `selected` (Set) and `active` (interacting node id) set classes. */
+  sync(nodes, selected, active = null) {
+    const live = new Set(nodes.map((n) => n.id));
+    for (const [id, el] of this.els) {
+      if (!live.has(id)) {
+        this.hooks.disposeBody?.(id);
+        el.remove();
+        this.els.delete(id);
+        this.keys.delete(id);
       }
-
-      nodeEl.appendChild(body);
-
-      // Wire interactive ports
-      nodeEl.querySelectorAll(".port-anchor").forEach((portEl) => {
-        portEl.addEventListener("mousedown", (e) => {
-          e.stopPropagation();
-          if (this.callbacks.onPortMouseDown) {
-            this.callbacks.onPortMouseDown(node.id, portEl.dataset.portId, portEl, e);
-          }
-        });
-      });
-
-      // Mouse drag handlers on header
-      this.attachDrag(header, node);
-
-      // Select node on click
-      nodeEl.onclick = (e) => {
-        e.stopPropagation();
-        if (this.callbacks.onSelectNode) this.callbacks.onSelectNode(node.id);
-      };
-
-      this.container.appendChild(nodeEl);
-    });
-  }
-
-  attachDrag(dragHandle, node) {
-    let isDragging = false;
-    let startX = 0;
-    let startY = 0;
-    let initialNodeX = 0;
-    let initialNodeY = 0;
-    const nodeEl = dragHandle.closest(".schematic-node");
-
-    dragHandle.addEventListener("mousedown", (e) => {
-      e.stopPropagation();
-      isDragging = true;
-      startX = e.clientX;
-      startY = e.clientY;
-      initialNodeX = node.x;
-      initialNodeY = node.y;
-
-      const onMouseMove = (moveEvent) => {
-        if (!isDragging) return;
-        const zoom = (this.callbacks.getZoom ? this.callbacks.getZoom() : 1.0) || 1.0;
-        const dx = (moveEvent.clientX - startX) / zoom;
-        const dy = (moveEvent.clientY - startY) / zoom;
-
-        node.x = initialNodeX + dx;
-        node.y = initialNodeY + dy;
-
-        if (nodeEl) {
-          nodeEl.style.left = `${node.x}px`;
-          nodeEl.style.top = `${node.y}px`;
-        }
-
-        if (this.callbacks.onDragNode) {
-          this.callbacks.onDragNode(node.id, node.x, node.y);
-        }
-      };
-
-      const onMouseUp = () => {
-        isDragging = false;
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
-      };
-
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
-    });
-  }
-
-  updateSelection(selectedNodeId) {
-    this.container.querySelectorAll(".schematic-node").forEach((el) => {
-      el.classList.toggle("selected", el.dataset.nodeId === selectedNodeId);
-    });
-  }
-
-  updateNodeColor(nodeId, color) {
-    const nodeEl = this.container.querySelector(`.schematic-node[data-node-id="${nodeId}"]`);
-    if (nodeEl) {
-      const header = nodeEl.querySelector(".node-header");
-      if (header) header.style.borderTop = `3px solid ${color}`;
     }
+    // Paint order inside each z tier (nodemap.css: groups < wires < nodes); elements already in place
+    // are not moved, since moving an iframe reloads it
+    let prev = null;
+    for (const node of paintOrder(nodes)) {
+      let el = this.els.get(node.id);
+      if (!el) {
+        el = this.create(node);
+        this.els.set(node.id, el);
+      }
+      this.patch(el, node, selected.has(node.id), active === node.id);
+      if (!el.isConnected || (prev && el.previousElementSibling !== prev && !this.orderedAfter(prev, el))) {
+        if (prev) prev.after(el);
+        else this.layer.appendChild(el);
+      }
+      prev = el;
+    }
+  }
+
+  /** True when `el` already comes after `prev` among the layer's children. */
+  orderedAfter(prev, el) {
+    return Boolean(prev.compareDocumentPosition(el) & 4);
+  }
+
+  create(node) {
+    const el = document.createElement("div");
+    el.className = `nm-node nm-type-${node.type}`;
+    el.dataset.nodeId = node.id;
+    el.dataset.nodeType = node.type;
+    el.innerHTML = `
+      <div class="nm-node-head">
+        <span class="nm-badge">${esc(BADGES[node.type] || node.type)}</span>
+        <span class="nm-title" title="Double-click to rename"></span>
+        <span class="nm-head-tools"></span>
+      </div>
+      <div class="nm-node-body"></div>
+      ${node.type === "group" ? "" : SIDE_PORTS.map((s) => `<span class="nm-port nm-port-side nm-port-${s}" data-side="${s}" title="Drag to connect"></span>`).join("")}
+      ${HANDLES.map((h) => `<span class="nm-rz nm-rz-${h}" data-rz="${h}"></span>`).join("")}`;
+    return el;
+  }
+
+  patch(el, node, isSelected, isActive) {
+    el.style.left = `${node.x}px`;
+    el.style.top = `${node.y}px`;
+    el.style.width = `${node.w}px`;
+    el.style.height = `${node.h}px`;
+    el.classList.toggle("selected", isSelected);
+    el.classList.toggle("nm-interacting", isActive);
+    el.classList.toggle("nm-has-accent", Boolean(node.color));
+    el.style.setProperty("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
+    const titleEl = el.querySelector(".nm-title");
+    const title = displayTitle(node);
+    if (titleEl && !titleEl.querySelector("input") && titleEl.textContent !== title) titleEl.textContent = title;
+    const tools = this.hooks.headTools ? this.hooks.headTools(node, isActive) : "";
+    const toolsEl = el.querySelector(".nm-head-tools");
+    if (toolsEl && toolsEl.dataset.html !== tools) {
+      toolsEl.innerHTML = tools;
+      toolsEl.dataset.html = tools;
+    }
+    const key = contentKey(node);
+    if (this.keys.get(node.id) !== key) {
+      this.keys.set(node.id, key);
+      const body = el.querySelector(".nm-node-body");
+      this.hooks.disposeBody?.(node.id);
+      this.hooks.renderBody(node, body);
+    }
+  }
+
+  /** Force a body rebuild on the next sync (content fetched again, toggles flipped). */
+  invalidate(id) {
+    this.keys.delete(id);
+  }
+
+  clear() {
+    for (const id of this.els.keys()) this.hooks.disposeBody?.(id);
+    this.els.clear();
+    this.keys.clear();
   }
 }
