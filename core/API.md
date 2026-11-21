@@ -18,31 +18,31 @@ agents.
   - Relational Table Families (`core/DBLayout.py`) [L537-L606]
   - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L607-L695]
   - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L696-L722]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L723-L906]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L723-L913]
   - 5.1. Data Sanitization Helpers [L725-L731]
   - 5.2. `Table` Class Interface [L732-L760]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L761-L859]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L860-L882]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L883-L906]
-- 6. End-to-End Inter-Module Execution Lifecycle [L907-L1054]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1055-L1438]
-  - 7.1. Unified Configuration Hierarchy [L1057-L1167]
-  - 7.1.1. Repository Auto-Detection & Selection [L1168-L1233]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1234-L1284]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1285-L1332]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1333-L1438]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1439-L1709]
-  - 8.1. High-Level Architecture [L1441-L1484]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1485-L1510]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1511-L1709]
-- 9. CVE List Ingestion (`parser/cve/`) [L1710-L1766]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1767-L1834]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1835-L1965]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1843-L1874]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1875-L1915]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1916-L1948]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1949-L1965]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1966-L2011]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L761-L866]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L867-L889]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L890-L913]
+- 6. End-to-End Inter-Module Execution Lifecycle [L914-L1061]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1062-L1445]
+  - 7.1. Unified Configuration Hierarchy [L1064-L1174]
+  - 7.1.1. Repository Auto-Detection & Selection [L1175-L1240]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1241-L1291]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1292-L1339]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1340-L1445]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1446-L1716]
+  - 8.1. High-Level Architecture [L1448-L1491]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1492-L1517]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1518-L1716]
+- 9. CVE List Ingestion (`parser/cve/`) [L1717-L1773]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1774-L1841]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1842-L1972]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1850-L1881]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1882-L1922]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1923-L1955]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1956-L1972]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1973-L2018]
 <!-- toc:end -->
 
 ---
@@ -377,7 +377,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
     completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by
     `init_cs_dict()`.
   - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name:
-    ast_id}` for name-only fallback resolution.
+    ast_id}` for name-only fallback resolution of types without a C name-space family.
   - `file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]]`: Lightweight bridge tags map
     `rel_file -> [(tag_id, blob_id, line_s, line_e)]` populated upon ChangeSet evacuation to allow
     zero-decompression tag-to-commit mapping during post-processing.
@@ -792,9 +792,14 @@ Represents a parsed file diff and acts as the relational staging buffer.
     - Otherwise returns reference tuple: `(query, OP_REF, parsed_route)`.
 - **Reference Resolution (`resolve_ref(query, parsed_route, force_stubs=False) -> SafeDataType | list`)**:
   1. `parsed_route[0] == REF_NO_REF`: Returns `None`.
-  2. `parsed_route[0] == REF_FILE`: Evaluates foreign cross-file symbol lookups with multi-tier fast paths:
-     - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for
-       immediate $O(1)$ resolved symbol `ast_id`.
+  2. `parsed_route[0] == REF_FILE`: Evaluates foreign cross-file symbol lookups with multi-tier fast paths.
+     Every tier tries the exact `(sym_name, sym_type)` first; its fallback is the requested C name space
+     (`ref_target_family(sym_type)`, `parser/c_ast/CAST_API.md` §6.3: macros, each tag kind, typedef names,
+     members, ordinary identifiers), probed type by type (`_family_get()`), so a statement, expression or
+     other-namespace node of the same name never answers the reference. Types without a family (non-C ASTs)
+     fall back to the name alone (`gp.file_names`, `resolved_names`, `get_file_name()` / `get_name()`).
+     - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` (and, name-only, `gp.file_names[rel_file]`)
+       for immediate $O(1)$ resolved symbol `ast_id`.
      - **Step 0b (File-Scoped Shared Symbols)**: Queries the file-scoped shared table (`_phase2_symbols` set
        by `pre_resolve_operations()` in workers, else `gp._shared_symbols`) for `(sym_name, sym_type)` then
        `sym_name` defined in `rel_file`, the same semantics as step 0. Plain `(name, type)` snapshot dicts
@@ -812,8 +817,10 @@ Represents a parsed file diff and acts as the relational staging buffer.
      - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, `gp._ast_ref_memo`
        (memoized parent-side `m_ast` `(name, type)` / `(name, None)` lookups, invalidated on version reset and
        negative-cache clear), and `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)`
-       lookups by `(name, type)`, notbind type, and name. Misses (including `(sym_name, None)`) are recorded in
-       `gp._ast_negative_cache`.
+       lookups by `(name, type)`, notbind type, then one name-only lookup: no row of the name ends the search, a
+       row of the requested name space (or any row, for a type without a family) answers, and only a row of
+       another kind probes the family type by type. Misses are recorded in `gp._ast_negative_cache`
+       (`(sym_name, None)` only for a type without a family).
      - **Step 3 (Stubs)**: With `force_stubs=True`, or for a file that is not in flight, stages a canonical
        `notbind` stub symbol (discarding negative cache entries). Parsing workers (`gp._is_worker`) never
        stage stubs: their TableEngine is never committed, so the reference is left for the parent.

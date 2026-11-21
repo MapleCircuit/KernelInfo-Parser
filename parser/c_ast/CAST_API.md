@@ -25,41 +25,41 @@ maintaining, or interfacing with the next-generation C & Assembly AST parsing en
   - 4.2 Coordinate Fast-Path: `get_cursor_line(cursor: cc.Cursor) -> Line` [L424-L430]
   - 4.3 Fast Delimiter Encapsulation: `encapsulate_trailing_delimiter` [L431-L438]
   - 4.4 `TokenStream` Architecture [L439-L464]
-- 5. Intermediate AST Node Hierarchy (`ast_nodes.py`, `cursor_tree.py`) [L465-L648]
-  - 5.1 Base Interfaces [L467-L531]
-  - 5.2 Statement Classes (`cursor_tree.py`) [L532-L562]
-  - 5.3 Expression & Sub-Construct Scope Containers (`cursor_tree.py`) [L563-L569]
-  - 5.4 Expressions & Relational Symbol Linking (`ast_nodes.py`, `cursor_tree.py`) [L570-L607]
-  - 5.5 Comments, Assembly & Macros (`ast_nodes.py`) [L608-L618]
-  - 5.6 C Preprocessor Subsystem (`CPPro`) (`ast_nodes.py`) [L619-L648]
-- 6. C Type System, Qualifiers & Declarations (`ast_nodes.py`, `cursor_tree.py`) [L649-L701]
-  - 6.1 `CQual` Bit-Flag Qualifier Model (`ast_nodes.py`) [L651-L663]
-  - 6.2 `TypeToken` & `TypeSegment` (`ast_nodes.py`) [L664-L683]
-  - 6.3 Forward Declaration Resolution: `get_notbind_type(ast_type: int) -> int` (`ast_nodes.py`) [L684-L691]
-  - 6.4 Declaration Type Resolution: `get_decl_type(ast_type: int) -> int` (`cursor_tree.py`) [L692-L701]
-- 7. Semantic Scope & AST Partitioning (`cursor_tree.py`, `ast_nodes.py`) [L702-L1138]
-  - 7.1 `Zone_Type` Enumeration (`ast_nodes.py`) [L704-L717]
-  - 7.2 `Zone` Class Contract (`cursor_tree.py`) [L718-L803]
-  - 7.3 `C_Type` Declarator State Machine (`cursor_tree.py`) [L804-L1138]
-- 8. 4-Tier Prior Tag Evolution Matching Engine (`tag_tracker.py`) [L1139-L1212]
-  - 8.1 Prior Tag Index Construction (`get_prior_tags`) [L1144-L1160]
-  - 8.2 The 4-Tier Transition Matching Pipeline (`match_prior_tag_transition`) [L1161-L1191]
-  - 8.3 Prior Tag Loading & Shared Staging Helpers (`tag_tracker.py`) [L1192-L1212]
-- 9. Relational ChangeSet Extraction & Engine Invariants (`cs_extractor.py`, `ast_nodes.py`) [L1213-L1332]
-  - 9.1 `Ast.tag` vs `CSExtractor.stage_tag` [L1215-L1224]
-  - 9.2 Rule 12 & Rule 14 ChangeSet Staging Sequence [L1225-L1263]
-  - 9.3 Symbol Definitions & References (`core/SymbolRows.py`) [L1264-L1332]
-- 10. Complete `ASTT` Type System & Relational Database Mappings [L1333-L1381]
-  - 10.1 Authoritative `ASTT` Enumeration Mapping (`core/globalstuff.py`) [L1335-L1354]
-  - 10.2 Standard C Keywords Mapping (`STANDARD_C_KEYWORDS`) [L1355-L1373]
-  - 10.3 Relational Database Table Map (`core/DBLayout.py`) [L1374-L1381]
-- 11. Critical Engine Invariants & AI Development Guidelines [L1382-L1430]
-- 12. Unit Testing & Snapshot Verification Contract [L1431-L1481]
-- 13. Pure C Outline Extractor (`c_pure_extractor.py`) [L1482-L1491]
-- 14. Pure Lexical Scope Extractor (`c_scope.py`) [L1492-L1589]
-  - 14.1 Public API [L1500-L1544]
-  - 14.2 Scan and Scope Rules [L1545-L1579]
-  - 14.3 Limits [L1580-L1589]
+- 5. Intermediate AST Node Hierarchy (`ast_nodes.py`, `cursor_tree.py`) [L465-L658]
+  - 5.1 Base Interfaces [L467-L534]
+  - 5.2 Statement Classes (`cursor_tree.py`) [L535-L565]
+  - 5.3 Expression & Sub-Construct Scope Containers (`cursor_tree.py`) [L566-L572]
+  - 5.4 Expressions & Relational Symbol Linking (`ast_nodes.py`, `cursor_tree.py`) [L573-L617]
+  - 5.5 Comments, Assembly & Macros (`ast_nodes.py`) [L618-L628]
+  - 5.6 C Preprocessor Subsystem (`CPPro`) (`ast_nodes.py`) [L629-L658]
+- 6. C Type System, Qualifiers & Declarations (`ast_nodes.py`, `cursor_tree.py`) [L659-L728]
+  - 6.1 `CQual` Bit-Flag Qualifier Model (`ast_nodes.py`) [L661-L673]
+  - 6.2 `TypeToken` & `TypeSegment` (`ast_nodes.py`) [L674-L693]
+  - 6.3 Forward Declarations & Reference Name Spaces (`get_notbind_type`, `ref_target_family`, `ast_nodes.py`) [L694-L718]
+  - 6.4 Declaration Type Resolution: `get_decl_type(ast_type: int) -> int` (`cursor_tree.py`) [L719-L728]
+- 7. Semantic Scope & AST Partitioning (`cursor_tree.py`, `ast_nodes.py`) [L729-L1205]
+  - 7.1 `Zone_Type` Enumeration (`ast_nodes.py`) [L731-L744]
+  - 7.2 `Zone` Class Contract (`cursor_tree.py`) [L745-L830]
+  - 7.3 `C_Type` Declarator State Machine (`cursor_tree.py`) [L831-L1205]
+- 8. 4-Tier Prior Tag Evolution Matching Engine (`tag_tracker.py`) [L1206-L1279]
+  - 8.1 Prior Tag Index Construction (`get_prior_tags`) [L1211-L1227]
+  - 8.2 The 4-Tier Transition Matching Pipeline (`match_prior_tag_transition`) [L1228-L1258]
+  - 8.3 Prior Tag Loading & Shared Staging Helpers (`tag_tracker.py`) [L1259-L1279]
+- 9. Relational ChangeSet Extraction & Engine Invariants (`cs_extractor.py`, `ast_nodes.py`) [L1280-L1400]
+  - 9.1 `Ast.tag` vs `CSExtractor.stage_tag` [L1282-L1291]
+  - 9.2 Rule 12 & Rule 14 ChangeSet Staging Sequence [L1292-L1330]
+  - 9.3 Symbol Definitions & References (`core/SymbolRows.py`) [L1331-L1400]
+- 10. Complete `ASTT` Type System & Relational Database Mappings [L1401-L1449]
+  - 10.1 Authoritative `ASTT` Enumeration Mapping (`core/globalstuff.py`) [L1403-L1422]
+  - 10.2 Standard C Keywords Mapping (`STANDARD_C_KEYWORDS`) [L1423-L1441]
+  - 10.3 Relational Database Table Map (`core/DBLayout.py`) [L1442-L1449]
+- 11. Critical Engine Invariants & AI Development Guidelines [L1450-L1498]
+- 12. Unit Testing & Snapshot Verification Contract [L1499-L1549]
+- 13. Pure C Outline Extractor (`c_pure_extractor.py`) [L1550-L1559]
+- 14. Pure Lexical Scope Extractor (`c_scope.py`) [L1560-L1657]
+  - 14.1 Public API [L1568-L1612]
+  - 14.2 Scan and Scope Rules [L1613-L1647]
+  - 14.3 Limits [L1648-L1657]
 <!-- toc:end -->
 
 ---
@@ -496,8 +496,11 @@ etc.):
 - Contains child collections: `zones: list[Zone]`, `operands: list[str]`, `call_exprs: list[Ast_CallExpr]`,
   `member_refs: list[Ast_MemberRefExpr]`, `decl_refs: list[Ast_DeclRefExpr]`, `macro_refs:
   list[Ast_MacroRefExpr]`, `type_refs: list[Ast_TypeRefExpr]`, queued per identifier token by
-  `_collect_expr_ref(node, token, cursor)` (shared with `AST_Initializer` and `Ast_CallStmt`) and staged by
-  `_extract_expr_refs(node, CS)`.
+  `_collect_expr_ref(node, token, cursor)` (shared with `AST_Initializer`, `Ast_CallStmt`, `AST_Array`,
+  `AST_Enum_Equal` and `C_Type`) and staged by `_extract_expr_refs(node, CS)`. A token whose cursor is a
+  declaration (`FIELD_DECL`, `ENUM_CONSTANT_DECL`, `FUNCTION_DECL`, `VAR_DECL`, `PARM_DECL`, `TYPEDEF_DECL`) queues
+  nothing: it is the name that declaration introduces, or a name libclang could not resolve inside it (error
+  recovery, left to `lexical_refs.py`).
 - Attributes: `self.type_id: int` (initialized from `self.__class__.type_id`), `self.ast_ref: Any = None`.
 - **Compound Body Zone Postponement**: `Ast_Statement` avoids pre-allocating a `Zone(Zone_Type.Compound_Stmt)`
   in `__init__`, postponing body zone creation until `{` is received in `exec_punctuation`. This ensures that
@@ -563,17 +566,23 @@ Base class in `cursor_tree.py` for expression and sub-construct containers (`AST
 ### 5.3 Expression & Sub-Construct Scope Containers (`cursor_tree.py`)
 | Class | Base Class | Associated `Zone_Type` | Description |
 | :--- | :--- | :--- | :--- |
-| `AST_Array` | `AST_Expression` | `Zone_Type.Array_Content` | Scopes array dimension bounds `[ ... ]`, tracking `bracket_depth`. |
-| `AST_Initializer` | `AST_Expression` | `Zone_Type.Initializer_Expr`| Scopes variable/struct initializer blocks `= { ... }`, tracking nested `brace_depth`, `paren_depth`, and `bracket_depth`. Supports nested designated initializers at `brace_depth >= 1` and array index designators (`[idx] = val`). Parses designated initializer entries (`.member = value` or `[idx] = value`) and bundles members (`C_MemberRefExpr` 61) and assigned values (`C_DeclRefExpr` 62) directly into an atomic joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, total_containers),), None, "{}", ASTT.C_InitListExpr, *container_args)` in `with CS(REF_POS):`, eliminating separate `m_ast_container.set` calls and preventing duplicate primary key collisions. |
-| `AST_Enum_Equal` | `AST_Expression` | `Zone_Type.Enum_Equal` | Scopes enum constant assignments (`= expr`), terminating on `}` or `,`. Preserves the assigned expression in `m_ast.name` staged via `m_ast.view` as `ASTT.C_enumequal`. |
+| `AST_Array` | `AST_Expression` | `Zone_Type.Array_Content` | Scopes array dimension bounds `[ ... ]`, tracking `bracket_depth`. Its identifiers go through `_collect_expr_ref()` (`int a[MAX_FOO]`, `u8 b[sizeof(struct T)]`, `char c[LAST_ENUM]`), staged by `extract()`. |
+| `AST_Initializer` | `AST_Expression` | `Zone_Type.Initializer_Expr`| Scopes variable/struct initializer blocks `= { ... }`, tracking nested `brace_depth`, `paren_depth`, and `bracket_depth`. Supports nested designated initializers at `brace_depth >= 1` and array index designators (`[idx] = val`). Parses designated initializer entries (`.member = value` or `[idx] = value`) and bundles members (`C_MemberRefExpr` 61) and assigned values (`C_DeclRefExpr` 62; a structural node recording no reference itself, `record_ref = False`: the value's references are those of its identifiers, at their own positions, and an array designator's identifiers are referenced too) directly into an atomic joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, total_containers),), None, "{}", ASTT.C_InitListExpr, *container_args)` in `with CS(REF_POS):`, eliminating separate `m_ast_container.set` calls and preventing duplicate primary key collisions. |
+| `AST_Enum_Equal` | `AST_Expression` | `Zone_Type.Enum_Equal` | Scopes enum constant assignments (`= expr`), terminating on `}` or `,`. Preserves the assigned expression in `m_ast.name` staged via `m_ast.view` as `ASTT.C_enumequal`; its identifiers (`A = BIT(3)`, `B = A + 1`) go through `_collect_expr_ref()`. |
 
 ### 5.4 Expressions & Relational Symbol Linking (`ast_nodes.py`, `cursor_tree.py`)
 - **Symbol Resolution (`resolve_cursor_type_ast(CS, cursor) -> tuple[int, Any]`)**:
   Inspects the Clang cursor's referenced symbol or definition to resolve its AST type and relational link:
   - Function references (`FUNCTION_DECL`, `CXX_METHOD`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None,
     safe_name, ASTT.C_functionprotnotbind)` and returns `(ASTT.C_functionproto, CS.ref(...))`.
-  - Field references (`FIELD_DECL`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None, safe_name,
-    ASTT.C_structnotbind)` and returns `(ASTT.C_struct, CS.ref(...))`.
+  - Field references (`FIELD_DECL`) &rarr; members are a name space of their own: the field's declaration
+    (registered by `C_Type.extract()` as `(name, C_MemberRefExpr)`, also a function-pointer field), a foreign
+    field as `(REF_FILE, rel_file, name, C_MemberRefExpr)`, else an unbound `m_ast.view(((m_ast.ast_id,),), None,
+    safe_name, ASTT.C_MemberRefExpr)`; returns `(ASTT.C_struct, CS.ref(...))`. A field registers no
+    `(name, C_DeclRefExpr)` / `(name, type)` key, so it never answers a variable, tag or macro reference.
+  - Variable / parameter references (`VAR_DECL`, `PARM_DECL`) of the parsed file with no registered declaration
+    (a C99 `for (T x = ...)` local, a parameter of a macro-spelled function, a name a macro generates) &rarr; an
+    unbound `m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_DeclRefExpr)`.
   - Record types (`RECORD`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None, safe_name,
     ASTT.C_structnotbind)` and returns `(ASTT.C_struct, CS.ref(...))`.
   - Enum types (`ENUM`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_enumnotbind)`
@@ -600,7 +609,8 @@ Base class in `cursor_tree.py` for expression and sub-construct containers (`AST
     `SymbolRole.TypeUsage = 2` reference of `resolve_cursor_type_ast()`'s target (`C_structdecl` /
     `C_uniondecl` / `C_enumdecl` / `C_SCtypedef`, a notbind node when unbound).
   - `Ast_CallStmt(Ast_CallExpr)` (`cursor_tree.py`): the `Zone` child of a `CALL_EXPR` statement
-    (`_child_node_factories()`). Its own `C_CallExpr` node and `Call` reference are those of `Ast_CallExpr`; the
+    (`_child_node_factories()`). Its own `C_CallExpr` node and `Call` reference are those of `Ast_CallExpr`, the
+    reference at the callee token (`ref_extent`: `c->ops->open(x)` calls at `open`, bound to the field); the
     tokens after the callee (`self.callee`) go through `_collect_expr_ref()`, so the arguments of a statement
     call (`l2cap_chan_del(chan, reason);`) carry their `DeclRef` / `MemberRef` / `Call` / `MacroExpansion` /
     `TypeUsage` references like those of any other expression.
@@ -681,13 +691,30 @@ class CQual(Flag):
       Compound `C_SCtypedef` tokens (e.g. `const __be32` or function pointer return types) resolve
       `target_ref`, append `(typetoken.type, target_ref)`, and stage `SymbolRole.TypeUsage` in `m_symbol_ref`.
 
-### 6.3 Forward Declaration Resolution: `get_notbind_type(ast_type: int) -> int` (`ast_nodes.py`)
-Maps bound declaration type constants to unbound forward reference constants:
+### 6.3 Forward Declarations & Reference Name Spaces (`get_notbind_type`, `ref_target_family`, `ast_nodes.py`)
+`get_notbind_type(ast_type: int) -> int` maps bound declaration type constants to unbound forward reference
+constants:
 - `ASTT.C_struct` / `ASTT.C_structdecl` &rarr; `ASTT.C_structnotbind` (29)
 - `ASTT.C_union` / `ASTT.C_uniondecl` &rarr; `ASTT.C_unionnotbind` (35)
 - `ASTT.C_enum` / `ASTT.C_enumdecl` &rarr; `ASTT.C_enumnotbind` (32)
 - `ASTT.C_functionproto` / `ASTT.C_functionprotodecl` &rarr; `ASTT.C_functionprotnotbind` (22)
 - `ASTT.C_SCtypedef` &rarr; `ASTT.C_SCtypedef` (10)
+
+`ref_target_family(ast_type: int) -> tuple[int, ...] | None` is the C name space a reference requested as
+`ast_type` may bind to when its exact `(name, type)` is unknown (`ChangeSet.resolve_ref()`, `core/API.md` §5),
+in preference order:
+- macros (`CPPro_define`, `CPPro_define_macro`): those two types;
+- `struct` / `union` / `enum` tags (each kind its own): `*decl`, `*notbind`, then the bare kind (forward
+  declarations);
+- typedef names (`C_SCtypedef`): typedefs only;
+- members (`C_MemberRefExpr`): member nodes only;
+- ordinary identifiers (`C_DeclRefExpr`, `C_enumequal`, the function types): variables, functions, enumerators,
+  typedef names and the kernel definitions spelled through macros, i.e. every C type id except macros, tags,
+  members, statements, expressions and directives.
+
+A statement, expression, directive or other-namespace node of the same name (`return NULL;`'s `C_ReturnStmt`,
+an array-size node `[NR_CPUS]`, a `C_MemberRefExpr`) therefore never answers a macro, type or call reference.
+Non-C types return `None` (name-only fallback).
 
 ### 6.4 Declaration Type Resolution: `get_decl_type(ast_type: int) -> int` (`cursor_tree.py`)
 Maps base construct type constants to definition declaration type constants:
@@ -807,7 +834,33 @@ class Zone_Type(IntEnum):
   encountering qualifiers with identical flags set, pointers, array brackets, or identifiers.
 - **Multi-Declarator Splitting**:
   Pairs shared base `root_type` with each subsequent declarator in `typedata`, producing `final_types =
-  [(root_type, decl_1), (root_type, decl_2), ...]`.
+  [(root_type, decl_1), (root_type, decl_2), ...]`. A specifier that does not close its segment (`unsigned`,
+  `signed`) leaves the first declarator in the root segment (`unsigned a, b;` is `[unsigned a] [b]`);
+  `_split_root_declarator()` gives it its own segment first (`[unsigned] [a] [b]`), so `a` is a declaration of its
+  own (registered and referenced) and `b` is typed `unsigned`. A single declarator keeps its segments.
+- **Expression References of a Declaration**:
+  `C_Type` queues references like a statement (`call_exprs` ... `type_refs`, `_collect_expr_ref()`), staged at
+  the start of `extract()` and flushed with the declaration's tag: every macro expansion it spells (`__user`,
+  `__init`, `__packed`, `__read_mostly`, `DECLARE_BITMAP`, `EXPORT_SYMBOL`), every expression token outside its
+  zones (`__initcall(fn)`, `typeof(x)`), bitfield widths (`int x : WIDTH`) and attribute arguments
+  (`__aligned(SMP_CACHE_BYTES)`). A token naming the declaration being declared (a `VAR_DECL` / `PARM_DECL` /
+  ... cursor of its own spelling, or `DEFINE_MUTEX(m)`'s `m` referenced by its own initializer) is no reference.
+- **Declarations Spelled Through a Function-Like Macro** (`_starts_lead_macro()`, `_lead_macro_arg()`):
+  A declaration (not a function) whose first name is a function-like macro the parser has no kernel rule for
+  (`BTF_ID(func, f)`, `DEFINE_SIMPLE_DEV_PM_OPS(ops, s, r)`), or a `_VAR_DECL_MACROS` member
+  (`DECLARE_BITMAP(map, BITS)`, `DEFINE_SPINLOCK(lock)`), reads its argument list as arguments, not
+  declarators: the declared name stays a declarator - the first argument of a `_VAR_DECL_MACROS` member
+  (whatever cursor its expansion gives it), else the token whose cursor is the declaration of its spelling - and
+  every other argument (`BITS`, `NR_CPUS * 2`, a callback, a type) is referenced and adds no type token, no
+  declarator and no `m_symbol_def` row. `extern DECLARE_BITMAP(map, NR);` defines `map` only.
+- **Macros That Name No Declarator**:
+  A macro instantiation that is neither a kernel macro with a rule (`_KNOWN_MACRO_FUNCS`), a tag name after
+  `struct` / `union` / `enum`, nor the declarator name spelled through an object-like macro
+  (`_is_renamed_function_name()` against `self.cursor`) adds no type token and no declarator (`} __packed;`,
+  `x __cacheline_aligned`, `MPI_POINTER p`); its expansion is referenced, and the arguments of a function-like
+  one (`void f(void) __releases(rq->lock)`) are read like a declaration macro's (referenced, no declarators). A
+  declaration macro the parser has no rule for drops a name its cursor preset that no token spells (the
+  generated `__mod_alias385` of `MODULE_ALIAS_MISCDEV(MINOR)`): it defines only a name its arguments spell.
 - **Strict Container Isolation Invariant**:
   - `Zone_Type.Declared_Args` strictly attaches to `C_struct` / `C_union` definitions.
   - `Zone_Type.Enum_Content` strictly attaches to `C_enum` definitions.
@@ -875,7 +928,16 @@ class Zone_Type(IntEnum):
     extracted and linked to the parent symbol at Container Level 1 in `m_ast_container`.
 - **Standalone Forward Declarations**:
   Standalone declarations (e.g. `struct svc_rqst;`) remain `ASTT.C_struct` (27) and are not marked as
-  definitions (`C_structdecl`), preventing orphan empty container rows.
+  definitions (`C_structdecl`), preventing orphan empty container rows. A tag in a function's return type
+  (`static enum hrtimer_restart f(void)`, `struct s g(void);`) is a `TypeUsage` at the tag name, never a forward
+  declaration.
+- **Typedefs of Tag Bodies**: `typedef struct s { ... } s_t;` and `typedef enum { A, B } e_t;` record, with the
+  typedef's tag, the named tag's definition (`C_structdecl` / `C_uniondecl` / `C_enumdecl`) and every enumerator
+  (`C_enumequal`) besides the typedef (`_queue_typedef_tag_defs()`, `_typedef_tag_defs`); an anonymous body
+  (named after the typedef) defines no tag. A typedef / declarator's `TypeUsage` of its own type segment is
+  recorded only for a named type (a struct / union / enum tag or a typedef name): a function-pointer declarator
+  (`int (*cb)(int)`, `typedef void (*fn_t)(void)`) owns its function type, and a pointer / qualifier segment
+  (`* const`) names none.
 - **Typedef Declarator Extraction & Chained Underlying Type Linking**:
   - Declarator token isolation: When executing identifiers under `cc.CursorKind.TYPEDEF_DECL` matching
     `safe_cursor_spelling(cursor)`, the declarator receives default type `0` (avoiding phantom child container
@@ -1108,19 +1170,24 @@ class Zone_Type(IntEnum):
   - Initcall macros (`_INITCALL_MACROS`: `module_init`, `module_exit`, `*initcall`) are extracted into
     `m_symbol_def` as `ASTT.C_InitcallDef` (163) and indexed in `CS.symbol_dict[(p_init, ASTT.C_InitcallDef)]`
     without overriding `ASTT.C_DeclRefExpr`.
-  - Symbol export macros (`_EXPORT_MACROS`: `EXPORT_SYMBOL*`) are extracted into `m_symbol_def` as
-    `ASTT.C_ExportSymbolDef` (164) and indexed in `CS.symbol_dict[(p_sym, ASTT.C_ExportSymbolDef)]` without
+  - Symbol export macros (`_EXPORT_MACROS`: `EXPORT_SYMBOL*`, `EXPORT_SYMBOL_NS*`, `EXPORT_PER_CPU_SYMBOL*`) are extracted into `m_symbol_def` as
+    `ASTT.C_ExportSymbolDef` (164), also when the expansion's `extern typeof(f) f;` redeclaration gives the
+    declaration a `FUNCTION_DECL` cursor (the export macro names the declaration; the function-name rule skips
+    it), and indexed in `CS.symbol_dict[(p_sym, ASTT.C_ExportSymbolDef)]` without
     overriding `ASTT.C_DeclRefExpr`, ensuring variable and function reference linking resolves to primary
     declarations.
   - Driver device match tables (`_DEVICE_TABLE_MACROS`: `MODULE_DEVICE_TABLE`) are extracted into
     `m_symbol_def` as `ASTT.C_DeviceTableDef` (175) and indexed in `CS.symbol_dict[(p_sym,
     ASTT.C_DeviceTableDef)]`.
   - Sysfs attribute definitions (`_SYSFS_ATTR_MACROS`: `DEVICE_ATTR_*`, `SYSFS_ATTR_*`, `CLASS_ATTR_*`,
-    `BUS_ATTR_*`, `DRIVER_ATTR_*`, `__ATTR*`) are extracted into `m_symbol_def` as `ASTT.C_SysfsAttrDef` (176)
-    and dual-indexed in `CS.symbol_dict`.
+    `BUS_ATTR_*`, `DRIVER_ATTR_*`, `SYSDEV_ATTR`, `SYSDEV_CLASS_ATTR`, `__ATTR*`) are extracted into `m_symbol_def`
+    as `ASTT.C_SysfsAttrDef` (176) and dual-indexed in `CS.symbol_dict`.
+  - An export or sysfs macro (`_NAMING_KERNEL_MACROS`) opening a declaration names it even when the expansion's
+    cursor preset another name (`dev_attr_x`, `extern typeof(f) f;`).
   - Inside compound statements (`Zone_Type.Compound_Stmt`), inner preprocessor directives inherit
     `create_tags=False`, ensuring clean single-tag extents for enclosing function definitions without inner
-    tag overlaps.
+    tag overlaps. A `#define` there (or inside a struct body or an initializer) still records its
+    `m_symbol_def` row, placed in the innermost tag around its lines by `finish_symbol_rows()`.
   - Local declarations and type definitions assign `self.type_id` so that `m_ast_container` preserves non-zero
     child construct types (`ASTT`).
 
@@ -1325,8 +1392,9 @@ return tag_ref
   `MACRO_INSTANTIATION` token at the `FUNCTION_DECL` location (`_is_renamed_function_name()`; function-like
   wrappers such as `SYSCALL_DEFINE3` excluded): the definition, its parameter types and its body references are
   recorded under the name written in the file.
-- **Literal declarators**: a literal split off as a declarator name (the `128` of `extern DECLARE_BITMAP(map,
-  128);`, the string of an unexpanded `MODULE_LICENSE("GPL")`) defines no `m_symbol_def` row.
+- **Literal declarators**: a literal split off as a declarator name (the string of an unexpanded
+  `MODULE_LICENSE("GPL")`) defines no `m_symbol_def` row; the arguments of a declaration macro are no
+  declarators at all (§7.3, `extern DECLARE_BITMAP(map, 128);` defines `map` only).
 - A reference to a declaration of the parsed file itself (`get_target_fnid_for_cursor()`) points at the file's
   own `m_file_name` operation, located in the ChangeSet (`_own_file_name_pos()`).
 

@@ -82,6 +82,52 @@ def get_notbind_type(ast_type: int) -> int:
             return ast_type
 
 
+# C name spaces of a reference target (ISO C 6.2.3 plus macros): an AST node type outside these never names a
+# declaration (statements, expressions, directives, member uses).
+_MACRO_FAMILY = (ASTT.CPPro_define, ASTT.CPPro_define_macro)
+_FUNCTION_TYPES = (ASTT.C_functionprotodecl, ASTT.C_functionproto, ASTT.C_functionprotnotbind)
+_NOT_ORDINARY = frozenset({
+    *_MACRO_FAMILY, ASTT.CPPro_undef,
+    ASTT.C_structdecl, ASTT.C_structnotbind, ASTT.C_uniondecl, ASTT.C_unionnotbind, ASTT.C_enumdecl, ASTT.C_enumnotbind,
+    ASTT.C_Comment, ASTT.C_Keyword, ASTT.C_MemberRefExpr, ASTT.C_CallExpr, ASTT.C_MacroParam, ASTT.C_TypeRef,
+    *(t for t in ASTT if ASTT.C_CompoundStmt <= t <= ASTT.C_InitListExpr and t not in (ASTT.C_DeclRefExpr,)),
+    ASTT.C_SizeofExpr, ASTT.C_CastExpr, ASTT.C_ConditionalOperator, ASTT.C_ArraySubscriptExpr, ASTT.C_DesignatedInitExpr,
+    ASTT.C_CompoundAssignOperator, ASTT.C_CompoundLiteralExpr, ASTT.C_IndirectGotoStmt, ASTT.C_AddrLabelExpr,
+    ASTT.C_NullStmt, ASTT.C_StmtExpr, ASTT.C_GenericSelectionExpr, ASTT.C_VaArgExpr, ASTT.C_LabelRef,
+    ASTT.C_IntegerLiteral, ASTT.C_FloatingLiteral, ASTT.C_StringLiteral, ASTT.C_CharacterLiteral, ASTT.C_StaticAssert,
+    ASTT.C_TypeofExpr, ASTT.C_OffsetofExpr, ASTT.C_TypesCompatiblePExpr, ASTT.C_ChooseExpr, ASTT.C_AlignofExpr,
+    ASTT.C_AtomicExpr, ASTT.C_AsmStmt,
+})
+# Ordinary identifiers: variables, functions, typedef names, enumerators (and the kernel definitions spelled
+# through macros); the declaration's node carries the declared type, so every other C type id qualifies
+_ORDINARY_HEAD = (ASTT.C_DeclRefExpr, *_FUNCTION_TYPES, ASTT.C_Compound, ASTT.C_int, ASTT.C_pointer, ASTT.C_unsigned,
+                  ASTT.C_struct, ASTT.C_SCtypedef, ASTT.C_long, ASTT.C_char, ASTT.C_enumequal, ASTT.C_array,
+                  ASTT.C_arrayempty, ASTT.C_short, ASTT.C_union, ASTT.C_enum, ASTT.C_bool, ASTT.C_void)
+_ORDINARY_FAMILY = (*_ORDINARY_HEAD, *(  # most frequent declared types first: fewer probes per fallback
+    t for t in ASTT
+    if (t.name.startswith("C_") or t == ASTT.Undefined) and t not in _NOT_ORDINARY and t not in _ORDINARY_HEAD
+))
+_REF_TARGET_FAMILIES: dict[int, tuple[int, ...]] = {
+    **{int(t): tuple(int(x) for x in _MACRO_FAMILY) for t in _MACRO_FAMILY},
+    **{int(t): (int(ASTT.C_structdecl), int(ASTT.C_structnotbind), int(ASTT.C_struct)) for t in (ASTT.C_struct, ASTT.C_structdecl, ASTT.C_structnotbind)},
+    **{int(t): (int(ASTT.C_uniondecl), int(ASTT.C_unionnotbind), int(ASTT.C_union)) for t in (ASTT.C_union, ASTT.C_uniondecl, ASTT.C_unionnotbind)},
+    **{int(t): (int(ASTT.C_enumdecl), int(ASTT.C_enumnotbind), int(ASTT.C_enum)) for t in (ASTT.C_enum, ASTT.C_enumdecl, ASTT.C_enumnotbind)},
+    int(ASTT.C_SCtypedef): (int(ASTT.C_SCtypedef),),
+    int(ASTT.C_MemberRefExpr): (int(ASTT.C_MemberRefExpr),),
+    **{int(t): tuple(int(x) for x in (*_FUNCTION_TYPES, *(o for o in _ORDINARY_FAMILY if o not in _FUNCTION_TYPES))) for t in _FUNCTION_TYPES},
+    int(ASTT.C_DeclRefExpr): tuple(int(x) for x in _ORDINARY_FAMILY),
+    int(ASTT.C_enumequal): (int(ASTT.C_enumequal), *(int(x) for x in _ORDINARY_FAMILY if x != ASTT.C_enumequal)),
+}
+
+
+def ref_target_family(ast_type: int) -> tuple[int, ...] | None:
+    """The AST node types a reference requested as `ast_type` may bind to when its exact `(name, type)` is unknown:
+    the requested C name space only - macros, struct / union / enum tags (each its own), typedef names, members, or
+    ordinary identifiers (variables, functions, enumerators) - in preference order. `None` for non-C types, which
+    keep a name-only match."""
+    return _REF_TARGET_FAMILIES.get(int(ast_type)) if ast_type is not None else None
+
+
 class Ast:
     """Base intermediate AST node offering extraction and tagging."""
     zones: tuple[Any, ...] = ()
@@ -1129,6 +1175,12 @@ class CPPro_define(CPPro):
                 CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
+            if safe_name:
+                # A `#define` inside a function, struct or initializer body: defined all the same, placed in the
+                # innermost tag around its lines (`finish_symbol_rows()`)
+                with CS(REF_POS):
+                    record_symbol_def(CS, 0, self.ast_ref, safe_name, type_const, int(SymbolLinkage.MacroOrKernelDef),
+                                      self.extent.line_pos[0], self.extent.line_pos[1])
         # Names the replacement list uses (not its parameters, nor the macro itself): resolved where it expands
         ignored = {str(p).strip().rstrip(".") for p in self.func_args} | {self.identifier}
         record_name_refs(CS, getattr(self, "tag_ref", 0),
@@ -1600,7 +1652,8 @@ class Ast_CallExpr(Ast):
                 ast_id_route = CS.get_route_parse()
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
         if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
-            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.Call), self.extent.line_pos[0], self.extent.char_pos[0]))
+            ref_ext = getattr(self, "ref_extent", None) or self.extent
+            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.Call), ref_ext.line_pos[0], ref_ext.char_pos[0]))
         if create_tag:
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -1662,7 +1715,7 @@ class Ast_DeclRefExpr(Ast):
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, self.type_id))
                 ast_id_route = CS.get_route_parse()
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-        if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
+        if ref_ast_id != 0 and getattr(self, "record_ref", True) and hasattr(CS, "pending_symbol_refs"):
             CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.DeclRef), self.extent.line_pos[0], self.extent.char_pos[0]))
         if create_tag:
             with CS(REF_NO_REF):

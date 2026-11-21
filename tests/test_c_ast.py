@@ -4593,6 +4593,189 @@ class TestExpressionReferences(unittest.TestCase):
         self.assertEqual(includes["prelude"], includes["plain"])
 
 
+
+class TestDeclaratorAndNamespaceFidelity(unittest.TestCase):
+    """References inside declarators and declaration macros, definitions libclang spells through macros or typedefs,
+    and the C name space of every reference target (parser/c_ast/cursor_tree.py `C_Type`, `AST_Array`,
+    `AST_Enum_Equal`, `AST_Initializer`; parser/c_ast/ast_nodes.py `ref_target_family()`)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_refs_in_declarators(self) -> None:
+        refs, defs = parse_snippet(
+            "#define MAX_FOO 8\n#define BIT(n) (1UL << (n))\n#define WIDTH 3\n"
+            "enum colors { RED, GREEN = BIT(3), BLUE = GREEN + 1 };\n"
+            "struct st { int a[MAX_FOO]; unsigned w : WIDTH; char b[BLUE]; };\n"
+            "static int garr[MAX_FOO + RED];\n"
+            "struct ops { int (*open)(int); struct st *ops; };\n"
+            "static int my_open(int x) { return x; }\n"
+            "static struct st my_st;\n"
+            "static struct ops my_ops = { .open = my_open, .ops = &my_st };\n"
+            "int arr2[4] = { [RED] = 1, [GREEN] = MAX_FOO };\n"
+            "int sw(int v)\n{\n\tswitch (v) {\n\tcase RED:\n\t\treturn 1;\n\tcase BLUE:\n\t\treturn 2;\n\t}\n\treturn 0;\n}\n",
+            "drivers/x/decl.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in (
+            (4, 28, "MacroExpansion", "BIT", "CPPro_define_macro"),     # enum initializer
+            (4, 43, "DeclRef", "GREEN", "C_enumequal"),
+            (5, 19, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),  # array bound of a field
+            (5, 42, "MacroExpansion", "WIDTH", "CPPro_define_macro"),    # bitfield width
+            (5, 56, "DeclRef", "BLUE", "C_enumequal"),
+            (6, 17, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),  # array bound of a global
+            (6, 27, "DeclRef", "RED", "C_enumequal"),
+            (10, 38, "DeclRef", "my_open", "C_functionprotodecl"),       # designated initializers
+            (10, 55, "DeclRef", "my_st", "C_struct"),
+            (11, 18, "DeclRef", "RED", "C_enumequal"),                   # array designators
+            (11, 29, "DeclRef", "GREEN", "C_enumequal"),
+            (11, 38, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),
+            (15, 7, "DeclRef", "RED", "C_enumequal"),                    # case labels
+            (17, 7, "DeclRef", "BLUE", "C_enumequal"),
+        ):
+            self.assertIn(item, got)
+        # `&my_st` is one reference, at the identifier; `= MAX_FOO` is a macro expansion only
+        self.assertNotIn((10, 54), {(line, col) for line, col, *_x in refs})
+        self.assertEqual([r for r in got if r[:2] == (11, 38)], [(11, 38, "MacroExpansion", "MAX_FOO", "CPPro_define_macro")])
+        # A member binds its field, never the struct tag of the same name
+        self.assertIn((10, 48, "MemberRef", "ops", "C_Compound"), got)
+        self.assertIn((10, 31, "MemberRef", "open", "C_functionprotodecl"), got)
+        self.assertIn((11, "arr2", "C_int", "ExternalDef"), defs)
+
+    def test_first_declarator_of_a_specifier_list(self) -> None:
+        refs, _defs = parse_snippet(
+            "void f(unsigned count)\n{\n\tunsigned cgno, bit;\n\tcgno = count;\n\tbit = cgno;\n}\n", "fs/x/multi.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in ((4, 2, "DeclRef", "cgno", "C_unsigned"), (5, 2, "DeclRef", "bit", "C_unsigned"),
+                     (5, 8, "DeclRef", "cgno", "C_unsigned")):
+            self.assertIn(item, got)
+
+    def test_declaration_macros_define_only_their_object(self) -> None:
+        refs, defs = parse_snippet(
+            "#define BITS_PER_LONG 64\n#define BITS_TO_LONGS(nr) (((nr) + BITS_PER_LONG - 1) / BITS_PER_LONG)\n"
+            "#define DECLARE_BITMAP(name, bits) unsigned long name[BITS_TO_LONGS(bits)]\n#define NR_THINGS 128\n"
+            "extern DECLARE_BITMAP(zmap, NR_THINGS);\n"
+            "extern DECLARE_BITMAP(ymap, BITS_PER_LONG * 2);\n"
+            "static DECLARE_BITMAP(xmap, 64);\n"
+            "struct s { DECLARE_BITMAP(fmap, NR_THINGS); };\n"
+            "#define __packed __attribute__((packed))\n"
+            "struct p { int a; } __packed;\n"
+            "struct mutex { int v; };\n#define __MUTEX_INITIALIZER(m) { .v = sizeof(m) }\n"
+            "#define DEFINE_MUTEX(m) struct mutex m = __MUTEX_INITIALIZER(m)\n"
+            "static DEFINE_MUTEX(map_mutex);\n"
+            "#define BTF_ID(prefix, name) static int __btf_##prefix##_##name;\n"
+            "BTF_ID(func, bpf_lsm_bpf)\n"
+            "void use(void *p);\nvoid g(void)\n{\n\tuse(&map_mutex);\n\tuse(zmap);\n}\n",
+            "include/linux/declmacro.h")
+        c_defs = {(line, name, typ, link) for line, name, typ, link in defs if not typ.startswith("CPPro")}
+        self.assertEqual(c_defs, {
+            (5, "zmap", "C_Compound", "PrototypeDecl"), (6, "ymap", "C_Compound", "PrototypeDecl"),
+            (7, "xmap", "C_Compound", "InternalStaticDef"), (8, "s", "C_structdecl", "ExternalDef"),
+            (10, "p", "C_structdecl", "ExternalDef"), (11, "mutex", "C_structdecl", "ExternalDef"),
+            (14, "map_mutex", "C_Compound", "InternalStaticDef"),
+            (17, "use", "C_functionprotodecl", "PrototypeDecl"), (18, "g", "C_functionprotodecl", "ExternalDef"),
+        })
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((5, 8, "MacroExpansion", "DECLARE_BITMAP"), (5, 29, "MacroExpansion", "NR_THINGS"),
+                     (6, 29, "MacroExpansion", "BITS_PER_LONG"), (8, 33, "MacroExpansion", "NR_THINGS"),
+                     (10, 21, "MacroExpansion", "__packed"), (14, 8, "MacroExpansion", "DEFINE_MUTEX"),
+                     (16, 1, "MacroExpansion", "BTF_ID"), (20, 7, "DeclRef", "map_mutex"), (21, 6, "DeclRef", "zmap")):
+            self.assertIn(item, got)
+
+    def test_attribute_macro_arguments_and_generated_names(self) -> None:
+        refs, defs = parse_snippet(
+            "struct rq { int lock; };\nextern struct rq *rq;\n#define __releases(x) __attribute__((unused))\n"
+            "void schedule_tail(int prev)\n\t__releases(rq->lock)\n{\n}\n"
+            "#define GEN_VAR(n) static int gen_##n;\nGEN_VAR(foo)\n"
+            "#define EXPORT_PER_CPU_SYMBOL(v) extern int v;\nint kstat;\nEXPORT_PER_CPU_SYMBOL(kstat)\n",
+            "kernel/x/attr.c")
+        c_defs = [(line, name, typ) for line, name, typ, _link in defs if not typ.startswith("CPPro")]
+        self.assertEqual(c_defs.count((4, "schedule_tail", "C_functionprotodecl")), 1)  # no bogus `rq` / `lock` declarators
+        self.assertNotIn("gen_foo", {name for _l, name, _t in c_defs})                 # a name no token spells
+        self.assertNotIn("foo", {name for _l, name, _t in c_defs})                     # nor a macro argument
+        self.assertIn((12, "kstat", "C_ExportSymbolDef"), c_defs)
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        self.assertIn((5, 2, "MacroExpansion", "__releases"), got)
+
+    def test_export_redeclaration_is_an_export(self) -> None:
+        _refs, defs = parse_snippet(
+            "#define __ADDRESSABLE(sym) static void * __attribute__((used)) __addressable_##sym = (void *)(unsigned long)&sym;\n"
+            "#define __EXPORT_SYMBOL(sym, license, ns) extern typeof(sym) sym; __ADDRESSABLE(sym) asm(\".section x\")\n"
+            "#define EXPORT_SYMBOL_GPL(sym) __EXPORT_SYMBOL(sym, \"GPL\", \"\")\n"
+            "int svc_bind(int x)\n{\n\treturn x;\n}\nEXPORT_SYMBOL_GPL(svc_bind);\n", "net/x/export.c")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        self.assertIn((4, "svc_bind", "C_functionprotodecl"), found)
+        self.assertIn((8, "svc_bind", "C_ExportSymbolDef"), found)
+        self.assertNotIn((8, "svc_bind", "C_functionprotodecl"), found)
+
+    def test_typedef_tag_bodies_and_nested_macros(self) -> None:
+        refs, defs = parse_snippet(
+            "typedef enum {\n\tDMX_OUT_DECODER,\n\tDMX_OUT_TAP = 2,\n} dmx_output_t;\n"
+            "typedef enum named_e { NE_A, NE_B } named_t;\n"
+            "typedef struct named_s { int a; } named_s_t;\n"
+            "typedef struct { int a;\n#define INNER_FLAG 1\n} anon_s_t;\n"
+            "enum hrtimer_restart { HR_A };\n"
+            "static enum hrtimer_restart timer_fn(int x)\n{\n#define PLURAL(x) (x)\n\treturn PLURAL(x) ? HR_A : HR_A;\n}\n",
+            "include/linux/typedefs.h")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        for item in ((2, "DMX_OUT_DECODER", "C_enumequal"), (3, "DMX_OUT_TAP", "C_enumequal"),
+                     (4, "dmx_output_t", "C_SCtypedef"), (5, "named_e", "C_enumdecl"), (5, "NE_A", "C_enumequal"),
+                     (5, "NE_B", "C_enumequal"), (6, "named_s", "C_structdecl"), (8, "INNER_FLAG", "CPPro_define_macro"),
+                     (13, "PLURAL", "CPPro_define_macro")):
+            self.assertIn(item, found)
+        self.assertNotIn("anon_s_t", {name for _l, name, typ in found if typ == "C_structdecl"})
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        # A tag in a function's return type is a use, not a forward declaration
+        self.assertIn((11, 13, "TypeUsage", "hrtimer_restart"), got)
+        self.assertNotIn((11, 1, "Declaration", "hrtimer_restart"), got)
+
+    def test_member_calls_and_function_pointer_declarators(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct ops { void (*ctor)(int); };\nstruct cache { struct ops *o; void (*dtor)(int); };\n"
+            "typedef int (*fn_t)(int);\n"
+            "void f(struct cache *c)\n{\n\tc->dtor(1);\n\tc->o->ctor(2);\n}\n", "mm/x/calls.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        self.assertIn((6, 5, "Call", "dtor", "C_functionprotodecl"), got)  # at the callee, bound to the field
+        self.assertIn((7, 8, "Call", "ctor", "C_functionprotodecl"), got)
+        self.assertIn((7, 5, "MemberRef", "o", "C_Compound"), got)
+        # A function-pointer declarator owns its function type: no TypeUsage of itself
+        self.assertFalse([r for r in got if r[2] == "TypeUsage" and r[3] in ("fn_t", "ctor", "dtor")])
+
+    def test_name_space_scoped_fallback(self) -> None:
+        from core.DBLayout import m_ast
+        from core.TableHandling import ChangeSet as CSet
+        from core.globalstuff import REF_FILE
+        from parser.c_ast.ast_nodes import ref_target_family
+
+        self.assertEqual(ref_target_family(ASTT.CPPro_define), (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro)))
+        self.assertEqual(ref_target_family(ASTT.C_MemberRefExpr), (int(ASTT.C_MemberRefExpr),))
+        self.assertNotIn(int(ASTT.C_ReturnStmt), ref_target_family(ASTT.C_DeclRefExpr))
+        self.assertNotIn(int(ASTT.CPPro_define), ref_target_family(ASTT.C_DeclRefExpr))
+        self.assertIsNone(ref_target_family(ASTT.ASM_Label))
+
+        class GP:
+            _is_worker = True  # no TableEngine lookups / stubs: only the per-file tables answer
+
+            def __init__(self, syms: dict) -> None:
+                self.file_symbols = {"include/linux/stddef.h": syms}
+                self.file_names = {}
+
+        def resolve(syms: dict, name: str, typ: int) -> Any:
+            cs = CSet("M\tkernel/x.c")
+            cs.gp = GP(syms)
+            return cs.resolve_ref(m_ast.ast_id, (REF_FILE, "include/linux/stddef.h", name, int(typ)))
+
+        stmt_and_var = {("NULL", int(ASTT.C_ReturnStmt)): 5, ("NULL", int(ASTT.C_DeclRefExpr)): 6}
+        # A macro reference never binds a statement or a variable of its name...
+        self.assertIsNone(resolve(stmt_and_var, "NULL", ASTT.CPPro_define))
+        # ...but finds the macro of any macro type
+        self.assertEqual(resolve({**stmt_and_var, ("NULL", int(ASTT.CPPro_define_macro)): 7}, "NULL", ASTT.CPPro_define), 7)
+        # A struct tag reference never binds a variable or member; a member never binds a tag
+        self.assertIsNone(resolve({("list_head", int(ASTT.C_DeclRefExpr)): 8}, "list_head", ASTT.C_structdecl))
+        self.assertIsNone(resolve({("ops", int(ASTT.C_structdecl)): 9}, "ops", ASTT.C_MemberRefExpr))
+        # An ordinary identifier binds a variable node of any declared type
+        self.assertEqual(resolve({("jiffies", int(ASTT.C_long)): 10}, "jiffies", ASTT.C_DeclRefExpr), 10)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
