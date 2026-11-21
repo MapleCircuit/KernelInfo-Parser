@@ -7,14 +7,18 @@
  *
  * Canvas JSON (`schema: "kip-nodemap-canvas"`, `version: 1`):
  *   { schema, version, nodes: [Node], edges: [Edge], viewport: {x, y, zoom},
- *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine, bgColor} }
+ *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine, bgColor, embedSessions, followSession} }
  *   Node  { id, type, x, y, w, h, title, customTitle, color, bgColor, hideHeader, groupId, version, repo,
  *           data, autoFit, baseW, baseH, scale }
  *   Edge  { id, from, to, fromSide, toSide, fromField, toField, label, arrow, style, curve, color }
  * `color` (accent) and `bgColor` (node / canvas background, `bgVar()`) are a preset accent id (`ACCENTS`)
  * or a custom `#rrggbb`; `""` is the theme default. `hideHeader` leaves the node header out in View Mode
- * (Edit Mode shows it dimmed). With `autoFit` the node is sized to its content: `baseW`×`baseH` is the
- * natural (unscaled) size and `w`/`h` = base × `scale`.
+ * (Edit Mode shows it dimmed). `scale` is the content scale of every non-group node: with `autoFit` the
+ * node is sized to its content (`baseW`×`baseH` is the natural, unscaled size and `w`/`h` = base ×
+ * `scale`); without it the outer box stays `w`×`h` and the content lays out in `w/scale`×`h/scale`
+ * (`contentBox()`). `embedSessions` are the NodeMap-scoped embedded sessions its tab nodes run in
+ * (`data.embedSessionId`), `followSession` the one whose Kconfig engines the canvas follows (`""` =
+ * the host workspace session).
  *
  * `UndoStack` / `historySnapshot()` hold the controller's bounded undo / redo history of the document
  * (nodes, edges, settings; viewport, Edit Mode and snap are view state and stay out of it).
@@ -24,17 +28,27 @@ export const CANVAS_SCHEMA = "kip-nodemap-canvas";
 export const CANVAS_VERSION = 1;
 export const STORAGE_PREFIX = "kip-nodemap-canvas:";
 
-export const NODE_TYPES = ["struct", "symbol", "source", "man", "tab", "note", "group"];
+export const NODE_TYPES = ["struct", "symbol", "source", "man", "tab", "note", "group", "diff", "mail", "kconfig", "maintainer"];
+/** Header badge of each node type (live node and SVG export). */
+export const NODE_BADGES = {
+  struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group",
+  diff: "diff", mail: "mail", kconfig: "kconfig", maintainer: "maint",
+};
 export const SIDES = ["auto", "top", "right", "bottom", "left"];
 export const ARROWS = ["none", "forward", "backward", "both"];
 export const LINE_STYLES = ["solid", "dashed", "dotted"];
 export const CURVES = ["bezier", "straight", "orthogonal"];
 export const SOURCE_MODES = ["file", "range", "symbol"];
 export const SYMBOL_KINDS = ["", "struct", "union", "function", "macro", "enum"];
+export const DIFF_MODES = ["file", "commit"];
 export const ALIGN_MODES = ["left", "center", "right", "top", "middle", "bottom"];
 export const STRUCT_STYLES = ["list", "table"];
 /** Node types whose content can be measured and scaled (`autoFit`); groups and live tab iframes cannot. */
-export const AUTOFIT_TYPES = ["struct", "symbol", "note", "source", "man"];
+export const AUTOFIT_TYPES = ["struct", "symbol", "note", "source", "man", "diff", "mail", "kconfig", "maintainer"];
+/** Node types a tab of the workspace can open (Open as tab, Copy to Session). */
+export const TAB_OPENABLE_TYPES = ["struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer"];
+/** Node types whose content scales (`scale`): every type but groups. */
+export const scalable = (type) => type !== "group";
 export const SCALE_MIN = 0.2;
 export const SCALE_MAX = 4;
 /** Largest natural size an auto-fitted node takes (canvas units, before scaling). */
@@ -99,6 +113,31 @@ export function colorToHex(c) {
   return null;
 }
 
+/**
+ * Box a node's content lays out in (canvas units, before `scale`): the natural size of an auto-fitted
+ * node, else the outer box divided by the content scale. `{w, h, s}`.
+ */
+export function contentBox(node) {
+  const s = node.scale && scalable(node.type) ? node.scale : 1;
+  if (node.autoFit) return { w: node.baseW, h: node.baseH, s };
+  return { w: node.w / s, h: node.h / s, s };
+}
+
+/**
+ * Set the content scale of a node (mutated; groups have none): an auto-fitted node grows or shrinks
+ * with it (base × scale), any other node keeps its outer box and lays its content out bigger or smaller.
+ */
+export function setContentScale(node, value) {
+  if (!scalable(node.type)) return node;
+  const s = Math.round(clamp(num(Number(value), 1), SCALE_MIN, SCALE_MAX) * 1000) / 1000;
+  node.scale = s;
+  if (node.autoFit) {
+    node.w = Math.round(node.baseW * s);
+    node.h = Math.round(node.baseH * s);
+  }
+  return node;
+}
+
 /** Default and limit geometry per node type (canvas units, zoom-controlled). */
 export const SIZE_LIMITS = {
   struct: { w: 300, h: 320, minW: 180, minH: 90, maxW: 1400, maxH: 2400 },
@@ -108,6 +147,10 @@ export const SIZE_LIMITS = {
   tab: { w: 720, h: 480, minW: 280, minH: 200, maxW: 3000, maxH: 2400 },
   note: { w: 240, h: 140, minW: 120, minH: 60, maxW: 1600, maxH: 1600 },
   group: { w: 520, h: 360, minW: 160, minH: 100, maxW: 6000, maxH: 6000 },
+  diff: { w: 620, h: 420, minW: 260, minH: 120, maxW: 2400, maxH: 2400 },
+  mail: { w: 480, h: 360, minW: 240, minH: 120, maxW: 1800, maxH: 2400 },
+  kconfig: { w: 340, h: 300, minW: 200, minH: 100, maxW: 1400, maxH: 2000 },
+  maintainer: { w: 380, h: 320, minW: 220, minH: 100, maxW: 1400, maxH: 2000 },
 };
 
 export const GRID_DEFAULT = 20;
@@ -200,6 +243,41 @@ export function normalizeData(type, raw) {
       return {
         tabType: str(d.tabType, "", 32),
         hash: str(d.hash, "", 4096).replace(/^#/, ""),
+        // NodeMap embedded session the iframe runs in (`""`: the canvas's first one, `embedSessionOf()`)
+        embedSessionId: typeof d.embedSessionId === "string" && ID_RE.test(d.embedSessionId) ? d.embedSessionId : "",
+      };
+    case "diff": {
+      const mode = pick(d.mode, DIFF_MODES, d.commitHash ? "commit" : "file");
+      return {
+        mode,
+        versionA: str(d.versionA, "", 256),
+        versionB: str(d.versionB, "", 256),
+        path: str(d.path, "", 1024),
+        oldPath: str(d.oldPath, "", 1024),
+        commitHash: /^[0-9a-f]{4,64}$/i.test(String(d.commitHash || "")) ? String(d.commitHash).toLowerCase() : "",
+      };
+    }
+    case "mail":
+      return {
+        tid: Number.isInteger(d.tid) && d.tid > 0 ? d.tid : null,
+        mid: str(d.mid, "", 512).replace(/^<|>$/g, ""),
+        subject: str(d.subject, "", 512),
+        // Messages whose body excerpt shows (message id -> true)
+        openMids: trueMap(d.openMids),
+        // One message of a thread on its own ("Expand Thread to Nodes", the ⊕ of a message)
+        single: Boolean(d.single) && Boolean(str(d.mid, "", 512)),
+      };
+    case "kconfig":
+      return {
+        symbol: str(d.symbol, "", 256).replace(/^CONFIG_/, ""),
+        arch: str(d.arch, "", 64) || "x86_64",
+      };
+    case "maintainer":
+      return {
+        secId: posInt(d.secId),
+        title: str(d.title, "", 512),
+        query: str(d.query, "", 256),
+        path: str(d.path, "", 1024),
       };
     case "note":
       return { text: str(d.text, "", 20000), markdown: d.markdown !== false };
@@ -229,6 +307,15 @@ export function defaultTitle(type, data) {
       return "Note";
     case "group":
       return "Group";
+    case "diff":
+      if (data.mode === "commit") return data.commitHash ? `${data.path ? `${data.path.split("/").pop()} @ ` : ""}${data.commitHash.slice(0, 12)}` : "Commit diff";
+      return data.path ? `${data.path.split("/").pop()} · ${data.versionA || "?"}..${data.versionB || "?"}` : "Diff";
+    case "mail":
+      return data.subject || (data.mid ? `<${data.mid}>` : data.tid ? `Thread ${data.tid}` : "Mail thread");
+    case "kconfig":
+      return data.symbol ? `CONFIG_${data.symbol}` : "Kconfig symbol";
+    case "maintainer":
+      return data.title || data.path || data.query || "Maintainers";
     default:
       return "Node";
   }
@@ -250,7 +337,7 @@ export function normalizeNode(raw) {
   let h = Math.round(clamp(num(raw.h, lim.h), lim.minH, lim.maxH));
   const baseW = Math.round(clamp(num(raw.baseW, w), 20, AUTOFIT_MAX.w));
   const baseH = Math.round(clamp(num(raw.baseH, h), 20, AUTOFIT_MAX.h));
-  const scale = autoFit ? clamp(num(raw.scale, 1), SCALE_MIN, SCALE_MAX) : 1;
+  const scale = scalable(type) ? clamp(num(raw.scale, 1), SCALE_MIN, SCALE_MAX) : 1;
   if (autoFit) {
     // Content-sized: the per-type limits do not apply, the geometry follows base × scale
     w = Math.round(baseW * scale);
@@ -318,10 +405,12 @@ export function emptyCanvas() {
 /**
  * Canvas-wide settings: snap grid; `editMode` (node editing controls shown); `kconfigCollapse` (fold #if
  * branches a Kconfig engine compiles out) and `kconfigEngine` (engine tab id, `""` = the engine of each
- * node's revision); `bgColor` the canvas background (`bgVar()` over `--bg-canvas`).
+ * node's revision); `bgColor` the canvas background (`bgVar()` over `--bg-canvas`); `embedSessions`
+ * (1+ `{id, name}`) and `followSession` (`""` or one of their ids, default the first).
  */
 export function normalizeSettings(raw) {
   const st = isObj(raw) ? raw : {};
+  const embedSessions = normalizeEmbedSessions(st.embedSessions);
   return {
     snap: Boolean(st.snap),
     grid: clamp(Math.round(num(st.grid, GRID_DEFAULT)), 4, 200),
@@ -329,7 +418,72 @@ export function normalizeSettings(raw) {
     kconfigCollapse: st.kconfigCollapse !== false,
     kconfigEngine: str(st.kconfigEngine, "", 256),
     bgColor: normalizeColor(st.bgColor),
+    embedSessions,
+    followSession: typeof st.followSession === "string" && (st.followSession === "" || embedSessions.some((x) => x.id === st.followSession))
+      ? st.followSession : embedSessions[0].id,
   };
+}
+
+/** Default embedded session of a new canvas. */
+export const DEFAULT_EMBED_SESSION = { id: "nms-1", name: "Canvas Session 1" };
+export const EMBED_SESSIONS_MAX = 16;
+
+function normalizeEmbedSessions(raw) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(raw) ? raw.slice(0, EMBED_SESSIONS_MAX) : []) {
+    if (!isObj(x) || typeof x.id !== "string" || !ID_RE.test(x.id) || seen.has(x.id)) continue;
+    seen.add(x.id);
+    out.push({ id: x.id, name: str(x.name, "", 128).trim() || x.id });
+  }
+  return out.length ? out : [{ ...DEFAULT_EMBED_SESSION }];
+}
+
+/** The embedded session a tab node runs in: its own when it still exists, else the canvas's first. */
+export function embedSessionOf(canvas, node) {
+  const list = canvas?.settings?.embedSessions || [DEFAULT_EMBED_SESSION];
+  const id = node?.data?.embedSessionId;
+  return list.find((x) => x.id === id) || list[0];
+}
+
+/** Add an embedded session (mutated settings); returns it, or null at the limit. */
+export function addEmbedSession(settings, name = "") {
+  const list = settings.embedSessions;
+  if (list.length >= EMBED_SESSIONS_MAX) return null;
+  let n = list.length + 1;
+  while (list.some((x) => x.id === `nms-${n}`)) n += 1;
+  const sess = { id: `nms-${n}`, name: str(name, "", 128).trim() || `Canvas Session ${n}` };
+  list.push(sess);
+  return sess;
+}
+
+/** Rename an embedded session; false when it does not exist or the name is empty. */
+export function renameEmbedSession(settings, id, name) {
+  const sess = settings.embedSessions.find((x) => x.id === id);
+  const clean = str(name, "", 128).trim();
+  if (!sess || !clean) return false;
+  sess.name = clean;
+  return true;
+}
+
+/**
+ * Delete an embedded session (the last one stays): tab nodes that ran in it move to the first remaining
+ * one, a canvas following it follows that one. Returns the ids of the moved tab nodes, or null.
+ */
+export function removeEmbedSession(canvas, id) {
+  const st = canvas.settings;
+  if (st.embedSessions.length <= 1 || !st.embedSessions.some((x) => x.id === id)) return null;
+  st.embedSessions = st.embedSessions.filter((x) => x.id !== id);
+  const fallback = st.embedSessions[0].id;
+  if (st.followSession === id) st.followSession = fallback;
+  const moved = [];
+  for (const n of canvas.nodes) {
+    if (n.type === "tab" && n.data.embedSessionId === id) {
+      n.data.embedSessionId = fallback;
+      moved.push(n.id);
+    }
+  }
+  return moved;
 }
 
 /**
@@ -527,16 +681,17 @@ export function applyNaturalSize(node, natW, natH) {
   return changed;
 }
 
-/** Turn auto-fit on or off (mutated); off keeps the current on-screen size at scale 1. */
+/** Turn auto-fit on or off (mutated); the content scale and the on-screen size stay. */
 export function setAutoFit(node, on) {
   if (!AUTOFIT_TYPES.includes(node.type)) return node;
   if (on && !node.autoFit) {
-    Object.assign(node, { autoFit: true, scale: 1, baseW: node.w, baseH: node.h });
+    const s = node.scale || 1;
+    Object.assign(node, { autoFit: true, baseW: Math.round(node.w / s), baseH: Math.round(node.h / s) });
   } else if (!on && node.autoFit) {
     const lim = SIZE_LIMITS[node.type];
+    // The content keeps its scale: the outer box stays where it is
     Object.assign(node, {
       autoFit: false,
-      scale: 1,
       w: Math.round(clamp(node.w, lim.minW, lim.maxW)),
       h: Math.round(clamp(node.h, lim.minH, lim.maxH)),
     });
@@ -827,9 +982,14 @@ export function tabTypeOfHash(hash) {
   }
 }
 
-/** URL of the isolated embed shell for a tab hash: the app with `?embed=1` (no chrome, no session). */
-export function embedSrc(hash, base = "/") {
-  return `${base}?embed=1#${String(hash || "").replace(/^#/, "")}`;
+/**
+ * URL of the isolated embed shell for a tab hash: the app with `?embed=1` (no chrome, no workspace
+ * session), joined to the NodeMap embedded session `embedSession` (`&embedSession=<id>`) when given.
+ */
+export function embedSrc(hash, base = "/", embedSession = "") {
+  // Key of the session: `<nodemap tab id>:<session id>` (utils/embed_mode.js EMBED_SESSION_RE)
+  const sess = embedSession && /^[\w.:-]{1,160}$/.test(embedSession) ? `&embedSession=${encodeURIComponent(embedSession)}` : "";
+  return `${base}?embed=1${sess}#${String(hash || "").replace(/^#/, "")}`;
 }
 
 /** `hiddenItems` key of the struct-wide outer conditions banner (`layout.outer_conds`). */

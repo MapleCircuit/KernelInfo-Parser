@@ -10,7 +10,11 @@ import { branchTruths, countDirectives, findItem, guardAutoCollapsed, guardTree,
 import { DirectiveEvaluator } from "../js/views/kconfig/directive_evaluator.js";
 import { headMetaOf, renderNoteMarkdown, renderSourceRows } from "../js/views/nodemap/node_content.js";
 import { canvasToSvg, captureNodeForeignObject, pngSize, svgSize } from "../js/views/nodemap/nodemap_export.js";
-import { contentKey } from "../js/views/nodemap/node_renderer.js";
+import { contentKey, nodeBox } from "../js/views/nodemap/node_renderer.js";
+import { htmlSegments, sourceLineSegments } from "../js/views/nodemap/node_content.js";
+import * as D from "../js/views/nodemap/domain_nodes.js";
+import { embedSessionChannel, embedSessionId } from "../js/utils/embed_mode.js";
+import { TAB_DRAG_MIME, TAB_DRAG_TEXT_PREFIX, mayCarryTab, tabDragPayload } from "../js/utils/tab_drag.js";
 
 const memStorage = () => {
   const m = new Map();
@@ -309,7 +313,10 @@ test("SVG export draws groups, nodes, styled edges and labels with resolved colo
 // ------------------------------------------------------------------ NodeMap upgrade: schema, struct rows, export, clipboard
 
 test("settings: Edit Mode off, Kconfig folding on, auto engine by default", () => {
-  assert.deepEqual(M.emptyCanvas().settings, { snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "", bgColor: "" });
+  assert.deepEqual(M.emptyCanvas().settings, {
+    snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "", bgColor: "",
+    embedSessions: [{ id: "nms-1", name: "Canvas Session 1" }], followSession: "nms-1",
+  });
   const st = M.normalizeSettings({ editMode: true, kconfigCollapse: false, kconfigEngine: "tab-7", grid: 2 });
   assert.equal(st.editMode, true);
   assert.equal(st.kconfigCollapse, false);
@@ -364,7 +371,8 @@ test("auto-fit: natural size, aspect-locked scaling, inspector sizes, off again"
   const back = M.normalizeNode(JSON.parse(JSON.stringify(n)));
   assert.deepEqual([back.autoFit, back.baseW, back.baseH, back.scale, back.w, back.h], [true, 200, 100, 3, 600, 300], "persisted");
   M.setAutoFit(n, false);
-  assert.deepEqual([n.autoFit, n.scale], [false, 1]);
+  assert.deepEqual([n.autoFit, n.scale, n.w, n.h], [false, 3, 600, 300], "off keeps the content scale and the on-screen box");
+  assert.deepEqual(M.contentBox(n), { w: 200, h: 100, s: 3 }, "the content still lays out at its scaled-down box");
   assert.ok(n.w <= M.SIZE_LIMITS.struct.maxW && n.h <= M.SIZE_LIMITS.struct.maxH, "back within the type's limits");
 });
 
@@ -591,7 +599,7 @@ test("SVG export: whole canvas, struct rows and bars, folds, hidden items, scale
   assert.ok((svg.match(/stroke-opacity="0\.9"/g) || []).length > 3, "scope bars of the outer block");
   assert.match(svg, /stroke="#ff8800"/, "custom node color");
   assert.match(svg, /stroke="#00aa11"/, "custom edge color");
-  assert.match(svg, /&lt;y&gt;/, "source lines, escaped");
+  assert.match(svg, /<tspan fill="#123456">&lt;<\/tspan><tspan fill="#123456">y<\/tspan>/, "source lines, escaped, as lexical tokens");
   assert.match(svg, /Live commits tab/, "a tab iframe is a placeholder card");
   assert.match(svg, /#v=v3\.0&amp;tab=commits/);
   assert.match(svg, /line one/);
@@ -794,4 +802,269 @@ test("PNG upscale: output size per factor, clamped to the canvas limits", () => 
   const area = pngSize(15000, 15000, 4);
   assert.ok(area.w * area.h <= 268435456);
   assert.deepEqual(svgSize('<svg xmlns="x" width="120" height="80" viewBox="0 0 40 20">'), { w: 120, h: 80 });
+});
+
+// ------------------------------------------------------------------ export fixes, scale, embedded sessions, domain nodes
+
+/** Resolver that keeps the token name readable: `var(--x)` -> `#<x>` stand-ins are not needed, names are. */
+const named = (c) => (c.startsWith("var(--") ? `[${c.slice(6, -1)}]` : c);
+
+test("SVG export: the node interior is clipped to its rounded box; group default accent is blue", () => {
+  const n = M.createNode("note", { id: "a", x: 0, y: 0, w: 200, h: 120, color: "red", data: { text: "x" } });
+  const g = M.createNode("group", { id: "g", x: -50, y: -50, w: 400, h: 300 });
+  for (const transparent of [false, true]) {
+    const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [g, n] }, named, { transparent });
+    const clip = /<clipPath id="(nmclip\d+)"><rect x="0" y="0" width="200" height="120" rx="6"\/><\/clipPath>/.exec(svg);
+    assert.ok(clip, "a rounded clip of the node's box");
+    const body = svg.slice(svg.indexOf(`<g clip-path="url(#${clip[1]})">`));
+    assert.ok(body.length < svg.length, "panel, header, accent strip and body inside it");
+    const strip = body.indexOf('height="3" fill="[accent-red]"');
+    const border = body.indexOf('rx="6" fill="none" stroke="[accent-red]"');
+    assert.ok(strip > 0 && border > strip, "the 3-unit accent strip is clipped; the border is drawn on top");
+    assert.doesNotMatch(svg, /<clipPath id="nmclip\d+"><rect x="0" y="0" width="200" height="26"\/>/, "no square header clip");
+    assert.match(svg, /stroke="\[accent-blue\]" stroke-dasharray="6 4"/, "an uncolored group frame is blue");
+  }
+});
+
+test("SVG export: auto-fitted structs end at their rows (folded #ifdefs leave no bottom band); live row heights win", () => {
+  const s = M.createNode("struct", { id: "s", x: 0, y: 0, data: { name: "n", style: "table" } });
+  M.setAutoFit(s, true);
+  M.applyNaturalSize(s, 360, 600); // stale natural height (measured before branches folded)
+  const canvas = { ...M.emptyCanvas(), nodes: [s] };
+  const opts = { content: () => NESTED, structOpts: () => ({ editMode: false, evaluator: kcfg() }) };
+  const rows = structRows(NESTED, s.data, { editMode: false, evaluator: kcfg() }).rows.length;
+  const border = (svg) => Number(/<rect x="0" y="0" width="360" height="([\d.]+)" rx="6" fill="none"/.exec(svg)[1]);
+  const h = border(canvasToSvg(canvas, named, opts));
+  assert.equal(h, 26 + 2 + rows * 18 + 2, "header + rows (18-unit table rows) + padding, not the stale 600");
+  const vb = /viewBox="-?\d+ -?\d+ \d+ (\d+)"/.exec(canvasToSvg(canvas, named, opts))[1];
+  assert.equal(Number(vb), Math.ceil(h + 80), "the image ends with the node, not the stale box");
+  const measured = canvasToSvg(canvas, named, { ...opts, rowHeights: () => Array(rows).fill(21) });
+  assert.equal(border(measured), 26 + 2 + rows * 21 + 2, "measured DOM row heights lay the rows out");
+  assert.equal(border(canvasToSvg(canvas, named, { ...opts, rowHeights: () => [21] })), h, "a row count that does not match is ignored");
+  s.autoFit = false;
+  s.h = 600;
+  assert.equal(border(canvasToSvg(canvas, named, opts)), 600, "a fixed-size node keeps its box");
+});
+
+test("SVG export: source lines keep the code view's lexical colors", () => {
+  const src = M.createNode("source", { id: "src", x: 0, y: 0, data: { path: "a.c" } });
+  const payload = { path: "a.c", start_line: 1, end_line: 2, total_lines: 2, lines: ["static int x = 1; /* c */", '#define S "s"'] };
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [src] }, named, { content: () => payload });
+  assert.match(svg, /<tspan fill="\[syn-keyword\]">static<\/tspan>/);
+  assert.match(svg, /<tspan fill="\[syn-number\]">1<\/tspan>/);
+  assert.match(svg, /<tspan fill="\[syn-comment\]" font-style="italic">\/\* c \*\/<\/tspan>/);
+  assert.match(svg, /<tspan fill="\[syn-preproc\]">#define <\/tspan><tspan fill="\[syn-preproc\]">S<\/tspan> <tspan fill="\[syn-string\]">&quot;s&quot;<\/tspan>/);
+  assert.deepEqual(htmlSegments('<span class="tok-keyword x">if</span> (<span class="ast-dimmed"><span class="tok-number">1</span></span>&amp;&#039;'),
+    [{ text: "if", cls: "tok-keyword" }, { text: " (", cls: "" }, { text: "1", cls: "tok-number" }, { text: "&'", cls: "" }]);
+  assert.equal(sourceLineSegments(["/* a", "b */ int"], "x.c")[1][0].cls, "tok-comment", "multi-line comments span lines");
+});
+
+test("content scale: every non-group node scales its content; outer box stays without auto-fit", () => {
+  const n = M.createNode("source", { x: 0, y: 0, w: 600, h: 400, data: { path: "a.c" } });
+  M.setContentScale(n, 2);
+  assert.deepEqual([n.w, n.h, n.scale], [600, 400, 2], "the footprint stays");
+  assert.deepEqual(M.contentBox(n), { w: 300, h: 200, s: 2 });
+  assert.deepEqual(nodeBox(n), { width: 300, height: 200, transform: "scale(2)" });
+  assert.equal(M.normalizeNode(JSON.parse(JSON.stringify(n))).scale, 2, "persisted for nodes without auto-fit");
+  M.setContentScale(n, 99);
+  assert.equal(n.scale, M.SCALE_MAX);
+  const g = M.createNode("group", { scale: 3 });
+  assert.equal(g.scale, 1, "groups never scale");
+  M.setContentScale(g, 2);
+  assert.equal(g.scale, 1);
+  const f = M.createNode("note", { data: { text: "x" } });
+  M.setAutoFit(f, true);
+  M.applyNaturalSize(f, 200, 100);
+  M.setContentScale(f, 1.5);
+  assert.deepEqual([f.w, f.h], [300, 150], "an auto-fitted node grows with it");
+  n.scale = 0.5;
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [n] }, named, { content: () => ({ path: "a.c", start_line: 1, end_line: 1, total_lines: 1, lines: ["x"] }) });
+  assert.match(svg, /translate\(0 0\) scale\(0\.5\)/);
+  assert.match(svg, /width="1200" height="800" rx="6" fill="none"/, "laid out at w/scale × h/scale");
+});
+
+test("NodeMap embedded sessions: one by default, add / rename / delete keeps one, scoped embed addresses", () => {
+  const c = M.emptyCanvas();
+  assert.deepEqual(c.settings.embedSessions, [{ id: "nms-1", name: "Canvas Session 1" }]);
+  assert.equal(c.settings.followSession, "nms-1", "the canvas follows its first session");
+  const b = M.addEmbedSession(c.settings);
+  assert.deepEqual(b, { id: "nms-2", name: "Canvas Session 2" });
+  assert.ok(M.renameEmbedSession(c.settings, "nms-2", "  Kconfig lab "));
+  assert.equal(c.settings.embedSessions[1].name, "Kconfig lab");
+  assert.equal(M.renameEmbedSession(c.settings, "nms-2", "   "), false);
+  const t = M.createNode("tab", { data: { tabType: "kconfig", hash: "tab=kconfig", embedSessionId: "nms-2" } });
+  c.nodes.push(t);
+  c.settings.followSession = "nms-2";
+  assert.equal(M.embedSessionOf(c, t).id, "nms-2");
+  assert.deepEqual(M.removeEmbedSession(c, "nms-2"), [t.id], "its tab nodes move to the first session");
+  assert.equal(t.data.embedSessionId, "nms-1");
+  assert.equal(c.settings.followSession, "nms-1");
+  assert.equal(M.removeEmbedSession(c, "nms-1"), null, "the last session stays");
+  const st = M.normalizeSettings({ embedSessions: [{ id: "x", name: "" }, { id: "bad id!" }, { id: "x" }], followSession: "gone" });
+  assert.deepEqual(st.embedSessions, [{ id: "x", name: "x" }]);
+  assert.equal(st.followSession, "x", "an unknown followed session falls back to the first");
+  assert.equal(M.normalizeSettings({ followSession: "" }).followSession, "", "the host workspace can be followed");
+  assert.equal(M.embedSrc("tab=kconfig", "/", "tab-1:nms-1"), "/?embed=1&embedSession=tab-1%3Anms-1#tab=kconfig");
+  assert.equal(M.embedSrc("#tab=x"), "/?embed=1#tab=x");
+  assert.equal(embedSessionId({ search: "?embed=1&embedSession=tab-1%3Anms-1" }), "tab-1:nms-1");
+  assert.equal(embedSessionId({ search: "?embedSession=tab-1" }), "", "only an embed shell joins one");
+  assert.equal(embedSessionId({ search: "?embed=1&embedSession=a%20b" }), "", "keys are validated");
+  assert.equal(embedSessionChannel("tab-1:nms-1"), "kip_nodemap_session:tab-1:nms-1");
+});
+
+test("tab drag payloads: typed, text and announced forms; files never carry a tab", () => {
+  const payload = { tabId: "t1", sourceWinId: "w", tabData: { id: "t1", type: "code", path: "a.c" } };
+  const dt = (data, types = Object.keys(data)) => ({ types, getData: (k) => data[k] || "" });
+  assert.deepEqual(tabDragPayload(dt({ [TAB_DRAG_MIME]: JSON.stringify(payload) })), payload);
+  assert.deepEqual(tabDragPayload(dt({ "text/plain": `${TAB_DRAG_TEXT_PREFIX}${JSON.stringify(payload)}` })), payload);
+  assert.deepEqual(tabDragPayload(dt({}, ["text/plain"]), payload), payload, "the announcement of another window");
+  assert.equal(tabDragPayload(dt({}, ["Files"]), payload), null);
+  assert.equal(mayCarryTab(dt({}, [TAB_DRAG_MIME])), true);
+  assert.equal(mayCarryTab(dt({}, ["text/plain"])), false);
+  assert.equal(mayCarryTab(dt({}, ["text/plain"]), payload), true);
+  assert.equal(mayCarryTab(dt({}, ["Files"]), payload), false);
+});
+
+test("domain node payloads normalize; titles", () => {
+  const d = M.createNode("diff", { data: { versionA: "v3.0", versionB: "v3.1", path: "kernel/fork.c" } });
+  assert.deepEqual(d.data, { mode: "file", versionA: "v3.0", versionB: "v3.1", path: "kernel/fork.c", oldPath: "", commitHash: "" });
+  assert.equal(d.title, "fork.c · v3.0..v3.1");
+  const c = M.createNode("diff", { data: { commitHash: "ABCDEF0123456789" } });
+  assert.equal(c.data.mode, "commit");
+  assert.equal(c.data.commitHash, "abcdef0123456789");
+  assert.equal(M.createNode("diff", { data: { mode: "commit", commitHash: "zz" } }).data.commitHash, "");
+  const m = M.createNode("mail", { data: { tid: 7, mid: "<a@b>", openMids: { x: true, y: false }, single: true } });
+  assert.deepEqual(m.data, { tid: 7, mid: "a@b", subject: "", openMids: { x: true }, single: true });
+  assert.equal(M.createNode("mail", { data: { tid: -1, single: true } }).data.single, false, "a single message needs its id");
+  const k = M.createNode("kconfig", { data: { symbol: "CONFIG_SMP" } });
+  assert.deepEqual(k.data, { symbol: "SMP", arch: "x86_64" });
+  assert.equal(k.title, "CONFIG_SMP");
+  const mt = M.createNode("maintainer", { data: { secId: 12, title: "SCHEDULER" } });
+  assert.deepEqual(mt.data, { secId: 12, title: "SCHEDULER", query: "", path: "" });
+  for (const t of ["diff", "mail", "kconfig", "maintainer"]) {
+    assert.ok(M.AUTOFIT_TYPES.includes(t) && M.TAB_OPENABLE_TYPES.includes(t) && M.NODE_BADGES[t], t);
+  }
+});
+
+const DIFF_TEXT = [
+  "diff --git a/kernel/fork.c b/kernel/fork.c",
+  "--- a/kernel/fork.c",
+  "+++ b/kernel/fork.c",
+  "@@ -10,3 +10,4 @@ static int x;",
+  " int a;",
+  "-int b;",
+  "+int b2;",
+  "+int <c>;",
+  " int d;",
+].join("\n");
+
+test("diff nodes: unified diff text and commit files become hunks with old / new line numbers", () => {
+  const files = D.parseUnifiedDiff(DIFF_TEXT);
+  assert.equal(files.length, 1);
+  assert.equal(files[0].path, "kernel/fork.c");
+  assert.deepEqual([files[0].additions, files[0].deletions], [2, 1]);
+  assert.deepEqual(files[0].hunks[0].lines, [[" ", 10, 10, "int a;"], ["-", 11, null, "int b;"], ["+", null, 11, "int b2;"], ["+", null, 12, "int <c>;"], [" ", 12, 13, "int d;"]]);
+  const p = D.diffPayload({ mode: "file", versionA: "v3.0", versionB: "v3.1", path: "kernel/fork.c" }, { diff: DIFF_TEXT, additions: 2, deletions: 1 });
+  const rows = D.diffRows(p);
+  assert.deepEqual(rows.map((r) => r.kind), ["hunk", " ", "-", "+", "+", " "], "one file: no file header");
+  const html = D.renderDiffBody(p);
+  assert.match(html, /nm-diff-add[^]*int &lt;c&gt;;/, "escaped");
+  assert.match(html, /<span class="nm-diff-no">11<\/span><span class="nm-diff-no"><\/span><span class="nm-diff-sign">-<\/span>/);
+  const commit = { commit_hash: "abc", files: [
+    { path: "a.c", old_path: "a.c", status: "M", additions: 1, deletions: 0, hunks: [{ old_start: 1, old_count: 1, new_start: 1, new_count: 2, heading: "f()", lines: [[" ", 1, 1, "x"], ["+", null, 2, "y"]] }] },
+    { path: "b.c", old_path: "b.c", status: "A", additions: 1, deletions: 0, hunks: [] },
+  ] };
+  const all = D.diffPayload({ mode: "commit", commitHash: "abc", path: "" }, commit);
+  assert.equal(all.files.length, 2);
+  assert.deepEqual(D.diffRows(all).filter((r) => r.kind === "file").map((r) => r.text), ["M a.c  +1 −0", "A b.c  +1 −0"]);
+  assert.equal(D.diffRows(all)[1].text, "@@ -1,1 +1,2 @@ f()");
+  assert.equal(D.diffPayload({ mode: "commit", commitHash: "abc", path: "b.c" }, commit).files.length, 1, "a commit diff keeps the node's file");
+  assert.equal(headMetaOf("diff", p).text, "kernel/fork.c · v3.0..v3.1");
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("diff", { id: "d", data: { path: "kernel/fork.c", versionA: "v3.0", versionB: "v3.1" } })] }, named, { content: () => p });
+  assert.match(svg, /fill="\[diff-add-fg\]"[^>]*>\+ int &lt;c&gt;;/, "added lines in the diff color");
+  assert.match(svg, /fill="\[diff-del-fg\]"[^>]*>- int b;/);
+  assert.match(svg, /@@ -10,3 \+10,4 @@/);
+  assert.match(svg, />DIFF</);
+});
+
+const THREAD = {
+  tid: 5, total: 4, messages: [
+    { message_id: "root@x", subject: "[PATCH v2 0/2] thing", author: "A", date_iso: "2011-01-01", timestamp: 1, is_patch: true, is_cover: true, patch_version: 2, references: "" },
+    { message_id: "p1@x", subject: "[PATCH v2 1/2] one", author: "A", timestamp: 2, is_patch: true, patch_version: 2, patch_idx: 1, patch_total: 2, references: "<root@x>" },
+    { message_id: "r1@x", subject: "Re: one", author: "B", timestamp: 3, references: ["root@x", "p1@x"] },
+    { message_id: "p2@x", subject: "[PATCH v2 2/2] two", author: "A", timestamp: 4, references: "<root@x>" },
+  ],
+};
+
+test("mail nodes: the reply tree with connector guides, badges and excerpts; expand-to-nodes layout", () => {
+  const model = D.mailThreadModel(THREAD, { mid: "r1@x", openMids: { "r1@x": true } }, new Map([["r1@x", "> quoted\n\nI agree.\nThanks"]]));
+  assert.deepEqual(model.rows.map((r) => [r.mid, r.parent, r.depth]), [["root@x", null, 0], ["p1@x", "root@x", 1], ["r1@x", "p1@x", 2], ["p2@x", "root@x", 1]]);
+  assert.deepEqual(model.rows.map((r) => r.guides), [[], ["tee"], ["pipe", "end"], ["end"]], "an ancestor with later siblings keeps its line");
+  assert.ok(model.rows[2].focus && model.rows[2].open);
+  assert.deepEqual(model.rows[2].excerpt, ["I agree.", "Thanks"], "quoted text left out");
+  assert.deepEqual(D.mailBadges(model.rows[0]), ["v2", "cover"]);
+  assert.deepEqual(D.mailBadges(model.rows[1]), ["v2", "1/2", "PATCH"]);
+  const html = D.renderMailBody(model);
+  assert.match(html, /nm-g-pipe[^]*nm-g-end/);
+  assert.match(html, /data-act="mail-spawn" data-key="p1@x"/);
+  assert.match(html, /I agree\./);
+  const lay = D.mailThreadLayout(model, { x: 100, y: 0 }, { w: 300, h: 100, gapX: 50, gapY: 20 });
+  assert.deepEqual(lay.map((p) => [p.mid, p.x, p.y]), [["root@x", 100, 0], ["p1@x", 450, 120], ["r1@x", 800, 240], ["p2@x", 450, 360]]);
+  const cyc = D.mailThreadModel({ messages: [{ message_id: "a", references: "<b>" }, { message_id: "b", references: "<a>" }] });
+  assert.equal(cyc.rows.length, 2, "a reference cycle hides no message");
+  const one = D.mailThreadModel({ message_id: "<m@x>", subject: "Hi", body: "Body text" }, { mid: "m@x", single: true });
+  assert.deepEqual(one.rows[0].excerpt, ["Body text"], "a single message shows its body");
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("mail", { id: "m", data: { tid: 5 } })] }, named, { content: () => model });
+  assert.match(svg, /\[PATCH v2 1\/2\] one/);
+  assert.match(svg, />1\/2<\/text>/, "patch badges");
+  assert.match(svg, /<line x1="(\d+)" y1="[\d.]+" x2="\1" y2="[\d.]+" stroke="\[border-color\]"\/>/, "connector lines");
+  assert.equal(headMetaOf("mail", model).text, "4 messages · t/5");
+});
+
+test("kconfig nodes: relations from the symbol and the graph, live value, relation targets", () => {
+  const detail = { name: "SMP", type_name: "bool", prompt: "Symmetric multi-processing", file_path: "arch/x86/Kconfig", line: 230, depends_on: ["X86_LOCAL_APIC"], selects: ["CONFIG_USE_GENERIC_SMP_HELPERS"], implies: [] };
+  const graph = { edges: [{ from: "SMP", to: "X86_LOCAL_APIC", type: "depends_on" }, { from: "SMP", to: "IRQ_WORK", type: "implies" }, { from: "NUMA", to: "SMP", type: "depends_on" }, { from: "X86_64_SMP", to: "SMP", type: "selects" }, { from: "A", to: "B", type: "selects" }] };
+  const model = D.kconfigModel(detail, graph, "SMP");
+  assert.deepEqual(model.groups.map((g) => [g.rel, g.names]), [
+    ["depends_on", ["X86_LOCAL_APIC"]], ["selects", ["USE_GENERIC_SMP_HELPERS"]], ["implies", ["IRQ_WORK"]],
+    ["depended_by", ["NUMA"]], ["selected_by", ["X86_64_SMP"]],
+  ]);
+  assert.equal(D.kconfigValue({ CONFIG_SMP: "y" }, "SMP"), "y");
+  assert.equal(D.kconfigValue({ SMP: "m" }, "SMP"), "m");
+  assert.equal(D.kconfigValue({}, "SMP"), "");
+  assert.equal(D.kconfigValue({ HZ: 250 }, "HZ"), "250");
+  const html = D.renderKconfigBody(model, "y", new Set(["NUMA"]));
+  assert.match(html, /nm-kc-val nm-kc-y[^>]*>y</);
+  assert.match(html, /class="nm-kc-chip on" data-act="kc-rel" data-key="depended_by:NUMA"/, "a related symbol on the canvas");
+  assert.match(D.renderKconfigBody(model, null), /no engine/);
+  assert.deepEqual(D.relationTargets(model).map((t) => [t.name, t.edge, t.dir]), [
+    ["X86_LOCAL_APIC", "depends on", "out"], ["USE_GENERIC_SMP_HELPERS", "selects", "out"], ["IRQ_WORK", "implies", "out"],
+    ["NUMA", "depends on", "in"], ["X86_64_SMP", "selects", "in"],
+  ]);
+  assert.deepEqual(D.relationTargets(model, "selected_by:X86_64_SMP").map((t) => t.name), ["X86_64_SMP"]);
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("kconfig", { id: "k", data: { symbol: "SMP" } })] }, named, { content: () => model, kconfigValues: () => ({ SMP: "y" }) });
+  assert.match(svg, /CONFIG_SMP/);
+  assert.match(svg, /fill="\[accent-green\]" font-family="monospace" font-size="10" text-anchor="middle" xml:space="preserve">y</, "the value badge");
+  assert.match(svg, />Selected by</);
+  assert.match(canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("kconfig", { id: "k", data: { symbol: "SMP" } })] }, named, { content: () => model }), />no engine</);
+  assert.equal(headMetaOf("kconfig", model).text, "arch/x86/Kconfig:230");
+});
+
+test("maintainer nodes: M / R / L / T / F lines and the status", () => {
+  const res = { version: "v3.0", section: {
+    sec_id: 3, name: "SCHEDULER", status: "Maintained", mailing_list: "linux-kernel@vger.kernel.org", scm_tree: "git git://a/sched.git",
+    members: [{ name: "Ingo", email: "i@x", role_type: 1 }, { name: "Peter", email: "p@x", role: "R", role_type: 2 }],
+    patterns: [{ pattern_type: "F", pattern: "kernel/sched/" }, { pattern_type: "X", pattern: "kernel/sched/x.c" }, { pattern_type: "K", pattern: "sched" }],
+  } };
+  const m = D.maintainerModel(res);
+  assert.deepEqual([m.title, m.status, m.maintainers, m.reviewers, m.lists, m.trees, m.files, m.excludes], [
+    "SCHEDULER", "Maintained", ["Ingo <i@x>"], ["Peter <p@x>"], ["linux-kernel@vger.kernel.org"], ["git git://a/sched.git"], ["kernel/sched/"], ["kernel/sched/x.c"],
+  ]);
+  assert.deepEqual(D.maintainerLines(m).map(([t]) => t), ["M", "R", "L", "T", "F", "X"]);
+  assert.equal(D.statusClass("Odd Fixes"), "odd");
+  assert.match(D.renderMaintainerBody(m), /nm-mt-status nm-mt-maintained/);
+  const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("maintainer", { id: "x", data: { secId: 3 } })] }, named, { content: () => m });
+  assert.match(svg, />M:<\/text>[^]*Ingo &lt;i@x&gt;/);
+  assert.match(svg, />Maintained</);
+  assert.equal(headMetaOf("maintainer", m).text, "Maintained");
 });

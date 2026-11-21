@@ -16,6 +16,7 @@ import { debounce } from "../../utils/debounce.js";
 import { isManPagesRepo } from "../../utils/projects.js";
 import { manLabel, manTabFields, manTabTitle } from "../man/man_model.js";
 import { previousTag } from "../code_view/file_diff.js";
+import { diffSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 
 const PAGE_SIZE = 500;
 const KCONFIG_TYPES = { 1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int" };
@@ -769,6 +770,14 @@ export class DiffView {
           this.openFile(isBase ? this.versionA : this.versionB, isBase ? (ch.old_file || ch.file_path) : ch.file_path);
         };
       });
+      const nmBtn = rowEl.querySelector("[data-nodemap]");
+      if (nmBtn) {
+        nmBtn.onclick = (e) => {
+          e.stopPropagation();
+          const spec = diffSpec({ versionA: this.versionA, versionB: this.versionB, path: ch.file_path, oldPath: ch.old_file || "", repo: this.api?.repo || state.activeRepo() });
+          if (spec) sendToNodemap(spec, { version: this.versionB });
+        };
+      }
     });
 
     const moreBtn = listEl.querySelector("#cmp-more");
@@ -802,6 +811,7 @@ export class DiffView {
           <span class="compare-row-actions">
             ${canOpenBase ? `<button class="code-btn" data-open="a" type="button" title="Open at ${escapeHtml(this.versionA)}">${escapeHtml(shortRef(this.versionA))}</button>` : ""}
             ${canOpenTarget ? `<button class="code-btn" data-open="b" type="button" title="Open at ${escapeHtml(this.versionB)}">${escapeHtml(shortRef(this.versionB))}</button>` : ""}
+            ${type !== "unchanged" ? `<button class="code-btn" data-nodemap type="button" title="Send this file's diff to the NodeMap canvas">🕸</button>` : ""}
           </span>
         </div>
       </div>`;

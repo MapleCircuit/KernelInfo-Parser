@@ -10,18 +10,20 @@
  *   .nm-rz[data-rz]          resize handles (n, s, e, w, ne, nw, se, sw)
  *   .nm-port[data-side]      side ports; struct rows add .nm-port-field[data-field]
  *   [data-act]               header and body buttons
- * An auto-fitted node (`autoFit`) lays out at its natural `baseW`×`baseH` and is drawn scaled by
+ * Every non-group node has a content scale (`scale`): an auto-fitted node (`autoFit`) lays out at its
+ * natural `baseW`×`baseH`, any other at `w/scale`×`h/scale` (`contentBox()`), and is drawn scaled by
  * `scale` (transform origin top left), so its on-screen box is `w`×`h` and content grows and shrinks
- * with it; ports, handles and field rows scale along, so wires still meet them.
+ * with it; field rows scale along (wires still meet them), side ports and resize handles are
+ * counter-scaled (`--nm-scale`) so they keep their on-screen size.
  * `hideHeader` sets `.nm-head-hidden` (nodemap.css: dimmed header in Edit Mode, none in View Mode);
  * `bgColor` sets `--nm-node-bg` (`.nm-has-bg`).
  */
-import { accentVar, bgVar, displayTitle, paintOrder } from "./canvas_model.js";
+import { NODE_BADGES, accentVar, bgVar, contentBox, displayTitle, paintOrder } from "./canvas_model.js";
 import { esc } from "./struct_view.js";
 
 const HANDLES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 const SIDE_PORTS = ["top", "right", "bottom", "left"];
-const BADGES = { struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group" };
+const BADGES = NODE_BADGES;
 
 /**
  * What makes a node's body stale: its payload and revision (plus `extra`, view state from outside the
@@ -31,13 +33,11 @@ export function contentKey(node, extra = "") {
   return JSON.stringify([node.type, node.version, node.repo, node.data, extra]);
 }
 
-/** CSS box and transform of a node element: natural size scaled for auto-fitted nodes. */
+/** CSS box and transform of a node element: its content box, scaled by the content scale. */
 export function nodeBox(node) {
-  if (node.autoFit && node.scale && node.scale !== 1) {
-    return { width: node.baseW, height: node.baseH, transform: `scale(${node.scale})` };
-  }
-  if (node.autoFit) return { width: node.baseW, height: node.baseH, transform: "" };
-  return { width: node.w, height: node.h, transform: "" };
+  const box = contentBox(node);
+  const r = (v) => Math.round(v * 100) / 100;
+  return { width: r(box.w), height: r(box.h), transform: box.s !== 1 ? `scale(${box.s})` : "" };
 }
 
 export class NodeRenderer {
@@ -123,6 +123,7 @@ export class NodeRenderer {
     el.classList.toggle("nm-interacting", isActive);
     el.classList.toggle("nm-has-accent", Boolean(node.color));
     el.classList.toggle("nm-autofit", Boolean(node.autoFit));
+    el.classList.toggle("nm-scaled", node.type !== "group" && Boolean(node.scale) && node.scale !== 1);
     el.style.setProperty("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
     el.classList.toggle("nm-head-hidden", Boolean(node.hideHeader));
     el.classList.toggle("nm-has-bg", Boolean(node.bgColor));
@@ -165,7 +166,7 @@ export class NodeRenderer {
     el.style.height = `${box.height}px`;
     el.style.transform = box.transform;
     // Handles and side ports are counter-scaled (nodemap.css) so they stay grabbable at any content scale
-    el.style.setProperty("--nm-scale", String(node.autoFit && node.scale ? node.scale : 1));
+    el.style.setProperty("--nm-scale", String(node.type !== "group" && node.scale ? node.scale : 1));
   }
 
   /** Force a body rebuild on the next sync (content fetched again, toggles flipped). */

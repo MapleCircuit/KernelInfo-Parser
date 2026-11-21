@@ -183,6 +183,8 @@ class GlobalState {
     // An embed shell (NodeMap tab node) starts empty and keeps nothing: the address opens its one tab
     if (isEmbedMode()) {
       this._persistenceSuspended = true;
+      // A shell joined to a NodeMap embedded session learns the engines its sibling shells run
+      if (sessionManager.embedSession) sessionManager.requestRemoteEngines();
       return;
     }
     // Load persisted state if available

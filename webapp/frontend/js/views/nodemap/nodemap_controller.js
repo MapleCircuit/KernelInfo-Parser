@@ -23,12 +23,21 @@
  *     scope bars, Kconfig-engine folding of compiled-out branches, hidden items
  *     (`/api/nodemap/{v}/struct/{name}`),
  *     source files / line ranges / symbol slices (`/api/nodemap/{v}/source`), man pages
- *     (`mountManDocument`), and live KernelInfo tabs in an isolated `?embed=1` iframe.
+ *     (`mountManDocument`), diffs, mailing-list threads (reply tree, Expand Thread to Nodes), Kconfig
+ *     symbols (live value, relation chips that spawn or link nodes), MAINTAINERS sections
+ *     (`domain_nodes.js`), and live KernelInfo tabs in an isolated `?embed=1` iframe;
+ *   - NodeMap embedded sessions (`settings.embedSessions`): the tab iframes run in one of them
+ *     (`&embedSession=`), and the canvas follows the Kconfig engines of one (`settings.followSession`)
+ *     over its scoped channel, so editing Kconfig in an embedded tab refolds struct `#ifdef`s and
+ *     updates Kconfig node values; Copy to Session hands a node as a tab to another workspace session;
+ *   - tabs dragged from a tab strip onto the canvas are copied in as nodes (native, Shift: a live tab);
+ *   - a content scale for every non-group node (Inspector), drawn into the image export too.
  * Element lookups stay inside the tab's own container (no document ids), so several NodeMap tabs and
  * panes never collide.
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
+import { sessionManager } from "../../session_manager.js";
 import { urlSync } from "../../url_sync.js";
 import { toast } from "../../components/toast.js";
 import { contextMenu } from "../../components/context_menu.js";
@@ -37,6 +46,8 @@ import { resolveColor } from "../../utils/theme.js";
 import { onUiScaleChanged } from "../../utils/ui_scale.js";
 import { isTabFeatureEnabled } from "../../utils/projects.js";
 import { isAlwaysVersionlessTab } from "../../tab_routes.js";
+import { embedSessionChannel } from "../../utils/embed_mode.js";
+import { mayCarryTab, tabDragPayload } from "../../utils/tab_drag.js";
 import { mountManDocument } from "../man/man_view.js";
 import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.js";
 import * as M from "./canvas_model.js";
@@ -44,6 +55,11 @@ import { computeEdgeGeometry, dashArray } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
 import { findItem, guardAutoCollapsed, renderStructBody, structRows } from "./struct_view.js";
 import { headMetaOf, renderNoteMarkdown, renderSourceRows } from "./node_content.js";
+import {
+  diffPayload, kconfigModel, kconfigValue, mailThreadLayout, mailThreadModel, maintainerModel, relationTargets,
+  renderDiffBody, renderKconfigBody, renderMailBody, renderMaintainerBody,
+} from "./domain_nodes.js";
+import { nodeSpecsForTab, tabForNode } from "./nodemap_bridge.js";
 import { PNG_DEFAULT_SCALE, PNG_SCALES, canvasToSvg, captureNodeForeignObject, pngSize, svgSize } from "./nodemap_export.js";
 
 /** Tab types a KernelInfo tab node offers (feature-gated per project). */
@@ -55,8 +71,9 @@ export const EMBED_TAB_TYPES = [
 ];
 
 const ADD_MENU = [
-  ["struct", "Struct / Union…", "🧱"], ["source", "Source File / Slice…", "📄"], ["man", "Man Page…", "📘"],
-  ["tab", "KernelInfo Tab…", "🗔"], ["symbol", "Symbol…", "🔣"], ["note", "Note Card", "📝"], ["group", "Group", "▭"],
+  ["struct", "Struct / Union…", "🧱"], ["source", "Source File / Slice…", "📄"], ["diff", "Diff…", "±"],
+  ["mail", "Mailing List Thread…", "✉"], ["kconfig", "Kconfig Symbol…", "⚙"], ["maintainer", "Maintainers…", "👥"],
+  ["man", "Man Page…", "📘"], ["tab", "KernelInfo Tab…", "🗔"], ["symbol", "Symbol…", "🔣"], ["note", "Note Card", "📝"], ["group", "Group", "▭"],
 ];
 
 const SAVE_DELAY_MS = 300;
@@ -66,6 +83,11 @@ const isTyping = (el) => Boolean(el && (el.closest?.("input, textarea, select, [
 // Body buttons that edit a node: they work in Edit Mode only (folds and header tools always do)
 const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards", "toggle-header"]);
 const PASTE_STEP = 24;
+// A copy pushed to another session is offered to the window holding it first (components/tabs.js)
+const PUSH_ACK_GRACE_MS = 400;
+// Messages a thread spawns as nodes at once ("Expand Thread to Nodes")
+const MAIL_EXPAND_MAX = 60;
+const KC_EXPAND_MAX = 40;
 const UNDO_LIMIT = 80;
 const cssEsc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
 // Clipboard of this window when localStorage refuses it (shared by the NodeMap tabs of the window)
@@ -104,6 +126,12 @@ export class NodeMapController {
     this.pasteCount = 0;
     this.history = new M.UndoStack(UNDO_LIMIT); // undo / redo of the document (commit() records)
     this.connectedPorts = new Set(); // port elements tagged .nm-port-connected
+    this.mailBodies = new Map(); // message id -> body text (expanded mail excerpts)
+    this.embedEngines = new Map(); // Kconfig engines of the followed embedded session: tabId -> engine
+    this.followChannel = null; // BroadcastChannel of the followed embedded session
+    this.followKey = "";
+    // Where the followed embedded session's channel comes from (tests swap it)
+    this.channelFactory = (name) => (typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(name) : null);
     // Where Kconfig engines come from (tests swap it)
     this.kconfigSource = {
       list: () => (typeof state.kconfigEngineList === "function" ? state.kconfigEngineList() : []),
@@ -132,6 +160,8 @@ export class NodeMapController {
       this.subscribe();
       this.consumeIncoming(tabData);
       this.applyTransform();
+      // Content that changed while the tab was hidden (folds, engines) could not be measured then
+      for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
       this.commit({ save: false, record: true });
       return;
     }
@@ -159,6 +189,7 @@ export class NodeMapController {
 
     this.attachToolbar();
     this.attachCanvasEvents();
+    this.attachTabDrop();
     this.subscribe();
     this.consumeIncoming(tabData);
     this.applyTransform();
@@ -179,6 +210,7 @@ export class NodeMapController {
     }
     if (this.onMessage) window.removeEventListener("message", this.onMessage);
     this.onWinMove = this.onWinUp = this.onMessage = null;
+    this.closeFollowChannel();
     this.connectedPorts = new Set();
     this.rootEl = null;
   }
@@ -204,11 +236,14 @@ export class NodeMapController {
       const off = state.subscribe(ev, () => this.onKconfigChanged());
       this.unsubs.push(typeof off === "function" ? off : () => {});
     }
+    this.syncFollowChannel();
   }
 
   onKconfigChanged() {
     this.kconfigEpoch += 1;
     this.evalCache.clear();
+    // Folded or unfolded branches change the height of auto-fitted struct nodes
+    for (const n of this.canvas?.nodes || []) if (n.autoFit && (n.type === "struct" || n.type === "kconfig")) this.fitQueue.add(n.id);
     clearTimeout(this.kconfigTimer);
     this.kconfigTimer = setTimeout(() => {
       if (this.containerEl?.isConnected) this.commit({ save: false });
@@ -225,14 +260,58 @@ export class NodeMapController {
   kconfigEngineFor(node) {
     const st = this.canvas?.settings;
     if (!st?.kconfigCollapse || node?.type !== "struct" || node.data.disableKconfigEngine) return null;
-    let list = [];
+    return this.pickEngine(node);
+  }
+
+  /**
+   * Engines the canvas follows: with `followSession`, the ones running in that NodeMap embedded
+   * session's tab iframes; the host workspace session's (this window and the sessions it sees) when
+   * the host is followed or the embedded session runs none. Only engines with a resolved configuration
+   * count.
+   */
+  followedEngines() {
     try {
-      list = (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
+      if (this.canvas?.settings.followSession) {
+        const embedded = [...this.embedEngines.values()].filter((e) => e && e.resolved);
+        if (embedded.length) return embedded;
+      }
+      return (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
     } catch {
-      list = [];
+      return [];
     }
-    if (st.kconfigEngine) return list.find((e) => e.tabId === st.kconfigEngine) || null;
-    return list.find((e) => e.version && e.version === node.version) || null;
+  }
+
+  /** Engine context (`{engineTabId, assignments, arch, strict}`) of a followed engine. */
+  engineContext(tabId) {
+    const e = this.embedEngines.get(tabId);
+    // An announced engine carries its whole resolved configuration: a symbol it leaves out is off
+    if (e) return { engineTabId: tabId, assignments: e.assignments, arch: e.arch, strict: true };
+    return this.kconfigSource.context(tabId);
+  }
+
+  /**
+   * The followed engine a node reads: the canvas's chosen engine, else the engine of the node's revision;
+   * an embedded session (followed explicitly) falls back to its only engine.
+   */
+  pickEngine(node) {
+    const st = this.canvas?.settings;
+    const list = this.followedEngines();
+    if (st?.kconfigEngine) return list.find((e) => e.tabId === st.kconfigEngine) || null;
+    const hit = list.find((e) => e.version && e.version === node.version);
+    if (hit) return hit;
+    // An embedded session's engine is followed by choice: its only engine serves every revision
+    return list.length === 1 && list[0].isEmbedded ? list[0] : null;
+  }
+
+  /** Assignments a Kconfig node shows its value from (null: no engine followed for it). */
+  kconfigValuesFor(node) {
+    const eng = this.pickEngine(node);
+    if (!eng) return null;
+    try {
+      return this.engineContext(eng.tabId)?.assignments || null;
+    } catch {
+      return null;
+    }
   }
 
   /** `DirectiveEvaluator` of the node's engine (cached per engine until its values change). */
@@ -242,7 +321,7 @@ export class NodeMapController {
     if (this.evalCache.has(eng.tabId)) return this.evalCache.get(eng.tabId);
     let ev = null;
     try {
-      const ctx = this.kconfigSource.context(eng.tabId);
+      const ctx = this.engineContext(eng.tabId);
       if (ctx && ctx.engineTabId === eng.tabId && ctx.assignments) {
         ev = new DirectiveEvaluator(ctx.assignments, { partial: !ctx.strict, macros: archMacros(ctx.arch, ctx.assignments) });
       }
@@ -262,7 +341,104 @@ export class NodeMapController {
   bodyKey(node) {
     if (node.type === "struct") return JSON.stringify([Boolean(this.canvas.settings.editMode), this.kconfigEngineFor(node)?.tabId || "", this.kconfigEpoch]);
     if (node.type === "note") return this.canvas.settings.editMode ? "edit" : "";
+    if (node.type === "kconfig") {
+      // Live value and which relations are already on the canvas
+      const values = this.kconfigValuesFor(node);
+      const names = this.canvas.nodes.filter((n) => n.type === "kconfig").map((n) => n.data.symbol).sort().join(",");
+      return JSON.stringify([values ? kconfigValue(values, node.data.symbol) : null, names, this.kconfigEpoch]);
+    }
+    if (node.type === "mail") return String(this.mailEpoch || 0);
+    if (node.type === "tab") return this.embedKey(M.embedSessionOf(this.canvas, node).id);
     return "";
+  }
+
+  // ------------------------------------------------------------------ NodeMap embedded sessions
+
+  /** Key of one of this canvas's embedded sessions (unique across NodeMap tabs: tab id + session id). */
+  embedKey(sessionId) {
+    return `${this.tab?.id || "nodemap"}:${sessionId}`;
+  }
+
+  /** Open (or switch) the channel of the followed embedded session; none when the host is followed. */
+  syncFollowChannel() {
+    const id = this.canvas?.settings.followSession || "";
+    const key = id ? this.embedKey(id) : "";
+    if (key === this.followKey && (this.followChannel || !key)) return;
+    this.closeFollowChannel();
+    this.followKey = key;
+    if (!key) return;
+    let ch = null;
+    try {
+      ch = this.channelFactory(embedSessionChannel(key));
+    } catch {
+      ch = null;
+    }
+    if (!ch) return;
+    ch.unref?.(); // Node test runs: an open channel never keeps the process alive
+    this.followChannel = ch;
+    ch.onmessage = (ev) => this.onEmbedMessage(ev?.data);
+    // The tab iframes of the session answer with their running engines
+    try {
+      ch.postMessage({ type: "kconfig:request_engines", sessionId: `nodemap:${key}` });
+    } catch {
+      // closed meanwhile
+    }
+  }
+
+  closeFollowChannel() {
+    try {
+      this.followChannel?.close?.();
+    } catch {
+      // already closed
+    }
+    const had = this.embedEngines.size > 0;
+    this.followChannel = null;
+    this.followKey = "";
+    this.embedEngines.clear();
+    if (had && this.canvas) this.onKconfigChanged();
+  }
+
+  /** Kconfig engine traffic of the followed embedded session (announce, assignments, revoke). */
+  onEmbedMessage(msg) {
+    if (msg?.type === "window:unloading") {
+      // A shell went away: the engines it announced go with it
+      let dropped = false;
+      for (const [id, e] of this.embedEngines) {
+        if (msg.winId && e.winId === msg.winId) {
+          this.embedEngines.delete(id);
+          dropped = true;
+        }
+      }
+      if (dropped) this.onKconfigChanged();
+      return;
+    }
+    if (!msg?.type || !msg.tabId) return;
+    const resolvedOf = (a) => Math.floor(Object.keys(a || {}).length / 2) >= 1;
+    if (msg.type === "kconfig:engine:announced") {
+      this.embedEngines.set(msg.tabId, {
+        tabId: msg.tabId, winId: msg.winId || "", title: msg.title || `KConfig (${msg.arch || "?"})`, version: msg.version || "",
+        arch: msg.arch || "", configName: msg.configName || "", assignments: msg.assignments || {}, resolved: resolvedOf(msg.assignments), isEmbedded: true,
+      });
+    } else if (msg.type === "kconfig:assignments:broadcast") {
+      const eng = this.embedEngines.get(msg.tabId);
+      if (!eng) {
+        try {
+          this.followChannel?.postMessage({ type: "kconfig:request_engines", sessionId: `nodemap:${this.followKey}` });
+        } catch {
+          // closed
+        }
+        return;
+      }
+      eng.assignments = msg.assignments || {};
+      eng.resolved = resolvedOf(eng.assignments);
+      for (const k of ["title", "version", "arch"]) if (msg[k]) eng[k] = msg[k];
+      if (typeof msg.configName === "string") eng.configName = msg.configName;
+    } else if (msg.type === "kconfig:engine:revoked") {
+      const eng = this.embedEngines.get(msg.tabId);
+      if (!eng || (msg.winId && eng.winId && eng.winId !== msg.winId)) return;
+      this.embedEngines.delete(msg.tabId);
+    } else return;
+    this.onKconfigChanged();
   }
 
   /** Nodes handed over by other views: `initialNodes`/`initialEdges`, `initialNode`, `pendingNodes`. */
@@ -312,6 +488,10 @@ export class NodeMapController {
 
   nodeFromSpec(spec, pos = null) {
     if (!spec || !M.NODE_TYPES.includes(spec.type)) return null;
+    const data = spec.type === "tab" && !spec.data?.embedSessionId
+      // A new tab node runs in the canvas's first embedded session
+      ? { ...(spec.data || {}), embedSessionId: this.canvas?.settings.embedSessions?.[0]?.id || "" }
+      : spec.data;
     return M.createNode(spec.type, {
       x: pos?.x ?? 0,
       y: pos?.y ?? 0,
@@ -320,9 +500,10 @@ export class NodeMapController {
       title: spec.title,
       customTitle: spec.customTitle,
       color: spec.color,
+      scale: spec.scale,
       version: spec.version || this.currentVersion,
       repo: spec.repo || this.repo,
-      data: spec.data,
+      data,
     });
   }
 
@@ -522,6 +703,26 @@ export class NodeMapController {
       title = "Add Symbol";
       body += field("name", "Symbol", "", 'placeholder="schedule" spellcheck="false" required');
       body += `<label class="nm-form-row"><span>Kind</span><select name="kind"><option value="func">function</option><option value="symbol">other</option></select></label>`;
+    } else if (type === "diff") {
+      title = "Add Diff";
+      body += `<label class="nm-form-row"><span>Show</span><select name="mode"><option value="file">One file between two revisions</option><option value="commit">A commit</option></select></label>`;
+      body += `<div class="nm-form-pair">${field("versionA", "From revision (file diff)", "", 'placeholder="v2.6.39" spellcheck="false"')}${field("versionB", "To revision (file diff)", v, 'spellcheck="false"')}</div>`;
+      body += field("path", "File (all files of a commit when empty)", "", 'placeholder="kernel/fork.c" spellcheck="false"');
+      body += field("oldPath", "Old path (renamed file)", "", 'spellcheck="false"');
+      body += field("commitHash", "Commit (commit diff)", "", 'placeholder="a1b2c3d4" spellcheck="false"');
+    } else if (type === "mail") {
+      title = "Add Mailing List Thread";
+      body += field("tid", "Thread id", "", 'type="number" min="1"');
+      body += field("mid", "Message-ID (focused message, or the thread it starts)", "", 'placeholder="20110101.12345@example.org" spellcheck="false"');
+    } else if (type === "kconfig") {
+      title = "Add Kconfig Symbol";
+      body += field("symbol", "Symbol", "", 'placeholder="SMP" spellcheck="false" required');
+      body += field("arch", "ARCH", "x86_64", 'spellcheck="false"');
+    } else if (type === "maintainer") {
+      title = "Add Maintainers Section";
+      body += field("query", "Section name", "", 'placeholder="SCHEDULER" spellcheck="false"');
+      body += field("path", "Or the section of a file", "", 'placeholder="kernel/sched/core.c" spellcheck="false"');
+      body += field("secId", "Or a section id", "", 'type="number" min="1"');
     } else if (type === "tab") {
       title = "Add KernelInfo Tab";
       const repo = this.repo;
@@ -534,7 +735,7 @@ export class NodeMapController {
     const modal = openModal({ title, subtitle: "The node is placed at the center of the view", width: "480px", footerHtml: '<button type="button" class="code-btn primary" data-act="add">Add</button>' });
     modal.body.innerHTML = `<form class="nm-form">${body}</form>`;
     const form = modal.body.querySelector("form");
-    form.querySelector("input[name='name'], input[name='path']")?.focus();
+    form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query']")?.focus();
     const submit = async () => {
       const f = Object.fromEntries(new FormData(form).entries());
       const spec = await this.specFromForm(type, f);
@@ -572,6 +773,36 @@ export class NodeMapController {
       if (!name) return toast.warning("Enter a man page name"), null;
       return { type, version, data: { name, section: String(f.section || "").trim() } };
     }
+    if (type === "diff") {
+      const commitHash = String(f.commitHash || "").trim();
+      const path = String(f.path || "").trim();
+      if (f.mode === "commit") {
+        if (!/^[0-9a-f]{4,64}$/i.test(commitHash)) return toast.warning("Enter a commit hash"), null;
+        return { type, version, data: { mode: "commit", commitHash, path } };
+      }
+      const versionA = String(f.versionA || "").trim();
+      const versionB = String(f.versionB || version).trim();
+      if (!path || !versionA || !versionB) return toast.warning("Enter a file and both revisions"), null;
+      return { type, version: versionB, data: { mode: "file", versionA, versionB, path, oldPath: String(f.oldPath || "").trim() } };
+    }
+    if (type === "mail") {
+      const tid = int(f.tid);
+      const mid = String(f.mid || "").trim().replace(/^<|>$/g, "");
+      if (!tid && !mid) return toast.warning("Enter a thread id or a Message-ID"), null;
+      return { type, version, data: { tid, mid } };
+    }
+    if (type === "kconfig") {
+      const symbol = String(f.symbol || "").trim().replace(/^CONFIG_/, "");
+      if (!/^[A-Za-z0-9_]+$/.test(symbol)) return toast.warning("Enter a Kconfig symbol"), null;
+      return { type, version, data: { symbol, arch: String(f.arch || "").trim() || "x86_64" } };
+    }
+    if (type === "maintainer") {
+      const secId = int(f.secId);
+      const query = String(f.query || "").trim();
+      const path = String(f.path || "").trim();
+      if (!secId && !query && !path) return toast.warning("Enter a section name, a file or a section id"), null;
+      return { type, version, data: { secId, query, path } };
+    }
     if (type === "tab") {
       if (f.openTab) {
         const t = state.findTab(f.openTab);
@@ -593,7 +824,26 @@ export class NodeMapController {
     const d = node.data;
     if (node.type === "struct") return JSON.stringify(["struct", node.repo, node.version, d.name, d.kind, d.path, d.hint, d.line]);
     if (node.type === "source") return JSON.stringify(["source", node.repo, node.version, d.path, d.mode, d.start, d.end, d.symbol, d.symbolKind, d.context]);
+    if (node.type === "diff") return JSON.stringify(["diff", node.repo, node.version, d.mode, d.versionA, d.versionB, d.path, d.oldPath, d.commitHash]);
+    if (node.type === "mail") return JSON.stringify(["mail", d.tid, d.mid, d.single]);
+    if (node.type === "kconfig") return JSON.stringify(["kconfig", node.repo, node.version, d.symbol, d.arch]);
+    if (node.type === "maintainer") return JSON.stringify(["maintainer", node.repo, node.version, d.secId, d.query, d.path]);
     return null;
+  }
+
+  /**
+   * What a domain node shows, from its loaded payload: the diff payload, the mail reply tree, the Kconfig
+   * and MAINTAINERS models (`domain_nodes.js`); the raw payload for struct / source nodes. Null while not
+   * loaded.
+   */
+  modelOf(node) {
+    const entry = this.content.get(this.fetchKeyOf(node));
+    if (entry?.status !== "ok") return null;
+    const v = entry.value;
+    if (node.type === "mail") return mailThreadModel(v, node.data, this.mailBodies);
+    if (node.type === "kconfig") return kconfigModel(v?.detail, v?.graph, node.data.symbol);
+    if (node.type === "maintainer") return maintainerModel(v);
+    return v;
   }
 
   /** Fetch a node's content once per fetch key; the body re-renders when it lands. */
@@ -671,11 +921,31 @@ export class NodeMapController {
         body.innerHTML = status("No tab address", true);
         return;
       }
-      const src = M.embedSrc(node.data.hash, typeof location !== "undefined" ? location.pathname : "/");
+      const sess = M.embedSessionOf(this.canvas, node);
+      const src = M.embedSrc(node.data.hash, typeof location !== "undefined" ? location.pathname : "/", this.embedKey(sess.id));
       body.innerHTML = `<div class="nm-tabframe">
           <iframe class="nm-iframe" src="${escapeHtml(src)}" title="${escapeHtml(M.displayTitle(node))}" loading="lazy" referrerpolicy="same-origin"></iframe>
           <button type="button" class="nm-shield" data-act="interact" title="Click to interact with this tab (Esc or a click on the canvas leaves it)">Click to interact</button>
         </div>`;
+    } else if (["diff", "mail", "kconfig", "maintainer"].includes(node.type)) {
+      const prevScroll = body.querySelector(".nm-scroll")?.scrollTop || 0;
+      const load = { diff: () => this.loadDiff(node), mail: () => this.loadMail(node), kconfig: () => this.loadKconfig(node), maintainer: () => this.loadMaintainer(node) }[node.type];
+      const entry = this.ensureContent(node, load);
+      if (entry.status === "loading") body.innerHTML = status(`Loading ${M.displayTitle(node)}…`);
+      else if (entry.status === "error") body.innerHTML = status(entry.error?.message || "Could not load it", true);
+      else {
+        const model = this.modelOf(node);
+        if (node.type === "diff") body.innerHTML = renderDiffBody(model);
+        else if (node.type === "mail") body.innerHTML = renderMailBody(model);
+        else if (node.type === "maintainer") body.innerHTML = renderMaintainerBody(model);
+        else {
+          const values = this.kconfigValuesFor(node);
+          const onCanvas = new Set(this.canvas.nodes.filter((n) => n.type === "kconfig" && n.id !== node.id).map((n) => n.data.symbol));
+          body.innerHTML = renderKconfigBody(model, values ? kconfigValue(values, model.name) : null, onCanvas);
+        }
+        const sc = body.querySelector(".nm-scroll");
+        if (sc) sc.scrollTop = prevScroll;
+      }
     } else if (node.type === "symbol") {
       const list = node.data.constituents || [];
       body.innerHTML = node.data.expanded
@@ -710,6 +980,74 @@ export class NodeMapController {
     if (d.mode === "symbol" && d.symbol) return client.getNodemapSource(node.version, { path: d.path, symbol: d.symbol, kind: d.symbolKind, context: d.context, fresh });
     if (d.mode === "range" && d.start) return client.getNodemapSource(node.version, { path: d.path, start: d.start, end: d.end || d.start, fresh });
     return client.getNodemapSource(node.version, { path: d.path, fresh });
+  }
+
+  async loadDiff(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    if (d.mode === "commit") {
+      if (!d.commitHash) throw new Error("Set a commit in the inspector");
+      return diffPayload(d, await client.getCommitDiff(node.version || this.currentVersion, d.commitHash));
+    }
+    if (!d.path || !d.versionA || !d.versionB) throw new Error("Set a file and both revisions in the inspector");
+    return diffPayload(d, await client.getFileDiff(d.versionA, d.versionB, d.path, d.oldPath || ""));
+  }
+
+  async loadMail(node) {
+    const d = node.data;
+    const client = this.api || api;
+    const oldKey = this.fetchKeyOf(node);
+    // A message node of its own shows that message (with its body); a thread node the whole thread
+    const res = d.single ? await client.getMailMessage(d.mid) : await client.getMailThread(d.tid || 0, d.mid || "");
+    if (d.single && res?.body && d.mid) this.mailBodies.set(d.mid, String(res.body));
+    if (res && res.available === false) throw new Error(res.error || "Not in the mailing-list archive");
+    // A thread found from its message: the node keeps the thread id and subject (not a user change)
+    const tid = res?.tid || res?.messages?.[0]?.tid || null;
+    const subject = res?.subject || res?.messages?.[0]?.subject || "";
+    if ((tid && !d.tid) || (subject && !d.subject)) {
+      setTimeout(() => {
+        if (tid && !node.data.tid) node.data.tid = tid;
+        if (subject && !node.data.subject) node.data.subject = subject;
+        // The fetch key follows tid: the loaded thread is kept under the new key
+        const entry = this.content.get(oldKey);
+        if (entry) this.content.set(this.fetchKeyOf(node), entry);
+        if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
+        if (this.containerEl?.isConnected) this.commit({ absorb: true });
+      }, 0);
+    }
+    return res;
+  }
+
+  async loadKconfig(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    const version = node.version || this.currentVersion;
+    const [detail, graph] = await Promise.all([
+      client.getKconfigSymbol(version, d.symbol, d.arch),
+      client.getKconfigGraph(version, d.arch, d.symbol).catch(() => ({ edges: [] })),
+    ]);
+    return { detail, graph };
+  }
+
+  async loadMaintainer(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    const version = node.version || this.currentVersion;
+    let secId = d.secId;
+    if (!secId && d.path) {
+      const m = await client.matchMaintainers(version, "", [d.path]);
+      const name = m?.subsystems?.[0];
+      if (!name) throw new Error(`No MAINTAINERS section covers ${d.path}`);
+      const ov = await client.getMaintainersOverview(version, name);
+      secId = (ov?.sections || []).find((x) => x.name === name)?.sec_id || ov?.sections?.[0]?.sec_id || null;
+    } else if (!secId && d.query) {
+      const ov = await client.getMaintainersOverview(version, d.query);
+      const list = ov?.sections || [];
+      const q = d.query.toLowerCase();
+      secId = (list.find((x) => String(x.name).toLowerCase() === q) || list[0])?.sec_id || null;
+    }
+    if (!secId) throw new Error("No matching MAINTAINERS section");
+    return client.getMaintainerSection(version, secId);
   }
 
   /** Whether ⟳ asked for this node's content from the server (past the local API cache); asked once. */
@@ -777,16 +1115,17 @@ export class NodeMapController {
     }
     if (node.type === "tab") s += active ? b("interact", "✓", "Done interacting (Esc)") : b("interact", "⤢", "Interact with the embedded tab");
     if (node.type === "symbol") s += b("expand", node.data.expanded ? "−" : "+", node.data.expanded ? "Collapse members" : "Expand members");
-    if (["struct", "source", "man"].includes(node.type)) s += b("refresh", "⟳", "Load again");
-    if (["struct", "source", "man", "tab", "symbol"].includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
+    if (node.type === "mail") s += b("mail-expand", "⇶", "Expand Thread to Nodes: one connected node per message");
+    if (node.type === "kconfig") s += b("kc-expand", "⇶", "Expand Relations: add or connect every related symbol");
+    if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) s += b("refresh", "⟳", "Load again");
+    if (M.TAB_OPENABLE_TYPES.includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
     return s;
   }
 
   /** Source reference shown at the right of a struct / source header (from its loaded content). */
   headMeta(node) {
-    if (node.type !== "struct" && node.type !== "source") return null;
-    const entry = this.content.get(this.fetchKeyOf(node));
-    return headMetaOf(node.type, entry?.status === "ok" ? entry.value : null);
+    if (!["struct", "source", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) return null;
+    return headMetaOf(node.type, this.modelOf(node));
   }
 
   // ------------------------------------------------------------------ view / commit
@@ -887,6 +1226,8 @@ export class NodeMapController {
     this.canvas.edges = reuse(this.canvas.edges, doc.edges);
     this.canvas.settings = { ...doc.settings, editMode: st.editMode, snap: st.snap };
     for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
+    // The followed embedded session may be another one now
+    this.syncFollowChannel();
     this.applyTransform();
     this.commit({ absorb: true });
   }
@@ -1403,7 +1744,138 @@ export class NodeMapController {
     else if (act === "open-tab") this.openNodeAsTab(node.id);
     else if (act === "refresh") this.refreshNode(node.id);
     else if (act === "expand") this.toggleExpandNode(node.id);
+    else if (act === "mail-open") this.toggleMailMessage(node.id, btn.dataset.key);
+    else if (act === "mail-spawn") this.spawnMailMessages(node.id, [btn.dataset.key]);
+    else if (act === "mail-expand") this.expandThreadToNodes(node.id);
+    else if (act === "kc-rel") this.expandKconfigRelations(node.id, btn.dataset.key);
+    else if (act === "kc-expand") this.expandKconfigRelations(node.id);
     else if (node.type === "struct") this.onStructAction(node, act, btn.dataset.key);
+  }
+
+  // ------------------------------------------------------------------ mail and Kconfig nodes
+
+  /** Show or hide a message's body excerpt in a mail node (the body is fetched once). */
+  async toggleMailMessage(id, mid) {
+    const node = this.byId(id);
+    if (!node || node.type !== "mail" || !mid) return;
+    const open = { ...node.data.openMids };
+    if (open[mid]) delete open[mid];
+    else open[mid] = true;
+    node.data.openMids = open;
+    if (node.autoFit) this.fitQueue.add(id);
+    this.commit();
+    if (!open[mid] || this.mailBodies.has(mid) || mid.startsWith("#")) return;
+    try {
+      const res = await (this.api || api).getMailMessage(mid);
+      this.mailBodies.set(mid, String(res?.body || res?.text || ""));
+    } catch (err) {
+      this.mailBodies.set(mid, `(${err.message})`);
+    }
+    this.mailEpoch = (this.mailEpoch || 0) + 1;
+    for (const n of this.canvas.nodes) if (n.type === "mail" && n.autoFit) this.fitQueue.add(n.id);
+    if (this.containerEl?.isConnected || !this.containerEl) this.commit({ save: false, inspector: false });
+  }
+
+  /** The canvas node showing message `mid` on its own (a mail node focused on it), or null. */
+  mailNodeOf(mid) {
+    return this.canvas.nodes.find((n) => n.type === "mail" && n.data.mid === mid && n.data.single) || null;
+  }
+
+  /**
+   * Message nodes for `mids` of thread node `id`, each connected to its parent message's node (or to the
+   * thread node for a root) by a `reply` edge; messages already on the canvas are connected, not copied.
+   * Returns the nodes created.
+   */
+  spawnMailMessages(id, mids, { select = true, layout = null } = {}) {
+    const thread = this.byId(id);
+    const model = thread ? this.modelOf(thread) : null;
+    if (!model) return [];
+    const rows = new Map(model.rows.map((r) => [r.mid, r]));
+    const created = [];
+    const place = layout ? new Map(layout.map((p) => [p.mid, p])) : null;
+    let k = 0;
+    for (const mid of mids) {
+      const r = rows.get(mid);
+      if (!r) continue;
+      let n = this.mailNodeOf(mid);
+      if (!n) {
+        const at = place?.get(mid) || { x: thread.x + thread.w + 80, y: thread.y + k * 140 };
+        n = M.createNode("mail", {
+          x: at.x, y: at.y, w: 320, h: 150, version: thread.version, repo: thread.repo,
+          data: { tid: thread.data.tid, mid, subject: r.subject, single: true },
+        });
+        this.canvas.nodes.push(n);
+        created.push(n);
+        k += 1;
+      }
+      const parentNode = (r.parent && this.mailNodeOf(r.parent)) || thread;
+      if (parentNode.id !== n.id && !this.canvas.edges.some((e) => e.from === parentNode.id && e.to === n.id)) {
+        const edge = M.createEdge({ from: parentNode.id, to: n.id, label: "reply" });
+        if (edge) this.canvas.edges.push(edge);
+      }
+    }
+    if (created.length) M.reassignGroups(this.canvas.nodes, created);
+    if (select && created.length) {
+      this.selected = new Set(created.map((x) => x.id));
+      this.selectedEdge = null;
+    }
+    this.commit();
+    return created;
+  }
+
+  /** "Expand Thread to Nodes": every message of a thread node as a connected node, laid out as the reply tree. */
+  expandThreadToNodes(id) {
+    const thread = this.byId(id);
+    const model = thread ? this.modelOf(thread) : null;
+    if (!model?.rows.length) return toast.info("The thread has not loaded yet"), [];
+    const rows = model.rows.slice(0, MAIL_EXPAND_MAX);
+    const layout = mailThreadLayout({ rows }, { x: thread.x + thread.w + 80, y: thread.y }, { w: 320, h: 150 });
+    const created = this.spawnMailMessages(id, rows.map((r) => r.mid), { layout });
+    if (model.rows.length > rows.length) toast.info(`Added the first ${rows.length} of ${model.rows.length} messages`);
+    return created;
+  }
+
+  /**
+   * Link a Kconfig node to its related symbols (`only` = `rel:NAME` for one chip): a symbol already on
+   * the canvas is connected, any other gets a node of its own (outgoing relations to the right, incoming
+   * to the left); each edge is labeled with the relation and drawn once.
+   */
+  expandKconfigRelations(id, only = "") {
+    const node = this.byId(id);
+    const model = node ? this.modelOf(node) : null;
+    if (!model) return toast.info("The symbol has not loaded yet"), [];
+    const targets = relationTargets(model, only).slice(0, only ? 1 : KC_EXPAND_MAX);
+    const created = [];
+    const count = { out: 0, in: 0 };
+    for (const t of targets) {
+      let other = this.canvas.nodes.find((n) => n.type === "kconfig" && n.data.symbol === t.name && n.data.arch === node.data.arch && n.version === node.version);
+      if (!other) {
+        const k = count[t.dir]++;
+        const lim = M.SIZE_LIMITS.kconfig;
+        other = M.createNode("kconfig", {
+          x: t.dir === "out" ? node.x + node.w + 120 : node.x - lim.w - 120,
+          y: node.y + k * (lim.h * 0.6 + 24),
+          h: Math.round(lim.h * 0.6),
+          version: node.version,
+          repo: node.repo,
+          data: { symbol: t.name, arch: node.data.arch },
+        });
+        this.canvas.nodes.push(other);
+        created.push(other);
+      }
+      const [from, to] = t.dir === "out" ? [node.id, other.id] : [other.id, node.id];
+      if (!this.canvas.edges.some((e) => e.from === from && e.to === to && e.label === t.edge)) {
+        const edge = M.createEdge({ from, to, label: t.edge, style: t.edge === "depends on" ? "solid" : "dashed" });
+        if (edge) this.canvas.edges.push(edge);
+      }
+    }
+    if (created.length) {
+      M.reassignGroups(this.canvas.nodes, created);
+      this.selected = new Set(created.map((x) => x.id));
+      this.selectedEdge = null;
+    }
+    this.commit();
+    return created;
   }
 
   onStructAction(node, act, key) {
@@ -1427,6 +1899,8 @@ export class NodeMapController {
     } else if (act === "style") {
       d.style = d.style === "table" ? "list" : "table";
     } else return;
+    // Folding, showing or hiding rows changes an auto-fitted node's height: it measures again
+    if (node.autoFit) this.fitQueue.add(node.id);
     this.commit();
   }
 
@@ -1799,26 +2273,138 @@ export class NodeMapController {
     this.commit({ save: false });
   }
 
+  /** The workspace tab a node opens as (`tabForNode()` with its loaded content). */
+  tabOfNode(node) {
+    const entry = this.content.get(this.fetchKeyOf(node));
+    return tabForNode(node, entry?.status === "ok" ? entry.value : null, { repo: this.repo, version: this.currentVersion });
+  }
+
   openNodeAsTab(id) {
     const node = this.byId(id);
     if (!node) return;
-    const d = node.data;
-    const base = { repo: node.repo || this.repo, version: node.version || this.currentVersion };
-    if (node.type === "source") {
-      const line = d.mode === "range" ? d.start : this.content.get(this.fetchKeyOf(node))?.value?.symbol?.line_s;
-      state.openTab({ type: "code", title: d.path.split("/").pop(), path: d.path, cursorLine: line || 1, ...(d.mode === "range" && d.end > d.start ? { lineEnd: d.end } : {}), ...base });
-    } else if (node.type === "struct") {
-      const layout = this.content.get(this.fetchKeyOf(node))?.value;
-      if (layout?.file_path) state.openTab({ type: "code", title: layout.file_path.split("/").pop(), path: layout.file_path, cursorLine: layout.line_s, ...base });
-      else state.openTab({ type: "pahole", title: `struct ${d.name}`, structName: d.name, ...base });
-    } else if (node.type === "man" && d.path) {
-      state.openTab({ type: "man", repo: d.repo, version: d.version, manPath: d.path, manPage: d.name, manSec: d.section, title: M.displayTitle(node) });
-    } else if (node.type === "tab" && d.hash) {
-      urlSync.applyAddress(d.hash);
-    } else if (node.type === "symbol") {
-      if (d.kind === "func") state.openTab({ type: "callgraph", title: `Callgraph: ${d.name}`, functionName: d.name, ...base });
-      else state.openTab({ type: "search", title: `Search: ${d.name}`, query: d.name, word: true, ...base });
+    // A tab node opens its own address (every field of the embedded view)
+    if (node.type === "tab" && node.data.hash) return urlSync.applyAddress(node.data.hash);
+    const tab = this.tabOfNode(node);
+    if (tab) state.openTab(tab);
+  }
+
+  /** Workspace sessions a node can be copied to: every one but the session this window holds. */
+  copyTargets() {
+    let list = [];
+    try {
+      list = (this.sessions || sessionManager).getSessionsIndex() || [];
+    } catch {
+      list = [];
     }
+    const current = state.currentSessionId || sessionManager.activeSessionId || "";
+    return (Array.isArray(list) ? list : []).filter((x) => x && x.id && x.id !== current);
+  }
+
+  /**
+   * Copy a node as a tab into another workspace session (the node stays): the window holding that
+   * session takes it live; when none answers, the tab is written into the session's stored record.
+   */
+  copyNodeToSession(id, sessionId) {
+    const node = this.byId(id);
+    const target = this.copyTargets().find((x) => x.id === sessionId);
+    if (!node || !target) return false;
+    const tab = this.tabOfNode(node);
+    if (!tab) {
+      toast.warning("This node has no tab to copy");
+      return false;
+    }
+    const sm = this.sessions || sessionManager;
+    const tabData = { ...tab, id: `tab-${Math.random().toString(36).slice(2, 9)}` };
+    const payload = {
+      tabId: tabData.id,
+      sourcePaneId: null,
+      sourceWinId: sm.getWindowId?.() || "",
+      sourceSessionId: state.currentSessionId || "",
+      sourceSessionName: state.currentSessionName || "",
+      tabData,
+    };
+    const name = target.name || target.id;
+    let taken = false;
+    const off = sm.subscribe?.("tab:transfer:accepted", (msg) => {
+      if (msg?.tabId === tabData.id) taken = true;
+    });
+    sm.broadcastTabPush?.(payload, target.id);
+    setTimeout(() => {
+      if (typeof off === "function") off();
+      if (taken) return toast.success(`Copied '${M.displayTitle(node)}' to session '${name}'`);
+      const stored = sm.pushTabToStoredSession?.(target.id, payload);
+      if (stored) toast.success(`Copied '${M.displayTitle(node)}' to session '${name}' (opens there with it)`);
+      else toast.error(`'${M.displayTitle(node)}' could not be copied to session '${name}'`);
+    }, PUSH_ACK_GRACE_MS);
+    return true;
+  }
+
+  // ------------------------------------------------------------------ tabs dragged in
+
+  /** Whether a drag over the canvas may carry a tab of a tab strip (`utils/tab_drag.js`). */
+  acceptsTabDrag(e) {
+    return mayCarryTab(e?.dataTransfer, sessionManager.getIncomingTabDrag?.() || null);
+  }
+
+  /**
+   * A tab dropped on the canvas is copied in (the tab stays open where it was): the node that shows it
+   * natively, or with Shift a live tab node, centered on the drop point. Returns the nodes added.
+   */
+  dropTab(payload, clientX, clientY, { live = false } = {}) {
+    const tab = payload?.tabData;
+    if (!tab) return [];
+    const specs = nodeSpecsForTab(tab, (t) => urlSync.paramsForTab(t).toString(), { live });
+    if (!specs.length) {
+      toast.info(tab.type === "nodemap" ? "A NodeMap canvas cannot hold another canvas" : "This tab cannot be shown on the canvas");
+      return [];
+    }
+    const p = this.toCanvas(clientX, clientY);
+    const added = [];
+    specs.forEach((spec, i) => {
+      const node = this.nodeFromSpec(spec);
+      if (!node) return;
+      node.x = Math.round(p.x - node.w / 2 + i * PASTE_STEP);
+      node.y = Math.round(p.y - node.h / 2 + i * PASTE_STEP);
+      if (this.canvas.settings.snap) {
+        node.x = M.snapValue(node.x, this.canvas.settings.grid);
+        node.y = M.snapValue(node.y, this.canvas.settings.grid);
+      }
+      this.canvas.nodes.push(node);
+      added.push(node);
+    });
+    if (!added.length) return [];
+    M.reassignGroups(this.canvas.nodes, added.filter((n) => n.type !== "group"));
+    this.selected = new Set(added.map((n) => n.id));
+    this.selectedEdge = null;
+    this.commit();
+    // A drag from another window: that window keeps its tab (no drag-out elevation there)
+    if (payload.sourceWinId) sessionManager.broadcastTabDropCopied?.({ tabId: payload.tabId || tab.id, sourceWinId: payload.sourceWinId });
+    toast.success(added[0].type === "tab" ? `Embedded '${tab.title || tab.type}' as a live tab` : `Copied '${tab.title || tab.type}' onto the canvas`);
+    return added;
+  }
+
+  attachTabDrop() {
+    const wrap = this.wrapEl;
+    const off = () => wrap.classList.remove("nm-drop-target");
+    wrap.addEventListener("dragover", (e) => {
+      if (!this.acceptsTabDrag(e)) return;
+      e.preventDefault();
+      // The pane under the canvas must not take this as a tab move into its strip
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      wrap.classList.add("nm-drop-target");
+    });
+    wrap.addEventListener("dragleave", (e) => {
+      if (!wrap.contains(e.relatedTarget)) off();
+    });
+    wrap.addEventListener("drop", (e) => {
+      off();
+      const payload = tabDragPayload(e.dataTransfer, sessionManager.getIncomingTabDrag?.() || null);
+      if (!payload) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.dropTab(payload, e.clientX, e.clientY, { live: e.shiftKey });
+    });
   }
 
   async toggleExpandNode(id) {
@@ -1944,6 +2530,18 @@ export class NodeMapController {
     const check = (name, on, label, title = "") => `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" ${on ? "checked" : ""}/> <span>${escapeHtml(label)}</span></label>`;
     const st = this.canvas.settings;
     const em = Boolean(st.editMode);
+    // Content scale of the given non-group nodes: slider, percent and a reset to 100%
+    const scaleRow = (list) => {
+      const sc = new Set(list.map((x) => x.scale || 1));
+      const cur = sc.size === 1 ? [...sc][0] : 1;
+      const pct = Math.round(cur * 100);
+      const one = list.length === 1 ? list[0] : null;
+      const note = one?.autoFit ? ` of ${one.baseW}×${one.baseH}` : sc.size > 1 ? " (mixed)" : "";
+      return `<div class="inspector-field"><span class="inspector-label">Content scale${list.length > 1 ? ` (${list.length})` : ""}</span><div class="nm-insp-inline nm-insp-scale">` +
+        `<input type="range" data-insp="content-scale" min="${M.SCALE_MIN * 100}" max="${M.SCALE_MAX * 100}" step="5" value="${pct}" aria-label="Content scale"/>` +
+        `<input type="number" data-insp="content-scale" min="${M.SCALE_MIN * 100}" max="${M.SCALE_MAX * 100}" step="5" value="${pct}" aria-label="Content scale in percent"/><span class="inspector-val">%${escapeHtml(note)}</span>` +
+        `${sc.size > 1 || cur !== 1 ? '<button type="button" class="nodemap-btn" data-insp="scale-reset" title="Back to 100%">100%</button>' : ""}</div></div>`;
+    };
     let html = `<div class="nm-insp-mode"><button type="button" class="nodemap-btn nm-mode-toggle" data-insp="edit-mode" aria-pressed="${em}" title="${em ? "Hide the node editing controls" : "Show the node editing controls: struct type, #ifdef and hide toggles, inline title and note editing"}">✎ Edit Mode: ${em ? "On" : "Off"}</button></div>`;
     const edge = this.selectedEdge ? this.canvas.edges.find((e) => e.id === this.selectedEdge) : null;
     const nodes = this.selectedNodes();
@@ -1961,6 +2559,8 @@ export class NodeMapController {
       html += `<div class="inspector-field"><span class="inspector-label">Selection</span><span class="inspector-val">${nodes.length} nodes</span></div>`;
       html += `<div class="inspector-field"><span class="inspector-label">Align</span><div class="nm-insp-grid">${M.ALIGN_MODES.map((m) => `<button type="button" class="nodemap-btn" data-insp="align" data-value="${m}">${m}</button>`).join("")}</div></div>`;
       html += `<div class="inspector-field"><span class="inspector-label">Distribute</span><div class="nm-insp-grid"><button type="button" class="nodemap-btn" data-insp="distribute" data-value="horizontal" ${nodes.length < 3 ? "disabled" : ""}>horizontally</button><button type="button" class="nodemap-btn" data-insp="distribute" data-value="vertical" ${nodes.length < 3 ? "disabled" : ""}>vertically</button></div></div>`;
+      const scalables = nodes.filter((n) => M.scalable(n.type));
+      if (scalables.length) html += scaleRow(scalables);
       const structs = nodes.filter((n) => n.type === "struct");
       if (structs.length) {
         const styles = new Set(structs.map((n) => n.data.style));
@@ -1978,12 +2578,12 @@ export class NodeMapController {
       html += `<div class="nm-insp-pair">${row("Width", input("w", n.w, 'type="number"'))}${row("Height", input("h", n.h, 'type="number"'))}</div>`;
       if (M.AUTOFIT_TYPES.includes(n.type)) {
         html += check("autofit", n.autoFit, "Auto-fit & Scale", "Size the node to all of its content; resizing then keeps the aspect ratio and scales the content");
-        if (n.autoFit) html += `<div class="inspector-field"><span class="inspector-label">Content scale</span><div class="nm-insp-inline"><span class="inspector-val">${Math.round(n.scale * 100)}% of ${n.baseW}×${n.baseH}</span>${n.scale !== 1 ? '<button type="button" class="nodemap-btn" data-insp="scale-reset" title="Back to 100%">100%</button>' : ""}</div></div>`;
       }
-      html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(n.color, n.type === "group" ? "var(--text-muted)" : n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)")}</div>`;
+      if (M.scalable(n.type)) html += scaleRow([n]);
+      html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(n.color, n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)")}</div>`;
       html += bgRow("Background", n.bgColor, "var(--bg-secondary)", "bg");
       html += check("hide-header", n.hideHeader, "Hide header in View Mode", "View Mode and exports leave this node's header out; Edit Mode shows it dimmed (drag, rename, restore)");
-      if (["struct", "source", "symbol"].includes(n.type)) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
+      if (["struct", "source", "symbol", "kconfig", "maintainer"].includes(n.type) || (n.type === "diff" && n.data.mode === "commit")) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
       if (n.type === "struct") {
         html += row("Name", input("d-name", d.name, 'spellcheck="false"'));
         html += `<div class="nm-insp-pair">${row("Kind", sel("d-kind", d.kind, ["struct", "union"]))}${row("Style", sel("d-style", d.style, M.STRUCT_STYLES))}</div>`;
@@ -2008,24 +2608,53 @@ export class NodeMapController {
         html += `<div class="inspector-field"><span class="inspector-label">Page</span><span class="inspector-val">${escapeHtml(d.path || `${d.name}(${d.section})`)} · ${escapeHtml(d.version || "")}</span></div>`;
       } else if (n.type === "tab") {
         html += `<div class="inspector-field"><span class="inspector-label">Embedded ${escapeHtml(d.tabType)} tab</span><span class="inspector-val">#${escapeHtml(d.hash)}</span></div>`;
-        html += `<div class="inspector-field"><span class="inspector-label">Runs isolated: its own state, no session, nothing saved. Click it to interact; Esc or a click on the canvas gives the pointer back.</span></div>`;
+        const sess = M.embedSessionOf(this.canvas, n);
+        html += row("Embedded session", sel("d-embedSessionId", sess.id, st.embedSessions.map((x) => x.id), st.embedSessions.map((x) => x.name)));
+        html += `<div class="inspector-field"><span class="inspector-label">Runs isolated in this NodeMap's session "${escapeHtml(sess.name)}": tabs of one session share their Kconfig engines; nothing is saved and no workspace session sees it. Click it to interact; Esc or a click on the canvas gives the pointer back.</span></div>`;
+      } else if (n.type === "diff") {
+        html += row("Show", sel("d-mode", d.mode, M.DIFF_MODES, ["one file between two revisions", "a commit"]));
+        if (d.mode === "commit") html += row("Commit", input("d-commitHash", d.commitHash, 'spellcheck="false"'));
+        else html += `<div class="nm-insp-pair">${row("From", input("d-versionA", d.versionA, 'spellcheck="false"'))}${row("To", input("d-versionB", d.versionB, 'spellcheck="false"'))}</div>`;
+        html += row(d.mode === "commit" ? "File (all when empty)" : "File", input("d-path", d.path, 'spellcheck="false"'));
+        if (d.mode === "file") html += row("Old path (rename)", input("d-oldPath", d.oldPath, 'spellcheck="false"'));
+      } else if (n.type === "mail") {
+        html += `<div class="nm-insp-pair">${row("Thread id", input("d-tid", d.tid || "", 'type="number" min="1"'))}${row("Message-ID", input("d-mid", d.mid, 'spellcheck="false"'))}</div>`;
+        if (!d.single) html += '<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="mail-expand" title="One node per message, connected by reply edges as the thread replies">⇶ Expand Thread to Nodes</button></div>';
+      } else if (n.type === "kconfig") {
+        html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false"'))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
+        const values = this.kconfigValuesFor(n);
+        const eng = this.pickEngine(n);
+        const why = values ? `${kconfigValue(values, d.symbol) || "unset"} in ${eng?.title || eng?.tabId || "the engine"}` : "no Kconfig engine followed for this revision";
+        html += `<div class="inspector-field"><span class="inspector-label">Value</span><span class="inspector-val">${escapeHtml(why)}</span></div>`;
+        html += '<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="kc-expand" title="Add or connect every related symbol with labeled edges">⇶ Expand Relations</button></div>';
+      } else if (n.type === "maintainer") {
+        html += row("Section name", input("d-query", d.query || d.title, 'spellcheck="false"'));
+        html += `<div class="nm-insp-pair">${row("Or a file", input("d-path", d.path, 'spellcheck="false"'))}${row("Section id", input("d-secId", d.secId || "", 'type="number" min="1"'))}</div>`;
       } else if (n.type === "note") {
         html += check("d-markdown", d.markdown, "Render Markdown");
       } else if (n.type === "group") {
         const members = M.groupDescendants(this.canvas.nodes, n.id).length;
         html += `<div class="inspector-field"><span class="inspector-label">Members</span><span class="inspector-val">${members} (drag nodes in or out of the frame)</span></div>`;
       }
-      html += `<div class="nm-insp-actions">${["struct", "source", "man", "tab", "symbol"].includes(n.type) ? '<button type="button" class="nodemap-btn" data-insp="open-tab">↗ Open as tab</button>' : ""}<button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
+      html += `<div class="nm-insp-actions">${M.TAB_OPENABLE_TYPES.includes(n.type) ? '<button type="button" class="nodemap-btn" data-insp="open-tab">↗ Open as tab</button>' : ""}<button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
+      if (M.TAB_OPENABLE_TYPES.includes(n.type)) {
+        const targets = this.copyTargets();
+        if (!targets.some((x) => x.id === this.copyTarget)) this.copyTarget = targets[0]?.id || "";
+        html += targets.length
+          ? `<div class="inspector-field"><span class="inspector-label">Copy to Session</span><div class="nm-insp-inline">${sel("copy-target", this.copyTarget, targets.map((x) => x.id), targets.map((x) => x.name || x.id))}<button type="button" class="nodemap-btn" data-insp="copy-session" title="Open this node as a tab in that workspace session (the node stays)">Copy…</button></div></div>`
+          : '<div class="inspector-field"><span class="inspector-label">Copy to Session</span><span class="inspector-val nm-hint">No other workspace session: create one with Switch Session</span></div>';
+      }
     } else {
       html += `<div class="inspector-field"><span class="inspector-label">Canvas</span><span class="inspector-val">${this.canvas.nodes.length} nodes · ${this.canvas.edges.length} connections</span></div>`;
       html += `<div class="nm-insp-pair">${row("Grid", input("grid", st.grid, 'type="number" min="4" max="200"'))}${check("snap", st.snap, "Snap")}</div>`;
       html += bgRow("Canvas background", st.bgColor || "", "var(--bg-canvas)", "canvas-bg");
-      let engines = [];
-      try {
-        engines = (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
-      } catch {
-        engines = [];
-      }
+      const engines = this.followedEngines();
+      // NodeMap embedded sessions: what the tab iframes run in, and the one the canvas follows
+      html += `<div class="inspector-field"><span class="inspector-label">NodeMap sessions</span><div class="nm-es-list">${st.embedSessions.map((x) =>
+        `<div class="nm-es-row"><input data-insp="es-name" data-id="${escapeHtml(x.id)}" value="${escapeHtml(x.name)}" aria-label="Session name" spellcheck="false"/><span class="nm-es-count" title="Tab nodes running in it">${this.canvas.nodes.filter((n) => n.type === "tab" && M.embedSessionOf(this.canvas, n).id === x.id).length}</span>` +
+        `<button type="button" class="nodemap-btn nm-danger" data-insp="es-delete" data-id="${escapeHtml(x.id)}" title="Delete (its tab nodes move to the first session)"${st.embedSessions.length <= 1 ? " disabled" : ""}>×</button></div>`).join("")}` +
+        `<button type="button" class="nodemap-btn" data-insp="es-add"${st.embedSessions.length >= M.EMBED_SESSIONS_MAX ? " disabled" : ""}>+ New Session</button></div></div>`;
+      html += row("Follow session", sel("follow-session", st.followSession, ["", ...st.embedSessions.map((x) => x.id)], ["Host workspace", ...st.embedSessions.map((x) => `NodeMap: ${x.name}`)]));
       html += check("kconfig-collapse", st.kconfigCollapse, "Fold #ifdef branches the Kconfig engine compiles out", "Struct nodes fold the branches of #if / #ifdef blocks that the Kconfig engine's configuration leaves out");
       if (engines.length > 1 || (st.kconfigEngine && !engines.some((e) => e.tabId === st.kconfigEngine))) {
         const ids = ["", ...engines.map((e) => e.tabId)];
@@ -2037,7 +2666,8 @@ export class NodeMapController {
         html += row("Kconfig engine", sel("kconfig-engine", st.kconfigEngine, ids, labels));
       } else {
         const e = engines[0];
-        html += `<div class="inspector-field"><span class="inspector-label">Kconfig engine</span><span class="inspector-val">${escapeHtml(e ? `${e.title || e.tabId} · ${e.version || "?"}${e.arch ? ` · ${e.arch}` : ""} (nodes of ${e.version || "that revision"})` : "None with a resolved configuration: open a Kconfig tab and turn its engine on")}</span></div>`;
+        const none = st.followSession ? "None in this NodeMap session: embed a Kconfig tab in it and turn its engine on" : "None with a resolved configuration: open a Kconfig tab and turn its engine on";
+        html += `<div class="inspector-field"><span class="inspector-label">Kconfig engine</span><span class="inspector-val">${escapeHtml(e ? `${e.title || e.tabId} · ${e.version || "?"}${e.arch ? ` · ${e.arch}` : ""} (nodes of ${e.version || "that revision"})` : none)}</span></div>`;
       }
       html += `<ul class="nm-help">
         <li>Drag the background to pan; wheel to zoom (Ctrl+wheel over node content)</li>
@@ -2047,6 +2677,7 @@ export class NodeMapController {
         <li>Ctrl+C / Ctrl+V copy and paste nodes (across NodeMap tabs), Ctrl+D duplicates</li>
         <li>Ctrl+Z undoes, Ctrl+Y or Ctrl+Shift+Z redoes</li>
         <li>Double-click the background for a note; Delete removes, arrows nudge</li>
+        <li>Drag a tab from a tab strip onto the canvas to copy it in (Shift: as a live tab)</li>
       </ul>`;
     }
     this.inspectorEl.innerHTML = html;
@@ -2071,7 +2702,27 @@ export class NodeMapController {
       if (k === "canvas-bg-custom") return this.setCanvasBackground(val, opts);
       return this.setColor(val, opts);
     }
-    if (k === "kconfig-collapse") {
+    if (k === "copy-target") {
+      this.copyTarget = String(val || "");
+      return;
+    }
+    if (k === "content-scale") {
+      const pct = Number(val);
+      if (!Number.isFinite(pct) || pct <= 0) return;
+      const list = this.selectedNodes().filter((x) => M.scalable(x.type));
+      if (!list.length) return;
+      for (const x of list) M.setContentScale(x, pct / 100);
+      // Live while dragging the slider: the inspector redraws (with the new value) once it is let go
+      return this.commit({ inspector: final, coalesce: `insp:content-scale:${list.map((x) => x.id).join(",")}`, coalesceEnd: Boolean(final) });
+    }
+    if (k === "es-name") {
+      if (!final) return;
+      if (!M.renameEmbedSession(this.canvas.settings, el.dataset.id, val)) return this.renderInspector();
+    } else if (k === "follow-session") {
+      this.canvas.settings.followSession = String(val || "");
+      this.syncFollowChannel();
+      this.onKconfigChanged();
+    } else if (k === "kconfig-collapse") {
       this.canvas.settings.kconfigCollapse = Boolean(val);
     } else if (k === "kconfig-engine") {
       this.canvas.settings.kconfigEngine = String(val || "");
@@ -2109,12 +2760,14 @@ export class NodeMapController {
     } else if (node && k.startsWith("d-")) {
       if (!final && el.tagName !== "SELECT") return;
       const f = k.slice(2);
-      const raw = ["start", "end", "context"].includes(f) ? int(val) : val;
-      node.data = M.normalizeData(node.type, { ...node.data, [f]: typeof raw === "string" ? raw.trim() : raw });
+      const raw = ["start", "end", "context", "tid", "secId"].includes(f) ? int(val) : val;
+      // A maintainer node looked up by name or file again forgets the section it resolved before
+      const reset = node.type === "maintainer" && (f === "query" || f === "path") ? { secId: null, title: "" } : {};
+      node.data = M.normalizeData(node.type, { ...node.data, ...reset, [f]: typeof raw === "string" ? raw.trim() : raw });
       if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
     } else return;
     // Typing in a field keeps the inspector (and the caret) as it is
-    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h"), coalesce, coalesceEnd });
+    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h" || k === "es-name"), coalesce, coalesceEnd });
   }
 
   onInspectorClick(e) {
@@ -2128,10 +2781,20 @@ export class NodeMapController {
     else if (k === "canvas-bg" || k === "canvas-bg-reset") this.setCanvasBackground(k === "canvas-bg" ? btn.dataset.value || "" : "");
     else if (k === "duplicate") this.duplicateSelection();
     else if (k === "show-hidden" && node) this.onStructAction(node, "show-hidden");
-    else if (k === "scale-reset" && node?.autoFit) {
-      M.setScaledSize(node, "w", node.baseW);
-      this.commit();
-    }
+    else if (k === "scale-reset") {
+      const list = this.selectedNodes().filter((x) => M.scalable(x.type));
+      for (const x of list) M.setContentScale(x, 1);
+      if (list.length) this.commit();
+    } else if (k === "es-add") {
+      if (M.addEmbedSession(this.canvas.settings)) this.commit();
+    } else if (k === "es-delete") {
+      if (M.removeEmbedSession(this.canvas, btn.dataset.id)) {
+        this.syncFollowChannel();
+        this.commit();
+      }
+    } else if (k === "copy-session" && node) this.copyNodeToSession(node.id, this.copyTarget);
+    else if (k === "mail-expand" && node) this.expandThreadToNodes(node.id);
+    else if (k === "kc-expand" && node) this.expandKconfigRelations(node.id);
     else if (k === "align") this.align(btn.dataset.value);
     else if (k === "distribute") this.distribute(btn.dataset.value);
     else if (k === "group") this.addGroup();
@@ -2174,13 +2837,21 @@ export class NodeMapController {
   svgOptions({ foreign = true } = {}) {
     return {
       editMode: Boolean(this.canvas.settings.editMode),
-      content: (n) => {
-        const entry = this.content.get(this.fetchKeyOf(n));
-        return entry?.status === "ok" ? entry.value : null;
-      },
+      content: (n) => this.modelOf(n),
       structOpts: (n) => this.structOpts(n),
+      rowHeights: (n) => this.structRowHeights(n),
+      kconfigValues: (n) => this.kconfigValuesFor(n),
       foreign: foreign ? (n) => captureNodeForeignObject(n, this.renderer?.element?.(n.id)) : null,
     };
+  }
+
+  /** Heights of a struct node's live rows (content units, one per drawn row), or null without a DOM. */
+  structRowHeights(node) {
+    if (node.type !== "struct") return null;
+    const rows = this.renderer?.element?.(node.id)?.querySelector?.(".nm-struct-rows");
+    if (!rows?.children) return null;
+    const hs = [...rows.children].filter((el) => el.classList?.contains("nm-sf")).map((el) => el.offsetHeight || 0);
+    return hs.length && hs.every((h) => h > 0) ? hs : null;
   }
 
   /** The whole canvas as a standalone SVG document (`opts`: transparent, foreign, pixelScale). */
@@ -2309,6 +2980,7 @@ export class NodeMapController {
       this.selected.clear();
       this.selectedEdge = null;
       this.active = null;
+      this.syncFollowChannel();
       this.applyTransform();
       this.rootEl.querySelector("[data-tb='snap']")?.setAttribute("aria-pressed", String(canvas.settings.snap));
       this.commit();

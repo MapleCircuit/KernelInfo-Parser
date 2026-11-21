@@ -92,10 +92,51 @@ export function renderSourceRows(lines, startLine, path, highlight = null) {
   return html;
 }
 
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+const decodeEntities = (t) => t.replace(/&(?:(amp|lt|gt|quot|apos|nbsp)|#(\d{1,6}));/g, (m, k, n) => (k ? ENTITIES[k] : String.fromCharCode(Number(n))));
+
+/**
+ * Lexical highlighting of source lines as plain segments, for the SVG export: one array per line of
+ * `{text, cls}` where `cls` is the `tok-*` class the code view colors the run with (`""` plain text).
+ * Same highlighter as `renderSourceRows()` (`AstOverlay`), so the image shows the node's colors.
+ */
+export function sourceLineSegments(lines, path) {
+  const ov = new AstOverlay();
+  ov.setFileInfo(null, path || "", lines[0] || "");
+  ov.indexMultiLineSpans(lines);
+  return lines.map((line, i) => htmlSegments(ov.renderLineHtml(i + 1, String(line ?? ""))));
+}
+
+/** `{text, cls}` runs of highlighter HTML (spans only; the innermost `tok-*` class wins). */
+export function htmlSegments(html) {
+  const out = [];
+  const stack = [];
+  const re = /<span\b([^>]*)>|<\/span>|<[^>]*>|[^<]+/g;
+  let m;
+  while ((m = re.exec(String(html || "")))) {
+    const tok = m[0];
+    if (tok.startsWith("</span")) stack.pop();
+    else if (tok.startsWith("<span")) {
+      const cls = /\bclass="([^"]*)"/.exec(m[1] || "")?.[1] || "";
+      stack.push(cls.split(/\s+/).find((c) => c.startsWith("tok-")) || "");
+    }
+    else if (!tok.startsWith("<")) {
+      const text = decodeEntities(tok);
+      const cls = [...stack].reverse().find(Boolean) || "";
+      const last = out[out.length - 1];
+      if (last && last.cls === cls) last.text += text;
+      else out.push({ text, cls });
+    }
+  }
+  return out;
+}
+
 /**
  * Compact source reference a node header shows on the right (`.nm-head-meta`), with its full form as
- * the tooltip: a struct's `file:line` of its definition, a source slice's `path · start–end`. `payload`
- * is the node's loaded content (null while not loaded: no reference).
+ * the tooltip: a struct's `file:line` of its definition, a source slice's `path · start–end`, a diff's
+ * `path · vA..vB` (or short commit), a thread's message count, a Kconfig symbol's definition, a
+ * MAINTAINERS section's status. `payload` is the node's loaded content (the `domain_nodes.js` model for
+ * mail, kconfig and maintainer nodes; null while not loaded: no reference).
  */
 export function headMetaOf(type, payload) {
   if (!payload) return { text: "", title: "" };
@@ -108,6 +149,25 @@ export function headMetaOf(type, payload) {
     const text = `${payload.path} · ${payload.start_line}–${payload.end_line}`;
     const title = `${text} of ${payload.total_lines}${payload.truncated ? " · truncated" : ""}${payload.symbol ? ` · ${payload.symbol.kind} ${payload.symbol.name}` : ""}`;
     return { text, title };
+  }
+  if (type === "diff" && payload.files) {
+    const add = payload.files.reduce((t, f) => t + (f.additions || 0), 0);
+    const del = payload.files.reduce((t, f) => t + (f.deletions || 0), 0);
+    const ref = payload.mode === "commit" ? String(payload.commitHash || "").slice(0, 12) : `${payload.versionA || "?"}..${payload.versionB || "?"}`;
+    const text = `${payload.path ? `${payload.path} · ` : ""}${ref}`;
+    return { text, title: `${text} · +${add} −${del} in ${payload.files.length} file${payload.files.length === 1 ? "" : "s"}` };
+  }
+  if (type === "mail" && Array.isArray(payload.rows)) {
+    const n = payload.rows.length;
+    const text = `${n} message${n === 1 ? "" : "s"}${payload.tid ? ` · t/${payload.tid}` : ""}`;
+    return { text, title: `${text}${payload.total > n ? ` of ${payload.total}` : ""}` };
+  }
+  if (type === "kconfig" && payload.name) {
+    const text = payload.file ? `${payload.file}${payload.line ? `:${payload.line}` : ""}` : "";
+    return { text, title: text ? `CONFIG_${payload.name} defined at ${text}` : "" };
+  }
+  if (type === "maintainer" && payload.status) {
+    return { text: payload.status, title: `S: ${payload.status}` };
   }
   return { text: "", title: "" };
 }

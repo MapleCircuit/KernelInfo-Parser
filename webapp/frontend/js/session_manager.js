@@ -5,7 +5,7 @@
  * and real-time cross-tab communication (BroadcastChannel).
  */
 import { localDB } from "./db.js";
-import { isEmbedMode } from "./utils/embed_mode.js";
+import { embedSessionChannel, embedSessionId, isEmbedMode } from "./utils/embed_mode.js";
 
 const SESSIONS_INDEX_KEY = "kip_sessions_index";
 const SESSION_STORAGE_PIN_KEY = "kip_active_session_id";
@@ -19,11 +19,16 @@ const HEARTBEAT_INTERVAL_MS = 10000;
 
 class SessionManager {
   constructor() {
-    // An embed shell (`?embed=1`, a NodeMap tab node) is a guest of its host window: no channel, no
-    // presence, no session pinning (utils/embed_mode.js)
+    // An embed shell (`?embed=1`, a NodeMap tab node) is a guest of its host window: no workspace
+    // channel, no presence, no session pinning, nothing written to the session index or records
+    // (utils/embed_mode.js). One joined to a NodeMap embedded session (`&embedSession=<key>`) talks
+    // over that session's own channel only, so its Kconfig engines reach the other shells of the
+    // session and the NodeMap that follows it.
     this.embedded = isEmbedMode();
-    this.channel = !this.embedded && typeof window !== "undefined" && "BroadcastChannel" in window
-      ? new BroadcastChannel(BROADCAST_CHANNEL_NAME)
+    this.embedSession = this.embedded ? embedSessionId() : "";
+    const channelName = this.embedded ? (this.embedSession ? embedSessionChannel(this.embedSession) : "") : BROADCAST_CHANNEL_NAME;
+    this.channel = channelName && typeof window !== "undefined" && "BroadcastChannel" in window
+      ? new BroadcastChannel(channelName)
       : null;
 
     this.windowId = null;
@@ -40,7 +45,25 @@ class SessionManager {
     this.incomingTabDrag = null;
     this.subscribers = new Map();
 
-    if (this.embedded) return;
+    if (this.embedded) {
+      if (this.embedSession) {
+        // A session of its own per shell: the shells of one embedded session see each other's engines
+        // as remote ones (the channel listeners skip messages of their own session)
+        this.activeSessionId = `nms:${this.embedSession}:${this.getWindowId()}`;
+        this.activeSessionName = "NodeMap session";
+        this.initChannelListeners();
+        // A shell going away (tab node removed, moved to another session, reloaded) retires its engines
+        // in the sibling shells and the NodeMap following the session
+        if (typeof window !== "undefined") {
+          window.addEventListener("pagehide", () => {
+            try {
+              this.channel?.postMessage({ type: "window:unloading", winId: this.getWindowId(), sessionId: this.activeSessionId });
+            } catch (e) {}
+          });
+        }
+      }
+      return;
+    }
     this.getWindowId();
     this.initChannelListeners();
     this.initWindowLifecycle();
@@ -227,6 +250,13 @@ class SessionManager {
           break;
         }
 
+        case "tab:drop:copied": {
+          // A tab dragged out of this window was dropped onto a NodeMap canvas of another window, which
+          // copied it: the drag was taken, so it must not be elevated into a window of its own
+          if (msg.sourceWinId && msg.sourceWinId === this.getWindowId()) this.emit("tab:drop:copied", msg);
+          break;
+        }
+
         case "tab:push": {
           // A tab handed straight to this window's session from another one (§5.24.5), without a
           // drag: it is taken here exactly as a cross-window drop, and the window it came from
@@ -308,12 +338,14 @@ class SessionManager {
   }
 
   saveActiveWindowsRegistry(reg) {
+    if (this.embedded) return; // embed shells never write workspace sessions
     try {
       localStorage.setItem(ACTIVE_WINDOWS_KEY, JSON.stringify(reg));
     } catch (e) {}
   }
 
   registerActiveWindow(sessionId, sessionName) {
+    if (this.embedded) return; // embed shells never write workspace sessions
     if (!sessionId) return;
     try {
       const reg = this.getActiveWindowsRegistry();
@@ -454,6 +486,7 @@ class SessionManager {
   }
 
   pinSessionToWindow(sessionId, sessionName = null) {
+    if (this.embedded) return; // embed shells never write workspace sessions
     if (sessionId !== this.activeSessionId) this.beforeSessionChange?.();
     this.activeSessionId = sessionId;
     if (sessionName) {
@@ -522,6 +555,8 @@ class SessionManager {
   }
 
   getSessionsIndex() {
+    // An embed shell lists no workspace session (and never migrates or writes the index)
+    if (this.embedded) return [];
     try {
       const raw = localStorage.getItem(SESSIONS_INDEX_KEY);
       if (raw) {
@@ -537,6 +572,7 @@ class SessionManager {
   }
 
   saveSessionsIndex(index) {
+    if (this.embedded) return; // embed shells never write workspace sessions
     try {
       localStorage.setItem(SESSIONS_INDEX_KEY, JSON.stringify(index));
     } catch (e) {
@@ -545,6 +581,7 @@ class SessionManager {
   }
 
   migrateLegacySession() {
+    if (this.embedded) return []; // embed shells never write workspace sessions
     try {
       const legacyRaw = localStorage.getItem("kernel_ide_state");
       if (legacyRaw) {
@@ -597,6 +634,7 @@ class SessionManager {
     kconfigProfiles = {},
     kconfigToolchains = {}
   } = {}) {
+    if (this.embedded) return null; // embed shells never write workspace sessions
     const timestampPart = Date.now().toString(36);
     const randomPart = Math.random().toString(36).substring(2, 8);
     const id = `sess_${timestampPart}_${randomPart}`;
@@ -754,6 +792,7 @@ class SessionManager {
   }
 
   saveActiveSession(stateObj) {
+    if (this.embedded) return; // embed shells never write workspace sessions
     if (!this.activeSessionId) return;
     const id = this.activeSessionId;
 
@@ -803,6 +842,7 @@ class SessionManager {
   }
 
   renameSession(sessionId, newName) {
+    if (this.embedded) return false; // embed shells never write workspace sessions
     const trimmed = (newName || "").trim();
     if (!sessionId || !trimmed) return false;
 
@@ -837,6 +877,7 @@ class SessionManager {
   }
 
   deleteSession(sessionId) {
+    if (this.embedded) return false; // embed shells never write workspace sessions
     if (!sessionId) return false;
 
     try {
@@ -1001,6 +1042,16 @@ class SessionManager {
   }
 
   /**
+   * Tell the window a dragged tab came from that a NodeMap canvas here copied it (the tab stays there:
+   * `tab:drop:copied` keeps that window from elevating it, `components/tabs.js`).
+   */
+  broadcastTabDropCopied({ tabId, sourceWinId }) {
+    if (!this.channel || !tabId || !sourceWinId || sourceWinId === this.getWindowId()) return false;
+    this.channel.postMessage({ type: "tab:drop:copied", winId: this.getWindowId(), tabId, sourceWinId });
+    return true;
+  }
+
+  /**
    * Hand a tab to the window holding `targetSessionId` (§5.24.5). Whether any window is listening
    * is not known here — the caller writes the tab into that session's stored record when no
    * `tab:transfer:accepted` comes back, so a stale presence entry cannot lose it.
@@ -1024,6 +1075,7 @@ class SessionManager {
    * values being shared across sessions under `profileKey` (§5.8). Returns the stored tab, or null.
    */
   pushTabToStoredSession(sessionId, payload) {
+    if (this.embedded) return null; // embed shells never write workspace sessions
     const session = this.readSession(sessionId);
     const tabData = payload?.tabData;
     if (!session || !tabData) return null;

@@ -15,11 +15,10 @@ import { requestVersionSwitch } from "./version_switch.js";
 import { attachScrollMemory } from "./scroll_memory.js";
 import { bindViewApi } from "../api.js";
 import { projectBadge } from "../utils/projects.js";
+import { TAB_DRAG_MIME, TAB_DRAG_TEXT_PREFIX } from "../utils/tab_drag.js";
 
-// Dragged tab in the drag event's data transfer; the text form is what survives browsers that
-// hand a custom type only to the window the drag started in.
-const TAB_DRAG_MIME = "application/kip-tab";
-const TAB_DRAG_TEXT_PREFIX = "kip-tab:";
+// Dragged tab in the drag event's data transfer (utils/tab_drag.js): the text form is what survives
+// browsers that hand a custom type only to the window the drag started in.
 // A drop on another window of this browser also lands outside this one: elevating the tab into a
 // new window waits this long for that window to say it took it (§5.24.4).
 const TRANSFER_GRACE_MS = 250;
@@ -54,6 +53,12 @@ export class TabsComponent {
       const title = tab.title;
       state.closeTab(msg.tabId, pane ? pane.id : null);
       toast.info(`'${title}' moved to session '${msg.sessionName || "another window"}'`);
+    });
+
+    // A NodeMap canvas of another window copied a tab dragged out of this one: the drag was taken
+    // there, so dragend does not elevate the tab into a window of its own (the tab stays here)
+    sessionManager.subscribe("tab:drop:copied", (msg) => {
+      if (msg?.tabId) this.transferredAwayTabIds.add(msg.tabId);
     });
 
     // A tab pushed to the session this window holds, from another window's tab menu (§5.24.5)
@@ -296,7 +301,8 @@ export class TabsComponent {
         payload
       };
 
-      e.dataTransfer.effectAllowed = "move";
+      // Moved between panes and windows; copied onto a NodeMap canvas (its drop asks for "copy")
+      e.dataTransfer.effectAllowed = "copyMove";
       const serialized = JSON.stringify(payload);
       e.dataTransfer.setData(TAB_DRAG_MIME, serialized);
       e.dataTransfer.setData("text/plain", `${TAB_DRAG_TEXT_PREFIX}${serialized}`);

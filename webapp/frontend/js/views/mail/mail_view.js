@@ -11,6 +11,7 @@ import { mergedListHtml, mergedSummary } from "./merged_render.js";
 import { pickAndTry, seriesMessages } from "./patch_try.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
+import { mailSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
 import { toast } from "../../components/toast.js";
@@ -1039,6 +1040,7 @@ export class MailView {
             <button class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
             <button class="code-btn mail-action-btn" data-act="copy-link" title="Copy versionless deep link to this message">🔗 Link</button>
             <button class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
+            <button class="code-btn mail-action-btn" data-act="nodemap" title="Send this thread, focused on this message, to the NodeMap canvas">🕸 NodeMap</button>
             ${msgSummary.is_patch && !/^\s*re\s*:/i.test(msgSummary.subject || "") ? `<button class="code-btn mail-action-btn" data-act="try" title="Apply this patch to a revision, in memory">Try on revision…</button>` : ""}
             <a href="${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>
           </div>
@@ -1128,6 +1130,16 @@ export class MailView {
         } else {
           toast.error("No raw content available to copy");
         }
+      };
+    }
+
+    const nodemapBtn = card.querySelector('[data-act="nodemap"]');
+    if (nodemapBtn) {
+      nodemapBtn.onclick = (e) => {
+        e.stopPropagation();
+        const repo = this.api?.repo || state.repoOf(state.findTab(this.tabId)) || state.activeRepo();
+        const spec = mailSpec({ tid: msgSummary.tid || this.activeThreadId, mid: msgSummary.message_id || "", subject: msgSummary.subject || "", repo });
+        if (spec) sendToNodemap(spec, { repo });
       };
     }
 

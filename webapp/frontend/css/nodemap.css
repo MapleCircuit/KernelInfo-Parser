@@ -26,6 +26,8 @@
 }
 
 .nodemap-canvas-wrapper.nm-panning { cursor: grabbing; }
+/* A tab dragged from a tab strip over the canvas: dropping copies it in as a node */
+.nodemap-canvas-wrapper.nm-drop-target { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent-blue) 70%, transparent); background-color: color-mix(in srgb, var(--accent-blue) 6%, var(--nm-canvas-bg, transparent)); }
 .nodemap-canvas-wrapper.nm-tool-select { cursor: crosshair; }
 
 .nodemap-canvas-wrapper.nm-grid-on {
@@ -186,11 +188,13 @@
 .nm-node.nm-interacting { outline: 2px solid var(--accent-green); outline-offset: 1px; }
 .nm-node.nm-has-accent { border-color: color-mix(in srgb, var(--nm-accent) 55%, var(--border-color)); }
 
-/* Auto-fitted nodes lay out at their natural size and are drawn scaled from the top left corner; their
- * resize handles and side ports keep their on-screen size (counter-scaled about their own center) */
-.nm-node.nm-autofit { transform-origin: 0 0; }
-.nm-autofit > .nm-rz, .nm-autofit > .nm-port-side { transform: scale(calc(1 / var(--nm-scale, 1))); }
-.nm-autofit > .nm-port-side:hover { transform: scale(calc(1.3 / var(--nm-scale, 1))); }
+/* Scaled nodes (node.scale: auto-fitted ones at their natural size, others at w/scale × h/scale) are
+ * drawn scaled from the top left corner; their resize handles and side ports keep their on-screen size
+ * (counter-scaled about their own center) */
+.nm-node.nm-autofit, .nm-node.nm-scaled { transform-origin: 0 0; }
+.nm-autofit > .nm-rz, .nm-autofit > .nm-port-side,
+.nm-scaled > .nm-rz, .nm-scaled > .nm-port-side { transform: scale(calc(1 / var(--nm-scale, 1))); }
+.nm-autofit > .nm-port-side:hover, .nm-scaled > .nm-port-side:hover { transform: scale(calc(1.3 / var(--nm-scale, 1))); }
 
 /* Measuring a node's natural size (nodemap_controller.measureNatural): content unclipped, unscaled */
 .nm-node.nm-measuring { width: max-content !important; height: max-content !important; transform: none !important; }
@@ -310,7 +314,7 @@
   box-shadow: none;
 }
 
-.nm-node.nm-type-group:not(.nm-has-accent) { --nm-accent: var(--text-muted); }
+.nm-node.nm-type-group:not(.nm-has-accent) { --nm-accent: var(--accent-blue); }
 .nm-node.nm-type-group.selected { z-index: 1; }
 .nm-type-group > .nm-node-head { background: transparent; border: none; }
 /* The frame lets pan, marquee and double-click through; its label, handles and ports stay interactive */
@@ -606,6 +610,76 @@
 .nm-src-code { padding-right: 12px; }
 .nm-src-hl { background: color-mix(in srgb, var(--accent-yellow) 12%, transparent); }
 
+/* 5b. Diffs (domain_nodes.js): old / new line numbers, sign, added and removed lines */
+.nm-diff { font-family: var(--font-mono); font-size: var(--fs-11, 11px); background: var(--bg-primary); color: var(--text-primary); }
+.nm-has-bg .nm-diff { background: transparent; }
+.nm-diff-row { display: flex; white-space: pre; line-height: 1.5; }
+.nm-diff-no { flex-shrink: 0; min-width: 4ch; padding: 0 4px; text-align: right; color: var(--text-muted); user-select: none; font-size: var(--fs-10, 10px); }
+.nm-diff-sign { flex-shrink: 0; width: 1.5ch; text-align: center; user-select: none; }
+.nm-diff-code { padding: 0 12px 0 2px; }
+.nm-diff-add { color: var(--diff-add-fg); background: color-mix(in srgb, var(--diff-add-fg) 12%, transparent); }
+.nm-diff-del { color: var(--diff-del-fg); background: color-mix(in srgb, var(--diff-del-fg) 12%, transparent); }
+.nm-diff-hunk { color: var(--syn-preproc); background: color-mix(in srgb, var(--accent-blue) 8%, transparent); padding-left: 8px; }
+.nm-diff-file { color: var(--text-primary); background: var(--bg-tertiary); font-weight: 600; padding-left: 8px; }
+.nm-diff-note { color: var(--text-muted); font-style: italic; padding-left: 8px; }
+
+/* 5c. Mailing-list threads: reply tree with connector guides */
+.nm-mail { padding: 4px 0; }
+.nm-mail-row { padding: 0 8px; overflow: hidden; }
+.nm-mail-focus { background: color-mix(in srgb, var(--accent-blue) 10%, transparent); }
+.nm-mail-line { display: flex; align-items: center; gap: 4px; min-height: 18px; white-space: nowrap; }
+/* 12 units per depth, as the meta / excerpt indent and the export (the line's 4-unit gap is taken back) */
+.nm-mail-guide { position: relative; flex: none; align-self: stretch; width: 12px; margin-right: -4px; }
+.nm-mail-guide::before, .nm-mail-guide::after { content: ""; position: absolute; border-color: var(--border-color); border-style: solid; border-width: 0; }
+.nm-g-pipe::before, .nm-g-tee::before { left: 6px; top: 0; bottom: -40px; border-left-width: 1px; }
+.nm-g-end::before { left: 6px; top: 0; height: 50%; border-left-width: 1px; }
+.nm-g-tee::after, .nm-g-end::after { left: 6px; top: 50%; width: 6px; border-top-width: 1px; }
+.nm-mail-toggle, .nm-mail-spawn { border: none; background: none; color: var(--text-muted); cursor: pointer; padding: 0 2px; font-size: var(--fs-10, 10px); flex: none; }
+.nm-mail-spawn { margin-left: auto; opacity: 0; }
+.nm-mail-row:hover .nm-mail-spawn, .nm-mail-spawn:focus-visible { opacity: 1; }
+.nm-mail-toggle:hover, .nm-mail-spawn:hover { color: var(--text-primary); }
+.nm-mail-badge { flex: none; font-size: var(--fs-9, 9px); padding: 0 4px; border-radius: 3px; color: var(--accent-blue); background: color-mix(in srgb, var(--accent-blue) 16%, transparent); }
+.nm-mail-subj { overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+.nm-mail-meta { padding-left: calc(var(--nm-mail-depth, 0) * 12px + 18px); color: var(--text-muted); font-size: var(--fs-10, 10px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nm-mail-excerpt { margin: 2px 0 4px calc(var(--nm-mail-depth, 0) * 12px + 18px); padding: 4px 6px; font-family: var(--font-mono); font-size: var(--fs-10, 10px); color: var(--text-secondary); background: var(--bg-primary); border-left: 2px solid var(--border-color); white-space: pre-wrap; }
+
+/* 5d. Kconfig symbols: value badge and relation chips */
+.nm-kc { padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }
+.nm-kc-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.nm-kc-name { font-family: var(--font-mono); font-weight: 700; color: var(--text-primary); }
+.nm-kc-type { font-family: var(--font-mono); font-size: var(--fs-10, 10px); color: var(--syn-type); }
+.nm-kc-val { font-family: var(--font-mono); font-size: var(--fs-10, 10px); padding: 0 6px; border-radius: 8px; border: 1px solid currentColor; color: var(--accent-blue); background: color-mix(in srgb, currentColor 14%, transparent); }
+.nm-kc-val.nm-kc-y { color: var(--accent-green); }
+.nm-kc-val.nm-kc-m { color: var(--accent-orange); }
+.nm-kc-val.nm-kc-n { color: var(--accent-red); }
+.nm-kc-val.nm-kc-unset, .nm-kc-val.nm-kc-none { color: var(--text-muted); }
+.nm-kc-prompt { color: var(--text-secondary); font-style: italic; }
+.nm-kc-group { display: flex; flex-direction: column; gap: 3px; }
+.nm-kc-rel { font-size: var(--fs-10, 10px); font-weight: 600; color: var(--text-muted); }
+.nm-kc-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.nm-kc-chip { font-family: var(--font-mono); font-size: var(--fs-10, 10px); padding: 0 6px; border-radius: 8px; border: 1px solid var(--border-color); background: none; color: var(--text-primary); cursor: pointer; }
+.nm-kc-chip:hover { border-color: var(--accent-blue); }
+.nm-kc-chip.on { border-color: var(--accent-blue); background: color-mix(in srgb, var(--accent-blue) 14%, transparent); }
+
+/* 5e. MAINTAINERS sections */
+.nm-mt { padding: 6px 8px; font-family: var(--font-mono); }
+.nm-mt-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-family: var(--font-sans, sans-serif); }
+.nm-mt-title { flex: 1; min-width: 0; font-weight: 700; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm-mt-status { flex: none; font-size: var(--fs-10, 10px); padding: 0 6px; border-radius: 8px; border: 1px solid currentColor; color: var(--text-muted); }
+.nm-mt-supported { color: var(--accent-green); }
+.nm-mt-maintained { color: var(--accent-blue); }
+.nm-mt-odd { color: var(--accent-orange); }
+.nm-mt-orphan { color: var(--accent-red); }
+.nm-mt-row { display: flex; gap: 6px; white-space: nowrap; line-height: 1.45; }
+.nm-mt-tag { flex: none; font-weight: 700; color: var(--text-muted); }
+.nm-mt-tag-M { color: var(--accent-blue); }
+.nm-mt-tag-R { color: var(--syn-type); }
+.nm-mt-tag-L { color: var(--accent-green); }
+.nm-mt-tag-T { color: var(--syn-preproc); }
+.nm-mt-tag-F { color: var(--syn-number); }
+.nm-mt-tag-X { color: var(--accent-red); }
+.nm-mt-val { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; }
+
 /* 6. Man pages and embedded tabs */
 .nm-man { display: flex; flex-direction: column; }
 .nm-man > .man-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -715,7 +789,14 @@
 .nm-insp-grid .nodemap-btn { justify-content: center; border-color: var(--border-color); }
 .nm-insp-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .nm-insp-actions .nodemap-btn { border-color: var(--border-color); }
-.nm-insp-inline { display: flex; gap: 4px; }
+.nm-insp-inline { display: flex; gap: 4px; align-items: center; }
+.nm-insp-scale input[type="range"] { flex: 1; min-width: calc(60px * var(--ui-layout-scale, 1)); padding: 0; border: none; background: none; }
+.nm-insp-scale input[type="number"] { width: calc(56px * var(--ui-layout-scale, 1)); flex: none; }
+.nm-hint { color: var(--text-muted); font-family: inherit; }
+.nm-es-list { display: flex; flex-direction: column; gap: 4px; }
+.nm-es-row { display: flex; gap: 4px; align-items: center; }
+.nm-es-row input { flex: 1; }
+.nm-es-count { flex: none; min-width: 2ch; text-align: center; font-family: var(--font-mono); font-size: var(--fs-11, 11px); color: var(--text-muted); }
 .nm-insp-check { flex-direction: row; align-items: center; gap: 6px; font-size: var(--fs-12, 12px); color: var(--text-secondary); }
 
 .nm-swatches { display: flex; flex-wrap: wrap; gap: 5px; }

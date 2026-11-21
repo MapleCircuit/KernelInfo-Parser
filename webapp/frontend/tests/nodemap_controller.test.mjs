@@ -22,7 +22,7 @@ globalThis.setTimeout = (...args) => {
 };
 
 const { isEmbedMode } = await import("../js/utils/embed_mode.js");
-const { nodeSpecsForTab, sourceSpec, targetNodemapTab, tokenSpec } = await import("../js/views/nodemap/nodemap_bridge.js");
+const { diffSpec, kconfigSpec, mailSpec, maintainerSpec, nodeSpecsForTab, sourceSpec, tabForNode, targetNodemapTab, tokenSpec } = await import("../js/views/nodemap/nodemap_bridge.js");
 const { NodeMapController } = await import("../js/views/nodemap/nodemap_controller.js");
 const M = await import("../js/views/nodemap/canvas_model.js");
 const { state } = await import("../js/state.js");
@@ -750,4 +750,334 @@ test("image export dialog: transparent background and PNG upscale with the outpu
   made.els.btn.onclick();
   assert.deepEqual(pngOpts, { transparent: false, scale: 2 });
   assert.deepEqual(pngSize(w, h, 4), { w: w * 4, h: h * 4, scale: 4, clamped: false });
+});
+
+// ------------------------------------------------------------------ tab drag-in, embedded sessions, copy to session, domain nodes
+
+const flush = (ms = 0) => new Promise((r) => realSetTimeout(r, ms));
+
+test("Send to NodeMap specs of the domain views; tabs convert to native diff / mail / kconfig / maintainer nodes", () => {
+  assert.deepEqual(diffSpec({ versionA: "v3.0", versionB: "v3.1", path: "a.c" }).data, { mode: "file", versionA: "v3.0", versionB: "v3.1", path: "a.c", oldPath: "" });
+  assert.equal(diffSpec({ versionA: "v3.0", versionB: "v3.1" }), null, "a file diff needs its file");
+  assert.equal(diffSpec({ commitHash: "abc123", version: "v3.0" }).data.mode, "commit");
+  assert.equal(mailSpec({}), null);
+  assert.equal(mailSpec({ tid: "5", mid: "m@x" }).data.tid, 5);
+  assert.equal(kconfigSpec({ symbol: "CONFIG_SMP" }).data.symbol, "SMP");
+  assert.equal(kconfigSpec({ symbol: "a b" }), null);
+  assert.equal(maintainerSpec({ secId: "3" }).data.secId, 3);
+  const T = (tab) => nodeSpecsForTab({ version: "v3.0", ...tab }, hashOf);
+  assert.equal(T({ type: "diff", versionA: "v3.0", versionB: "v3.1", path: "a.c" })[0].type, "diff");
+  assert.equal(T({ type: "diff", versionA: "v3.0", versionB: "v3.1" })[0].type, "tab", "a whole-revision compare stays a live tab");
+  assert.deepEqual(T({ type: "commits", commitId: "abc123" })[0].data, { mode: "commit", commitHash: "abc123", path: "" });
+  assert.deepEqual(T({ type: "mail", threadId: "9", messageId: "m@x" })[0].data, { tid: 9, mid: "m@x", subject: "" });
+  assert.deepEqual(T({ type: "kconfig", symbol: "SMP", arch: "arm64" })[0].data, { symbol: "SMP", arch: "arm64" });
+  assert.equal(T({ type: "kconfig", arch: "arm64" })[0].type, "tab", "a Kconfig tab without a symbol embeds live");
+  assert.equal(T({ type: "maintainers", secId: 4, section: "SCHED" })[0].type, "maintainer");
+  assert.equal(nodeSpecsForTab({ type: "kconfig", symbol: "SMP", version: "v3.0" }, hashOf, { live: true })[0].type, "tab");
+  // Nodes open as the matching workspace tab (Open as tab, Copy to Session)
+  const n = (type, data, extra = {}) => M.createNode(type, { version: "v3.0", data, ...extra });
+  assert.deepEqual(tabForNode(n("kconfig", { symbol: "SMP" })), { type: "kconfig", title: "KConfig (x86_64)", symbol: "SMP", arch: "x86_64", repo: "", version: "v3.0" });
+  assert.equal(tabForNode(n("diff", { commitHash: "abcdef1" })).commitId, "abcdef1");
+  assert.deepEqual([tabForNode(n("mail", { tid: 5, mid: "m" })).threadId, tabForNode(n("mail", { tid: 5, mid: "m" })).messageId], [5, "m"]);
+  assert.equal(tabForNode(n("maintainer", { secId: 3, title: "S" })).secId, 3);
+  const t = tabForNode(n("tab", { tabType: "code", hash: "v=v3.1&tab=code&file=a.c&line=4-9" }));
+  assert.deepEqual([t.type, t.path, t.cursorLine, t.lineEnd, t.version], ["code", "a.c", 4, 9, "v3.1"], "a tab node's address as tab fields");
+  assert.equal(tabForNode(n("note", { text: "x" })), null);
+});
+
+test("tabs dropped on the canvas are copied in at the drop point: native nodes, Shift for a live tab", async () => {
+  const { sessionManager } = await import("../js/session_manager.js");
+  const { c } = controller();
+  withViewport(c);
+  c.canvas.viewport = { x: 100, y: 50, zoom: 2 };
+  const copied = [];
+  const real = sessionManager.broadcastTabDropCopied;
+  sessionManager.broadcastTabDropCopied = (m) => copied.push(m);
+  try {
+    const tab = { id: "t-code", type: "code", path: "kernel/fork.c", version: "v3.0", title: "fork.c" };
+    const [src] = c.dropTab({ tabId: tab.id, tabData: tab }, 500, 450);
+    assert.equal(src.type, "source");
+    assert.deepEqual([src.x + src.w / 2, src.y + src.h / 2], [200, 200], "centered on the drop point in canvas units");
+    assert.deepEqual([...c.selected], [src.id]);
+    const [live] = c.dropTab({ tabId: tab.id, tabData: tab, sourceWinId: "other-win" }, 500, 450, { live: true });
+    assert.equal(live.type, "tab", "Shift drops a live tab node");
+    assert.equal(live.data.embedSessionId, "nms-1", "running in the canvas's first embedded session");
+    assert.deepEqual(copied, [{ tabId: "t-code", sourceWinId: "other-win" }], "the window it came from keeps its tab");
+    assert.deepEqual(c.dropTab({ tabData: { type: "nodemap", id: "x" } }, 0, 0), [], "a canvas is never dropped into a canvas");
+    assert.equal(c.canvas.nodes.length, 2);
+    const ev = (types) => ({ dataTransfer: { types } });
+    assert.equal(c.acceptsTabDrag(ev(["application/kip-tab"])), true);
+    assert.equal(c.acceptsTabDrag(ev(["Files"])), false);
+  } finally {
+    sessionManager.broadcastTabDropCopied = real;
+  }
+});
+
+/** A stand-in BroadcastChannel factory: posted messages and closes are recorded. */
+function fakeChannels() {
+  const made = [];
+  const factory = (name) => {
+    const ch = { name, posted: [], closed: false, onmessage: null, postMessage(m) { this.posted.push(m); }, close() { this.closed = true; } };
+    made.push(ch);
+    return ch;
+  };
+  return { made, factory };
+}
+
+test("embedded sessions: tab iframes join one; the canvas follows its Kconfig engines over the scoped channel", () => {
+  const { c } = controller();
+  withViewport(c);
+  const { made, factory } = fakeChannels();
+  c.channelFactory = factory;
+  c.kconfigSource = { list: () => [], context: () => null };
+  const before = localStorage.getItem("kip_sessions_index");
+  const t = c.addNode({ type: "tab", data: { tabType: "kconfig", hash: "tab=kconfig&v=v3.0" } });
+  assert.equal(t.data.embedSessionId, "nms-1");
+  const body = { innerHTML: "", querySelector: () => null };
+  c.renderBody(t, body);
+  assert.match(body.innerHTML, /\?embed=1&amp;embedSession=tab-1%3Anms-1#tab=kconfig/, "the iframe joins the canvas-scoped session");
+  // Inspector: a second session, the tab moved to it, the canvas following it
+  c.selected = new Set();
+  c.onInspectorClick({ target: { closest: () => ({ dataset: { insp: "es-add" } }) } });
+  assert.equal(c.canvas.settings.embedSessions.length, 2);
+  c.selected = new Set([t.id]);
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "d-embedSessionId" }, value: "nms-2", tagName: "SELECT" }) } }, true);
+  assert.equal(t.data.embedSessionId, "nms-2");
+  assert.match(c.bodyKey(t), /tab-1:nms-2/, "a new session rebuilds the iframe");
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "follow-session" }, value: "nms-2", tagName: "SELECT" }) } }, true);
+  const ch = made.at(-1);
+  assert.equal(ch.name, "kip_nodemap_session:tab-1:nms-2");
+  assert.deepEqual(ch.posted.map((m) => m.type), ["kconfig:request_engines"], "the session's iframes are asked for their engines");
+  // An embedded Kconfig tab announces its engine, then edits a value
+  const s = c.addNode({ type: "struct", version: "v3.0", data: { name: "n" } });
+  c.content.set(c.fetchKeyOf(s), { status: "ok", value: LAYOUT });
+  const k = c.addNode({ type: "kconfig", version: "v3.0", data: { symbol: "A" } });
+  c.content.set(c.fetchKeyOf(k), { status: "ok", value: { detail: { name: "A" }, graph: { edges: [] } } });
+  assert.equal(c.kconfigValuesFor(k), null, "nothing announced yet");
+  const epoch = c.kconfigEpoch;
+  ch.onmessage({ data: { type: "kconfig:engine:announced", tabId: "kt", winId: "w1", version: "v3.0", arch: "x86_64", assignments: { CONFIG_A: "y", A: "y" } } });
+  assert.equal(c.kconfigEpoch, epoch + 1, "an engine announcement redraws");
+  assert.equal(c.kconfigEngineFor(s).tabId, "kt");
+  assert.equal(structRows(LAYOUT, s.data, c.structOpts(s)).rows.find((r) => r.key === "3:ifdef").kind, "pp", "CONFIG_A=y keeps the branch open");
+  assert.match(c.bodyKey(k), /^\["y"/, "the Kconfig node shows y");
+  ch.onmessage({ data: { type: "kconfig:assignments:broadcast", tabId: "kt", assignments: { CONFIG_B: "y", B: "y" } } });
+  c.evalCache.clear();
+  assert.equal(structRows(LAYOUT, s.data, c.structOpts(s)).rows.find((r) => r.key === "3:ifdef").kind, "summary", "an edit in the embedded tab folds the struct's #ifdef");
+  assert.match(c.bodyKey(k), /^\["n"|^\[""/, "and the Kconfig node's value follows");
+  ch.onmessage({ data: { type: "kconfig:assignments:broadcast", tabId: "unknown", assignments: {} } });
+  assert.equal(ch.posted.at(-1).type, "kconfig:request_engines", "an unknown engine is asked to announce itself");
+  ch.onmessage({ data: { type: "kconfig:engine:revoked", tabId: "kt", winId: "other" } });
+  assert.ok(c.embedEngines.has("kt"), "only the announcing window revokes");
+  ch.onmessage({ data: { type: "kconfig:engine:revoked", tabId: "kt", winId: "w1" } });
+  assert.equal(c.embedEngines.size, 0);
+  // Back to the host workspace: the scoped channel closes; deleting a session keeps one
+  c.selected = new Set();
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "follow-session" }, value: "", tagName: "SELECT" }) } }, true);
+  assert.ok(ch.closed);
+  c.onInspectorClick({ target: { closest: () => ({ dataset: { insp: "es-delete", id: "nms-2" } }) } });
+  assert.deepEqual(c.canvas.settings.embedSessions.map((x) => x.id), ["nms-1"]);
+  assert.equal(t.data.embedSessionId, "nms-1");
+  assert.equal(localStorage.getItem("kip_sessions_index"), before, "embedded sessions never reach the workspace session index");
+  c.canvas.settings.followSession = "nms-1";
+  c.syncFollowChannel();
+  const last = made.at(-1);
+  c.dispose();
+  assert.ok(last.closed, "dispose closes the followed channel");
+});
+
+test("embed shells write no workspace session: index, records and pins stay untouched", async () => {
+  const { sessionManager } = await import("../js/session_manager.js");
+  const keys = () => JSON.stringify(Object.keys(localStorage).sort().map((k) => [k, localStorage.getItem(k)]));
+  const before = keys();
+  sessionManager.embedded = true;
+  try {
+    assert.deepEqual(sessionManager.getSessionsIndex(), [], "Switch Session lists nothing in an embed shell");
+    sessionManager.saveSessionsIndex([{ id: "x" }]);
+    sessionManager.saveActiveSession({ panes: [] });
+    assert.equal(sessionManager.createSession({ name: "n" }), null);
+    assert.equal(sessionManager.pushTabToStoredSession("x", { tabData: { id: "t" } }), null);
+    sessionManager.pinSessionToWindow("x");
+    assert.equal(keys(), before);
+  } finally {
+    sessionManager.embedded = false;
+  }
+});
+
+test("Copy to Session: targets every other workspace session and hands the node over as a tab", async () => {
+  const { c } = controller();
+  withViewport(c);
+  const pushed = [];
+  const stored = [];
+  c.sessions = {
+    getSessionsIndex: () => [{ id: "cur", name: "Current" }, { id: "s2", name: "Other" }],
+    getWindowId: () => "w-1",
+    subscribe: () => () => {},
+    broadcastTabPush: (p, id) => pushed.push([p, id]),
+    pushTabToStoredSession: (id, p) => (stored.push([id, p]), p.tabData),
+  };
+  const prev = state.currentSessionId;
+  state.currentSessionId = "cur";
+  try {
+    assert.deepEqual(c.copyTargets().map((x) => x.id), ["s2"], "never the session this window holds");
+    const k = c.addNode({ type: "kconfig", version: "v3.0", data: { symbol: "SMP", arch: "arm64" } });
+    assert.ok(c.copyNodeToSession(k.id, "s2"));
+    assert.equal(pushed.length, 1);
+    assert.equal(pushed[0][1], "s2");
+    assert.deepEqual([pushed[0][0].tabData.type, pushed[0][0].tabData.symbol, pushed[0][0].tabData.arch], ["kconfig", "SMP", "arm64"]);
+    assert.ok(c.byId(k.id), "the node stays on the canvas");
+    await flush(450);
+    assert.equal(stored.length, 1, "no window took it live: written into the session's stored record");
+    assert.equal(c.copyNodeToSession(k.id, "cur"), false, "not to the current session");
+    c.sessions.getSessionsIndex = () => [{ id: "cur" }];
+    assert.deepEqual(c.copyTargets(), []);
+  } finally {
+    state.currentSessionId = prev;
+  }
+});
+
+test("content scale in the inspector: any non-group node, batch over a selection, independent of auto-fit", () => {
+  const { c } = controller();
+  withViewport(c);
+  const a = c.addNode({ type: "source", data: { path: "a.c" } });
+  const b = c.addNode({ type: "tab", data: { tabType: "commits", hash: "tab=commits" } });
+  const g = c.addGroup();
+  const [w, h] = [a.w, a.h];
+  c.selected = new Set([a.id, b.id, g.id]);
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "content-scale" }, value: "150", tagName: "INPUT", type: "range" }) } }, true);
+  assert.deepEqual([a.scale, b.scale, g.scale], [1.5, 1.5, 1], "groups have none");
+  assert.deepEqual([a.w, a.h], [w, h], "the outer box stays");
+  c.onInspectorClick({ target: { closest: () => ({ dataset: { insp: "scale-reset" } }) } });
+  assert.deepEqual([a.scale, b.scale], [1, 1]);
+  c.selected = new Set([a.id]);
+  c.measureNatural = () => ({ w: 300, h: 100 });
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "autofit" }, type: "checkbox", checked: true, tagName: "INPUT" }) } }, true);
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "content-scale" }, value: "200", tagName: "INPUT", type: "number" }) } }, true);
+  assert.deepEqual([a.scale, a.w, a.h], [2, a.baseW * 2, a.baseH * 2], "an auto-fitted node grows with its scale");
+  const svg = canvasToSvg(c.canvas, (x) => x, c.svgOptions());
+  assert.match(svg, /scale\(2\)/);
+});
+
+test("collapsing a guard of an auto-fitted struct measures it again", () => {
+  const { c } = controller();
+  withViewport(c);
+  const s = c.addNode({ type: "struct", data: { name: "n" } });
+  c.content.set(c.fetchKeyOf(s), { status: "ok", value: LAYOUT });
+  let measured = 0;
+  c.measureNatural = () => (measured++, { w: 300, h: 200 });
+  M.setAutoFit(s, true);
+  c.canvas.settings.editMode = true;
+  measured = 0;
+  clickAct(c, s.id, "guard-fold", "3:ifdef");
+  assert.ok(measured > 0, "a fold re-fits");
+  measured = 0;
+  c.onKconfigChanged();
+  assert.ok(c.fitQueue.has(s.id), "an engine change re-fits auto-fitted structs");
+});
+
+const THREAD = {
+  tid: 5, total: 3, messages: [
+    { message_id: "root@x", subject: "[PATCH 0/1] t", timestamp: 1, references: "" },
+    { message_id: "p1@x", subject: "[PATCH 1/1] one", timestamp: 2, references: "<root@x>" },
+    { message_id: "r1@x", subject: "Re: one", timestamp: 3, references: "<root@x> <p1@x>" },
+  ],
+};
+
+test("mail nodes: Expand Thread to Nodes lays out the reply tree with reply edges, never twice", () => {
+  const { c } = controller();
+  withViewport(c);
+  const th = c.addNode({ type: "mail", data: { tid: 5 } });
+  c.content.set(c.fetchKeyOf(th), { status: "ok", value: THREAD });
+  const created = c.expandThreadToNodes(th.id);
+  assert.equal(created.length, 3);
+  const byMid = new Map(created.map((n) => [n.data.mid, n]));
+  assert.ok(created.every((n) => n.data.single && n.data.tid === 5));
+  const edge = (a, b) => c.canvas.edges.find((e) => e.from === a.id && e.to === b.id);
+  assert.equal(edge(th, byMid.get("root@x")).label, "reply", "the root hangs off the thread node");
+  assert.ok(edge(byMid.get("root@x"), byMid.get("p1@x")));
+  assert.ok(edge(byMid.get("p1@x"), byMid.get("r1@x")), "a reply hangs off the message it answers");
+  assert.ok(byMid.get("r1@x").x > byMid.get("p1@x").x, "one column per reply depth");
+  assert.deepEqual(c.expandThreadToNodes(th.id), [], "messages already on the canvas are not copied");
+  assert.equal(c.canvas.edges.length, 3, "nor connected twice");
+  assert.equal(c.tabOfNode(byMid.get("p1@x")).messageId, "p1@x");
+});
+
+test("kconfig nodes: relation chips and Expand Relations spawn or link nodes with labeled edges; live value", () => {
+  const { c } = controller();
+  withViewport(c);
+  c.canvas.settings.followSession = "";
+  c.kconfigSource = {
+    list: () => [{ tabId: "k1", version: "v3.0", resolved: true }],
+    context: (id) => ({ engineTabId: id, assignments: { CONFIG_SMP: "y", SMP: "y" }, arch: "x86_64", strict: true }),
+  };
+  const k = c.addNode({ type: "kconfig", version: "v3.0", data: { symbol: "SMP" } });
+  const numa = c.addNode({ type: "kconfig", version: "v3.0", data: { symbol: "NUMA" } });
+  c.content.set(c.fetchKeyOf(k), { status: "ok", value: { detail: { name: "SMP", depends_on: ["X86_LOCAL_APIC"], selects: [] }, graph: { edges: [{ from: "NUMA", to: "SMP", type: "depends_on" }, { from: "X86_64_SMP", to: "SMP", type: "selects" }] } } });
+  assert.equal(kconfigValueOf(c, k), "y", "the followed engine's value");
+  const one = c.expandKconfigRelations(k.id, "depends_on:X86_LOCAL_APIC");
+  assert.equal(one.length, 1);
+  assert.equal(one[0].data.symbol, "X86_LOCAL_APIC");
+  assert.ok(one[0].x > k.x, "a dependency is placed to the right");
+  const rest = c.expandKconfigRelations(k.id);
+  assert.deepEqual(rest.map((n) => n.data.symbol), ["X86_64_SMP"], "NUMA is already on the canvas: linked, not copied");
+  const labels = c.canvas.edges.map((e) => [c.byId(e.from).data.symbol, e.label, c.byId(e.to).data.symbol]);
+  assert.deepEqual(labels.sort(), [["NUMA", "depends on", "SMP"], ["SMP", "depends on", "X86_LOCAL_APIC"], ["X86_64_SMP", "selects", "SMP"]]);
+  assert.ok(numa.x !== undefined);
+  c.expandKconfigRelations(k.id);
+  assert.equal(c.canvas.edges.length, 3, "edges are drawn once");
+});
+
+function kconfigValueOf(c, node) {
+  return JSON.parse(c.bodyKey(node))[0];
+}
+
+test("maintainer nodes resolve their section from a file or a name", async () => {
+  const { c } = controller();
+  const calls = [];
+  c.api = {
+    matchMaintainers: async (v, patch, files) => (calls.push(["match", files]), { subsystems: ["SCHEDULER"] }),
+    getMaintainersOverview: async (v, q) => (calls.push(["overview", q]), { sections: [{ sec_id: 7, name: "SCHEDULER" }, { sec_id: 8, name: "SCHEDULER FOO" }] }),
+    getMaintainerSection: async (v, id) => (calls.push(["section", id]), { section: { sec_id: id, name: "SCHEDULER", status: "Maintained" } }),
+  };
+  const byPath = c.addNode({ type: "maintainer", version: "v3.0", data: { path: "kernel/sched/core.c" } });
+  const res = await c.loadMaintainer(byPath);
+  assert.equal(res.section.sec_id, 7);
+  assert.deepEqual(calls.map((x) => x[0]), ["match", "overview", "section"]);
+  calls.length = 0;
+  const byName = c.addNode({ type: "maintainer", version: "v3.0", data: { query: "scheduler foo" } });
+  assert.equal((await c.loadMaintainer(byName)).section.sec_id, 8, "the exact name wins");
+  c.content.set(c.fetchKeyOf(byName), { status: "ok", value: { section: { sec_id: 8, name: "SCHEDULER FOO", status: "Supported" } } });
+  assert.equal(c.headMeta(byName).text, "Supported");
+});
+
+test("a departed embed shell retires its engines; a thread found by Message-ID keeps its loaded content", async () => {
+  const { c } = controller();
+  withViewport(c);
+  const { made, factory } = fakeChannels();
+  c.channelFactory = factory;
+  c.kconfigSource = { list: () => [], context: () => null };
+  c.syncFollowChannel();
+  const ch = made.at(-1);
+  ch.onmessage({ data: { type: "kconfig:engine:announced", tabId: "kt", winId: "w9", version: "v3.0", assignments: { A: "y", CONFIG_A: "y" } } });
+  assert.equal(c.followedEngines().length, 1);
+  ch.onmessage({ data: { type: "window:unloading", winId: "w9" } });
+  assert.equal(c.followedEngines().length, 0, "the shell's engine left with it");
+  let fetches = 0;
+  c.api = { getMailThread: async () => (fetches++, { tid: 42, subject: "Subj", messages: [{ message_id: "m@x", tid: 42, subject: "Subj" }] }) };
+  const n = c.addNode({ type: "mail", data: { mid: "m@x" } });
+  const body = { innerHTML: "", querySelector: () => null };
+  c.renderBody(n, body);
+  await flush(5);
+  assert.equal(n.data.tid, 42);
+  assert.equal(c.content.get(c.fetchKeyOf(n))?.status, "ok", "re-keyed under the thread id: no second fetch");
+  c.renderBody(n, body);
+  await flush(5);
+  assert.equal(fetches, 1);
+  c.dispose();
+});
+
+test("commit diff lines from the server are coerced before they reach the HTML", async () => {
+  const D = await import("../js/views/nodemap/domain_nodes.js");
+  const p = D.diffPayload({ mode: "commit", commitHash: "abc", path: "" }, { files: [{ path: "a", hunks: [{ old_start: 1, new_start: 1, lines: [["<b>", "<i>", 2, "x"]] }] }] });
+  assert.deepEqual(p.files[0].hunks[0].lines[0], [" ", null, 2, "x"]);
+  assert.doesNotMatch(D.renderDiffBody(p), /<b>|<i>/);
 });

@@ -20,6 +20,7 @@
 import { api } from "../../api.js";
 import { shortcuts } from "../../utils/shortcuts.js";
 import { state, kconfigProfileKey } from "../../state.js";
+import { kconfigSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { toast } from "../../components/toast.js";
 import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
@@ -1263,7 +1264,8 @@ export class KconfigView {
       <div class="kconfig-prop-card">
         <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
           <span>Dependency graph</span>
-          <button class="code-btn" id="btn-kconfig-graph" type="button">Show graph</button>
+          <span><button class="code-btn" id="btn-kconfig-nodemap" type="button" title="Send CONFIG_${escapeHtml(sym)} with its relations to the NodeMap canvas">🕸 NodeMap</button>
+          <button class="code-btn" id="btn-kconfig-graph" type="button">Show graph</button></span>
         </div>
         <div id="kconfig-dep-graph"></div>
       </div>
@@ -1288,6 +1290,8 @@ export class KconfigView {
     const autosolveBtn = detailCol.querySelector("#btn-autosolve-sym");
     if (autosolveBtn) autosolveBtn.onclick = () => this.autosolve(sym);
     detailCol.querySelector("#btn-kconfig-history").onclick = () => showKconfigHistoryModal(this.currentVersion, sym);
+    const nmBtn = detailCol.querySelector("#btn-kconfig-nodemap");
+    if (nmBtn) nmBtn.onclick = () => sendToNodemap(kconfigSpec({ symbol: sym, arch: this.currentArch, version: this.currentVersion, repo: this.api?.repo || state.activeRepo() }), { version: this.currentVersion });
     detailCol.querySelector("#btn-kconfig-graph").onclick = (ev) => {
       ev.target.disabled = true;
       this.renderDependencyGraph(sym, detailCol.querySelector("#kconfig-dep-graph")).finally(() => {

@@ -22,7 +22,7 @@ import { referenceMenuItems } from "./file_references.js";
 import { hasFeature } from "../utils/projects.js";
 import { canBeVersionlessTab, isAlwaysVersionlessTab } from "../tab_routes.js";
 import { urlSync } from "../url_sync.js";
-import { nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
+import { diffSpec, nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
 
 class ContextMenu {
   constructor() {
@@ -1065,6 +1065,11 @@ class ContextMenu {
           }
         },
         {
+          label: "Send Diff to NodeMap",
+          icon: "🕸",
+          onClick: () => sendToNodemap(diffSpec({ commitHash: full, version: v, repo: state.activeRepo() }), { version: v }),
+        },
+        {
           // Only the header selection moves: no tab changes revision until Apply / New Tab (§5.13)
           label: isWorkCommit ? "Already the Work Commit" : "Set as Work Commit",
           icon: "🎯",
@@ -1201,7 +1206,9 @@ class ContextMenu {
       if (fieldKey) items.push({ label: "Attach Node to This Member…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id, fieldKey) });
       else if (node.type !== "group" && node.type !== "note") items.push({ label: "Attach Connected Node…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id) });
       if (node.type === "symbol") items.push({ label: d.expanded ? "Collapse Members" : "Expand Members", icon: d.expanded ? "🔼" : "🔽", onClick: () => controller.toggleExpandNode(node.id) });
-      if (["struct", "source", "man", "tab", "symbol"].includes(node.type)) items.push({ label: "Open as Tab", icon: "↗", onClick: () => controller.openNodeAsTab(node.id) });
+      if (node.type === "mail" && !d.single) items.push({ label: "Expand Thread to Nodes", icon: "⇶", onClick: () => controller.expandThreadToNodes(node.id) });
+      if (node.type === "kconfig") items.push({ label: "Expand Relations", icon: "⇶", onClick: () => controller.expandKconfigRelations(node.id) });
+      if (["struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) items.push({ label: "Open as Tab", icon: "↗", onClick: () => controller.openNodeAsTab(node.id) });
       if ((node.type === "struct" || node.type === "symbol") && name) {
         items.push({ separator: true });
         items.push({

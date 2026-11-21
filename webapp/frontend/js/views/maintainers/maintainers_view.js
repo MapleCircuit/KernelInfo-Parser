@@ -3,6 +3,7 @@
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
+import { maintainerSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
@@ -380,6 +381,7 @@ export class MaintainersView {
         <div class="m-section-header">
           <div class="m-section-title">${escapeHtml(sec.name)}</div>
           <div style="font-size:var(--fs-12, 12px);color:var(--accent-cyan);margin-top:4px;">Status: ${escapeHtml(sec.status || "Maintained")}</div>
+          <button class="code-btn" type="button" data-act="nodemap" style="margin-top:6px;" title="Send this section to the NodeMap canvas">🕸 Send to NodeMap</button>
         </div>
 
         <div class="m-grid-2col">
@@ -454,6 +456,11 @@ export class MaintainersView {
           </div>
         </div>
       `;
+
+      const nmBtn = detailEl.querySelector('[data-act="nodemap"]');
+      if (nmBtn) {
+        nmBtn.onclick = () => sendToNodemap(maintainerSpec({ secId: sec.sec_id || secId, title: sec.name || "", version: this.currentVersion, repo: this.api?.repo || state.activeRepo() }), { version: this.currentVersion });
+      }
 
       // Developer click -> Person Profile
       detailEl.querySelectorAll(".person-item").forEach((el) => {

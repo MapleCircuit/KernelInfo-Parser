@@ -1,20 +1,27 @@
 /**
  * nodemap_export.js - SVG (and, through it, PNG) of a whole NodeMap canvas: the bounding box of every
  * node and wire plus a margin, never the viewport. Nodes are drawn with what they show, as vectors:
- * group frames, note text, symbol member lists, source slices (code lines), struct members in the node's
+ * group frames, note text, symbol member lists, source slices (code lines with the code view's lexical
+ * colors), diffs (hunks, old/new line numbers, added / removed colors), mail threads (reply tree with
+ * connectors and badges), Kconfig symbols (value badge, relation groups), MAINTAINERS sections, struct
+ * members in the node's
  * `list` or `table` style (types, `#if` lines indented per nesting level with their scope bars, the
  * table's `#ifdef` cell, folded branches, hidden items and the outer conditions banner as the node shows
  * them); headers with their source reference (left out for `hideHeader` nodes in View Mode), node and
- * canvas backgrounds, accents (preset or custom), auto-fit scaling and edges anchored at the struct rows
- * they leave from. Man pages and live tab iframes are hybrid: a DOM snapshot of their rendered content
+ * canvas backgrounds, accents (preset or custom), the content scale of every node and edges anchored at
+ * the struct rows they leave from. Every node interior (panel, header, accent strip, body) is clipped to
+ * the node's rounded `rx="6"` box, the border drawn on top. Struct rows take the live rows' measured
+ * heights when given (`opts.rowHeights`), and an auto-fitted node ends where its drawn content ends, so
+ * folded `#if` branches leave no empty band at the bottom. Man pages and live tab iframes are hybrid: a DOM snapshot of their rendered content
  * (`captureNodeForeignObject()`, XHTML with inlined computed styles in a `<foreignObject>`), or a
  * placeholder card when nothing is mounted. Theme tokens are resolved to literal colors so the file looks
  * the same outside the app. `canvasToSvg()` and the size helpers are DOM-free (unit tested);
  * `captureNodeForeignObject()` reads the live DOM.
  */
-import { BG_TINT, accentVar, boundsOf, colorToHex, displayTitle, isCustomColor, paintOrder } from "./canvas_model.js";
+import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, isCustomColor, paintOrder } from "./canvas_model.js";
 import { arrowHeads, dashArray, edgePath, resolveEnds } from "./edge_router.js";
-import { headMetaOf } from "./node_content.js";
+import { headMetaOf, sourceLineSegments } from "./node_content.js";
+import { diffRows, kconfigValue, mailBadges, maintainerLines, statusClass, valueClass } from "./domain_nodes.js";
 import { countDirectives, esc as escHtml, structRows } from "./struct_view.js";
 
 const PAD = 40;
@@ -29,7 +36,16 @@ const PP_INDENT = 10; // per enclosing #if block (nodemap.css .nm-pp-indent)
 const MONO_CH = 6.6; // width of one 11-unit monospace character
 const SANS_CH = 6.2;
 const TRACK_W = 6;
-const BADGES = { struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group" };
+const DIFF_ROW_H = 16.5;
+const MAIL_ROW_H = 18;
+const MAIL_META_H = 14;
+const KC_ROW_H = 18;
+const MT_ROW_H = 16;
+const GUIDE_W = 12;
+/** Type-default accents (nodemap.css): groups are blue like every node, notes yellow. */
+export function defaultAccent(type) {
+  return type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)";
+}
 
 const r1 = (v) => Math.round(v * 10) / 10;
 // Characters XML 1.0 does not allow (form feeds in kernel sources, NULs): dropped so the document parses
@@ -47,7 +63,7 @@ function mixColors(a, b, t) {
 
 /** Box the content of a node is laid out in (natural size for auto-fitted nodes) and its scale. */
 function layoutBox(n) {
-  return n.autoFit ? { w: n.baseW, h: n.baseH, s: n.scale || 1 } : { w: n.w, h: n.h, s: 1 };
+  return contentBox(n);
 }
 
 /** Text cut to `max` characters with an ellipsis. */
@@ -90,6 +106,8 @@ function plainNoteLine(line) {
  *   resolve(cssColor)   turns `var(--x)` into a literal color
  *   opts.content(node)  loaded payload of a struct / source node (null while not loaded)
  *   opts.structOpts(node)  `{editMode, evaluator}` the node's struct rows are drawn with
+ *   opts.rowHeights(node)  measured heights of the live struct rows (content units), or null
+ *   opts.kconfigValues(node)  assignments of the Kconfig engine a kconfig node shows values from, or null
  *   opts.editMode       Edit Mode (struct toolbar chips, hidden items and headers dimmed instead of left out)
  *   opts.foreign(node)  `{html}` DOM snapshot of a man / tab node (`captureNodeForeignObject()`), or null
  *   opts.transparent    no canvas background and no canvas-colored halo behind edge labels
@@ -100,6 +118,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   const foreignOf = typeof opts.foreign === "function" ? opts.foreign : () => null;
   const editMode = Boolean(opts.editMode);
   const structOptsOf = typeof opts.structOpts === "function" ? opts.structOpts : () => ({ editMode });
+  const rowHeightsOf = typeof opts.rowHeights === "function" ? opts.rowHeights : () => null;
+  const kcValuesOf = typeof opts.kconfigValues === "function" ? opts.kconfigValues : () => null;
   /** Background of a node or the canvas: theme token, custom color, or a preset tinted into the token. */
   const bgOf = (id, base) => {
     const b = resolve(base);
@@ -123,13 +143,39 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     preproc: resolve("var(--syn-preproc)"),
     number: resolve("var(--syn-number)"),
     note: resolve("var(--accent-yellow)"),
+    add: resolve("var(--diff-add-fg)"),
+    del: resolve("var(--diff-del-fg)"),
+    green: resolve("var(--accent-green)"),
+    red: resolve("var(--accent-red)"),
+    orange: resolve("var(--accent-orange)"),
+    blue: resolve("var(--accent-blue)"),
   };
+  // Lexical token colors of the code view (codeview.css `.tok-*`)
+  const TOK = {
+    "tok-keyword": "var(--syn-keyword)", "tok-type": "var(--syn-type)", "tok-string": "var(--syn-string)",
+    "tok-number": "var(--syn-number)", "tok-comment": "var(--syn-comment)", "tok-preproc": "var(--syn-preproc)",
+    "tok-macro": "var(--syn-preproc)", "tok-include": "var(--syn-string)", "tok-punct": "var(--syn-punct)",
+    "tok-function": "var(--syn-function)", "tok-identifier": "var(--syn-identifier)", "tok-variable": "var(--syn-variable)",
+    "tok-attribute": "var(--syn-attribute)", "tok-lifetime": "var(--syn-variable)",
+  };
+  const tokColor = new Map();
+  const colorOfTok = (cls) => {
+    if (!TOK[cls]) return C.text;
+    if (!tokColor.has(cls)) tokColor.set(cls, resolve(TOK[cls]));
+    return tokColor.get(cls);
+  };
+  let used = 0; // bottom of what the last body drew (local units): auto-fitted nodes end there
   const anchors = new Map(); // node id -> Map(field key -> canvas y)
   let defs = "";
   let clipN = 0;
   const clip = (x, y, w, h) => {
     const id = `nmclip${clipN++}`;
     defs += `<clipPath id="${id}"><rect x="${r1(x)}" y="${r1(y)}" width="${r1(Math.max(0, w))}" height="${r1(Math.max(0, h))}"/></clipPath>`;
+    return id;
+  };
+  const clipRound = (w, h) => {
+    const id = `nmclip${clipN++}`;
+    defs += `<clipPath id="${id}"><rect x="0" y="0" width="${r1(Math.max(0, w))}" height="${r1(Math.max(0, h))}" rx="6"/></clipPath>`;
     return id;
   };
 
@@ -184,25 +230,38 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const ctlW = table ? (editMode ? 30 : 14) : 0;
     const typeW = model.typeCh * MONO_CH;
     const rowH = table ? TABLE_ROW_H : ROW_H;
+    // The live rows' heights (folded branches and their labels are taller than member rows), else the
+    // export's own metrics
+    const measured = rowHeightsOf(n);
+    const hs = Array.isArray(measured) && measured.length === model.rows.length && measured.every((v) => v > 0) ? measured : null;
+    const rowTops = [];
+    let acc = rowsTop;
+    for (let i = 0; i < model.rows.length; i++) {
+      rowTops.push(acc);
+      acc += hs ? hs[i] : rowH;
+    }
+    const rowsEnd = acc;
+    used = model.rows.length ? rowsEnd + 2 : rowsTop + 18;
     const fieldY = new Map();
     s += `<g clip-path="url(#${id})">`;
     if (!model.rows.length) s += txt(10, rowsTop + 12, "No members", { fill: C.faint, italic: true });
-    if (cellRight && model.rows.length) s += `<line x1="${cellRight}" y1="${rowsTop}" x2="${cellRight}" y2="${r1(rowsTop + model.rows.length * rowH)}" stroke="${C.rule}"/>`;
+    if (cellRight && model.rows.length) s += `<line x1="${cellRight}" y1="${rowsTop}" x2="${cellRight}" y2="${r1(rowsEnd)}" stroke="${C.rule}"/>`;
     model.rows.forEach((r, i) => {
-      const ry = rowsTop + i * rowH;
-      const mid = ry + rowH / 2;
-      const base = ry + rowH / 2 + 4;
+      const ry = rowTops[i];
+      const rh = hs ? hs[i] : rowH;
+      const mid = ry + rh / 2;
+      const base = ry + rh / 2 + 4;
       const op = r.dim ? 0.45 : r.dead ? 0.6 : 1;
       let row = "";
       for (const [l, part] of r.bars) {
         const bx = 6 + l * TRACK_W + 1;
         const y1 = part === "start" ? mid : ry;
-        const y2 = part === "end" ? mid : ry + rowH;
+        const y2 = part === "end" ? mid : ry + rh;
         const alpha = [0.9, 0.7, 0.55, 0.4][l % 4];
         row += `<line x1="${bx}" y1="${r1(y1)}" x2="${bx}" y2="${r1(y2)}" stroke="${C.preproc}" stroke-opacity="${alpha}" stroke-width="2"/>`;
         if (part === "start" || part === "end" || part === "mid") row += `<line x1="${bx}" y1="${r1(mid)}" x2="${bx + 4}" y2="${r1(mid)}" stroke="${C.preproc}" stroke-opacity="${alpha}" stroke-width="2"/>`;
       }
-      if (table) row += `<line x1="0" y1="${ry + rowH}" x2="${box.w}" y2="${ry + rowH}" stroke="${C.rule}"/>`;
+      if (table) row += `<line x1="0" y1="${r1(ry + rh)}" x2="${box.w}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
       const x0 = cellRight ? cellRight + 4 : 6 + gutter + (table ? 0 : r.depth * 14);
       const lineNo = r.line ? txt(box.w - 8, base, esc(r.line), { fill: C.faint, size: 9, family: "monospace", anchor: "end" }) : "";
       if (r.kind === "pp" || r.kind === "summary") {
@@ -219,7 +278,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
           row += txt(x0, base, esc(lead), { fill: C.faint, family: "monospace" });
           const typeText = r.kind === "agg" ? `${r.tag}${r.typeText ? ` ${r.typeText}` : ""}` : r.type;
           if (typeText) row += txt(tx + 4 + r.depth * 2 * MONO_CH, base, esc(fit(typeText, model.typeCh - r.depth * 2)), { fill: r.kind === "agg" ? C.keyword : C.type, family: "monospace" });
-          row += `<line x1="${r1(tx + typeW + 8)}" y1="${ry}" x2="${r1(tx + typeW + 8)}" y2="${ry + rowH}" stroke="${C.rule}"/>`;
+          row += `<line x1="${r1(tx + typeW + 8)}" y1="${r1(ry)}" x2="${r1(tx + typeW + 8)}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
           const nx = tx + typeW + 12;
           row += txt(nx, base, `<tspan fill="${C.text}">${esc(r.kind === "agg" ? label : r.name)}</tspan>${r.kind === "field" && r.suffix ? `<tspan fill="${C.number}">${esc(r.suffix)}</tspan>` : ""}`, { family: "monospace", weight: r.kind === "agg" ? "bold" : "" });
         } else {
@@ -243,7 +302,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     s += "</g>";
     // Field anchors: the row's middle, kept inside the visible rows (as the live view does)
     const ys = new Map();
-    for (const [k, my] of fieldY) ys.set(k, Math.min(Math.max(my, rowsTop + 4), rowsBottom - 4));
+    const visBottom = n.autoFit ? Math.min(rowsBottom, rowsEnd) : rowsBottom;
+    for (const [k, my] of fieldY) ys.set(k, Math.min(Math.max(my, rowsTop + 4), visBottom - 4));
     anchors.set(n.id, ys);
     return s;
   };
@@ -261,14 +321,24 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const hl = r.symbol && (r.symbol.line_s > r.start_line || r.symbol.line_e < r.end_line) ? r.symbol : null;
     const id = clip(0, y0, box.w, box.h - y0);
     s += `<g clip-path="url(#${id})">`;
-    for (let i = 0; i < Math.min(lines.length, max); i++) {
+    const shown = Math.min(lines.length, max);
+    // The code view's lexical highlighter over the whole slice (multi-line comments and strings)
+    const segs = sourceLineSegments(lines.map((l) => String(l ?? "")), r.path || d.path);
+    for (let i = 0; i < shown; i++) {
       const no = r.start_line + i;
       const ly = y0 + i * SRC_ROW_H;
       if (hl && no >= hl.line_s && no <= hl.line_e) s += `<rect x="0" y="${r1(ly)}" width="${box.w}" height="${SRC_ROW_H}" fill="${C.note}" fill-opacity="0.12"/>`;
       s += txt(noW, ly + 12, esc(no), { fill: C.faint, family: "monospace", anchor: "end" });
-      s += txt(noW + 8, ly + 12, esc(String(lines[i]).replace(/\t/g, "        ")), { family: "monospace" });
+      const spans = (segs[i] || []).map((g) => {
+        const t = esc(g.text.replace(/\t/g, "        "));
+        if (!t) return "";
+        const italic = g.cls === "tok-comment" || g.cls === "tok-lifetime" ? ' font-style="italic"' : "";
+        return g.cls ? `<tspan fill="${colorOfTok(g.cls)}"${italic}>${t}</tspan>` : t;
+      }).join("");
+      s += txt(noW + 8, ly + 12, spans, { family: "monospace" });
     }
     s += "</g>";
+    used = y0 + shown * SRC_ROW_H + 2;
     return s;
   };
 
@@ -282,6 +352,157 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       s += txt(10, top + 18 + i * 16, esc(l), { fill: C.text });
     });
     return s;
+  };
+
+  /** Rows of text clipped to the body, with a fixed row height; records how far they reach. */
+  const rowsClip = (box, top, inner) => {
+    const id = clip(0, top, box.w, box.h - top);
+    return `<g clip-path="url(#${id})">${inner}</g>`;
+  };
+
+  const diffBody = (n, box, top) => {
+    const p = content(n);
+    const d = n.data;
+    if (!p) return txt(10, top + 16, esc(d.path || (d.commitHash ? d.commitHash.slice(0, 12) : "Diff")), { fill: C.faint });
+    const rows = diffRows(p);
+    const max = Math.max(0, Math.ceil((box.h - top) / DIFF_ROW_H));
+    let maxNo = 1;
+    for (const r of rows) maxNo = Math.max(maxNo, r.old || 0, r.new || 0);
+    const noW = Math.max(3, String(maxNo).length) * MONO_CH + 8;
+    let s = n.bgColor ? "" : `<rect x="0" y="${top}" width="${box.w}" height="${box.h - top}" fill="${C.code}"/>`;
+    let inner = "";
+    const shown = Math.min(rows.length, max);
+    for (let i = 0; i < shown; i++) {
+      const r = rows[i];
+      const ly = top + i * DIFF_ROW_H;
+      const base = ly + 12;
+      if (r.kind === "file") {
+        inner += `<rect x="0" y="${r1(ly)}" width="${box.w}" height="${DIFF_ROW_H}" fill="${C.head}"/>` + txt(8, base, esc(r.text), { fill: C.text, family: "monospace", weight: "bold" });
+      } else if (r.kind === "hunk") {
+        inner += `<rect x="0" y="${r1(ly)}" width="${box.w}" height="${DIFF_ROW_H}" fill="${C.blue}" fill-opacity="0.08"/>` + txt(8, base, esc(r.text), { fill: C.preproc, family: "monospace" });
+      } else if (r.kind === "note") {
+        inner += txt(8, base, esc(r.text), { fill: C.faint, family: "monospace", italic: true });
+      } else {
+        const color = r.kind === "+" ? C.add : r.kind === "-" ? C.del : C.text;
+        if (r.kind !== " ") inner += `<rect x="0" y="${r1(ly)}" width="${box.w}" height="${DIFF_ROW_H}" fill="${color}" fill-opacity="0.12"/>`;
+        inner += txt(noW - 4, base, esc(r.old ?? ""), { fill: C.faint, family: "monospace", anchor: "end", size: 10 });
+        inner += txt(noW * 2 - 4, base, esc(r.new ?? ""), { fill: C.faint, family: "monospace", anchor: "end", size: 10 });
+        inner += txt(noW * 2 + 4, base, `${esc(r.kind === " " ? " " : r.kind)} ${esc(String(r.text).replace(/\t/g, "        "))}`, { fill: color, family: "monospace" });
+      }
+    }
+    s += rowsClip(box, top, inner);
+    used = top + Math.max(1, shown) * DIFF_ROW_H + 2;
+    return s;
+  };
+
+  const mailBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.subject || n.data.mid || "Mail thread"), { fill: C.faint });
+    if (!model.rows.length) return txt(10, top + 16, "No messages", { fill: C.faint, italic: true });
+    let inner = "";
+    let y = top + 4;
+    const cols = (x) => Math.max(4, Math.floor((box.w - x - 10) / SANS_CH));
+    for (const r of model.rows) {
+      if (y > box.h) break;
+      const gx = 8;
+      const mid = y + MAIL_ROW_H / 2;
+      const rowEnd = y + MAIL_ROW_H + MAIL_META_H + (r.open ? Math.max(1, r.excerpt.length) * 14 + 4 : 0);
+      // Connectors: an ancestor's continuing line (pipe), this row's elbow (tee / end)
+      r.guides.forEach((g, k) => {
+        const x = gx + k * GUIDE_W + GUIDE_W / 2;
+        if (g === "pipe" || g === "tee") inner += `<line x1="${x}" y1="${r1(y)}" x2="${x}" y2="${r1(rowEnd)}" stroke="${C.border}"/>`;
+        if (g === "end") inner += `<line x1="${x}" y1="${r1(y)}" x2="${x}" y2="${r1(mid)}" stroke="${C.border}"/>`;
+        if (g === "tee" || g === "end") inner += `<line x1="${x}" y1="${r1(mid)}" x2="${x + GUIDE_W / 2}" y2="${r1(mid)}" stroke="${C.border}"/>`;
+      });
+      let x = gx + r.guides.length * GUIDE_W;
+      if (r.focus) inner += `<rect x="0" y="${r1(y)}" width="${box.w}" height="${MAIL_ROW_H + MAIL_META_H}" fill="${C.blue}" fill-opacity="0.1"/>`;
+      for (const b of mailBadges(r)) {
+        const bw = b.length * 5.6 + 8;
+        const col = b === "cover" ? C.orange : b === "PATCH" ? C.green : C.blue;
+        inner += `<rect x="${r1(x)}" y="${r1(y + 3)}" width="${r1(bw)}" height="12" rx="3" fill="${col}" fill-opacity="0.16"/>` + txt(x + bw / 2, y + 12, esc(b), { fill: col, size: 9, anchor: "middle" });
+        x += bw + 4;
+      }
+      inner += txt(x, y + 13, esc(fit(r.subject, cols(x))), { fill: C.text, weight: r.depth === 0 ? "bold" : "" });
+      const mx = gx + r.guides.length * GUIDE_W;
+      inner += txt(mx, y + MAIL_ROW_H + 9, esc(fit(`${r.author}${r.date ? ` · ${r.date}` : ""}`, cols(mx))), { fill: C.faint, size: 10 });
+      if (r.open) {
+        (r.excerpt.length ? r.excerpt : ["…"]).forEach((l, k) => {
+          inner += txt(mx + 6, y + MAIL_ROW_H + MAIL_META_H + 12 + k * 14, esc(fit(l, Math.floor((box.w - mx - 16) / MONO_CH))), { fill: C.muted, size: 10, family: "monospace" });
+        });
+      }
+      y = rowEnd;
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
+  const kconfigBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(`CONFIG_${n.data.symbol || "?"}`), { fill: C.faint });
+    const values = kcValuesOf(n);
+    const value = values ? kconfigValue(values, model.name) : null;
+    let inner = "";
+    let y = top + 4;
+    inner += txt(8, y + 13, esc(`CONFIG_${model.name}`), { fill: C.text, family: "monospace", weight: "bold" });
+    let x = 8 + (model.name.length + 7) * MONO_CH + 8;
+    if (model.type) {
+      inner += txt(x, y + 13, esc(model.type), { fill: C.type, family: "monospace", size: 10 });
+      x += model.type.length * 6 + 10;
+    }
+    const vText = value === null ? "no engine" : value || "unset";
+    const vCls = value === null ? "none" : valueClass(value);
+    const vCol = { y: C.green, m: C.orange, n: C.red, val: C.blue, unset: C.faint, none: C.faint }[vCls];
+    const vw = vText.length * 6 + 12;
+    inner += `<rect x="${r1(x)}" y="${y + 3}" width="${r1(vw)}" height="14" rx="7" fill="${vCol}" fill-opacity="0.18" stroke="${vCol}"/>` + txt(x + vw / 2, y + 13.5, esc(vText), { fill: vCol, size: 10, family: "monospace", anchor: "middle" });
+    y += KC_ROW_H + 2;
+    if (model.prompt) {
+      inner += txt(8, y + 12, esc(fit(model.prompt, Math.floor((box.w - 16) / SANS_CH))), { fill: C.muted, italic: true });
+      y += KC_ROW_H;
+    }
+    for (const g of model.groups) {
+      inner += txt(8, y + 12, esc(g.label), { fill: C.faint, size: 10, weight: "bold" });
+      y += 16;
+      let cx = 8;
+      for (const name of g.names) {
+        const cw = name.length * 6 + 12;
+        if (cx + cw > box.w - 8 && cx > 8) {
+          cx = 8;
+          y += KC_ROW_H;
+        }
+        inner += `<rect x="${r1(cx)}" y="${r1(y + 1)}" width="${r1(cw)}" height="15" rx="7" fill="none" stroke="${C.border}"/>` + txt(cx + cw / 2, y + 12, esc(name), { fill: C.text, size: 10, family: "monospace", anchor: "middle" });
+        cx += cw + 4;
+      }
+      y += KC_ROW_H + 2;
+    }
+    if (!model.groups.length) {
+      inner += txt(8, y + 12, "No relations", { fill: C.faint, italic: true });
+      y += KC_ROW_H;
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
+  const maintainerBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.title || n.data.path || n.data.query || "Maintainers"), { fill: C.faint });
+    let inner = "";
+    let y = top + 4;
+    inner += txt(8, y + 13, esc(fit(model.title || "(section)", Math.floor((box.w - 120) / 6.6))), { fill: C.text, weight: "bold", size: 12 });
+    if (model.status) {
+      const col = { supported: C.green, maintained: C.blue, odd: C.orange, orphan: C.red, other: C.faint }[statusClass(model.status)];
+      const sw = model.status.length * 5.8 + 12;
+      inner += `<rect x="${r1(box.w - 8 - sw)}" y="${y + 3}" width="${r1(sw)}" height="14" rx="7" fill="${col}" fill-opacity="0.16" stroke="${col}"/>` + txt(box.w - 8 - sw / 2, y + 13.5, esc(model.status), { fill: col, size: 10, anchor: "middle" });
+    }
+    y += KC_ROW_H + 4;
+    const tagColor = { M: C.blue, R: C.type, L: C.green, T: C.preproc, W: C.muted, F: C.number, X: C.red };
+    for (const [tag, v] of maintainerLines(model)) {
+      if (y > box.h) break;
+      inner += txt(8, y + 12, `${tag}:`, { fill: tagColor[tag] || C.faint, family: "monospace", weight: "bold" });
+      inner += txt(8 + 3 * MONO_CH, y + 12, esc(fit(v, Math.floor((box.w - 16 - 3 * MONO_CH) / MONO_CH))), { fill: C.text, family: "monospace" });
+      y += MT_ROW_H;
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
   };
 
   const symbolBody = (n, box, top) => {
@@ -306,32 +527,51 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return s;
   };
 
+  const rects = new Map(); // node id -> exported canvas rect (auto-fitted nodes end where their content does)
   const nodeSvg = (n) => {
-    const accent = resolve(accentVar(n.color, n.type === "group" ? "var(--border-color)" : n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)"));
+    const accent = resolve(accentVar(n.color, defaultAccent(n.type)));
     if (n.type === "group") {
+      rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: n.h });
       return `<g><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${accent}" fill-opacity="0.06" stroke="${accent}" stroke-dasharray="6 4"/>` +
         `${txt(n.x + 10, n.y + 18, esc(displayTitle(n)), { weight: "bold", size: 12 })}</g>\n`;
     }
-    const box = layoutBox(n);
+    let box = layoutBox(n);
+    const headShown = !n.hideHeader || editMode;
+    const top = headShown ? HEAD_H : 0;
+    used = 0;
+    let body = "";
+    if (n.type === "struct") body = structBody(n, box, top, accent);
+    else if (n.type === "source") body = sourceBody(n, box, top);
+    else if (n.type === "note") body = noteBody(n, box, top);
+    else if (n.type === "symbol") body = symbolBody(n, box, top);
+    else if (n.type === "diff") body = diffBody(n, box, top);
+    else if (n.type === "mail") body = mailBody(n, box, top);
+    else if (n.type === "kconfig") body = kconfigBody(n, box, top);
+    else if (n.type === "maintainer") body = maintainerBody(n, box, top);
+    // An auto-fitted node is as tall as its content: what the export draws of it ends the node (the live
+    // rows' rounding, folded #if branches), never an empty band below
+    if (n.autoFit && used > top && used < box.h) box = { ...box, h: Math.ceil(used) };
+    rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: Math.round(box.h * box.s) });
     const tf = box.s !== 1 ? `translate(${n.x} ${n.y}) scale(${box.s})` : `translate(${n.x} ${n.y})`;
     let s = `<g transform="${tf}">`;
     const panel = n.bgColor ? bgOf(n.bgColor, "var(--bg-secondary)") : C.panel;
-    s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" rx="6" fill="${panel}" stroke="${n.color ? accent : C.border}" stroke-width="1"/>`;
-    if (n.type === "note" && !n.bgColor) s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" rx="6" fill="${accent}" fill-opacity="0.08"/>`;
+    // Everything inside the node is clipped to its rounded box: the square header fill and accent strip
+    // never stick out of the corners; the border is drawn on top
+    const rid = clipRound(box.w, box.h);
+    s += `<g clip-path="url(#${rid})">`;
+    s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" fill="${panel}"/>`;
+    if (n.type === "note" && !n.bgColor) s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" fill="${accent}" fill-opacity="0.08"/>`;
     // Header (accent strip, type badge, title, source reference): none for a hidden header in View
     // Mode, dimmed in Edit Mode
-    const headShown = !n.hideHeader || editMode;
     if (headShown) {
-      let h = "";
-      const hid = clip(0, 0, box.w, HEAD_H);
-      h += `<g clip-path="url(#${hid})"><rect x="0" y="0" width="${box.w}" height="${HEAD_H + 6}" rx="6" fill="${C.head}"/>` +
-        `<rect x="0" y="0" width="${box.w}" height="3" fill="${n.color ? accent : C.rule}"/></g>`;
+      let h = `<rect x="0" y="0" width="${box.w}" height="${HEAD_H}" fill="${C.head}"/>` +
+        `<rect x="0" y="0" width="${box.w}" height="3" fill="${n.color ? accent : C.rule}"/>`;
       h += `<line x1="0" y1="${HEAD_H}" x2="${box.w}" y2="${HEAD_H}" stroke="${C.border}"/>`;
-      const badge = BADGES[n.type] || n.type;
+      const badge = NODE_BADGES[n.type] || n.type;
       const bw = badge.length * 5.6 + 8;
       h += `<rect x="8" y="8" width="${r1(bw)}" height="13" rx="3" fill="${accent}" fill-opacity="0.16"/>`;
       h += txt(8 + bw / 2, 17.5, esc(badge.toUpperCase()), { fill: accent, size: 9, anchor: "middle" });
-      const meta = headMetaOf(n.type, ["struct", "source"].includes(n.type) ? content(n) : null).text;
+      const meta = headMetaOf(n.type, n.type === "symbol" || n.type === "note" || n.type === "tab" || n.type === "man" ? null : content(n)).text;
       // The reference takes at most 55% of the header (as .nm-head-meta), keeping its end (line numbers)
       const metaCols = meta ? Math.min(meta.length, Math.floor((box.w * 0.55) / 6)) : 0;
       if (meta) {
@@ -341,13 +581,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       h += txt(16 + bw, 18, esc(fit(displayTitle(n), Math.floor((box.w - bw - 28 - (metaCols ? metaCols * 6 + 8 : 0)) / 6.6))), { weight: "bold", size: 12 });
       s += n.hideHeader ? `<g opacity="0.45">${h}</g>` : h;
     }
-    const top = headShown ? HEAD_H : 0;
     const bid = clip(0, top, box.w, box.h - top);
-    let body = "";
-    if (n.type === "struct") body = structBody(n, box, top, accent);
-    else if (n.type === "source") body = sourceBody(n, box, top);
-    else if (n.type === "note") body = noteBody(n, box, top);
-    else if (n.type === "symbol") body = symbolBody(n, box, top);
     const fo = n.type === "tab" || n.type === "man" ? foreignOf(n) : null;
     if (fo?.html) {
       // Live rendered content: XHTML snapshot, clipped to the body like the node shows it
@@ -361,6 +595,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       body = cardBody(box, top, [[d.name ? `${d.name}(${d.section || "?"})` : (d.path || "Man page"), { fill: C.text, size: 12 }], [d.path ? `${d.repo ? `${d.repo} · ` : ""}${d.path}` : "", { fill: C.faint, size: 10, family: "monospace" }]]);
     }
     s += `<g clip-path="url(#${bid})">${body}</g>`;
+    s += "</g>";
     s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" rx="6" fill="none" stroke="${n.color ? accent : C.border}" stroke-width="1.5"/>`;
     return `${s}</g>\n`;
   };
@@ -369,11 +604,12 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   const ordered = paintOrder(canvas.nodes);
   const groupsSvg = ordered.filter((x) => x.type === "group").map(nodeSvg).join("");
   const nodesSvg = ordered.filter((x) => x.type !== "group").map(nodeSvg).join("");
-  const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
+  // Edges and bounds use the exported boxes
+  const byId = new Map(canvas.nodes.map((n) => [n.id, { ...n, ...(rects.get(n.id) || {}) }]));
   const pointOf = (n, field, side) => {
     const y = field ? anchors.get(n.id)?.get(field) : undefined;
     if (y === undefined) return null;
-    const s = n.autoFit ? n.scale || 1 : 1;
+    const s = layoutBox(n).s;
     return { x: side === "left" ? n.x : n.x + n.w, y: n.y + y * s };
   };
   let edgesSvg = "";
@@ -405,7 +641,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   }
   /* ui-scale-exempt-end */
 
-  const nb = boundsOf(canvas.nodes) || { x: 0, y: 0, w: 400, h: 300 };
+  const nb = boundsOf([...byId.values()]) || { x: 0, y: 0, w: 400, h: 300 };
   let x1 = nb.x, y1 = nb.y, x2 = nb.x + nb.w, y2 = nb.y + nb.h;
   for (const p of extra) {
     x1 = Math.min(x1, p.x);
