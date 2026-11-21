@@ -9,8 +9,8 @@ class PipelineProfiler:
 
     file_path: str = ""
     clang_parse_tu_s: float = 0.0
-    # extract_include_symbols(): Python walk over the TU's includes and imported declarations
-    include_symbols_s: float = 0.0
+    # map_direct_includes(): direct #include line -> repository path map and top-level cursor walk
+    include_map_s: float = 0.0
     clang_tokenize_s: float = 0.0
     token_processing_s: float = 0.0
     ast_extraction_s: float = 0.0
@@ -22,7 +22,7 @@ class PipelineProfiler:
         """Sum of the measured components (`total_elapsed_s` when it was set explicitly)."""
         return self.total_elapsed_s or (
             self.clang_parse_tu_s
-            + self.include_symbols_s
+            + self.include_map_s
             + self.clang_tokenize_s
             + self.token_processing_s
             + self.ast_extraction_s
@@ -35,7 +35,7 @@ class PipelineProfiler:
         return {
             "file_path": self.file_path,
             "clang_parse_tu_s": self.clang_parse_tu_s,
-            "include_symbols_s": self.include_symbols_s,
+            "include_map_s": self.include_map_s,
             "clang_tokenize_s": self.clang_tokenize_s,
             "token_processing_s": self.token_processing_s,
             "ast_extraction_s": self.ast_extraction_s,
@@ -50,7 +50,7 @@ class PipelineProfiler:
         return cls(
             file_path=str(data.get("file_path", "")),
             clang_parse_tu_s=float(data.get("clang_parse_tu_s", 0.0)),
-            include_symbols_s=float(data.get("include_symbols_s", 0.0)),
+            include_map_s=float(data.get("include_map_s", 0.0)),
             clang_tokenize_s=float(data.get("clang_tokenize_s", 0.0)),
             token_processing_s=float(data.get("token_processing_s", 0.0)),
             ast_extraction_s=float(data.get("ast_extraction_s", 0.0)),
@@ -62,7 +62,7 @@ class PipelineProfiler:
     def add(self, other: "PipelineProfiler") -> None:
         """Accumulate metrics from another profiler instance."""
         self.clang_parse_tu_s += other.clang_parse_tu_s
-        self.include_symbols_s += other.include_symbols_s
+        self.include_map_s += other.include_map_s
         self.clang_tokenize_s += other.clang_tokenize_s
         self.token_processing_s += other.token_processing_s
         self.ast_extraction_s += other.ast_extraction_s
@@ -135,7 +135,7 @@ def format_profiling_report(
         row = (
             f"{f_display:<{w_file}} | "
             f"{_format_ms(p.clang_parse_tu_s):>9} | "
-            f"{_format_ms(p.include_symbols_s):>9} | "
+            f"{_format_ms(p.include_map_s):>9} | "
             f"{_format_ms(p.clang_tokenize_s):>9} | "
             f"{_format_ms(p.token_processing_s):>9} | "
             f"{_format_ms(p.ast_extraction_s):>9} | "
@@ -152,7 +152,7 @@ def format_profiling_report(
     tot_row = (
         f"{COLOR.cyan('TOTAL AGGREGATE'):<{w_file + 9}} | "
         f"{_format_ms(tot.clang_parse_tu_s):>9} | "
-        f"{_format_ms(tot.include_symbols_s):>9} | "
+        f"{_format_ms(tot.include_map_s):>9} | "
         f"{_format_ms(tot.clang_tokenize_s):>9} | "
         f"{_format_ms(tot.token_processing_s):>9} | "
         f"{_format_ms(tot.ast_extraction_s):>9} | "
@@ -165,7 +165,7 @@ def format_profiling_report(
     pct_row = (
         f"{COLOR.cyan('PERCENTAGE OF TOTAL'):<{w_file + 9}} | "
         f"{_format_pct(tot.clang_parse_tu_s, grand_total, 9)} | "
-        f"{_format_pct(tot.include_symbols_s, grand_total, 9)} | "
+        f"{_format_pct(tot.include_map_s, grand_total, 9)} | "
         f"{_format_pct(tot.clang_tokenize_s, grand_total, 9)} | "
         f"{_format_pct(tot.token_processing_s, grand_total, 9)} | "
         f"{_format_pct(tot.ast_extraction_s, grand_total, 9)} | "
@@ -346,7 +346,7 @@ class PipelineStageProfiler:
                 lines.append(f"Aggregate across {self.worker_count:,} parsed files:")
                 for label, val in (
                     ("Clang TU Parse:", w_tot.clang_parse_tu_s),
-                    ("Include Symbols:", w_tot.include_symbols_s),
+                    ("Include Map:", w_tot.include_map_s),
                     ("Clang Tokenize:", w_tot.clang_tokenize_s),
                     ("Token Processing:", w_tot.token_processing_s),
                     ("AST Generation:", w_tot.ast_extraction_s),

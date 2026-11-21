@@ -21,11 +21,11 @@
       },
       {
         "fnid": "$fnid_2",
-        "fname": "netdevice.h"
+        "fname": "linux/netdevice.h"
       },
       {
         "fnid": "$fnid_3",
-        "fname": "ip.h"
+        "fname": "linux/ip.h"
       },
       {
         "fnid": "$fnid_4",
@@ -63,68 +63,208 @@
       },
       {
         "ast_id": "$ast_2",
+        "name": "net",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_3",
         "name": "!defined(_TRACE_NET_H)||defined(TRACE_HEADER_MULTI_READ)",
         "type_id": "67 (CPPro_if)"
       },
       {
-        "ast_id": "$ast_3",
+        "ast_id": "$ast_4",
         "name": "_TRACE_NET_H",
         "type_id": "75 (CPPro_define)"
       },
       {
-        "ast_id": "$ast_4",
+        "ast_id": "$ast_5",
+        "name": "TRACE_HEADER_MULTI_READ",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_6",
         "name": "<linux/skbuff.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_5",
+        "ast_id": "$ast_7",
         "name": "<linux/netdevice.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_6",
+        "ast_id": "$ast_8",
         "name": "<linux/ip.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_7",
+        "ast_id": "$ast_9",
         "name": "<linux/tracepoint.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_8",
+        "ast_id": "$ast_10",
         "name": "TRACE_EVENT",
         "type_id": "20 (C_functionproto)"
       },
       {
-        "ast_id": "$ast_9",
+        "ast_id": "$ast_11",
         "name": "DECLARE_EVENT_CLASS",
         "type_id": "20 (C_functionproto)"
       },
       {
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "name": "DEFINE_EVENT",
         "type_id": "20 (C_functionproto)"
       },
       {
-        "ast_id": "$ast_11",
+        "ast_id": "$ast_13",
         "name": "",
         "type_id": "70 (CPPro_endif)"
       },
       {
-        "ast_id": "$ast_12",
+        "ast_id": "$ast_14",
         "name": "/* _TRACE_NET_H */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_13",
+        "ast_id": "$ast_15",
         "name": "/* This part must be outside protection */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_14",
+        "ast_id": "$ast_16",
         "name": "<trace/define_trace.h>",
         "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_17",
+        "name": "net_dev_xmit",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_18",
+        "name": "skb",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_19",
+        "name": "rc",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_20",
+        "name": "dev",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_21",
+        "name": "skb_len",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_22",
+        "name": "skbaddr",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_23",
+        "name": "len",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_24",
+        "name": "name",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_25",
+        "name": "__entry",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_26",
+        "name": "TP_PROTO",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_27",
+        "name": "TP_ARGS",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_28",
+        "name": "sk_buff",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_29",
+        "name": "net_device",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_30",
+        "name": "TP_STRUCT__entry",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_31",
+        "name": "__field",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_32",
+        "name": "__string",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_33",
+        "name": "TP_fast_assign",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_34",
+        "name": "__assign_str",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_35",
+        "name": "TP_printk",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_36",
+        "name": "__get_str",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_37",
+        "name": "DECLARE_EVENT_CLASS",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_38",
+        "name": "net_dev_template",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_39",
+        "name": "DEFINE_EVENT",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_40",
+        "name": "net_dev_queue",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_41",
+        "name": "netif_receive_skb",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_42",
+        "name": "netif_rx",
+        "type_id": "62 (C_DeclRefExpr)"
       }
     ],
     "m_tag": [
@@ -145,105 +285,105 @@
       {
         "tag_id": "$tag_2",
         "hash": "hex:15fc85a9900c1064a96968c630f8051a1e93474bb8a527bab9e678b51a85b636",
-        "ast_id": "$ast_2",
+        "ast_id": "$ast_3",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_3",
         "hash": "hex:17944bd5050427ddce72cdca9112ca4b06d6d37de2d13fda8b5757067ed61aef",
-        "ast_id": "$ast_3",
+        "ast_id": "$ast_4",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_4",
         "hash": "hex:588a01d21a38ffad99674ea9b705057d86bb47915e923e3b30e886d231f27304",
-        "ast_id": "$ast_4",
+        "ast_id": "$ast_6",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_5",
         "hash": "hex:bc5df93d0a1eda2d21e184646d8142545030e3bdedf7d88778c7b5f3c6c455c4",
-        "ast_id": "$ast_5",
+        "ast_id": "$ast_7",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_6",
         "hash": "hex:af518b74d71ab200cfa9ae330c9d7c0e62646f0c97ec74587f49686795bfbbef",
-        "ast_id": "$ast_6",
+        "ast_id": "$ast_8",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_7",
         "hash": "hex:644d94693ace0e7d1a7501c4394aef86a258a33d0941077760b4e24f63ffe316",
-        "ast_id": "$ast_7",
+        "ast_id": "$ast_9",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_8",
         "hash": "hex:a9da58541da36838a4e649c6f0f440ba04ab765ae5cd2d8219cad57927629124",
-        "ast_id": "$ast_8",
+        "ast_id": "$ast_10",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_9",
         "hash": "hex:0146317883dfefff66c08019fa3a2d73ccc7f71f24da4e17fbee68e63c875b2c",
-        "ast_id": "$ast_9",
+        "ast_id": "$ast_11",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_10",
         "hash": "hex:183a2c84c140c313ff598d3e1a5d49877390220671ed30038503e5b1fd652d2d",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_11",
         "hash": "hex:d58b80106ac48fe28e6022d5ad5a5c56a8262794c0cfec456c83205e36cba76c",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_12",
         "hash": "hex:35c14743434f6ff2fe7c5cb5036299f9eb7ed7b0b821b890786e449f53882e33",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_13",
         "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
-        "ast_id": "$ast_11",
+        "ast_id": "$ast_13",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_14",
         "hash": "hex:5943948da7f1c003fe1ce5d2521a652712013db017b05872795b031ca61533f0",
-        "ast_id": "$ast_12",
+        "ast_id": "$ast_14",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_15",
         "hash": "hex:186be7aa3cc06a0ddd8c9542df3909cde6bae3e4191ee48905b6a35f6b28633e",
-        "ast_id": "$ast_13",
+        "ast_id": "$ast_15",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_16",
         "hash": "hex:68b473cfa2b535dc4477f1cfbf4a0ef8467cd24894beceb6b02227a8893ad9a9",
-        "ast_id": "$ast_14",
+        "ast_id": "$ast_16",
         "hl_s": 0,
         "hl_l": 0
       }
@@ -409,7 +549,7 @@
         "char_s": 1,
         "line_e": 78,
         "char_e": 7,
-        "ast_id": "$ast_2"
+        "ast_id": "$ast_3"
       },
       {
         "map_id": "$tag_3",
@@ -417,7 +557,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 21,
-        "ast_id": "$ast_3"
+        "ast_id": "$ast_4"
       },
       {
         "map_id": "$tag_4",
@@ -425,7 +565,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 26,
-        "ast_id": "$ast_4"
+        "ast_id": "$ast_6"
       },
       {
         "map_id": "$tag_5",
@@ -433,7 +573,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 29,
-        "ast_id": "$ast_5"
+        "ast_id": "$ast_7"
       },
       {
         "map_id": "$tag_6",
@@ -441,7 +581,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 22,
-        "ast_id": "$ast_6"
+        "ast_id": "$ast_8"
       },
       {
         "map_id": "$tag_7",
@@ -449,7 +589,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 30,
-        "ast_id": "$ast_7"
+        "ast_id": "$ast_9"
       },
       {
         "map_id": "$tag_8",
@@ -457,7 +597,7 @@
         "char_s": 1,
         "line_e": 26,
         "char_e": 3,
-        "ast_id": "$ast_8"
+        "ast_id": "$ast_10"
       },
       {
         "map_id": "$tag_9",
@@ -465,7 +605,7 @@
         "char_s": 1,
         "line_e": 21,
         "char_e": 2,
-        "ast_id": "$ast_9"
+        "ast_id": "$ast_11"
       },
       {
         "map_id": "$tag_10",
@@ -473,7 +613,7 @@
         "char_s": 1,
         "line_e": 6,
         "char_e": 3,
-        "ast_id": "$ast_10"
+        "ast_id": "$ast_12"
       },
       {
         "map_id": "$tag_11",
@@ -481,7 +621,7 @@
         "char_s": 1,
         "line_e": 6,
         "char_e": 3,
-        "ast_id": "$ast_10"
+        "ast_id": "$ast_12"
       },
       {
         "map_id": "$tag_12",
@@ -489,7 +629,7 @@
         "char_s": 1,
         "line_e": 6,
         "char_e": 3,
-        "ast_id": "$ast_10"
+        "ast_id": "$ast_12"
       },
       {
         "map_id": "$tag_13",
@@ -497,7 +637,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 7,
-        "ast_id": "$ast_11"
+        "ast_id": "$ast_13"
       },
       {
         "map_id": "$tag_14",
@@ -505,7 +645,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 26,
-        "ast_id": "$ast_12"
+        "ast_id": "$ast_14"
       },
       {
         "map_id": "$tag_15",
@@ -513,7 +653,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 43,
-        "ast_id": "$ast_13"
+        "ast_id": "$ast_15"
       },
       {
         "map_id": "$tag_16",
@@ -521,7 +661,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 32,
-        "ast_id": "$ast_14"
+        "ast_id": "$ast_16"
       }
     ],
     "m_git_ref": [
@@ -547,8 +687,18 @@
     "m_symbol_def": [
       {
         "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_10",
+        "name": "net_dev_xmit",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 12,
+        "line_e": 37
+      },
+      {
+        "blob_id": "$fid_0",
         "tag_id": "$tag_9",
-        "ast_id": "$ast_9",
+        "ast_id": "$ast_11",
         "name": "net_dev_template",
         "type_id": "151 (C_TracepointDef)",
         "linkage": 5,
@@ -558,7 +708,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_10",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "name": "net_dev_queue",
         "type_id": "151 (C_TracepointDef)",
         "linkage": 5,
@@ -568,7 +718,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_11",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "name": "netif_receive_skb",
         "type_id": "151 (C_TracepointDef)",
         "linkage": 5,
@@ -578,7 +728,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_12",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_12",
         "name": "netif_rx",
         "type_id": "151 (C_TracepointDef)",
         "linkage": 5,
@@ -598,22 +748,842 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_3",
-        "ast_id": "$ast_3",
+        "ast_id": "$ast_4",
         "name": "_TRACE_NET_H",
         "type_id": "75 (CPPro_define)",
         "linkage": 5,
         "line_s": 5,
         "line_e": 5
+      }
+    ],
+    "m_symbol_ref": [
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_17",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 12,
+        "char_s": 13
       },
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_8",
-        "ast_id": "$ast_8",
-        "name": "net_dev_xmit",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 12,
-        "line_e": 37
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 19,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 43,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 65,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 72,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 79,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 53,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 48,
+        "char_s": 20
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 29,
+        "char_s": 22
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 52,
+        "char_s": 22
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 54,
+        "char_s": 22
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 14,
+        "char_s": 27
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 41,
+        "char_s": 27
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 63,
+        "char_s": 27
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 70,
+        "char_s": 27
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 77,
+        "char_s": 27
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_19",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 19,
+        "char_s": 15
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_19",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 31,
+        "char_s": 17
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_19",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 24,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_19",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 15,
+        "char_s": 8
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_20",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 19,
+        "char_s": 19
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_20",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 25,
+        "char_s": 20
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_20",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 32,
+        "char_s": 22
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_20",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 16,
+        "char_s": 23
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_21",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 17,
+        "char_s": 17
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_21",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 30,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_21",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 19,
+        "char_s": 24
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_22",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 22,
+        "char_s": 21
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_22",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 46,
+        "char_s": 21
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_23",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 23,
+        "char_s": 26
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_23",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 47,
+        "char_s": 26
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 25,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 36,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 48,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 58,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 32,
+        "char_s": 16
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 54,
+        "char_s": 16
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 36,
+        "char_s": 20
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 58,
+        "char_s": 20
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 29,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 30,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 31,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 52,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 53,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 36,
+        "char_s": 38
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 58,
+        "char_s": 38
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_25",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 36,
+        "char_s": 52
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_26",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 14,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_26",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 41,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_26",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 63,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_26",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 70,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_26",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 77,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_27",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 19,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_27",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 43,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_27",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 65,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_27",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 72,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_27",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 79,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_28",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 14,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_28",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 41,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_28",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 63,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_28",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 70,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_28",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 77,
+        "char_s": 18
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_1",
+        "ast_id": "$ast_2",
+        "target_fnid": 0,
+        "role": "7 (MacroBodyRef)",
+        "line": 2,
+        "char_s": 22
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_29",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 16,
+        "char_s": 11
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_30",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 21,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_30",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 45,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_31",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 22,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_31",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 23,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_31",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 24,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_31",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 46,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_31",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 47,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_32",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 25,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_32",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 48,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_33",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 28,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_33",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 51,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_34",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 32,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_34",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 54,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_35",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 35,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_35",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 57,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_36",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 36,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_36",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 58,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_37",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 39,
+        "char_s": 1
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_38",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 61,
+        "char_s": 14
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_38",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 68,
+        "char_s": 14
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_38",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 75,
+        "char_s": 14
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_38",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 39,
+        "char_s": 21
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_39",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 61,
+        "char_s": 1
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_40",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 61,
+        "char_s": 32
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_41",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 68,
+        "char_s": 32
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_42",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 75,
+        "char_s": 32
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_2",
+        "ast_id": "$ast_4",
+        "target_fnid": 0,
+        "role": "8 (CondRef)",
+        "line": 4,
+        "char_s": 14
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_2",
+        "ast_id": "$ast_5",
+        "target_fnid": 0,
+        "role": "8 (CondRef)",
+        "line": 4,
+        "char_s": 39
       }
     ]
   }

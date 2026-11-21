@@ -14,8 +14,10 @@ sys.setrecursionlimit(50000)
 import time
 import shutil
 import unittest
+from unittest import mock
 import subprocess
 import multiprocessing
+import contextlib
 import hashlib
 from typing import Any
 
@@ -4171,6 +4173,607 @@ def run_c_ast_tests(
         print(COLOR.red(f"[-] TEST FAILURES DETECTED in {elapsed:.2f}s."))
         print(COLOR.cyan("==========================================================================================\n"))
         return 1
+
+
+def parse_snippet(code: str, path: str = "include/linux/snip.h", extra_files: dict[str, str] | None = None,
+                  inspect: Any = None) -> tuple[list[tuple], list[tuple]]:
+    """Parse one C file in a sandbox tree (MockDB): ([(line, col, role name, target name, target type name)],
+    [(line_s, name, type name, linkage name)]). `extra_files` adds tree files (a Makefile gives the tree a build
+    layout); `inspect(cs)` sees the ChangeSet after the parse."""
+    import shutil
+    import tempfile
+    from core.globalstuff import SymbolLinkage, SymbolRole
+
+    MockDB.store.clear()
+    G.DB = MockDB
+    G.TE = get_table_engine("cached")()
+    gp = GreatProcessor()
+    init_db_layout(gp)
+    G.TE.start(gp.Table_Array, G.DB)
+    root = tempfile.mkdtemp(dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+    try:
+        dest = os.path.join(root, path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="latin-1") as fh:
+            fh.write(code)
+        for extra_path, extra_text in (extra_files or {}).items():
+            extra_dest = os.path.join(root, extra_path)
+            os.makedirs(os.path.dirname(extra_dest), exist_ok=True)
+            with open(extra_dest, "w", encoding="latin-1") as fh:
+                fh.write(extra_text)
+        mf = MasterFile()
+        mf.version_dict["v3.0"] = root
+        G.MF = mf
+        gp.Version_Name = "v3.0"
+        gp.VID = 1
+        cs = ChangeSet(f"A\t{path}")
+        cs.current_vid = 1
+        cs.gp = gp
+        cs.mf = mf
+        G.CURRENT_PARSING_FILE = path
+        default_processing(cs, gp)
+        cs.parse()
+        if inspect is not None:
+            inspect(cs)
+        cs.execute()
+        G.TE.commit_all()
+        st = MockDB.store
+        ast = {r[0]: r for r in st.get("m_ast", {}).values()}
+        roles = {int(v): k for k, v in SymbolRole.__members__.items()}
+        links = {int(v): k for k, v in SymbolLinkage.__members__.items()}
+
+        def tname(t: int) -> str:
+            return ASTT(t).name if t in ASTT._value2member_map_ else str(t)
+
+        refs = sorted((r[6], r[7], roles.get(r[5], r[5]), ast.get(r[3], (0, None, 0))[1], tname(ast.get(r[3], (0, None, 0))[2]))
+                      for r in symbol_view_rows(st, "m_symbol_ref"))
+        defs = sorted((r[7], r[4], tname(r[5]), links.get(r[6], r[6])) for r in symbol_view_rows(st, "m_symbol_def"))
+        return refs, defs
+    finally:
+        clear_tu_caches()
+        if extra_files:
+            from parser import compile_env
+            for env in list(compile_env._TREE_ENVS.values()):
+                if env.root == os.path.abspath(root).rstrip("/"):
+                    env.cleanup()
+        shutil.rmtree(root, ignore_errors=True)
+        G.CURRENT_PARSING_FILE = None
+        if G.TE:
+            G.TE.close()
+
+
+class TestIncludeTargets(unittest.TestCase):
+    """CPPro_include: canonical m_ast_include targets, no m_ast_container, target-aware Tier 1 recycling."""
+
+    def setUp(self) -> None:
+        MockDB.store.clear()
+        G.DEBUG_TYPECHECK = True
+        G.DB = MockDB
+        G.TE = get_table_engine("cached")()
+        self.gp = GreatProcessor()
+        init_db_layout(self.gp)
+        G.TE.start(self.gp.Table_Array, G.DB)
+        self.mf = MasterFile()
+        G.MF = self.mf
+        self.dirs: list[str] = []
+
+    def tearDown(self) -> None:
+        if G.TE:
+            try:
+                G.TE.close()
+            except Exception:
+                pass
+        MockDB.store.clear()
+        clear_tu_caches()
+        G.CURRENT_PARSING_FILE = None
+        G.CURRENT_PARSING_DIR = None
+        for d in self.dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _parse(self, vid: int, files: dict[str, str], path: str) -> int:
+        """Parse `path` of a tree holding `files` as version `vid` (modified from `vid - 1` when > 1); its fid."""
+        temp_dir = self.mf.create_temp_dir()
+        self.dirs.append(temp_dir)
+        name = f"v3.{vid - 1}"
+        self.mf.version_dict[name] = temp_dir
+        for rel, text in files.items():
+            full = os.path.join(temp_dir, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="latin-1") as f:
+                f.write(text)
+        gp = self.gp
+        gp.Version_Name = name
+        gp.VID = vid
+        gp.Old_VID = vid - 1
+        cs = ChangeSet(f"{'A' if vid == 1 else 'M'}\t{path}")
+        cs.current_vid = vid
+        cs.gp = gp
+        cs.mf = self.mf
+        cs.blob_hash = bytes([vid]) * 20
+        G.CURRENT_PARSING_FILE = path
+        if vid > 1:
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            with cs(REF_OLD):
+                cs.store(m_bridge_file.view(((m_bridge_file.fnid, m_file_name.fnid, 1),), vid - 1,
+                                            cs.ref(m_file_name.fnid, REF_ROOT), None, None, cs.current_path))
+        default_processing(cs, gp)
+        cs.parse()
+        self.assertTrue(cs.execute())
+        G.TE.commit_all()
+        fids = [row[0] for row in MockDB.store.get(m_file.table_name, {}).values() if bytes(row[1]) == cs.blob_hash]
+        self.assertEqual(len(fids), 1)
+        return fids[0]
+
+    def _includes(self, fid: int) -> dict[str, tuple[int, str]]:
+        """{directive text: (tag_id, m_ast_include target)} of the include tags bridged to blob `fid`."""
+        tags = {row[0]: row for row in MockDB.store.get("m_tag", {}).values()}
+        asts = {row[0]: row for row in MockDB.store.get("m_ast", {}).values()}
+        inc = {row[0]: row[1] for row in MockDB.store.get("m_ast_include", {}).values()}
+        names = {row[0]: row[1] for row in MockDB.store.get("m_file_name", {}).values()}
+        out = {}
+        for row in MockDB.store.get("m_bridge_tag", {}).values():
+            if row[0] != fid:
+                continue
+            ast = asts.get(tags[row[1]][2])
+            if ast and ast[2] == int(ASTT.CPPro_include):
+                out[ast[1]] = (row[1], names[inc[ast[0]]])
+        return out
+
+    def test_inactive_branch_include_resolves_canonical_path(self) -> None:
+        files = {
+            "include/linux/foo.h": "#define FOO 1\n",
+            "include/linux/bar.h": "#define BAR 1\n",
+            "drivers/x/local.h": "#define LOCAL 1\n",
+            "drivers/x/a.c": (
+                "#include <linux/foo.h>\n"
+                "#ifdef CONFIG_NEVER_SET\n"
+                "#include <linux/bar.h>\n"
+                "#include \"local.h\"\n"
+                "#endif\n"
+                "#include <linux/autoconf_not_in_tree.h>\n"
+                "int x = FOO;\n"
+            ),
+        }
+        fid = self._parse(1, files, "drivers/x/a.c")
+        got = {text: target for text, (_tag, target) in self._includes(fid).items()}
+        self.assertEqual(got, {
+            "<linux/foo.h>": "include/linux/foo.h",
+            # Inactive branch: libclang opens nothing, the build's search path finds the tree file
+            "<linux/bar.h>": "include/linux/bar.h",
+            '"local.h"': "drivers/x/local.h",
+            # Not in the tree: the written spelling
+            "<linux/autoconf_not_in_tree.h>": "linux/autoconf_not_in_tree.h",
+        })
+        # Directive text and target only: no m_ast_container row on any include node
+        include_ids = {row[0] for row in MockDB.store.get("m_ast", {}).values() if row[2] == int(ASTT.CPPro_include)}
+        self.assertEqual(len(include_ids), 4)
+        containers = [row for row in MockDB.store.get(m_ast_container.table_name, {}).values() if row[0] in include_ids]
+        self.assertEqual(containers, [])
+
+    def test_libclang_miss_falls_back_to_the_build_search_path(self) -> None:
+        """A directive libclang opened nothing for resolves through CompileEnv / IncludeResolver."""
+        import tempfile
+        from types import SimpleNamespace
+        from parser.arch_layout import ArchLayout
+        from parser.c_ast.ast_nodes import CPPro_include
+        from parser.c_ast.tokenizer import Line
+        from parser.compile_env import ArchEnv, CompileEnv
+
+        files = {"include/linux/foo.h", "include/asm-x86_64/atomic.h", "drivers/x/local.h", "drivers/x/a.c"}
+        layout = ArchLayout("x86_64", "x86", includes=["include/"], links={"include/asm/": "include/asm-x86_64/"})
+        root = tempfile.mkdtemp(prefix="kip-inc-")
+        self.dirs.append(root)
+        env = CompileEnv(root, files, lambda _p: None, {"x86_64": layout}, key="inc-test", build_base=root)
+        cs = SimpleNamespace(resolved_includes_by_line={}, compile_env=env, compile_arch=ArchEnv("x86_64", layout),
+                             current_path="drivers/x/a.c", mfdir=root)
+
+        def target(written: str) -> str:
+            node = CPPro_include(Line(3, 3, 1, 20), written)
+            return node.resolve_target(cs)
+
+        # Never the raw spelling when the tree holds the header
+        self.assertEqual(target("<linux/foo.h>"), "include/linux/foo.h")
+        self.assertEqual(target("<asm/atomic.h>"), "include/asm-x86_64/atomic.h")  # through the layout's link
+        self.assertEqual(target('"local.h"'), "drivers/x/local.h")
+        self.assertEqual(target("<local.h>"), "local.h")  # the angle form does not search the file's directory
+        # Build-generated or absent: the written spelling
+        self.assertEqual(target("<linux/autoconf.h>"), "linux/autoconf.h")
+        self.assertEqual(target("<generated/asm-offsets.h>"), "generated/asm-offsets.h")
+        self.assertEqual(target("CONFIG_HEADER"), "CONFIG_HEADER")  # macro include
+        # libclang's line map wins
+        cs.resolved_includes_by_line = {3: "include/linux/other.h"}
+        self.assertEqual(target("<linux/foo.h>"), "include/linux/other.h")
+
+    def test_tier1_recycling_checks_the_include_target(self) -> None:
+        src = '#include "local.h"\n#include <linux/same.h>\nint x;\n'
+        v1 = {"drivers/x/a.c": src, "drivers/x/local.h": "#define L 1\n", "include/local.h": "#define G 1\n",
+              "include/linux/same.h": "#define S 1\n"}
+        fid1 = self._parse(1, v1, "drivers/x/a.c")
+        inc1 = self._includes(fid1)
+        self.assertEqual(inc1['"local.h"'][1], "drivers/x/local.h")
+
+        # v2: identical text, but drivers/x/local.h is gone: "local.h" now reads include/local.h
+        v2 = {k: v for k, v in v1.items() if k != "drivers/x/local.h"}
+        fid2 = self._parse(2, v2, "drivers/x/a.c")
+        inc2 = self._includes(fid2)
+        self.assertEqual(inc2['"local.h"'][1], "include/local.h")
+        # Same code hash, different target: a new tag (moved from the prior one), never the stale one
+        self.assertNotEqual(inc2['"local.h"'][0], inc1['"local.h"'][0])
+        self.assertIn((inc1['"local.h"'][0], inc2['"local.h"'][0]), set(MockDB.store.get("m_moved_tag", {})))
+        # Same text and same target: the prior tag is recycled
+        self.assertEqual(inc2["<linux/same.h>"], inc1["<linux/same.h>"])
+
+
+class TestHeaderReferenceCompleteness(unittest.TestCase):
+    """Definitions and references of header constructs: macro-prefixed prototypes, #define bodies, #if tests and
+    names libclang leaves unresolved (parser/c_ast/lexical_refs.py)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_macro_prefixed_prototypes_are_definitions(self) -> None:
+        _refs, defs = parse_snippet(
+            "#define NORET_TYPE\n#define ATTRIB_NORET __attribute__((noreturn))\n"
+            "NORET_TYPE void panic(const char *fmt, ...);\nNORET_TYPE void do_exit(long code)\n\tATTRIB_NORET;\n"
+            "void plain(int y) ATTRIB_NORET;\nNORET_TYPE int body(void) { return 0; }\n")
+        found = {(name, typ, link) for _l, name, typ, link in defs}
+        for name in ("panic", "do_exit", "plain"):
+            self.assertIn((name, "C_functionprotodecl", "PrototypeDecl"), found)
+        self.assertIn(("body", "C_functionprotodecl", "ExternalDef"), found)
+
+    def test_define_bodies_and_conditions(self) -> None:
+        refs, _defs = parse_snippet(
+            "#ifndef GUARD_H\n#define GUARD_H\n"
+            "#define WRAP(x) helper_fn(x, struct foo_s, BAR_CONST, p->member, pre_##x)\n"
+            "#if defined(CONFIG_SMP) && NR_CPUS > 1\nint a;\n#elif IS_ENABLED(CONFIG_X)\nint b;\n#endif\n"
+            "#ifdef CONFIG_Y\nint c;\n#endif\n#endif\n")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in ((3, 17, "MacroBodyRef", "helper_fn", "C_DeclRefExpr"), (3, 37, "MacroBodyRef", "foo_s", "C_structnotbind"),
+                     (3, 44, "MacroBodyRef", "BAR_CONST", "C_DeclRefExpr"), (4, 13, "CondRef", "CONFIG_SMP", "CPPro_define"),
+                     (4, 28, "CondRef", "NR_CPUS", "CPPro_define"), (6, 18, "CondRef", "CONFIG_X", "CPPro_define"),
+                     (9, 8, "CondRef", "CONFIG_Y", "CPPro_define"), (1, 9, "CondRef", "GUARD_H", "CPPro_define")):
+            self.assertIn(item, got)
+        names = {name for *_x, name, _t in refs}
+        # Macro parameters, member names and pasted fragments are not references
+        for absent in ("x", "member", "pre_", "WRAP", "defined"):
+            self.assertNotIn(absent, names)
+
+    def test_unresolved_and_skipped_names(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct s { int f; };\nstatic int g(struct s *p, int n)\n{\n\tu32 v = (u32)n;\n"
+            "\tif (UNKNOWN_FLAG & n)\n\t\tmissing_fn(p->f, n);\n#ifdef CONFIG_NOT_SET\n\tother_fn(thing);\n"
+            "\tstruct hidden *h = 0;\n#endif\nout:\n\treturn v + known_var;\n}\n", "fs/snip.c")
+        got = {(line, role, name, typ) for line, _c, role, name, typ in refs}
+        for item in ((4, "TypeUsage", "u32", "C_SCtypedef"), (5, "MacroExpansion", "UNKNOWN_FLAG", "CPPro_define"),
+                     (6, "Call", "missing_fn", "C_functionprotnotbind"), (8, "Call", "other_fn", "C_functionprotnotbind"),
+                     (8, "DeclRef", "thing", "C_DeclRefExpr"), (9, "TypeUsage", "hidden", "C_structnotbind"),
+                     (12, "DeclRef", "known_var", "C_DeclRefExpr")):
+            self.assertIn(item, got)
+        names = [name for *_x, name, _t in refs]
+        self.assertNotIn("out", names)          # a label
+        self.assertEqual(names.count("f"), 1)   # the member reference only, not a lexical duplicate
+
+    def test_lexical_classifier(self) -> None:
+        from parser.c_ast.lexical_refs import CUR_NONE, CUR_RESOLVED, KIND_IDENTIFIER, KIND_KEYWORD, KIND_PUNCT, lexical_refs
+
+        def toks(*items):
+            return [(t, k, 1, i + 1, st) for i, (t, k, st) in enumerate(items)]
+
+        I, K, P = KIND_IDENTIFIER, KIND_KEYWORD, KIND_PUNCT
+        stream = toks(("struct", K, CUR_RESOLVED), ("tag_t", I, CUR_NONE), (";", P, 0), ("u8", I, CUR_NONE), ("x", I, CUR_RESOLVED),
+                      (";", P, 0), ("FOO", I, CUR_NONE), ("(", P, 0), ("call_me", I, CUR_NONE), ("(", P, 0), (")", P, 0), (")", P, 0),
+                      (";", P, 0), ("obj", I, CUR_NONE), ("->", P, 0), ("field", I, CUR_NONE), (";", P, 0), ("seen", I, CUR_NONE))
+        out = {(name, role) for name, _l, _c, role, _t in lexical_refs(stream, {(1, 18)}, set())}
+        from core.globalstuff import SymbolRole as R
+        self.assertEqual(out, {("tag_t", int(R.TypeUsage)), ("u8", int(R.TypeUsage)), ("FOO", int(R.MacroExpansion)),
+                               ("call_me", int(R.Call)), ("obj", int(R.DeclRef))})
+        self.assertEqual(lexical_refs(stream, set(), {1}), [])  # a directive line
+
+    def test_scope_isolated_lexical_declarations(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct holder { int field_only; };\n"
+            "int proto_fn(int proto_only);\n"
+            "static int fn_a(int param_x)\n"
+            "{\n"
+            "\tu32 local_y = (u32)param_x;\n"
+            "\treturn local_y + param_x;\n"
+            "}\n"
+            "static int fn_b(void)\n"
+            "{\n"
+            "\treturn param_x + local_y + proto_only + field_only;\n"
+            "}\n"
+            "int file_scope_val = sizeof(local_y);\n",
+            "fs/scope_iso.c",
+        )
+        by_line_name = {(line, role, name) for line, _col, role, name, _typ in refs}
+        # Inside fn_a (lines 5-6), param_x and local_y are in scope and must not emit unresolved DeclRefs
+        self.assertNotIn((5, "DeclRef", "param_x"), by_line_name)
+        self.assertNotIn((6, "DeclRef", "local_y"), by_line_name)
+        self.assertNotIn((6, "DeclRef", "param_x"), by_line_name)
+        # Inside fn_b (line 10) and at file scope (line 12), param_x, local_y, proto_only, and field_only are unresolved
+        self.assertIn((10, "DeclRef", "param_x"), by_line_name)
+        self.assertIn((10, "DeclRef", "local_y"), by_line_name)
+        self.assertIn((10, "DeclRef", "proto_only"), by_line_name)
+        self.assertIn((10, "DeclRef", "field_only"), by_line_name)
+        self.assertIn((12, "DeclRef", "local_y"), by_line_name)
+
+
+class TestExpressionReferences(unittest.TestCase):
+    """References inside expressions (parser/c_ast/cursor_tree.py `_collect_expr_ref()`), declarations libclang
+    spells through macros, the lexical fast path and the header prelude (parser/compile_env.py `header_prelude()`)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_type_names_in_expressions(self) -> None:
+        refs, _defs = parse_snippet(
+            "#define offsetof(T, m) __builtin_offsetof(T, m)\n"
+            "#define container_of(p, T, m) ((T *)((char *)(p) - offsetof(T, m)))\n"
+            "typedef unsigned int u32;\nstruct foo { int a; struct foo *next; };\nunion bar { int x; };\nenum col { RED };\n"
+            "static unsigned long f(void *p, struct foo *q)\n{\n"
+            "\tunsigned long n = sizeof(struct foo) + sizeof(union bar) + sizeof(u32);\n"
+            "\tstruct foo *x = (struct foo *)p;\n"
+            "\tstruct foo *z = container_of(&q->next, struct foo, next);\n"
+            "\tn += offsetof(struct foo, a) + (enum col)0;\n"
+            "\treturn n + ((struct foo){ .a = 1 }).a + (unsigned long)x + (unsigned long)z;\n}\n"
+            "static int g = sizeof(struct foo);\n", "kernel/expr.c")
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((9, 34, "TypeUsage", "foo"), (9, 54, "TypeUsage", "bar"), (9, 68, "TypeUsage", "u32"),  # sizeof
+                     (10, 26, "TypeUsage", "foo"),                                                          # (T *)x
+                     (11, 48, "TypeUsage", "foo"),                                                          # container_of
+                     (12, 23, "TypeUsage", "foo"), (12, 39, "TypeUsage", "col"),                            # offsetof, enum cast
+                     (13, 22, "TypeUsage", "foo"),                                                          # compound literal
+                     (15, 30, "TypeUsage", "foo")):                                                         # initializer
+            self.assertIn(item, got)
+
+    def test_arguments_of_a_call_statement(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct s { int f; };\nvoid use(int a, int b);\nint helper(int v);\n"
+            "void g(struct s *p, int n)\n{\n\tuse(p->f, helper(n));\n\tuse(n, sizeof(struct s));\n}\n", "kernel/call.c")
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((6, 2, "Call", "use"), (6, 6, "DeclRef", "p"), (6, 9, "MemberRef", "f"), (6, 12, "Call", "helper"),
+                     (6, 19, "DeclRef", "n"), (7, 6, "DeclRef", "n"), (7, 23, "TypeUsage", "s")):
+            self.assertIn(item, got)
+        self.assertEqual(sum(1 for line, col, role, *_x in got if (line, col, role) == (6, 2, "Call")), 1)
+
+    def test_function_renamed_by_a_macro_and_literal_declarators(self) -> None:
+        refs, defs = parse_snippet(
+            "typedef unsigned char u8;\n#define vset fset\nstatic inline void vset(u8 *p, u8 a)\n{\n\t*p = a;\n}\n"
+            "#define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]\nextern DECLARE_BITMAP(zmap, 128);\n",
+            "drivers/x/rename.h")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        self.assertIn((3, "vset", "C_functionprotodecl"), found)
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((3, 25, "TypeUsage", "u8"), (3, 32, "TypeUsage", "u8"), (5, 3, "DeclRef", "p"), (5, 7, "DeclRef", "a")):
+            self.assertIn(item, got)
+        names = {name for _l, name, _t, _k in defs}
+        self.assertIn("zmap", names)
+        self.assertNotIn("128", names)  # a literal is no declarator name
+
+    def test_lexical_fast_path_skips_the_scope_model(self) -> None:
+        from unittest import mock
+        from parser.c_ast import c_scope
+        from parser.c_ast.lexical_refs import CUR_NONE, CUR_RESOLVED, KIND_IDENTIFIER, KIND_PUNCT, lexical_refs
+
+        resolved = [("x", KIND_IDENTIFIER, 1, 1, CUR_RESOLVED), (";", KIND_PUNCT, 1, 2, CUR_RESOLVED),
+                    ("y", KIND_IDENTIFIER, 2, 1, CUR_NONE), (";", KIND_PUNCT, 2, 2, CUR_RESOLVED)]
+        with mock.patch.object(c_scope, "extract_scopes", wraps=c_scope.extract_scopes) as scopes:
+            # y is covered by a parser reference: no candidate, no scope model
+            self.assertEqual(lexical_refs(resolved, {(2, 1)}, set(), ("x;", "y;")), [])
+            self.assertEqual(scopes.call_count, 0)
+            # y on a directive line: no candidate either
+            self.assertEqual(lexical_refs(resolved, set(), {2}, ("x;", "y;")), [])
+            self.assertEqual(scopes.call_count, 0)
+            out = lexical_refs(resolved, set(), set(), ("x;", "y;"))
+            self.assertEqual([name for name, *_x in out], ["y"])
+            self.assertEqual(scopes.call_count, 1)
+
+    def test_header_prelude_retry(self) -> None:
+        from parser import compile_env
+        from tests.test_compile_env import TREE
+
+        extra = {k: v for k, v in TREE.items() if k != "fs/x.c"}
+        extra["include/linux/types.h"] = "#ifndef _LINUX_TYPES_H\n#define _LINUX_TYPES_H\ntypedef unsigned int u32;\n#endif\n"
+        code = ("struct nlm_host;\nstruct nlmsvc_binding {\n\tu32 (*fopen)(struct nlm_host *, u32);\n};\n"
+                "static inline u32 nlm_next(u32 v, struct nlm_host *h)\n{\n\treturn v + 1;\n}\n#include <linux/types.h>\n")
+        includes: dict[str, dict[int, str]] = {}
+        results = {}
+        for label in ("plain", "prelude"):
+            def inspect(cs: Any, label: str = label) -> None:
+                includes[label] = dict(cs.resolved_includes_by_line)
+            with mock.patch.object(compile_env.CompileEnv, "header_prelude", return_value=[]) if label == "plain" else contextlib.nullcontext():
+                results[label] = parse_snippet(code, "include/linux/lockd/bind.h", extra_files=extra, inspect=inspect)
+        plain = {(line, col, role, name) for line, col, role, name, _t in results["plain"][0]}
+        prelude = {(line, col, role, name) for line, col, role, name, _t in results["prelude"][0]}
+        self.assertTrue(plain < prelude)
+        self.assertIn((3, 34, "TypeUsage", "u32"), prelude - plain)  # the parameter after the unknown type
+        self.assertIn((7, 9, "DeclRef", "v"), prelude - plain)
+        # The header's own #include stays mapped: the include map is read from the parse without the prelude
+        self.assertEqual(includes["plain"], {9: "include/linux/types.h"})
+        self.assertEqual(includes["prelude"], includes["plain"])
+
+
+
+class TestDeclaratorAndNamespaceFidelity(unittest.TestCase):
+    """References inside declarators and declaration macros, definitions libclang spells through macros or typedefs,
+    and the C name space of every reference target (parser/c_ast/cursor_tree.py `C_Type`, `AST_Array`,
+    `AST_Enum_Equal`, `AST_Initializer`; parser/c_ast/ast_nodes.py `ref_target_family()`)."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def test_refs_in_declarators(self) -> None:
+        refs, defs = parse_snippet(
+            "#define MAX_FOO 8\n#define BIT(n) (1UL << (n))\n#define WIDTH 3\n"
+            "enum colors { RED, GREEN = BIT(3), BLUE = GREEN + 1 };\n"
+            "struct st { int a[MAX_FOO]; unsigned w : WIDTH; char b[BLUE]; };\n"
+            "static int garr[MAX_FOO + RED];\n"
+            "struct ops { int (*open)(int); struct st *ops; };\n"
+            "static int my_open(int x) { return x; }\n"
+            "static struct st my_st;\n"
+            "static struct ops my_ops = { .open = my_open, .ops = &my_st };\n"
+            "int arr2[4] = { [RED] = 1, [GREEN] = MAX_FOO };\n"
+            "int sw(int v)\n{\n\tswitch (v) {\n\tcase RED:\n\t\treturn 1;\n\tcase BLUE:\n\t\treturn 2;\n\t}\n\treturn 0;\n}\n",
+            "drivers/x/decl.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in (
+            (4, 28, "MacroExpansion", "BIT", "CPPro_define_macro"),     # enum initializer
+            (4, 43, "DeclRef", "GREEN", "C_enumequal"),
+            (5, 19, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),  # array bound of a field
+            (5, 42, "MacroExpansion", "WIDTH", "CPPro_define_macro"),    # bitfield width
+            (5, 56, "DeclRef", "BLUE", "C_enumequal"),
+            (6, 17, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),  # array bound of a global
+            (6, 27, "DeclRef", "RED", "C_enumequal"),
+            (10, 38, "DeclRef", "my_open", "C_functionprotodecl"),       # designated initializers
+            (10, 55, "DeclRef", "my_st", "C_struct"),
+            (11, 18, "DeclRef", "RED", "C_enumequal"),                   # array designators
+            (11, 29, "DeclRef", "GREEN", "C_enumequal"),
+            (11, 38, "MacroExpansion", "MAX_FOO", "CPPro_define_macro"),
+            (15, 7, "DeclRef", "RED", "C_enumequal"),                    # case labels
+            (17, 7, "DeclRef", "BLUE", "C_enumequal"),
+        ):
+            self.assertIn(item, got)
+        # `&my_st` is one reference, at the identifier; `= MAX_FOO` is a macro expansion only
+        self.assertNotIn((10, 54), {(line, col) for line, col, *_x in refs})
+        self.assertEqual([r for r in got if r[:2] == (11, 38)], [(11, 38, "MacroExpansion", "MAX_FOO", "CPPro_define_macro")])
+        # A member binds its field, never the struct tag of the same name
+        self.assertIn((10, 48, "MemberRef", "ops", "C_Compound"), got)
+        self.assertIn((10, 31, "MemberRef", "open", "C_functionprotodecl"), got)
+        self.assertIn((11, "arr2", "C_int", "ExternalDef"), defs)
+
+    def test_first_declarator_of_a_specifier_list(self) -> None:
+        refs, _defs = parse_snippet(
+            "void f(unsigned count)\n{\n\tunsigned cgno, bit;\n\tcgno = count;\n\tbit = cgno;\n}\n", "fs/x/multi.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        for item in ((4, 2, "DeclRef", "cgno", "C_unsigned"), (5, 2, "DeclRef", "bit", "C_unsigned"),
+                     (5, 8, "DeclRef", "cgno", "C_unsigned")):
+            self.assertIn(item, got)
+
+    def test_declaration_macros_define_only_their_object(self) -> None:
+        refs, defs = parse_snippet(
+            "#define BITS_PER_LONG 64\n#define BITS_TO_LONGS(nr) (((nr) + BITS_PER_LONG - 1) / BITS_PER_LONG)\n"
+            "#define DECLARE_BITMAP(name, bits) unsigned long name[BITS_TO_LONGS(bits)]\n#define NR_THINGS 128\n"
+            "extern DECLARE_BITMAP(zmap, NR_THINGS);\n"
+            "extern DECLARE_BITMAP(ymap, BITS_PER_LONG * 2);\n"
+            "static DECLARE_BITMAP(xmap, 64);\n"
+            "struct s { DECLARE_BITMAP(fmap, NR_THINGS); };\n"
+            "#define __packed __attribute__((packed))\n"
+            "struct p { int a; } __packed;\n"
+            "struct mutex { int v; };\n#define __MUTEX_INITIALIZER(m) { .v = sizeof(m) }\n"
+            "#define DEFINE_MUTEX(m) struct mutex m = __MUTEX_INITIALIZER(m)\n"
+            "static DEFINE_MUTEX(map_mutex);\n"
+            "#define BTF_ID(prefix, name) static int __btf_##prefix##_##name;\n"
+            "BTF_ID(func, bpf_lsm_bpf)\n"
+            "void use(void *p);\nvoid g(void)\n{\n\tuse(&map_mutex);\n\tuse(zmap);\n}\n",
+            "include/linux/declmacro.h")
+        c_defs = {(line, name, typ, link) for line, name, typ, link in defs if not typ.startswith("CPPro")}
+        self.assertEqual(c_defs, {
+            (5, "zmap", "C_Compound", "PrototypeDecl"), (6, "ymap", "C_Compound", "PrototypeDecl"),
+            (7, "xmap", "C_Compound", "InternalStaticDef"), (8, "s", "C_structdecl", "ExternalDef"),
+            (10, "p", "C_structdecl", "ExternalDef"), (11, "mutex", "C_structdecl", "ExternalDef"),
+            (14, "map_mutex", "C_Compound", "InternalStaticDef"),
+            (17, "use", "C_functionprotodecl", "PrototypeDecl"), (18, "g", "C_functionprotodecl", "ExternalDef"),
+        })
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        for item in ((5, 8, "MacroExpansion", "DECLARE_BITMAP"), (5, 29, "MacroExpansion", "NR_THINGS"),
+                     (6, 29, "MacroExpansion", "BITS_PER_LONG"), (8, 33, "MacroExpansion", "NR_THINGS"),
+                     (10, 21, "MacroExpansion", "__packed"), (14, 8, "MacroExpansion", "DEFINE_MUTEX"),
+                     (16, 1, "MacroExpansion", "BTF_ID"), (20, 7, "DeclRef", "map_mutex"), (21, 6, "DeclRef", "zmap")):
+            self.assertIn(item, got)
+
+    def test_attribute_macro_arguments_and_generated_names(self) -> None:
+        refs, defs = parse_snippet(
+            "struct rq { int lock; };\nextern struct rq *rq;\n#define __releases(x) __attribute__((unused))\n"
+            "void schedule_tail(int prev)\n\t__releases(rq->lock)\n{\n}\n"
+            "#define GEN_VAR(n) static int gen_##n;\nGEN_VAR(foo)\n"
+            "#define EXPORT_PER_CPU_SYMBOL(v) extern int v;\nint kstat;\nEXPORT_PER_CPU_SYMBOL(kstat)\n",
+            "kernel/x/attr.c")
+        c_defs = [(line, name, typ) for line, name, typ, _link in defs if not typ.startswith("CPPro")]
+        self.assertEqual(c_defs.count((4, "schedule_tail", "C_functionprotodecl")), 1)  # no bogus `rq` / `lock` declarators
+        self.assertNotIn("gen_foo", {name for _l, name, _t in c_defs})                 # a name no token spells
+        self.assertNotIn("foo", {name for _l, name, _t in c_defs})                     # nor a macro argument
+        self.assertIn((12, "kstat", "C_ExportSymbolDef"), c_defs)
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        self.assertIn((5, 2, "MacroExpansion", "__releases"), got)
+
+    def test_export_redeclaration_is_an_export(self) -> None:
+        _refs, defs = parse_snippet(
+            "#define __ADDRESSABLE(sym) static void * __attribute__((used)) __addressable_##sym = (void *)(unsigned long)&sym;\n"
+            "#define __EXPORT_SYMBOL(sym, license, ns) extern typeof(sym) sym; __ADDRESSABLE(sym) asm(\".section x\")\n"
+            "#define EXPORT_SYMBOL_GPL(sym) __EXPORT_SYMBOL(sym, \"GPL\", \"\")\n"
+            "int svc_bind(int x)\n{\n\treturn x;\n}\nEXPORT_SYMBOL_GPL(svc_bind);\n", "net/x/export.c")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        self.assertIn((4, "svc_bind", "C_functionprotodecl"), found)
+        self.assertIn((8, "svc_bind", "C_ExportSymbolDef"), found)
+        self.assertNotIn((8, "svc_bind", "C_functionprotodecl"), found)
+
+    def test_typedef_tag_bodies_and_nested_macros(self) -> None:
+        refs, defs = parse_snippet(
+            "typedef enum {\n\tDMX_OUT_DECODER,\n\tDMX_OUT_TAP = 2,\n} dmx_output_t;\n"
+            "typedef enum named_e { NE_A, NE_B } named_t;\n"
+            "typedef struct named_s { int a; } named_s_t;\n"
+            "typedef struct { int a;\n#define INNER_FLAG 1\n} anon_s_t;\n"
+            "enum hrtimer_restart { HR_A };\n"
+            "static enum hrtimer_restart timer_fn(int x)\n{\n#define PLURAL(x) (x)\n\treturn PLURAL(x) ? HR_A : HR_A;\n}\n",
+            "include/linux/typedefs.h")
+        found = {(line, name, typ) for line, name, typ, _link in defs}
+        for item in ((2, "DMX_OUT_DECODER", "C_enumequal"), (3, "DMX_OUT_TAP", "C_enumequal"),
+                     (4, "dmx_output_t", "C_SCtypedef"), (5, "named_e", "C_enumdecl"), (5, "NE_A", "C_enumequal"),
+                     (5, "NE_B", "C_enumequal"), (6, "named_s", "C_structdecl"), (8, "INNER_FLAG", "CPPro_define_macro"),
+                     (13, "PLURAL", "CPPro_define_macro")):
+            self.assertIn(item, found)
+        self.assertNotIn("anon_s_t", {name for _l, name, typ in found if typ == "C_structdecl"})
+        got = {(line, col, role, name) for line, col, role, name, _t in refs}
+        # A tag in a function's return type is a use, not a forward declaration
+        self.assertIn((11, 13, "TypeUsage", "hrtimer_restart"), got)
+        self.assertNotIn((11, 1, "Declaration", "hrtimer_restart"), got)
+
+    def test_member_calls_and_function_pointer_declarators(self) -> None:
+        refs, _defs = parse_snippet(
+            "struct ops { void (*ctor)(int); };\nstruct cache { struct ops *o; void (*dtor)(int); };\n"
+            "typedef int (*fn_t)(int);\n"
+            "void f(struct cache *c)\n{\n\tc->dtor(1);\n\tc->o->ctor(2);\n}\n", "mm/x/calls.c")
+        got = {(line, col, role, name, typ) for line, col, role, name, typ in refs}
+        self.assertIn((6, 5, "Call", "dtor", "C_functionprotodecl"), got)  # at the callee, bound to the field
+        self.assertIn((7, 8, "Call", "ctor", "C_functionprotodecl"), got)
+        self.assertIn((7, 5, "MemberRef", "o", "C_Compound"), got)
+        # A function-pointer declarator owns its function type: no TypeUsage of itself
+        self.assertFalse([r for r in got if r[2] == "TypeUsage" and r[3] in ("fn_t", "ctor", "dtor")])
+
+    def test_name_space_scoped_fallback(self) -> None:
+        from core.DBLayout import m_ast
+        from core.TableHandling import ChangeSet as CSet
+        from core.globalstuff import REF_FILE
+        from parser.c_ast.ast_nodes import ref_target_family
+
+        self.assertEqual(ref_target_family(ASTT.CPPro_define), (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro)))
+        self.assertEqual(ref_target_family(ASTT.C_MemberRefExpr), (int(ASTT.C_MemberRefExpr),))
+        self.assertNotIn(int(ASTT.C_ReturnStmt), ref_target_family(ASTT.C_DeclRefExpr))
+        self.assertNotIn(int(ASTT.CPPro_define), ref_target_family(ASTT.C_DeclRefExpr))
+        self.assertIsNone(ref_target_family(ASTT.ASM_Label))
+
+        class GP:
+            _is_worker = True  # no TableEngine lookups / stubs: only the per-file tables answer
+
+            def __init__(self, syms: dict) -> None:
+                self.file_symbols = {"include/linux/stddef.h": syms}
+                self.file_names = {}
+
+        def resolve(syms: dict, name: str, typ: int) -> Any:
+            cs = CSet("M\tkernel/x.c")
+            cs.gp = GP(syms)
+            return cs.resolve_ref(m_ast.ast_id, (REF_FILE, "include/linux/stddef.h", name, int(typ)))
+
+        stmt_and_var = {("NULL", int(ASTT.C_ReturnStmt)): 5, ("NULL", int(ASTT.C_DeclRefExpr)): 6}
+        # A macro reference never binds a statement or a variable of its name...
+        self.assertIsNone(resolve(stmt_and_var, "NULL", ASTT.CPPro_define))
+        # ...but finds the macro of any macro type
+        self.assertEqual(resolve({**stmt_and_var, ("NULL", int(ASTT.CPPro_define_macro)): 7}, "NULL", ASTT.CPPro_define), 7)
+        # A struct tag reference never binds a variable or member; a member never binds a tag
+        self.assertIsNone(resolve({("list_head", int(ASTT.C_DeclRefExpr)): 8}, "list_head", ASTT.C_structdecl))
+        self.assertIsNone(resolve({("ops", int(ASTT.C_structdecl)): 9}, "ops", ASTT.C_MemberRefExpr))
+        # An ordinary identifier binds a variable node of any declared type
+        self.assertEqual(resolve({("jiffies", int(ASTT.C_long)): 10}, "jiffies", ASTT.C_DeclRefExpr), 10)
 
 
 if __name__ == "__main__":

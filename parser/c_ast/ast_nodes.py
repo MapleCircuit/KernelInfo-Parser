@@ -29,6 +29,7 @@ from parser.c_ast.tokenizer import AST_KIND, Line
 from parser.c_ast.tag_tracker import (
     check_exact_match,
     match_prior_tag_transition,
+    prior_include_target_matches,
     stage_bridge_tag,
     stage_new_tag,
     stage_tag_map,
@@ -79,6 +80,52 @@ def get_notbind_type(ast_type: int) -> int:
             return ASTT.C_functionprotnotbind
         case _:
             return ast_type
+
+
+# C name spaces of a reference target (ISO C 6.2.3 plus macros): an AST node type outside these never names a
+# declaration (statements, expressions, directives, member uses).
+_MACRO_FAMILY = (ASTT.CPPro_define, ASTT.CPPro_define_macro)
+_FUNCTION_TYPES = (ASTT.C_functionprotodecl, ASTT.C_functionproto, ASTT.C_functionprotnotbind)
+_NOT_ORDINARY = frozenset({
+    *_MACRO_FAMILY, ASTT.CPPro_undef,
+    ASTT.C_structdecl, ASTT.C_structnotbind, ASTT.C_uniondecl, ASTT.C_unionnotbind, ASTT.C_enumdecl, ASTT.C_enumnotbind,
+    ASTT.C_Comment, ASTT.C_Keyword, ASTT.C_MemberRefExpr, ASTT.C_CallExpr, ASTT.C_MacroParam, ASTT.C_TypeRef,
+    *(t for t in ASTT if ASTT.C_CompoundStmt <= t <= ASTT.C_InitListExpr and t not in (ASTT.C_DeclRefExpr,)),
+    ASTT.C_SizeofExpr, ASTT.C_CastExpr, ASTT.C_ConditionalOperator, ASTT.C_ArraySubscriptExpr, ASTT.C_DesignatedInitExpr,
+    ASTT.C_CompoundAssignOperator, ASTT.C_CompoundLiteralExpr, ASTT.C_IndirectGotoStmt, ASTT.C_AddrLabelExpr,
+    ASTT.C_NullStmt, ASTT.C_StmtExpr, ASTT.C_GenericSelectionExpr, ASTT.C_VaArgExpr, ASTT.C_LabelRef,
+    ASTT.C_IntegerLiteral, ASTT.C_FloatingLiteral, ASTT.C_StringLiteral, ASTT.C_CharacterLiteral, ASTT.C_StaticAssert,
+    ASTT.C_TypeofExpr, ASTT.C_OffsetofExpr, ASTT.C_TypesCompatiblePExpr, ASTT.C_ChooseExpr, ASTT.C_AlignofExpr,
+    ASTT.C_AtomicExpr, ASTT.C_AsmStmt,
+})
+# Ordinary identifiers: variables, functions, typedef names, enumerators (and the kernel definitions spelled
+# through macros); the declaration's node carries the declared type, so every other C type id qualifies
+_ORDINARY_HEAD = (ASTT.C_DeclRefExpr, *_FUNCTION_TYPES, ASTT.C_Compound, ASTT.C_int, ASTT.C_pointer, ASTT.C_unsigned,
+                  ASTT.C_struct, ASTT.C_SCtypedef, ASTT.C_long, ASTT.C_char, ASTT.C_enumequal, ASTT.C_array,
+                  ASTT.C_arrayempty, ASTT.C_short, ASTT.C_union, ASTT.C_enum, ASTT.C_bool, ASTT.C_void)
+_ORDINARY_FAMILY = (*_ORDINARY_HEAD, *(  # most frequent declared types first: fewer probes per fallback
+    t for t in ASTT
+    if (t.name.startswith("C_") or t == ASTT.Undefined) and t not in _NOT_ORDINARY and t not in _ORDINARY_HEAD
+))
+_REF_TARGET_FAMILIES: dict[int, tuple[int, ...]] = {
+    **{int(t): tuple(int(x) for x in _MACRO_FAMILY) for t in _MACRO_FAMILY},
+    **{int(t): (int(ASTT.C_structdecl), int(ASTT.C_structnotbind), int(ASTT.C_struct)) for t in (ASTT.C_struct, ASTT.C_structdecl, ASTT.C_structnotbind)},
+    **{int(t): (int(ASTT.C_uniondecl), int(ASTT.C_unionnotbind), int(ASTT.C_union)) for t in (ASTT.C_union, ASTT.C_uniondecl, ASTT.C_unionnotbind)},
+    **{int(t): (int(ASTT.C_enumdecl), int(ASTT.C_enumnotbind), int(ASTT.C_enum)) for t in (ASTT.C_enum, ASTT.C_enumdecl, ASTT.C_enumnotbind)},
+    int(ASTT.C_SCtypedef): (int(ASTT.C_SCtypedef),),
+    int(ASTT.C_MemberRefExpr): (int(ASTT.C_MemberRefExpr),),
+    **{int(t): tuple(int(x) for x in (*_FUNCTION_TYPES, *(o for o in _ORDINARY_FAMILY if o not in _FUNCTION_TYPES))) for t in _FUNCTION_TYPES},
+    int(ASTT.C_DeclRefExpr): tuple(int(x) for x in _ORDINARY_FAMILY),
+    int(ASTT.C_enumequal): (int(ASTT.C_enumequal), *(int(x) for x in _ORDINARY_FAMILY if x != ASTT.C_enumequal)),
+}
+
+
+def ref_target_family(ast_type: int) -> tuple[int, ...] | None:
+    """The AST node types a reference requested as `ast_type` may bind to when its exact `(name, type)` is unknown:
+    the requested C name space only - macros, struct / union / enum tags (each its own), typedef names, members, or
+    ordinary identifiers (variables, functions, enumerators) - in preference order. `None` for non-C types, which
+    keep a name-only match."""
+    return _REF_TARGET_FAMILIES.get(int(ast_type)) if ast_type is not None else None
 
 
 class Ast:
@@ -228,7 +275,7 @@ class Ast:
 
         # 1. Tier 1: Check exact code hash match against prior version tags
         if ext.code:
-            tag_id = check_exact_match(CS, code_hash)
+            tag_id = check_exact_match(CS, code_hash, getattr(self, "accept_prior_tag", None))
             if tag_id is not None:
                 stage_bridge_tag(CS, tag_id, ext.line_pos, ext.char_pos)
                 self.tag_ref = tag_id
@@ -536,6 +583,36 @@ class Ast_ASM_Label(Ast):
 
 # --- C Preprocessor Subsystem (CPPro) ---
 
+_PP_NOT_NAMES = frozenset({
+    "defined", "sizeof", "typeof", "__typeof__", "__typeof", "_Alignof", "__alignof__", "__has_include",
+    "__has_include_next", "__has_attribute", "__has_builtin", "__has_feature", "__has_extension",
+    "__has_cpp_attribute", "__has_c_attribute", "__is_identifier", "__VA_ARGS__", "__VA_OPT__",
+})
+_TAG_KEYWORD_TARGET = {"struct": ASTT.C_structnotbind, "union": ASTT.C_unionnotbind, "enum": ASTT.C_enumnotbind}
+
+
+def record_name_refs(CS: Any, tag_ref: Any, names: list[tuple[str, int, int, int]], role: int) -> None:
+    """Record a reference of `role` at each (name, line, column, target type) of a preprocessor directive.
+
+    The target is the name's unbound AST node (`m_ast.view` of the name and target type: `CPPro_define` for a
+    tested macro, `C_structnotbind` & co. after `struct`/`union`/`enum`, `C_DeclRefExpr` otherwise), so readers of
+    `m_symbol_ref` see the name; which definition it means is decided where the macro expands or the test runs.
+    """
+    seen: set[tuple[str, int, int]] = set()
+    for name, line, col, target_type in names:
+        if not name or name in _PP_NOT_NAMES or (name, line, col) in seen:
+            continue
+        seen.add((name, line, col))
+        with CS(REF_POS):
+            CS.store(m_ast.view(((m_ast.ast_id,),), None, name[:255], int(target_type)))
+            route = CS.get_route_parse()
+        record_symbol_ref(CS, tag_ref or 0, CS.ref(m_ast.ast_id, *route), 0, int(role), int(line), int(col))
+
+
+def _tok_pos(token: Any) -> tuple[int, int]:
+    return int(token.line.line_pos[0]), int(token.line.char_pos[0])
+
+
 class CPPro(Ast):
     """Root C Preprocessor Directive."""
 
@@ -558,15 +635,26 @@ class CPPro(Ast):
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
             return False
-        if ast_kind == AST_KIND.comment:
-            return False
         t_line = token.line.line_pos[0]
         cur_line = self.extent.line_pos[1]
+        rawfile = getattr(G, "CURRENT_RAWFILE", None)
+        if ast_kind == AST_KIND.comment:
+            if not rawfile or not str(getattr(G, "CURRENT_PARSING_FILE", "") or "").endswith((".S", ".s")):
+                return False
+            if t_line > cur_line:
+                for l in range(cur_line - 1, t_line - 1):
+                    if not (0 <= l < len(rawfile) and rawfile[l].rstrip().endswith("\\")):
+                        return False
+            end_line = token.line.line_pos[1]
+            end_col = token.line.char_pos[1]
+            if 0 <= end_line - 1 < len(rawfile) and rawfile[end_line - 1][max(0, end_col - 1):].strip():
+                self.extent.grow(token.line)
+                return True
+            return False
         if t_line <= cur_line:
             self.extent.grow(token.line)
             return True
         # Check backslash continuation from rawfile
-        rawfile = getattr(G, "CURRENT_RAWFILE", None)
         if rawfile:
             all_continued = True
             for l in range(cur_line - 1, t_line - 1):
@@ -675,6 +763,7 @@ class CPPro_if(CPPro):
     def init_subclass(self) -> None:
         self.expression = ""
         self.type_id = ASTT.CPPro_if
+        self.cond_names: list[tuple[str, int, int, int]] = []
 
     def _append_tok(self, spelling: str) -> None:
         if self.expression and (self.expression[-1].isalnum() or self.expression[-1] == '_') and (spelling and (spelling[0].isalnum() or spelling[0] == '_')):
@@ -690,12 +779,16 @@ class CPPro_if(CPPro):
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
+        if not hasattr(self, "cond_names"):
+            self.cond_names = []
+        self.cond_names.append((token.spelling_str, *_tok_pos(token), int(ASTT.CPPro_define)))
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_if, self.expression[:255], self.extent, create_tag=create_tag)
+        record_name_refs(CS, getattr(self, "tag_ref", 0), getattr(self, "cond_names", []), SymbolRole.CondRef)
 
 
 class CPPro_elif(CPPro):
@@ -724,12 +817,16 @@ class CPPro_elif(CPPro):
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
+        if not hasattr(self, "cond_names"):
+            self.cond_names = []
+        self.cond_names.append((token.spelling_str, *_tok_pos(token), int(ASTT.CPPro_define)))
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elif, self.expression[:255], self.extent, create_tag=create_tag)
+        record_name_refs(CS, getattr(self, "tag_ref", 0), getattr(self, "cond_names", []), SymbolRole.CondRef)
 
 
 class CPPro_else(CPPro):
@@ -775,6 +872,7 @@ class CPPro_ifdef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -782,6 +880,10 @@ class CPPro_ifdef(CPPro):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_ifdef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_ifndef(CPPro):
@@ -799,6 +901,7 @@ class CPPro_ifndef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -806,6 +909,10 @@ class CPPro_ifndef(CPPro):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_ifndef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_elifdef(CPPro):
@@ -823,9 +930,14 @@ class CPPro_elifdef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elifdef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_elifndef(CPPro):
@@ -843,9 +955,14 @@ class CPPro_elifndef(CPPro):
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
             self.identifier = token.spelling_str
+            self.id_pos = _tok_pos(token)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elifndef, self.identifier[:255], self.extent, create_tag=create_tag)
+        pos = getattr(self, "id_pos", None)
+        if pos is not None and self.identifier:
+            record_name_refs(CS, getattr(self, "tag_ref", 0), [(self.identifier, pos[0], pos[1], int(ASTT.CPPro_define))],
+                             SymbolRole.CondRef)
 
 
 class CPPro_define(CPPro):
@@ -868,6 +985,51 @@ class CPPro_define(CPPro):
         self.in_args = False
         self.has_args = False
         self.type_id = ASTT.CPPro_define
+        # Names of the replacement list: (name, line, column, target type); the last token's kind for context
+        self.body_names: list[tuple[str, int, int, int]] = []
+        self._body_prev = ""
+        self._body_line = 0
+        self._pasted_comment = False
+
+    def _note_body_name(self, token: Any) -> None:
+        names = self.__dict__.setdefault("body_names", [])
+        prev = self.__dict__.get("_body_prev", "")
+        prev_line = self.__dict__.get("_body_line", 0)
+        tok_line = int(token.line.line_pos[0])
+        name = token.spelling_str
+        self._body_line = tok_line
+        if self.__dict__.get("_pasted_comment"):
+            self._pasted_comment = False
+            if names and prev == names[-1][0]:
+                names.pop()
+            self._body_prev = name
+            return
+        if prev in ("##", ".", "->", "#"):
+            self._body_prev = name
+            return
+        # An assembly macro body holds instructions: registers (`%eax`) and the mnemonic or directive opening a
+        # statement (start of the body, after `;` or `:`, or at the start of a continued line) are no names
+        if self.__dict__.get("_asm_body") is None:
+            self._asm_body = str(getattr(G, "CURRENT_PARSING_FILE", "") or "").endswith((".S", ".s"))
+        if self._asm_body:
+            if prev == "%" or name.lower() in _ASM_REGISTER_NAMES:
+                self._body_prev = name
+                return
+            at_stmt_start = (
+                prev in ("", ";", "\\", ":")
+                or (prev_line and tok_line > prev_line)
+                or (not names and prev == self.identifier)
+            )
+            if at_stmt_start and not any(c.isupper() or c == "_" for c in name):
+                self._body_prev = name
+                return
+        target = _TAG_KEYWORD_TARGET.get(prev, ASTT.C_DeclRefExpr)
+        names.append((name, *_tok_pos(token), int(target)))
+        self._body_prev = name
+
+    def exec_comment(self, token: Any, cursor: Any) -> None:
+        if token.spelling_str == "/**/" and self.__dict__.get("body_names") and self.__dict__.get("_body_prev") == self.body_names[-1][0]:
+            self._pasted_comment = True
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
         if not self.identifier:
@@ -877,12 +1039,14 @@ class CPPro_define(CPPro):
         if self.in_args:
             self.func_args.append(token.spelling_str)
             return
+        self._note_body_name(token)
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
             self.replacement += " " + token.spelling_str
 
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if self.identifier and not self.has_args and self.replacement is None:
             if token.spelling_str == "(" and self.id_extent is not None:
                 if (token.line.line_pos[0] == self.id_extent.line_pos[1] and 
@@ -899,26 +1063,37 @@ class CPPro_define(CPPro):
                 else:
                     self.func_args.append("...")
             return
+        spelling = token.spelling_str
+        if spelling == "##" and self.__dict__.get("body_names") and self.__dict__.get("_body_prev") == self.body_names[-1][0]:
+            self.body_names.pop()  # a fragment pasted into another name
+        self._body_prev = spelling
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
             self.replacement += " " + token.spelling_str
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if not self.identifier:
             self.identifier = token.spelling_str
             self.id_extent = token.line
             return
         if self.in_args:
             return
+        self._body_prev = token.spelling_str
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
             self.replacement += " " + token.spelling_str
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
+        self._pasted_comment = False
         if self.in_args:
             return
+        self._body_prev = token.spelling_str
+        self._body_line = int(token.line.line_pos[0])
         if self.replacement is None:
             self.replacement = token.spelling_str
         else:
@@ -972,15 +1147,6 @@ class CPPro_define(CPPro):
         if self.replacement:
             with CS(REF_POS):
                 CS.store(m_ast_attribute.set(self.ast_ref, 0, "replacement", str(self.replacement)[:255]))
-            import re
-            words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", self.replacement))
-            ignored = set(self.func_args) | {self.identifier, "defined", "sizeof", "typeof", "__typeof__"}
-            tag_ref = getattr(self, "tag_ref", 0)
-            if tag_ref:
-                for w in words:
-                    if w not in ignored:
-                        with CS(REF_POS):
-                            record_symbol_ref(CS, tag_ref, w, 0, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0])
 
         if create_tag:
             with CS(REF_NO_REF):
@@ -1009,6 +1175,16 @@ class CPPro_define(CPPro):
                 CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
+            if safe_name:
+                # A `#define` inside a function, struct or initializer body: defined all the same, placed in the
+                # innermost tag around its lines (`finish_symbol_rows()`)
+                with CS(REF_POS):
+                    record_symbol_def(CS, 0, self.ast_ref, safe_name, type_const, int(SymbolLinkage.MacroOrKernelDef),
+                                      self.extent.line_pos[0], self.extent.line_pos[1])
+        # Names the replacement list uses (not its parameters, nor the macro itself): resolved where it expands
+        ignored = {str(p).strip().rstrip(".") for p in self.func_args} | {self.identifier}
+        record_name_refs(CS, getattr(self, "tag_ref", 0),
+                         [n for n in self.__dict__.get("body_names", ()) if n[0] not in ignored], SymbolRole.MacroBodyRef)
 
 
 class CPPro_undef(CPPro):
@@ -1039,11 +1215,13 @@ class CPPro_include(CPPro):
         super().__init__(extent)
         self.w_include = written_include
         self.a_include = resolved_path
+        self.inc_file_name = ""
         self.type_id = ASTT.CPPro_include
 
     def init_subclass(self) -> None:
         self.w_include = ""
         self.a_include = ""
+        self.inc_file_name = ""
         self.type_id = ASTT.CPPro_include
 
     def _check_inc_cursor(self, cursor: Any) -> None:
@@ -1051,6 +1229,7 @@ class CPPro_include(CPPro):
             try:
                 inc_file = cursor.get_included_file()
                 if inc_file is not None and inc_file.name:
+                    self.inc_file_name = inc_file.name
                     self.a_include = normalize_repo_path(inc_file.name, getattr(G, "CURRENT_PARSING_DIR", None))
             except Exception:
                 pass
@@ -1071,66 +1250,68 @@ class CPPro_include(CPPro):
         self.w_include += token.spelling_str
         self._check_inc_cursor(cursor)
 
-    def extract(self, CS: Any, create_tag: bool = True) -> None:
+    def resolve_target(self, CS: Any) -> str:
+        """Repository path the directive includes (`m_ast_include` target).
+
+        1. The file libclang opened for the line (C: `CS.resolved_includes_by_line`; assembly: the inclusion
+           cursor's file), as its repository path (`CompileEnv.repo_path()`).
+        2. Not opened (inactive `#if` branch, skipped block, missing header): the written name searched like the
+           build does (`CompileEnv.resolve_include()`, layout of `CS.compile_arch`).
+        3. Not in the tree (build-generated `linux/autoconf.h`, `generated/asm-offsets.h`, macro includes): the
+           written spelling without its delimiters.
+        """
+        resolved = getattr(CS, "resolved_includes_by_line", {}).get(self.extent.line_pos[0])
+        if resolved:
+            return resolved
+        env = getattr(CS, "compile_env", None)
+        if env is not None:
+            if self.inc_file_name:
+                rel = env.repo_path(self.inc_file_name)
+                if rel and not rel.startswith(".."):
+                    return rel
+            written = self.w_include.strip()
+            if len(written) >= 2 and written[0] in "<\"" and written[-1] == (">" if written[0] == "<" else '"'):
+                hit = env.resolve_include(written[1:-1], getattr(CS, "current_path", "") or "",
+                                          quoted=written[0] == '"', arch_env=getattr(CS, "compile_arch", None))
+                if hit:
+                    return hit
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-        resolved_inc = getattr(CS, "resolved_includes_by_line", {}).get(self.extent.line_pos[0])
-        if resolved_inc:
-            clean_target = resolved_inc
-        else:
-            raw_target = self.a_include if self.a_include else self.w_include
-            include_target = normalize_repo_path(raw_target, base_dir)
-            clean_target = str(include_target).strip().strip("<>\"'").strip()
-        safe_target = clean_target[:255]
+        raw_target = self.a_include if (self.a_include and env is None) else self.w_include
+        return str(normalize_repo_path(raw_target, base_dir)).strip().strip("<>\"'").strip()
+
+    def accept_prior_tag(self, CS: Any, prior_tag: tuple[Any, ...]) -> bool:
+        """Tier 1 recycles a prior tag only when its `m_ast_include` target is this directive's target."""
+        return prior_include_target_matches(CS, prior_tag, self.target_fnid(CS))
+
+    def target_fnid(self, CS: Any) -> int | None:
+        row = m_file_name.get(None, self.safe_target)
+        return row[2][0] if row and len(row) >= 3 and row[2] else None
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.safe_target = self.resolve_target(CS)[:255]
 
         with CS(REF_POS):
-            CS.store(m_file_name.get_set(None, safe_target))
+            CS.store(m_file_name.get_set(None, self.safe_target))
             fnid_route = CS.get_route_parse()
 
-        symbols = getattr(CS, "include_symbols", {}).get(self.extent.line_pos[0], [])
-        if symbols:
-            if not hasattr(CS, "include_symbol_refs"):
-                CS.include_symbol_refs = {}
-            flat_container_args = []
-            for priority, (sym_name, sym_type) in enumerate(symbols):
-                sym_key = (sym_name, sym_type)
-                if sym_key not in CS.include_symbol_refs:
-                    with CS(REF_POS):
-                        CS.store(m_ast.view(((m_ast.ast_id,),), None, sym_name[:255], sym_type))
-                        sym_route = CS.get_route_parse()
-                    CS.include_symbol_refs[sym_key] = CS.ref(m_ast.ast_id, *sym_route)
-                flat_container_args.extend([None, priority, int(sym_type), CS.include_symbol_refs[sym_key]])
-
-            joins = ((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, len(symbols)))
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    joins,
-                    None,
-                    self.w_include[:255],
-                    ASTT.CPPro_include,
-                    None,
-                    CS.ref(m_file_name.fnid, *fnid_route),
-                    *flat_container_args
-                ))
-                ast_id_route = CS.get_route_parse()
-            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-        else:
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id, m_ast_include.ast_id, 1),),
-                    None,
-                    self.w_include[:255],
-                    ASTT.CPPro_include,
-                    None,
-                    CS.ref(m_file_name.fnid, *fnid_route),
-                ))
-                ast_id_route = CS.get_route_parse()
-            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        # Directive text and target only (no m_ast_container): included symbols derive from m_symbol_ref
+        with CS(REF_POS):
+            CS.store(m_ast.view(
+                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
+                None,
+                self.w_include[:255],
+                self.type_id,
+                None,
+                CS.ref(m_file_name.fnid, *fnid_route),
+            ))
+            ast_id_route = CS.get_route_parse()
+        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
         if create_tag:
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:
                     self.ast_debug(CS, ast_id_route)
-                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include)
+                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=self.type_id)
 
 
 class CPPro_include_next(CPPro_include):
@@ -1144,34 +1325,17 @@ class CPPro_include_next(CPPro_include):
         super().init_subclass()
         self.type_id = ASTT.CPPro_include_next
 
-    def extract(self, CS: Any, create_tag: bool = True) -> None:
+    def resolve_target(self, CS: Any) -> str:
+        """The file libclang opened (`CompileEnv.repo_path()`), else the written spelling: `#include_next`
+        continues the search after the directory of the including header, which only libclang knows."""
+        env = getattr(CS, "compile_env", None)
+        if env is not None and self.inc_file_name:
+            rel = env.repo_path(self.inc_file_name)
+            if rel and not rel.startswith(".."):
+                return rel
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-        raw_target = self.a_include if self.a_include else self.w_include
-        include_target = normalize_repo_path(raw_target, base_dir)
-        clean_target = str(include_target).strip().strip("<>\"'").strip()
-        safe_target = clean_target[:255]
-
-        with CS(REF_POS):
-            CS.store(m_file_name.get_set(None, safe_target))
-            fnid_route = CS.get_route_parse()
-
-        with CS(REF_POS):
-            CS.store(m_ast.view(
-                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
-                None,
-                self.w_include[:255],
-                ASTT.CPPro_include_next,
-                None,
-                CS.ref(m_file_name.fnid, *fnid_route),
-            ))
-            ast_id_route = CS.get_route_parse()
-        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-
-        if create_tag:
-            with CS(REF_NO_REF):
-                if G.OVERRIDE_FORCE_AST_DEBUG:
-                    self.ast_debug(CS, ast_id_route)
-                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include_next)
+        raw_target = self.a_include if (self.a_include and env is None) else self.w_include
+        return str(normalize_repo_path(raw_target, base_dir)).strip().strip("<>\"'").strip()
 
 
 class CPPro_ident(CPPro):
@@ -1488,7 +1652,8 @@ class Ast_CallExpr(Ast):
                 ast_id_route = CS.get_route_parse()
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
         if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
-            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.Call), self.extent.line_pos[0], self.extent.char_pos[0]))
+            ref_ext = getattr(self, "ref_extent", None) or self.extent
+            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.Call), ref_ext.line_pos[0], ref_ext.char_pos[0]))
         if create_tag:
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -1550,7 +1715,7 @@ class Ast_DeclRefExpr(Ast):
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, self.type_id))
                 ast_id_route = CS.get_route_parse()
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-        if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
+        if ref_ast_id != 0 and getattr(self, "record_ref", True) and hasattr(CS, "pending_symbol_refs"):
             CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.DeclRef), self.extent.line_pos[0], self.extent.char_pos[0]))
         if create_tag:
             with CS(REF_NO_REF):
@@ -1572,6 +1737,23 @@ class Ast_MacroRefExpr(Ast):
         t_id, ref_ast_id = resolve_cursor_type_ast(CS, c)
         if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
             CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0]))
+
+
+class Ast_TypeRefExpr(Ast):
+    """A type named inside an expression (`TYPE_REF` of `sizeof(struct T)`, `(T *)x`, `offsetof(struct T, f)`,
+    a compound literal): a `SymbolRole.TypeUsage` reference of the record / enum / typedef, no AST node."""
+
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_SCtypedef
+        self.name = name
+        self.cursor = cursor
+
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        from parser.c_ast.cursor_tree import resolve_cursor_type_ast
+        t_id, ref_ast_id = resolve_cursor_type_ast(CS, getattr(self, "cursor", None))
+        if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
+            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.TypeUsage), self.extent.line_pos[0], self.extent.char_pos[0]))
 
 
 class Ast_BinaryOperator(Ast):

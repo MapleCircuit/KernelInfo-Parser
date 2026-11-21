@@ -15,6 +15,7 @@ const ITEMS = [
   it("pid_t", "type", "include/linux/types.h", ["kernel/fork.c", "include/linux/types.h"]),
   it("IS_ENABLED", "macro", "include/linux/kconfig.h", ["include/linux/kconfig.h"], { forced: true }),
   it("jiffies", "variable", "include/linux/jiffies.h", ["kernel/fork.c", "include/linux/jiffies.h"]),
+  it("CONFIG_LOCKD_V4", "config", "fs/lockd/Kconfig", ["fs/lockd/svc.c", "fs/lockd/Kconfig"], { via: "kconfig" }),
 ];
 
 test("path eligibility", () => {
@@ -25,19 +26,23 @@ test("path eligibility", () => {
 });
 
 test("filter ids, icons and labels", () => {
-  assert.deepEqual(IMPORT_FILTERS.map((f) => f.id), ["all", "function", "struct", "type", "macro", "variable"]);
+  assert.deepEqual(IMPORT_FILTERS.map((f) => f.id), ["all", "function", "struct", "type", "macro", "variable", "config"]);
   assert.equal(filterIdOf("prototype"), "function");
   assert.equal(filterIdOf("struct"), "struct");
+  assert.equal(filterIdOf("config"), "config");
   assert.equal(filterIdOf("weird"), "variable");
   assert.equal(kindIcon("struct"), "{}");
   assert.equal(kindIcon("prototype"), "ƒ");
+  assert.equal(kindIcon("config"), "⚙");
   assert.equal(kindIcon("nope"), "•");
   assert.equal(kindLabel("macro"), "Macro");
+  assert.equal(kindLabel("config"), "Config");
   assert.equal(kindLabel("nope"), "nope");
 });
 
 test("kind pill filtering folds prototypes into functions", () => {
   assert.deepEqual(filterImports(ITEMS, { kind: "function" }).map((i) => i.name), ["kmalloc", "do_fork"]);
+  assert.deepEqual(filterImports(ITEMS, { kind: "config" }).map((i) => i.name), ["CONFIG_LOCKD_V4"]);
   assert.equal(filterImports(ITEMS).length, ITEMS.length);
   assert.deepEqual(filterImports(null), []);
   assert.deepEqual(filterImports(undefined, { kind: "macro" }), []);
@@ -54,9 +59,9 @@ test("search matches names, headers and intermediate chain headers", () => {
 });
 
 test("countByFilter with and without query", () => {
-  assert.deepEqual(countByFilter(ITEMS), { all: 6, function: 2, struct: 1, type: 1, macro: 1, variable: 1 });
-  assert.deepEqual(countByFilter(ITEMS, "sched.h"), { all: 2, function: 1, struct: 1, type: 0, macro: 0, variable: 0 });
-  assert.deepEqual(countByFilter(null), { all: 0, function: 0, struct: 0, type: 0, macro: 0, variable: 0 });
+  assert.deepEqual(countByFilter(ITEMS), { all: 7, function: 2, struct: 1, type: 1, macro: 1, variable: 1, config: 1 });
+  assert.deepEqual(countByFilter(ITEMS, "sched.h"), { all: 2, function: 1, struct: 1, type: 0, macro: 0, variable: 0, config: 0 });
+  assert.deepEqual(countByFilter(null), { all: 0, function: 0, struct: 0, type: 0, macro: 0, variable: 0, config: 0 });
 });
 
 test("groupImports by kind is ordered and deterministic", () => {
@@ -65,7 +70,7 @@ test("groupImports by kind is ordered and deterministic", () => {
   const groups = groupImports(input, "kind");
   assert.equal(JSON.stringify(input), snapshot);
   assert.deepEqual(groups.map((g) => [g.key, g.label]), [
-    ["function", "Functions"], ["struct", "Structs"], ["type", "Types"], ["macro", "Macros"], ["variable", "Variables"],
+    ["function", "Functions"], ["struct", "Structs"], ["type", "Types"], ["macro", "Macros"], ["variable", "Variables"], ["config", "Config"],
   ]);
   assert.deepEqual(groups[0].items.map((i) => i.name), ["do_fork", "kmalloc"]);
   assert.deepEqual(groupImports([ITEMS[3]]).map((g) => g.key), ["type"]);
@@ -75,11 +80,11 @@ test("groupImports by kind is ordered and deterministic", () => {
 test("groupImports by header orders by chain length then path; items tie-break on header and line", () => {
   const groups = groupImports(ITEMS, "header");
   assert.deepEqual(groups.map((g) => g.key), [
-    "include/linux/kconfig.h", "include/linux/jiffies.h", "include/linux/sched.h", "include/linux/types.h",
+    "include/linux/kconfig.h", "fs/lockd/Kconfig", "include/linux/jiffies.h", "include/linux/sched.h", "include/linux/types.h",
     "include/linux/slab.h",
   ]);
   assert.equal(groups[0].label, "include/linux/kconfig.h");
-  assert.deepEqual(groups[2].items.map((i) => i.name), ["do_fork", "task_struct"]);
+  assert.deepEqual(groups[3].items.map((i) => i.name), ["do_fork", "task_struct"]);
   const dup = [
     it("a", "macro", "b.h", ["x.c", "b.h"], { line: 9 }),
     it("a", "macro", "a.h", ["x.c", "a.h"], { line: 5 }),
@@ -103,6 +108,10 @@ test("formatChain normal vs forced include", () => {
   assert.equal(formatChain(ITEMS[0], { arrow: " > ", full: true }), "kernel/fork.c > include/linux/mm.h > include/linux/slab.h");
   const forced = it("foo", "macro", "include/linux/foo.h", ["include/linux/kconfig.h", "include/linux/foo.h"], { forced: true });
   assert.equal(formatChain(forced), "-include kconfig.h → foo.h");
+  const context = { ...ITEMS[0], via: "context", context: "fs/nfsd/lockd.c", chain: ["fs/nfsd/lockd.c", "include/linux/fs.h"] };
+  assert.equal(formatChain(context), "context lockd.c → fs.h");
+  const kconfig = it("CONFIG_LOCKD_V4", "config", "fs/lockd/Kconfig", ["fs/lockd/svc.c", "fs/lockd/Kconfig"], { via: "kconfig" });
+  assert.equal(formatChain(kconfig), "kconfig svc.c → Kconfig");
   assert.equal(formatChain({}), "");
 });
 
@@ -114,6 +123,7 @@ test("emptyStateMessage", () => {
   assert.equal(emptyStateMessage(null, { path: "Makefile" }), "Imports are available for C, header and assembly files.");
   assert.equal(emptyStateMessage({ ...ok, indexed: false }, { path: "a.c" }),
     "This revision's file is not indexed; imported symbols are unavailable.");
-  assert.equal(emptyStateMessage({ ...ok, layout: false }, { path: "a.c" }), "No build layout for ARCH=x86_64 at this revision.");
+  assert.equal(emptyStateMessage({ ...ok, layout: false, items: [] }, { path: "a.c" }), "No build layout for ARCH=x86_64 at this revision.");
+  assert.equal(emptyStateMessage({ ...ok, layout: false, items: [ITEMS[6]] }, { path: "a.c" }), null);
   assert.equal(emptyStateMessage({ ...ok, items: [] }, { path: "a.c" }), "No imported symbols referenced in this file.");
 });

@@ -607,9 +607,20 @@ def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temp
             search_dirs.append(tmp)
 
     for base in search_dirs:
-        for pattern in ("code-parser.*", "kip-*"):
+        for pattern in ("code-parser.*", "kip-*", "kip_build*"):
             for path in glob.glob(os.path.join(base, pattern)):
                 if not os.path.isdir(path) or os.path.islink(path):
+                    continue
+                if os.path.basename(path) == "kip_build":
+                    for child in glob.glob(os.path.join(path, "*")):
+                        if not os.path.isdir(child) or os.path.islink(child):
+                            continue
+                        if owner_alive(child):
+                            continue
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                    with contextlib.suppress(OSError):
+                        os.rmdir(path)
                     continue
                 if owner_alive(path):
                     logger.debug(f"Keeping scratch directory of a running parser: {path}")

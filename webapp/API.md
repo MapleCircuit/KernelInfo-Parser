@@ -18,31 +18,31 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L264-L272]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L273-L315]
   - 2.6. Frontend & Service Architectural Invariants [L316-L368]
-- 2B. Backend Domain & Infrastructure Services [L369-L1043]
-  - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L371-L450]
-  - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L451-L483]
-  - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L484-L513]
-  - 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`) [L514-L572]
-  - 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`) [L573-L653]
-  - 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`) [L654-L673]
-  - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L674-L709]
-  - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L710-L737]
-  - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L738-L766]
-  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L767-L819]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L820-L873]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L874-L891]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L892-L948]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L949-L996]
-  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L997-L1043]
-- 3. Database Schema & Underlying Tables [L1044-L1058]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1059-L1064]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1065-L1070]
-- 6. Using the Services from Python [L1071-L1088]
-- 7. Configuration & Execution [L1089-L1177]
-  - 7.1. Configuration Precedence & Resolution [L1091-L1139]
-  - 7.2. Starting the Server [L1140-L1177]
-- 8. Error Handling, Status Codes & Resilience [L1178-L1209]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1191-L1209]
+- 2B. Backend Domain & Infrastructure Services [L369-L1046]
+  - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L371-L453]
+  - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L454-L486]
+  - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L487-L516]
+  - 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`) [L517-L575]
+  - 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`) [L576-L656]
+  - 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`) [L657-L676]
+  - 2.13. Catalog Caching & Compact Version Catalog (`webapp/backend/services/catalog_cache.py`, `webapp/backend/routers/versions.py`, `webapp/frontend/js/utils/version_catalog.js`) [L677-L712]
+  - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L713-L740]
+  - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L741-L769]
+  - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L770-L822]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L823-L876]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L877-L894]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L895-L951]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L952-L999]
+  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L1000-L1046]
+- 3. Database Schema & Underlying Tables [L1047-L1061]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1062-L1067]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1068-L1073]
+- 6. Using the Services from Python [L1074-L1091]
+- 7. Configuration & Execution [L1092-L1180]
+  - 7.1. Configuration Precedence & Resolution [L1094-L1142]
+  - 7.2. Starting the Server [L1143-L1180]
+- 8. Error Handling, Status Codes & Resilience [L1181-L1212]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1194-L1212]
 <!-- toc:end -->
 
 ---
@@ -405,7 +405,8 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    definition of one ARCH value: the `arch` parameter of the symbol endpoints, which the frontend sets to the
    KConfig engine's ARCH while the engine is on with a resolved configuration, and to `x86_64` otherwise
    (§5.19). `definition_arch(version, arch)` resolves the ARCH value through `KconfigService.resolve_arch`
-   (unknown values fall back to `x86_64`) and returns it with its `ArchScope` and word size (`arch_bits`:
+   (a value the revision does not build falls back to `x86_64`, else `i386`: the only x86 ARCH of 1.2-2.4
+   trees and of the trees before `arch/`) and returns it with its `ArchScope` and word size (`arch_bits`:
    `x86_64` → 64, `i386` → 32, generic `x86` → none). The scope is the ARCH's build layout at the revision
    (`webapp/backend/services/arch_layout_service.py`): the `m_arch_root` rows the parser stored for the
    version's head commit, or, for revisions without rows (branches, commits never ingested), the same
@@ -431,10 +432,12 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    in, `SymbolService._prefer_reachable()` puts first the definitions the compilation of that file reads for
    the ARCH, i.e. what the compiler sees. `arch_layout_service.reachable(rev, arch, file)` walks the file's
    `#include` chain with the ARCH's build layout (`parser/include_graph.py`,
-   `parser/kconfig_ast/KCONFIG_API.md` §6.6): forced `-include` files first, quoted names in the including
+   `parser/kconfig_ast/KCONFIG_API.md` §6.7): forced `-include` files first, quoted names in the including
    file's directory, then the `-I` directories in order, through the build's symlinks and generated
-   asm-generic wrappers. `#include` lines count whatever `#if` block holds them (the frontend still drops
-   definitions its configuration compiles out), and directives come from the parser's per-blob facts
+   asm-generic wrappers. `#include` lines count whatever `#if` block holds them, except branches the compilation
+   cannot take on `__KERNEL__` / `__ASSEMBLY__` (`condition_filter()`: an assembly file skips the C-only part of
+   a header; a condition on anything else keeps its includes, and the frontend still drops definitions its
+   configuration compiles out), and directives come from the parser's per-blob facts
    (`m_blob_facts` family 3, `parser/include_facts.py`: the walk hands each breadth-first level to
    `IncludeResolver.reachable(prefetch=…)`, one query per level for the blobs not cached), else from Git, once
    per blob (cached by blob SHA, 50,000 entries; each walk cached per (commit, ARCH, file), 32 entries; a cold
@@ -444,9 +447,9 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    `include/asm-x86_64/semaphore.h` to `include/asm-x86_64/atomic.h` for x86_64 (through `include/linux/sem.h`
    → `include/asm-um/atomic.h` → `include/asm-um/arch/atomic.h` = `include/asm-x86_64/atomic.h` for ARCH=um),
    and never to the unrelated `net/rxrpc/internal.h`. The walk reads the files themselves rather than
-   `m_ast_include`/`m_file_reference`: those rows come from the parser's own clang run, which links
-   `include/asm` to `asm-generic` and skips the includes of inactive `#if` branches, so they describe no
-   particular ARCH.
+   `m_ast_include`/`m_file_reference`: those rows hold one target per directive, resolved for the single ARCH
+   the parser compiled the blob for (`parser/c_ast/CAST_API.md` §5, `CPPro_include`), so they describe no other
+   ARCH.
 
 ### 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`)
 Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is

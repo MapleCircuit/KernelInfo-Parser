@@ -17,15 +17,15 @@
       },
       {
         "fnid": "$fnid_1",
-        "fname": "module.h"
+        "fname": "linux/module.h"
       },
       {
         "fnid": "$fnid_2",
-        "fname": "kernel.h"
+        "fname": "linux/kernel.h"
       },
       {
         "fnid": "$fnid_3",
-        "fname": "errno.h"
+        "fname": "linux/errno.h"
       },
       {
         "fnid": "$fnid_4",
@@ -33,7 +33,7 @@
       },
       {
         "fnid": "$fnid_5",
-        "fname": "string.h"
+        "fname": "linux/string.h"
       },
       {
         "fnid": "$fnid_6",
@@ -88,253 +88,253 @@
       },
       {
         "ast_id": "$ast_3",
-        "name": "EBUSY",
-        "type_id": "75 (CPPro_define)"
-      },
-      {
-        "ast_id": "$ast_4",
-        "name": "EINVAL",
-        "type_id": "75 (CPPro_define)"
-      },
-      {
-        "ast_id": "$ast_5",
         "name": "<linux/errno.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_6",
+        "ast_id": "$ast_4",
         "name": "<linux/spinlock.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_7",
-        "name": "NULL",
-        "type_id": "75 (CPPro_define)"
-      },
-      {
-        "ast_id": "$ast_8",
+        "ast_id": "$ast_5",
         "name": "<linux/string.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_9",
+        "ast_id": "$ast_6",
         "name": "<linux/seq_file.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_7",
         "name": "<linux/proc_fs.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_11",
+        "ast_id": "$ast_8",
         "name": "<linux/init.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_12",
+        "ast_id": "$ast_9",
         "name": "<asm/dma.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_13",
+        "ast_id": "$ast_10",
         "name": "<asm/system.h>",
         "type_id": "78 (CPPro_include)"
       },
       {
-        "ast_id": "$ast_14",
+        "ast_id": "$ast_11",
         "name": "/* A note on resource allocation:\n *\n * All drivers needing DMA channels, should allocate and release them\n * through the public routines `request_dma()' and `free_dma()'.\n *\n * In order to avoid problems, all processes should allocate resources in\n * the",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_15",
+        "ast_id": "$ast_12",
         "name": "dma_spin_lock",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_16",
+        "ast_id": "$ast_13",
         "name": "DEFINE_SPINLOCK",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_17",
+        "ast_id": "$ast_14",
         "name": "/*\n *\tIf our port doesn't define this it has no PC like DMA\n */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_18",
+        "ast_id": "$ast_15",
         "name": "MAX_DMA_CHANNELS",
         "type_id": "71 (CPPro_ifdef)"
       },
       {
-        "ast_id": "$ast_19",
+        "ast_id": "$ast_16",
+        "name": "MAX_DMA_CHANNELS",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_17",
         "name": "/* Channel n is busy iff dma_chan_busy[n].lock != 0.\n * DMA0 used to be reserved for DRAM refresh, but apparently not any more...\n * DMA4 is reserved for cascading.\n */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_20",
+        "ast_id": "$ast_18",
         "name": "lock",
         "type_id": "41 (C_int)"
       },
       {
-        "ast_id": "$ast_21",
+        "ast_id": "$ast_19",
         "name": "",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_22",
+        "ast_id": "$ast_20",
         "name": "device_id",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_23",
+        "ast_id": "$ast_21",
         "name": "dma_chan",
         "type_id": "28 (C_structdecl)"
       },
       {
-        "ast_id": "$ast_24",
+        "ast_id": "$ast_22",
         "name": "MAX_DMA_CHANNELS",
         "type_id": "23 (C_array)"
       },
       {
-        "ast_id": "$ast_25",
+        "ast_id": "$ast_23",
         "name": "[4]",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_26",
+        "ast_id": "$ast_24",
         "name": "1",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_27",
+        "ast_id": "$ast_25",
         "name": "{}",
         "type_id": "66 (C_InitListExpr)"
       },
       {
-        "ast_id": "$ast_28",
+        "ast_id": "$ast_26",
         "name": "dma_chan_busy",
         "type_id": "27 (C_struct)"
       },
       {
-        "ast_id": "$ast_29",
+        "ast_id": "$ast_27",
         "name": "/**\n * request_dma - request and reserve a system DMA channel\n * @dmanr: DMA channel number\n * @device_id: reserving device ID string, used in /proc/dma\n */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_30",
+        "ast_id": "$ast_28",
         "name": "",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_31",
+        "ast_id": "$ast_29",
         "name": "dmanr",
         "type_id": "37 (C_unsigned)"
       },
       {
-        "ast_id": "$ast_32",
+        "ast_id": "$ast_30",
         "name": "device_id",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_33",
+        "ast_id": "$ast_31",
         "name": "",
         "type_id": "47 (C_IfStmt)"
       },
       {
-        "ast_id": "$ast_34",
-        "name": "xchg",
-        "type_id": "22 (C_functionprotnotbind)"
-      },
-      {
-        "ast_id": "$ast_35",
-        "name": "xchg",
-        "type_id": "60 (C_CallExpr)"
-      },
-      {
-        "ast_id": "$ast_36",
-        "name": "lock",
-        "type_id": "61 (C_MemberRefExpr)"
-      },
-      {
-        "ast_id": "$ast_37",
-        "name": "dmanr",
-        "type_id": "62 (C_DeclRefExpr)"
-      },
-      {
-        "ast_id": "$ast_38",
+        "ast_id": "$ast_32",
         "name": "device_id",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_39",
+        "ast_id": "$ast_33",
         "name": "dma_chan_busy",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_40",
+        "ast_id": "$ast_34",
+        "name": "dmanr",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_35",
         "name": "device_id",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_41",
+        "ast_id": "$ast_36",
         "name": "op",
         "type_id": "63 (C_BinaryOperator)"
       },
       {
-        "ast_id": "$ast_42",
+        "ast_id": "$ast_37",
         "name": "/* old flag was 0, now contains 1 to indicate busy */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_43",
+        "ast_id": "$ast_38",
         "name": "0",
         "type_id": "54 (C_ReturnStmt)"
       },
       {
-        "ast_id": "$ast_44",
+        "ast_id": "$ast_39",
         "name": "<dependent",
         "type_id": "29 (C_structnotbind)"
       },
       {
-        "ast_id": "$ast_45",
-        "name": "int",
-        "type_id": "29 (C_structnotbind)"
-      },
-      {
-        "ast_id": "$ast_46",
+        "ast_id": "$ast_40",
         "name": "{}",
         "type_id": "46 (C_CompoundStmt)"
       },
       {
-        "ast_id": "$ast_47",
+        "ast_id": "$ast_41",
         "name": "request_dma",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_48",
+        "ast_id": "$ast_42",
         "name": "/* request_dma */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_49",
+        "ast_id": "$ast_43",
         "name": "/**\n * free_dma - free a reserved system DMA channel\n * @dmanr: DMA channel number\n */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_50",
+        "ast_id": "$ast_44",
         "name": "KERN_WARNING",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_51",
+        "ast_id": "$ast_45",
         "name": "dmanr",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_52",
+        "ast_id": "$ast_46",
         "name": "",
         "type_id": "54 (C_ReturnStmt)"
+      },
+      {
+        "ast_id": "$ast_47",
+        "name": "{}",
+        "type_id": "46 (C_CompoundStmt)"
+      },
+      {
+        "ast_id": "$ast_48",
+        "name": "xchg",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_49",
+        "name": "xchg",
+        "type_id": "60 (C_CallExpr)"
+      },
+      {
+        "ast_id": "$ast_50",
+        "name": "lock",
+        "type_id": "61 (C_MemberRefExpr)"
+      },
+      {
+        "ast_id": "$ast_51",
+        "name": "dmanr",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_52",
+        "name": "int",
+        "type_id": "29 (C_structnotbind)"
       },
       {
         "ast_id": "$ast_53",
@@ -343,33 +343,33 @@
       },
       {
         "ast_id": "$ast_54",
-        "name": "dmanr",
-        "type_id": "62 (C_DeclRefExpr)"
-      },
-      {
-        "ast_id": "$ast_55",
-        "name": "{}",
-        "type_id": "46 (C_CompoundStmt)"
-      },
-      {
-        "ast_id": "$ast_56",
         "name": "free_dma",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_57",
+        "ast_id": "$ast_55",
         "name": "/* free_dma */",
         "type_id": "2 (C_Comment)"
       },
       {
-        "ast_id": "$ast_58",
+        "ast_id": "$ast_56",
         "name": "",
         "type_id": "69 (CPPro_else)"
       },
       {
-        "ast_id": "$ast_59",
-        "name": "- EINVAL",
+        "ast_id": "$ast_57",
+        "name": "- EINVAL ;",
         "type_id": "54 (C_ReturnStmt)"
+      },
+      {
+        "ast_id": "$ast_58",
+        "name": "{}",
+        "type_id": "46 (C_CompoundStmt)"
+      },
+      {
+        "ast_id": "$ast_59",
+        "name": "request_dma",
+        "type_id": "21 (C_functionprotodecl)"
       },
       {
         "ast_id": "$ast_60",
@@ -378,78 +378,78 @@
       },
       {
         "ast_id": "$ast_61",
-        "name": "request_dma",
-        "type_id": "21 (C_functionprotodecl)"
-      },
-      {
-        "ast_id": "$ast_62",
-        "name": "{}",
-        "type_id": "46 (C_CompoundStmt)"
-      },
-      {
-        "ast_id": "$ast_63",
         "name": "free_dma",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_64",
+        "ast_id": "$ast_62",
         "name": "",
         "type_id": "70 (CPPro_endif)"
       },
       {
-        "ast_id": "$ast_65",
+        "ast_id": "$ast_63",
         "name": "CONFIG_PROC_FS",
         "type_id": "71 (CPPro_ifdef)"
       },
       {
-        "ast_id": "$ast_66",
+        "ast_id": "$ast_64",
+        "name": "CONFIG_PROC_FS",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_65",
         "name": "seq_file",
         "type_id": "29 (C_structnotbind)"
       },
       {
-        "ast_id": "$ast_67",
+        "ast_id": "$ast_66",
         "name": "m",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_68",
+        "ast_id": "$ast_67",
         "name": "",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_69",
+        "ast_id": "$ast_68",
         "name": "v",
         "type_id": "36 (C_void)"
       },
       {
-        "ast_id": "$ast_70",
+        "ast_id": "$ast_69",
         "name": "i",
         "type_id": "41 (C_int)"
       },
       {
-        "ast_id": "$ast_71",
+        "ast_id": "$ast_70",
         "name": "i",
         "type_id": "23 (C_array)"
       },
       {
-        "ast_id": "$ast_72",
+        "ast_id": "$ast_71",
         "name": "m",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_73",
+        "ast_id": "$ast_72",
         "name": "i",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_74",
+        "ast_id": "$ast_73",
         "name": "dma_chan_busy",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_75",
+        "ast_id": "$ast_74",
         "name": "device_id",
         "type_id": "23 (C_array)"
+      },
+      {
+        "ast_id": "$ast_75",
+        "name": "{}",
+        "type_id": "46 (C_CompoundStmt)"
       },
       {
         "ast_id": "$ast_76",
@@ -458,33 +458,33 @@
       },
       {
         "ast_id": "$ast_77",
-        "name": "{}",
-        "type_id": "46 (C_CompoundStmt)"
-      },
-      {
-        "ast_id": "$ast_78",
         "name": "",
         "type_id": "53 (C_ForStmt)"
       },
       {
-        "ast_id": "$ast_79",
+        "ast_id": "$ast_78",
         "name": "{}",
         "type_id": "46 (C_CompoundStmt)"
       },
       {
-        "ast_id": "$ast_80",
+        "ast_id": "$ast_79",
         "name": "proc_dma_show",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_81",
+        "ast_id": "$ast_80",
         "name": "seq_puts",
         "type_id": "22 (C_functionprotnotbind)"
       },
       {
-        "ast_id": "$ast_82",
+        "ast_id": "$ast_81",
         "name": "",
         "type_id": "60 (C_CallExpr)"
+      },
+      {
+        "ast_id": "$ast_82",
+        "name": "m",
+        "type_id": "62 (C_DeclRefExpr)"
       },
       {
         "ast_id": "$ast_83",
@@ -523,128 +523,153 @@
       },
       {
         "ast_id": "$ast_90",
-        "name": "single_open",
-        "type_id": "22 (C_functionprotnotbind)"
-      },
-      {
-        "ast_id": "$ast_91",
-        "name": "single_open",
-        "type_id": "60 (C_CallExpr)"
-      },
-      {
-        "ast_id": "$ast_92",
-        "name": "file",
-        "type_id": "62 (C_DeclRefExpr)"
-      },
-      {
-        "ast_id": "$ast_93",
-        "name": "proc_dma_show",
-        "type_id": "62 (C_DeclRefExpr)"
-      },
-      {
-        "ast_id": "$ast_94",
-        "name": "single_open ( file , proc_dma_show , NULL )",
+        "name": "single_open ( file , proc_dma_show , NULL ) ;",
         "type_id": "54 (C_ReturnStmt)"
       },
       {
-        "ast_id": "$ast_95",
+        "ast_id": "$ast_91",
         "name": "{}",
         "type_id": "46 (C_CompoundStmt)"
       },
       {
-        "ast_id": "$ast_96",
+        "ast_id": "$ast_92",
         "name": "proc_dma_open",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_97",
+        "ast_id": "$ast_93",
         "name": "open",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_98",
+        "ast_id": "$ast_94",
         "name": "proc_dma_open",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_99",
+        "ast_id": "$ast_95",
         "name": "read",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_100",
+        "ast_id": "$ast_96",
         "name": "seq_read",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_101",
+        "ast_id": "$ast_97",
         "name": "llseek",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_102",
+        "ast_id": "$ast_98",
         "name": "seq_lseek",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_103",
+        "ast_id": "$ast_99",
         "name": "release",
         "type_id": "61 (C_MemberRefExpr)"
       },
       {
-        "ast_id": "$ast_104",
+        "ast_id": "$ast_100",
         "name": "single_release",
         "type_id": "62 (C_DeclRefExpr)"
       },
       {
-        "ast_id": "$ast_105",
+        "ast_id": "$ast_101",
         "name": "{}",
         "type_id": "66 (C_InitListExpr)"
       },
       {
-        "ast_id": "$ast_106",
+        "ast_id": "$ast_102",
         "name": "file_operations",
         "type_id": "29 (C_structnotbind)"
       },
       {
-        "ast_id": "$ast_107",
+        "ast_id": "$ast_103",
         "name": "",
         "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_108",
+        "ast_id": "$ast_104",
         "name": "proc_dma_operations",
         "type_id": "27 (C_struct)"
       },
       {
-        "ast_id": "$ast_109",
-        "name": "proc_create",
-        "type_id": "22 (C_functionprotnotbind)"
+        "ast_id": "$ast_105",
+        "name": "NULL",
+        "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_110",
-        "name": "",
-        "type_id": "60 (C_CallExpr)"
+        "ast_id": "$ast_106",
+        "name": "proc_dma_operations",
+        "type_id": "1 (C_Compound)"
       },
       {
-        "ast_id": "$ast_111",
+        "ast_id": "$ast_107",
         "name": "{}",
         "type_id": "46 (C_CompoundStmt)"
       },
       {
-        "ast_id": "$ast_112",
+        "ast_id": "$ast_108",
         "name": "proc_dma_init",
         "type_id": "21 (C_functionprotodecl)"
       },
       {
-        "ast_id": "$ast_113",
+        "ast_id": "$ast_109",
         "name": "__initcall",
         "type_id": "20 (C_functionproto)"
       },
       {
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "name": "EXPORT_SYMBOL",
         "type_id": "20 (C_functionproto)"
+      },
+      {
+        "ast_id": "$ast_111",
+        "name": "dma_spin_lock",
+        "type_id": "62 (C_DeclRefExpr)"
+      },
+      {
+        "ast_id": "$ast_112",
+        "name": "EINVAL",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_113",
+        "name": "EBUSY",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_114",
+        "name": "KERN_WARNING",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_115",
+        "name": "printk",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_116",
+        "name": "seq_printf",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_117",
+        "name": "single_open",
+        "type_id": "22 (C_functionprotnotbind)"
+      },
+      {
+        "ast_id": "$ast_118",
+        "name": "NULL",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_119",
+        "name": "proc_create",
+        "type_id": "22 (C_functionprotnotbind)"
       }
     ],
     "m_tag": [
@@ -672,203 +697,203 @@
       {
         "tag_id": "$tag_3",
         "hash": "hex:2e1fc7a2a12e78bc1973b284dbe17308d26cef41da5c2a129b1f2cf7983f1fe4",
-        "ast_id": "$ast_5",
+        "ast_id": "$ast_3",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_4",
         "hash": "hex:59525a835a5aec22a7dc3836fabdcb011219aaf1ed1e3bb6b4fcc7e83eafb13a",
-        "ast_id": "$ast_6",
+        "ast_id": "$ast_4",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_5",
         "hash": "hex:fbebe77f2584c4df3014bfa2007cdf80457b612c78a1f7b77e464f608c10bb00",
-        "ast_id": "$ast_8",
+        "ast_id": "$ast_5",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_6",
         "hash": "hex:fba0a99664a3a4214fc64b2d30d6485f22243d115276e5229c80b938aa5cabc3",
-        "ast_id": "$ast_9",
+        "ast_id": "$ast_6",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_7",
         "hash": "hex:0263fbab0623ea4b2f65bf2980f31a9d2edbf1c1efcc9a1a2d0851482d690dc5",
-        "ast_id": "$ast_10",
+        "ast_id": "$ast_7",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_8",
         "hash": "hex:e1bec3ce43ee8fd874203ef67eddf668984a5ea37b99672830f6f5e8846d9e99",
-        "ast_id": "$ast_11",
+        "ast_id": "$ast_8",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_9",
         "hash": "hex:ab57b36d1a5be2437820110daef96f6a00d2c9f8435091711b5b200821387266",
-        "ast_id": "$ast_12",
+        "ast_id": "$ast_9",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_10",
         "hash": "hex:43ce0aebafdb17e734575f4f8e2de79618fe51b76618da9757e8cfc9fed15354",
-        "ast_id": "$ast_13",
+        "ast_id": "$ast_10",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_11",
         "hash": "hex:51e7c6c205b54b0a129aac9cff87f696d39955cf6fadba06f755c484689ecb59",
-        "ast_id": "$ast_14",
+        "ast_id": "$ast_11",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_12",
         "hash": "hex:9bcf4c3b7f4ffe35e203a19e2397b394a49b406cd0e972ce979578a7efd360b0",
-        "ast_id": "$ast_16",
+        "ast_id": "$ast_13",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_13",
         "hash": "hex:46c60f739a3f6cbd0085172874adcf1e9e490fb4aef72dc76bf2e0307c7f1567",
-        "ast_id": "$ast_17",
+        "ast_id": "$ast_14",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_14",
         "hash": "hex:3538f6ddef50fc9ea0ad3ee138dfd35f66111e2cedf1f71a8bce27efe65080d5",
-        "ast_id": "$ast_18",
+        "ast_id": "$ast_15",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_15",
         "hash": "hex:685c8f2be0b27275b82e5ad28b13b0e81c77fb7362903346f5264197a6c7246e",
-        "ast_id": "$ast_19",
+        "ast_id": "$ast_17",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_16",
         "hash": "hex:49a08f4192fb56bb0e43f953686f0eb3e404edfb949aa74ea54ea6cd1232d607",
-        "ast_id": "$ast_23",
+        "ast_id": "$ast_21",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_17",
         "hash": "hex:98847714b5c10a4e0d97966d13d913ecda5f40b6519848f634b972d81f7e3c27",
-        "ast_id": "$ast_28",
+        "ast_id": "$ast_26",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_18",
         "hash": "hex:5c3b25fc50917ffec605f3df218f8d7b556ce85d8f9051408f2ffa1ad99f3eb0",
-        "ast_id": "$ast_29",
+        "ast_id": "$ast_27",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_19",
         "hash": "hex:f73f40acf70016ff264cec0a1cbabc1faf885df0b98425f05beb43f2516ccaff",
-        "ast_id": "$ast_47",
+        "ast_id": "$ast_41",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_20",
         "hash": "hex:5e26c8286353418d62584e01d5f0fcfabc44fcb9a4d9c8ff4e53efa2ac56d046",
-        "ast_id": "$ast_48",
+        "ast_id": "$ast_42",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_21",
         "hash": "hex:fa570f28edc1b02793defc481ca36ee6ba02c4701c43f1f77c50110807872ab3",
-        "ast_id": "$ast_49",
+        "ast_id": "$ast_43",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_22",
         "hash": "hex:5e81fe0b95ba5284dd1adf1277672433e1b19c81a0b1d69dcce0dc2fe7da9c9a",
-        "ast_id": "$ast_56",
+        "ast_id": "$ast_54",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_23",
         "hash": "hex:80da59e951f0dd8bb5d027109b8c85d06762aa31f0024e712e9f8bb484958931",
-        "ast_id": "$ast_57",
+        "ast_id": "$ast_55",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_24",
         "hash": "hex:cd31727502550a74af67e8e5a448d73e73abfa5e17f280b881a2d2394e8afc40",
-        "ast_id": "$ast_58",
+        "ast_id": "$ast_56",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_25",
         "hash": "hex:be0c6390166b62d14bab19759941c84a2f2dba0ea6156c6176d5bd5ed6a4f548",
-        "ast_id": "$ast_61",
+        "ast_id": "$ast_59",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_26",
         "hash": "hex:d9e57d70ba00cf5ee28e8123acf4936658a3873f11835d2a9b78042c08115d4f",
-        "ast_id": "$ast_63",
+        "ast_id": "$ast_61",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_27",
         "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
-        "ast_id": "$ast_64",
+        "ast_id": "$ast_62",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_28",
         "hash": "hex:1d067d8d1d3bb091ab1891da07eeed49c367be261eadae81bbe293c8bd5fb5ac",
-        "ast_id": "$ast_65",
+        "ast_id": "$ast_63",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_29",
         "hash": "hex:3538f6ddef50fc9ea0ad3ee138dfd35f66111e2cedf1f71a8bce27efe65080d5",
-        "ast_id": "$ast_18",
+        "ast_id": "$ast_15",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_30",
         "hash": "hex:8c976ba516e38d0f6c4fb252099116e0bddbba62fd4c7d4b0f88b664657c04ee",
-        "ast_id": "$ast_80",
+        "ast_id": "$ast_79",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_31",
         "hash": "hex:cd31727502550a74af67e8e5a448d73e73abfa5e17f280b881a2d2394e8afc40",
-        "ast_id": "$ast_58",
+        "ast_id": "$ast_56",
         "hl_s": 0,
         "hl_l": 0
       },
@@ -882,7 +907,7 @@
       {
         "tag_id": "$tag_33",
         "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
-        "ast_id": "$ast_64",
+        "ast_id": "$ast_62",
         "hl_s": 0,
         "hl_l": 0
       },
@@ -896,56 +921,56 @@
       {
         "tag_id": "$tag_35",
         "hash": "hex:08f8ac647cdd48e3efda295539f251c3fdef3b6f75f5d95975be614438efcb21",
-        "ast_id": "$ast_96",
+        "ast_id": "$ast_92",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_36",
         "hash": "hex:d1052cb041b60ad7bd312dfd4ddd76745b4998bccd6d8b9bd18d75c7801be2ca",
-        "ast_id": "$ast_108",
+        "ast_id": "$ast_104",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_37",
         "hash": "hex:364e4f78726e7bf8463321b346b860bf2846d23d8a7ec8a302b0950a0149ae32",
-        "ast_id": "$ast_112",
+        "ast_id": "$ast_108",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_38",
         "hash": "hex:e8e2b39f6eeb7763e4d727e9f6294bce62c26c3f8d6c7d5914bc101ab52d75ed",
-        "ast_id": "$ast_113",
+        "ast_id": "$ast_109",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_39",
         "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
-        "ast_id": "$ast_64",
+        "ast_id": "$ast_62",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_40",
         "hash": "hex:830c6105859c4cf212ec16150508cd3e4719226b69d1c68c1fe62891c50630a3",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_41",
         "hash": "hex:7de62a860ce357801d02a71b365131a5afa82a84f4e7c377735c223cc39526e7",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "hl_s": 0,
         "hl_l": 0
       },
       {
         "tag_id": "$tag_42",
         "hash": "hex:c4caadac32520f86ccea300e04ba359b476b366a21331a4c78c41f6f5b93d125",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "hl_s": 0,
         "hl_l": 0
       }
@@ -1327,7 +1352,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 25,
-        "ast_id": "$ast_5"
+        "ast_id": "$ast_3"
       },
       {
         "map_id": "$tag_4",
@@ -1335,7 +1360,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 28,
-        "ast_id": "$ast_6"
+        "ast_id": "$ast_4"
       },
       {
         "map_id": "$tag_5",
@@ -1343,7 +1368,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 26,
-        "ast_id": "$ast_8"
+        "ast_id": "$ast_5"
       },
       {
         "map_id": "$tag_6",
@@ -1351,7 +1376,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 28,
-        "ast_id": "$ast_9"
+        "ast_id": "$ast_6"
       },
       {
         "map_id": "$tag_7",
@@ -1359,7 +1384,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 27,
-        "ast_id": "$ast_10"
+        "ast_id": "$ast_7"
       },
       {
         "map_id": "$tag_8",
@@ -1367,7 +1392,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 24,
-        "ast_id": "$ast_11"
+        "ast_id": "$ast_8"
       },
       {
         "map_id": "$tag_9",
@@ -1375,7 +1400,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 21,
-        "ast_id": "$ast_12"
+        "ast_id": "$ast_9"
       },
       {
         "map_id": "$tag_10",
@@ -1383,7 +1408,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 24,
-        "ast_id": "$ast_13"
+        "ast_id": "$ast_10"
       },
       {
         "map_id": "$tag_11",
@@ -1391,7 +1416,7 @@
         "char_s": 1,
         "line_e": 14,
         "char_e": 4,
-        "ast_id": "$ast_14"
+        "ast_id": "$ast_11"
       },
       {
         "map_id": "$tag_12",
@@ -1399,7 +1424,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 32,
-        "ast_id": "$ast_16"
+        "ast_id": "$ast_13"
       },
       {
         "map_id": "$tag_13",
@@ -1407,7 +1432,7 @@
         "char_s": 1,
         "line_e": 3,
         "char_e": 4,
-        "ast_id": "$ast_17"
+        "ast_id": "$ast_14"
       },
       {
         "map_id": "$tag_14",
@@ -1415,7 +1440,7 @@
         "char_s": 1,
         "line_e": 55,
         "char_e": 24,
-        "ast_id": "$ast_18"
+        "ast_id": "$ast_15"
       },
       {
         "map_id": "$tag_15",
@@ -1423,7 +1448,7 @@
         "char_s": 1,
         "line_e": 4,
         "char_e": 4,
-        "ast_id": "$ast_19"
+        "ast_id": "$ast_17"
       },
       {
         "map_id": "$tag_16",
@@ -1431,7 +1456,7 @@
         "char_s": 1,
         "line_e": 4,
         "char_e": 3,
-        "ast_id": "$ast_23"
+        "ast_id": "$ast_21"
       },
       {
         "map_id": "$tag_17",
@@ -1439,7 +1464,7 @@
         "char_s": 1,
         "line_e": 3,
         "char_e": 3,
-        "ast_id": "$ast_28"
+        "ast_id": "$ast_26"
       },
       {
         "map_id": "$tag_18",
@@ -1447,7 +1472,7 @@
         "char_s": 1,
         "line_e": 5,
         "char_e": 4,
-        "ast_id": "$ast_29"
+        "ast_id": "$ast_27"
       },
       {
         "map_id": "$tag_19",
@@ -1455,7 +1480,7 @@
         "char_s": 1,
         "line_e": 13,
         "char_e": 2,
-        "ast_id": "$ast_47"
+        "ast_id": "$ast_41"
       },
       {
         "map_id": "$tag_20",
@@ -1463,7 +1488,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 20,
-        "ast_id": "$ast_48"
+        "ast_id": "$ast_42"
       },
       {
         "map_id": "$tag_21",
@@ -1471,7 +1496,7 @@
         "char_s": 1,
         "line_e": 4,
         "char_e": 4,
-        "ast_id": "$ast_49"
+        "ast_id": "$ast_43"
       },
       {
         "map_id": "$tag_22",
@@ -1479,7 +1504,7 @@
         "char_s": 1,
         "line_e": 13,
         "char_e": 2,
-        "ast_id": "$ast_56"
+        "ast_id": "$ast_54"
       },
       {
         "map_id": "$tag_23",
@@ -1487,7 +1512,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 17,
-        "ast_id": "$ast_57"
+        "ast_id": "$ast_55"
       },
       {
         "map_id": "$tag_24",
@@ -1495,7 +1520,7 @@
         "char_s": 1,
         "line_e": 12,
         "char_e": 7,
-        "ast_id": "$ast_58"
+        "ast_id": "$ast_56"
       },
       {
         "map_id": "$tag_25",
@@ -1503,7 +1528,7 @@
         "char_s": 1,
         "line_e": 4,
         "char_e": 2,
-        "ast_id": "$ast_61"
+        "ast_id": "$ast_59"
       },
       {
         "map_id": "$tag_26",
@@ -1511,7 +1536,7 @@
         "char_s": 1,
         "line_e": 3,
         "char_e": 2,
-        "ast_id": "$ast_63"
+        "ast_id": "$ast_61"
       },
       {
         "map_id": "$tag_27",
@@ -1519,7 +1544,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 7,
-        "ast_id": "$ast_64"
+        "ast_id": "$ast_62"
       },
       {
         "map_id": "$tag_28",
@@ -1527,7 +1552,7 @@
         "char_s": 1,
         "line_e": 43,
         "char_e": 7,
-        "ast_id": "$ast_65"
+        "ast_id": "$ast_63"
       },
       {
         "map_id": "$tag_29",
@@ -1535,7 +1560,7 @@
         "char_s": 1,
         "line_e": 13,
         "char_e": 24,
-        "ast_id": "$ast_18"
+        "ast_id": "$ast_15"
       },
       {
         "map_id": "$tag_30",
@@ -1543,7 +1568,7 @@
         "char_s": 1,
         "line_e": 12,
         "char_e": 2,
-        "ast_id": "$ast_80"
+        "ast_id": "$ast_79"
       },
       {
         "map_id": "$tag_31",
@@ -1551,7 +1576,7 @@
         "char_s": 1,
         "line_e": 7,
         "char_e": 7,
-        "ast_id": "$ast_58"
+        "ast_id": "$ast_56"
       },
       {
         "map_id": "$tag_32",
@@ -1567,7 +1592,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 7,
-        "ast_id": "$ast_64"
+        "ast_id": "$ast_62"
       },
       {
         "map_id": "$tag_34",
@@ -1583,7 +1608,7 @@
         "char_s": 1,
         "line_e": 4,
         "char_e": 2,
-        "ast_id": "$ast_96"
+        "ast_id": "$ast_92"
       },
       {
         "map_id": "$tag_36",
@@ -1591,7 +1616,7 @@
         "char_s": 1,
         "line_e": 6,
         "char_e": 3,
-        "ast_id": "$ast_108"
+        "ast_id": "$ast_104"
       },
       {
         "map_id": "$tag_37",
@@ -1599,7 +1624,7 @@
         "char_s": 1,
         "line_e": 5,
         "char_e": 2,
-        "ast_id": "$ast_112"
+        "ast_id": "$ast_108"
       },
       {
         "map_id": "$tag_38",
@@ -1607,7 +1632,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 27,
-        "ast_id": "$ast_113"
+        "ast_id": "$ast_109"
       },
       {
         "map_id": "$tag_39",
@@ -1615,7 +1640,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 7,
-        "ast_id": "$ast_64"
+        "ast_id": "$ast_62"
       },
       {
         "map_id": "$tag_40",
@@ -1623,7 +1648,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 28,
-        "ast_id": "$ast_114"
+        "ast_id": "$ast_110"
       },
       {
         "map_id": "$tag_41",
@@ -1631,7 +1656,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 25,
-        "ast_id": "$ast_114"
+        "ast_id": "$ast_110"
       },
       {
         "map_id": "$tag_42",
@@ -1639,7 +1664,7 @@
         "char_s": 1,
         "line_e": 1,
         "char_e": 30,
-        "ast_id": "$ast_114"
+        "ast_id": "$ast_110"
       }
     ],
     "m_git_ref": [
@@ -1656,7 +1681,7 @@
     ],
     "m_ast_attribute": [
       {
-        "ast_id": "$ast_112",
+        "ast_id": "$ast_108",
         "priority": 0,
         "name": "init",
         "val": ""
@@ -1666,7 +1691,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_36",
-        "ast_id": "$ast_108",
+        "ast_id": "$ast_104",
         "name": "proc_dma_operations",
         "type_id": "27 (C_struct)",
         "linkage": 1,
@@ -1676,7 +1701,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_37",
-        "ast_id": "$ast_112",
+        "ast_id": "$ast_108",
         "name": "proc_dma_init",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 1,
@@ -1686,7 +1711,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_38",
-        "ast_id": "$ast_113",
+        "ast_id": "$ast_109",
         "name": "proc_dma_init",
         "type_id": "163 (C_InitcallDef)",
         "linkage": 5,
@@ -1696,7 +1721,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_40",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "name": "request_dma",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1706,7 +1731,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_41",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "name": "free_dma",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1716,7 +1741,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_42",
-        "ast_id": "$ast_114",
+        "ast_id": "$ast_110",
         "name": "dma_spin_lock",
         "type_id": "164 (C_ExportSymbolDef)",
         "linkage": 5,
@@ -1726,7 +1751,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_12",
-        "ast_id": "$ast_16",
+        "ast_id": "$ast_13",
         "name": "dma_spin_lock",
         "type_id": "150 (C_MacroVarDef)",
         "linkage": 5,
@@ -1736,7 +1761,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_16",
-        "ast_id": "$ast_23",
+        "ast_id": "$ast_21",
         "name": "dma_chan",
         "type_id": "28 (C_structdecl)",
         "linkage": 0,
@@ -1746,7 +1771,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_17",
-        "ast_id": "$ast_28",
+        "ast_id": "$ast_26",
         "name": "dma_chan_busy",
         "type_id": "27 (C_struct)",
         "linkage": 1,
@@ -1756,7 +1781,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_19",
-        "ast_id": "$ast_47",
+        "ast_id": "$ast_41",
         "name": "request_dma",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 0,
@@ -1766,7 +1791,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_22",
-        "ast_id": "$ast_56",
+        "ast_id": "$ast_54",
         "name": "free_dma",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 0,
@@ -1776,7 +1801,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_25",
-        "ast_id": "$ast_61",
+        "ast_id": "$ast_59",
         "name": "request_dma",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 0,
@@ -1786,7 +1811,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_26",
-        "ast_id": "$ast_63",
+        "ast_id": "$ast_61",
         "name": "free_dma",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 0,
@@ -1796,7 +1821,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_30",
-        "ast_id": "$ast_80",
+        "ast_id": "$ast_79",
         "name": "proc_dma_show",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 1,
@@ -1816,7 +1841,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_35",
-        "ast_id": "$ast_96",
+        "ast_id": "$ast_92",
         "name": "proc_dma_open",
         "type_id": "21 (C_functionprotodecl)",
         "linkage": 1,
@@ -1828,7 +1853,16 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_36",
-        "ast_id": "$ast_106",
+        "ast_id": "$ast_100",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 147,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_36",
+        "ast_id": "$ast_102",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
         "line": 143,
@@ -1836,8 +1870,125 @@
       },
       {
         "blob_id": "$fid_0",
+        "tag_id": "$tag_42",
+        "ast_id": "$ast_111",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 161,
+        "char_s": 15
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_111",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 41,
+        "char_s": 17
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_25",
+        "ast_id": "$ast_112",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 106,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_112",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 73,
+        "char_s": 11
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_113",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 76,
+        "char_s": 11
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_114",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 91,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_114",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 96,
+        "char_s": 10
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_115",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 91,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_115",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 96,
+        "char_s": 3
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_30",
+        "ast_id": "$ast_116",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 124,
+        "char_s": 4
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_35",
+        "ast_id": "$ast_117",
+        "target_fnid": 0,
+        "role": "3 (Call)",
+        "line": 140,
+        "char_s": 9
+      },
+      {
+        "blob_id": "$fid_0",
         "tag_id": "$tag_37",
-        "ast_id": "$ast_109",
+        "ast_id": "$ast_118",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 152,
+        "char_s": 24
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_35",
+        "ast_id": "$ast_118",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 140,
+        "char_s": 42
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_37",
+        "ast_id": "$ast_119",
         "target_fnid": 0,
         "role": "3 (Call)",
         "line": 152,
@@ -1845,8 +1996,62 @@
       },
       {
         "blob_id": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 72,
+        "char_s": 15
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 90,
+        "char_s": 15
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_30",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 122,
+        "char_s": 19
+      },
+      {
+        "blob_id": "$fid_0",
         "tag_id": "$tag_17",
-        "ast_id": "$ast_23",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "6 (MacroExpansion)",
+        "line": 60,
+        "char_s": 38
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_29",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "8 (CondRef)",
+        "line": 117,
+        "char_s": 8
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_14",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "8 (CondRef)",
+        "line": 47,
+        "char_s": 8
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_17",
+        "ast_id": "$ast_21",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
         "line": 60,
@@ -1855,7 +2060,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_19",
-        "ast_id": "$ast_28",
+        "ast_id": "$ast_26",
         "target_fnid": 0,
         "role": "5 (DeclRef)",
         "line": 78,
@@ -1864,7 +2069,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_19",
-        "ast_id": "$ast_31",
+        "ast_id": "$ast_29",
         "target_fnid": 0,
         "role": "5 (DeclRef)",
         "line": 78,
@@ -1873,16 +2078,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_19",
-        "ast_id": "$ast_31",
-        "target_fnid": 0,
-        "role": "5 (DeclRef)",
-        "line": 75,
-        "char_s": 26
-      },
-      {
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_19",
-        "ast_id": "$ast_32",
+        "ast_id": "$ast_30",
         "target_fnid": 0,
         "role": "5 (DeclRef)",
         "line": 78,
@@ -1890,8 +2086,17 @@
       },
       {
         "blob_id": "$fid_0",
+        "tag_id": "$tag_22",
+        "ast_id": "$ast_45",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 95,
+        "char_s": 26
+      },
+      {
+        "blob_id": "$fid_0",
         "tag_id": "$tag_19",
-        "ast_id": "$ast_34",
+        "ast_id": "$ast_48",
         "target_fnid": 0,
         "role": "3 (Call)",
         "line": 75,
@@ -1900,7 +2105,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_22",
-        "ast_id": "$ast_34",
+        "ast_id": "$ast_48",
         "target_fnid": 0,
         "role": "3 (Call)",
         "line": 95,
@@ -1908,17 +2113,17 @@
       },
       {
         "blob_id": "$fid_0",
-        "tag_id": "$tag_22",
-        "ast_id": "$ast_51",
+        "tag_id": "$tag_28",
+        "ast_id": "$ast_64",
         "target_fnid": 0,
-        "role": "5 (DeclRef)",
-        "line": 95,
-        "char_s": 26
+        "role": "8 (CondRef)",
+        "line": 115,
+        "char_s": 8
       },
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_30",
-        "ast_id": "$ast_66",
+        "ast_id": "$ast_65",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
         "line": 118,
@@ -1927,7 +2132,7 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_32",
-        "ast_id": "$ast_66",
+        "ast_id": "$ast_65",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
         "line": 131,
@@ -1936,20 +2141,20 @@
       {
         "blob_id": "$fid_0",
         "tag_id": "$tag_32",
-        "ast_id": "$ast_81",
+        "ast_id": "$ast_66",
+        "target_fnid": 0,
+        "role": "5 (DeclRef)",
+        "line": 133,
+        "char_s": 11
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_32",
+        "ast_id": "$ast_80",
         "target_fnid": 0,
         "role": "3 (Call)",
         "line": 133,
         "char_s": 2
-      },
-      {
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_35",
-        "ast_id": "$ast_84",
-        "target_fnid": 0,
-        "role": "5 (DeclRef)",
-        "line": 140,
-        "char_s": 27
       },
       {
         "blob_id": "$fid_0",
@@ -1971,21 +2176,21 @@
       },
       {
         "blob_id": "$fid_0",
-        "tag_id": "$tag_35",
-        "ast_id": "$ast_89",
+        "tag_id": "$tag_36",
+        "ast_id": "$ast_96",
         "target_fnid": 0,
         "role": "5 (DeclRef)",
-        "line": 140,
-        "char_s": 21
+        "line": 145,
+        "char_s": 11
       },
       {
         "blob_id": "$fid_0",
-        "tag_id": "$tag_35",
-        "ast_id": "$ast_90",
+        "tag_id": "$tag_36",
+        "ast_id": "$ast_98",
         "target_fnid": 0,
-        "role": "3 (Call)",
-        "line": 140,
-        "char_s": 9
+        "role": "5 (DeclRef)",
+        "line": 146,
+        "char_s": 13
       }
     ]
   }

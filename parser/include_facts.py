@@ -1,7 +1,9 @@
 """parser/include_facts.py - `#include` directives of a source blob (`m_blob_facts` family 3, pure).
 
-`[[name, quoted], ...]` of every `#include` / `#include_next` with a literal name, in file order
-(`parser/include_graph.include_directives()`), for `.c`, `.h` and `.S` blobs. The webapp's include walks
+`[[name, quoted, conds], ...]` of every `#include` / `#include_next` with a literal name, in file order
+(`parser/include_graph.include_directives_with_conditions()`), for `.c`, `.h`, `.S` and `.s` blobs. `conds` is
+the list of `#if` conditions (strings) enclosing the directive, empty when it is unconditional; a stored
+entry without `conds` decodes with an empty list. The webapp's include walks
 (`ArchLayoutService.reachable()`) and its list of `.c`/`.S` files included by other files
 (`KconfigService._included_sources()`) read them instead of opening every file from Git.
 """
@@ -11,11 +13,11 @@ import json
 import zlib
 from typing import Any
 
-from parser.include_graph import include_directives
+from parser.include_graph import include_directives_with_conditions
 
 FAMILY = 3
-FORMAT = 1
-SUFFIXES = (".c", ".h", ".S")
+FORMAT = 2
+SUFFIXES = (".c", ".h", ".S", ".s")
 
 
 def applies(path: str) -> bool:
@@ -23,7 +25,7 @@ def applies(path: str) -> bool:
 
 
 def extract(text: str) -> list[list[Any]]:
-    return [[name, quoted] for name, quoted in include_directives(text or "")]
+    return [[name, quoted, conds] for name, quoted, conds in include_directives_with_conditions(text or "")]
 
 
 def encode(record: list[list[Any]] | None) -> bytes:
@@ -33,23 +35,24 @@ def encode(record: list[list[Any]] | None) -> bytes:
     return zlib.compress(json.dumps(record, separators=(",", ":")).encode(), 3)
 
 
-def decode(data: bytes | bytearray | memoryview | None) -> list[tuple[str, bool]] | None:
-    """[(name, quoted)] of a stored record (None when the bytes are not one)."""
+def decode(data: bytes | bytearray | memoryview | None) -> list[tuple[str, bool, list[str]]] | None:
+    """[(name, quoted, conds)] of a stored record (None when the bytes are not one)."""
     if data is None:
         return None
     raw = bytes(data)
     if not raw:
         return []
     try:
-        return [(str(n), bool(q)) for n, q in json.loads(zlib.decompress(raw))]
-    except (zlib.error, ValueError, TypeError):
+        return [(str(e[0]), bool(e[1]), [str(c) for c in (e[2] if len(e) > 2 else ())]) for e in json.loads(zlib.decompress(raw))]
+    except (zlib.error, ValueError, TypeError, IndexError):
         return None
 
 
-def included_sources(directives: list[tuple[str, bool]]) -> set[str]:
+def included_sources(directives: list[tuple[Any, ...]]) -> set[str]:
     """Basenames of the `.c` / `.S` files a blob includes (compiled inside it, not on their own)."""
     out = set()
-    for name, _quoted in directives:
+    for item in directives:
+        name = item[0]
         if name.endswith((".c", ".S")):
             out.add(name.rsplit("/", 1)[-1])
     return out

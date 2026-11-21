@@ -9,7 +9,10 @@ from webapp.backend.database.helpers import (
     safe_decode,
     get_version_info,
 )
+from webapp.backend.security.jail import is_safe_rel_path
+from webapp.backend.security.sql import is_valid_identifier
 from webapp.backend.services.arch_layout_service import arch_layout_service
+from webapp.backend.services.imports_service import def_namespace, import_kind, imports_service
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
     best_path,
@@ -51,6 +54,30 @@ MAX_XREF_TARGETS = 64
 TYPE_DEF_TYPES = {"struct": "C_structdecl", "union": "C_uniondecl", "enum": "C_enumdecl", "typedef": "C_SCtypedef"}
 _TYPE_DEF_NAMES = frozenset(TYPE_DEF_TYPES.values())
 
+
+
+def _include_category(t_name: str) -> str:
+    """Popover category of an included symbol's declaration type."""
+    if not t_name:
+        return "Symbol"
+    tl = t_name.lower()
+    if "enumequal" in tl or "enumconstant" in tl:
+        return "EnumConstant"
+    if "struct" in tl:
+        return "Struct"
+    if "union" in tl:
+        return "Union"
+    if "enum" in tl:
+        return "Enum"
+    if "proto" in tl or "func" in tl:
+        return "Function"
+    if "typedef" in tl:
+        return "Typedef"
+    if "define" in tl or "macro" in tl:
+        return "Macro"
+    if "extern" in tl or "var" in tl:
+        return "Variable"
+    return "Symbol"
 
 def format_symbol_type(type_name: str) -> str:
     """Format internal AST type names into user-friendly display labels."""
@@ -606,10 +633,25 @@ class SymbolService:
         file_path: str | None = None,
         line: int | None = None,
         header: str | None = None,
+        arch: str | None = None,
     ) -> dict[str, Any]:
-        """Retrieve imported symbols and target header file path for a CPPro_include AST node."""
-        import os
+        """Imported symbols and target header file path of a CPPro_include AST node.
+
+        The node stores the directive text and its `m_ast_include` target only. The symbols are the Imports
+        panel's items of the referring file at this revision (`ImportsService.get_imports()`: the names its blob
+        references in `m_symbol_ref`, resolved through its `#include` closure for ARCH=<arch>) whose `#include`
+        chain passes through this directive's header. Each definition location resolves through the header's
+        reachable `#include` closure for ARCH=<arch>, then the referring file's imports (its own closure and
+        context imports), then the revision's tree.
+        """
         from core.globalstuff import normalize_repo_path
+
+        arch = str(arch or DEFAULT_DEFINITION_ARCH).strip()
+        if not is_valid_identifier(arch) or len(arch) > 32:
+            raise HTTPException(status_code=400, detail="Invalid arch")
+        clean_file = (file_path or "").strip().strip("/") or None
+        if clean_file and not is_safe_rel_path(clean_file):
+            raise HTTPException(status_code=400, detail="Invalid file_path")
 
         with get_reader() as reader:
             _, version_name, blob_paths = self._scope(reader, version_name)
@@ -621,7 +663,7 @@ class SymbolService:
                     target_ast_id = t_row["ast_id"]
 
             # The include directive of the referring file, looked up in that file's blob at this revision
-            file_blob = self._blob_of(reader, version_name, file_path) if target_ast_id <= 0 and file_path else None
+            file_blob = self._blob_of(reader, version_name, clean_file) if clean_file else None
             if target_ast_id <= 0 and file_blob and line:
                 f_row = reader.select_one(
                     ("m_bridge_tag", "bt"),
@@ -667,9 +709,10 @@ class SymbolService:
                 if header:
                     from webapp.backend.services.filesystem_service import filesystem_service
                     try:
-                        resolved = filesystem_service.resolve_include(version_name, header, current_file=file_path)
+                        resolved = filesystem_service.resolve_include(version_name, header, current_file=file_path,
+                                                                      arch=arch)
                         hdr_file = resolved.get("path", "")
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - an unresolvable header keeps its written name
                         hdr_file = header.strip().strip("<>\"' ;")
 
                 return {
@@ -690,88 +733,121 @@ class SymbolService:
             raw_header = safe_decode(inc_row["fname"]) if inc_row else ""
             header_file = normalize_repo_path(raw_header)
 
-            cont_rows = reader.select_rows(
-                ("m_ast_container", "c"),
-                {"priority": "c.priority", "type_id": "c.type_id", "type_name": "td.name",
-                 "sym_ast_id": "ra.ast_id", "sym_name": "ra.name"},
-                {"c.ast_id": target_ast_id},
-                joins=[
-                    Join(("m_type_descriptor", "td"), {"td.type_id": "c.type_id"}, "left"),
-                    Join(("m_ast", "ra"), {"ra.ast_id": "c.ref_ast_id"}, "left"),
-                ],
-                order_by=["c.priority"],
-            )
+        header_file = self._include_header(version_name, arch, header_file, raw_include_text, clean_file, blob_paths)
 
-            symbol_names = [safe_decode(r["sym_name"]) for r in cont_rows if r["sym_name"]]
+        symbol_rows: list[dict[str, Any]] = []
+        file_items: dict[str, dict[str, Any]] = {}
+        if clean_file and file_blob:
+            try:
+                imports = imports_service.get_imports(version_name, clean_file, arch)
+            except HTTPException:
+                imports = {"items": []}
+            listed: set[str] = set()
+            for it in imports.get("items") or ():
+                if it.get("kind") == "config":
+                    continue
+                file_items.setdefault(it["name"], it)
+                # Names the file imports through this directive: the item's chain starts at the file itself
+                # and its first hop is the directive's header
+                chain = it.get("chain") or []
+                if (it.get("via") == "include" and len(chain) >= 2 and chain[0] == clean_file
+                        and chain[1] == header_file and it["name"] not in listed):
+                    listed.add(it["name"])
+                    type_id = int(ASTT[it["type_name"]]) if it.get("type_name") in ASTT.__members__ else 0
+                    symbol_rows.append({"priority": len(symbol_rows), "ast_id": None, "name": it["name"],
+                                        "type_id": type_id, "type_name": it.get("type_name") or ""})
 
-            # Each symbol's definition in this revision's tree: in the header itself, then in its directory
-            def_map = {}
-            if symbol_names:
-                header_dir = (os.path.dirname(header_file) + "/") if header_file else ""
-                ranked: dict[str, tuple] = {}
-                for d_row in reader.select_rows(
-                    "m_symbol_def", {"name": "name", "fid": "blob_id", "line_s": "line_s"}, {"name": symbol_names},
-                ):
-                    paths = blob_paths.get(d_row["fid"])
-                    if not paths:
-                        continue
-                    d_name = safe_decode(d_row["name"])
-                    path = header_file if header_file in paths else paths[0]
-                    rank = (0 if path == header_file else 1 if header_dir and path.startswith(header_dir) else 2, d_row["line_s"] or 0)
-                    if d_name not in ranked or rank < ranked[d_name]:
-                        ranked[d_name] = rank
-                        def_map[d_name] = {
-                            "fid": d_row["fid"],
-                            "line_s": d_row["line_s"],
-                            "def_file": path,
-                        }
+        def_map = self._include_symbol_defs(version_name, arch, header_file, clean_file, symbol_rows, file_items,
+                                            blob_paths)
 
-            def _get_category(t_name: str) -> str:
-                if not t_name:
-                    return "Symbol"
-                tl = t_name.lower()
-                if "enumequal" in tl or "enumconstant" in tl:
-                    return "EnumConstant"
-                if "struct" in tl:
-                    return "Struct"
-                if "union" in tl:
-                    return "Union"
-                if "enum" in tl:
-                    return "Enum"
-                if "proto" in tl or "func" in tl:
-                    return "Function"
-                if "typedef" in tl:
-                    return "Typedef"
-                if "define" in tl or "macro" in tl:
-                    return "Macro"
-                if "extern" in tl or "var" in tl:
-                    return "Variable"
-                return "Symbol"
+        symbols_list = []
+        for r in symbol_rows:
+            def_info = def_map.get(r["name"])
+            symbols_list.append({
+                **r,
+                "category": _include_category(r["type_name"]),
+                "def_file": def_info["def_file"] if def_info else None,
+                "def_line_s": def_info["line_s"] if def_info else None,
+            })
+        return {
+            "ast_id": target_ast_id,
+            "include_text": raw_include_text,
+            "header_file": header_file,
+            "arch": arch,
+            "symbols": symbols_list,
+        }
 
-            symbols_list = []
-            for r in cont_rows:
-                priority = r["priority"]
-                type_id = r["type_id"]
-                t_name = safe_decode(r["type_name"])
-                sym_ast_id = r["sym_ast_id"]
-                sym_name = safe_decode(r["sym_name"])
+    @staticmethod
+    def _include_header(version_name: str, arch: str, header_file: str, include_text: str, file_path: str | None,
+                        blob_paths: dict[int, list[str]]) -> str:
+        """Tree path of the directive's header: the parser's resolved target when the tree holds it, else the
+        directive resolved for ARCH=<arch> from the referring file."""
+        tree = git_tree_resolver.list_tree(version_name) or {}
+        if header_file and header_file in tree:
+            return header_file
+        if not include_text:
+            return header_file
+        from webapp.backend.services.filesystem_service import filesystem_service
+        try:
+            resolved = filesystem_service.resolve_include(version_name, include_text, current_file=file_path, arch=arch)
+        except Exception:  # noqa: BLE001 - keep the parser's target
+            return header_file
+        return resolved.get("path") or header_file
 
-                def_info = def_map.get(sym_name)
-                symbols_list.append({
-                    "priority": priority,
-                    "ast_id": sym_ast_id,
-                    "name": sym_name,
-                    "type_id": type_id,
-                    "type_name": t_name,
-                    "category": _get_category(t_name),
-                    "def_file": def_info["def_file"] if def_info else None,
-                    "def_line_s": def_info["line_s"] if def_info else None,
-                })
+    @staticmethod
+    def _include_symbol_defs(version_name: str, arch: str, header_file: str, file_path: str | None,
+                             symbol_rows: list[dict[str, Any]], file_items: dict[str, dict[str, Any]],
+                             blob_paths: dict[int, list[str]]) -> dict[str, dict[str, Any]]:
+        """{name: {"def_file", "line_s"}} of the include's symbols: the header's reachable `#include` closure
+        for ARCH=<arch> first (C name space of the declaration, full definitions before prototypes and
+        forward declarations), then the referring file's import items (its own closure and context imports),
+        then the referring file's closure, then the revision's tree ranked for ARCH=<arch>."""
+        wanted = {r["name"]: r["type_name"] or "" for r in symbol_rows}
+        out: dict[str, dict[str, Any]] = {}
 
-            return {
-                "ast_id": target_ast_id,
-                "include_text": raw_include_text,
-                "header_file": header_file,
-                "symbols": symbols_list,
-            }
+        def take(items: dict[str, dict[str, Any]]) -> None:
+            for name, it in items.items():
+                if name in wanted and name not in out:
+                    out[name] = {"def_file": it["header_path"], "line_s": it["line"]}
+
+        def missing() -> dict[str, str]:
+            return {n: t for n, t in wanted.items() if n not in out}
+
+        if header_file and wanted:
+            take(imports_service.closure_definitions(version_name, arch, header_file, wanted)[1])
+        if missing() and file_items:
+            take({n: it for n, it in file_items.items()
+                  if n in wanted and (not wanted[n] or def_namespace(it["type_name"]) == def_namespace(wanted[n]))})
+        if missing() and file_path:
+            take(imports_service.closure_definitions(version_name, arch, file_path, missing())[1])
+        rest = missing()
+        if rest:
+            _, scope, bits = definition_arch(version_name, arch)
+            ranked: dict[str, tuple] = {}
+            with get_reader() as reader:
+                rows = reader.select_rows(
+                    ("m_symbol_def", "s"),
+                    {"name": "s.name", "fid": "s.blob_id", "line_s": "s.line_s", "line_e": "s.line_e",
+                     "linkage": "s.linkage", "type_name": "t.name"},
+                    {"s.name": sorted(rest)},
+                    joins=[Join(("m_type_descriptor", "t"), {"t.type_id": "s.type_id"}, "left")],
+                )
+            for d_row in rows:
+                paths = blob_paths.get(d_row["fid"])
+                if not paths:
+                    continue
+                d_name = safe_decode(d_row["name"])
+                type_name = safe_decode(d_row["type_name"])
+                want = rest.get(d_name)
+                if want and def_namespace(type_name) != def_namespace(want):
+                    continue
+                if import_kind(type_name, d_row["linkage"], d_row["line_s"] or 0, d_row["line_e"] or 0) is None:
+                    continue
+                path = header_file if header_file in paths else best_path(paths, scope, bits)
+                rank = (0 if path == header_file else 1, not path.endswith(".h"),
+                        definition_rank(path, d_row["linkage"], d_row["line_s"], scope, bits))
+                if d_name not in ranked or rank < ranked[d_name]:
+                    ranked[d_name] = rank
+                    out[d_name] = {"def_file": path, "line_s": d_row["line_s"]}
+        return out
 

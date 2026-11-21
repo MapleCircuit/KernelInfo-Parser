@@ -307,7 +307,7 @@ def benchmark_cast_stages(files: list[str] | None = None) -> None:
         setattr(obj, name, wrapped)
 
     wrap_fn(cc.Index, "parse", "1_clang_parse")
-    wrap_fn(cmod, "extract_include_symbols", "2_include_walk")
+    wrap_fn(cmod, "map_direct_includes", "2_include_walk")
     wrap_fn(tokmod.TokenStream, "__init__", "3_tokenize")
     wrap_fn(CSExtractor, "extract_zone", "5_extract_zone")
 

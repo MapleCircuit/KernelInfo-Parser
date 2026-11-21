@@ -50,6 +50,7 @@ from parser.c_ast.ctypes_bindings import (
     _CLANG_VISIT_CHILDREN,
     _CLANG_GET_CURSOR_REFERENCED,
     _CLANG_CURSOR_IS_NULL,
+    _CLANG_MACRO_IS_FUNCTION_LIKE,
 )
 from parser.c_ast.tokenizer import (
     Line,
@@ -95,6 +96,7 @@ from parser.c_ast.ast_nodes import (
     Ast_MemberRefExpr,
     Ast_DeclRefExpr,
     Ast_MacroRefExpr,
+    Ast_TypeRefExpr,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,7 @@ _VALID_TOP_KINDS = frozenset({
     cc.CursorKind.ASM_STMT,
 })
 _NON_NAME_TOKENS = frozenset({"struct", "union", "enum", "(", "*", ""})
+_NAMED_TYPE_TOKENS = frozenset({ASTT.C_struct, ASTT.C_union, ASTT.C_enum, ASTT.C_SCtypedef})
 _VAR_DECL_MACROS = frozenset({
     "DEFINE_SPINLOCK",
     "DEFINE_RAW_SPINLOCK",
@@ -259,6 +262,10 @@ _EXPORT_MACROS = frozenset({
     "EXPORT_UNUSED_SYMBOL_GPL",
     "EXPORT_TRACEPOINT_SYMBOL",
     "EXPORT_TRACEPOINT_SYMBOL_GPL",
+    "EXPORT_PER_CPU_SYMBOL",
+    "EXPORT_PER_CPU_SYMBOL_GPL",
+    "EXPORT_SYMBOL_NS",
+    "EXPORT_SYMBOL_NS_GPL",
 })
 _INITCALL_MACROS = frozenset({
     "module_init",
@@ -306,7 +313,16 @@ _SYSFS_ATTR_MACROS = frozenset({
     "IIO_DEVICE_ATTR",
     "IIO_DEVICE_ATTR_RO",
     "IIO_DEVICE_ATTR_RW",
+    "SYSDEV_ATTR",
+    "SYSDEV_CLASS_ATTR",
+    "CLASS_ATTR_WO",
+    "DEVICE_ATTR_ADMIN_RO",
+    "DEVICE_ATTR_ADMIN_RW",
+    "DRIVER_ATTR_WO",
+    "BUS_ATTR_WO",
 })
+# Kernel macros that name the declaration they open (`extract()` reads the defined name from their first argument)
+_NAMING_KERNEL_MACROS = _EXPORT_MACROS | _SYSFS_ATTR_MACROS
 _KNOWN_MACRO_FUNCS = frozenset({
     "MODULE_AUTHOR",
     "MODULE_DESCRIPTION",
@@ -334,6 +350,37 @@ _KNOWN_MACRO_FUNCS = frozenset({
     *_SYSFS_ATTR_MACROS,
 })
 
+_TYPE_REF_TARGET_KINDS = frozenset({2, 3, 5, 20})  # STRUCT_DECL, UNION_DECL, ENUM_DECL, TYPEDEF_DECL
+
+
+def _type_ref_target(cursor: Any) -> bool:
+    """True when a `TYPE_REF` cursor names a resolved record / enum / typedef (unresolved names: lexical_refs.py)."""
+    try:
+        ref = _CLANG_GET_CURSOR_REFERENCED(cursor)
+        return not _CLANG_CURSOR_IS_NULL(ref) and ref._kind_id in _TYPE_REF_TARGET_KINDS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_renamed_function_name(token: Any, cursor: Any, fn_cur: Any) -> bool:
+    """True when `token` is the declarator name of `fn_cur` spelled through an object-like macro: its cursor is the
+    `MACRO_INSTANTIATION` at the function's location (function-like wrappers such as `SYSCALL_DEFINE3` excluded)."""
+    try:
+        if getattr(cursor, "_kind_id", None) != 502:  # MACRO_INSTANTIATION
+            return False
+        loc = fn_cur.location
+        if (loc.line, loc.column) != (int(token.line.line_pos[0]), int(token.line.char_pos[0])):
+            return False
+        macro = _CLANG_GET_CURSOR_REFERENCED(cursor)
+        return not _CLANG_CURSOR_IS_NULL(macro) and not _CLANG_MACRO_IS_FUNCTION_LIKE(macro)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_DECL_EXPR_REF_KINDS = frozenset({101, 102, 103, 502})  # DECL_REF_EXPR, MEMBER_REF_EXPR, CALL_EXPR, MACRO_INSTANTIATION
+_DECL_KIND_IDS = frozenset({6, 8, 9, 20})  # FIELD_DECL, FUNCTION_DECL, VAR_DECL, TYPEDEF_DECL
+_DECLARATOR_KIND_IDS = frozenset({6, 7, 8, 9, 10, 20})  # ... ENUM_CONSTANT_DECL, PARM_DECL
+_SYSCALL_PREFIXES = ("SYSCALL_DEFINE", "COMPAT_SYSCALL_DEFINE")
 _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_INSTANTIATION,
     cc.CursorKind.INVALID_FILE,
@@ -749,6 +796,14 @@ def get_rel_file_for_cursor(CS: Any, cursor: Any) -> str | None:
         if cached is not None or file_path in cache:
             return cached
 
+    # The compilation environment knows the tree and the build directory (symlinks, wrappers, generated headers)
+    env = getattr(CS, "compile_env", None) if CS is not None else None
+    if env is not None and os.path.isabs(file_path):
+        res = env.repo_path(file_path)
+        if cache is not None:
+            cache[file_path] = res
+        return res
+
     # Exclude host system headers (server include directories)
     if file_path.startswith(("/usr/", "/etc/", "/opt/", "/var/", "/lib/", "/bin/", "/dev/")):
         # Exception: /dev/shm workspace used for repository checkouts
@@ -912,20 +967,19 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
             return (ASTT.C_functionproto, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
     if k_id == 6:  # cc.CursorKind.FIELD_DECL
+        # Members are a name space of their own: the field's declaration (registered as `(name, C_MemberRefExpr)`),
+        # else an unbound member `m_ast.view(name, C_MemberRefExpr)` - never a tag, variable or macro of that name
         spelling = safe_cursor_spelling(ref_cursor)
         if spelling:
             safe_name = str(spelling)[:255]
             rel_file = get_rel_file_for_cursor(CS, ref_cursor)
             if rel_file and rel_file != cur_file:
-                return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_structdecl)))
-            if hasattr(CS, "symbol_dict"):
-                if (safe_name, ASTT.C_structdecl) in CS.symbol_dict:
-                    return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_structdecl)]))
-                if (safe_name, ASTT.C_struct) in CS.symbol_dict:
-                    return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_struct)]))
+                return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_MemberRefExpr)))
+            if hasattr(CS, "symbol_dict") and (safe_name, ASTT.C_MemberRefExpr) in CS.symbol_dict:
+                return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_MemberRefExpr)]))
             op_idx = len(CS.cs)
             with CS(REF_NO_REF):
-                CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind))
+                CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_MemberRefExpr))
             return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
     if k_id == 7:  # cc.CursorKind.ENUM_CONSTANT_DECL
@@ -955,6 +1009,14 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
             elif hasattr(CS, "symbol_dict"):
                 if (safe_var_name, ASTT.C_DeclRefExpr) in CS.symbol_dict:
                     ref_ast_id = CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_var_name, ASTT.C_DeclRefExpr)])
+                elif rel_file and rel_file == cur_file:
+                    # A variable of this file the parser registered no declaration for (a C99 `for (T x = ...)`
+                    # local, a parameter of a macro-spelled function, a name a macro generates): an unbound
+                    # ordinary identifier of its name
+                    op_idx = len(CS.cs)
+                    with CS(REF_NO_REF):
+                        CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_var_name, ASTT.C_DeclRefExpr))
+                    ref_ast_id = CS.ref(m_ast.ast_id, REF_POS, op_idx)
 
         if type_obj is not None:
             t_kind = getattr(type_obj, "kind", None)
@@ -1117,6 +1179,44 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
     return (ASTT.Undefined, 0)
 
 
+def _tu_cursor_at(CS: Any, extent: Any) -> Any:
+    """The libclang cursor at the start of `extent` in the file being parsed (None outside a live C parse)."""
+    am = getattr(CS, "parsers", {}).get("C_AM") if CS is not None else None
+    tl = getattr(am, "TL", None)
+    tu = getattr(tl, "parsed_tu", None)
+    if tu is None or extent is None:
+        return None
+    try:
+        line, col = extent.line_pos[0], extent.char_pos[0]
+        loc = tu.get_location(am.fullfilename, (int(line), int(col)))
+        cursor = cc.Cursor.from_location(tu, loc)
+    except Exception:  # noqa: BLE001
+        return None
+    if cursor is None or cursor.kind == cc.CursorKind.NO_DECL_FOUND:
+        return None
+    cursor._tu = tu
+    return cursor
+
+
+def _own_file_name_pos(CS: Any) -> int | None:
+    """Root position of the parsed file's own m_file_name operation (the file prelude stages it, first in the
+    pipeline's `default_processing()`), None when the ChangeSet has none."""
+    pos = getattr(CS, "_own_fnid_pos", -1)
+    if pos != -1:
+        return pos
+    found = None
+    for idx, op in enumerate(getattr(CS, "cs", ()) or ()):
+        target = op[0] if isinstance(op, tuple) and op else None
+        table_id = target if type(target) is int else (target[0][0][0] if isinstance(target, tuple) and target and
+                                                       isinstance(target[0], tuple) and target[0] and
+                                                       isinstance(target[0][0], tuple) else None)
+        if table_id == m_file_name.table_id:
+            found = idx
+            break
+    CS._own_fnid_pos = found
+    return found
+
+
 def get_target_fnid_for_cursor(CS: Any, cursor: Any) -> Any:
     """Resolve the target repository file name ID (fnid) for a referenced cursor."""
     if cursor is None:
@@ -1130,7 +1230,8 @@ def get_target_fnid_for_cursor(CS: Any, cursor: Any) -> Any:
         return 0
     cur_path = getattr(CS, "current_path", "")
     if rel_path == cur_path:
-        return CS.ref(m_file_name.fnid, REF_POS, 0)
+        pos = _own_file_name_pos(CS)
+        return CS.ref(m_file_name.fnid, REF_POS, pos) if pos is not None else 0
 
     if not hasattr(CS, "_target_fnid_cache"):
         CS._target_fnid_cache = {}
@@ -1200,6 +1301,64 @@ def resolve_linkage(node: Any, default_linkage: int = SymbolLinkage.ExternalDef)
     return int(SymbolLinkage.ExternalDef)
 
 
+def _collect_expr_ref(node: Any, token: Any, cursor: Any) -> None:
+    """Queue the reference an identifier token of an expression makes on `node` (`call_exprs`, `member_refs`,
+    `decl_refs`, `macro_refs`, `type_refs`; staged by `_extract_expr_refs()`): a call, a member, a variable /
+    parameter / enumerator / function named without a call, a macro expansion, or a type."""
+    k = getattr(cursor, "kind", None)
+    if k == cc.CursorKind.CALL_EXPR:
+        node.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
+        node.call_exprs[-1].callee_cursor = cursor
+    elif k == cc.CursorKind.MEMBER_REF_EXPR:
+        node.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
+        node.member_refs[-1].member_cursor = cursor
+    elif k == cc.CursorKind.MACRO_INSTANTIATION:
+        if token.spelling_str == getattr(cursor, "spelling", ""):
+            node.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
+    elif k == cc.CursorKind.TYPE_REF:
+        # A type named in an expression: sizeof(struct T), (T *)x, offsetof(struct T, f), (struct T){...}
+        if _type_ref_target(cursor):
+            node.type_refs.append(Ast_TypeRefExpr(token.line, token.spelling_str, cursor=cursor))
+    elif k is not None and k not in _SKIP_REF_KINDS:
+        if getattr(cursor, "_kind_id", None) in _DECLARATOR_KIND_IDS:
+            # A declaration's cursor: the name it introduces (`for (int i = 0; ...)`), or a name libclang could not
+            # resolve inside it (`a[UNDEFINED]`, error recovery): no reference to that declaration (an
+            # unresolved name is `lexical_refs.py`'s)
+            return
+        ref = getattr(cursor, "referenced", None)
+        ref_k = getattr(ref, "kind", None) if ref is not None else None
+        if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
+            node.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
+            node.call_exprs[-1].callee_cursor = cursor
+        elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
+            node.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.decl_refs[-1].decl_cursor = cursor
+        elif ref_k == cc.CursorKind.FIELD_DECL:
+            node.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.member_refs[-1].member_cursor = cursor
+        elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
+            node.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+            node.decl_refs[-1].decl_cursor = cursor
+
+
+def _init_expr_refs(node: Any) -> None:
+    """Give `node` the reference queues `_collect_expr_ref()` fills."""
+    node.call_exprs = []
+    node.member_refs = []
+    node.decl_refs = []
+    node.macro_refs = []
+    node.type_refs = []
+
+
+def _extract_expr_refs(node: Any, CS: Any) -> None:
+    """Stage the references `_collect_expr_ref()` queued on `node`."""
+    for group in (node.call_exprs, node.member_refs, node.decl_refs, node.macro_refs, node.type_refs):
+        for ref in group:
+            with CS(REF_NO_REF):
+                ref.extract(CS)
+
+
 class Ast_Statement(Ast):
     """Base class for C statement AST nodes."""
     type_id: int = ASTT.C_CompoundStmt
@@ -1216,6 +1375,7 @@ class Ast_Statement(Ast):
         self.member_refs: list[Any] = []
         self.decl_refs: list[Any] = []
         self.macro_refs: list[Any] = []
+        self.type_refs: list[Any] = []
         self._compound_kids: list[Any] = []
 
         if cursor is not None:
@@ -1288,32 +1448,7 @@ class Ast_Statement(Ast):
         for zone in reversed(self.zones):
             if not zone.completed and zone.check_exec(token, cursor, AST_KIND.identifier):
                 return
-        k = getattr(cursor, "kind", None)
-        if k == cc.CursorKind.CALL_EXPR:
-            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-            self.call_exprs[-1].callee_cursor = cursor
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-            self.member_refs[-1].member_cursor = cursor
-        elif k == cc.CursorKind.MACRO_INSTANTIATION:
-            if token.spelling_str == getattr(cursor, "spelling", ""):
-                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
-        elif k is not None and k not in _SKIP_REF_KINDS:
-            ref = getattr(cursor, "referenced", None)
-            ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
-                self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-                self.call_exprs[-1].callee_cursor = cursor
-            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
-                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
-            elif ref_k == cc.CursorKind.FIELD_DECL:
-                self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
+        _collect_expr_ref(self, token, cursor)
         self.operands.append(token.spelling_str)
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
@@ -1352,6 +1487,9 @@ class Ast_Statement(Ast):
         for macro_ref in self.macro_refs:
             with CS(REF_NO_REF):
                 macro_ref.extract(CS, create_tag=create_tags)
+        for type_ref in self.type_refs:
+            with CS(REF_NO_REF):
+                type_ref.extract(CS)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
@@ -1835,6 +1973,7 @@ class AST_Array(AST_Expression):
         self.data: list[str] = []
         self.bracket_depth = 1
         self.ast_ref: Any = None
+        _init_expr_refs(self)
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -1856,8 +1995,11 @@ class AST_Array(AST_Expression):
         if ast_kind == AST_KIND.comment:
             return
         self.data.append(token.spelling_str)
+        if ast_kind == AST_KIND.identifier:
+            _collect_expr_ref(self, token, cursor)  # `int a[MAX_FOO]`, `u8 b[sizeof(struct T)]`
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
+        _extract_expr_refs(self, CS)
         dim_expr = "".join(self.data).strip()[:255]
         t_id = int(ASTT.C_vla) if getattr(self, "is_vla", False) else (int(ASTT.C_arrayempty) if not dim_expr else int(ASTT.C_array))
         with CS(REF_POS):
@@ -1907,6 +2049,7 @@ class AST_Initializer(AST_Expression):
         self.member_refs: list[Ast_MemberRefExpr] = []
         self.decl_refs: list[Ast_DeclRefExpr] = []
         self.macro_refs: list[Ast_MacroRefExpr] = []
+        self.type_refs: list[Ast_TypeRefExpr] = []
         self.entries: list[InitializerEntry] = []
         self.cur_entry: InitializerEntry | None = None
         self.entry_state: int = 0
@@ -1946,32 +2089,7 @@ class AST_Initializer(AST_Expression):
         return True
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
-        k = getattr(cursor, "kind", None)
-        if k == cc.CursorKind.CALL_EXPR:
-            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-            self.call_exprs[-1].callee_cursor = cursor
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-            self.member_refs[-1].member_cursor = cursor
-        elif k == cc.CursorKind.MACRO_INSTANTIATION:
-            if token.spelling_str == getattr(cursor, "spelling", ""):
-                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
-        elif k is not None and k not in _SKIP_REF_KINDS:
-            ref = getattr(cursor, "referenced", None)
-            ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
-                self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
-                self.call_exprs[-1].callee_cursor = cursor
-            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
-                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
-            elif ref_k == cc.CursorKind.FIELD_DECL:
-                self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
-                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
-                self.decl_refs[-1].decl_cursor = cursor
+        _collect_expr_ref(self, token, cursor)
         self.data.append(token.spelling_str)
 
     def exec_filter(self, token: Any, cursor: Any, ast_kind: int) -> None:
@@ -2005,6 +2123,8 @@ class AST_Initializer(AST_Expression):
                 if not hasattr(self, "_array_desig_tokens"):
                     self._array_desig_tokens = []
                 self._array_desig_tokens.append(spelling)
+                if ast_kind == AST_KIND.identifier:
+                    _collect_expr_ref(self, token, cursor)  # `[IDX] = val`
                 return
 
             if self.entry_state == 1:
@@ -2070,6 +2190,10 @@ class AST_Initializer(AST_Expression):
                     val_name = str(val_tok.spelling_str)[:255] if val_tok is not None else ""
                     val_ext = entry.value_extent or (val_tok.line if val_tok is not None else entry.member_line)
                     val_node = Ast_DeclRefExpr(val_ext, val_name, cursor=val_cur)
+                    # The value's references are the identifiers' own (`exec_identifier()`, at their positions):
+                    # the value node is structure, not a second reference at the value's first token (`&x`) or
+                    # a DeclRef of a macro (`= MAX_FOO`)
+                    val_node.record_ref = False
                     val_node.extract(CS, create_tag=False)
                     container_items.append((p, int(val_node.type_id), val_node.ast_ref))
                     p += 1
@@ -2124,6 +2248,9 @@ class AST_Initializer(AST_Expression):
                     macro_ref.extract(CS, create_tag=False)
                 except TypeError:
                     macro_ref.extract(CS)
+        for type_ref in self.type_refs:
+            with CS(REF_NO_REF):
+                type_ref.extract(CS)
 
 
 class AST_Enum_Equal(AST_Expression):
@@ -2132,6 +2259,7 @@ class AST_Enum_Equal(AST_Expression):
     def __init__(self, extent: Line, end_mode: int = End_Mode.Extent) -> None:
         super().__init__(extent, end_mode=end_mode)
         self.data: list[str] = []
+        _init_expr_refs(self)
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -2147,8 +2275,11 @@ class AST_Enum_Equal(AST_Expression):
         if ast_kind == AST_KIND.comment:
             return
         self.data.append(token.spelling_str)
+        if ast_kind == AST_KIND.identifier:
+            _collect_expr_ref(self, token, cursor)  # `A = BIT(3)`, `B = A + 1`
 
     def extract(self, CS: Any, create_tag: bool = False) -> None:
+        _extract_expr_refs(self, CS)
         expr_str = " ".join(self.data).lstrip("= ").strip()[:255]
         if expr_str:
             with CS(REF_POS):
@@ -2182,6 +2313,18 @@ class C_Type(Ast):
         self.bitfield_tokens: list[str] = []
         self.bitfield_width: str = ""
         self.syscall_name: str = ""
+        # References of the expression tokens a declaration carries outside its zones (macro expansions, the
+        # arguments of a declaration macro, bitfield widths, attribute arguments; `_collect_expr_ref()`)
+        _init_expr_refs(self)
+        # A declaration spelled through a function-like macro (`DECLARE_BITMAP(map, BITS)`, `BTF_ID(func, f)`):
+        # paren depth of its argument list while inside it (0 outside), see `_lead_macro_arg()`
+        self._lead_macro_pending: bool = False
+        self._lead_macro_depth: int = 0
+        self._lead_macro_name: str = ""
+        self._lead_macro_arg_idx: int = 0
+        self._lead_macro_arg_named: bool = False
+        # Definitions a typedef of a tag body carries, recorded with the typedef's tag (`_queue_typedef_tag_defs()`)
+        self._typedef_tag_defs: list[tuple[Any, str, int, int, int, int]] = []
 
     def _parse_attribute_tokens(self) -> None:
         tokens = getattr(self, "_current_attr_tokens", None)
@@ -2555,6 +2698,19 @@ class C_Type(Ast):
                 self._macro_paren_opened = True
         elif tspelling == ")":
             self.paren_depth = max(0, self.paren_depth - 1)
+        if self._lead_macro_pending:
+            self._lead_macro_pending = False
+            if tspelling == "(":
+                self._lead_macro_depth = self.paren_depth
+                self._lead_macro_arg_idx = 0
+                self._lead_macro_arg_named = False
+                return
+        elif self._lead_macro_depth:
+            if self.paren_depth < self._lead_macro_depth:
+                self._lead_macro_depth = 0
+            elif tspelling == "," and self.paren_depth == self._lead_macro_depth:
+                self._lead_macro_arg_idx += 1
+            return
 
         if self.zones:
             last_z = self.zones[-1]
@@ -2709,6 +2865,8 @@ class C_Type(Ast):
                         self.zones.append(Zone(Zone_Type.Initializer_Expr, (cursor,)))
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
+        if self._lead_macro_depth and not self.zones:
+            return
         if self.zones:
             last_z = self.zones[-1]
             if not last_z.completed and last_z.check_exec(token, cursor, AST_KIND.keyword):
@@ -2728,6 +2886,19 @@ class C_Type(Ast):
                     return
 
         tspelling = token.spelling_str
+        kind_id = getattr(cursor, "_kind_id", None)
+        if kind_id in _DECL_EXPR_REF_KINDS and not (kind_id == 101 and self._declares_here(cursor)):
+            # A macro expansion (`__user`, `__init`, `DECLARE_BITMAP`, an attribute or array-size macro) or an
+            # expression token (`__initcall(fn)`, `typeof(x)`): referenced where it is spelled
+            _collect_expr_ref(self, token, cursor)
+        if self._lead_macro_depth and self._lead_macro_arg(token, cursor, kind_id):
+            return
+        if kind_id == 502 and self._starts_lead_macro(tspelling, cursor):
+            self._lead_macro_pending = True
+            self._lead_macro_name = tspelling
+            if getattr(self, "name", "") == safe_cursor_spelling(self.cursor):
+                self.name = ""  # a name the expansion generates (`__mod_alias385`) is none of the file's tokens
+
         if tspelling in _PARAM_KERNEL_ATTRIBUTES:
             self.in_attribute = True
             self.attribute_paren_depth = 0
@@ -2744,6 +2915,11 @@ class C_Type(Ast):
 
         if tspelling in _KNOWN_MACRO_FUNCS and not getattr(self, "name", ""):
             self.name = tspelling
+        elif (tspelling in _NAMING_KERNEL_MACROS and kind_id == 502 and not self.content.content
+              and not any(seg.content for seg in self.typedata)):
+            # An export / sysfs attribute macro opening the declaration names it, also when its expansion's
+            # cursor preset the name (`EXPORT_SYMBOL(f)`'s `extern typeof(f) f;`, `dev_attr_x`)
+            self.name = tspelling
 
         # Function declaration identifier check
         fn_cur = (
@@ -2751,10 +2927,11 @@ class C_Type(Ast):
             if (self.cursor is not None and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD})
             else cursor
         )
-        if (
-            fn_cur.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
-            and tspelling == safe_cursor_spelling(fn_cur)
-        ):
+        if fn_cur.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD} and (
+            tspelling == safe_cursor_spelling(fn_cur) or _is_renamed_function_name(token, cursor, fn_cur)
+        ) and getattr(self, "name", "") not in _EXPORT_MACROS:
+            # (`EXPORT_SYMBOL(f)` expanding to `extern typeof(f) f;` redeclares `f`: an export, not a prototype)
+            # Also the name of a function an object-like macro renames (`#define vnic_set_nic_cfg fnic_set_nic_cfg`)
             self.name = tspelling
             tt = TypeToken(token, ASTT.C_functionproto)
             tt.is_definition = True
@@ -2762,6 +2939,15 @@ class C_Type(Ast):
             self.content.content[-1].is_definition = fn_cur.is_definition()
             self.swap_out()
             self.has_functionproto = True
+            return
+
+        if kind_id == 502 and not self._macro_names_declarator(token, cursor):
+            # A macro that names no declarator (`} __packed;`, `x __read_mostly`, `MPI_POINTER p`): its
+            # expansion is referenced, it adds no type token and no declarator name; the arguments of a
+            # function-like one (`__releases(rq->lock)`) are referenced like a declaration macro's
+            if self._is_function_like(cursor):
+                self._lead_macro_pending = True
+                self._lead_macro_name = tspelling
             return
 
         if self.content.content:
@@ -2821,6 +3007,8 @@ class C_Type(Ast):
             for zone in reversed(self.zones[:-1]):
                 if not zone.completed and zone.check_exec(token, cursor, AST_KIND.literal):
                     return True
+        if self._lead_macro_depth:
+            return True
         self.content.append(TypeToken(token, ASTT.Undefined))
         return True
 
@@ -2833,6 +3021,8 @@ class C_Type(Ast):
             else:
                 if kind != AST_KIND.comment:
                     self.bitfield_tokens.append(tspelling)
+                    if kind == AST_KIND.identifier:
+                        _collect_expr_ref(self, token, cursor)  # `int x : WIDTH;`
                 return
 
         if tspelling in ("__attribute__", "__attribute", "__declspec"):
@@ -2860,6 +3050,8 @@ class C_Type(Ast):
                 return
             else:
                 self._current_attr_tokens.append(tspelling)
+                if kind == AST_KIND.identifier:
+                    _collect_expr_ref(self, token, cursor)  # `__aligned(SMP_CACHE_BYTES)`
                 return
             return
 
@@ -2874,6 +3066,132 @@ class C_Type(Ast):
                 self.exec_identifier(token, cursor)
             case AST_KIND.literal:
                 self.exec_literal(token, cursor)
+
+    def _starts_lead_macro(self, tspelling: str, cursor: Any) -> bool:
+        """True when the macro instantiation `tspelling` opens a declaration spelled through a function-like macro
+        whose arguments are no declarators: a `_VAR_DECL_MACROS` member (`DECLARE_BITMAP(name, bits)`) or a macro
+        the parser has no rule for (`BTF_ID(func, f)`, `DEFINE_SIMPLE_DEV_PM_OPS(ops, s, r)`), as the first name of a
+        declaration that is no function (the kernel macros with a rule of their own, `SYSCALL_DEFINE<n>`, and
+        function wrappers keep theirs)."""
+        name = getattr(self, "name", "")
+        if (name and name != safe_cursor_spelling(self.cursor)) or self.content.content or any(seg.content for seg in self.typedata):
+            return False  # (a name preset from the declaration's cursor is no token of it)
+        if (tspelling in _KNOWN_MACRO_FUNCS and tspelling not in _VAR_DECL_MACROS) or tspelling.startswith(_SYSCALL_PREFIXES):
+            return False
+        if getattr(self.cursor, "kind", None) in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            return False
+        return self._is_function_like(cursor)
+
+    @staticmethod
+    def _is_function_like(cursor: Any) -> bool:
+        """True when the `MACRO_INSTANTIATION` `cursor` expands a function-like macro."""
+        try:
+            macro = _CLANG_GET_CURSOR_REFERENCED(cursor)
+            return not _CLANG_CURSOR_IS_NULL(macro) and bool(_CLANG_MACRO_IS_FUNCTION_LIKE(macro))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _lead_macro_arg(self, token: Any, cursor: Any, kind_id: Any) -> bool:
+        """Handle an identifier inside the argument list of a declaration macro (`_starts_lead_macro()`): only the
+        name the declaration introduces (its cursor is that declaration) stays a declarator; any other argument
+        (`bits`, `NR_CPUS`, a callback, a type) is referenced and adds nothing to the declaration. True when consumed."""
+        if self.paren_depth < self._lead_macro_depth:
+            self._lead_macro_depth = 0
+            return False
+        if (self._lead_macro_name in _VAR_DECL_MACROS and self._lead_macro_arg_idx == 0
+                and not self._lead_macro_arg_named and self.paren_depth == self._lead_macro_depth):
+            # A kernel declaration macro names its object with its first argument (`DEFINE_RWLOCK(tasklist_lock)`,
+            # whose expansion may give that token an initializer's cursor)
+            self._lead_macro_arg_named = True
+            return False
+        if token.spelling_str == safe_cursor_spelling(cursor) and (
+                kind_id in _DECL_KIND_IDS or (kind_id == 101 and self._declares_here(cursor))):
+            return False
+        if kind_id == 43:  # TYPE_REF: a type argument (`DEFINE_FREE(name, struct T *, ...)`)
+            _collect_expr_ref(self, token, cursor)
+        return True
+
+    def _queue_typedef_tag_defs(self, CS: Any, item: Any, safe_item_name: str, decl_type: int, ast_id_route: Any) -> None:
+        """Queue the definitions a typedef of a tag body carries (`typedef struct s {...} s_t;`, `typedef enum {
+        A, B } e_t;`): the named tag, and every enumerator; they are recorded with the typedef's tag
+        (`_typedef_tag_defs`). An anonymous body defines no tag name."""
+        declared_zone = next((z for z in self.zones if z.zone_type in (Zone_Type.Declared_Args, Zone_Type.Enum_Content)), None)
+        line_s = self.extent.line_pos[0]
+        line_e = declared_zone.extent.line_pos[1] if declared_zone else self.extent.line_pos[1]
+        linkage = resolve_linkage(self)
+        typedef_name = safe_cursor_spelling(self.cursor) if getattr(self.cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL else ""
+        # An anonymous body takes the typedef's name (`typedef enum { ... } e_t;`): no tag of its own
+        if item.code not in _NON_NAME_TOKENS and item.code == safe_item_name and item.code != (typedef_name or self.name):
+            self._typedef_tag_defs.append((CS.ref(m_ast.ast_id, *ast_id_route), safe_item_name, int(decl_type), linkage, line_s, line_e))
+        if decl_type == ASTT.C_enumdecl:
+            enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
+            for ch in getattr(enum_zone, "children", ()):
+                ch_name = getattr(ch, "name", "")
+                ch_ast_ref = getattr(ch, "ast_ref", None)
+                if ch_name and ch_ast_ref is not None:
+                    ch_ext = getattr(ch, "extent", self.extent)
+                    self._typedef_tag_defs.append((ch_ast_ref, str(ch_name)[:255], int(ASTT.C_enumequal), linkage,
+                                                   ch_ext.line_pos[0], ch_ext.line_pos[1]))
+
+    def _declares_here(self, cursor: Any) -> bool:
+        """True when the `DECL_REF_EXPR` `cursor` names a variable / field this declaration introduces (the name
+        argument a declaration macro also passes to its initializer: `DEFINE_MUTEX(m)` is
+        `struct mutex m = __MUTEX_INITIALIZER(m)`)."""
+        try:
+            ref = _CLANG_GET_CURSOR_REFERENCED(cursor)
+            if _CLANG_CURSOR_IS_NULL(ref) or ref._kind_id not in (6, 9):  # FIELD_DECL, VAR_DECL
+                return False
+            line = ref.location.line
+        except Exception:  # noqa: BLE001
+            return False
+        return self.extent.line_pos[0] <= line <= self.extent.line_pos[1]
+
+    def _macro_names_declarator(self, token: Any, cursor: Any) -> bool:
+        """True when the macro instantiation `token` stays a type / declarator token: a kernel macro with a rule
+        (`_KNOWN_MACRO_FUNCS`), a token of a function declaration (function-like wrappers such as `SYSCALL_DEFINE3`),
+        a tag name after `struct` / `union` / `enum`, or the declarator name of `self.cursor` spelled through an
+        object-like macro."""
+        tspelling = token.spelling_str
+        if tspelling in _KNOWN_MACRO_FUNCS or getattr(self, "name", "") in _KNOWN_MACRO_FUNCS:
+            return True
+        if tspelling.startswith(_SYSCALL_PREFIXES) or getattr(self.cursor, "kind", None) in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            return True  # function wrappers (`SYSCALL_DEFINE3(...)`, `BPF_CALL_2(...)`) keep their shape
+        last = self.content.content[-1] if self.content.content else None
+        if last is not None and last.code in ("struct", "union", "enum"):
+            return True
+        return self.cursor is not None and _is_renamed_function_name(token, cursor, self.cursor)
+
+    def _split_root_declarator(self) -> None:
+        """Give the first declarator of a multi-declarator declaration its own segment.
+
+        A specifier that does not close its segment (`unsigned`, `signed`) keeps the first declarator in the root
+        segment (`unsigned a, b;` is `[unsigned a] [b]`), which every later declarator inherits as its type; the
+        root becomes `[unsigned] [a] [b]` so `a` is a declaration of its own and `b` is typed `unsigned`. A lone
+        root name whose cursor declares it (one declaration macro after another without `;`) splits the same way."""
+        data = self.typedata
+        if len(data) < 2:
+            return
+        root = data[0]
+        content = root.content
+        if (not content or root.ref_type != TSRef.No_Ref or content[-1].type != 0 or not content[-1].code
+                or not (content[-1].code[0].isalpha() or content[-1].code[0] == "_")
+                or any(tok.type == 0 for tok in content[:-1])):
+            return
+        if len(content) == 1:
+            # A lone root name is a declarator only when its cursor declares that name (the object of a
+            # declaration macro, `BTF_SET_START(set)`); an unresolved type name (`UNKNOWN_T a, b;`) stays the type
+            cur = getattr(content[0], "cursor", None)
+            if getattr(cur, "_kind_id", None) not in _DECL_KIND_IDS or safe_cursor_spelling(cur) != content[0].code:
+                return
+        if not any(seg.content and seg.content[-1].type == 0 for seg in data[1:]):
+            return
+        head = TypeSegment()
+        head.content = content[:-1]
+        head.cqual = root.cqual
+        head.cqual_content = root.cqual_content
+        name = TypeSegment()
+        name.content = [content[-1]]
+        self.typedata = [head, name, *data[1:]]
 
     def _normalize_syscall_macro(self) -> bool:
         """Rewrite a `SYSCALL_DEFINE<n>` / `COMPAT_SYSCALL_DEFINE<n>` definition into a regular function shape.
@@ -3037,6 +3355,8 @@ class C_Type(Ast):
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         if self.content:
             self.swap_out()
+        # The declaration's own expression references, attributed with the tag it stages (pending refs)
+        _extract_expr_refs(self, CS)
 
         # Trace macro extraction (TRACE_EVENT, DECLARE_EVENT_CLASS, DEFINE_EVENT, etc.)
         if getattr(self, "name", "") in _TRACE_MACROS:
@@ -3544,6 +3864,7 @@ class C_Type(Ast):
         type_constructor = []
         final_types = []
 
+        self._split_root_declarator()
         for typesegment in self.typedata:
             if not root_type:
                 root_type = typesegment
@@ -3565,6 +3886,24 @@ class C_Type(Ast):
             has_pointer = any(
                 token.type == ASTT.C_pointer for ts in final_type for token in ts.content
             )
+            # A tag in a function's return type (`static enum E f(void)`) is a use, never a tag declaration
+            returns_tag = any(token.type == ASTT.C_functionproto for ts in final_type for token in ts.content)
+            # A declaration starting with a macro that expands to nothing or an attribute (`NORET_TYPE void
+            # panic(...)`, `EXPORT_SYMBOL`-style prefixes) carries the macro's cursor: its function name token
+            # carries the declaration's own FUNCTION_DECL cursor
+            if self.cursor is None or getattr(self.cursor, "kind", None) == cc.CursorKind.MACRO_INSTANTIATION:
+                for ts in final_type:
+                    for tok in ts.content:
+                        if tok.type != ASTT.C_functionproto or not tok.code:
+                            continue
+                        tok_cursor = getattr(tok, "cursor", None) or _tu_cursor_at(CS, tok.extent)
+                        if (tok_cursor is not None and getattr(tok_cursor, "kind", None) == cc.CursorKind.FUNCTION_DECL
+                                and safe_cursor_spelling(tok_cursor) == tok.code):
+                            self.cursor = tok_cursor
+                            break
+                    else:
+                        continue
+                    break
             is_func_decl = (
                 self.cursor is not None
                 and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
@@ -3597,14 +3936,14 @@ class C_Type(Ast):
                     if declared_args_link:
                         is_def = True
                         target_link = declared_args_link
-                    elif not has_var and not has_pointer and self.end_mode != End_Mode.Comma:
+                    elif not has_var and not has_pointer and not returns_tag and self.end_mode != End_Mode.Comma:
                         is_def = True
                         target_link = ()
                 elif has_enum:
                     if enum_content_link:
                         is_def = True
                         target_link = enum_content_link
-                    elif not has_var and not has_pointer and self.end_mode != End_Mode.Comma:
+                    elif not has_var and not has_pointer and not returns_tag and self.end_mode != End_Mode.Comma:
                         is_def = True
                         target_link = ()
                 elif has_func:
@@ -3850,12 +4189,18 @@ class C_Type(Ast):
                         has_var = any(
                             token.type == 0 for ts in final_type for token in ts.content
                         )
-                        if safe_item_name and hasattr(CS, "symbol_dict"):
+                        if safe_item_name and hasattr(CS, "symbol_dict") and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL and item.type == ASTT.C_functionproto:
+                            # A function-pointer field (`int (*open)(int);`) is a member name
+                            CS.symbol_dict[(safe_item_name, ASTT.C_MemberRefExpr)] = ast_id_route[1]
+                        elif safe_item_name and hasattr(CS, "symbol_dict"):
                             CS.symbol_dict[(safe_item_name, decl_type)] = ast_id_route[1]
                             CS.symbol_dict[(safe_item_name, item.type)] = ast_id_route[1]
                             if ast_staging_name != safe_item_name:
                                 CS.symbol_dict[(ast_staging_name, ast_staging_type)] = ast_id_route[1]
                                 CS.symbol_dict[(ast_staging_name, decl_type)] = ast_id_route[1]
+
+                        if create_tag and is_typedef_def and decl_type in (ASTT.C_structdecl, ASTT.C_uniondecl, ASTT.C_enumdecl):
+                            self._queue_typedef_tag_defs(CS, item, safe_item_name, decl_type, ast_id_route)
 
                         if create_tag and not is_typedef_def:
                             if has_var and item.type != ASTT.C_functionproto:
@@ -4325,7 +4670,10 @@ class C_Type(Ast):
                 and getattr(self, "name", "") not in _EXPORT_MACROS
             )
 
-            if safe_name and hasattr(CS, "symbol_dict") and not is_demoted_macro:
+            if safe_name and hasattr(CS, "symbol_dict") and not is_demoted_macro and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL:
+                # A field is a member name: it answers member references only (`resolve_cursor_type_ast()`)
+                CS.symbol_dict[(safe_name, ASTT.C_MemberRefExpr)] = ast_id_route[-1]
+            elif safe_name and hasattr(CS, "symbol_dict") and not is_demoted_macro:
                 pos_idx = ast_id_route[-1]
                 CS.symbol_dict[(safe_name, main_t_id)] = pos_idx
                 CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)] = pos_idx
@@ -4355,7 +4703,9 @@ class C_Type(Ast):
                         ast_name=safe_name,
                         ast_type=main_t_id,
                     )
-                if not is_param and safe_name and not is_demoted_macro:
+                # A declarator names an identifier: a literal split off as one (the `128` of
+                # `extern DECLARE_BITMAP(map, 128);`) defines nothing
+                if not is_param and safe_name and not is_demoted_macro and (safe_name[0].isalpha() or safe_name[0] == "_"):
                     with CS(REF_POS):
                         record_symbol_def(
                             CS,
@@ -4367,6 +4717,10 @@ class C_Type(Ast):
                             var_extent.line_pos[0],
                             var_extent.line_pos[1],
                         )
+                for ast_ref, d_name, d_type, d_linkage, d_line_s, d_line_e in self._typedef_tag_defs:
+                    with CS(REF_POS):
+                        record_symbol_def(CS, tag_ref or getattr(self, "tag_ref", 0), ast_ref, d_name, d_type, d_linkage, d_line_s, d_line_e)
+                self._typedef_tag_defs = []
             else:
                 var_extent = self.extent
 
@@ -4389,7 +4743,13 @@ class C_Type(Ast):
                         elif hasattr(CS, "pending_symbol_refs"):
                             CS.pending_symbol_refs.append((sym_ref, int(SymbolRole.TypeUsage), s_line, s_col))
                 elif is_type_def and hasattr(self, "ast_ref"):
-                    if ts.ref_type in (TSRef.Route_Ref, TSRef.AST_Ref) and ts.ref is not None:
+                    # A function-pointer declarator (`int (*cb)(int)`, `typedef void (*fn_t)(void)`)
+                    # owns its function type, and a pointer / qualifier segment (`* const`) names no type: neither
+                    # is a use of a named type
+                    if (ts.ref_type in (TSRef.Route_Ref, TSRef.AST_Ref) and ts.ref is not None
+                            and not any(tok.type == ASTT.C_functionproto for tok in ts.content)
+                            and any(tok.type in _NAMED_TYPE_TOKENS and tok.code not in _NON_NAME_TOKENS and tok.code != "typedef"
+                                    for tok in ts.content)):
                         type_ast_ref = CS.ref(m_ast.ast_id, *ts.ref) if ts.ref_type == TSRef.Route_Ref else ts.ref
                         if create_tag and (tag_ref or getattr(self, "tag_ref", None)):
                             active_tag = tag_ref or getattr(self, "tag_ref", 0)
@@ -4967,6 +5327,32 @@ def _named_node(cls: type) -> Callable[[Line, Any, str], Ast]:
     return make
 
 
+class Ast_CallStmt(Ast_CallExpr):
+    """A call that is a statement of a compound statement (`Zone` child of `CALL_EXPR`): the `C_CallExpr` node and
+    `SymbolRole.Call` reference of `Ast_CallExpr`, plus the references of the argument tokens (`_collect_expr_ref()`)."""
+
+    def __init__(self, extent: Line, callee: str = "", end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode=end_mode, cursor=cursor)
+        self.callee = callee
+        self.call_exprs: list[Any] = []
+        self.member_refs: list[Any] = []
+        self.decl_refs: list[Any] = []
+        self.macro_refs: list[Any] = []
+        self.type_refs: list[Any] = []
+        self._callee_seen = False
+
+    def exec_identifier(self, token: Any, cursor: Any) -> None:
+        if not self._callee_seen and token.spelling_str == self.callee:
+            self._callee_seen = True  # the callee: the call's own reference (Ast_CallExpr.extract), at its token
+            self.ref_extent = token.line  # (`p->ops->open(x)` calls at `open`, not at `p`)
+            return
+        _collect_expr_ref(self, token, cursor)
+
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        super().extract(CS, create_tag=create_tag)
+        _extract_expr_refs(self, CS)
+
+
 def _unary_expr_node(extent: Line, cursor: Any, sp: str) -> Ast:
     """sizeof / alignof (`UNARY_EXPR`): alignof when the spelling or the first token says so."""
     if cursor is not None:
@@ -5003,7 +5389,7 @@ def _child_node_factories() -> dict[Any, Callable[[Line, Any, str], Ast]]:
         "CONTINUE_STMT": plain(Ast_ContinueStmt),
         "GOTO_STMT": plain(Ast_GotoStmt),
         "LABEL_STMT": plain(Ast_LabelStmt),
-        "CALL_EXPR": plain(Ast_CallExpr),
+        "CALL_EXPR": lambda extent, cursor, sp: Ast_CallStmt(extent, sp, end_mode=End_Mode.Extent, cursor=cursor),
         "MEMBER_REF_EXPR": plain(Ast_MemberRefExpr),
         "DECL_REF_EXPR": plain(Ast_DeclRefExpr),
         "MACRO_INSTANTIATION": lambda extent, cursor, sp: Ast_MacroRefExpr(extent, sp, end_mode=End_Mode.Extent, cursor=cursor),

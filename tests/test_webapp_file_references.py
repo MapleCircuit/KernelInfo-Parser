@@ -84,5 +84,50 @@ class TestFileReferences(unittest.TestCase):
             self.call(make_db(), path="../etc/passwd")
 
 
+
+BIND, NLM = "include/linux/lockd/bind.h", "include/linux/lockd/nlm.h"
+
+
+def include_db(target: str, kind: str = "mock"):
+    """bind.h of version 1 with a compiler reference (ref_type 1) to the file named `target`; the checkpoint tree
+    holds bind.h and nlm.h (`linux/lockd/nlm.h` is the written spelling a parse without include directories kept)."""
+    from tests.db_fixtures import make_db
+
+    return make_db(kind, rows={
+        "m_file_name": [{"fnid": 1, "fname": BIND}, {"fnid": 2, "fname": "linux/lockd/nlm.h"}, {"fnid": 3, "fname": NLM}],
+        "m_file_blob": [{"blob_id": 10, "blob_hash": b"\x01" * 20, "ftype": 1},
+                        {"blob_id": 11, "blob_hash": b"\x02" * 20, "ftype": 1}],
+        "m_bridge_checkpoint": [{"commit_id": 1, "fnid": 1, "blob_id": 10}, {"commit_id": 1, "fnid": 3, "blob_id": 11}],
+        "m_file_reference": [{"ref_id": 1, "target_fnid": {"linux/lockd/nlm.h": 2, NLM: 3}[target], "ref_type": 1,
+                              "line_no": 12, "source_blob_id": 10, "source_fnid": 1, "details": ""}],
+    })
+
+
+class TestResolveInclude(unittest.TestCase):
+    """filesystem_service.resolve_include(): a stored reference names its target only when the revision holds it."""
+
+    def resolve(self, db, header: str = "<linux/lockd/nlm.h>") -> dict:
+        fss._INCLUDE_CACHE.clear()
+        self.addCleanup(fss._INCLUDE_CACHE.clear)
+        from webapp.backend.services import arch_layout_service as als, tree_resolver as tr
+        with patch_reader(db), \
+                mock.patch.object(fss, "get_version_info", return_value=(1, "2.3.35pre2")), \
+                mock.patch.object(tr, "definition_arch", return_value=("i386", None, 32)), \
+                mock.patch.object(als.arch_layout_service, "resolve_include", return_value=None), \
+                mock.patch.object(fss.git_tree_resolver, "list_tree", return_value={BIND: "a" * 40, NLM: "b" * 40}):
+            return fss.FilesystemService().resolve_include("2.3.35pre2", header, current_file=BIND)
+
+    def test_reference_to_a_file_of_the_tree(self) -> None:
+        for kind in ("mock", "sqlite"):
+            res = self.resolve(include_db(NLM, kind))
+            self.assertEqual((res["path"], res["method"]), (NLM, "file_reference"), kind)
+
+    def test_unresolved_spelling_does_not_hijack_the_search(self) -> None:
+        for kind in ("mock", "sqlite"):
+            res = self.resolve(include_db("linux/lockd/nlm.h", kind))
+            self.assertEqual(res["path"], NLM, kind)
+            self.assertNotEqual(res["method"], "file_reference", kind)
+
+
 if __name__ == "__main__":
     unittest.main()

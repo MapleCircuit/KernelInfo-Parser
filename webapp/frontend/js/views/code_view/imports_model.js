@@ -4,8 +4,9 @@
  * (webapp/frontend/tests/imports_model.test.mjs).
  *
  * Items come from GET /api/fs/imports/{version}?path=&arch= ({name, kind, type_name, header_path, line, chain,
- * forced, ref_line, ref_lines, ref_count, alternatives}). When `forced` is true, `chain[0]` is the
- * compiler-forced `-include` header; otherwise `chain[0]` is the current file and the last element is `header_path`.
+ * forced, via, context, ref_line, ref_lines, ref_count, alternatives}). When `forced` is true, `chain[0]` is the
+ * compiler-forced `-include` header; for a context import (`via: "context"`) `chain[0]` is the file including the
+ * current one (`context`); otherwise `chain[0]` is the current file. The last element is `header_path`.
  */
 
 /** File extensions (case-sensitive) for which the imports panel is available. */
@@ -26,18 +27,19 @@ export const IMPORT_FILTERS = [
   { id: "type", label: "Types" },
   { id: "macro", label: "Macros" },
   { id: "variable", label: "Variables" },
+  { id: "config", label: "Config" },
 ];
 
 /** Pill id of an item kind ("prototype" folds into "function"; unknown kinds into "variable"). */
 export function filterIdOf(kind) {
   if (kind === "prototype") return "function";
-  if (kind === "function" || kind === "struct" || kind === "type" || kind === "macro") return kind;
+  if (kind === "function" || kind === "struct" || kind === "type" || kind === "macro" || kind === "config") return kind;
   return "variable";
 }
 
 /** Icon glyph per item kind. */
 export const KIND_ICONS = {
-  function: "ƒ", prototype: "ƒ", struct: "{}", type: "T", macro: "#", variable: "x",
+  function: "ƒ", prototype: "ƒ", struct: "{}", type: "T", macro: "#", variable: "x", config: "⚙",
 };
 
 /** Icon glyph for `kind` ("•" when unknown). */
@@ -46,7 +48,7 @@ export function kindIcon(kind) {
 }
 
 const KIND_LABELS = {
-  function: "Function", prototype: "Prototype", struct: "Struct", type: "Type", macro: "Macro", variable: "Variable",
+  function: "Function", prototype: "Prototype", struct: "Struct", type: "Type", macro: "Macro", variable: "Variable", config: "Config",
 };
 
 /** Human label for `kind` (the kind string itself when unknown). */
@@ -128,12 +130,17 @@ export function chainSegments(item) {
   }));
 }
 
-/** Chain as text (basenames, or full paths when `full`); forced includes get an "-include " prefix. */
+/** Chain as text (basenames, or full paths when `full`); forced includes get an "-include " prefix, context
+ * imports (defined by what the including file includes first) a "context " prefix, and Kconfig symbols
+ * a "kconfig " prefix. */
 export function formatChain(item, { arrow = " → ", full = false } = {}) {
   const chain = (item && item.chain) || [];
   if (!chain.length) return "";
   const text = chain.map((p) => (full ? p : basename(p))).join(arrow);
-  return item.forced ? `-include ${text}` : text;
+  const forced = item.forced ? `-include ${text}` : text;
+  if (item.via === "context") return `context ${forced}`;
+  if (item.via === "kconfig") return `kconfig ${forced}`;
+  return forced;
 }
 
 /** Message shown instead of the list, or null when the list should render (or is still loading). */
@@ -141,7 +148,9 @@ export function emptyStateMessage(payload, { path } = {}) {
   if (!isImportsPath(path)) return "Imports are available for C, header and assembly files.";
   if (!payload) return null;
   if (payload.indexed === false) return "This revision's file is not indexed; imported symbols are unavailable.";
-  if (payload.layout === false) return `No build layout for ARCH=${payload.arch} at this revision.`;
+  if (payload.layout === false && (!payload.items || !payload.items.length)) {
+    return `No build layout for ARCH=${payload.arch} at this revision.`;
+  }
   if (!payload.items || !payload.items.length) return "No imported symbols referenced in this file.";
   return null;
 }

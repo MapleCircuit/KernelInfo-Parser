@@ -159,6 +159,10 @@ _CLANG_CURSOR_IS_NULL = cc.conf.lib.clang_Cursor_isNull
 _CLANG_CURSOR_IS_NULL.argtypes = [cc.Cursor]
 _CLANG_CURSOR_IS_NULL.restype = ctypes.c_int
 
+_CLANG_MACRO_IS_FUNCTION_LIKE = cc.conf.lib.clang_Cursor_isMacroFunctionLike
+_CLANG_MACRO_IS_FUNCTION_LIKE.argtypes = [cc.Cursor]
+_CLANG_MACRO_IS_FUNCTION_LIKE.restype = ctypes.c_uint
+
 _CLANG_GET_CURSOR_REFERENCED = cc.conf.lib.clang_getCursorReferenced
 _CLANG_GET_CURSOR_REFERENCED.argtypes = [cc.Cursor]
 _CLANG_GET_CURSOR_REFERENCED.restype = cc.Cursor

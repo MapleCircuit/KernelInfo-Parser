@@ -860,9 +860,11 @@ class ApiClient {
     if (options.filePath) params.append("file_path", options.filePath);
     if (options.line) params.append("line", options.line);
     if (options.header) params.append("header", options.header);
+    const arch = options.arch || state.definitionContext().arch || "x86_64";
+    params.append("arch", arch);
 
-    const queryStr = params.toString() ? `?${params.toString()}` : "";
-    const cacheKey = `inc_syms_${this._vk(ver)}_${targetId}_${options.filePath || ""}_${options.line || ""}_${options.header || ""}`;
+    const queryStr = `?${params.toString()}`;
+    const cacheKey = `inc_syms2_${this._vk(ver)}_${arch}_${targetId}_${options.tagId || ""}_${options.filePath || ""}_${options.line || ""}_${options.header || ""}`;
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/include/${targetId}${queryStr}`, {}, "symbols", cacheKey);
   }
 

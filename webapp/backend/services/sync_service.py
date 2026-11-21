@@ -272,10 +272,12 @@ def clear_parse_dependent_caches() -> None:
     from webapp.backend.services import (
         filesystem_service,
         history_service,
+        kconfig_facts,
         maintainer_service,
         kconfig_service,
     )
     from webapp.backend.services.arch_layout_service import arch_layout_service
+    from webapp.backend.services.imports_service import imports_service
     from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 
     for cache in (
@@ -289,11 +291,17 @@ def clear_parse_dependent_caches() -> None:
         kconfig_service._MODELS, kconfig_service._BUILD_RESOLVERS,
         kconfig_service._LISTING_CACHE, kconfig_service._PATHS_CACHE, kconfig_service._USAGE_CACHE,
         kconfig_service._ARCH_INFO_CACHE, kconfig_service._KBUILD_COVERAGE,
+        imports_service._cache,
     ):
         try:
             cache.clear()
         except Exception:
             pass
+
+    try:
+        kconfig_facts.clear()
+    except Exception:
+        pass
 
     try:
         arch_layout_service.clear_cache()

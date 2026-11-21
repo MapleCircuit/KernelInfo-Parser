@@ -178,6 +178,7 @@ def get_include_symbols(
     file_path: str | None = Query(None),
     line: int | None = Query(None),
     header: str | None = Query(None),
+    arch: str | None = Query(None, description="ARCH whose #include closure locates the definitions (default x86_64)"),
 ) -> dict[str, Any]:
     """Imported symbols and target header file path of a CPPro_include AST node."""
     return symbol_service.get_include_symbols(
@@ -187,4 +188,5 @@ def get_include_symbols(
         file_path=file_path,
         line=line,
         header=header,
+        arch=arch,
     )

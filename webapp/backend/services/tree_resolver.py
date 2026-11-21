@@ -525,10 +525,14 @@ def definition_rank(path: str | None, linkage: Any, line_s: int | None, srcarch:
 
 
 DEFAULT_DEFINITION_ARCH = "x86_64"
+# ARCH of revisions without x86_64 (before 2.6.0: arch/i386/ only; before 1.1: no arch/)
+FALLBACK_DEFINITION_ARCH = "i386"
 
 
 def definition_arch(version_name: str, arch: str | None) -> tuple[str, ArchScope, int | None]:
-    """(ARCH, ArchScope, word size) used to rank definitions; unknown ARCH values fall back to x86_64.
+    """(ARCH, ArchScope, word size) used to rank definitions; an ARCH value the revision does not build falls
+    back to x86_64, else i386 (the only ARCH of 1.x-2.4 trees that 2.0-2.6.23 x86 code builds as, and of the
+    trees before arch/), else x86_64 with the x86 scope.
 
     The scope comes from the ARCH's build layout at the revision (webapp/backend/services/
     arch_layout_service.py); without one, the SRCARCH's own_arch_dirs are assumed.
@@ -536,7 +540,7 @@ def definition_arch(version_name: str, arch: str | None) -> tuple[str, ArchScope
     from webapp.backend.services.arch_layout_service import arch_layout_service
     from webapp.backend.services.kconfig_service import KconfigService
 
-    for candidate in (arch or DEFAULT_DEFINITION_ARCH, DEFAULT_DEFINITION_ARCH):
+    for candidate in dict.fromkeys((arch or DEFAULT_DEFINITION_ARCH, DEFAULT_DEFINITION_ARCH, FALLBACK_DEFINITION_ARCH)):
         try:
             info = KconfigService().resolve_arch(version_name, candidate)
         except Exception as exc:

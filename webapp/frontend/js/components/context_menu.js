@@ -393,7 +393,8 @@ class ContextMenu {
               filePath: tokenData.filePath,
               line: tokenData.line,
               header: tokenData.header || tokenName,
-              tagId: tokenData.tag_id
+              tagId: tokenData.tag_id,
+              arch: state.definitionContext().arch
             });
             includeSymbolsPopover.show(x, y, tokenData, incData);
           } catch (err) {
@@ -603,7 +604,8 @@ class ContextMenu {
                 filePath: token.filePath,
                 line: token.line,
                 header: token.header || token.name,
-                tagId: token.tag_id
+                tagId: token.tag_id,
+                arch: state.definitionContext().arch
               });
               includeSymbolsPopover.show(x, y, token, incData);
             } catch (err) {

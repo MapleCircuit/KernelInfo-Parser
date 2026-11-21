@@ -142,6 +142,17 @@ _REF_BYPASS_LINKS = frozenset({REF_POS, REF_MULTI})
 _REF_RESET_LINKS = frozenset({REF_ROOT, REF_C_AST, REF_NO_REF})
 
 
+def _family_get(source: Any, sym_name: Any, family: tuple[int, ...]) -> Any:
+    """First hit of `(sym_name, type)` over the name-space `family` (`ref_target_family()`) in `source` (a
+    `(name, type)`-keyed mapping, or a `lookup(name, type)` callable), else None."""
+    lookup = source if callable(source) else (lambda n, t: source.get((n, t)))
+    for t in family:
+        hit = lookup(sym_name, t)
+        if hit is not None:
+            return hit
+    return None
+
+
 def is_data_unsafe(data: tuple) -> bool:
     """Check if a data tuple contains any unresolved references (RefType).
 
@@ -390,6 +401,11 @@ class ChangeSet:
                 sym_key = (sym_name, sym_type)
                 rel_file = parsed_route[1]
                 gp = self.gp
+                # A miss of the exact (name, type) falls back to the requested C name space only (macro, tag,
+                # typedef, member, ordinary identifier): a statement / expression / other-namespace node of the
+                # same name never answers it. Non-C types (family None) keep a name-only fallback.
+                from parser.c_ast.ast_nodes import ref_target_family
+                family = ref_target_family(sym_type) if isinstance(sym_type, int) else None
                 # GreatProcessor state (stand-ins may carry only part of it)
                 file_symbols = getattr(gp, "file_symbols", None)
                 file_names = getattr(gp, "file_names", None)
@@ -399,12 +415,16 @@ class ChangeSet:
                 if f_syms:
                     if sym_key in f_syms:
                         return to_safe_data(f_syms[sym_key])
-                    f_names = file_names.get(rel_file) if file_names is not None else None
-                    if f_names is None:
+                    if family is not None:
+                        hit = _family_get(f_syms, sym_name, family)
+                        if hit is not None:
+                            return to_safe_data(hit)
+                    f_names = None if family is not None else (file_names.get(rel_file) if file_names is not None else None)
+                    if f_names is None and family is None:
                         f_names = {s_name: a_id for (s_name, _), a_id in f_syms.items()}
                         if file_names is not None:
                             file_names[rel_file] = f_names
-                    if sym_name in f_names:
+                    if f_names is not None and sym_name in f_names:
                         return to_safe_data(f_names[sym_name])
 
                 # 0b. Fast check: file-scoped shared memory table (worker pre-resolution snapshot, else the
@@ -418,15 +438,22 @@ class ChangeSet:
                 if scoped_syms is not None:
                     scoped_id = scoped_syms.get_file_symbol(rel_file, sym_name, sym_type)
                     if scoped_id is None:
-                        scoped_id = scoped_syms.get_file_name(rel_file, sym_name)
+                        if family is not None:
+                            scoped_id = _family_get(lambda n, t: scoped_syms.get_file_symbol(rel_file, n, t), sym_name, family)
+                        else:
+                            scoped_id = scoped_syms.get_file_name(rel_file, sym_name)
                     if scoped_id is not None:
                         return to_safe_data(scoped_id)
                 elif phase2_syms:
                     # Plain (name, type) snapshot maps: not file-scoped, kept for direct callers
                     if sym_key in phase2_syms:
                         return to_safe_data(phase2_syms[sym_key])
-                    phase2_names = getattr(self, "_phase2_names", None)
-                    if phase2_names is None:
+                    if family is not None:
+                        hit = _family_get(lambda n, t: phase2_syms[(n, t)] if (n, t) in phase2_syms else None, sym_name, family)
+                        if hit is not None:
+                            return to_safe_data(hit)
+                    phase2_names = None if family is not None else getattr(self, "_phase2_names", None)
+                    if phase2_names is None and family is None:
                         if hasattr(phase2_syms, "get_name"):
                             phase2_names = phase2_syms
                         elif hasattr(phase2_syms, "items"):
@@ -453,11 +480,16 @@ class ChangeSet:
                     if resolved_symbols:
                         if sym_key in resolved_symbols:
                             return to_safe_data(resolved_symbols[sym_key])
-                        res_names = getattr(foreign_cs, "resolved_names", None)
-                        if res_names is None:
-                            res_names = foreign_cs.resolved_names = {s_name: a_id for (s_name, _), a_id in resolved_symbols.items()}
-                        if sym_name in res_names:
-                            return to_safe_data(res_names[sym_name])
+                        if family is not None:
+                            hit = _family_get(resolved_symbols, sym_name, family)
+                            if hit is not None:
+                                return to_safe_data(hit)
+                        else:
+                            res_names = getattr(foreign_cs, "resolved_names", None)
+                            if res_names is None:
+                                res_names = foreign_cs.resolved_names = {s_name: a_id for (s_name, _), a_id in resolved_symbols.items()}
+                            if sym_name in res_names:
+                                return to_safe_data(res_names[sym_name])
 
                     # 1b. Check active un-evacuated symbol_dict
                     if foreign_cs.symbol_dict and foreign_cs.cs:
@@ -466,13 +498,20 @@ class ChangeSet:
                             val = foreign_cs._get_value_at(query, op_pos)
                             if val is not None:
                                 return to_safe_data(val)
-                        sym_names = getattr(foreign_cs, "symbol_name_dict", None)
-                        if sym_names is None:
-                            sym_names = foreign_cs.symbol_name_dict = {s_name: pos for (s_name, _), pos in foreign_cs.symbol_dict.items()}
-                        if sym_name in sym_names:
-                            val = foreign_cs._get_value_at(query, sym_names[sym_name])
-                            if val is not None:
-                                return to_safe_data(val)
+                        if family is not None:
+                            f_pos = _family_get(foreign_cs.symbol_dict, sym_name, family)
+                            if f_pos is not None:
+                                val = foreign_cs._get_value_at(query, f_pos)
+                                if val is not None:
+                                    return to_safe_data(val)
+                        else:
+                            sym_names = getattr(foreign_cs, "symbol_name_dict", None)
+                            if sym_names is None:
+                                sym_names = foreign_cs.symbol_name_dict = {s_name: pos for (s_name, _), pos in foreign_cs.symbol_dict.items()}
+                            if sym_name in sym_names:
+                                val = foreign_cs._get_value_at(query, sym_names[sym_name])
+                                if val is not None:
+                                    return to_safe_data(val)
 
                 # In-flight check (Rule 24): a changed file that has not executed yet has published no
                 # symbols, and the DB still describes its previous version, so neither may answer for it.
@@ -493,8 +532,9 @@ class ChangeSet:
                             file_names[rel_file] = f_names
                         if sym_key in db_syms:
                             return to_safe_data(db_syms[sym_key])
-                        if sym_name in f_names:
-                            return to_safe_data(f_names[sym_name])
+                        hit = _family_get(db_syms, sym_name, family) if family is not None else f_names.get(sym_name)
+                        if hit is not None:
+                            return to_safe_data(hit)
 
                 # 2. TableHandling Fast-Path for AST nodes (query[0] == m_ast.table_id)
                 from core.DBLayout import m_ast
@@ -519,17 +559,20 @@ class ChangeSet:
                             staged_id = gp_staged_syms.get(staged_key)
                             if staged_id is not None:
                                 return to_safe_data(staged_id)
-                        if gp_staged_names is not None:
-                            name_id = gp_staged_names.get(safe_sym_name)
-                            if name_id is not None:
-                                return to_safe_data(name_id)
+                        if family is not None:
+                            name_id = _family_get(lambda n, t: gp_staged_syms.get((n, t)), safe_sym_name, family)
+                        else:
+                            name_id = gp_staged_names.get(safe_sym_name) if gp_staged_names is not None else None
+                        if name_id is not None:
+                            return to_safe_data(name_id)
 
                     # Fast-path check via shared memory symbol buffer
                     if scoped_syms is not None and hasattr(scoped_syms, "get_symbol"):
                         for found in (
                             scoped_syms.get_symbol(safe_sym_name, safe_sym_type),
                             scoped_syms.get_symbol(safe_sym_name, safe_notbind_type),
-                            scoped_syms.get_name(safe_sym_name) if hasattr(scoped_syms, "get_name") else None,
+                            (_family_get(scoped_syms.get_symbol, safe_sym_name, family) if family is not None
+                             else (scoped_syms.get_name(safe_sym_name) if hasattr(scoped_syms, "get_name") else None)),
                         ):
                             if found is not None:
                                 return to_safe_data(found)
@@ -570,41 +613,55 @@ class ChangeSet:
 
                     vid_key = getattr(self, "current_vid", 0) if use_vid_key else 0
                     if not (is_neg_cached or is_worker):
-                        # Exact (name, type), then its notbind variant, then any type of that name
-                        for lookup_type, cache_type in (
-                            (safe_sym_type, safe_sym_type),
-                            (safe_notbind_type, safe_notbind_type),
-                            (None, safe_sym_type),
-                        ):
-                            memo_key = (
-                                (vid_key, safe_sym_name, lookup_type)
-                                if use_vid_key
-                                else (safe_sym_name, lookup_type)
-                            )
+                        # Exact (name, type), then its notbind variant, then any type of that name - for a C name
+                        # space, one name-only probe: no row of the name ends the search, a row of the name space
+                        # answers, and only a row of another kind (a statement, a member, ...) probes the name
+                        # space type by type
+                        def te_find(lookup_type: Any) -> tuple[Any, Any]:
+                            memo_key = (vid_key, safe_sym_name, lookup_type) if use_vid_key else (safe_sym_name, lookup_type)
+                            type_key = memo_key + ("type",)
                             if ref_memo is not None and memo_key in ref_memo:
-                                found_id = ref_memo[memo_key]
-                                if found_id is None:
-                                    continue
-                            else:
-                                res = G.TE.get(m_ast.table_id, (None, safe_sym_name, lookup_type))
-                                if res is not None and len(res) > query[1] and res[query[1]] is not None:
-                                    found_id = res[query[1]]
-                                    if ref_memo is not None and safe_sym_name is not None:
-                                        ref_memo[memo_key] = found_id
-                                else:
-                                    if ref_memo is not None and safe_sym_name is not None:
-                                        ref_memo[memo_key] = None
-                                    continue
+                                return ref_memo[memo_key], ref_memo.get(type_key, lookup_type)
+                            res = G.TE.get(m_ast.table_id, (None, safe_sym_name, lookup_type))
+                            found = res[query[1]] if res is not None and len(res) > query[1] else None
+                            row_type = res[m_ast.type_id[1]] if found is not None and len(res) > m_ast.type_id[1] else lookup_type
+                            if ref_memo is not None and safe_sym_name is not None:
+                                ref_memo[memo_key] = found
+                                if lookup_type is None:
+                                    ref_memo[type_key] = row_type
+                            return found, row_type
+
+                        hit: tuple[Any, ...] | None = None
+                        for lookup_type in (safe_sym_type, safe_notbind_type):
+                            found_id, _t = te_find(lookup_type)
+                            if found_id is not None:
+                                hit = (found_id, lookup_type)
+                                break
+                        if hit is None:
+                            any_id, any_type = te_find(None)
+                            if any_id is not None and (family is None or any_type in family):
+                                hit = (any_id, safe_sym_type if family is None else any_type, True)
+                            elif any_id is not None:
+                                for lookup_type in family:
+                                    if lookup_type in (safe_sym_type, safe_notbind_type):
+                                        continue
+                                    found_id, _t = te_find(lookup_type)
+                                    if found_id is not None:
+                                        hit = (found_id, lookup_type)
+                                        break
+                        if hit is not None:
+                            found_id, cache_type, by_name = hit if len(hit) == 3 else (*hit, False)
                             if gp_staged_syms is not None and cache_type is not None:
                                 gp_staged_syms[(safe_sym_name, cache_type)] = found_id
-                            if gp_staged_names is not None and (lookup_type is None or safe_sym_name not in gp_staged_names):
+                            if gp_staged_names is not None and (by_name or safe_sym_name not in gp_staged_names):
                                 gp_staged_names[safe_sym_name] = found_id
                             return to_safe_data(found_id)
 
-                        # Record miss in negative cache
+                        # Record miss in negative cache (a name-space miss says nothing of the name's other types)
                         if gp_neg_cache is not None and neg_key is not None:
                             gp_neg_cache.add(neg_key)
-                            gp_neg_cache.add((safe_sym_name, None))
+                            if family is None:
+                                gp_neg_cache.add((safe_sym_name, None))
 
                     if (force_stubs or not is_active_foreign) and not is_worker:
                         set_res = G.TE.set(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
@@ -1489,7 +1546,7 @@ class ChangeSet:
         return result
 
 
-# Previous-version tag data only parsing reads: never pickled to the parent
+# Previous-version tag data and compilation environment attributes only parsing reads: never pickled to the parent
 _PARSE_ONLY_PRIOR_ATTRS = (
     "prior_tags_by_name",
     "prior_tags_by_pos",
@@ -1498,6 +1555,10 @@ _PARSE_ONLY_PRIOR_ATTRS = (
     "_prior_tags_by_pos_sorted",
     "_batch_prior_tags",
     "_batch_prior_items",
+    "prior_include_fnids",
+    "compile_env",
+    "compile_arch",
+    "parse_diagnostics",
 )
 
 

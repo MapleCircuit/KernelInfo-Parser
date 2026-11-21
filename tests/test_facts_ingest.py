@@ -123,7 +123,7 @@ class TestNewFamilies(unittest.TestCase):
         from parser import include_facts as inc
         from parser.kconfig_ast import kconfig_definitions as kd
         rec = inc.extract('#include <linux/a.h>\n# include "b.c"\n#include_next <c.h>\n')
-        self.assertEqual(inc.decode(inc.encode(rec)), [("linux/a.h", False), ("b.c", True), ("c.h", False)])
+        self.assertEqual(inc.decode(inc.encode(rec)), [("linux/a.h", False, []), ("b.c", True, []), ("c.h", False, [])])
         self.assertEqual(inc.included_sources(inc.decode(inc.encode(rec))), {"b.c"})
         self.assertEqual(inc.encode(inc.extract("int x;\n")), b"")
         defs = kd.extract(self.KCONFIG)
@@ -174,15 +174,15 @@ class TestNewFamilies(unittest.TestCase):
         self.assertIn("rust_init", symbols)
         from parser import include_facts as inc
         rust_f3 = inc.decode(rust_data[INC])
-        self.assertIn(("helper", False), rust_f3)
-        self.assertIn(("alloc", False), rust_f3)
+        self.assertIn(("helper", False, []), rust_f3)
+        self.assertIn(("alloc", False, []), rust_f3)
 
         asm_data = res[1][1]
         asm_f1 = sf.decode(asm_data[CALLS])
         self.assertEqual(asm_f1["d"][0], ["my_entry", 2, 4, 0, ""], "format 2 rows: no return type for assembly")
         self.assertEqual(asm_f1["c"][0][1], "my_helper")
         asm_f3 = inc.decode(asm_data[INC])
-        self.assertIn(("arch_def.h", True), asm_f3)
+        self.assertIn("arch_def.h", [d[0] for d in asm_f3 if d[1]])
 
     def test_backfill_doc_references_and_cve_files(self) -> None:
         import json

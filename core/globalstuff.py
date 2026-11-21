@@ -746,6 +746,8 @@ class SymbolRole(IntEnum):
     MemberRef = 4
     DeclRef = 5
     MacroExpansion = 6
+    MacroBodyRef = 7      # A name in a #define replacement list (resolved where the macro expands)
+    CondRef = 8           # A macro tested by #if / #ifdef / #ifndef / #elif (defined(X), CONFIG_X)
 
 
 class FileRefType(IntEnum):

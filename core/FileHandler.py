@@ -61,24 +61,18 @@ def owner_alive(path: str | Path) -> bool:
     return True
 
 
-def _ensure_asm_symlinks(base_dir: str | Path) -> None:
-    """Ensure include/asm and include/uapi/asm symlinks point to asm-generic."""
+def _remove_stale_asm_links(base_dir: str | Path) -> None:
+    """Remove the `include/asm` / `include/uapi/asm` -> `asm-generic` symlinks earlier parser versions created in a
+    workspace: build-time links live in the build directory of each ARCH (parser/compile_env.py), and one in the
+    tree would be searched before it."""
     base = Path(base_dir)
-    asm_path = base / "include" / "asm"
-    if not asm_path.exists() and not asm_path.is_symlink():
+    for rel in ("include/asm", "include/uapi/asm"):
+        link = base / rel
         try:
-            os.symlink("asm-generic", asm_path)
+            if link.is_symlink() and os.readlink(link) == "asm-generic":
+                link.unlink()
         except OSError:
-            sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
-
-    uapi_asm_parent = base / "include" / "uapi"
-    if uapi_asm_parent.exists():
-        uapi_asm_path = uapi_asm_parent / "asm"
-        if not uapi_asm_path.exists() and not uapi_asm_path.is_symlink():
-            try:
-                os.symlink("asm-generic", uapi_asm_path)
-            except OSError:
-                sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
+            pass
 
 
 class MasterFile:
@@ -282,7 +276,7 @@ class MasterFile:
                 f.write(data)
             if new_mode == "100755":
                 os.chmod(target, 0o755)
-        _ensure_asm_symlinks(ws)
+        _remove_stale_asm_links(ws)
 
     @staticmethod
     def _prune_empty_dirs(root: str, directory: str) -> None:
@@ -360,7 +354,7 @@ class MasterFile:
                 p_arch.stdout.close()
         p_arch.wait()
 
-        _ensure_asm_symlinks(temp_path)
+        _remove_stale_asm_links(temp_path)
         return temp_path
 
     def get_file(self, file_path: str, version: str) -> str:

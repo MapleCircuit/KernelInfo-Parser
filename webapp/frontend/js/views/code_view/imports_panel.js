@@ -232,7 +232,11 @@ export class ImportsPanel {
       if (seg.path === current) return `<span class="${cls} current" title="${escapeHtml(seg.path)} (this file)">${escapeHtml(seg.label)}</span>`;
       return `<a href="#" class="${cls}" data-open="${escapeHtml(seg.path)}" title="Open ${escapeHtml(seg.path)}">${escapeHtml(seg.label)}</a>`;
     }).join('<span class="code-imports-arrow">→</span>');
-    const badge = item.forced ? '<span class="code-imports-forced" title="Reached through a compiler-forced -include header">-include</span>' : "";
+    const context = item.via === "context"
+      ? `<span class="code-imports-context" title="${escapeHtml(`Defined by what ${item.context || "an including file"} includes before this file (this file relies on its includer)`)}">context</span>` : "";
+    const kconfig = item.via === "kconfig" || item.kind === "config"
+      ? '<span class="code-imports-kconfig" title="Defined in Kconfig">kconfig</span>' : "";
+    const badge = context + kconfig + (item.forced ? '<span class="code-imports-forced" title="Reached through a compiler-forced -include header">-include</span>' : "");
     return `<div class="code-imports-chain" title="${escapeHtml(formatChain(item, { full: true }))}">${badge}${links}</div>`;
   }
 

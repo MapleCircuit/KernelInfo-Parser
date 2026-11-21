@@ -477,11 +477,11 @@ class TestStageCounts(unittest.TestCase):
     def test_profiles_without_parsing_are_not_counted(self) -> None:
         prof = G.STAGE_PROFILER
         prof.record_worker_profiler(PipelineProfiler(file_path="drivers/"))
-        prof.record_worker_profiler(PipelineProfiler(file_path="a.c", clang_parse_tu_s=0.2, include_symbols_s=0.1))
+        prof.record_worker_profiler(PipelineProfiler(file_path="a.c", clang_parse_tu_s=0.2, include_map_s=0.1))
         self.assertEqual(prof.worker_count, 1)
-        self.assertAlmostEqual(prof.worker_aggregate.include_symbols_s, 0.1)
+        self.assertAlmostEqual(prof.worker_aggregate.include_map_s, 0.1)
         report = prof.format_stage_report()
-        self.assertIn("Include Symbols", report)
+        self.assertIn("Include Map", report)
         self.assertNotIn("CS Execution", report)
 
     def test_percent_cells_have_the_same_visible_width(self) -> None:
