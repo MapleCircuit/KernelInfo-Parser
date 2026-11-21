@@ -6,7 +6,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as M from "../js/views/nodemap/canvas_model.js";
 import { anchorPoint, arrowHeads, autoSides, computeEdgeGeometry, dashArray, edgePath, resolveEnds } from "../js/views/nodemap/edge_router.js";
-import { countDirectives, findItem, renderStructBody } from "../js/views/nodemap/struct_view.js";
+import { branchTruths, countDirectives, findItem, guardAutoCollapsed, guardTree, renderStructBody, structRows } from "../js/views/nodemap/struct_view.js";
+import { DirectiveEvaluator } from "../js/views/kconfig/directive_evaluator.js";
 import { renderNoteMarkdown, renderSourceRows } from "../js/views/nodemap/node_content.js";
 import { canvasToSvg } from "../js/views/nodemap/nodemap_export.js";
 import { contentKey } from "../js/views/nodemap/node_renderer.js";
@@ -49,7 +50,7 @@ test("canvas JSON round-trips; invalid payloads reset and dangling references ar
   const a = M.createNode("struct", { id: "a", x: 40, y: 60, groupId: "g1", data: { name: "x", typeOverrides: { "3:f": true }, collapsed: { "5:u": true } } });
   const b = M.createNode("note", { id: "b", x: 800, y: 60, data: { text: "hi" } });
   const e = M.createEdge({ id: "e1", from: "a", to: "b", fromField: "3:f", fromSide: "right", label: "uses", arrow: "both", style: "dashed", curve: "orthogonal", color: "red" });
-  const canvas = { ...M.emptyCanvas(), nodes: [g, a, b], edges: [e], viewport: { x: 10, y: -20, zoom: 1.5 }, settings: { snap: true, grid: 16 } };
+  const canvas = { ...M.emptyCanvas(), nodes: [g, a, b], edges: [e], viewport: { x: 10, y: -20, zoom: 1.5 }, settings: M.normalizeSettings({ snap: true, grid: 16 }) };
   const json = JSON.parse(JSON.stringify(M.serializeCanvas(canvas)));
   const back = M.normalizeCanvas(json);
   assert.deepEqual(back, M.serializeCanvas(canvas));
@@ -303,4 +304,323 @@ test("SVG export draws groups, nodes, styled edges and labels with resolved colo
   assert.match(svg, /hello &lt;b&gt;/);
   assert.doesNotMatch(svg, /var\(--/);
   assert.ok(svg.indexOf(">Core<") < svg.indexOf(">struct a<"), "groups paint below nodes");
+});
+
+// ------------------------------------------------------------------ NodeMap upgrade: schema, struct rows, export, clipboard
+
+test("settings: Edit Mode off, Kconfig folding on, auto engine by default", () => {
+  assert.deepEqual(M.emptyCanvas().settings, { snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "" });
+  const st = M.normalizeSettings({ editMode: true, kconfigCollapse: false, kconfigEngine: "tab-7", grid: 2 });
+  assert.equal(st.editMode, true);
+  assert.equal(st.kconfigCollapse, false);
+  assert.equal(st.kconfigEngine, "tab-7");
+  assert.equal(st.grid, 4);
+  assert.equal(M.normalizeSettings({ editMode: "yes" }).editMode, false, "only a real boolean turns it on");
+});
+
+test("custom #rrggbb colors normalize, persist and resolve; presets keep their tokens", () => {
+  const n = M.createNode("note", { color: "#A1B2C3" });
+  assert.equal(n.color, "#a1b2c3");
+  assert.equal(M.createNode("note", { color: "#abc" }).color, "", "short hex is not a stored color");
+  assert.equal(M.createNode("note", { color: "url(x)" }).color, "");
+  assert.equal(M.createNode("note", { color: "green" }).color, "green");
+  const e = M.createEdge({ from: "a", to: "b", color: "#00ff7F" });
+  assert.equal(e.color, "#00ff7f");
+  assert.equal(M.accentVar("#a1b2c3"), "#a1b2c3");
+  assert.equal(M.accentVar("cyan"), "var(--accent-cyan)");
+  assert.equal(M.accentVar("", "var(--x)"), "var(--x)");
+  const canvas = { ...M.emptyCanvas(), nodes: [n, M.createNode("note", { id: "b" })], edges: [] };
+  assert.equal(M.normalizeCanvas(M.serializeCanvas(canvas)).nodes[0].color, "#a1b2c3", "custom colors are part of the canvas JSON");
+  assert.equal(M.colorToHex("#abc"), "#aabbcc");
+  assert.equal(M.colorToHex("rgb(255, 0, 16)"), "#ff0010");
+  assert.equal(M.colorToHex("rgba(1,2,3,0.5)"), "#010203");
+  assert.equal(M.colorToHex("#11223344"), "#112233");
+  assert.equal(M.colorToHex("tomato"), null);
+});
+
+test("auto-fit: natural size, aspect-locked scaling, inspector sizes, off again", () => {
+  const n = M.createNode("struct", { data: { name: "s" }, w: 300, h: 200 });
+  assert.deepEqual([n.autoFit, n.scale, n.baseW, n.baseH], [false, 1, 300, 200]);
+  assert.equal(M.createNode("tab", { autoFit: true }).autoFit, false, "live tab iframes cannot be fitted");
+  assert.equal(M.createNode("group", { autoFit: true }).autoFit, false);
+  M.setAutoFit(n, true);
+  assert.equal(M.applyNaturalSize(n, 420, 900), true);
+  assert.deepEqual([n.baseW, n.baseH, n.w, n.h], [420, 900, 420, 900], "the whole content fits, past the type's usual max height");
+  assert.equal(M.applyNaturalSize(n, 420, 900), false, "same size, nothing changes");
+  // Dragging the east handle by +210 doubles the width: the height follows, the content scales
+  const r = M.scaleResize(M.rectOf(n), "e", 210, 0, n);
+  assert.deepEqual(r, { x: n.x, y: n.y, w: 630, h: 1350, scale: 1.5 });
+  // A corner scales by the axis that moved more; the north-west corner keeps the bottom right in place
+  const nw = M.scaleResize({ x: 100, y: 100, w: 420, h: 900 }, "nw", 210, 0, n);
+  assert.equal(nw.scale, 0.5);
+  assert.deepEqual([nw.x + nw.w, nw.y + nw.h], [520, 1000]);
+  assert.equal(M.scaleResize(M.rectOf(n), "s", 0, -100000, n).scale, M.SCALE_MIN);
+  Object.assign(n, r);
+  assert.equal(Math.round((n.w / n.h) * 1000), Math.round((n.baseW / n.baseH) * 1000), "aspect ratio is locked");
+  M.applyNaturalSize(n, 200, 100);
+  assert.deepEqual([n.w, n.h], [300, 150], "new content keeps the scale");
+  M.setScaledSize(n, "h", 300);
+  assert.deepEqual([n.scale, n.w, n.h], [3, 600, 300]);
+  const back = M.normalizeNode(JSON.parse(JSON.stringify(n)));
+  assert.deepEqual([back.autoFit, back.baseW, back.baseH, back.scale, back.w, back.h], [true, 200, 100, 3, 600, 300], "persisted");
+  M.setAutoFit(n, false);
+  assert.deepEqual([n.autoFit, n.scale], [false, 1]);
+  assert.ok(n.w <= M.SIZE_LIMITS.struct.maxW && n.h <= M.SIZE_LIMITS.struct.maxH, "back within the type's limits");
+});
+
+test("cloneSubgraph: fresh ids, groups bring their members, internal edges only", () => {
+  const g = M.createNode("group", { id: "g", x: 0, y: 0, w: 600, h: 400 });
+  const a = M.createNode("note", { id: "a", x: 20, y: 40, groupId: "g", data: { text: "a" } });
+  const b = M.createNode("struct", { id: "b", x: 300, y: 40, groupId: "g", data: { name: "b", hiddenItems: { "3:x": true } } });
+  const c = M.createNode("note", { id: "c", x: 900, y: 40, data: { text: "c" } });
+  const canvas = { ...M.emptyCanvas(), nodes: [g, a, b, c], edges: [M.createEdge({ id: "e1", from: "a", to: "b", label: "in" }), M.createEdge({ id: "e2", from: "b", to: "c" })] };
+  const out = M.cloneSubgraph(canvas, ["g"], { x: 10, y: 20 });
+  assert.equal(out.nodes.length, 3, "the group and both members");
+  const ids = new Set(out.nodes.map((n) => n.id));
+  for (const id of ["g", "a", "b", "c"]) assert.ok(!ids.has(id), "fresh ids");
+  const ng = out.nodes.find((n) => n.type === "group");
+  assert.ok(out.nodes.filter((n) => n.type !== "group").every((n) => n.groupId === ng.id), "members follow the copied group");
+  assert.deepEqual([ng.x, ng.y], [10, 20]);
+  assert.equal(out.edges.length, 1, "only the edge between copied nodes");
+  assert.equal(out.edges[0].label, "in");
+  assert.ok(ids.has(out.edges[0].from) && ids.has(out.edges[0].to));
+  assert.notEqual(out.edges[0].id, "e1");
+  const nb = out.nodes.find((n) => n.type === "struct");
+  nb.data.hiddenItems["9:y"] = true;
+  assert.deepEqual(b.data.hiddenItems, { "3:x": true }, "a deep copy");
+  assert.equal(canvas.nodes.length, 4, "the canvas is not changed");
+  const solo = M.cloneSubgraph(canvas, ["a"], { x: 24, y: 24 });
+  assert.equal(solo.nodes[0].groupId, null, "a member copied without its group leaves it");
+  assert.equal(solo.edges.length, 0);
+
+  const clip = M.normalizeClipboard(JSON.parse(JSON.stringify(M.clipboardPayload(canvas, ["a", "b"], "tab-1"))));
+  assert.equal(clip.nodes.length, 2);
+  assert.equal(clip.edges.length, 1);
+  assert.equal(clip.origin, "tab-1");
+  assert.equal(M.normalizeClipboard({ schema: "nope", nodes: [] }), null);
+  assert.equal(M.normalizeClipboard({ schema: M.CLIPBOARD_SCHEMA, nodes: [] }), null);
+});
+
+const NESTED = {
+  version: "v3.0", name: "n", kind: "struct", file_path: "include/n.h", line_s: 1, line_e: 30, outer_conds: [],
+  items: [
+    { kind: "field", name: "a", type: "int", line: 2, conds: [] },
+    { kind: "directive", directive: "ifdef", expr: "CONFIG_A", text: "#ifdef CONFIG_A", line: 3, depth: 0 },
+    { kind: "field", name: "b", type: "long", line: 4, conds: ["defined(CONFIG_A)"] },
+    { kind: "directive", directive: "if", expr: "defined(CONFIG_B)", text: "#if defined(CONFIG_B)", line: 5, depth: 1 },
+    { kind: "field", name: "c", type: "char", line: 6, conds: [] },
+    { kind: "directive", directive: "elif", expr: "IS_ENABLED(CONFIG_C)", text: "#elif IS_ENABLED(CONFIG_C)", line: 7, depth: 1 },
+    { kind: "field", name: "d", type: "u8", line: 8, conds: [] },
+    { kind: "directive", directive: "else", expr: "", text: "#else", line: 9, depth: 1 },
+    { kind: "field", name: "e", type: "u16", line: 10, conds: [] },
+    { kind: "directive", directive: "endif", expr: "", text: "#endif", line: 11, depth: 1 },
+    { kind: "directive", directive: "else", expr: "", text: "#else", line: 12, depth: 0 },
+    { kind: "field", name: "f", type: "u32", line: 13, conds: [] },
+    { kind: "directive", directive: "endif", expr: "", text: "#endif", line: 14, depth: 0 },
+    { kind: "directive", directive: "ifdef", expr: "FOO_UNKNOWN", text: "#ifdef FOO_UNKNOWN", line: 15, depth: 0 },
+    { kind: "aggregate", tag: "union", name: "u", type_name: "", line: 16, conds: [], children: [
+      { kind: "field", name: "p", type: "void *", line: 17, conds: [] },
+      { kind: "field", name: "q", type: "u64", line: 18, conds: [], array: "[2]" },
+    ] },
+    { kind: "directive", directive: "endif", expr: "", text: "#endif", line: 20, depth: 0 },
+  ],
+};
+const kcfg = () => new DirectiveEvaluator({ CONFIG_A: "y", A: "y", CONFIG_C: "y", C: "y" }, { partial: false });
+const structData = (over = {}) => M.createNode("struct", { data: { name: "n", ...over } }).data;
+const keysOf = (rows) => rows.map((r) => r.key);
+
+test("#if blocks: nesting, #elif / #else branches and continuous scope bars", () => {
+  const tree = guardTree(NESTED.items);
+  assert.equal(tree.length, 3, "a field and two top-level blocks");
+  assert.deepEqual(tree[1].branches.map((b) => b.key), ["3:ifdef", "12:else"]);
+  assert.equal(tree[1].branches[0].items[1].branches.length, 3, "#if / #elif / #else nest inside");
+  assert.equal(tree[1].end.line, 14);
+  const { rows, tracks } = structRows(NESTED, structData());
+  assert.equal(tracks, 2, "two nesting levels, two bar tracks");
+  const at = (key) => rows.find((r) => r.key === key);
+  assert.deepEqual(at("2:a").bars, [], "outside every block");
+  assert.deepEqual(at("3:ifdef").bars, [[0, "start"]]);
+  assert.deepEqual(at("4:b").bars, [[0, "full"]]);
+  assert.deepEqual(at("5:if").bars, [[0, "full"], [1, "start"]]);
+  assert.deepEqual(at("8:d").bars, [[0, "full"], [1, "full"]]);
+  assert.deepEqual(at("9:else").bars, [[0, "full"], [1, "mid"]]);
+  assert.deepEqual(at("11:endif").bars, [[0, "full"], [1, "end"]]);
+  assert.deepEqual(at("12:else").bars, [[0, "mid"]]);
+  assert.deepEqual(at("14:endif").bars, [[0, "end"]]);
+  assert.deepEqual(at("17:p").bars, [[0, "full"]], "aggregate members inside a block keep its track");
+  // Every row between an opening line and its #endif crosses track 0: the bar never breaks
+  const from = rows.findIndex((r) => r.key === "3:ifdef");
+  const to = rows.findIndex((r) => r.key === "14:endif");
+  assert.ok(rows.slice(from, to + 1).every((r) => r.bars.some(([l]) => l === 0)));
+  const html = renderStructBody(NESTED, structData());
+  assert.match(html, /nm-pp-bar nm-pp-start nm-pp-l0/);
+  assert.match(html, /nm-pp-bar nm-pp-end nm-pp-l1/);
+  assert.match(html, /--nm-pp-tracks:2/);
+  const off = structRows(NESTED, structData({ showGuards: false }));
+  assert.equal(off.tracks, 0, "no directive lines, no bars");
+  assert.ok(!off.rows.some((r) => r.kind === "pp"));
+});
+
+test("Kconfig folding: false branches fold, true and unknown stay open, manual toggles win, per-node off", () => {
+  const ev = kcfg();
+  const tree = guardTree(NESTED.items);
+  assert.deepEqual(branchTruths(tree[1], ev), [1, 0], "#ifdef CONFIG_A built, its #else not");
+  assert.deepEqual(branchTruths(tree[1].branches[0].items[1], ev), [0, 1, 0], "#if false, #elif true, #else not reached");
+  assert.deepEqual(branchTruths(tree[2], ev), [-1], "a macro the engine does not know is unknown");
+  const d = structData();
+  let { rows } = structRows(NESTED, d, { evaluator: ev });
+  const at = (key) => rows.find((r) => r.key === key);
+  assert.equal(at("5:if").kind, "summary");
+  assert.equal(at("5:if").count, 1);
+  assert.equal(at("5:if").auto, true);
+  assert.equal(at("6:c"), undefined, "members of a folded branch are not drawn");
+  assert.equal(at("7:elif").kind, "pp", "the true branch stays open");
+  assert.ok(at("8:d"));
+  assert.equal(at("9:else").kind, "summary");
+  assert.equal(at("12:else").kind, "summary");
+  assert.equal(at("15:ifdef").kind, "pp", "unknown stays open");
+  assert.ok(at("17:p"));
+  let html = renderStructBody(NESTED, d, { evaluator: ev });
+  assert.match(html, /1 member · compiled out/);
+  assert.match(html, /data-act="guard-fold" data-key="5:if"/);
+  // A manual unfold overrides the engine; a manual fold works on any branch
+  assert.equal(guardAutoCollapsed(NESTED, "5:if", ev), true);
+  assert.equal(guardAutoCollapsed(NESTED, "7:elif", ev), false);
+  M.toggleGuardCollapse(d, "5:if", true);
+  assert.deepEqual(d.collapsedGuards, { "5:if": false });
+  M.toggleGuardCollapse(d, "7:elif", false);
+  rows = structRows(NESTED, d, { evaluator: ev }).rows;
+  assert.ok(rows.find((r) => r.key === "6:c"), "unfolded by hand");
+  assert.ok(rows.find((r) => r.key === "6:c").dead, "still marked as compiled out");
+  assert.equal(rows.find((r) => r.key === "7:elif").kind, "summary", "folded by hand");
+  assert.equal(rows.find((r) => r.key === "7:elif").auto, false);
+  M.toggleGuardCollapse(d, "5:if", true);
+  assert.deepEqual(d.collapsedGuards, { "7:elif": true }, "back to the engine's choice drops the override");
+  // No evaluator (no engine, or the node disables it): nothing folds on its own
+  rows = structRows(NESTED, structData(), { evaluator: null }).rows;
+  assert.ok(!rows.some((r) => r.kind === "summary"));
+  html = renderStructBody(NESTED, structData({ showGuards: false }), { evaluator: ev });
+  assert.match(html, /nm-sf-ppsum/, "a folded branch still shows its summary when guard lines are hidden");
+  assert.doesNotMatch(html, /data-key="6:c"/);
+});
+
+test("hiding members, aggregates and #if blocks: dimmed in Edit Mode, left out in View Mode", () => {
+  const d = structData();
+  M.toggleHidden(d, "2:a");
+  M.toggleHidden(d, "16:u");
+  M.toggleHidden(d, "3:ifdef");
+  const view = structRows(NESTED, d, { editMode: false });
+  assert.deepEqual(keysOf(view.rows), ["15:ifdef", "20:endif"], "the hidden field, block and aggregate subtree are gone");
+  assert.equal(view.hidden, 3);
+  const edit = structRows(NESTED, d, { editMode: true });
+  const at = (key) => edit.rows.find((r) => r.key === key);
+  assert.equal(at("2:a").hidden, true);
+  assert.equal(at("16:u").hidden, true);
+  assert.equal(at("17:p").dim, true, "members of a hidden aggregate dim with it");
+  assert.equal(at("17:p").hidden, false);
+  assert.equal(at("4:b").dim, true, "members of a hidden block dim with it");
+  const html = renderStructBody(NESTED, d, { editMode: true });
+  assert.match(html, /data-act="hide-item" data-key="2:a" title="Restore/);
+  assert.match(html, /data-act="hide-item" data-key="3:ifdef"/, "a block hides from its opening line");
+  assert.match(html, /3 hidden/);
+  const viewHtml = renderStructBody(NESTED, d, { editMode: false });
+  assert.doesNotMatch(viewHtml, /data-key="2:a"|data-key="17:p"/);
+  assert.equal(M.showAllHidden(d), 3);
+  assert.equal(structRows(NESTED, d).rows.length, structRows(NESTED, structData()).rows.length);
+  // A hidden block with guard lines off still offers its restore button in Edit Mode
+  const d2 = structData({ showGuards: false });
+  M.toggleHidden(d2, "3:ifdef");
+  assert.match(renderStructBody(NESTED, d2, { editMode: true }), /data-act="hide-item" data-key="3:ifdef"/);
+});
+
+test("Edit Mode gates editing buttons; folds stay in View Mode", () => {
+  const view = renderStructBody(NESTED, structData(), { editMode: false });
+  assert.doesNotMatch(view, /data-act="toggle-type"|data-act="hide-item"|data-act="all-types"|data-act="guards"/);
+  assert.match(view, /data-act="collapse" data-key="16:u"/, "aggregate folds work in View Mode");
+  assert.match(view, /data-act="guard-fold"/, "branch folds work in View Mode");
+  const edit = renderStructBody(NESTED, structData(), { editMode: true });
+  assert.match(edit, /data-act="toggle-type" data-key="2:a"/);
+  assert.match(edit, /data-act="hide-item" data-key="2:a"/);
+  assert.match(edit, /data-act="all-types"/);
+  assert.match(edit, /data-act="guards"/);
+});
+
+test("struct styles: list rows inline, table rows with Type and Symbol cells", () => {
+  const list = renderStructBody(NESTED, structData());
+  assert.match(list, /nm-style-list/);
+  assert.doesNotMatch(list, /nm-sf-cell/);
+  const d = structData({ style: "table" });
+  assert.equal(d.style, "table");
+  assert.equal(structData({ style: "grid" }).style, "list");
+  const table = renderStructBody(NESTED, d);
+  assert.match(table, /nm-style-table/);
+  assert.match(table, /<span class="nm-sf-type nm-sf-cell">long<\/span><span class="nm-sf-name nm-sf-cell">b<\/span>/);
+  assert.match(table, /<span class="nm-sf-name nm-sf-cell">q<span class="nm-sf-suffix">\[2\]<\/span>/);
+  assert.match(table, /nm-sf-type nm-sf-cell"><span class="nm-sf-tag">union/, "aggregates fill both columns");
+  assert.match(table, /--nm-type-col:\d+ch/);
+  M.setAllTypes(d, false);
+  assert.match(renderStructBody(NESTED, d), /<span class="nm-sf-type nm-sf-cell"><\/span><span class="nm-sf-name nm-sf-cell">b</, "a hidden type keeps its empty cell");
+  assert.match(renderStructBody(NESTED, d), /nm-port-left[^>]*data-field="4:b"/, "field ports stay on both sides");
+});
+
+test("SVG export: whole canvas, struct rows and bars, folds, hidden items, scale, colors, field edges, tab cards", () => {
+  const s = M.createNode("struct", { id: "s", x: 0, y: 0, w: 360, h: 500, color: "#ff8800", data: { name: "n", style: "table", hiddenItems: { "2:a": true } } });
+  const t = M.createNode("tab", { id: "t", x: 3000, y: 2000, data: { tabType: "commits", hash: "v=v3.0&tab=commits" } });
+  const src = M.createNode("source", { id: "src", x: 600, y: 0, data: { path: "kernel/fork.c" } });
+  const note = M.createNode("note", { id: "no", x: -800, y: -300, w: 200, data: { text: "line one\nline two is long enough to wrap around the card" } });
+  const fit = M.createNode("symbol", { id: "f", x: 600, y: 600, data: { name: "x", expanded: true, constituents: [{ name: "m1" }] } });
+  M.setAutoFit(fit, true);
+  M.applyNaturalSize(fit, 200, 100);
+  Object.assign(fit, M.scaleResize(M.rectOf(fit), "e", 200, 0, fit));
+  const canvas = {
+    ...M.emptyCanvas(),
+    nodes: [s, t, src, note, fit],
+    edges: [M.createEdge({ from: "s", to: "src", fromField: "8:d", fromSide: "right", color: "#00aa11" }), M.createEdge({ from: "s", to: "t", fromField: "2:a", fromSide: "right" })],
+  };
+  const payloads = { s: NESTED, src: { path: "kernel/fork.c", start_line: 1, end_line: 2, total_lines: 2, lines: ["int x;", "\tint <y>;"] } };
+  const resolve = (c) => (c.startsWith("var(") ? "#123456" : c);
+  const svg = canvasToSvg(canvas, resolve, { content: (n) => payloads[n.id] || null, structOpts: () => ({ editMode: false, evaluator: kcfg() }) });
+  const vb = /viewBox="(-?\d+) (-?\d+) (\d+) (\d+)"/.exec(svg).slice(1).map(Number);
+  assert.ok(vb[0] <= -840 && vb[1] <= -340, "starts before the leftmost, topmost node");
+  assert.ok(vb[0] + vb[2] >= 3000 + 720 + 40 && vb[1] + vb[3] >= 2000 + 480 + 40, "reaches past the farthest node: never the viewport");
+  assert.doesNotMatch(svg, /var\(--|<foreignObject|<image/, "pure vector, literal colors");
+  assert.match(svg, /<tspan fill="#123456">b<\/tspan>/, "table rows draw their members");
+  assert.doesNotMatch(svg, />a<\/tspan>/, "a hidden member is left out in View Mode");
+  assert.match(svg, /▸ #if defined\(CONFIG_B\) · 1 member/, "a Kconfig-folded branch is a summary row");
+  assert.match(svg, /stroke-width="2"\/>/);
+  assert.ok((svg.match(/stroke-opacity="0\.9"/g) || []).length > 3, "scope bars of the outer block");
+  assert.match(svg, /stroke="#ff8800"/, "custom node color");
+  assert.match(svg, /stroke="#00aa11"/, "custom edge color");
+  assert.match(svg, /&lt;y&gt;/, "source lines, escaped");
+  assert.match(svg, /Live commits tab/, "a tab iframe is a placeholder card");
+  assert.match(svg, /#v=v3\.0&amp;tab=commits/);
+  assert.match(svg, /line one/);
+  assert.match(svg, /translate\(600 600\) scale\(2\)/, "auto-fitted content is scaled");
+  assert.match(svg, />m1</);
+  // The field edge leaves at its row: below the head, toolbar and earlier rows, not the side's middle
+  const paths = [...svg.matchAll(/<path d="M (-?[\d.]+) (-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  assert.equal(paths.length, 2);
+  assert.equal(paths[0][0], 360, "on the right side of the struct");
+  assert.ok(paths[0][1] > 26 + 22 && paths[0][1] < 250, `anchored at the row of d (y=${paths[0][1]})`);
+  assert.equal(paths[1][1], 250, "a hidden row falls back to the side anchor");
+  const edit = canvasToSvg(canvas, resolve, { editMode: true, content: (n) => payloads[n.id] || null, structOpts: () => ({ editMode: true }) });
+  assert.match(edit, />a<\/tspan>/, "Edit Mode draws hidden members (dimmed)");
+  assert.match(edit, /opacity="0\.45"/);
+  assert.match(edit, />Types</, "and the struct toolbar chips");
+});
+
+test("SVG export stays valid XML: control characters dropped, label extents in the bounds; hidden counts follow the layout", () => {
+  const src = M.createNode("source", { id: "src", x: 0, y: 0, data: { path: "a.c" } });
+  const n = M.createNode("note", { id: "n", x: 900, y: 0, customTitle: "t\u0000itle", data: { text: "form\u000Cfeed" } });
+  const canvas = { ...M.emptyCanvas(), nodes: [src, n], edges: [M.createEdge({ from: "src", to: "n", label: "x".repeat(400) })] };
+  const svg = canvasToSvg(canvas, (c) => c, { content: () => ({ path: "a.c", start_line: 1, end_line: 1, total_lines: 1, lines: ["\u000C/* page */"] }) });
+  // eslint-disable-next-line no-control-regex
+  assert.doesNotMatch(svg, /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/);
+  assert.match(svg, /form feed/, "a form feed in a note is whitespace");
+  assert.match(svg, />\/\* page \*\/</, "a form feed in a source line is dropped");
+  const vb = /viewBox="(-?\d+) (-?\d+) (\d+) (\d+)"/.exec(svg).slice(1).map(Number);
+  assert.ok(vb[0] < -200, "a long label widens the image");
+  const d = structData();
+  d.hiddenItems = { "2:a": true, "999:gone": true };
+  assert.equal(structRows(NESTED, d, { editMode: true }).hidden, 1, "a key of a moved line is not counted");
 });

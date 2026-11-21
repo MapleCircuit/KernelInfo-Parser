@@ -26,6 +26,8 @@ const { nodeSpecsForTab, sourceSpec, targetNodemapTab, tokenSpec } = await impor
 const { NodeMapController } = await import("../js/views/nodemap/nodemap_controller.js");
 const M = await import("../js/views/nodemap/canvas_model.js");
 const { state } = await import("../js/state.js");
+const { canvasToSvg } = await import("../js/views/nodemap/nodemap_export.js");
+const { structRows } = await import("../js/views/nodemap/struct_view.js");
 
 const hashOf = (t) => `v=${t.version}&tab=${t.type}`;
 
@@ -245,4 +247,266 @@ test("embed shell writes no shared KConfig profile", async () => {
   } finally {
     sessionManager.embedded = false;
   }
+});
+
+// ------------------------------------------------------------------ NodeMap upgrade: Edit Mode, Kconfig, clipboard, auto-fit
+
+const LAYOUT = {
+  file_path: "include/n.h", line_s: 1, line_e: 9, outer_conds: [],
+  items: [
+    { kind: "field", name: "a", type: "int", line: 2, conds: [] },
+    { kind: "directive", directive: "ifdef", expr: "CONFIG_A", text: "#ifdef CONFIG_A", line: 3, depth: 0 },
+    { kind: "field", name: "b", type: "long", line: 4, conds: ["defined(CONFIG_A)"] },
+    { kind: "directive", directive: "endif", expr: "", text: "#endif", line: 5, depth: 0 },
+  ],
+};
+
+/** A body click on `[data-act=act]` of node `id`. */
+function clickAct(c, id, act, key = "") {
+  const btn = { dataset: { act, key } };
+  const nodeEl = { dataset: { nodeId: id } };
+  c.onClick({ target: { closest: (s) => (s === "[data-act]" ? btn : s === ".nm-node" ? nodeEl : null) }, stopPropagation() {} });
+}
+
+const keyEvent = (key, extra = {}) => {
+  let prevented = false;
+  return { ev: { key, ctrlKey: true, target: { closest: () => null }, preventDefault: () => { prevented = true; }, ...extra }, prevented: () => prevented };
+};
+
+test("Edit Mode gates node editing actions; folds and the body key follow it", () => {
+  const { c } = controller();
+  const s = c.addNode({ type: "struct", data: { name: "n" } });
+  c.content.set(c.fetchKeyOf(s), { status: "ok", value: LAYOUT });
+  assert.equal(c.canvas.settings.editMode, false, "View Mode by default");
+  clickAct(c, s.id, "hide-item", "2:a");
+  clickAct(c, s.id, "toggle-type", "2:a");
+  clickAct(c, s.id, "all-types");
+  assert.deepEqual(s.data.hiddenItems, {}, "no hiding in View Mode");
+  assert.deepEqual(s.data.typeOverrides, {});
+  assert.equal(s.data.showTypes, true);
+  clickAct(c, s.id, "guard-fold", "3:ifdef");
+  assert.deepEqual(s.data.collapsedGuards, { "3:ifdef": true }, "branch folds work in View Mode");
+  const key = c.bodyKey(s);
+  c.setEditMode(true);
+  assert.notEqual(c.bodyKey(s), key, "struct bodies redraw with Edit Mode");
+  clickAct(c, s.id, "hide-item", "2:a");
+  assert.deepEqual(s.data.hiddenItems, { "2:a": true });
+  c.onStructAction(s, "show-hidden");
+  assert.deepEqual(s.data.hiddenItems, {});
+  const tab = c.addNode({ type: "tab", data: { tabType: "commits", hash: "tab=commits" } });
+  const tk = c.bodyKey(tab);
+  c.setEditMode(false);
+  assert.equal(c.bodyKey(tab), tk, "a live tab iframe is not rebuilt by Edit Mode");
+  assert.equal(M.normalizeCanvas(M.serializeCanvas(c.canvas)).settings.editMode, false);
+});
+
+test("Kconfig engine per node: revision match, canvas choice, per-node and canvas off; folds follow the engine", () => {
+  const { c } = controller();
+  const engines = [
+    { tabId: "k1", title: "Kconfig A", version: "v3.0", arch: "x86_64", resolved: true },
+    { tabId: "k2", title: "Kconfig B", version: "v4.0", arch: "arm64", resolved: true },
+    { tabId: "k3", title: "Unresolved", version: "v3.0", resolved: false },
+  ];
+  c.kconfigSource = {
+    list: () => engines,
+    context: (id) => ({ engineTabId: id, arch: "x86_64", strict: true, assignments: id === "k1" ? { CONFIG_A: "y", A: "y" } : {} }),
+  };
+  const s = c.addNode({ type: "struct", version: "v3.0", data: { name: "n" } });
+  c.content.set(c.fetchKeyOf(s), { status: "ok", value: LAYOUT });
+  assert.equal(c.kconfigEngineFor(s).tabId, "k1", "the resolved engine of the node's revision");
+  assert.ok(c.evaluatorFor(s), "an evaluator over its values");
+  c.canvas.settings.kconfigEngine = "k2";
+  c.evalCache.clear();
+  assert.equal(c.kconfigEngineFor(s).tabId, "k2", "the canvas's chosen engine wins");
+  // k2 has no CONFIG_A: the #ifdef branch is compiled out and folds on its own
+  assert.equal(structRows(LAYOUT, s.data, c.structOpts(s)).rows.find((r) => r.key === "3:ifdef").kind, "summary");
+  clickAct(c, s.id, "guard-fold", "3:ifdef");
+  assert.deepEqual(s.data.collapsedGuards, { "3:ifdef": false }, "a manual unfold overrides the engine");
+  clickAct(c, s.id, "guard-fold", "3:ifdef");
+  assert.deepEqual(s.data.collapsedGuards, {}, "folding it again follows the engine");
+  s.data.disableKconfigEngine = true;
+  assert.equal(c.kconfigEngineFor(s), null, "Disable Kconfig engine");
+  assert.equal(structRows(LAYOUT, s.data, c.structOpts(s)).rows.find((r) => r.key === "3:ifdef").kind, "pp");
+  s.data.disableKconfigEngine = false;
+  c.canvas.settings.kconfigCollapse = false;
+  assert.equal(c.kconfigEngineFor(s), null, "folding off for the canvas");
+  c.canvas.settings.kconfigCollapse = true;
+  c.canvas.settings.kconfigEngine = "";
+  s.version = "v9.9";
+  assert.equal(c.kconfigEngineFor(s), null, "no engine of another revision is guessed");
+  const epoch = c.kconfigEpoch;
+  c.onKconfigChanged();
+  assert.equal(c.kconfigEpoch, epoch + 1, "engine events redraw struct bodies");
+  assert.equal(c.evalCache.size, 0);
+});
+
+
+test("copy / paste / duplicate: fresh ids, internal edges, groups, across tabs, native text copy kept", () => {
+  localStorage.removeItem(M.CLIPBOARD_KEY);
+  const { c } = controller({ id: "tab-a", type: "nodemap", version: "v3.0", repo: "" });
+  withViewport(c);
+  const a = c.addNode({ type: "note", data: { text: "a" } });
+  const b = c.addNode({ type: "struct", data: { name: "b" } });
+  Object.assign(a, { x: 0, y: 0 });
+  Object.assign(b, { x: 400, y: 0 });
+  c.canvas.edges.push(M.createEdge({ from: a.id, to: b.id, label: "uses" }));
+  c.selected = new Set([a.id, b.id]);
+
+  // Selected text copies natively: the canvas does not take Ctrl+C or Ctrl+V
+  globalThis.getSelection = () => ({ toString: () => "int x;" });
+  let k = keyEvent("c");
+  c.onKeyDown(k.ev);
+  assert.equal(k.prevented(), false);
+  assert.equal(localStorage.getItem(M.CLIPBOARD_KEY), null);
+  k = keyEvent("v");
+  c.onKeyDown(k.ev);
+  assert.equal(c.canvas.nodes.length, 2);
+  globalThis.getSelection = () => ({ toString: () => "" });
+  // Focus in an input keeps the key too
+  k = keyEvent("c", { target: { closest: (s) => (s.includes("input") ? {} : null) } });
+  c.onKeyDown(k.ev);
+  assert.equal(localStorage.getItem(M.CLIPBOARD_KEY), null);
+
+  k = keyEvent("c");
+  c.onKeyDown(k.ev);
+  assert.equal(k.prevented(), true);
+  assert.ok(localStorage.getItem(M.CLIPBOARD_KEY), "the clipboard is shared through localStorage");
+  k = keyEvent("v");
+  c.onKeyDown(k.ev);
+  assert.equal(c.canvas.nodes.length, 4);
+  const pasted = c.canvas.nodes.slice(2);
+  assert.deepEqual([pasted[0].x, pasted[0].y], [24, 24], "offset from the originals");
+  assert.deepEqual([...c.selected].sort(), pasted.map((n) => n.id).sort(), "the pasted nodes are selected");
+  assert.equal(c.canvas.edges.length, 2, "the edge between them is pasted too");
+  const pe = c.canvas.edges[1];
+  assert.ok(pasted.some((n) => n.id === pe.from) && pasted.some((n) => n.id === pe.to));
+  c.pasteClipboard();
+  assert.deepEqual([c.canvas.nodes[4].x, c.canvas.nodes[4].y], [48, 48], "each paste cascades");
+
+  // Another NodeMap tab pastes the same clipboard, centered in its view
+  const { c: other } = controller({ id: "tab-b", type: "nodemap", version: "v3.0", repo: "" });
+  withViewport(other);
+  assert.equal(other.pasteClipboard(), true);
+  assert.equal(other.canvas.nodes.length, 2);
+  assert.equal(other.canvas.edges.length, 1);
+  const bb = M.boundsOf(other.canvas.nodes);
+  assert.equal(Math.round(bb.x + bb.w / 2), 400, "centered on the view (800 wide)");
+
+  // Duplicate (Ctrl+D) keeps groups: a copied group brings its members, in the copy of it
+  const g = other.addGroup();
+  other.selected = new Set([g.id]);
+  k = keyEvent("d");
+  other.onKeyDown(k.ev);
+  assert.equal(k.prevented(), true);
+  const groups = other.canvas.nodes.filter((n) => n.type === "group");
+  assert.equal(groups.length, 2);
+  const copyGroup = groups[1];
+  assert.equal(M.groupDescendants(other.canvas.nodes, copyGroup.id).length, 2, "members are copied into the copied group");
+  assert.deepEqual([...other.selected], [copyGroup.id]);
+  assert.equal(other.canvas.edges.length, 2);
+
+  // No storage: the window's memory copy still pastes
+  const real = localStorage.setItem;
+  localStorage.setItem = () => {
+    throw new Error("quota");
+  };
+  try {
+    other.selected = new Set([other.canvas.nodes[0].id]);
+    other.copySelection();
+    assert.equal(localStorage.getItem(M.CLIPBOARD_KEY), null, "a stale stored clipboard is dropped");
+    const before = other.canvas.nodes.length;
+    assert.equal(other.pasteClipboard(), true);
+    assert.equal(other.canvas.nodes.length, before + 1);
+  } finally {
+    localStorage.setItem = real;
+  }
+});
+
+test("auto-fit: measured content sizes the node, resize handles keep the aspect ratio and scale", () => {
+  const { c } = controller();
+  withViewport(c);
+  const s = c.addNode({ type: "struct", data: { name: "n" } });
+  c.measureNatural = () => ({ w: 400, h: 200 });
+  c.selected = new Set([s.id]);
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "autofit" }, type: "checkbox", checked: true, tagName: "INPUT" }) } }, true);
+  assert.equal(s.autoFit, true);
+  assert.deepEqual([s.baseW, s.baseH, s.w, s.h], [400, 200, 400, 200], "sized to its content on the next commit");
+  c.gesture = { kind: "resize", start: { x: 0, y: 0 }, id: s.id, handle: "se", rect: M.rectOf(s), moved: false };
+  c.onPointerMove({ clientX: 200, clientY: 10, buttons: 1 });
+  assert.deepEqual([s.w, s.h, s.scale], [600, 300, 1.5], "the corner scales by the axis that moved more");
+  c.onPointerUp({ type: "pointerup" });
+  c.measureNatural = () => ({ w: 500, h: 100 });
+  c.fitQueue.add(s.id);
+  c.commit();
+  assert.deepEqual([s.baseW, s.baseH, s.w, s.h], [500, 100, 750, 150], "changed content refits at the same scale");
+  c.onInspectorInput({ target: { closest: () => ({ dataset: { insp: "w" }, value: "250", tagName: "INPUT" }) } }, true);
+  assert.deepEqual([s.scale, s.w, s.h], [0.5, 250, 50], "a width in the inspector sets the scale");
+  const t = c.addNode({ type: "tab", data: { tabType: "commits", hash: "tab=commits" } });
+  M.setAutoFit(t, true);
+  assert.equal(t.autoFit, false, "live tab iframes are never fitted");
+});
+
+test("custom colors, Duplicate in the node menu, and the SVG export of the controller's content", async () => {
+  const { c } = controller();
+  withViewport(c);
+  const s = c.addNode({ type: "struct", data: { name: "n" } });
+  c.content.set(c.fetchKeyOf(s), { status: "ok", value: LAYOUT });
+  c.setColor("#12AB34");
+  assert.equal(s.color, "#12ab34");
+  c.setColor("not-a-color");
+  assert.equal(s.color, "");
+  assert.equal(c.pickerValue("#a0b0c0"), "#a0b0c0");
+  assert.match(c.pickerValue("blue"), /^#[0-9a-f]{6}$/, "presets start the picker at a #rrggbb");
+  const svg = canvasToSvg(c.canvas, (x) => x, c.svgOptions());
+  assert.match(svg, /<tspan fill="var\(--text-primary\)">b<\/tspan>/, "struct members from the loaded layout");
+
+  const { contextMenu } = await import("../js/components/context_menu.js");
+  const realRender = contextMenu.renderMenu;
+  let menu = null;
+  contextMenu.renderMenu = (x, y, cfg) => {
+    menu = cfg;
+  };
+  try {
+    contextMenu.showNodeMapMenu(0, 0, { node: s, controller: c });
+    const dup = menu.items.find((i) => i.label === "Duplicate");
+    assert.ok(dup, "Duplicate is in the node menu");
+    dup.onClick();
+    assert.equal(c.canvas.nodes.filter((n) => n.type === "struct").length, 2);
+  } finally {
+    contextMenu.renderMenu = realRender;
+  }
+});
+
+test("wrapping auto-fit nodes keep their width across rebuilds; a text selection outside the canvas does not block Ctrl+C", () => {
+  const { c } = controller();
+  withViewport(c);
+  const n = c.addNode({ type: "note", data: { text: "x" } });
+  M.setAutoFit(n, true);
+  const el = { isConnected: true, offsetWidth: 0, offsetHeight: 0, style: { setProperty() {} }, classList: { add() {}, remove() {} } };
+  Object.defineProperty(el, "offsetWidth", { get: () => n.baseW });
+  Object.defineProperty(el, "offsetHeight", { get: () => 120 });
+  c.renderer.element = () => el;
+  const w = n.baseW;
+  for (let i = 0; i < 3; i++) {
+    c.fitQueue.add(n.id);
+    c.commit();
+  }
+  assert.equal(n.baseW, w, "no slack added to a wrapping node's width");
+  assert.equal(n.baseH, 122);
+  c.renderer.element = () => null;
+
+  localStorage.removeItem(M.CLIPBOARD_KEY);
+  c.rootEl = { contains: (x) => x === "inside", classList: { toggle() {} } };
+  c.selected = new Set([n.id]);
+  globalThis.getSelection = () => ({ toString: () => "sidebar text", anchorNode: "outside", focusNode: "outside" });
+  let k = keyEvent("c");
+  c.onKeyDown(k.ev);
+  assert.equal(k.prevented(), true, "the nodes are copied");
+  localStorage.removeItem(M.CLIPBOARD_KEY);
+  globalThis.getSelection = () => ({ toString: () => "node text", anchorNode: "inside", focusNode: "inside" });
+  k = keyEvent("c");
+  c.onKeyDown(k.ev);
+  assert.equal(k.prevented(), false, "text selected inside the canvas copies natively");
+  globalThis.getSelection = () => ({ toString: () => "" });
+  c.rootEl = null;
 });

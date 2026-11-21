@@ -7,9 +7,15 @@
  *     marquee selection (Select tool, or Shift/Ctrl+drag), Shift/Ctrl-click multi-select;
  *   - node drag (header; dragging a group moves its members, dropping a node in or out of a group frame
  *     changes its membership), resize from 8 handles with per-type limits, optional snap-to-grid;
- *   - inline titles (double-click), notes, groups, accent colors, align / distribute;
+ *   - Edit Mode (canvas setting, Inspector toggle): node editing controls (struct type / guard / hide
+ *     toggles, inline title and note editing) show only in it; folds and header tools always work;
+ *   - inline titles (double-click), notes, groups, accent colors (presets or a custom color), align /
+ *     distribute, duplicate and copy / paste (Ctrl+D, Ctrl+C, Ctrl+V; a localStorage clipboard shared by
+ *     every NodeMap tab), auto-fit nodes whose content scales with aspect-locked resizes;
  *   - edges from side ports or struct field ports: anchor sides (or auto), label, arrows, line style, curve;
- *   - content nodes: struct layouts with type toggles and `#if` guards (`/api/nodemap/{v}/struct/{name}`),
+ *   - content nodes: struct layouts (`list` / `table` style) with type toggles, `#if` guards and their
+ *     scope bars, Kconfig-engine folding of compiled-out branches, hidden items
+ *     (`/api/nodemap/{v}/struct/{name}`),
  *     source files / line ranges / symbol slices (`/api/nodemap/{v}/source`), man pages
  *     (`mountManDocument`), and live KernelInfo tabs in an isolated `?embed=1` iframe.
  * Element lookups stay inside the tab's own container (no document ids), so several NodeMap tabs and
@@ -26,10 +32,11 @@ import { onUiScaleChanged } from "../../utils/ui_scale.js";
 import { isTabFeatureEnabled } from "../../utils/projects.js";
 import { isAlwaysVersionlessTab } from "../../tab_routes.js";
 import { mountManDocument } from "../man/man_view.js";
+import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.js";
 import * as M from "./canvas_model.js";
 import { computeEdgeGeometry, dashArray } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
-import { findItem, renderStructBody } from "./struct_view.js";
+import { findItem, guardAutoCollapsed, renderStructBody, structRows } from "./struct_view.js";
 import { renderNoteMarkdown, renderSourceRows } from "./node_content.js";
 import { canvasToSvg } from "./nodemap_export.js";
 
@@ -50,6 +57,24 @@ const SAVE_DELAY_MS = 300;
 const DRAG_THRESHOLD = 3;
 
 const isTyping = (el) => Boolean(el && (el.closest?.("input, textarea, select, [contenteditable='true']")));
+// Body buttons that edit a node: they work in Edit Mode only (folds and header tools always do)
+const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards"]);
+const PASTE_STEP = 24;
+// Clipboard of this window when localStorage refuses it (shared by the NodeMap tabs of the window)
+let memoryClipboard = null;
+
+/** Whether the document holds a non-empty text selection inside `root` (copying it stays native). */
+function hasTextSelection(root) {
+  try {
+    const sel = globalThis.getSelection?.();
+    if (!sel || !sel.toString()) return false;
+    // A selection elsewhere on the page (sidebar, another pane) does not keep the canvas from copying nodes
+    if (!root?.contains || !sel.anchorNode) return true;
+    return root.contains(sel.anchorNode) || root.contains(sel.focusNode);
+  } catch {
+    return false;
+  }
+}
 
 export class NodeMapController {
   constructor() {
@@ -64,6 +89,16 @@ export class NodeMapController {
     this.saveTimer = null;
     this.unsubs = [];
     this.containerEl = null;
+    this.evalCache = new Map(); // Kconfig engine tab id -> DirectiveEvaluator
+    this.kconfigEpoch = 0;
+    this.fitQueue = new Set(); // auto-fit nodes to measure on the next commit
+    this.pasteStamp = "";
+    this.pasteCount = 0;
+    // Where Kconfig engines come from (tests swap it)
+    this.kconfigSource = {
+      list: () => (typeof state.kconfigEngineList === "function" ? state.kconfigEngineList() : []),
+      context: (id) => (typeof state.definitionContext === "function" ? state.definitionContext(id) : null),
+    };
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -107,6 +142,7 @@ export class NodeMapController {
       renderBody: (node, body) => this.renderBody(node, body),
       disposeBody: (id) => this.disposeBody(id),
       headTools: (node, active) => this.headTools(node, active),
+      bodyKey: (node) => this.bodyKey(node),
     });
 
     this.attachToolbar();
@@ -149,6 +185,70 @@ export class NodeMapController {
     const onTheme = () => this.renderWires();
     window.addEventListener("kip:theme-changed", onTheme);
     this.unsubs.push(() => window.removeEventListener("kip:theme-changed", onTheme));
+    // Kconfig engines opened, closed or re-resolved: struct nodes fold their branches again
+    for (const ev of ["kconfig:engine:changed", "kconfig:assignments:updated"]) {
+      const off = state.subscribe(ev, () => this.onKconfigChanged());
+      this.unsubs.push(typeof off === "function" ? off : () => {});
+    }
+  }
+
+  onKconfigChanged() {
+    this.kconfigEpoch += 1;
+    this.evalCache.clear();
+    clearTimeout(this.kconfigTimer);
+    this.kconfigTimer = setTimeout(() => {
+      if (this.containerEl?.isConnected) this.commit({ save: false });
+    }, 120);
+  }
+
+  // ------------------------------------------------------------------ Kconfig engine
+
+  /**
+   * The Kconfig engine a struct node folds its branches by: none when folding is off for the canvas or
+   * the node; the canvas's chosen engine, else the engine of the node's revision. Only engines with a
+   * resolved configuration count.
+   */
+  kconfigEngineFor(node) {
+    const st = this.canvas?.settings;
+    if (!st?.kconfigCollapse || node?.type !== "struct" || node.data.disableKconfigEngine) return null;
+    let list = [];
+    try {
+      list = (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
+    } catch {
+      list = [];
+    }
+    if (st.kconfigEngine) return list.find((e) => e.tabId === st.kconfigEngine) || null;
+    return list.find((e) => e.version && e.version === node.version) || null;
+  }
+
+  /** `DirectiveEvaluator` of the node's engine (cached per engine until its values change). */
+  evaluatorFor(node) {
+    const eng = this.kconfigEngineFor(node);
+    if (!eng) return null;
+    if (this.evalCache.has(eng.tabId)) return this.evalCache.get(eng.tabId);
+    let ev = null;
+    try {
+      const ctx = this.kconfigSource.context(eng.tabId);
+      if (ctx && ctx.engineTabId === eng.tabId && ctx.assignments) {
+        ev = new DirectiveEvaluator(ctx.assignments, { partial: !ctx.strict, macros: archMacros(ctx.arch, ctx.assignments) });
+      }
+    } catch {
+      ev = null;
+    }
+    this.evalCache.set(eng.tabId, ev);
+    return ev;
+  }
+
+  /** Options a struct node's rows are drawn with (live body and SVG export alike). */
+  structOpts(node) {
+    return { editMode: Boolean(this.canvas?.settings.editMode), evaluator: this.evaluatorFor(node) };
+  }
+
+  /** View state outside a node that its body depends on (Edit Mode, the Kconfig engine). */
+  bodyKey(node) {
+    if (node.type === "struct") return JSON.stringify([Boolean(this.canvas.settings.editMode), this.kconfigEngineFor(node)?.tabId || "", this.kconfigEpoch]);
+    if (node.type === "note") return this.canvas.settings.editMode ? "edit" : "";
+    return "";
   }
 
   /** Nodes handed over by other views: `initialNodes`/`initialEdges`, `initialNode`, `pendingNodes`. */
@@ -508,7 +608,10 @@ export class NodeMapController {
     if (node.type === "group") {
       body.innerHTML = "";
     } else if (node.type === "note") {
-      body.innerHTML = `<div class="nm-note nm-scroll">${node.data.markdown ? renderNoteMarkdown(node.data.text) : `<pre class="nm-note-plain">${escapeHtml(node.data.text || "Double-click to write a note")}</pre>`}</div>`;
+      const empty = this.canvas.settings.editMode ? "Double-click to write a note" : "Empty note (Edit Mode edits it)";
+      let html = node.data.markdown ? renderNoteMarkdown(node.data.text) : `<pre class="nm-note-plain">${escapeHtml(node.data.text || empty)}</pre>`;
+      if (!String(node.data.text || "").trim()) html = `<p class="nm-empty">${escapeHtml(empty)}</p>`;
+      body.innerHTML = `<div class="nm-note nm-scroll">${html}</div>`;
     } else if (node.type === "struct") {
       const prevScroll = body.querySelector(".nm-struct-rows")?.scrollTop || 0;
       const entry = this.ensureContent(node, () => this.loadStruct(node));
@@ -516,7 +619,7 @@ export class NodeMapController {
       else if (entry.status === "error") {
         body.innerHTML = `${status(entry.error?.message || "Not found", true)}<div class="nm-status">Set the defining file in the inspector to read it from the source (unparsed revisions).</div>`;
       } else {
-        body.innerHTML = renderStructBody(entry.value, node.data);
+        body.innerHTML = renderStructBody(entry.value, node.data, this.structOpts(node));
         const rows = body.querySelector(".nm-struct-rows");
         if (rows) rows.scrollTop = prevScroll;
       }
@@ -637,6 +740,11 @@ export class NodeMapController {
       if (this.mounts.get(node.id) === token) body.innerHTML = `<div class="nm-status nm-error">${escapeHtml(err.message)}</div>`;
     });
     body.querySelector(".man-body")?.classList.add("nm-scroll");
+    // The page is in: an auto-fitted node takes its size now
+    if (node.autoFit && this.mounts.get(node.id) === token) {
+      this.fitQueue.add(node.id);
+      this.commit({ save: false, inspector: false });
+    }
   }
 
   headTools(node, active) {
@@ -666,11 +774,56 @@ export class NodeMapController {
     for (const id of [...this.selected]) if (!ids.has(id)) this.selected.delete(id);
     if (this.selectedEdge && !this.canvas.edges.some((e) => e.id === this.selectedEdge)) this.selectedEdge = null;
     if (this.active && !ids.has(this.active)) this.active = null;
+    this.rootEl?.classList.toggle("nm-edit", Boolean(this.canvas.settings.editMode));
     this.renderer.sync(this.canvas.nodes, this.selected, this.active);
+    const fitted = this.autoFitPass();
     this.renderWires();
     if (this.hintEl) this.hintEl.hidden = this.canvas.nodes.length > 0;
     if (inspector) this.renderInspector();
-    if (save) this.scheduleSave();
+    if (save || fitted) this.scheduleSave();
+  }
+
+  // ------------------------------------------------------------------ auto-fit
+
+  /**
+   * Measure the auto-fitted nodes whose body was rebuilt (or that asked for it) and size them to their
+   * content; true when a geometry changed.
+   */
+  autoFitPass() {
+    const ids = new Set([...(this.renderer.takeRebuilt?.() || []), ...this.fitQueue]);
+    this.fitQueue.clear();
+    let changed = false;
+    for (const id of ids) {
+      const node = this.byId(id);
+      if (!node?.autoFit) continue;
+      const nat = this.measureNatural(node);
+      if (nat && M.applyNaturalSize(node, nat.w, nat.h)) {
+        changed = true;
+        const el = this.renderer.element(id);
+        if (el && this.renderer.place) this.renderer.place(el, node);
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Natural (unscaled, unclipped) size of a node's content: its element laid out at max-content (notes
+   * and man pages wrap, so they keep their width and grow in height). Null without a live element.
+   */
+  measureNatural(node) {
+    const el = this.renderer?.element(node.id);
+    if (!el?.isConnected || typeof el.offsetWidth !== "number") return null;
+    const wraps = node.type === "note" || node.type === "man";
+    el.style.setProperty("--nm-measure-w", `${node.baseW}px`);
+    el.classList.add("nm-measuring");
+    if (wraps) el.classList.add("nm-measure-wrap");
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    el.classList.remove("nm-measuring", "nm-measure-wrap");
+    if (!w || !h) return null;
+    // A little slack so rounding never brings scrollbars back; a wrapping node keeps its width exactly
+    // (it was measured at that width: slack there would widen it on every rebuild)
+    return { w: wraps ? node.baseW : Math.ceil(w) + 2, h: Math.ceil(h) + 2 };
   }
 
   // Kept for the context menu and other views
@@ -886,6 +1039,8 @@ export class NodeMapController {
       return;
     }
     const nodeEl = t.closest(".nm-node");
+    // Dragging nodes or the canvas leaves no stale text selection behind (Ctrl+C copies nodes then)
+    if (!nodeEl || (t.closest(".nm-node-head") && !t.closest("button"))) this.clearTextSelection();
     if (!nodeEl) {
       if (this.active) {
         this.active = null;
@@ -933,6 +1088,15 @@ export class NodeMapController {
         else this.selectOnly(node.id);
         this.commit({ save: false });
       }
+    }
+  }
+
+  clearTextSelection() {
+    try {
+      const sel = globalThis.getSelection?.();
+      if (sel && sel.toString() && this.rootEl?.contains(sel.anchorNode)) sel.removeAllRanges();
+    } catch {
+      // no selection API
     }
   }
 
@@ -986,9 +1150,11 @@ export class NodeMapController {
     } else if (g.kind === "resize") {
       const node = this.byId(g.id);
       if (!node) return;
-      Object.assign(node, M.resizeRect(g.rect, g.handle, dxs / z, dys / z, M.SIZE_LIMITS[node.type], snap));
+      // Auto-fitted nodes keep their aspect ratio: the drag scales their content
+      if (node.autoFit) Object.assign(node, M.scaleResize(g.rect, g.handle, dxs / z, dys / z, node));
+      else Object.assign(node, M.resizeRect(g.rect, g.handle, dxs / z, dys / z, M.SIZE_LIMITS[node.type], snap));
       const el = this.renderer.element(node.id);
-      if (el) Object.assign(el.style, { left: `${node.x}px`, top: `${node.y}px`, width: `${node.w}px`, height: `${node.h}px` });
+      if (el) this.renderer.place(el, node);
       this.scheduleWires();
     } else if (g.kind === "wire") {
       g.cur = this.toCanvas(e.clientX, e.clientY);
@@ -1070,6 +1236,7 @@ export class NodeMapController {
     if (!node) return;
     e.stopPropagation();
     const act = btn.dataset.act;
+    if (EDIT_ACTS.has(act) && !this.canvas.settings.editMode) return;
     if (act === "interact") {
       this.active = this.active === node.id ? null : node.id;
       this.selected = new Set([node.id]);
@@ -1091,7 +1258,21 @@ export class NodeMapController {
       const layout = this.content.get(this.fetchKeyOf(node))?.value;
       const item = layout ? findItem(layout.items, key) : null;
       if (item) M.toggleItemType(d, item);
+    } else if (act === "guard-fold" && key) {
+      const layout = this.content.get(this.fetchKeyOf(node))?.value;
+      M.toggleGuardCollapse(d, key, guardAutoCollapsed(layout, key, this.evaluatorFor(node)));
+    } else if (act === "hide-item" && key) {
+      M.toggleHidden(d, key);
+    } else if (act === "show-hidden") {
+      M.showAllHidden(d);
+    } else if (act === "style") {
+      d.style = d.style === "table" ? "list" : "table";
     } else return;
+    this.commit();
+  }
+
+  setEditMode(on) {
+    this.canvas.settings.editMode = Boolean(on);
     this.commit();
   }
 
@@ -1100,6 +1281,13 @@ export class NodeMapController {
     const titleEl = e.target.closest(".nm-title");
     const nodeEl = e.target.closest(".nm-node");
     const edgeEl = e.target.closest(".nm-edge[data-edge-id]");
+    if (nodeEl && !this.canvas.settings.editMode) {
+      if ((titleEl || e.target.closest(".nm-type-note .nm-node-body")) && !this.hintedEditMode) {
+        this.hintedEditMode = true;
+        toast.info("Turn on Edit Mode in the Inspector to rename nodes and edit notes in place");
+      }
+      return;
+    }
     if (titleEl && nodeEl) return this.beginTitleEdit(nodeEl.dataset.nodeId);
     if (nodeEl) {
       const node = this.byId(nodeEl.dataset.nodeId);
@@ -1131,6 +1319,18 @@ export class NodeMapController {
     } else if (e.key === "Delete" || e.key === "Backspace") {
       e.preventDefault();
       this.deleteSelection();
+    } else if (mod && (e.key === "c" || e.key === "C") && !e.shiftKey && !e.altKey) {
+      // Selected text (code, a note, a struct row) copies natively
+      if (hasTextSelection(this.rootEl) || !this.selected.size) return;
+      e.preventDefault();
+      this.copySelection();
+    } else if (mod && (e.key === "v" || e.key === "V") && !e.shiftKey && !e.altKey) {
+      if (hasTextSelection(this.rootEl)) return;
+      if (this.pasteClipboard()) e.preventDefault();
+    } else if (mod && (e.key === "d" || e.key === "D") && !e.shiftKey && !e.altKey) {
+      if (!this.selected.size) return;
+      e.preventDefault();
+      this.duplicateSelection();
     } else if (mod && (e.key === "a" || e.key === "A")) {
       e.preventDefault();
       this.selected = new Set(this.canvas.nodes.map((n) => n.id));
@@ -1296,12 +1496,96 @@ export class NodeMapController {
     this.commit();
   }
 
-  setColor(color) {
+  /** Accent of the selected edge or nodes: a preset id or a custom `#rrggbb`. */
+  setColor(color, { inspector = true } = {}) {
+    const c = M.normalizeColor(color);
     if (this.selectedEdge) {
       const e = this.canvas.edges.find((x) => x.id === this.selectedEdge);
-      if (e) e.color = color;
-    } else for (const n of this.selectedNodes()) n.color = color;
+      if (e) e.color = c;
+    } else for (const n of this.selectedNodes()) n.color = c;
+    this.commit({ inspector });
+  }
+
+  /** Add cloned nodes and edges (cloneSubgraph output), re-derive their groups and select them. */
+  insertClones({ nodes, edges }) {
+    if (!nodes.length) return [];
+    const ids = new Set(nodes.map((n) => n.id));
+    this.canvas.nodes.push(...nodes);
+    this.canvas.edges.push(...edges);
+    // Copies outside a copied group join whatever group they land in
+    M.reassignGroups(this.canvas.nodes, nodes.filter((n) => !(n.groupId && ids.has(n.groupId))));
+    this.selected = new Set(nodes.filter((n) => !(n.groupId && ids.has(n.groupId))).map((n) => n.id));
+    this.selectedEdge = null;
     this.commit();
+    return nodes;
+  }
+
+  /** Duplicate the selection next to itself (groups with their members, edges between copied nodes). */
+  duplicateSelection(ids = [...this.selected]) {
+    if (!ids.length) return [];
+    return this.insertClones(M.cloneSubgraph(this.canvas, ids, { x: PASTE_STEP, y: PASTE_STEP }));
+  }
+
+  duplicateNode(id) {
+    if (!this.selected.has(id)) this.selected = new Set([id]);
+    return this.duplicateSelection();
+  }
+
+  /** Copy the selection to the NodeMap clipboard (localStorage, shared by every NodeMap tab). */
+  copySelection() {
+    const ids = [...this.selected];
+    if (!ids.length) return null;
+    const payload = M.clipboardPayload(this.canvas, ids, this.tab?.id || "");
+    memoryClipboard = payload;
+    try {
+      globalThis.localStorage.setItem(M.CLIPBOARD_KEY, JSON.stringify(payload));
+    } catch {
+      // Storage refused it: this window's memory copy is the clipboard, an older stored one must not win
+      try {
+        globalThis.localStorage?.removeItem(M.CLIPBOARD_KEY);
+      } catch {
+        // nothing stored
+      }
+    }
+    this.pasteStamp = payload.stamp;
+    this.pasteCount = 0;
+    toast.info(`Copied ${payload.nodes.length} node${payload.nodes.length === 1 ? "" : "s"} (Ctrl+V pastes them in any NodeMap tab)`);
+    return payload;
+  }
+
+  readClipboard() {
+    let raw = null;
+    try {
+      const stored = globalThis.localStorage?.getItem(M.CLIPBOARD_KEY);
+      raw = stored ? JSON.parse(stored) : null;
+    } catch {
+      raw = null;
+    }
+    return M.normalizeClipboard(raw) || M.normalizeClipboard(memoryClipboard);
+  }
+
+  /**
+   * Paste the clipboard: copied from this canvas, offset from the originals (cascading on every paste);
+   * from another tab, centered in the view. False when the clipboard is empty.
+   */
+  pasteClipboard() {
+    const clip = this.readClipboard();
+    if (!clip) return false;
+    if (clip.stamp !== this.pasteStamp) {
+      this.pasteStamp = clip.stamp;
+      this.pasteCount = 0;
+    }
+    this.pasteCount += 1;
+    const step = PASTE_STEP * this.pasteCount;
+    let offset = { x: step, y: step };
+    if (clip.origin !== (this.tab?.id || "")) {
+      const b = M.boundsOf(clip.nodes);
+      const c = this.viewCenter();
+      offset = { x: Math.round(c.x - (b.x + b.w / 2)) + step - PASTE_STEP, y: Math.round(c.y - (b.y + b.h / 2)) + step - PASTE_STEP };
+    }
+    const clones = M.cloneSubgraph({ nodes: clip.nodes, edges: clip.edges }, clip.nodes.map((n) => n.id), offset);
+    this.insertClones(clones);
+    return true;
   }
 
   align(mode) {
@@ -1431,14 +1715,41 @@ export class NodeMapController {
 
   // ------------------------------------------------------------------ inspector
 
+  /** `#rrggbb` a color input starts at: the custom color, else what the accent resolves to. */
+  pickerValue(color, fallback = "var(--accent-blue)") {
+    if (M.isCustomColor(color)) return color.toLowerCase();
+    let hex = null;
+    try {
+      hex = M.colorToHex(resolveColor(M.accentVar(color, fallback)));
+      if (!hex && typeof document !== "undefined") {
+        // Named or modern color syntax: let the 2D context normalize it
+        const ctx = document.createElement("canvas").getContext?.("2d");
+        if (ctx) {
+          ctx.fillStyle = resolveColor(M.accentVar(color, fallback));
+          hex = M.colorToHex(ctx.fillStyle);
+        }
+      }
+    } catch {
+      hex = null;
+    }
+    return hex || `#${"0".repeat(6)}`;
+  }
+
   renderInspector() {
     if (!this.inspectorEl) return;
-    const swatches = (current) => `<div class="nm-swatches" role="group" aria-label="Accent">${M.ACCENTS.map((a) =>
-      `<button type="button" class="nm-swatch${a.id === current ? " on" : ""}" data-insp="color" data-value="${a.id}" title="${a.label}" style="--nm-sw:${M.accentVar(a.id, "var(--bg-tertiary)")}"></button>`).join("")}</div>`;
-    const sel = (name, value, options) => `<select data-insp="${name}">${options.map((o) => `<option value="${o}"${o === value ? " selected" : ""}>${o || "any"}</option>`).join("")}</select>`;
+    const swatches = (current, fallback = "var(--accent-blue)") => {
+      const custom = M.isCustomColor(current);
+      return `<div class="nm-swatches" role="group" aria-label="Accent">${M.ACCENTS.map((a) =>
+        `<button type="button" class="nm-swatch${a.id === current ? " on" : ""}" data-insp="color" data-value="${a.id}" title="${a.label}" style="--nm-sw:${M.accentVar(a.id, "var(--bg-tertiary)")}"></button>`).join("")}` +
+        `<label class="nm-swatch nm-swatch-custom${custom ? " on" : ""}" title="Custom color…" style="--nm-sw:${custom ? escapeHtml(current) : "var(--bg-tertiary)"}"><input type="color" data-insp="color-custom" value="${escapeHtml(this.pickerValue(current, fallback))}" aria-label="Custom color"/></label></div>`;
+    };
+    const sel = (name, value, options, labels = null) => `<select data-insp="${name}">${options.map((o, i) => `<option value="${escapeHtml(o)}"${o === value ? " selected" : ""}>${escapeHtml(labels ? labels[i] : (o || "any"))}</option>`).join("")}</select>`;
     const row = (label, inner) => `<label class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span>${inner}</label>`;
     const input = (name, value, extra = "") => `<input data-insp="${name}" value="${escapeHtml(value ?? "")}" ${extra}/>`;
-    let html = "";
+    const check = (name, on, label, title = "") => `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" ${on ? "checked" : ""}/> <span>${escapeHtml(label)}</span></label>`;
+    const st = this.canvas.settings;
+    const em = Boolean(st.editMode);
+    let html = `<div class="nm-insp-mode"><button type="button" class="nodemap-btn nm-mode-toggle" data-insp="edit-mode" aria-pressed="${em}" title="${em ? "Hide the node editing controls" : "Show the node editing controls: struct type, #ifdef and hide toggles, inline title and note editing"}">✎ Edit Mode: ${em ? "On" : "Off"}</button></div>`;
     const edge = this.selectedEdge ? this.canvas.edges.find((e) => e.id === this.selectedEdge) : null;
     const nodes = this.selectedNodes();
     if (edge) {
@@ -1449,26 +1760,44 @@ export class NodeMapController {
       html += `<div class="nm-insp-pair">${row("From side", sel("edge-fromSide", edge.fromSide, M.SIDES))}${row("To side", sel("edge-toSide", edge.toSide, M.SIDES))}</div>`;
       html += `<div class="nm-insp-pair">${row("Arrows", sel("edge-arrow", edge.arrow, M.ARROWS))}${row("Line", sel("edge-style", edge.style, M.LINE_STYLES))}</div>`;
       html += row("Route", sel("edge-curve", edge.curve, M.CURVES));
-      html += row("Color", swatches(edge.color));
+      html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(edge.color)}</div>`;
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="edge-reverse">⇄ Reverse</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
     } else if (nodes.length > 1) {
       html += `<div class="inspector-field"><span class="inspector-label">Selection</span><span class="inspector-val">${nodes.length} nodes</span></div>`;
       html += `<div class="inspector-field"><span class="inspector-label">Align</span><div class="nm-insp-grid">${M.ALIGN_MODES.map((m) => `<button type="button" class="nodemap-btn" data-insp="align" data-value="${m}">${m}</button>`).join("")}</div></div>`;
       html += `<div class="inspector-field"><span class="inspector-label">Distribute</span><div class="nm-insp-grid"><button type="button" class="nodemap-btn" data-insp="distribute" data-value="horizontal" ${nodes.length < 3 ? "disabled" : ""}>horizontally</button><button type="button" class="nodemap-btn" data-insp="distribute" data-value="vertical" ${nodes.length < 3 ? "disabled" : ""}>vertically</button></div></div>`;
-      html += row("Color", swatches(""));
-      html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="group">▭ Group</button><button type="button" class="nodemap-btn" data-insp="fit">Fit</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
+      const structs = nodes.filter((n) => n.type === "struct");
+      if (structs.length) {
+        const styles = new Set(structs.map((n) => n.data.style));
+        const cur = styles.size === 1 ? [...styles][0] : "";
+        html += row(`Struct style (${structs.length})`, sel("multi-style", cur, cur ? M.STRUCT_STYLES : ["", ...M.STRUCT_STYLES], cur ? null : ["mixed", ...M.STRUCT_STYLES]));
+      }
+      html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches("")}</div>`;
+      html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate the selection (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn" data-insp="group">▭ Group</button><button type="button" class="nodemap-btn" data-insp="fit">Fit</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
     } else if (nodes.length === 1) {
       const n = nodes[0];
       const d = n.data;
       html += row("Title", `<div class="nm-insp-inline">${input("title", M.displayTitle(n))}${n.customTitle ? '<button type="button" class="nodemap-btn" data-insp="reset-title" title="Back to the default title">Reset</button>' : ""}</div>`);
       html += `<div class="nm-insp-pair">${row("Width", input("w", n.w, 'type="number"'))}${row("Height", input("h", n.h, 'type="number"'))}</div>`;
-      html += row("Color", swatches(n.color));
+      if (M.AUTOFIT_TYPES.includes(n.type)) {
+        html += check("autofit", n.autoFit, "Auto-fit & Scale", "Size the node to all of its content; resizing then keeps the aspect ratio and scales the content");
+        if (n.autoFit) html += `<div class="inspector-field"><span class="inspector-label">Content scale</span><div class="nm-insp-inline"><span class="inspector-val">${Math.round(n.scale * 100)}% of ${n.baseW}×${n.baseH}</span>${n.scale !== 1 ? '<button type="button" class="nodemap-btn" data-insp="scale-reset" title="Back to 100%">100%</button>' : ""}</div></div>`;
+      }
+      html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(n.color, n.type === "group" ? "var(--text-muted)" : n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)")}</div>`;
       if (["struct", "source", "symbol"].includes(n.type)) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
       if (n.type === "struct") {
         html += row("Name", input("d-name", d.name, 'spellcheck="false"'));
-        html += row("Kind", sel("d-kind", d.kind, ["struct", "union"]));
+        html += `<div class="nm-insp-pair">${row("Kind", sel("d-kind", d.kind, ["struct", "union"]))}${row("Style", sel("d-style", d.style, M.STRUCT_STYLES))}</div>`;
         html += row("Defining file", input("d-path", d.path, `spellcheck="false" placeholder="${escapeHtml(d.hint || "from the index")}"`));
         html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="struct-types" aria-pressed="${d.showTypes}">Types: ${d.showTypes ? "shown" : "hidden"}</button><button type="button" class="nodemap-btn" data-insp="struct-guards" aria-pressed="${d.showGuards}">#ifdef: ${d.showGuards ? "shown" : "hidden"}</button></div>`;
+        html += check("d-disableKconfigEngine", d.disableKconfigEngine, "Disable Kconfig engine", "This node ignores the Kconfig engine: no #ifdef branch folds on its own");
+        const eng = this.kconfigEngineFor(n);
+        const why = d.disableKconfigEngine ? "off for this node" : !st.kconfigCollapse ? "off for the canvas" : eng ? `${eng.title || eng.tabId} · ${eng.version || "?"}${eng.arch ? ` · ${eng.arch}` : ""}: compiled-out branches fold` : `no resolved engine for ${n.version || "this revision"}`;
+        html += `<div class="inspector-field"><span class="inspector-label">Kconfig folding</span><span class="inspector-val">${escapeHtml(why)}</span></div>`;
+        const loaded = this.content.get(this.fetchKeyOf(n));
+        // Items of this revision's layout only (keys of moved lines hide nothing)
+        const hidden = loaded?.status === "ok" ? structRows(loaded.value, d, { editMode: true }).hidden : Object.keys(d.hiddenItems || {}).length;
+        if (hidden) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="show-hidden" title="Restore every hidden member, aggregate and #ifdef block">Show all hidden (${hidden})</button></div>`;
         const layout = this.content.get(this.fetchKeyOf(n))?.value;
         if (layout) html += `<div class="inspector-field"><span class="inspector-label">Definition</span><span class="inspector-val">${escapeHtml(`${layout.file_path}:${layout.line_s}-${layout.line_e}`)} · span from ${layout.span_source === "db" ? "the index" : "the source text"}; guards read from the source</span></div>`;
       } else if (n.type === "source") {
@@ -1482,20 +1811,40 @@ export class NodeMapController {
         html += `<div class="inspector-field"><span class="inspector-label">Embedded ${escapeHtml(d.tabType)} tab</span><span class="inspector-val">#${escapeHtml(d.hash)}</span></div>`;
         html += `<div class="inspector-field"><span class="inspector-label">Runs isolated: its own state, no session, nothing saved. Click it to interact; Esc or a click on the canvas gives the pointer back.</span></div>`;
       } else if (n.type === "note") {
-        html += `<label class="inspector-field nm-insp-check"><input type="checkbox" data-insp="d-markdown" ${d.markdown ? "checked" : ""}/> <span>Render Markdown</span></label>`;
+        html += check("d-markdown", d.markdown, "Render Markdown");
       } else if (n.type === "group") {
         const members = M.groupDescendants(this.canvas.nodes, n.id).length;
         html += `<div class="inspector-field"><span class="inspector-label">Members</span><span class="inspector-val">${members} (drag nodes in or out of the frame)</span></div>`;
       }
-      html += `<div class="nm-insp-actions">${["struct", "source", "man", "tab", "symbol"].includes(n.type) ? '<button type="button" class="nodemap-btn" data-insp="open-tab">↗ Open as tab</button>' : ""}<button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
+      html += `<div class="nm-insp-actions">${["struct", "source", "man", "tab", "symbol"].includes(n.type) ? '<button type="button" class="nodemap-btn" data-insp="open-tab">↗ Open as tab</button>' : ""}<button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
     } else {
       html += `<div class="inspector-field"><span class="inspector-label">Canvas</span><span class="inspector-val">${this.canvas.nodes.length} nodes · ${this.canvas.edges.length} connections</span></div>`;
-      html += `<div class="nm-insp-pair">${row("Grid", input("grid", this.canvas.settings.grid, 'type="number" min="4" max="200"'))}<label class="inspector-field nm-insp-check"><input type="checkbox" data-insp="snap" ${this.canvas.settings.snap ? "checked" : ""}/> <span>Snap</span></label></div>`;
+      html += `<div class="nm-insp-pair">${row("Grid", input("grid", st.grid, 'type="number" min="4" max="200"'))}${check("snap", st.snap, "Snap")}</div>`;
+      let engines = [];
+      try {
+        engines = (this.kconfigSource.list() || []).filter((e) => e && e.resolved);
+      } catch {
+        engines = [];
+      }
+      html += check("kconfig-collapse", st.kconfigCollapse, "Fold #ifdef branches the Kconfig engine compiles out", "Struct nodes fold the branches of #if / #ifdef blocks that the Kconfig engine's configuration leaves out");
+      if (engines.length > 1 || (st.kconfigEngine && !engines.some((e) => e.tabId === st.kconfigEngine))) {
+        const ids = ["", ...engines.map((e) => e.tabId)];
+        const labels = ["Auto: the engine of each node's revision", ...engines.map((e) => `${e.title || e.tabId} · ${e.version || "?"}${e.arch ? ` · ${e.arch}` : ""}`)];
+        if (st.kconfigEngine && !ids.includes(st.kconfigEngine)) {
+          ids.push(st.kconfigEngine);
+          labels.push("(closed engine)");
+        }
+        html += row("Kconfig engine", sel("kconfig-engine", st.kconfigEngine, ids, labels));
+      } else {
+        const e = engines[0];
+        html += `<div class="inspector-field"><span class="inspector-label">Kconfig engine</span><span class="inspector-val">${escapeHtml(e ? `${e.title || e.tabId} · ${e.version || "?"}${e.arch ? ` · ${e.arch}` : ""} (nodes of ${e.version || "that revision"})` : "None with a resolved configuration: open a Kconfig tab and turn its engine on")}</span></div>`;
+      }
       html += `<ul class="nm-help">
         <li>Drag the background to pan; wheel to zoom (Ctrl+wheel over node content)</li>
         <li>Shift/Ctrl+drag or the Select tool draws a selection box; Shift/Ctrl+click adds to it</li>
-        <li>Drag a header to move, a corner or edge to resize; double-click a title to rename</li>
+        <li>Drag a header to move, a corner or edge to resize; Edit Mode: double-click a title to rename</li>
         <li>Drag from a side dot (or a struct field dot) onto another node to connect</li>
+        <li>Ctrl+C / Ctrl+V copy and paste nodes (across NodeMap tabs), Ctrl+D duplicates</li>
         <li>Double-click the background for a note; Delete removes, arrows nudge</li>
       </ul>`;
     }
@@ -1510,7 +1859,22 @@ export class NodeMapController {
     const edge = this.selectedEdge ? this.canvas.edges.find((x) => x.id === this.selectedEdge) : null;
     const node = this.selected.size === 1 ? this.byId([...this.selected][0]) : null;
     const int = (v) => (/^\d+$/.test(String(v).trim()) ? parseInt(v, 10) : null);
-    if (k === "grid" && final) {
+    if (k === "color-custom") {
+      // Live while the picker is open; the inspector redraws once it is closed
+      if (!M.isCustomColor(val)) return;
+      return this.setColor(val, { inspector: final });
+    }
+    if (k === "kconfig-collapse") {
+      this.canvas.settings.kconfigCollapse = Boolean(val);
+    } else if (k === "kconfig-engine") {
+      this.canvas.settings.kconfigEngine = String(val || "");
+    } else if (k === "multi-style") {
+      if (!M.STRUCT_STYLES.includes(val)) return;
+      for (const n of this.selectedNodes()) if (n.type === "struct") n.data.style = val;
+    } else if (node && k === "autofit") {
+      M.setAutoFit(node, Boolean(val));
+      if (node.autoFit) this.fitQueue.add(node.id);
+    } else if (k === "grid" && final) {
       this.canvas.settings.grid = Math.max(4, Math.min(200, int(val) || M.GRID_DEFAULT));
       this.applyTransform();
     } else if (k === "snap") {
@@ -1527,7 +1891,9 @@ export class NodeMapController {
     } else if (node && (k === "w" || k === "h") && final) {
       const lim = M.SIZE_LIMITS[node.type];
       const v = int(val);
-      if (v) node[k] = k === "w" ? Math.max(lim.minW, Math.min(lim.maxW, v)) : Math.max(lim.minH, Math.min(lim.maxH, v));
+      // An auto-fitted node keeps its aspect ratio: the size sets the content scale
+      if (v && node.autoFit) M.setScaledSize(node, k, v);
+      else if (v) node[k] = k === "w" ? Math.max(lim.minW, Math.min(lim.maxW, v)) : Math.max(lim.minH, Math.min(lim.maxH, v));
     } else if (node && k === "version" && final) {
       node.version = String(val).trim();
     } else if (node && k.startsWith("d-")) {
@@ -1538,7 +1904,7 @@ export class NodeMapController {
       if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
     } else return;
     // Typing in a field keeps the inspector (and the caret) as it is
-    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-")) });
+    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h") });
   }
 
   onInspectorClick(e) {
@@ -1546,7 +1912,14 @@ export class NodeMapController {
     if (!btn) return;
     const k = btn.dataset.insp;
     const node = this.selected.size === 1 ? this.byId([...this.selected][0]) : null;
-    if (k === "color") this.setColor(btn.dataset.value || "");
+    if (k === "edit-mode") this.setEditMode(!this.canvas.settings.editMode);
+    else if (k === "color") this.setColor(btn.dataset.value || "");
+    else if (k === "duplicate") this.duplicateSelection();
+    else if (k === "show-hidden" && node) this.onStructAction(node, "show-hidden");
+    else if (k === "scale-reset" && node?.autoFit) {
+      M.setScaledSize(node, "w", node.baseW);
+      this.commit();
+    }
     else if (k === "align") this.align(btn.dataset.value);
     else if (k === "distribute") this.distribute(btn.dataset.value);
     else if (k === "group") this.addGroup();
@@ -1582,13 +1955,30 @@ export class NodeMapController {
     toast.success("Exported the canvas as JSON");
   }
 
+  /** Options of the vector export: loaded struct / source payloads and the struct rows' view state. */
+  svgOptions() {
+    return {
+      editMode: Boolean(this.canvas.settings.editMode),
+      content: (n) => {
+        const entry = this.content.get(this.fetchKeyOf(n));
+        return entry?.status === "ok" ? entry.value : null;
+      },
+      structOpts: (n) => this.structOpts(n),
+    };
+  }
+
+  /** The whole canvas as a standalone vector SVG document. */
+  canvasSvg() {
+    return canvasToSvg(this.canvas, (c) => resolveColor(c), this.svgOptions());
+  }
+
   exportSVG() {
-    this.download("nodemap_canvas.svg", new Blob([canvasToSvg(this.canvas, (c) => resolveColor(c))], { type: "image/svg+xml" }));
+    this.download("nodemap_canvas.svg", new Blob([this.canvasSvg()], { type: "image/svg+xml" }));
     toast.success("Exported SVG image");
   }
 
   exportPNG() {
-    const svg = canvasToSvg(this.canvas, (c) => resolveColor(c));
+    const svg = this.canvasSvg();
     const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
     const img = new Image();
     img.onload = () => {

@@ -184,6 +184,19 @@
 .nm-node.nm-interacting { outline: 2px solid var(--accent-green); outline-offset: 1px; }
 .nm-node.nm-has-accent { border-color: color-mix(in srgb, var(--nm-accent) 55%, var(--border-color)); }
 
+/* Auto-fitted nodes lay out at their natural size and are drawn scaled from the top left corner; their
+ * resize handles and side ports keep their on-screen size (counter-scaled about their own center) */
+.nm-node.nm-autofit { transform-origin: 0 0; }
+.nm-autofit > .nm-rz, .nm-autofit > .nm-port-side { transform: scale(calc(1 / var(--nm-scale, 1))); }
+.nm-autofit > .nm-port-side:hover { transform: scale(calc(1.3 / var(--nm-scale, 1))); }
+
+/* Measuring a node's natural size (nodemap_controller.measureNatural): content unclipped, unscaled */
+.nm-node.nm-measuring { width: max-content !important; height: max-content !important; transform: none !important; }
+.nm-node.nm-measuring.nm-measure-wrap { width: var(--nm-measure-w) !important; }
+.nm-measuring .nm-node-body,
+.nm-measuring .nm-scroll,
+.nm-measuring .nm-man .man-body { flex: none !important; overflow: visible !important; min-height: 0; max-height: none !important; }
+
 .nm-node-head {
   display: flex;
   align-items: center;
@@ -358,6 +371,7 @@
 }
 
 .nm-chip.on { border-color: var(--accent-blue); color: var(--text-primary); background: color-mix(in srgb, var(--accent-blue) 14%, transparent); }
+.nm-chip-note { cursor: default; color: var(--text-muted); border-style: dashed; }
 .nm-chip:disabled { opacity: 0.45; cursor: default; }
 
 .nm-struct-src {
@@ -387,13 +401,102 @@
 .nm-struct-rows { font-family: var(--font-mono); padding: 2px 0; }
 
 .nm-sf {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 4px 1px calc(4px + var(--nm-depth, 0) * 14px);
+  padding: 1px 4px 1px calc(4px + var(--nm-gutter, 0px) + var(--nm-depth, 0) * 14px);
   white-space: nowrap;
   border-left: 2px solid transparent;
 }
+
+/* Controls column (folds, type toggle): inline in list style, a fixed column in table style */
+.nm-sf-ctl { display: contents; }
+
+/* #if scope bars: one track per nesting level, from the #if line through #elif / #else to #endif */
+.nm-pp-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(6px + var(--nm-pp-level, 0) * 6px);
+  width: 2px;
+  background: var(--nm-pp-c, var(--syn-preproc));
+  pointer-events: none;
+}
+
+.nm-pp-l0 { --nm-pp-c: color-mix(in srgb, var(--syn-preproc) 90%, transparent); }
+.nm-pp-l1 { --nm-pp-c: color-mix(in srgb, var(--syn-preproc) 70%, transparent); }
+.nm-pp-l2 { --nm-pp-c: color-mix(in srgb, var(--syn-preproc) 55%, transparent); }
+.nm-pp-l3 { --nm-pp-c: color-mix(in srgb, var(--syn-preproc) 40%, transparent); }
+.nm-pp-start { top: 50%; }
+.nm-pp-end { bottom: 50%; }
+
+.nm-pp-start::after, .nm-pp-mid::after, .nm-pp-end::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  width: 5px;
+  height: 2px;
+  background: var(--nm-pp-c, var(--syn-preproc));
+}
+
+.nm-pp-start::after { top: 0; }
+.nm-pp-mid::after { top: calc(50% - 1px); }
+.nm-pp-end::after { bottom: 0; }
+
+/* Table style: Type | Symbol columns with cell borders */
+.nm-style-table .nm-sf {
+  padding-left: calc(4px + var(--nm-gutter, 0px));
+  padding-top: 0;
+  padding-bottom: 0;
+  min-height: 17px;
+  border-bottom: 1px solid var(--border-muted);
+  align-items: stretch;
+}
+
+.nm-style-table .nm-sf > * { align-self: center; }
+.nm-style-table .nm-sf-ctl { display: flex; gap: 2px; width: 14px; flex-shrink: 0; }
+.nm-edit .nm-style-table .nm-sf-ctl { width: 30px; }
+
+.nm-style-table .nm-sf > .nm-sf-cell { align-self: stretch; display: flex; align-items: center; }
+
+.nm-style-table .nm-sf-type.nm-sf-cell {
+  width: var(--nm-type-col, 12ch);
+  flex-shrink: 0;
+  box-sizing: content-box;
+  padding: 0 6px 0 calc(var(--nm-depth, 0) * 2ch);
+  border-right: 1px solid var(--border-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  gap: 0.5ch;
+}
+
+.nm-style-table .nm-sf-name.nm-sf-cell { flex: 1; padding-left: 2px; }
+.nm-style-table .nm-sf-pp { padding-left: calc(4px + var(--nm-gutter, 0px)); }
+.nm-style-table .nm-sf-pp .nm-sf-pptext { padding-left: 2px; }
+
+/* Hidden items (Edit Mode shows them dimmed), members of a compiled-out branch */
+.nm-sf.nm-sf-dim { opacity: 0.45; }
+.nm-sf.nm-sf-hidden { text-decoration: line-through; text-decoration-color: var(--text-muted); }
+.nm-sf.nm-sf-dead:not(.nm-sf-pp) .nm-sf-name, .nm-sf.nm-sf-dead:not(.nm-sf-pp) .nm-sf-type { opacity: 0.65; font-style: italic; }
+
+.nm-sf-hide {
+  font-size: var(--fs-9, 9px);
+  line-height: 1;
+  padding: 1px 3px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.nm-sf:hover .nm-sf-hide, .nm-sf-hide.on, .nm-sf-hide:focus-visible { opacity: 1; }
+.nm-sf-hide:hover { color: var(--text-primary); border-color: var(--border-color); }
+.nm-sf-hide.on { color: var(--accent-blue); }
+.nm-sf-count { color: var(--text-muted); font-weight: 400; }
 
 .nm-sf:hover { background: var(--bg-hover); }
 .nm-sf.nm-guarded { border-left-color: color-mix(in srgb, var(--syn-preproc) 55%, transparent); }
@@ -407,9 +510,28 @@
 
 .nm-sf-pp {
   color: var(--syn-preproc);
-  padding-left: calc(4px + var(--nm-depth, 0) * 14px + var(--nm-pp-depth, 0) * 8px);
   font-style: italic;
 }
+
+.nm-sf-pp.nm-pp-false .nm-sf-pptext { opacity: 0.7; text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--syn-preproc) 50%, transparent); }
+
+/* A folded #if branch: its directive and how many members it holds */
+.nm-sf-ppsum { background: color-mix(in srgb, var(--syn-preproc) 7%, transparent); }
+
+.nm-sf-ppsum-label {
+  border: 1px solid color-mix(in srgb, var(--syn-preproc) 45%, transparent);
+  border-radius: 8px;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-style: normal;
+  font-size: var(--fs-9, 9px);
+  padding: 0 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.nm-sf-ppsum-label:hover { color: var(--text-primary); border-color: var(--syn-preproc); }
 
 .nm-sf-tt, .nm-sf-fold {
   font-size: var(--fs-9, 9px);
@@ -575,6 +697,33 @@
 
 .nm-swatch.on { border-color: var(--text-primary); box-shadow: 0 0 0 2px var(--bg-secondary), 0 0 0 3px var(--text-primary); }
 .nm-swatch:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+/* Custom color: a native color input inside the last swatch (rainbow ring until one is picked) */
+.nm-swatch-custom {
+  position: relative;
+  overflow: hidden;
+  box-sizing: border-box;
+  background: conic-gradient(var(--accent-red), var(--accent-yellow), var(--accent-green), var(--accent-cyan), var(--accent-blue), var(--accent-purple), var(--accent-red));
+}
+
+.nm-swatch-custom.on { background: var(--nm-sw); }
+.nm-swatch-custom:focus-within { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+
+.nm-swatch-custom input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  border: 0;
+  padding: 0;
+}
+
+/* Edit Mode toggle: always at the top of the inspector */
+.nm-insp-mode { display: flex; }
+.nm-mode-toggle { flex: 1; justify-content: center; border-color: var(--border-color); font-weight: 600; }
+.nm-mode-toggle[aria-pressed="true"] { color: var(--accent-green); border-color: var(--accent-green); background: color-mix(in srgb, var(--accent-green) 12%, transparent); }
 
 .nm-help { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-11, 11px); color: var(--text-secondary); }
 

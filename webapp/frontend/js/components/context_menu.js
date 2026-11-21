@@ -1225,6 +1225,8 @@ class ContextMenu {
       }
       items.push({ separator: true });
       if (controller.selected?.size > 1) items.push({ label: "Group Selection", icon: "▭", onClick: () => controller.addGroup() });
+      items.push({ label: controller.selected?.size > 1 ? `Duplicate ${controller.selected.size} Nodes` : "Duplicate", icon: "⧉", shortcut: "Ctrl+D", onClick: () => controller.duplicateNode(node.id) });
+      items.push({ label: controller.selected?.size > 1 ? `Copy ${controller.selected.size} Nodes` : "Copy", icon: "📋", shortcut: "Ctrl+C", onClick: () => controller.copySelection() });
       items.push({ label: "Center / Focus Node", icon: "🎯", onClick: () => controller.centerOnNode(node.id) });
       items.push({ label: controller.selected?.size > 1 ? `Remove ${controller.selected.size} Nodes` : "Remove Node", icon: "🗑️", danger: true, onClick: () => controller.deleteSelection() });
       this.renderMenu(x, y, { header: { title: title || "Node", sub: `NodeMap [${node.type}]` }, items });
@@ -1236,6 +1238,7 @@ class ContextMenu {
       items.push({ label: "Add Node…", icon: "➕", onClick: () => controller.showAddMenu(x, y) });
       if (at) items.push({ label: "Add Note Here", icon: "📝", onClick: () => controller.addNoteAt(Math.round(at.x), Math.round(at.y)) });
       items.push({ label: "Add Group", icon: "▭", onClick: () => controller.addGroup() });
+      items.push({ label: "Paste Nodes", icon: "📋", shortcut: "Ctrl+V", disabled: !controller.readClipboard?.(), onClick: () => controller.pasteClipboard() });
       items.push({ separator: true });
       items.push({ label: "Fit to View", icon: "⤢", onClick: () => controller.fitView() });
       items.push({ label: "Reset View & Zoom (100%)", icon: "🔄", onClick: () => controller.resetTransform() });

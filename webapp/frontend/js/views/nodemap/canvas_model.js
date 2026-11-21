@@ -6,9 +6,13 @@
  * persisted JSON (localStorage and Export JSON) always has the shape `normalizeCanvas()` produces.
  *
  * Canvas JSON (`schema: "kip-nodemap-canvas"`, `version: 1`):
- *   { schema, version, nodes: [Node], edges: [Edge], viewport: {x, y, zoom}, settings: {snap, grid} }
- *   Node  { id, type, x, y, w, h, title, customTitle, color, groupId, version, repo, data }
+ *   { schema, version, nodes: [Node], edges: [Edge], viewport: {x, y, zoom},
+ *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine} }
+ *   Node  { id, type, x, y, w, h, title, customTitle, color, groupId, version, repo, data,
+ *           autoFit, baseW, baseH, scale }
  *   Edge  { id, from, to, fromSide, toSide, fromField, toField, label, arrow, style, curve, color }
+ * `color` is a preset accent id (`ACCENTS`) or a custom `#rrggbb`. With `autoFit` the node is sized to its
+ * content: `baseW`×`baseH` is the natural (unscaled) size and `w`/`h` = base × `scale`.
  */
 
 export const CANVAS_SCHEMA = "kip-nodemap-canvas";
@@ -23,6 +27,13 @@ export const CURVES = ["bezier", "straight", "orthogonal"];
 export const SOURCE_MODES = ["file", "range", "symbol"];
 export const SYMBOL_KINDS = ["", "struct", "union", "function", "macro", "enum"];
 export const ALIGN_MODES = ["left", "center", "right", "top", "middle", "bottom"];
+export const STRUCT_STYLES = ["list", "table"];
+/** Node types whose content can be measured and scaled (`autoFit`); groups and live tab iframes cannot. */
+export const AUTOFIT_TYPES = ["struct", "symbol", "note", "source", "man"];
+export const SCALE_MIN = 0.2;
+export const SCALE_MAX = 4;
+/** Largest natural size an auto-fitted node takes (canvas units, before scaling). */
+export const AUTOFIT_MAX = { w: 4000, h: 8000 };
 
 /** Preset accents: ids map to theme tokens, so every theme (dark, light, high contrast) recolors them. */
 export const ACCENTS = [
@@ -37,10 +48,38 @@ export const ACCENTS = [
   { id: "pink", label: "Pink" },
 ];
 const ACCENT_IDS = new Set(ACCENTS.map((a) => a.id));
+const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
 
-/** CSS color of an accent id (`""` = the type's default token). */
+/** Whether `c` is a custom `#rrggbb` color (preset ids are not). */
+export function isCustomColor(c) {
+  return typeof c === "string" && HEX_COLOR_RE.test(c);
+}
+
+/** A stored color: a preset accent id or a custom `#rrggbb` (lower case); anything else is `""`. */
+export function normalizeColor(c) {
+  if (isCustomColor(c)) return c.toLowerCase();
+  return typeof c === "string" && ACCENT_IDS.has(c) ? c : "";
+}
+
+/** CSS color of an accent id or custom `#rrggbb` (`""` = the type's default token). */
 export function accentVar(id, fallback = "var(--border-color)") {
+  if (isCustomColor(id)) return id.toLowerCase();
   return id && ACCENT_IDS.has(id) ? `var(--accent-${id})` : fallback;
+}
+
+/**
+ * `#rrggbb` of a resolved CSS color (`#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()` / `rgba()`), for a native
+ * color input; null when it cannot be read.
+ */
+export function colorToHex(c) {
+  const s = String(c || "").trim().toLowerCase();
+  let m = /^#([0-9a-f]{3})$/.exec(s);
+  if (m) return `#${[...m[1]].map((x) => x + x).join("")}`;
+  m = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/.exec(s);
+  if (m) return `#${m[1]}`;
+  m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/.exec(s);
+  if (m) return `#${m.slice(1, 4).map((v) => Math.max(0, Math.min(255, Math.round(Number(v)))).toString(16).padStart(2, "0")).join("")}`;
+  return null;
 }
 
 /** Default and limit geometry per node type (canvas units, zoom-controlled). */
@@ -79,6 +118,11 @@ const boolMap = (m) => {
   for (const [k, v] of Object.entries(m)) if (typeof v === "boolean" && k.length <= 256) out[k] = v;
   return out;
 };
+const trueMap = (m) => {
+  const out = {};
+  for (const [k, v] of Object.entries(boolMap(m))) if (v) out[k] = true;
+  return out;
+};
 
 /** Type-specific payload, normalized. */
 export function normalizeData(type, raw) {
@@ -96,6 +140,12 @@ export function normalizeData(type, raw) {
         showGuards: typeof d.showGuards === "boolean" ? d.showGuards : true,
         typeOverrides: boolMap(d.typeOverrides),
         collapsed: boolMap(d.collapsed),
+        style: pick(d.style, STRUCT_STYLES, "list"),
+        // #if branches folded (true) or unfolded (false) by hand, overriding the Kconfig auto-collapse
+        collapsedGuards: boolMap(d.collapsedGuards),
+        // Members, aggregates (with their subtree) and #if blocks hidden in Edit Mode
+        hiddenItems: trueMap(d.hiddenItems),
+        disableKconfigEngine: Boolean(d.disableKconfigEngine),
       };
     case "symbol":
       return {
@@ -178,20 +228,35 @@ export function normalizeNode(raw) {
   const type = raw.type;
   const lim = SIZE_LIMITS[type];
   const data = normalizeData(type, raw.data);
+  const autoFit = AUTOFIT_TYPES.includes(type) && raw.autoFit === true;
+  let w = Math.round(clamp(num(raw.w, lim.w), lim.minW, lim.maxW));
+  let h = Math.round(clamp(num(raw.h, lim.h), lim.minH, lim.maxH));
+  const baseW = Math.round(clamp(num(raw.baseW, w), 20, AUTOFIT_MAX.w));
+  const baseH = Math.round(clamp(num(raw.baseH, h), 20, AUTOFIT_MAX.h));
+  const scale = autoFit ? clamp(num(raw.scale, 1), SCALE_MIN, SCALE_MAX) : 1;
+  if (autoFit) {
+    // Content-sized: the per-type limits do not apply, the geometry follows base × scale
+    w = Math.round(baseW * scale);
+    h = Math.round(baseH * scale);
+  }
   return {
     id: typeof raw.id === "string" && ID_RE.test(raw.id) ? raw.id : newId("n"),
     type,
     x: Math.round(num(raw.x, 80)),
     y: Math.round(num(raw.y, 80)),
-    w: Math.round(clamp(num(raw.w, lim.w), lim.minW, lim.maxW)),
-    h: Math.round(clamp(num(raw.h, lim.h), lim.minH, lim.maxH)),
+    w,
+    h,
     title: str(raw.title, "", 512) || defaultTitle(type, data),
     customTitle: str(raw.customTitle, "", 512),
-    color: ACCENT_IDS.has(raw.color) ? raw.color : "",
+    color: normalizeColor(raw.color),
     groupId: typeof raw.groupId === "string" && ID_RE.test(raw.groupId) ? raw.groupId : null,
     version: str(raw.version, "", 256),
     repo: str(raw.repo, "", 128),
     data,
+    autoFit,
+    baseW: autoFit ? baseW : w,
+    baseH: autoFit ? baseH : h,
+    scale: Math.round(scale * 1000) / 1000,
   };
 }
 
@@ -219,7 +284,7 @@ export function normalizeEdge(raw, nodeIds = null) {
     arrow: pick(raw.arrow, ARROWS, "forward"),
     style: pick(raw.style, LINE_STYLES, "solid"),
     curve: pick(raw.curve, CURVES, "bezier"),
-    color: ACCENT_IDS.has(raw.color) ? raw.color : "",
+    color: normalizeColor(raw.color),
   };
 }
 
@@ -228,7 +293,23 @@ export function createEdge(opts = {}) {
 }
 
 export function emptyCanvas() {
-  return { schema: CANVAS_SCHEMA, version: CANVAS_VERSION, nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, settings: { snap: false, grid: GRID_DEFAULT } };
+  return { schema: CANVAS_SCHEMA, version: CANVAS_VERSION, nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, settings: normalizeSettings({}) };
+}
+
+/**
+ * Canvas-wide settings: snap grid; `editMode` (node editing controls shown); `kconfigCollapse` (fold #if
+ * branches a Kconfig engine compiles out) and `kconfigEngine` (engine tab id, `""` = the engine of each
+ * node's revision).
+ */
+export function normalizeSettings(raw) {
+  const st = isObj(raw) ? raw : {};
+  return {
+    snap: Boolean(st.snap),
+    grid: clamp(Math.round(num(st.grid, GRID_DEFAULT)), 4, 200),
+    editMode: st.editMode === true,
+    kconfigCollapse: st.kconfigCollapse !== false,
+    kconfigEngine: str(st.kconfigEngine, "", 256),
+  };
 }
 
 /**
@@ -261,14 +342,13 @@ export function normalizeCanvas(raw) {
     edges.push(edge);
   }
   const vp = isObj(raw.viewport) ? raw.viewport : {};
-  const st = isObj(raw.settings) ? raw.settings : {};
   return {
     schema: CANVAS_SCHEMA,
     version: CANVAS_VERSION,
     nodes,
     edges,
     viewport: { x: num(vp.x, 0), y: num(vp.y, 0), zoom: clamp(num(vp.zoom, 1), ZOOM_MIN, ZOOM_MAX) },
-    settings: { snap: Boolean(st.snap), grid: clamp(Math.round(num(st.grid, GRID_DEFAULT)), 4, 200) },
+    settings: normalizeSettings(raw.settings),
   };
 }
 
@@ -374,6 +454,85 @@ export function resizeRect(rect, handle, dx, dy, limits, grid = 0) {
     y = bottom - h;
   }
   return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+}
+
+/**
+ * Aspect-locked resize of an auto-fitted node: handle `handle` dragged by (dx, dy) changes the content
+ * scale, never the content box. `rect` is the geometry at drag start, `base` its natural `{baseW, baseH}`.
+ * Edge handles scale by their axis, corners by the axis that moved more; the opposite edge stays put.
+ * Returns `{x, y, w, h, scale}` with `w`/`h` = base × scale.
+ */
+export function scaleResize(rect, handle, dx, dy, base) {
+  const bw = Math.max(1, base.baseW);
+  const bh = Math.max(1, base.baseH);
+  const cur = rect.w / bw;
+  const right = rect.x + rect.w;
+  const bottom = rect.y + rect.h;
+  const horiz = handle.includes("e") || handle.includes("w");
+  const vert = handle.includes("n") || handle.includes("s");
+  const nw = rect.w + (handle.includes("e") ? dx : handle.includes("w") ? -dx : 0);
+  const nh = rect.h + (handle.includes("s") ? dy : handle.includes("n") ? -dy : 0);
+  const sw = nw / bw;
+  const sh = nh / bh;
+  let s = cur;
+  if (horiz && vert) s = Math.abs(sw - cur) >= Math.abs(sh - cur) ? sw : sh;
+  else if (horiz) s = sw;
+  else if (vert) s = sh;
+  s = clamp(s, SCALE_MIN, SCALE_MAX);
+  const w = Math.round(bw * s);
+  const h = Math.round(bh * s);
+  return {
+    x: Math.round(handle.includes("w") ? right - w : rect.x),
+    y: Math.round(handle.includes("n") ? bottom - h : rect.y),
+    w,
+    h,
+    scale: Math.round(s * 1000) / 1000,
+  };
+}
+
+/**
+ * Apply a measured natural content size to an auto-fitted node (mutated): `baseW`/`baseH` become the
+ * size (bounded by `AUTOFIT_MAX` and the type's minimum), `w`/`h` follow base × scale. True when the
+ * geometry changed.
+ */
+export function applyNaturalSize(node, natW, natH) {
+  if (!node.autoFit || !(natW > 0) || !(natH > 0)) return false;
+  const lim = SIZE_LIMITS[node.type];
+  const baseW = Math.round(clamp(natW, Math.min(lim.minW, AUTOFIT_MAX.w), AUTOFIT_MAX.w));
+  const baseH = Math.round(clamp(natH, Math.min(lim.minH, AUTOFIT_MAX.h), AUTOFIT_MAX.h));
+  const w = Math.round(baseW * node.scale);
+  const h = Math.round(baseH * node.scale);
+  const changed = baseW !== node.baseW || baseH !== node.baseH || w !== node.w || h !== node.h;
+  Object.assign(node, { baseW, baseH, w, h });
+  return changed;
+}
+
+/** Turn auto-fit on or off (mutated); off keeps the current on-screen size at scale 1. */
+export function setAutoFit(node, on) {
+  if (!AUTOFIT_TYPES.includes(node.type)) return node;
+  if (on && !node.autoFit) {
+    Object.assign(node, { autoFit: true, scale: 1, baseW: node.w, baseH: node.h });
+  } else if (!on && node.autoFit) {
+    const lim = SIZE_LIMITS[node.type];
+    Object.assign(node, {
+      autoFit: false,
+      scale: 1,
+      w: Math.round(clamp(node.w, lim.minW, lim.maxW)),
+      h: Math.round(clamp(node.h, lim.minH, lim.maxH)),
+    });
+    node.baseW = node.w;
+    node.baseH = node.h;
+  }
+  return node;
+}
+
+/** Set the on-screen width or height of an auto-fitted node: the other axis follows the aspect ratio. */
+export function setScaledSize(node, axis, value) {
+  const s = clamp(axis === "w" ? value / Math.max(1, node.baseW) : value / Math.max(1, node.baseH), SCALE_MIN, SCALE_MAX);
+  node.scale = Math.round(s * 1000) / 1000;
+  node.w = Math.round(node.baseW * node.scale);
+  node.h = Math.round(node.baseH * node.scale);
+  return node;
 }
 
 /** Normalized rectangle between two corner points (marquee). */
@@ -546,6 +705,62 @@ export function removeNodes(canvas, ids) {
   return canvas;
 }
 
+// ------------------------------------------------------------------ duplicate / clipboard
+
+/**
+ * Deep copy of nodes `nodeIds` (a group brings every member inside it) with fresh ids, moved by `offset`
+ * `{x, y}`: members of a copied group stay in the copy of it (others leave any group), and every edge
+ * whose two ends are both copied is copied too. Returns `{nodes, edges}`; `canvas` is not changed.
+ */
+export function cloneSubgraph(canvas, nodeIds, offset = { x: 0, y: 0 }) {
+  const picked = dragSet(canvas.nodes, nodeIds);
+  const idMap = new Map(picked.map((n) => [n.id, newId("n")]));
+  const dx = Math.round(num(offset?.x, 0));
+  const dy = Math.round(num(offset?.y, 0));
+  // Document order keeps the paint order of the copies
+  const nodes = canvas.nodes.filter((n) => idMap.has(n.id)).map((n) => {
+    const copy = JSON.parse(JSON.stringify(n));
+    copy.id = idMap.get(n.id);
+    copy.x = n.x + dx;
+    copy.y = n.y + dy;
+    copy.groupId = n.groupId && idMap.has(n.groupId) ? idMap.get(n.groupId) : null;
+    return copy;
+  });
+  const edges = canvas.edges.filter((e) => idMap.has(e.from) && idMap.has(e.to)).map((e) => ({
+    ...JSON.parse(JSON.stringify(e)),
+    id: newId("e"),
+    from: idMap.get(e.from),
+    to: idMap.get(e.to),
+  }));
+  return { nodes, edges };
+}
+
+export const CLIPBOARD_KEY = "kip-nodemap-clipboard";
+export const CLIPBOARD_SCHEMA = "kip-nodemap-clip";
+
+/** Clipboard payload of a selection (shared by every NodeMap tab through localStorage). */
+export function clipboardPayload(canvas, nodeIds, origin = "") {
+  const { nodes, edges } = cloneSubgraph(canvas, nodeIds);
+  return { schema: CLIPBOARD_SCHEMA, version: CANVAS_VERSION, origin: str(origin, "", 256), stamp: newId("c"), nodes, edges };
+}
+
+/** A clipboard payload repaired (null when it is not one): nodes normalized, edges kept between them. */
+export function normalizeClipboard(raw) {
+  if (!isObj(raw) || raw.schema !== CLIPBOARD_SCHEMA || !Array.isArray(raw.nodes)) return null;
+  const nodes = [];
+  const seen = new Set();
+  for (const n of raw.nodes.slice(0, 5000)) {
+    const node = normalizeNode(n);
+    if (!node || seen.has(node.id)) continue;
+    seen.add(node.id);
+    nodes.push(node);
+  }
+  if (!nodes.length) return null;
+  for (const n of nodes) if (n.groupId && !seen.has(n.groupId)) n.groupId = null;
+  const edges = (Array.isArray(raw.edges) ? raw.edges : []).map((e) => normalizeEdge(e, seen)).filter(Boolean);
+  return { schema: CLIPBOARD_SCHEMA, version: CANVAS_VERSION, origin: str(raw.origin, "", 256), stamp: str(raw.stamp, "", 128), nodes, edges };
+}
+
 // ------------------------------------------------------------------ struct toggles
 
 /** Stable key of a struct layout item: its source line and name (survives reloads of the same revision). */
@@ -595,4 +810,32 @@ export function tabTypeOfHash(hash) {
 /** URL of the isolated embed shell for a tab hash: the app with `?embed=1` (no chrome, no session). */
 export function embedSrc(hash, base = "/") {
   return `${base}?embed=1#${String(hash || "").replace(/^#/, "")}`;
+}
+
+/** Hide or restore one struct item (member, aggregate with its subtree, or `#if` block by its opening line). */
+export function toggleHidden(structData, key) {
+  if (!key) return false;
+  if (structData.hiddenItems[key]) delete structData.hiddenItems[key];
+  else structData.hiddenItems[key] = true;
+  return Boolean(structData.hiddenItems[key]);
+}
+
+/** Restore every hidden struct item; returns how many there were. */
+export function showAllHidden(structData) {
+  const n = Object.keys(structData.hiddenItems || {}).length;
+  structData.hiddenItems = {};
+  return n;
+}
+
+/**
+ * Fold or unfold one `#if` branch by hand. `autoCollapsed` is what the Kconfig engine decides for it:
+ * a manual state equal to it is dropped, so the branch follows the engine again.
+ */
+export function toggleGuardCollapse(structData, key, autoCollapsed = false) {
+  const manual = structData.collapsedGuards[key];
+  const now = typeof manual === "boolean" ? manual : Boolean(autoCollapsed);
+  const next = !now;
+  if (next === Boolean(autoCollapsed)) delete structData.collapsedGuards[key];
+  else structData.collapsedGuards[key] = next;
+  return next;
 }
