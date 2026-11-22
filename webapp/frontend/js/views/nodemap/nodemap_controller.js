@@ -14,6 +14,8 @@ import { state } from "../../state.js";
 import { urlSync } from "../../url_sync.js";
 import { toast } from "../../components/toast.js";
 import { escapeHtml } from "../../components/modal.js";
+import { shortRef } from "../../components/ref_picker.js";
+import { registerSelectionVersionApplier } from "../../components/version_switch.js";
 import { resolveColor } from "../../utils/theme.js";
 import { onUiScaleChanged } from "../../utils/ui_scale.js";
 import { isDocumentationPath } from "../docs/rst_renderer.js";
@@ -55,7 +57,7 @@ import {
 import { layoutGraphJob } from "./nodemap_worker.js";
 import { renderStructBody } from "./struct_view.js";
 import { NodeMapTourPlayer } from "./tour_mode.js";
-import { applyCanvasVersion, diffStructLayouts, renderStructDiffBadge, revertCanvasVersion } from "./version_diff.js";
+import { applyCanvasVersion, diffStructLayouts, renderStructDiffBadge, retargetNodeVersions, revertCanvasVersion } from "./version_diff.js";
 import { VIRTUAL_THRESHOLD, estimateNaturalSourceSize, mountVirtualDiff, mountVirtualSource, visibleCanvasRect } from "./virtual_source.js";
 import { NodeMapWorkerPool } from "./worker_pool.js";
 
@@ -130,6 +132,9 @@ export class NodeMapController {
     this.currentVersion = tabData?.version || state.currentVersion;
     this.repo = tabData?.repo || state.activeRepo();
     this.storageKey = `${M.STORAGE_PREFIX}${tabData?.id || "default"}`;
+    // The header's Apply moves the selected nodes instead of the tab while some are selected
+    this.unregisterApplier?.();
+    this.unregisterApplier = tabData?.id ? registerSelectionVersionApplier(tabData.id, (ref) => this.applyVersionToSelection(ref)) : null;
 
     const firstInit = !this.canvas;
     if (firstInit) {
@@ -216,6 +221,8 @@ export class NodeMapController {
 
   dispose() {
     this._disposeGen += 1;
+    this.unregisterApplier?.();
+    this.unregisterApplier = null;
     this.flushSave();
     clearTimeout(this.kconfigTimer);
     this.kconfigTimer = null;
@@ -1867,6 +1874,7 @@ export class NodeMapController {
 
   compareVersion(targetVersion) {
     this.versionDiffTarget = String(targetVersion || "").trim();
+    this.versionDiffShown = this.versionDiffTarget;
     this.versionDiffCache.clear();
     for (const n of this.canvas?.nodes || []) if (n.type === "struct") this.renderer?.invalidate(n.id);
     this.commit({ save: false });
@@ -1881,6 +1889,47 @@ export class NodeMapController {
       this.commit();
     }
     return res.changedIds;
+  }
+
+  /**
+   * Move the selected nodes to revision `ref` as one undo step (header Apply, multi-selection
+   * Revision field). Null when nothing is selected (the caller then switches the tab's default
+   * revision); else `{ changedIds, level, message }` for a toast. Nodes without a revision are skipped.
+   */
+  applyVersionToSelection(ref, { toastResult = false } = {}) {
+    const target = String(ref || "").trim();
+    const nodes = this.selectedNodes();
+    if (!target || !nodes.length) return null;
+    // The header names refs of the tab's repository (app.js moves a tab across projects otherwise)
+    const res = retargetNodeVersions(nodes, target, { repo: this.repo || state.repoOf(this.tab) });
+    const label = shortRef(target);
+    const plural = (n) => `${n} selected node${n === 1 ? "" : "s"}`;
+    let level = "success";
+    let message;
+    if (res.changedIds.length) {
+      this.versionDiffCache.clear();
+      for (const id of res.changedIds) {
+        this.renderer?.invalidate(id);
+        this.portOffsets.delete(id);
+      }
+      this.commit();
+      message = `Updated ${plural(res.changedIds.length)} to ${label}`;
+      if (res.unchanged) message += ` (${res.unchanged} already on it)`;
+      if (res.skipped) message += ` · ${res.skipped} without a revision skipped`;
+      if (res.otherRepo) message += ` · ${res.otherRepo} of another repository skipped`;
+    } else if (res.otherRepo) {
+      level = "info";
+      message = `The ${plural(res.otherRepo)} ${res.otherRepo === 1 ? "belongs" : "belong"} to another repository than ${label}`;
+    } else if (res.unchanged) {
+      level = "info";
+      message = `The ${plural(res.unchanged)} ${res.unchanged === 1 ? "is" : "are"} already on ${label}`;
+    } else {
+      level = "info";
+      message = `The ${plural(res.skipped)} ${res.skipped === 1 ? "has" : "have"} no revision: clear the selection to switch this NodeMap's default revision`;
+    }
+    const out = { changedIds: res.changedIds, unchanged: res.unchanged, skipped: res.skipped, otherRepo: res.otherRepo, level, message };
+    if (toastResult) toast[level]?.(message);
+    return out;
   }
 
   revertTargetVersion() {

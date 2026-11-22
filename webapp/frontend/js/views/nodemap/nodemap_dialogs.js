@@ -22,6 +22,7 @@ import {
   renameNamedCanvas, saveNamedCanvas,
 } from "./nodemap_library.js";
 import { generateImpactMap } from "./impact_map.js";
+import { pickButtonHtml, wireFormPickers } from "./nodemap_pickers.js";
 import { sessionManager } from "../../session_manager.js";
 
 /** Tab types a KernelInfo tab node offers (feature-gated per project). */
@@ -116,21 +117,24 @@ export function showExportMenu(ctrl, x, y) {
 
 export function openNodeDialog(ctrl, type, existing = null) {
   const v = existing?.version || ctrl.currentVersion || "";
-  const field = (name, label, value = "", extra = "") =>
-    `<label class="nm-form-row"><span>${escapeHtml(label)}</span><input name="${name}" value="${escapeHtml(value ?? "")}" ${extra}/></label>`;
-  let body = field("version", "Revision", v, 'spellcheck="false"');
+  // `pick`: "version" / "file" adds the picker button (`nodemap_pickers.js`); `data-ac` autocompletes
+  const field = (name, label, value = "", extra = "", pick = "") => {
+    const inp = `<input name="${name}" value="${escapeHtml(value ?? "")}" ${extra}/>`;
+    return `<label class="nm-form-row"><span>${escapeHtml(label)}</span>${pick ? `<div class="nm-pick-wrap">${inp}${pickButtonHtml(pick, name)}</div>` : inp}</label>`;
+  };
+  let body = field("version", "Revision", v, 'spellcheck="false"', "version");
   let title = "";
   if (type === "struct") {
     title = "Add Struct / Union";
-    body += field("name", "Name", "", 'placeholder="task_struct" spellcheck="false" required');
+    body += field("name", "Name", "", 'placeholder="task_struct" spellcheck="false" required data-ac="struct"');
     body += `<label class="nm-form-row"><span>Kind</span><select name="kind"><option value="struct">struct</option><option value="union">union</option></select></label>`;
-    body += field("path", "Defining file (needed for unparsed revisions)", "", 'placeholder="include/linux/sched.h" spellcheck="false"');
+    body += field("path", "Defining file (needed for unparsed revisions)", "", 'placeholder="include/linux/sched.h" spellcheck="false"', "file");
   } else if (type === "source") {
     title = "Add Source File / Slice";
-    body += field("path", "File", "", 'placeholder="kernel/fork.c" spellcheck="false" required');
+    body += field("path", "File", "", 'placeholder="kernel/fork.c" spellcheck="false" required', "file");
     body += `<label class="nm-form-row"><span>Show</span><select name="mode"><option value="file">Whole file</option><option value="range">Line range</option><option value="symbol">Symbol definition</option></select></label>`;
     body += `<div class="nm-form-pair">${field("start", "From line", "", 'type="number" min="1"')}${field("end", "To line", "", 'type="number" min="1"')}</div>`;
-    body += `<div class="nm-form-pair">${field("symbol", "Symbol", "", 'placeholder="copy_process" spellcheck="false"')}
+    body += `<div class="nm-form-pair">${field("symbol", "Symbol", "", 'placeholder="copy_process" spellcheck="false" data-ac="symbol"')}
       <label class="nm-form-row"><span>Kind</span><select name="symbolKind">${M.SYMBOL_KINDS.map((k) => `<option value="${k}">${k || "any"}</option>`).join("")}</select></label></div>`;
     body += field("context", "Context lines around a symbol", "0", 'type="number" min="0" max="200"');
   } else if (type === "man") {
@@ -139,14 +143,14 @@ export function openNodeDialog(ctrl, type, existing = null) {
     body += field("section", "Section", "", 'placeholder="2" spellcheck="false"');
   } else if (type === "symbol") {
     title = "Add Symbol";
-    body += field("name", "Symbol", "", 'placeholder="schedule" spellcheck="false" required');
+    body += field("name", "Symbol", "", 'placeholder="schedule" spellcheck="false" required data-ac="symbol"');
     body += `<label class="nm-form-row"><span>Kind</span><select name="kind"><option value="func">function</option><option value="symbol">other</option></select></label>`;
   } else if (type === "diff") {
     title = "Add Diff";
     body += `<label class="nm-form-row"><span>Show</span><select name="mode"><option value="file">One file between two revisions</option><option value="commit">A commit</option></select></label>`;
-    body += `<div class="nm-form-pair">${field("versionA", "From revision (file diff)", "", 'placeholder="v2.6.39" spellcheck="false"')}${field("versionB", "To revision (file diff)", v, 'spellcheck="false"')}</div>`;
-    body += field("path", "File (all files of a commit when empty)", "", 'placeholder="kernel/fork.c" spellcheck="false"');
-    body += field("oldPath", "Old path (renamed file)", "", 'spellcheck="false"');
+    body += `<div class="nm-form-pair">${field("versionA", "From revision (file diff)", "", 'placeholder="v2.6.39" spellcheck="false"', "version")}${field("versionB", "To revision (file diff)", v, 'spellcheck="false"', "version")}</div>`;
+    body += field("path", "File (all files of a commit when empty)", "", 'placeholder="kernel/fork.c" spellcheck="false"', "file");
+    body += field("oldPath", "Old path (renamed file)", "", 'spellcheck="false"', "file");
     body += field("commitHash", "Commit (commit diff)", "", 'placeholder="a1b2c3d4" spellcheck="false"');
   } else if (type === "mail") {
     title = "Add Mailing List Thread";
@@ -154,18 +158,18 @@ export function openNodeDialog(ctrl, type, existing = null) {
     body += field("mid", "Message-ID (focused message, or the thread it starts)", "", 'placeholder="20110101.12345@example.org" spellcheck="false"');
   } else if (type === "kconfig") {
     title = "Add Kconfig Symbol";
-    body += field("symbol", "Symbol", "", 'placeholder="SMP" spellcheck="false" required');
+    body += field("symbol", "Symbol", "", 'placeholder="SMP" spellcheck="false" required data-ac="kconfig"');
     body += field("arch", "ARCH", "x86_64", 'spellcheck="false"');
   } else if (type === "maintainer") {
     title = "Add Maintainers Section";
     body += field("query", "Section name", "", 'placeholder="SCHEDULER" spellcheck="false"');
-    body += field("path", "Or the section of a file", "", 'placeholder="kernel/sched/core.c" spellcheck="false"');
+    body += field("path", "Or the section of a file", "", 'placeholder="kernel/sched/core.c" spellcheck="false"', "file");
     body += field("secId", "Or a section id", "", 'type="number" min="1"');
   } else if (type === "cve") {
     title = "Add CVE / Fix-Chain";
     body += field("cveId", "CVE ID", "", 'placeholder="CVE-2024-1234" spellcheck="false"');
-    body += field("release", "Release state check (optional)", v, 'placeholder="v6.6" spellcheck="false"');
-    body += field("filePath", "Or all CVEs for a file", "", 'placeholder="mm/slub.c" spellcheck="false"');
+    body += field("release", "Release state check (optional)", v, 'placeholder="v6.6" spellcheck="false"', "version");
+    body += field("filePath", "Or all CVEs for a file", "", 'placeholder="mm/slub.c" spellcheck="false"', "file");
   } else if (type === "kapi") {
     title = "Add Kernel API / Boundary";
     body += `<label class="nm-form-row"><span>Catalog</span><select name="catalog">${M.KAPI_CATALOGS.map((c) => `<option value="${c}">${c}</option>`).join("")}</select></label>`;
@@ -174,14 +178,14 @@ export function openNodeDialog(ctrl, type, existing = null) {
     body += field("arch", "ARCH", "x86_64", 'spellcheck="false"');
   } else if (type === "doc") {
     title = "Add Kernel Docs (.rst / kernel-doc)";
-    body += field("path", "Documentation or source file", "", 'placeholder="Documentation/core-api/kernel-api.rst" spellcheck="false" required');
+    body += field("path", "Documentation or source file", "", 'placeholder="Documentation/core-api/kernel-api.rst" spellcheck="false" required', "file");
     body += `<label class="nm-form-row"><span>Mode</span><select name="mode">${M.DOC_MODES.map((m) => `<option value="${m}">${m}</option>`).join("")}</select></label>`;
     body += field("functions", "kernel-doc filter (optional)", "", 'placeholder="kmalloc" spellcheck="false"');
   } else if (type === "history") {
     title = "Add Symbol History / Blame";
     body += `<label class="nm-form-row"><span>Mode</span><select name="mode"><option value="symbol">Symbol timeline</option><option value="blame">File blame commits</option></select></label>`;
-    body += field("path", "File path", "", 'placeholder="kernel/fork.c" spellcheck="false" required');
-    body += `<div class="nm-form-pair">${field("line", "Line", "1", 'type="number" min="1"')}${field("name", "Symbol name (optional)", "", 'placeholder="copy_process" spellcheck="false"')}</div>`;
+    body += field("path", "File path", "", 'placeholder="kernel/fork.c" spellcheck="false" required', "file");
+    body += `<div class="nm-form-pair">${field("line", "Line", "1", 'type="number" min="1"')}${field("name", "Symbol name (optional)", "", 'placeholder="copy_process" spellcheck="false" data-ac="symbol"')}</div>`;
   } else if (type === "tab") {
     title = "Add KernelInfo Tab";
     const repo = ctrl.repo;
@@ -195,6 +199,7 @@ export function openNodeDialog(ctrl, type, existing = null) {
   const modal = open({ title, subtitle: "The node is placed at the center of the view", width: "480px", footerHtml: '<button type="button" class="code-btn primary" data-act="add">Add</button>' });
   modal.body.innerHTML = `<form class="nm-form">${body}</form>`;
   const form = modal.body.querySelector("form");
+  wireFormPickers(form, dialogPickerContext(ctrl, form, type));
   form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query'], input[name='cveId']")?.focus?.();
   const submit = async () => {
     const f = Object.fromEntries(new FormData(form).entries());
@@ -208,6 +213,26 @@ export function openNodeDialog(ctrl, type, existing = null) {
     submit();
   });
   modal.footer.querySelector("[data-act='add']").onclick = submit;
+}
+
+/**
+ * Scope of a dialog's pickers: the repository of the NodeMap, the form's Revision (a file diff
+ * browses the "From" tree for its old path and the "To" tree for its path), and its ARCH.
+ */
+export function dialogPickerContext(ctrl, form, type) {
+  const val = (n) => String(form?.querySelector?.(`[name="${n}"]`)?.value || "").trim();
+  return {
+    client: ctrl.clientFor({}),
+    version: () => val("version") || ctrl.currentVersion || "",
+    arch: () => val("arch") || "x86_64",
+    fileVersion: (name) => {
+      if (type === "diff" && val("mode") !== "commit") return (name === "oldPath" ? val("versionA") : val("versionB")) || val("version");
+      if (type === "cve" && name === "filePath") return val("release") || val("version");
+      return val("version");
+    },
+    picker: ctrl.refPicker,
+    openModalFn: ctrl.openModalFn,
+  };
 }
 
 export async function specFromForm(ctrl, type, f) {
@@ -417,13 +442,19 @@ export function promptCallPath(ctrl, fromId) {
     footerHtml: '<button type="button" class="code-btn primary" data-act="find">Expand Paths</button>',
   });
   modal.body.innerHTML = `<form class="nm-form">
-    <label class="nm-form-row"><span>Target function</span><input name="to" placeholder="schedule" required spellcheck="false"/></label>
+    <label class="nm-form-row"><span>Target function</span><input name="to" placeholder="schedule" required spellcheck="false" data-ac="symbol"/></label>
     <div class="nm-form-pair">
       <label class="nm-form-row"><span>Max depth</span><input name="maxDepth" type="number" min="1" max="12" value="6"/></label>
       <label class="nm-form-row"><span>Paths (k)</span><input name="k" type="number" min="1" max="10" value="3"/></label>
     </div>
   </form>`;
   const form = modal.body.querySelector("form");
+  wireFormPickers(form, {
+    client: ctrl.clientFor(from),
+    version: () => from.version || ctrl.currentVersion || "",
+    picker: ctrl.refPicker,
+    openModalFn: ctrl.openModalFn,
+  });
   form.querySelector("input[name='to']")?.focus?.();
   const submit = async () => {
     const f = Object.fromEntries(new FormData(form).entries());
@@ -640,11 +671,12 @@ export function openImpactMapDialog(ctrl) {
     footerHtml: '<button type="button" class="code-btn primary" data-act="build">Build Impact Map</button>',
   });
   modal.body.innerHTML = `<form class="nm-form">
-    <label class="nm-form-row"><span>Revision</span><input name="version" value="${escapeHtml(ctrl.currentVersion || "v3.0")}" spellcheck="false"/></label>
+    <label class="nm-form-row"><span>Revision</span><div class="nm-pick-wrap"><input name="version" value="${escapeHtml(ctrl.currentVersion || "v3.0")}" spellcheck="false"/>${pickButtonHtml("version", "version")}</div></label>
     <label class="nm-form-row"><span>Commit hash (auto-fetches commit diff, structs, callers &amp; maintainers)</span><input name="commitHash" placeholder="e.g. a1b2c3d4e5f6" spellcheck="false"/></label>
     <label class="nm-form-row"><span>Or modified files / unified diff (one file path per line or raw diff)</span><textarea name="diffOrFiles" rows="5" placeholder="kernel/sched/core.c&#10;include/linux/sched.h" spellcheck="false"></textarea></label>
   </form>`;
   const form = modal.body.querySelector("form");
+  wireFormPickers(form, { client: ctrl.clientFor({}), version: () => form?.querySelector?.("[name='version']")?.value || ctrl.currentVersion || "", picker: ctrl.refPicker, openModalFn: ctrl.openModalFn });
   const submit = async () => {
     const f = Object.fromEntries(new FormData(form).entries());
     const version = String(f.version || ctrl.currentVersion || "v3.0").trim();

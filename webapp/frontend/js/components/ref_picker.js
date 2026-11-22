@@ -199,6 +199,8 @@ class RefPicker {
   handleKey(e, input) {
     if (e.key === "Escape") {
       e.preventDefault();
+      // Only the picker closes: a dialog it was opened from stays open
+      e.stopPropagation();
       this.close();
     } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();

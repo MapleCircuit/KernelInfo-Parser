@@ -11,6 +11,10 @@
  * drops the one saved for the revision it leaves, which reaches beyond the switch itself, so it is
  * confirmed first (see webapp/API.md section 5.0). Restoring a revision from the URL hash does not
  * prompt.
+ *
+ * A view may take Apply over for a selection (`registerSelectionVersionApplier`): a NodeMap tab with
+ * selected nodes moves those nodes to the revision instead of switching its own default revision
+ * (`applyVersionToSelection`, webapp/API_FRONTEND.md section 5.3).
  */
 import { state, kconfigProfileKey } from "../state.js";
 import { isAlwaysVersionlessTab } from "../tab_routes.js";
@@ -32,6 +36,34 @@ export async function requestVersionSwitch(target, tab = state.getActiveTab()) {
   }
   state.setVersion(ref, tab);
   return true;
+}
+
+/** Tab id -> `(ref) => result | null` of the views that apply a revision to their selection. */
+const selectionAppliers = new Map();
+
+/**
+ * Let the view of tab `tabId` take the header's Apply over while it has a selection: `apply(ref)`
+ * returns `{ level, message }` when it applied `ref` to its selection, or null to let the tab switch.
+ * Returns the unregister function.
+ */
+export function registerSelectionVersionApplier(tabId, apply) {
+  if (!tabId || typeof apply !== "function") return () => {};
+  selectionAppliers.set(tabId, apply);
+  return () => {
+    if (selectionAppliers.get(tabId) === apply) selectionAppliers.delete(tabId);
+  };
+}
+
+/**
+ * Header Apply on a tab whose view holds a selection: the view's result (`{ level, message }`), or
+ * null when it has no selection (or registered nothing) and the tab itself switches. Runs even when
+ * the tab is already on `target`: the selected nodes may be on another revision.
+ */
+export function applyVersionToSelection(target, tab = state.getActiveTab()) {
+  const ref = typeof target === "string" ? target.trim() : "";
+  if (!ref || !tab) return null;
+  const apply = selectionAppliers.get(tab.id);
+  return apply ? apply(ref) || null : null;
 }
 
 /** Open a repository explorer on the revision selected in the header ("New Tab"). */

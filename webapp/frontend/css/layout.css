@@ -684,6 +684,9 @@
   overflow: hidden;
 }
 
+/* Opened from a dialog (NodeMap forms): above the modal backdrop */
+.ki-modal-backdrop ~ .ref-picker { z-index: 10010; }
+
 .ref-picker-input {
   margin: 8px;
   padding: 6px 8px;

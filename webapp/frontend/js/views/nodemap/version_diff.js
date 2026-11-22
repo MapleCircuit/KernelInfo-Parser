@@ -139,3 +139,62 @@ export function revertCanvasVersion(nodes, previousVersions = {}) {
   }
   return revertedIds;
 }
+
+/**
+ * Node types whose content follows a revision when one is applied to selected nodes (the header's
+ * Apply, the multi-selection Revision field): the canvas-wide set plus `cve` and `diff`. A `diff` in
+ * file mode moves its "To" side (`versionB`), a `cve` node its release check (`release`, with the
+ * revision of its file CVEs); a `tab` node moves the `v=` of its embedded address.
+ * `note`, `group`, `man` and `mail` nodes have no revision.
+ */
+export const SELECTION_VERSIONED_TYPES = new Set([...VERSIONED_TYPES, "cve", "diff"]);
+
+/** Revision `node` shows (what applying a revision changes), or null when it has none. */
+export function revisionOf(node) {
+  if (!node) return null;
+  if (node.type === "diff" && node.data?.mode !== "commit") return String(node.data?.versionB || node.version || "");
+  if (node.type === "cve") return String(node.data?.release || node.version || "");
+  if (node.type === "tab") {
+    const p = new URLSearchParams(String(node.data?.hash || ""));
+    return p.has("v") ? p.get("v") : null;
+  }
+  return SELECTION_VERSIONED_TYPES.has(node.type) ? String(node.version || "") : null;
+}
+
+/**
+ * Move `nodes` to revision `targetVersion`: `{ changedIds, unchanged, skipped, otherRepo }` (already
+ * on it / without a revision / of another repository than `repo`, whose refs the target may not name).
+ * Mutates the nodes; the caller invalidates and commits them as one step.
+ */
+export function retargetNodeVersions(nodes, targetVersion, { repo = null } = {}) {
+  const ver = String(targetVersion || "").trim();
+  const out = { changedIds: [], unchanged: 0, skipped: 0, otherRepo: 0 };
+  if (!ver) return out;
+  for (const n of nodes || []) {
+    if (repo !== null && n.repo && n.repo !== repo && revisionOf(n) !== null) {
+      out.otherRepo += 1;
+      continue;
+    }
+    const cur = revisionOf(n);
+    if (cur === null) {
+      out.skipped += 1;
+      continue;
+    }
+    if (cur === ver) {
+      out.unchanged += 1;
+      continue;
+    }
+    if (n.type === "tab") {
+      const p = new URLSearchParams(String(n.data.hash || ""));
+      p.set("v", ver);
+      n.data = { ...n.data, hash: p.toString() };
+    } else if (n.type === "diff" && n.data?.mode !== "commit") {
+      n.data = { ...n.data, versionB: ver };
+    } else if (n.type === "cve") {
+      n.data = { ...n.data, release: ver };
+    }
+    n.version = ver;
+    out.changedIds.push(n.id);
+  }
+  return out;
+}

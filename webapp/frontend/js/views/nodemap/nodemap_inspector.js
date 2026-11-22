@@ -7,8 +7,10 @@ import { escapeHtml } from "../../components/modal.js";
 import { resolveColor } from "../../utils/theme.js";
 import * as M from "./canvas_model.js";
 import { kconfigValue } from "./domain_nodes.js";
+import { attachAutocomplete, fetchSuggestions, openFileExplorer, openVersionPicker, structKindOf, withPickHtml } from "./nodemap_pickers.js";
 import { paholeRows, structRows } from "./struct_view.js";
 import { NodeMapTourPlayer, captureTourStep, createTour, removeTourStep, reorderTourStep } from "./tour_mode.js";
+import { revisionOf } from "./version_diff.js";
 
 /** `#rrggbb` a color input starts at: the custom color, else what the accent resolves to. */
 export function pickerValue(color, fallback = "var(--accent-blue)") {
@@ -42,6 +44,9 @@ export function renderInspector(ctrl) {
   const sel = (name, value, options, labels = null, extra = "") => `<select data-insp="${name}" ${extra}>${options.map((o, i) => `<option value="${escapeHtml(o)}"${o === value ? " selected" : ""}>${escapeHtml(labels ? labels[i] : (o || "any"))}</option>`).join("")}</select>`;
   const row = (label, inner) => `<label class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span>${inner}</label>`;
   const input = (name, value, extra = "") => `<input data-insp="${name}" value="${escapeHtml(value ?? "")}" ${extra}/>`;
+  // Revision / file inputs with their picker button (`nodemap_pickers.js`); `data-ac` inputs autocomplete
+  const verInput = (name, value, extra = "") => withPickHtml(input(name, value, extra), "version", name, { insp: true });
+  const fileInput = (name, value, extra = "") => withPickHtml(input(name, value, extra), "file", name, { insp: true });
   const check = (name, on, label, title = "") => `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" ${on ? "checked" : ""}/> <span>${escapeHtml(label)}</span></label>`;
   const st = ctrl.canvas.settings;
   const em = Boolean(st.editMode);
@@ -86,6 +91,11 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Distribute</span><div class="nm-insp-grid"><button type="button" class="nodemap-btn" data-insp="distribute" data-value="horizontal" ${nodes.length < 3 ? "disabled" : ""}>horizontally</button><button type="button" class="nodemap-btn" data-insp="distribute" data-value="vertical" ${nodes.length < 3 ? "disabled" : ""}>vertically</button></div></div>`;
     const scalables = nodes.filter((n) => M.scalable(n.type));
     if (scalables.length) html += scaleRow(scalables);
+    const revs = nodes.map(revisionOf).filter((r) => r !== null);
+    if (revs.length) {
+      const one = new Set(revs).size === 1 ? revs[0] : "";
+      html += row(`Revision (${revs.length})`, verInput("multi-version", one, `spellcheck="false" placeholder="${one ? "" : "mixed"}" title="Moves every selected node with a revision (one undo step)"`));
+    }
     const structs = nodes.filter((n) => n.type === "struct");
     if (structs.length) {
       const styles = new Set(structs.map((n) => n.data.style));
@@ -114,11 +124,11 @@ export function renderInspector(ctrl) {
       html += row("Layer", sel("layerId", n.layerId || "", ["", ...st.layers.map((l) => l.id)], ["(Always visible)", ...st.layers.map((l) => l.name)]));
     }
     html += check("hide-header", n.hideHeader, "Hide header in View Mode", "View Mode and exports leave this node's header out; Edit Mode shows it dimmed (drag, rename, restore)");
-    if (["struct", "source", "symbol", "kconfig", "maintainer", "kapi", "doc", "history"].includes(n.type) || (n.type === "diff" && n.data.mode === "commit")) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
+    if (["struct", "source", "symbol", "kconfig", "maintainer", "kapi", "doc", "history"].includes(n.type) || (n.type === "diff" && n.data.mode === "commit")) html += row("Revision", verInput("version", n.version, 'spellcheck="false"'));
     if (n.type === "struct") {
-      html += row("Name", input("d-name", d.name, 'spellcheck="false"'));
+      html += row("Name", input("d-name", d.name, 'spellcheck="false" data-ac="struct"'));
       html += `<div class="nm-insp-pair">${row("Kind", sel("d-kind", d.kind, ["struct", "union"]))}${row("Style", sel("d-style", d.style, M.STRUCT_STYLES))}</div>`;
-      html += row("Defining file", input("d-path", d.path, `spellcheck="false" placeholder="${escapeHtml(d.hint || "from the index")}"`));
+      html += row("Defining file", fileInput("d-path", d.path, `spellcheck="false" placeholder="${escapeHtml(d.hint || "from the index")}"`));
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="struct-types" aria-pressed="${d.showTypes}">Types: ${d.showTypes ? "shown" : "hidden"}</button><button type="button" class="nodemap-btn" data-insp="struct-guards" aria-pressed="${d.showGuards}">#ifdef: ${d.showGuards ? "shown" : "hidden"}</button></div>`;
       html += check("d-disableKconfigEngine", d.disableKconfigEngine, "Disable Kconfig engine", "This node ignores the Kconfig engine: no #ifdef branch folds on its own");
       const eng = ctrl.kconfigEngineFor(n);
@@ -139,7 +149,7 @@ export function renderInspector(ctrl) {
       const layout = ctrl.content.get(ctrl.fetchKeyOf(n))?.value;
       if (layout) html += `<div class="inspector-field"><span class="inspector-label">Definition</span><span class="inspector-val">${escapeHtml(`${layout.file_path}:${layout.line_s}-${layout.line_e}`)} · span from ${layout.span_source === "db" ? "the index" : "the source text"}; guards read from the source</span></div>`;
     } else if (n.type === "symbol") {
-      html += row("Symbol", input("d-name", d.name, 'spellcheck="false"'));
+      html += row("Symbol", input("d-name", d.name, 'spellcheck="false" data-ac="symbol"'));
       if (d.kind === "func") {
         html += `<div class="nm-insp-actions">
           <button type="button" class="nodemap-btn" data-insp="cg-callers">⤴ + Callers</button>
@@ -148,10 +158,10 @@ export function renderInspector(ctrl) {
         </div>`;
       }
     } else if (n.type === "source") {
-      html += row("File", input("d-path", d.path, 'spellcheck="false"'));
+      html += row("File", fileInput("d-path", d.path, 'spellcheck="false"'));
       html += row("Show", sel("d-mode", d.mode, M.SOURCE_MODES));
       if (d.mode === "range") html += `<div class="nm-insp-pair">${row("From", input("d-start", d.start || "", 'type="number" min="1"'))}${row("To", input("d-end", d.end || "", 'type="number" min="1"'))}</div>`;
-      if (d.mode === "symbol") html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false"'))}${row("Kind", sel("d-symbolKind", d.symbolKind, M.SYMBOL_KINDS))}</div>${row("Context lines", input("d-context", d.context, 'type="number" min="0" max="200"'))}`;
+      if (d.mode === "symbol") html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false" data-ac="symbol"'))}${row("Kind", sel("d-symbolKind", d.symbolKind, M.SYMBOL_KINDS))}</div>${row("Context lines", input("d-context", d.context, 'type="number" min="0" max="200"'))}`;
     } else if (n.type === "man") {
       html += `<div class="inspector-field"><span class="inspector-label">Page</span><span class="inspector-val">${escapeHtml(d.path || `${d.name}(${d.section})`)} · ${escapeHtml(d.version || "")}</span></div>`;
     } else if (n.type === "tab") {
@@ -162,14 +172,14 @@ export function renderInspector(ctrl) {
     } else if (n.type === "diff") {
       html += row("Show", sel("d-mode", d.mode, M.DIFF_MODES, ["one file between two revisions", "a commit"]));
       if (d.mode === "commit") html += row("Commit", input("d-commitHash", d.commitHash, 'spellcheck="false"'));
-      else html += `<div class="nm-insp-pair">${row("From", input("d-versionA", d.versionA, 'spellcheck="false"'))}${row("To", input("d-versionB", d.versionB, 'spellcheck="false"'))}</div>`;
-      html += row(d.mode === "commit" ? "File (all when empty)" : "File", input("d-path", d.path, 'spellcheck="false"'));
-      if (d.mode === "file") html += row("Old path (rename)", input("d-oldPath", d.oldPath, 'spellcheck="false"'));
+      else html += `<div class="nm-insp-pair">${row("From", verInput("d-versionA", d.versionA, 'spellcheck="false"'))}${row("To", verInput("d-versionB", d.versionB, 'spellcheck="false"'))}</div>`;
+      html += row(d.mode === "commit" ? "File (all when empty)" : "File", fileInput("d-path", d.path, 'spellcheck="false"'));
+      if (d.mode === "file") html += row("Old path (rename)", fileInput("d-oldPath", d.oldPath, 'spellcheck="false"'));
     } else if (n.type === "mail") {
       html += `<div class="nm-insp-pair">${row("Thread id", input("d-tid", d.tid || "", 'type="number" min="1"'))}${row("Message-ID", input("d-mid", d.mid, 'spellcheck="false"'))}</div>`;
       if (!d.single) html += '<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="mail-expand" title="One node per message, connected by reply edges as the thread replies">⇶ Expand Thread to Nodes</button></div>';
     } else if (n.type === "kconfig") {
-      html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false"'))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
+      html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false" data-ac="kconfig"'))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
       const values = ctrl.kconfigValuesFor(n);
       const eng = ctrl.pickEngine(n);
       const why = values ? `${kconfigValue(values, d.symbol) || "unset"} in ${eng?.title || eng?.tabId || "the engine"}` : "no Kconfig engine followed for this revision";
@@ -177,19 +187,19 @@ export function renderInspector(ctrl) {
       html += '<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="kc-expand" title="Add or connect every related symbol with labeled edges">⇶ Expand Relations</button></div>';
     } else if (n.type === "maintainer") {
       html += row("Section name", input("d-query", d.query || d.title, 'spellcheck="false"'));
-      html += `<div class="nm-insp-pair">${row("Or a file", input("d-path", d.path, 'spellcheck="false"'))}${row("Section id", input("d-secId", d.secId || "", 'type="number" min="1"'))}</div>`;
+      html += `<div class="nm-insp-pair">${row("Or a file", fileInput("d-path", d.path, 'spellcheck="false"'))}${row("Section id", input("d-secId", d.secId || "", 'type="number" min="1"'))}</div>`;
     } else if (n.type === "cve") {
       html += row("CVE ID", input("d-cveId", d.cveId, 'placeholder="CVE-2024-..." spellcheck="false"'));
-      html += `<div class="nm-insp-pair">${row("Release", input("d-release", d.release, 'spellcheck="false"'))}${row("File CVEs", input("d-filePath", d.filePath, 'spellcheck="false"'))}</div>`;
+      html += `<div class="nm-insp-pair">${row("Release", verInput("d-release", d.release, 'spellcheck="false"'))}${row("File CVEs", fileInput("d-filePath", d.filePath, 'spellcheck="false"'))}</div>`;
     } else if (n.type === "kapi") {
       html += `<div class="nm-insp-pair">${row("Catalog", sel("d-catalog", d.catalog, M.KAPI_CATALOGS))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
       html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false"'))}${row("Query", input("d-query", d.query, 'spellcheck="false"'))}</div>`;
     } else if (n.type === "doc") {
-      html += row("Path", input("d-path", d.path, 'spellcheck="false"'));
+      html += row("Path", fileInput("d-path", d.path, 'spellcheck="false"'));
       html += `<div class="nm-insp-pair">${row("Mode", sel("d-mode", d.mode, M.DOC_MODES))}${row("Functions", input("d-functions", d.functions, 'spellcheck="false"'))}</div>`;
     } else if (n.type === "history") {
       html += `<div class="nm-insp-pair">${row("Mode", sel("d-mode", d.mode, M.HISTORY_MODES))}${row("Line", input("d-line", d.line || 1, 'type="number" min="1"'))}</div>`;
-      html += `<div class="nm-insp-pair">${row("File", input("d-path", d.path, 'spellcheck="false"'))}${row("Symbol", input("d-name", d.name, 'spellcheck="false"'))}</div>`;
+      html += `<div class="nm-insp-pair">${row("File", fileInput("d-path", d.path, 'spellcheck="false"'))}${row("Symbol", input("d-name", d.name, 'spellcheck="false" data-ac="symbol"'))}</div>`;
     } else if (n.type === "note") {
       html += check("d-markdown", d.markdown, "Render Markdown");
     } else if (n.type === "group") {
@@ -224,7 +234,7 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Visibility layers</span><div class="nm-layer-list">${layers.map((l) =>
       `<div class="nm-layer-row"><input type="checkbox" data-insp="layer-toggle" data-id="${escapeHtml(l.id)}" ${l.visible !== false ? "checked" : ""} aria-label="Layer visible"/><input data-insp="layer-name" data-id="${escapeHtml(l.id)}" value="${escapeHtml(l.name)}" aria-label="Layer name" spellcheck="false"/><button type="button" class="nodemap-btn nm-danger" data-insp="layer-delete" data-id="${escapeHtml(l.id)}" title="Delete layer">×</button></div>`).join("")}
       <button type="button" class="nodemap-btn" data-insp="layer-add">+ New Layer</button></div></div>`;
-    html += `<div class="inspector-field"><span class="inspector-label">Version Time-Travel</span><div class="nm-insp-inline">${input("ver-target", ctrl.versionDiffTarget, 'placeholder="v6.6" spellcheck="false" aria-label="Compare revision"')}<button type="button" class="nodemap-btn" data-insp="ver-compare">Compare</button>${ctrl.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-clear">Clear</button>' : ""}</div>
+    html += `<div class="inspector-field"><span class="inspector-label">Version Time-Travel</span><div class="nm-insp-inline">${verInput("ver-target", ctrl.versionDiffTarget, 'placeholder="v6.6" spellcheck="false" aria-label="Compare revision"')}<button type="button" class="nodemap-btn" data-insp="ver-compare">Compare</button>${ctrl.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-clear">Clear</button>' : ""}</div>
       <div class="nm-insp-actions">${ctrl.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-apply">Apply Revision</button>' : ""}${ctrl.versionRevertMap ? '<button type="button" class="nodemap-btn" data-insp="ver-revert">↶ Revert Versions</button>' : ""}</div></div>`;
     html += NodeMapTourPlayer.inspectorHtml(ctrl.canvas, ctrl.activeTourId);
     const engines = ctrl.followedEngines();
@@ -257,6 +267,84 @@ export function renderInspector(ctrl) {
     </ul>`;
   }
   ctrl.inspectorEl.innerHTML = html;
+  wireInspectorAutocomplete(ctrl);
+}
+
+/** Node and scope (`client`, `version`) an Inspector picker of key `k` works in. */
+export function inspectorPickContext(ctrl, k) {
+  const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
+  const client = ctrl.clientFor(node || {});
+  const d = node?.data || {};
+  let version = node?.version || ctrl.currentVersion || "";
+  if (node?.type === "diff" && d.mode !== "commit") version = (k === "d-oldPath" ? d.versionA : d.versionB) || version;
+  if (node?.type === "cve" && d.release) version = d.release;
+  return { node, client, version };
+}
+
+/** Selected node ids a picker opened for: a pick lands only if the selection is still the same. */
+const selectionKey = (ctrl) => [...ctrl.selected].sort().join(",");
+
+/**
+ * Put a picked value in the Inspector input `k` and commit it as if typed (one undo step); dropped
+ * when the selection changed since the picker opened (`openedFor`). The input keeps the focus.
+ */
+export function commitInspectorPick(ctrl, k, value, openedFor = null) {
+  if (openedFor !== null && openedFor !== selectionKey(ctrl)) return;
+  const el = ctrl.inspectorEl?.querySelector?.(`[data-insp="${k}"]`);
+  const target = el || { dataset: { insp: k }, value, tagName: "INPUT", type: "text" };
+  target.value = value;
+  if (!target.closest) target.closest = () => target;
+  const res = onInspectorInput(ctrl, { target }, true);
+  ctrl.inspectorEl?.querySelector?.(`[data-insp="${k}"]`)?.focus?.();
+  return res;
+}
+
+/** Revision popover / File Explorer of an Inspector picker button (`data-insp="pick"`). */
+export function openInspectorPicker(ctrl, btn) {
+  const k = btn.dataset.for;
+  const kind = btn.dataset.pick;
+  const el = ctrl.inspectorEl?.querySelector?.(`[data-insp="${k}"]`);
+  const { client, version } = inspectorPickContext(ctrl, k);
+  const current = el?.value ?? "";
+  const openedFor = selectionKey(ctrl);
+  if (kind === "version") {
+    return openVersionPicker(btn, { current: current || version, client, picker: ctrl.refPicker, onSelect: (ref) => commitInspectorPick(ctrl, k, ref, openedFor) });
+  }
+  if (kind === "file") {
+    return openFileExplorer({ client, version, currentPath: current, openModalFn: ctrl.openModalFn, onSelect: (path) => commitInspectorPick(ctrl, k, path, openedFor) });
+  }
+  return null;
+}
+
+/** Struct pick: name, defining file and kind in one commit (the file the index knows for it). */
+export function commitStructPick(ctrl, row) {
+  const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
+  if (!node || node.type !== "struct" || !row?.name) return;
+  const patch = { name: row.name };
+  if (row.path && (row.name !== node.data.name || !node.data.path)) patch.path = row.path;
+  const kind = structKindOf(row.kind);
+  if (kind) patch.kind = kind;
+  node.data = M.normalizeData(node.type, { ...node.data, ...patch });
+  if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
+  ctrl.commit({ inspector: true, coalesce: `insp:d-name:${node.id}`, coalesceEnd: true });
+}
+
+/** Attach the symbol / struct / Kconfig autocompletes to the freshly rendered Inspector. */
+function wireInspectorAutocomplete(ctrl) {
+  const els = ctrl.inspectorEl?.querySelectorAll?.("input[data-ac]");
+  if (!els?.length) return;
+  for (const el of els) {
+    const mode = el.dataset.ac;
+    const k = el.dataset.insp;
+    attachAutocomplete(el, {
+      fetch: (q) => {
+        const { node, client, version } = inspectorPickContext(ctrl, k);
+        const arch = ctrl.inspectorEl?.querySelector?.('[data-insp="d-arch"]')?.value || node?.data?.arch || "x86_64";
+        return fetchSuggestions(mode, client, version, q, { arch });
+      },
+      onPick: (row) => (mode === "struct" ? commitStructPick(ctrl, row) : commitInspectorPick(ctrl, k, row.name)),
+    });
+  }
 }
 
 export function onInspectorInput(ctrl, e, final) {
@@ -291,9 +379,15 @@ export function onInspectorInput(ctrl, e, final) {
     }
     return ctrl.commit({ inspector: final, coalesce: `insp:content-scale:${list.map((x) => x.id).join(",")}`, coalesceEnd: Boolean(final) });
   }
+  if (k === "multi-version") {
+    if (final && String(val || "").trim()) ctrl.applyVersionToSelection(val);
+    return;
+  }
   if (k === "ver-target") {
+    const prev = ctrl.versionDiffShown || "";
     ctrl.versionDiffTarget = String(val || "").trim();
-    if (final && ctrl.versionDiffTarget) ctrl.compareVersion(ctrl.versionDiffTarget);
+    // One comparison per revision: a pick and the input's own change event do not load it twice
+    if (final && ctrl.versionDiffTarget && ctrl.versionDiffTarget !== prev) ctrl.compareVersion(ctrl.versionDiffTarget);
     return;
   }
   if (k === "tour-select") {
@@ -395,7 +489,8 @@ export function onInspectorClick(ctrl, e) {
   if (!btn) return;
   const k = btn.dataset.insp;
   const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
-  if (k === "edit-mode") ctrl.setEditMode(!ctrl.canvas.settings.editMode);
+  if (k === "pick") openInspectorPicker(ctrl, btn);
+  else if (k === "edit-mode") ctrl.setEditMode(!ctrl.canvas.settings.editMode);
   else if (k === "color") ctrl.setColor(btn.dataset.value || "");
   else if (k === "bg" || k === "bg-reset") ctrl.setBackground(k === "bg" ? btn.dataset.value || "" : "");
   else if (k === "canvas-bg" || k === "canvas-bg-reset") ctrl.setCanvasBackground(k === "canvas-bg" ? btn.dataset.value || "" : "");

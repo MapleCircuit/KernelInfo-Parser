@@ -10,7 +10,7 @@ import { TabsComponent } from "./components/tabs.js";
 import { contextMenu } from "./components/context_menu.js";
 import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
 import { branchPicker, branchSourceOf } from "./components/branch_picker.js";
-import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
+import { applyVersionToSelection, requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
 import { headerLayout } from "./components/header_layout.js";
 import { shortcuts } from "./utils/shortcuts.js";
@@ -1310,6 +1310,12 @@ class KernelIdeApp {
         }
         if (isAlwaysVersionlessTab(tab.type)) {
           toast.info(`${tab.title} does not use a version tag — use New Tab to open ${shortRef(target)}`);
+          return;
+        }
+        // A NodeMap with selected nodes moves those nodes (one undo step), not its default revision
+        const applied = applyVersionToSelection(target, tab);
+        if (applied) {
+          (toast[applied.level] || toast.success)(applied.message);
           return;
         }
         if (tab.version === target) {

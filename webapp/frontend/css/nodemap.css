@@ -848,6 +848,94 @@
 .nm-insp-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .nm-insp-actions .nodemap-btn { border-color: var(--border-color); }
 .nm-insp-inline { display: flex; gap: 4px; align-items: center; }
+
+/* Field pickers (nodemap_pickers.js): revision / file buttons, symbol autocomplete, File Explorer */
+.nm-pick-wrap { display: flex; gap: 4px; align-items: center; min-width: 0; width: 100%; }
+.nm-pick-wrap input { flex: 1; min-width: 0; }
+.nm-pick-btn {
+  flex: none;
+  justify-content: center;
+  min-width: calc(26px * var(--ui-layout-scale, 1));
+  padding: calc(2px * var(--ui-layout-scale, 1)) calc(5px * var(--ui-layout-scale, 1));
+  font-size: var(--fs-12, 12px);
+  border-color: var(--border-color);
+}
+.nm-pick-btn:hover, .nm-pick-btn:focus-visible { border-color: var(--border-focus); color: var(--text-primary); }
+
+.nm-ac-list {
+  position: fixed;
+  z-index: 2000;
+  max-width: calc(520px * var(--ui-layout-scale, 1));
+  max-height: calc(280px * var(--ui-layout-scale, 1));
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  padding: 2px 0;
+}
+.ki-modal-backdrop ~ .nm-ac-list { z-index: 10010; }
+.nm-ac-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: calc(3px * var(--ui-layout-scale, 1)) calc(8px * var(--ui-layout-scale, 1));
+  cursor: pointer;
+  font-size: var(--fs-12, 12px);
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.nm-ac-item.highlight, .nm-ac-item:hover { background: var(--bg-hover); }
+.nm-ac-name { font-family: var(--font-mono); }
+.nm-ac-kind { flex: none; font-size: var(--fs-10, 10px); color: var(--accent-blue); text-transform: lowercase; }
+.nm-ac-meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: right; font-size: var(--fs-11, 11px); color: var(--text-muted); }
+
+.nm-fx { display: flex; flex-direction: column; gap: 8px; }
+.nm-fx-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-family: var(--font-mono); font-size: var(--fs-12, 12px); color: var(--text-secondary); }
+.nm-fx-crumb {
+  background: none;
+  border: none;
+  padding: 1px 3px;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  color: var(--accent-blue);
+  cursor: pointer;
+}
+.nm-fx-crumb:hover { background: var(--bg-hover); }
+.nm-fx-crumb.current { color: var(--text-primary); font-weight: 600; }
+.nm-fx-sep { color: var(--text-muted); }
+.nm-fx-crumb-label { color: var(--text-secondary); font-family: inherit; }
+.nm-fx-filter {
+  font-size: var(--fs-12, 12px);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: calc(4px * var(--ui-layout-scale, 1)) calc(8px * var(--ui-layout-scale, 1));
+}
+.nm-fx-filter:focus { outline: none; border-color: var(--border-focus); }
+.nm-fx-list {
+  height: calc(320px * var(--ui-layout-scale, 1));
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+}
+.nm-fx-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: calc(3px * var(--ui-layout-scale, 1)) calc(8px * var(--ui-layout-scale, 1));
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--fs-12, 12px);
+  color: var(--text-primary);
+}
+.nm-fx-row.highlight, .nm-fx-row:hover { background: var(--bg-hover); }
+.nm-fx-dir .nm-fx-name, .nm-fx-up .nm-fx-name { color: var(--accent-blue); }
+.nm-fx-icon { flex: none; width: 1.4em; text-align: center; }
+.nm-fx-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm-fx-empty { padding: 12px; font-size: var(--fs-12, 12px); color: var(--text-muted); }
 .nm-insp-scale input[type="range"] { flex: 1; min-width: calc(60px * var(--ui-layout-scale, 1)); padding: 0; border: none; background: none; }
 .nm-insp-scale input[type="number"] { width: calc(56px * var(--ui-layout-scale, 1)); flex: none; }
 .nm-hint { color: var(--text-muted); font-family: inherit; }

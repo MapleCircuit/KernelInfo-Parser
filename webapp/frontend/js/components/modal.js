@@ -28,7 +28,11 @@ export function openModal({ title, subtitle = "", width = "760px", footerHtml = 
   document.body.appendChild(backdrop);
 
   const onKey = (e) => {
-    if (e.key === "Escape") close();
+    if (e.key !== "Escape") return;
+    // Stacked dialogs (a file browser opened from a form): Escape closes the topmost one only
+    const open = document.querySelectorAll?.(".ki-modal-backdrop");
+    if (open?.length && open[open.length - 1] !== backdrop) return;
+    close();
   };
   function close() {
     if (!backdrop.isConnected) return;

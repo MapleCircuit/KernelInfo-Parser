@@ -1081,3 +1081,148 @@ test("commit diff lines from the server are coerced before they reach the HTML",
   assert.deepEqual(p.files[0].hunks[0].lines[0], [" ", null, 2, "x"]);
   assert.doesNotMatch(D.renderDiffBody(p), /<b>|<i>/);
 });
+
+test("header Apply moves the selected versioned nodes in one undo step, else leaves them to the tab switch", async () => {
+  const VS = await import("../js/components/version_switch.js");
+  const tab = { id: "tab-apply", type: "nodemap", version: "v6.12", repo: "" };
+  const { c } = controller(tab);
+  const unregister = VS.registerSelectionVersionApplier(tab.id, (ref) => c.applyVersionToSelection(ref));
+  const s = c.addNode({ type: "struct", version: "v3.0", data: { name: "task_struct" } });
+  const src = c.addNode({ type: "source", version: "v6.12", data: { path: "kernel/fork.c" } });
+  const d = c.addNode({ type: "diff", version: "v6.1", data: { mode: "file", versionA: "v6.1", versionB: "v6.6", path: "mm/slub.c" } });
+  const t = c.addNode({ type: "tab", data: { tabType: "commits", hash: "v=v3.0&tab=commits" } });
+  const note = c.addNode({ type: "note", data: { text: "n" } });
+  const g = c.addNode({ type: "group", data: {} });
+
+  c.selected = new Set();
+  c.commit({ save: false });
+  assert.equal(VS.applyVersionToSelection("v6.12", tab), null, "no selection: the tab's default revision switches");
+  assert.equal(s.version, "v3.0");
+
+  // The tab is already on v6.12, the selected struct is not: Apply still moves it
+  c.selected = new Set([s.id, src.id, d.id, t.id, note.id, g.id]);
+  c.commit({ save: false });
+  const steps = c.history.undoList.length;
+  const res = VS.applyVersionToSelection("v6.12", tab);
+  assert.equal(res.level, "success");
+  assert.deepEqual(new Set(res.changedIds), new Set([s.id, d.id, t.id]));
+  assert.equal(res.unchanged, 1, "the source node is already on it");
+  assert.equal(res.skipped, 2, "note and group have no revision");
+  assert.match(res.message, /^Updated 3 selected nodes to v6\.12/);
+  assert.equal(s.version, "v6.12");
+  assert.equal(d.data.versionB, "v6.12", "a file diff moves its To side");
+  assert.equal(d.data.versionA, "v6.1");
+  assert.equal(new URLSearchParams(t.data.hash).get("v"), "v6.12", "a tab node moves its embedded address");
+  assert.equal(c.history.undoList.length, steps + 1, "one undo step");
+  c.undo();
+  assert.equal(c.byId(s.id).version, "v3.0", "undo restores every node at once");
+  assert.equal(c.byId(d.id).data.versionB, "v6.6");
+  assert.equal(new URLSearchParams(c.byId(t.id).data.hash).get("v"), "v3.0");
+
+  c.selected = new Set([note.id, g.id]);
+  const none = VS.applyVersionToSelection("v6.12", tab);
+  assert.equal(none.level, "info", "only versionless nodes: nothing changes");
+  assert.deepEqual(none.changedIds, []);
+
+  // CVE release checks move; nodes of another repository keep their refs
+  const cve = c.addNode({ type: "cve", version: "v6.1", data: { cveId: "CVE-2024-1", release: "v6.1" } });
+  const other = c.addNode({ type: "struct", version: "v6.1", repo: "other-repo", data: { name: "x" } });
+  c.selected = new Set([cve.id, other.id]);
+  const mixed = VS.applyVersionToSelection("v6.12", tab);
+  assert.deepEqual(mixed.changedIds, [cve.id]);
+  assert.equal(cve.data.release, "v6.12");
+  assert.equal(other.version, "v6.1");
+  assert.equal(mixed.otherRepo, 1);
+  assert.match(mixed.message, /1 of another repository skipped/);
+
+  unregister();
+  c.selected = new Set([c.byId(s.id).id]);
+  assert.equal(VS.applyVersionToSelection("v6.12", tab), null, "an unregistered view leaves Apply to the tab");
+});
+
+test("inspector pickers commit through the input handler: revision popover, multi-selection revision, struct pick", async () => {
+  const I = await import("../js/views/nodemap/nodemap_inspector.js");
+  const { c } = controller();
+  const s = c.addNode({ type: "struct", version: "v3.0", data: { name: "foo" } });
+  const opened = [];
+  c.refPicker = { open: (anchor, opts) => opened.push({ anchor, opts }) };
+  c.commit({ save: false });
+  const steps = c.history.undoList.length;
+  I.onInspectorClick(c, { target: { closest: () => ({ dataset: { insp: "pick", pick: "version", for: "version" } }) } });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].opts.current, "v3.0");
+  assert.equal(opened[0].opts.scoped, false, "every tag and commit, as in Compare");
+  opened[0].opts.onSelect("v6.6");
+  assert.equal(s.version, "v6.6");
+  assert.equal(c.history.undoList.length, steps + 1);
+
+  // A pick that arrives after the selection moved to another node is dropped
+  const other = c.addNode({ type: "struct", version: "v3.0", data: { name: "other" } });
+  c.selected = new Set([s.id]);
+  I.onInspectorClick(c, { target: { closest: () => ({ dataset: { insp: "pick", pick: "version", for: "version" } }) } });
+  c.selected = new Set([other.id]);
+  opened.at(-1).opts.onSelect("v5.0");
+  assert.equal(other.version, "v3.0");
+  assert.equal(s.version, "v6.6");
+  c.selected = new Set([s.id]);
+  opened.splice(1);
+
+  // Diff From / To browse their own side
+  const d = c.addNode({ type: "diff", version: "v3.0", data: { mode: "file", versionA: "v2.6.39", versionB: "v3.0", path: "" } });
+  I.onInspectorClick(c, { target: { closest: () => ({ dataset: { insp: "pick", pick: "version", for: "d-versionA" } }) } });
+  opened[1].opts.onSelect("v2.6.38");
+  assert.equal(d.data.versionA, "v2.6.38");
+
+  // Multi-selection Revision field
+  const n = c.addNode({ type: "note", data: { text: "x" } });
+  c.selected = new Set([s.id, d.id, n.id]);
+  I.onInspectorInput(c, { target: { closest() { return this; }, dataset: { insp: "multi-version" }, value: "v6.1", tagName: "INPUT", type: "text" } }, true);
+  assert.equal(s.version, "v6.1");
+  assert.equal(d.data.versionB, "v6.1");
+
+  // Struct autocomplete pick fills name, defining file and kind in one step
+  c.selected = new Set([s.id]);
+  c.commit({ save: false });
+  const before = c.history.undoList.length;
+  I.commitStructPick(c, { name: "bar", kind: "C_union", path: "include/linux/bar.h" });
+  assert.equal(s.data.name, "bar");
+  assert.equal(s.data.path, "include/linux/bar.h");
+  assert.equal(s.data.kind, "union");
+  assert.equal(c.history.undoList.length, before + 1);
+});
+
+test("dialog pickers: revision popover and autocomplete fill the form inputs", async () => {
+  const P = await import("../js/views/nodemap/nodemap_pickers.js");
+  const { FakeElement } = await import("./helpers/dom_shim.mjs");
+  const mk = (name, value = "") => Object.assign(new FakeElement("input"), { name, value });
+  const inputs = { version: mk("version", "v3.0"), name: mk("name"), path: mk("path"), kind: mk("kind", "struct") };
+  inputs.name.dataset.ac = "struct";
+  const vBtn = new FakeElement("button");
+  vBtn.dataset = { pick: "version", for: "version" };
+  const fBtn = new FakeElement("button");
+  fBtn.dataset = { pick: "file", for: "path" };
+  const form = {
+    querySelector: (s) => inputs[/name="(\w+)"/.exec(s)?.[1]] || null,
+    querySelectorAll: (s) => (s === "[data-pick]" ? [vBtn, fBtn] : s === "input[data-ac]" ? [inputs.name] : []),
+  };
+  const opened = [];
+  const modals = [];
+  P.wireFormPickers(form, {
+    client: { getDirectoryTree: async () => ({ entries: [] }) },
+    version: () => inputs.version.value,
+    picker: { open: (a, o) => opened.push(o) },
+    openModalFn: (cfg) => {
+      const m = { cfg, body: { innerHTML: "", querySelector: () => null }, footer: { querySelector: () => null }, close() {} };
+      modals.push(m);
+      return m;
+    },
+  });
+  vBtn.dispatchEvent({ type: "click" });
+  opened[0].onSelect("v6.6");
+  assert.equal(inputs.version.value, "v6.6");
+  inputs.path.value = "include/linux/sched.h";
+  fBtn.dispatchEvent({ type: "click" });
+  assert.equal(modals.length, 1, "Browse… opens the File Explorer");
+  assert.match(modals[0].cfg.subtitle, /v6\.6/, "scoped to the form's revision");
+  assert.ok(inputs.name._nmAutocomplete, "the struct name autocompletes");
+});
