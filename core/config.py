@@ -183,6 +183,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Seconds a parsing worker may hold one batch without returning it before it is stack-dumped, killed and
         # its batch re-parsed one file per batch (pipeline/worker_stage.py); 0 disables the watchdog
         "worker_batch_timeout_s": 300,
+        # Seconds a single-file retry batch (a file of a batch that stalled or killed its worker) may take; the
+        # effective limit is the smaller of this and worker_batch_timeout_s; 0 keeps worker_batch_timeout_s
+        "worker_retry_file_timeout_s": 90,
         "single_version": False,
         "include_pre_releases": True,
     },
@@ -575,6 +578,10 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     env_batch_timeout = _get_user_env("WORKER_BATCH_TIMEOUT_S")
     parser_sec["worker_batch_timeout_s"] = max(0, _coerce_int(
         env_batch_timeout if env_batch_timeout else parser_sec.get("worker_batch_timeout_s"), 300
+    ))
+    env_retry_timeout = _get_user_env("WORKER_RETRY_FILE_TIMEOUT_S")
+    parser_sec["worker_retry_file_timeout_s"] = max(0, _coerce_int(
+        env_retry_timeout if env_retry_timeout else parser_sec.get("worker_retry_file_timeout_s"), 90
     ))
 
     if env_p_cache_max := _get_user_env("CACHE_MAX_TABLE_MB"):

@@ -14,7 +14,9 @@ the C and assembly parsers pass to libclang, so a file reads the headers `make A
   build products never exist in Git, so the two form the build's view of the tree.
 - **Arguments** (`args_for()`): `-nostdinc -isystem <libclang resource include>` (no host header is ever read),
   `-x c` (C) or `-x assembler-with-cpp -D__ASSEMBLY__` (`.S` / `.s`), the target of the configuration
-  (`--target=x86_64-linux-gnu` / `i386-linux-gnu` / ...), the layout's flags (`-D__KERNEL__`, `-std=gnu11`, ...;
+  (`--target=x86_64-linux-gnu` / `i386-linux-gnu` / ...; an ARCH libclang has no triple for keeps the host
+  target when 64-bit and takes `i386-linux-gnu` when 32-bit, so `sizeof(long)` matches `BITS_PER_LONG`; the
+  byte order stays little-endian), the layout's flags (`-D__KERNEL__`, `-std=gnu11`, ...;
   `-std=gnu89` when the layout names none), the include directories and the forced `-include` headers (for C all
   of them, for assembly all but `compiler_types.h`, which kbuild adds to `c_flags` only), and the per-object
   `KBUILD_BASENAME` / `KBUILD_MODNAME` / `KBUILD_MODFILE` strings of the file.
@@ -77,6 +79,11 @@ _TARGETS: dict[str, tuple[str | None, str | None]] = {
     "sparc64": ("sparc64-linux-gnu", "sparc64-linux-gnu"), "mips": ("mips64-linux-gnu", "mips-linux-gnu"),
     "loongarch": ("loongarch64-linux-gnu", "loongarch64-linux-gnu"), "ia64": (None, None),
 }
+# --target of an ARCH without a `_TARGETS` entry (tile, blackfin, sh, m68k, ...): the host target for a 64-bit
+# configuration, a 32-bit triple for a 32-bit one, so `sizeof(long)` agrees with the configuration's
+# `BITS_PER_LONG` (with a 64-bit `long`, `CPU_MASK_ALL`'s `[0 ... BITS_TO_LONGS(NR_CPUS) - 2]` wraps to
+# `[0 ... SIZE_MAX]`, a range designator libclang expands element by element without end)
+_GENERIC_TARGETS: tuple[str | None, str | None] = (None, "i386-linux-gnu")
 
 _ACTIVE: CompileEnv | None = None
 _TREE_ENVS: dict[str, CompileEnv] = {}
@@ -468,8 +475,8 @@ class CompileEnv:
                              if self.configure else ({}, None))
         env = ArchEnv(arch, layout, config, defconfig, config_digest(config))
         bits64 = env.is_64bit()
-        pair = _TARGETS.get(layout.srcarch) or _TARGETS.get(arch)
-        env.target = (pair[0] if bits64 else pair[1]) if pair else None
+        pair = _TARGETS.get(layout.srcarch) or _TARGETS.get(arch) or _GENERIC_TARGETS
+        env.target = pair[0] if bits64 else pair[1]
         digest = hashlib.sha1(f"{self.key}\0{arch}\0{env.config_hash}".encode("utf-8", "surrogatepass")).hexdigest()[:16]
         env.build_dir = os.path.join(self.build_base, f"{digest}-{arch}")
         self._materialize(env)

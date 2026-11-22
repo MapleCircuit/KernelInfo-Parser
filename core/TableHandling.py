@@ -1459,6 +1459,8 @@ class ChangeSet:
         """Select and invoke appropriate language AST parser based on current_path file type.
 
         Detects file language type using `self.get_file_type()` and triggers parser (e.g. `c_ast_parse(self)`).
+        A path in `gp.raw_fallback_paths` (a file whose parse killed or stalled a worker twice,
+        `pipeline/worker_stage.py`) is parsed by `raw_ast_parse` whatever its type.
         """
         if not self.current_path or self.file_operation == "R100":
             return
@@ -1466,7 +1468,10 @@ class ChangeSet:
         staged_before_parse = len(self.cs)
         try:
             current_type = self.get_file_type()
-            if current_type == T_C:
+            if self.current_path in (getattr(self.gp, "raw_fallback_paths", None) or ()):
+                from parser.raw_ast.raw_ast import raw_ast_parse
+                raw_ast_parse(self)
+            elif current_type == T_C:
                 from parser.c_ast.c_ast import c_ast_parse
                 c_ast_parse(self)
             elif current_type == T_ASM:

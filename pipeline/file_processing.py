@@ -32,7 +32,7 @@ from core.DBLayout import (
     m_tag_ref,
 )
 from pipeline.state import MF, gp, logger
-from pipeline.worker_protocol import _FRAME_DONE, _FRAME_INIT_FAILED, _WORKER_SPLIT_KEYS, _encode_batch_result, _recv_task
+from pipeline.worker_protocol import _FRAME_DONE, _FRAME_INIT_FAILED, _FRAME_READY, _WORKER_SPLIT_KEYS, _encode_batch_result, _recv_task
 
 
 
@@ -231,7 +231,8 @@ def file_processing_worker(
     A serializer thread pickles each finished batch (zlib-compressed in low memory modes) together with
     its per-file errors and sends it back on `conn` as one result frame, so parsing the next batch
     (already queued by the parent) overlaps sending the last one. `send_bytes` blocks while the parent is
-    behind, which caps worker memory at the batches in flight. A done frame is sent last; closing the
+    behind, which caps worker memory at the batches in flight. A ready frame follows the DB connection set-up
+    (before the first task is read), a done frame is sent last; closing the
     pipe without it marks the worker as crashed. `SIGUSR1` dumps the worker's stacks to stderr
     (`_register_stack_dump_signal()`); the parent sends it before killing a stalled worker.
     """
@@ -270,6 +271,11 @@ def file_processing_worker(
             pass
         conn.close()
         return
+    try:
+        _send(_FRAME_READY)
+    except OSError:
+        # The parent went away; the task wait below sees the closed pipe
+        pass
 
     # File-scoped shared symbol segments inherited from the parent (None during Stage 1)
     shared_symbols = getattr(gp_ref, "_shared_symbols", None) if gp_ref is not None else None

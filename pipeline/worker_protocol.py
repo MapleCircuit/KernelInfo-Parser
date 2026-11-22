@@ -10,8 +10,8 @@ import zlib
 
 
 # Frames on each worker's private duplex pipe. The parent sends task frames (two ahead, so a worker never
-# waits for its next batch) and a stop frame once no batch is left; the worker answers each task with a
-# result frame and ends with a done frame. A pipe that closes before the done frame means the worker died
+# waits for its next batch) and a stop frame once no batch is left; the worker sends a ready frame once its
+# start-up (DB connection) is done, answers each task with a result frame and ends with a done frame. A pipe that closes before the done frame means the worker died
 # (signal, OOM kill, libclang abort) while parsing the oldest batch it had not returned.
 _FRAME_TASK = b"T"
 
@@ -26,6 +26,10 @@ _FRAME_INIT_FAILED = b"I"
 
 
 _FRAME_DONE = b"D"
+
+
+# Start-up finished (DB connection open): the watchdog's start-up grace ends and the first batch's clock starts
+_FRAME_READY = b"Y"
 
 
 _RESULT_HEADER = struct.Struct("<cqB")  # frame tag, batch id, zlib-compressed flag

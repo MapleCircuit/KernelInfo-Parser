@@ -252,6 +252,85 @@ PRE_ARCH_TREE = {
 }
 
 
+# An ARCH libclang has no triple for (arch/tile, 2.6.36): 32-bit TILEPro and 64-bit TILE-Gx, chosen by 64BIT
+UNMAPPED_TREE = {
+    "Makefile": (
+        "VERSION = 2\nPATCHLEVEL = 6\nSUBLEVEL = 36\nEXTRAVERSION = -rc1\n"
+        "ARCH ?= x86_64\nLINUXINCLUDE := -Iinclude\nCPPFLAGS := -D__KERNEL__ $(LINUXINCLUDE)\n"
+        "include arch/$(ARCH)/Makefile\n"
+    ),
+    "scripts/Makefile.lib": "c_flags = $(CPPFLAGS)\n",
+    "arch/x86_64/Makefile": "core-y += arch/x86_64/kernel/\n",
+    "arch/x86_64/Kconfig": "config X86_64\n\tbool\n\tdefault y\n",
+    "arch/tile/Makefile": "core-y += arch/tile/kernel/\n",
+    "arch/tile/Kconfig": "config 64BIT\n\tbool\n\tdefault n\n",
+    # CPU_MASK_ALL of include/linux/cpumask.h for NR_CPUS > BITS_PER_LONG, as INIT_TASK() expands it: with a
+    # 64-bit long, BITS_TO_LONGS(64) - 2 is (size_t)-1, a range designator libclang expands without end
+    "arch/tile/kernel/init_task.c": (
+        "#define NR_CPUS 64\n#define BITS_PER_LONG 32\n"
+        "#define BITS_TO_LONGS(nr) (((nr) + (8 * sizeof(long)) - 1) / (8 * sizeof(long)))\n"
+        "typedef struct { unsigned long bits[BITS_TO_LONGS(NR_CPUS)]; } cpumask_t;\n"
+        "struct task_struct { cpumask_t cpus_allowed; };\n"
+        "struct task_struct init_task = { .cpus_allowed = (cpumask_t) { {\n"
+        "\t[0 ... BITS_TO_LONGS(NR_CPUS) - 2] = ~0UL,\n"
+        "\t[BITS_TO_LONGS(NR_CPUS) - 1] = ((NR_CPUS % BITS_PER_LONG) ? (1UL << (NR_CPUS % BITS_PER_LONG)) - 1 : ~0UL)\n"
+        "} } };\n"
+        "typedef char long_matches_config[sizeof(long) * 8 == BITS_PER_LONG ? 1 : -1];\n"
+    ),
+}
+
+
+def _parse_errors_in_child(path: str, args: list[str], options: int, queue) -> None:
+    tu = cc.Index.create().parse(path, args=["-w", *args], options=options)
+    queue.put(sum(1 for d in tu.diagnostics if d.severity >= cc.Diagnostic.Error))
+
+
+class TestUnmappedArchTarget(unittest.TestCase):
+    """An ARCH without a `_TARGETS` triple: a 32-bit configuration gets a 32-bit target, a 64-bit one the host's."""
+
+    def env_of(self, tree: dict[str, str]) -> CompileEnv:
+        root = tempfile.mkdtemp(prefix="kip-env-", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        for path, text in tree.items():
+            dest = os.path.join(root, path)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="latin-1") as fh:
+                fh.write(text)
+        base = tempfile.mkdtemp(prefix="kip-build-")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, base, True)
+        env = CompileEnv(root, set(tree), tree.get, None, key=f"test-{id(tree)}", build_base=base)
+        self.addCleanup(env.cleanup)
+        return env
+
+    def test_32_bit_configuration_parses_with_a_32_bit_long(self) -> None:
+        import multiprocessing
+
+        env = self.env_of(UNMAPPED_TREE)
+        path = "arch/tile/kernel/init_task.c"
+        args, options, arch_env = env.args_for(path)
+        self.assertEqual(arch_env.arch, "tile")
+        self.assertFalse(arch_env.is_64bit())
+        self.assertIn("--target=i386-linux-gnu", args)
+        # Bounded: the parse with a 64-bit long never ends
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+        child = ctx.Process(target=_parse_errors_in_child, args=(os.path.join(env.root, path), args, options, queue))
+        child.start()
+        child.join(30)
+        if child.is_alive():
+            child.kill()
+            child.join()
+            self.fail("libclang did not finish parsing the CPU_MASK_ALL initializer within 30s")
+        self.assertEqual(queue.get(timeout=5), 0)
+
+    def test_64_bit_configuration_keeps_the_host_target(self) -> None:
+        tree = dict(UNMAPPED_TREE)
+        tree["arch/tile/Kconfig"] = "config 64BIT\n\tbool\n\tdefault y\n"
+        args, _, arch_env = self.env_of(tree).args_for("arch/tile/kernel/init_task.c")
+        self.assertTrue(arch_env.is_64bit())
+        self.assertFalse([a for a in args if a.startswith("--target=")])
+
+
 class TestHistoricalCompileEnv(unittest.TestCase):
     """CompileEnv of trees before kbuild's c_flags (2.x) and before arch/ (0.01-1.0)."""
 

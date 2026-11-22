@@ -10,6 +10,7 @@ import os
 import pickle
 import signal
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -21,13 +22,14 @@ import pipeline.git_commit_worker
 import pipeline.multicore
 import pipeline.scheduler
 import pipeline.source_order
+import pipeline.state
 import pipeline.systemic
 import pipeline.unchanged
 import pipeline.worker_protocol
 import pipeline.worker_stage
 from core.DBLayout import m_ast
 from core.GreatProcessor import GreatProcessor
-from core.globalstuff import FILE_ERROR, G, REF_FILE
+from core.globalstuff import FILE_ERROR, G, REF_FILE, T_C
 from core.TableHandling import ChangeSet
 from db_engine import MockDB
 from tests.db_fixtures import make_db
@@ -157,6 +159,39 @@ def _lingering_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
         conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {f: len(files) for f in files}, [], compress=False))
     conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
     time.sleep(3600)
+
+
+def _ready_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
+    """Fake worker sending the ready frame like `file_processing_worker`; a 'hang' file never returns, a 'crash'
+    file kills it unless the parent named it in `gp.raw_fallback_paths` (then it returns 'raw'). With
+    `_READY_DELAY_S` set it starts up that long before its ready frame."""
+    import time
+
+    if _READY_DELAY_S:
+        time.sleep(_READY_DELAY_S[0])
+    conn.send_bytes(pipeline.worker_protocol._FRAME_READY)
+    raw_paths = getattr(gp_ref, "raw_fallback_paths", ()) or ()
+    while True:
+        task = pipeline.worker_protocol._recv_task(conn)
+        if task is None:
+            break
+        batch_id, files = task
+        # Keyed by path, like the ChangeSets of `file_processing_worker`
+        if all(f.split("\t")[-1] in raw_paths for f in files):
+            result = {f.split("\t")[-1]: "raw" for f in files}
+        else:
+            if any("hang" in f for f in files):
+                time.sleep(3600)
+            if any("crash" in f for f in files):
+                os.kill(os.getpid(), signal.SIGKILL)
+            result = {f.split("\t")[-1]: len(files) for f in files}
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, result, [], compress=False))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
+    conn.close()
+
+
+# Start-up seconds of `_ready_worker` before its ready frame (set by the test before the workers fork)
+_READY_DELAY_S: list[float] = []
 
 
 def _unstartable_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
@@ -512,6 +547,83 @@ class TestWorkerStage(unittest.TestCase):
         self.assertEqual(result.lost_files, [])
         self.assertTrue(any("did not exit" in line for line in logs.output))
 
+    def test_file_crashing_twice_is_ingested_through_the_raw_fallback(self) -> None:
+        """A file that kills a worker in its batch and on its own is parsed raw, so the version records it."""
+        ingested: dict[str, object] = {}
+        errors: list = []
+        batches = [(0, ["M\ta.c", "M\tcrash.c"]), (1, ["M\tb.c"])]
+        with self.assertLogs(pipeline.worker_stage.logger, level="WARNING") as logs:
+            result = pipeline.worker_stage._run_worker_stage(
+                "[test]", batches, ingested.update, 2, errors, worker_target=_ready_worker
+            )
+        self.assertEqual(ingested, {"a.c": 1, "b.c": 1, "crash.c": "raw"})
+        self.assertEqual(result.lost_files, [])
+        self.assertEqual(result.crashed_files, [])
+        self.assertEqual(result.raw_fallback_files, ["M\tcrash.c"])
+        self.assertEqual(pipeline.state.gp.raw_fallback_paths, frozenset(), "reset once the fallback workers ran")
+        crash_errors = [e[1] for e in errors if e[0] == "M\tcrash.c"]
+        self.assertEqual(len(crash_errors), 1, crash_errors)
+        self.assertIn("died while parsing this file", crash_errors[0])
+        self.assertIn("ingested through the raw_ast fallback", crash_errors[0])
+        self.assertTrue(any("[raw fallback]" in line and "crash.c" in line for line in logs.output))
+
+    def test_raw_fallback_that_crashes_too_leaves_the_file_lost(self) -> None:
+        errors: list = []
+        result = pipeline.worker_stage._run_worker_stage(
+            "[test]", [(0, ["crash.c"])], lambda batch: None, 1, errors, worker_target=_crashing_worker
+        )
+        self.assertEqual(result.lost_files, ["crash.c"])
+        self.assertEqual(result.raw_fallback_files, [])
+        self.assertEqual([e[1] for e in errors if e[0] == "crash.c"],
+                         ["A worker process died while parsing this file; it was not ingested."])
+
+    def test_raw_fallback_can_be_disabled(self) -> None:
+        result = pipeline.worker_stage._run_worker_stage(
+            "[test]", [(0, ["crash.c"])], lambda batch: None, 1, [], worker_target=_ready_worker, raw_fallback=False
+        )
+        self.assertEqual(result.lost_files, ["crash.c"])
+        self.assertEqual(result.raw_fallback_files, [])
+
+    @mock.patch.object(pipeline.worker_stage, "_WORKER_INIT_GRACE_S", 3600.0)
+    def test_ready_frame_ends_the_start_up_grace(self) -> None:
+        """Past its ready frame a worker gets the batch timeout only, not the start-up grace."""
+        errors: list = []
+        started = time.monotonic()
+        result = pipeline.worker_stage._run_worker_stage(
+            "[test]", [(0, ["hang.c"])], lambda batch: None, 1, errors, worker_target=_ready_worker,
+            batch_timeout_s=1.0, raw_fallback=False,
+        )
+        self.assertLess(time.monotonic() - started, 60.0)
+        self.assertEqual(result.lost_files, ["hang.c"])
+        self.assertTrue(any(e[0] == "hang.c" and "stalled for more than 1s" in e[1] for e in errors))
+
+    @mock.patch.object(pipeline.worker_stage, "_WORKER_INIT_GRACE_S", 30.0)
+    def test_start_up_before_the_ready_frame_is_not_a_stall(self) -> None:
+        """A slow start-up is covered by the grace; the first batch's clock starts at the ready frame."""
+        _READY_DELAY_S[:] = [1.5]
+        self.addCleanup(_READY_DELAY_S.clear)
+        ingested: dict[str, object] = {}
+        result = pipeline.worker_stage._run_worker_stage(
+            "[test]", [(0, ["a.c"])], ingested.update, 1, [], worker_target=_ready_worker, batch_timeout_s=1.0,
+        )
+        self.assertEqual(ingested, {"a.c": 1})
+        self.assertEqual(result.failed_workers, 0)
+
+    def test_single_file_retry_batches_use_the_retry_file_timeout(self) -> None:
+        """In a retry round a single-file batch is killed at `parser.worker_retry_file_timeout_s`."""
+        errors: list = []
+        started = time.monotonic()
+        with mock.patch.object(pipeline.worker_stage, "_configured_retry_file_timeout", return_value=1.0), \
+                self.assertLogs(pipeline.worker_stage.logger, level="ERROR") as logs:
+            result = pipeline.worker_stage._run_worker_stage(
+                "[test] [retry]", [(0, ["hang.c"])], lambda batch: None, 1, errors, retry_lost=False,
+                worker_target=_ready_worker, batch_timeout_s=300.0, raw_fallback=False,
+            )
+        self.assertLess(time.monotonic() - started, 60.0)
+        self.assertEqual(result.lost_files, ["hang.c"])
+        self.assertTrue(any("(limit 1s)" in line for line in logs.output))
+        self.assertTrue(any(e[0] == "hang.c" and "stalled for more than 1s" in e[1] for e in errors))
+
     def test_same_error_on_most_files_stops_the_stage(self) -> None:
         """A stage stops as soon as one error message covers most files, without ingesting the rest."""
         errors: list = []
@@ -684,10 +796,12 @@ class _FakeConn:
         return None
 
 
-def _run_worker(files: list[str], *, shared_symbols=None, mf=None, parse=None):
+def _run_worker(files: list[str], *, shared_symbols=None, mf=None, parse=None, raw_fallback_paths=frozenset(),
+                c_parse=None, conn=None):
     """Run `file_processing_worker` over one batch; returns (ChangeSets by path, errors, calls)."""
     gp_ref = types.SimpleNamespace(
         VID=2, Old_VID=0, Version_Name="v", file_blob_hashes=None, _shared_symbols=shared_symbols,
+        raw_fallback_paths=raw_fallback_paths,
     )
     captured: dict = {}
     calls = {"prune": 0, "resolve": 0}
@@ -707,11 +821,12 @@ def _run_worker(files: list[str], *, shared_symbols=None, mf=None, parse=None):
             mock.patch.object(ChangeSet, "prune_unchanged_dependencies", _prune), \
             mock.patch.object(ChangeSet, "pre_resolve_operations", _resolve), \
             mock.patch("parser.raw_ast.raw_ast.raw_ast_parse", parse or (lambda cs: None)), \
+            mock.patch("parser.c_ast.c_ast.c_ast_parse", c_parse or (lambda cs: None)), \
             mock.patch.object(ChangeSet, "preprocess_ref_views", lambda self: None), \
             mock.patch.object(type(G), "LOW_MEMORY_MODE", False), \
             mock.patch.object(type(G), "VERY_LOW_MEMORY_MODE", False):
         pipeline.file_processing.file_processing_worker(
-            _FakeConn([(0, files)]), 2, gp_ref, mf or types.SimpleNamespace(get_file=lambda p, v: "text"), 0
+            conn or _FakeConn([(0, files)]), 2, gp_ref, mf or types.SimpleNamespace(get_file=lambda p, v: "text"), 0
         )
     return captured["dict"], captured["errors"], calls
 
@@ -767,6 +882,39 @@ class TestWorkerBody(unittest.TestCase):
         self.assertEqual(len(cs.cs), 3)
         # the error is counted by the systemic-failure check, which looks at keys holding a tab
         self.assertIn("\t", errors[0][0])
+
+
+class TestRawFallbackWorkerBody(unittest.TestCase):
+    """`file_processing_worker` with `gp.raw_fallback_paths`: the named file is parsed by raw_ast_parse."""
+
+    def test_named_c_file_is_parsed_raw_with_its_file_rows(self) -> None:
+        parsed: list[str] = []
+
+        def c_parse(cs):
+            raise AssertionError("libclang must not run for a raw fallback file")
+
+        path = "arch/tile/kernel/init_task.c"
+        done, errors, _ = _run_worker([f"A\t{path}"], raw_fallback_paths=frozenset({path}),
+                                      parse=lambda cs: parsed.append(cs.current_path), c_parse=c_parse)
+        self.assertEqual(errors, [])
+        self.assertEqual(parsed, [path])
+        cs = done[path]
+        self.assertEqual(cs.get_file_type(), T_C, "the blob keeps its C type, so Step 4.5 finds it by path")
+        # m_file_name, m_file_blob and m_bridge_checkpoint rows, as for any parsed file
+        self.assertEqual(len(cs.cs), 3)
+
+    def test_other_c_files_still_use_the_c_parser(self) -> None:
+        parsed: list[str] = []
+        done, errors, _ = _run_worker(["A\tkernel/fork.c"], raw_fallback_paths=frozenset({"arch/tile/kernel/init_task.c"}),
+                                      parse=lambda cs: self.fail("raw parser used"),
+                                      c_parse=lambda cs: parsed.append(cs.current_path))
+        self.assertEqual((errors, parsed), ([], ["kernel/fork.c"]))
+
+    def test_ready_frame_precedes_results(self) -> None:
+        conn = _FakeConn([(0, ["A\tdocs/a.txt"])])
+        _run_worker(["A\tdocs/a.txt"], conn=conn)
+        self.assertEqual(conn.sent[0], pipeline.worker_protocol._FRAME_READY)
+        self.assertEqual(conn.sent[1], b"frame")
 
 
 class TestPriorTagBatchQuery(unittest.TestCase):

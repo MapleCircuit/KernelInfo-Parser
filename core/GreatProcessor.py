@@ -275,6 +275,9 @@ class GreatProcessor:
         self.commit_ids_by_hash: dict[str, int] = {}
         # Changed paths whose blob was already parsed and reused by Step 4.5 instead of being parsed again
         self.deduped_paths: set[str] = set()
+        # Paths parsed by raw_ast_parse whatever their type: files that killed or stalled a parse worker twice
+        # (pipeline/worker_stage.py raw fallback stage; set only while that stage's workers fork)
+        self.raw_fallback_paths: frozenset[str] = frozenset()
         # Background git commit parser (`main._git_commit_worker`) and the directory holding its result
         self._commit_proc = None
         self._commit_result_dir: str | None = None
@@ -732,6 +735,7 @@ class GreatProcessor:
         self.worker_change_list = None
         self.commit_ids_by_hash = {}
         self.deduped_paths = set()
+        self.raw_fallback_paths = frozenset()
         self.Symlink_List.clear()
         self.stop_commit_worker()
         self.close_shared_symbols()

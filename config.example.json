@@ -44,6 +44,7 @@
     "preload_flush_mb": 512,
     "cache_max_table_mb": 6144,
     "worker_batch_timeout_s": 300,
+    "worker_retry_file_timeout_s": 90,
     "distributed": {
       "enabled": false,
       "role": "master",

@@ -30,7 +30,7 @@ from core.DBLayout import (
 from pipeline.file_processing import file_processing_worker
 from pipeline.state import MF, _MP, gp, logger
 from pipeline.systemic import _raise_if_systemic
-from pipeline.worker_protocol import _FRAME_DONE, _FRAME_INIT_FAILED, _FRAME_RESULT, _FRAME_STOP, _FRAME_TASK, _PREFETCH_DEPTH, _STAGE_END, _TASKS_AHEAD, _WORKER_SPLIT_KEYS, _decode_batch_result
+from pipeline.worker_protocol import _FRAME_DONE, _FRAME_INIT_FAILED, _FRAME_READY, _FRAME_RESULT, _FRAME_STOP, _FRAME_TASK, _PREFETCH_DEPTH, _STAGE_END, _TASKS_AHEAD, _WORKER_SPLIT_KEYS, _decode_batch_result
 
 
 
@@ -44,7 +44,11 @@ class WorkerStageResult:
     deadline_hit: bool = False
     elapsed_s: float = 0.0
     tail_idle_s: float = 0.0
+    # Items no worker ingested; `crashed_files` are those of them whose single-file batch killed or stalled a
+    # worker in the retry round; `raw_fallback_files` the crashed items the raw fallback stage ingested instead
     lost_files: list[str] = field(default_factory=list)
+    crashed_files: list[str] = field(default_factory=list)
+    raw_fallback_files: list[str] = field(default_factory=list)
     # Where the stage's time went (see _stage_time_split())
     split: dict[str, float] = field(default_factory=dict)
 
@@ -55,8 +59,12 @@ DEFAULT_BATCH_TIMEOUT_S = 300.0
 _STALL_HEARTBEAT_S = 60.0
 # Seconds a stalled worker gets to write its SIGUSR1 stack dump before it is terminated
 _STALL_DUMP_GRACE_S = 1.5
-# Extra seconds a worker gets on its first batch, which also covers its start-up (DB connection, cache detach)
+# Extra seconds a worker gets on its first batch until its ready frame arrives (start-up: DB connection, cache
+# detach); a worker that sends none (an older worker body) keeps the grace until its first result frame
 _WORKER_INIT_GRACE_S = 120.0
+# Seconds a single-file batch of a retry round may take (`parser.worker_retry_file_timeout_s`; capped by the
+# batch timeout, <= 0 keeps the batch timeout)
+DEFAULT_RETRY_FILE_TIMEOUT_S = 90.0
 # Seconds a worker that sent its done frame may take to exit (close its pipe) before it is killed
 _DONE_EXIT_GRACE_S = 60.0
 # Seconds between SSH tunnel liveness checks while the parent waits for worker results
@@ -69,6 +77,14 @@ def _configured_batch_timeout() -> float:
         return float(get_parser_config().get("worker_batch_timeout_s", DEFAULT_BATCH_TIMEOUT_S))
     except (TypeError, ValueError):
         return DEFAULT_BATCH_TIMEOUT_S
+
+
+def _configured_retry_file_timeout() -> float:
+    """`parser.worker_retry_file_timeout_s` (env WORKER_RETRY_FILE_TIMEOUT_S); <= 0 keeps the batch timeout."""
+    try:
+        return float(get_parser_config().get("worker_retry_file_timeout_s", DEFAULT_RETRY_FILE_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_FILE_TIMEOUT_S
 
 
 def _ensure_db_tunnel(label: str) -> None:
@@ -336,6 +352,7 @@ def _run_worker_stage(
     retry_lost: bool = True,
     worker_target: Callable[..., None] | None = None,
     batch_timeout_s: float | None = None,
+    raw_fallback: bool = True,
 ) -> WorkerStageResult:
     """Parse `batches` on forked workers and stream every batch result into `ingest` on this thread.
 
@@ -353,7 +370,15 @@ def _run_worker_stage(
     Stall watchdog: a worker that holds its oldest unreturned batch for more than `batch_timeout_s` seconds
     (default `parser.worker_batch_timeout_s`; <= 0 disables it) without a result frame pending on its pipe is
     logged with the batch's files, sent `SIGUSR1` (stack dump to stderr), terminated and killed, then handled
-    like a worker that died: the batch is retried one file per batch. A worker that sent its done frame but
+    like a worker that died: the batch is retried one file per batch. Until a worker's ready frame (or, without
+    one, its first result frame) the limit grows by `_WORKER_INIT_GRACE_S`; the ready frame restarts the clock of
+    its first batch. In a retry round (`retry_lost=False`) a single-file batch is limited to
+    `parser.worker_retry_file_timeout_s` when that is lower.
+
+    Raw fallback (`raw_fallback`, first round only): the items whose single-file batch killed or stalled a worker
+    in the retry round are parsed once more on new workers with `gp.raw_fallback_paths` naming them, so
+    `ChangeSet.parse()` reads them with `raw_ast_parse` (no libclang) and the version still records their
+    blob and checkpoint rows; their `error_list` entry says so. Items lost there too stay in `lost_files`. A worker that sent its done frame but
     does not exit within `_DONE_EXIT_GRACE_S` is killed. Every `_STALL_HEARTBEAT_S` without a returned batch
     the reader logs the batches still in flight; while waiting, the parent keeps the database SSH tunnel alive.
     """
@@ -365,6 +390,10 @@ def _run_worker_stage(
 
     target = worker_target or file_processing_worker
     stall_timeout_s = float(_configured_batch_timeout() if batch_timeout_s is None else batch_timeout_s)
+    retry_file_timeout_s = _configured_retry_file_timeout() if not retry_lost else 0.0
+    single_file_timeout_s = (
+        min(stall_timeout_s, retry_file_timeout_s) if retry_file_timeout_s > 0 else stall_timeout_s
+    )
     batch_files = dict(batches)
     num_workers = max(1, min(num_workers, len(batches)))
     t_start = time.perf_counter()
@@ -406,8 +435,9 @@ def _run_worker_stage(
     last_activity: dict[int, float] = {}
     done_at: dict[int, float] = {}
     stalled_workers: dict[int, tuple[int, float]] = {}
-    stalled_batches: set[int] = set()
-    # Workers that returned at least one result frame (past their start-up)
+    # Stalled batch -> the limit it exceeded
+    stalled_batches: dict[int, float] = {}
+    # Workers that sent their ready frame or returned at least one result frame (past their start-up)
     started_workers: set[int] = set()
 
     def _offer(item: Any) -> bool:
@@ -461,14 +491,22 @@ def _run_worker_stage(
         except (EOFError, OSError):
             return True  # closed: the next wait reports it
 
-    def _kill_stalled(open_conns: dict[Any, int], conn: Any, worker_id: int, elapsed: float) -> None:
+    def _batch_limit(worker_id: int) -> float:
+        """Seconds `worker_id` may hold its oldest unreturned batch."""
+        if worker_id not in started_workers:
+            return stall_timeout_s + _WORKER_INIT_GRACE_S
+        if len(batch_files.get(assigned[worker_id][0], ())) == 1:
+            return single_file_timeout_s
+        return stall_timeout_s
+
+    def _kill_stalled(open_conns: dict[Any, int], conn: Any, worker_id: int, elapsed: float, limit: float) -> None:
         p = procs[worker_id]
         b_id = assigned[worker_id][0]
         files = batch_files.get(b_id, [])
         stalled_workers[worker_id] = (b_id, elapsed)
-        stalled_batches.add(b_id)
+        stalled_batches[b_id] = limit
         logger.error(COLOR.red(
-            f"{label}: worker {worker_id} (PID {p.pid}) stalled for {elapsed:.0f}s (limit {stall_timeout_s:.0f}s) "
+            f"{label}: worker {worker_id} (PID {p.pid}) stalled for {elapsed:.0f}s (limit {limit:.0f}s) "
             f"on batch {b_id} ({len(files)} files: {', '.join(files)}); dumping its stacks to stderr and killing it."
         ))
         sigusr1 = getattr(signal, "SIGUSR1", None)
@@ -495,10 +533,10 @@ def _run_worker_stage(
             if stall_timeout_s <= 0 or not assigned[worker_id] or worker_id in init_failed:
                 continue
             elapsed = now - last_activity.get(worker_id, now)
-            limit = stall_timeout_s if worker_id in started_workers else stall_timeout_s + _WORKER_INIT_GRACE_S
+            limit = _batch_limit(worker_id)
             # A result waiting on the pipe means the worker is sending, not stuck
             if elapsed > limit and not _has_pending_frame(conn):
-                _kill_stalled(open_conns, conn, worker_id, elapsed)
+                _kill_stalled(open_conns, conn, worker_id, elapsed, limit)
 
     def _heartbeat(open_conns: dict[Any, int], now: float, idle_s: float) -> None:
         in_flight = [
@@ -539,6 +577,12 @@ def _run_worker_stage(
                                 worker_stats.append(stats)
                             except Exception:
                                 pass
+                    elif tag == _FRAME_READY:
+                        # Start-up is over: the first batch's clock starts now, without the start-up grace
+                        if worker_id not in started_workers:
+                            started_workers.add(worker_id)
+                            if assigned[worker_id]:
+                                last_activity[worker_id] = time.monotonic()
                     elif tag == _FRAME_INIT_FAILED:
                         init_failed.add(worker_id)
                         error_list.append(pickle.loads(frame[1:]))
@@ -748,11 +792,12 @@ def _run_worker_stage(
                     retry_batches.append((next_id + len(retry_batches), [f]))
             else:
                 reason = (
-                    f"A worker stalled for more than {stall_timeout_s:.0f}s while parsing this file and was killed"
+                    f"A worker stalled for more than {stalled_batches[b_id]:.0f}s while parsing this file and was killed"
                     if b_id in stalled_batches else "A worker process died while parsing this file"
                 )
                 for f in b_items:
                     result.lost_files.append(f)
+                    result.crashed_files.append(f)
                     error_list.append((f, f"{reason}; it was not ingested.", ""))
     next_id += len(retry_batches)
     retry_batches += [(next_id + i, batch_files[b_id]) for i, b_id in enumerate(unfinished)]
@@ -775,9 +820,86 @@ def _run_worker_stage(
         retry_lost=False,
         worker_target=target,
         batch_timeout_s=stall_timeout_s,
+        raw_fallback=False,
     )
     result.files_ingested += retry.files_ingested
     result.failed_workers += retry.failed_workers
     result.deadline_hit = result.deadline_hit or retry.deadline_hit
     result.lost_files += retry.lost_files
+    result.crashed_files += retry.crashed_files
+    if raw_fallback and retry_lost and result.crashed_files and not result.deadline_hit:
+        _run_raw_fallback(label, result, ingest, num_workers, error_list, target, stall_timeout_s)
     return result
+
+
+def _run_raw_fallback(
+    label: str,
+    result: WorkerStageResult,
+    ingest: Callable[[dict[str, Any]], None],
+    num_workers: int,
+    error_list: list[tuple[str, str, str]],
+    target: Callable[..., None],
+    stall_timeout_s: float,
+) -> None:
+    """Parse `result.crashed_files` once more with `raw_ast_parse` (see `_run_worker_stage()`), in place.
+
+    A file left out of the version would be "missing from the prior version" in the next one
+    (`pipeline/unchanged.py`) and parsed, and lost, again in every later version; ingested raw, its blob is
+    recorded once and Step 4.5 reuses it for every later version holding the same blob.
+    """
+    items = list(result.crashed_files)
+    fallback_label = f"{label} [raw fallback]"
+    logger.warning(COLOR.yellow(
+        f"{fallback_label}: {len(items)} file(s) killed or stalled a worker twice; ingesting them with the raw_ast "
+        f"parser instead: {', '.join(items)}"
+    ))
+    fallback_errors: list[tuple[str, str, str]] = []
+    ingested_paths: set[str] = set()
+
+    def _ingest(batch: dict[str, Any]) -> None:
+        ingest(batch)
+        ingested_paths.update(batch)
+
+    gp.raw_fallback_paths = frozenset(item.split("\t")[-1] for item in items)
+    try:
+        fallback = _run_worker_stage(
+            fallback_label,
+            [(i, [item]) for i, item in enumerate(items)],
+            _ingest,
+            num_workers,
+            fallback_errors,
+            retry_lost=False,
+            worker_target=target,
+            batch_timeout_s=stall_timeout_s,
+            raw_fallback=False,
+        )
+    except RuntimeError as e:
+        logger.error(COLOR.red(f"{fallback_label}: could not run: {e}"))
+        error_list.extend(fallback_errors)
+        return
+    finally:
+        gp.raw_fallback_paths = frozenset()
+    result.failed_workers += fallback.failed_workers
+    result.deadline_hit = result.deadline_hit or fallback.deadline_hit
+    # The fallback's own "not ingested" entries repeat the first ones; its other errors (raw parse) are kept
+    error_list.extend(err for err in fallback_errors if not err[1].endswith("it was not ingested."))
+    recovered = [item for item in items if item.split("\t")[-1] in ingested_paths]
+    pending_recovered = list(recovered)
+    for idx, (item, message, tb) in enumerate(error_list):
+        if item in pending_recovered and message.endswith("it was not ingested."):
+            pending_recovered.remove(item)
+            error_list[idx] = (
+                item,
+                message.removesuffix("it was not ingested.")
+                + "it was ingested through the raw_ast fallback (whole-file tag, no language AST).",
+                tb,
+            )
+    for item in recovered:
+        if item in result.lost_files:
+            result.lost_files.remove(item)
+        if item in result.crashed_files:
+            result.crashed_files.remove(item)
+    result.files_ingested += fallback.files_ingested
+    result.raw_fallback_files = recovered
+    if recovered:
+        logger.warning(COLOR.yellow(f"{fallback_label}: ingested {len(recovered)} file(s) as raw_ast: {', '.join(recovered)}"))

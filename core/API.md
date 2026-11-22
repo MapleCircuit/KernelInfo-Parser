@@ -12,37 +12,37 @@ agents.
   - 1.3. Global Constants & Enums [L158-L249]
 - 2. Filesystem & Git Subsystem (`core/FileHandler.py`) [L250-L322]
   - 2.1. `MasterFile` (`mf`) [L252-L322]
-- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L538]
-  - 3.1. `GreatProcessor` (`gp`) [L325-L538]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L539-L736]
-  - Relational Table Families (`core/DBLayout.py`) [L551-L620]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L621-L709]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L710-L736]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L737-L932]
-  - 5.1. Data Sanitization Helpers [L739-L745]
-  - 5.2. `Table` Class Interface [L746-L779]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L780-L885]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L886-L908]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L909-L932]
-- 6. End-to-End Inter-Module Execution Lifecycle [L933-L1080]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1081-L1497]
-  - 7.1. Unified Configuration Hierarchy [L1083-L1198]
-  - 7.1.1. Repository Auto-Detection & Selection [L1199-L1264]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1265-L1334]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1335-L1382]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1383-L1497]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1498-L1768]
-  - 8.1. High-Level Architecture [L1500-L1543]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1544-L1569]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1570-L1768]
-- 9. CVE List Ingestion (`parser/cve/`) [L1769-L1825]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1826-L1893]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1894-L2028]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1902-L1933]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1934-L1978]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1979-L2011]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2012-L2028]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2029-L2074]
+- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L551]
+  - 3.1. `GreatProcessor` (`gp`) [L325-L551]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L552-L749]
+  - Relational Table Families (`core/DBLayout.py`) [L564-L633]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L634-L722]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L723-L749]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L750-L946]
+  - 5.1. Data Sanitization Helpers [L752-L758]
+  - 5.2. `Table` Class Interface [L759-L792]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L793-L899]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L900-L922]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L923-L946]
+- 6. End-to-End Inter-Module Execution Lifecycle [L947-L1094]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1095-L1513]
+  - 7.1. Unified Configuration Hierarchy [L1097-L1214]
+  - 7.1.1. Repository Auto-Detection & Selection [L1215-L1280]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1281-L1350]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1351-L1398]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1399-L1513]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1514-L1784]
+  - 8.1. High-Level Architecture [L1516-L1559]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1560-L1585]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1586-L1784]
+- 9. CVE List Ingestion (`parser/cve/`) [L1785-L1841]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1842-L1909]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1910-L2044]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1918-L1949]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1950-L1994]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1995-L2027]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2028-L2044]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2045-L2090]
 <!-- toc:end -->
 
 ---
@@ -412,18 +412,31 @@ Central runtime container, schema registry, and worker IPC coordinator.
     runner. Workers are forked from the `fork` multiprocessing context with the parent DB socket closed and
     reopened around the fork (`on_started` callbacks run after the reopen). Each worker owns a duplex pipe (no
     shared task queue or lock): the parent's reader thread sends it batches in order, two ahead of the one it
-    parses, and a stop frame once none is left; the worker answers each with one result frame (pickled once,
+    parses, and a stop frame once none is left; the worker sends a ready frame (`_FRAME_READY`) once its DB
+    connection is open, before it reads its first task, answers each batch with one result frame (pickled once,
     `(batch_cs_dict, per_file_errors)` or `(batch_cs_dict, per_file_errors, blob_symbols)` when streaming fetched
     blob symbols, zlib-compressed in low memory modes) and ends with a done frame. The
     reader thread hands up to `_PREFETCH_DEPTH` (8) serialized batches to the ingest thread, and `send_bytes` blocks while the
     parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the
     worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per
     batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they
-    make progress; files that kill a worker again are reported. A **stall watchdog** in the reader thread
+    make progress; files that kill a worker again are reported. A **raw fallback stage**
+    (`_run_raw_fallback`, `[raw fallback]` label, first round only, `raw_fallback=True` by default) parses the
+    files whose single-file batch killed or stalled a worker in the retry round once more on new workers, with
+    `gp.raw_fallback_paths` naming them: `ChangeSet.parse()` reads them with `raw_ast_parse` (no libclang), so
+    the version records their `m_file_name`, `m_file_blob` (type of the path, e.g. `T_C`) and
+    `m_bridge_checkpoint` rows and a whole-file tag. The next version carries the file like any other
+    (`pipeline/unchanged.py` finds its checkpoint) and Step 4.5 reuses its blob for every later version holding
+    the same blob hash. Their `error_list` entry names the crash or stall and the raw_ast fallback;
+    `WorkerStageResult.raw_fallback_files` lists them, and a file lost in the fallback stage too stays in
+    `lost_files` (`crashed_files`). A **stall watchdog** in the reader thread
     treats a worker that holds its oldest unreturned batch longer than `batch_timeout_s` (parameter, default
     `parser.worker_batch_timeout_s` = 300 s, `<= 0` disables it) with no result frame waiting on its pipe as
-    hung. The batch timer restarts when a batch reaches an idle worker and on every result frame. Until its
-    first result frame a worker gets `_WORKER_INIT_GRACE_S` (120 s) more, which covers its start-up. The watchdog
+    hung. The batch timer restarts when a batch reaches an idle worker, on the worker's ready frame and on every
+    result frame. Until its ready frame (or, for a worker body that sends none, its first result frame) a worker
+    gets `_WORKER_INIT_GRACE_S` (120 s) more, which covers its start-up. In a retry round (`retry_lost=False`)
+    a single-file batch is limited to `min(batch_timeout_s, parser.worker_retry_file_timeout_s)` (default 90 s),
+    so a file that hangs again fails fast. The watchdog
     logs an `ERROR` naming the worker, its PID, the stall time, the batch id and its files, sends `SIGUSR1`
     (`file_processing_worker` registers a `faulthandler` dump of every thread's stack to stderr; a
     `_STALL_DUMP_GRACE_S` (1.5 s) wait lets it finish), terminates and kills the worker and handles it like a
@@ -876,7 +889,8 @@ Represents a parsed file diff and acts as the relational staging buffer.
   - Appends resulting rows to `CS.cs_result` and marks `cs_processed = True`.
 - **Parsing (`parse() -> None`)**: dispatches on `get_file_type()` (content-aware: a `.c`/`.h` written in
   assembly is `T_ASM`, `core.globalstuff.type_check(path, content)`); the C and assembly parsers emit their
-  recorded symbol rows themselves (`core.SymbolRows.finish()`).
+  recorded symbol rows themselves (`core.SymbolRows.finish()`). A path in `gp.raw_fallback_paths` (the raw
+  fallback stage of `_run_worker_stage`, §3) is parsed by `raw_ast_parse` whatever its type.
 - **IPC Sanitization (`clear_bloat() -> None`)**:
   - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.file = None`, `self.parsers =
     {}`, `self.prior_tags = None`, `self.prior_tags_map = None`, `self.active_tag_list = None`,
@@ -1127,7 +1141,9 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     0.3: largest share of a version's files that may differ from its base for its checkpoint to be kept as a
     delta, §4.2; 0 keeps every checkpoint full), `facts_workers` (default 4: processes of Step 6.9),
     `worker_batch_timeout_s` (default 300, env `WORKER_BATCH_TIMEOUT_S`: seconds a parsing worker may hold one
-    batch before the stall watchdog of `_run_worker_stage` kills it, §3; 0 disables the watchdog)
+    batch before the stall watchdog of `_run_worker_stage` kills it, §3; 0 disables the watchdog),
+    `worker_retry_file_timeout_s` (default 90, env `WORKER_RETRY_FILE_TIMEOUT_S`: limit of a single-file batch in
+    a retry round, capped by `worker_batch_timeout_s`; 0 keeps `worker_batch_timeout_s`)
     (`table_engine`, `memory_mode`, `mem_max`: memory guard ceiling in GB, `--mm` overrides it, 0 disables the guard, `hugepages`, `preload_flush_mb`: MB of preloaded
     rows held on the heap before they are packed into a shared-memory segment, env `PRELOAD_FLUSH_MB`;
     `cache_max_table_mb`: ceiling (MB) on the size of one TE-cached table, a bigger one is read straight from
