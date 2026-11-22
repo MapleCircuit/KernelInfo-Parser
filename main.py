@@ -594,6 +594,7 @@ def _run() -> None:
         or getattr(args, "preparse", False)
         or getattr(args, "dry_run", False)
         or getattr(args, "backfill", None)
+        or getattr(args, "reparse_raw_fallbacks", False)
     ):
         # Before registering as a node or leasing a task
         _preflight_libclang()

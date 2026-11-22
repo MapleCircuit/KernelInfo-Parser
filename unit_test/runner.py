@@ -59,6 +59,7 @@ DEFAULT_MODULES = [
     "tests.test_blob_fact_readers",
     "tests.test_webapp_file_references",
     "tests.test_raw_ast",
+    "tests.test_reparse_raw_fallbacks",
     "tests.test_rust_ast",
     "tests.test_config",
     "tests.test_systemd_manager",

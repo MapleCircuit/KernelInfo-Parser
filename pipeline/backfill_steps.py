@@ -54,6 +54,10 @@ def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: 
             requested = True
             summary = backfills.repair_head_commit_files(db, str(MF.repo_dir), network_id)
             logger.info(f"[Repair head commit files] {summary}")
+        if getattr(args, "reparse_raw_fallbacks", False):
+            requested = True
+            summary = backfills.reparse_raw_fallbacks(db, network_id, repo_id, dry_run=bool(getattr(args, "dry_run", False)))
+            logger.info(f"[Reparse raw fallbacks] { {k: v for k, v in summary.items() if k != 'items'} }")
         if getattr(args, "backfill_doc_references", False):
             requested = True
             workers = _resolve_backfill_workers(args)

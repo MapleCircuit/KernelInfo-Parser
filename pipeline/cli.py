@@ -187,7 +187,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         dest="dry_run",
         action="store_true",
-        help="Preview version discovery, gap detection, and planned repair actions without modifying the database",
+        help="Preview version discovery, gap detection, and planned repair actions without modifying the database "
+             "(with --reparse-raw-fallbacks: list the raw-fallback blobs only)",
     )
     parser.add_argument(
         "-l", "--low-mem", "--low-memory",
@@ -424,6 +425,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete the m_commit_file rows of version head commits naming files the commit did not touch "
              "(written by Step 4.5 before 2026-11-07), then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--reparse-raw-fallbacks",
+        dest="reparse_raw_fallbacks",
+        action="store_true",
+        help="List the blobs of structured file types (C, ASM, Kconfig, MAINTAINERS, CREDITS) whose only tags "
+             "are raw_ast whole-file tags (the raw fallback stage), then reset them to unparsed: delete their tags, "
+             "symbol and maintainer rows (blobs, checkpoints, commit rows and file references stay), so the next "
+             "ingestion whose change list holds a blob parses it with the structured parser; until then the versions "
+             "holding it list the file without tags. With --dry-run only lists them. Then exit (core/API.md section 12)",
     )
     parser.add_argument(
         "--backfill-doc-references",

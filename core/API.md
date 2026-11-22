@@ -12,37 +12,37 @@ agents.
   - 1.3. Global Constants & Enums [L158-L249]
 - 2. Filesystem & Git Subsystem (`core/FileHandler.py`) [L250-L322]
   - 2.1. `MasterFile` (`mf`) [L252-L322]
-- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L551]
-  - 3.1. `GreatProcessor` (`gp`) [L325-L551]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L552-L749]
-  - Relational Table Families (`core/DBLayout.py`) [L564-L633]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L634-L722]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L723-L749]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L750-L946]
-  - 5.1. Data Sanitization Helpers [L752-L758]
-  - 5.2. `Table` Class Interface [L759-L792]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L793-L899]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L900-L922]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L923-L946]
-- 6. End-to-End Inter-Module Execution Lifecycle [L947-L1094]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1095-L1513]
-  - 7.1. Unified Configuration Hierarchy [L1097-L1214]
-  - 7.1.1. Repository Auto-Detection & Selection [L1215-L1280]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1281-L1350]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1351-L1398]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1399-L1513]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1514-L1784]
-  - 8.1. High-Level Architecture [L1516-L1559]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1560-L1585]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1586-L1784]
-- 9. CVE List Ingestion (`parser/cve/`) [L1785-L1841]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1842-L1909]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1910-L2044]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1918-L1949]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1950-L1994]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1995-L2027]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2028-L2044]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2045-L2090]
+- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L552]
+  - 3.1. `GreatProcessor` (`gp`) [L325-L552]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L553-L751]
+  - Relational Table Families (`core/DBLayout.py`) [L565-L634]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L635-L724]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L725-L751]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L752-L948]
+  - 5.1. Data Sanitization Helpers [L754-L760]
+  - 5.2. `Table` Class Interface [L761-L794]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L795-L901]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L902-L924]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L925-L948]
+- 6. End-to-End Inter-Module Execution Lifecycle [L949-L1096]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1097-L1515]
+  - 7.1. Unified Configuration Hierarchy [L1099-L1216]
+  - 7.1.1. Repository Auto-Detection & Selection [L1217-L1282]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1283-L1352]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1353-L1400]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1401-L1515]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1516-L1786]
+  - 8.1. High-Level Architecture [L1518-L1561]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1562-L1587]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1588-L1786]
+- 9. CVE List Ingestion (`parser/cve/`) [L1787-L1843]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1844-L1911]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1912-L2046]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1920-L1951]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1952-L1996]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1997-L2029]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2030-L2046]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2047-L2094]
 <!-- toc:end -->
 
 ---
@@ -428,7 +428,8 @@ Central runtime container, schema registry, and worker IPC coordinator.
     `m_bridge_checkpoint` rows and a whole-file tag. The next version carries the file like any other
     (`pipeline/unchanged.py` finds its checkpoint) and Step 4.5 reuses its blob for every later version holding
     the same blob hash. Their `error_list` entry names the crash or stall and the raw_ast fallback;
-    `WorkerStageResult.raw_fallback_files` lists them, and a file lost in the fallback stage too stays in
+    `WorkerStageResult.raw_fallback_files` lists them (`--reparse-raw-fallbacks`, §12, lists and resets such
+  blobs once the parser handles them), and a file lost in the fallback stage too stays in
     `lost_files` (`crashed_files`). A **stall watchdog** in the reader thread
     treats a worker that holds its oldest unreturned batch longer than `batch_timeout_s` (parameter, default
     `parser.worker_batch_timeout_s` = 300 s, `<= 0` disables it) with no result frame waiting on its pipe as
@@ -687,7 +688,8 @@ therefore bracketed:
   layout the run created, `m_arch_layout` above its watermark, goes with its entries); every row derived from
   the `m_ingest_blob` blobs in the tables referencing `m_file_blob` (except the commit-scoped
   `m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_blob_transition`), including the rows
-  hanging off them (e.g. `m_maintainer_member` of a deleted section); and for each watermarked table, in
+  hanging off them (e.g. `m_maintainer_member` of a deleted section; `blob_rows_plan()`, which
+  `--reparse-raw-fallbacks` of §12 runs too); and for each watermarked table, in
   child-first order, the link-table rows referencing ids above its mark, then its own rows above the mark (a
   watermarked child's new rows go with its own mark). The plan is a list of `Delete` steps (`table`,
   `condition` in words, bound `values`, a `db_engine` Where spec); a step runs as `delete_rows(..., limit=50000)`
@@ -2062,6 +2064,8 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 | `--backfill-commit-relations [--from-commit-id N]` | `m_commit_relation`, `m_commit_link` (§4 rows 63-64) | Parses the stored message of every commit (`m_commit`, all networks) in chunks of 5,000, abbreviated targets resolved against the selected repository once per chunk, `INSERT IGNORE`. The state row (`commit_id 0, kind 0`) records `next:<last id>` after each chunk and `done:<max id>` at the end; the next run resumes from it (`--from-commit-id` overrides). Runs automatically at start until the state says done (a new database is done at once); until then the webapp keeps its SQLite relation index. |
 
 | `--backfill-kbuild` | `m_kbuild_symbol` (§4 row 61) | The Makefile/Kbuild (path, blob) pairs of every finished version's checkpoint (read by primary key, restricted to those paths) without rows: each blob read from Git by SHA (`git cat-file --batch`) and parsed against its directory; also deletes the old `m_file_reference` rows of `ref_type` 3/4. Runs once automatically at start when the table is empty and the database holds finished versions, unless the run's repository is not a kernel tree (`man-pages`). |
+
+| `--reparse-raw-fallbacks [--dry-run]` | none (resets parse products) | Finds the raw-fallback blobs (`backfills.raw_fallback_blobs()`): `m_file_blob` rows of a structured type (`T_C`, `T_ASM`, `T_KCONFIG`, `T_MAINTAINERS`, `T_CREDITS`) whose every `m_bridge_tag` row names an `ASTT.Raw_Content` tag, i.e. files the raw fallback stage (§3) ingested; the query starts at the `Raw_Content` AST nodes (one full scan of `m_ast`, which has no `type_id` index) and follows the `m_tag.ast_id` / `m_bridge_tag.tag_id` indexes (`straight_join`). The parsers of these types never emit `Raw_Content`, so an empty or comment-only source (no tags, or structured ones) never matches; `T_RUST` is left out because `rust_ast` itself writes a whole-file `Raw_Content` tag for a file rustc yields no AST for. Each blob is logged with its file type, up to 3 paths, its checkpoint count and the first / latest finished version holding it. `--dry-run` stops there. Otherwise, refused (`deferred`) while any `m_ingest_state` row is `INGEST_PARSING`, the blobs are reset to unparsed in transactions of 500 blobs, each chunk re-checked inside its transaction: `ingest_state.blob_rows_plan()` (the blob-derived rows a rollback deletes, §4.1: `m_bridge_tag`, `m_blob_symbol`, `m_blob_symbol_file`, `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_symbol_own`, `m_maintainer_section` with its members / patterns / files, `m_credits_entry`) minus `backfills.RAW_FALLBACK_KEEP` (`m_file_reference`, `m_kbuild_symbol`: content-derived by Step 6.6). `m_file_blob`, `m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_blob_facts` and the shared `m_tag` / `m_ast` rows stay, so every version still holds the file and its blob. Step 4.5 reuses tagged blobs only, so the next ingestion whose change list holds a reset blob parses it with the structured parser; the versions holding it until then list the file without tags. Idempotent: a reset blob no longer matches. Never automatic. |
 
 | `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, inserting cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference` (`ref_id` omitted: AUTO_INCREMENT assigns it, `Table.db_assigned_ids`). |
 

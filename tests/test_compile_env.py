@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 import clang.cindex as cc
 
@@ -329,6 +330,79 @@ class TestUnmappedArchTarget(unittest.TestCase):
         args, _, arch_env = self.env_of(tree).args_for("arch/tile/kernel/init_task.c")
         self.assertTrue(arch_env.is_64bit())
         self.assertFalse([a for a in args if a.startswith("--target=")])
+
+
+def _byte_order_source(bits: int, big: bool) -> str:
+    order = "__ORDER_BIG_ENDIAN__" if big else "__ORDER_LITTLE_ENDIAN__"
+    return (
+        f"typedef char long_matches_config[sizeof(long) * 8 == {bits} ? 1 : -1];\n"
+        f"#if __BYTE_ORDER__ != {order}\n#error wrong byte order\n#endif\n"
+    )
+
+
+class TestUnmappedArchByteOrder(unittest.TestCase):
+    """A big-endian ARCH without a `_TARGETS` triple gets a big-endian triple of its `long` width (configuration
+    symbols first, then `_BIG_ENDIAN_ARCHES`); a little-endian one keeps `_GENERIC_TARGETS`."""
+
+    env_of = TestUnmappedArchTarget.env_of
+
+    def args_of(self, arch: str, kconfig: str, bits: int, big: bool) -> tuple[list[str], int, object]:
+        tree = dict(UNMAPPED_TREE)
+        tree[f"arch/{arch}/Makefile"] = f"core-y += arch/{arch}/kernel/\n"
+        tree[f"arch/{arch}/Kconfig"] = kconfig
+        path = f"arch/{arch}/kernel/order.c"
+        tree[path] = _byte_order_source(bits, big)
+        env = self.env_of(tree)
+        args, options, arch_env = env.args_for(path)
+        self.assertEqual(arch_env.arch, arch)
+        tu = cc.Index.create().parse(os.path.join(env.root, path), args=["-w", *args], options=options)
+        errors = [d.spelling for d in tu.diagnostics if d.severity >= cc.Diagnostic.Error]
+        self.assertEqual(errors, [], args)
+        return args, options, arch_env
+
+    def test_inherently_big_endian_32_bit_arch(self) -> None:
+        args, _, arch_env = self.args_of("parisc", "config 64BIT\n\tbool\n\tdefault n\n", 32, True)
+        self.assertTrue(arch_env.is_big_endian())
+        self.assertIn("--target=powerpc-linux-gnu", args)
+
+    def test_inherently_big_endian_64_bit_arch(self) -> None:
+        args, _, arch_env = self.args_of("parisc", "config 64BIT\n\tbool\n\tdefault y\n", 64, True)
+        self.assertTrue(arch_env.is_64bit())
+        self.assertIn("--target=powerpc64-linux-gnu", args)
+
+    def test_cpu_big_endian_symbol_selects_big_endian(self) -> None:
+        kconfig = "config 64BIT\n\tbool\n\tdefault n\n\nconfig CPU_BIG_ENDIAN\n\tbool\n\tdefault y\n"
+        args, _, _ = self.args_of("sh", kconfig, 32, True)
+        self.assertIn("--target=powerpc-linux-gnu", args)
+        kconfig64 = "config 64BIT\n\tbool\n\tdefault y\n\nconfig CPU_BIG_ENDIAN\n\tbool\n\tdefault y\n"
+        args, _, _ = self.args_of("tile", kconfig64, 64, True)
+        self.assertIn("--target=powerpc64-linux-gnu", args)
+
+    def test_little_endian_symbols_keep_the_generic_targets(self) -> None:
+        # sh: CPU_BIG_ENDIAN not set; m32r (big-endian by default): CPU_LITTLE_ENDIAN=y
+        kconfig = "config 64BIT\n\tbool\n\tdefault n\n\nconfig CPU_BIG_ENDIAN\n\tbool \"big\"\n\tdefault n\n"
+        args, _, arch_env = self.args_of("sh", kconfig, 32, False)
+        self.assertFalse(arch_env.is_big_endian())
+        self.assertIn("--target=i386-linux-gnu", args)
+        kconfig = "config 64BIT\n\tbool\n\tdefault n\n\nconfig CPU_LITTLE_ENDIAN\n\tbool \"le\"\n\tdefault y\n"
+        args, _, _ = self.args_of("m32r", kconfig, 32, False)
+        self.assertIn("--target=i386-linux-gnu", args)
+        args, _, _ = self.args_of("m32r", "config 64BIT\n\tbool\n\tdefault n\n", 32, True)
+        self.assertIn("--target=powerpc-linux-gnu", args)
+
+    def test_m68k_takes_its_own_triple_when_libclang_has_it(self) -> None:
+        kconfig = "config 64BIT\n\tbool\n\tdefault n\n"
+        if compile_env.target_supported("m68k-linux-gnu"):
+            args, _, _ = self.args_of("m68k", kconfig, 32, True)
+            self.assertIn("--target=m68k-linux-gnu", args)
+        with unittest.mock.patch.object(compile_env, "target_supported", return_value=False):
+            args, _, _ = self.args_of("m68k", kconfig, 32, True)
+        self.assertIn("--target=powerpc-linux-gnu", args)
+
+    def test_mapped_arches_keep_their_targets(self) -> None:
+        self.assertEqual(compile_env._TARGETS["mips"], ("mips64-linux-gnu", "mips-linux-gnu"))
+        self.assertEqual(compile_env._GENERIC_TARGETS, (None, "i386-linux-gnu"))
+        self.assertFalse(set(compile_env._BIG_ENDIAN_ARCHES) & set(compile_env._TARGETS))
 
 
 class TestHistoricalCompileEnv(unittest.TestCase):

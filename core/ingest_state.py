@@ -175,6 +175,26 @@ def blob_derived_tables(tables: Sequence[Any]) -> list[tuple[Any, str]]:
     return out
 
 
+def blob_rows_plan(tables: Sequence[Any], blob_ids: Iterable[int], keep: Iterable[str] = ()) -> list[Delete]:
+    """Deletes of the rows parsing `blob_ids` produced (`blob_derived_tables()`, and the rows hanging off
+    them first), in chunks of `_IN_CHUNK` blobs; tables named in `keep` are left alone. The blobs themselves and
+    their commit-scoped rows (checkpoints, commit files, commit tags) stay."""
+    skip = set(keep)
+    children = _children(tables)
+    derived = [(t, col) for t, col in blob_derived_tables(tables) if t.table_name not in skip]
+    plan: list[Delete] = []
+    blobs = sorted(set(blob_ids))
+    for i in range(0, len(blobs), _IN_CHUNK):
+        chunk = tuple(blobs[i:i + _IN_CHUNK])
+        for t, col in derived:
+            pk = id_column(t)
+            if pk:
+                for child, child_col in children.get(t.table_name, ()):
+                    plan.append(_delete_in_parent_rows(child.table_name, child_col, t.table_name, pk, col, chunk))
+            plan.append(_delete_in(t.table_name, col, chunk))
+    return plan
+
+
 def precheck_queries(tables: Sequence[Any], marks: dict[str, int]) -> list[tuple[str, Select]]:
     """(description, Select) finding rows older than the run that reference rows the run created.
 
@@ -208,15 +228,7 @@ def rollback_plan(tables: Sequence[Any], marks: dict[str, int], commit_id: int, 
     plan: list[Delete] = [_delete_eq(name, "commit_id", commit_id) for name in _VERSION_ROWS]
 
     # 1. Rows derived from pre-existing blobs the run parsed (and the rows hanging off them)
-    blobs = sorted(set(blob_ids))
-    for i in range(0, len(blobs), _IN_CHUNK):
-        chunk = tuple(blobs[i:i + _IN_CHUNK])
-        for t, col in blob_derived_tables(tables):
-            pk = id_column(t)
-            if pk:
-                for child, child_col in children.get(t.table_name, ()):
-                    plan.append(_delete_in_parent_rows(child.table_name, child_col, t.table_name, pk, col, chunk))
-            plan.append(_delete_in(t.table_name, col, chunk))
+    plan.extend(blob_rows_plan(tables, blob_ids))
 
     # 2. Rows above the watermarks: link tables referencing them first, then the tables themselves
     marked = [(t, c) for t, c in marked_tables(tables) if t.table_name in marks]

@@ -14,9 +14,11 @@ the C and assembly parsers pass to libclang, so a file reads the headers `make A
   build products never exist in Git, so the two form the build's view of the tree.
 - **Arguments** (`args_for()`): `-nostdinc -isystem <libclang resource include>` (no host header is ever read),
   `-x c` (C) or `-x assembler-with-cpp -D__ASSEMBLY__` (`.S` / `.s`), the target of the configuration
-  (`--target=x86_64-linux-gnu` / `i386-linux-gnu` / ...; an ARCH libclang has no triple for keeps the host
-  target when 64-bit and takes `i386-linux-gnu` when 32-bit, so `sizeof(long)` matches `BITS_PER_LONG`; the
-  byte order stays little-endian), the layout's flags (`-D__KERNEL__`, `-std=gnu11`, ...;
+  (`--target=x86_64-linux-gnu` / `i386-linux-gnu` / ...; an ARCH without a `_TARGETS` triple keeps the host
+  target when 64-bit and takes `i386-linux-gnu` when 32-bit, so `sizeof(long)` matches `BITS_PER_LONG`; a
+  big-endian one (`ArchEnv.is_big_endian()`: CPU_BIG_ENDIAN / CPU_LITTLE_ENDIAN of the configuration, else
+  `_BIG_ENDIAN_ARCHES`) takes its own triple when libclang has a backend for it (m68k), else
+  `powerpc64-linux-gnu` / `powerpc-linux-gnu`), the layout's flags (`-D__KERNEL__`, `-std=gnu11`, ...;
   `-std=gnu89` when the layout names none), the include directories and the forced `-include` headers (for C all
   of them, for assembly all but `compiler_types.h`, which kbuild adds to `c_flags` only), and the per-object
   `KBUILD_BASENAME` / `KBUILD_MODNAME` / `KBUILD_MODFILE` strings of the file.
@@ -79,13 +81,30 @@ _TARGETS: dict[str, tuple[str | None, str | None]] = {
     "sparc64": ("sparc64-linux-gnu", "sparc64-linux-gnu"), "mips": ("mips64-linux-gnu", "mips-linux-gnu"),
     "loongarch": ("loongarch64-linux-gnu", "loongarch64-linux-gnu"), "ia64": (None, None),
 }
-# --target of an ARCH without a `_TARGETS` entry (tile, blackfin, sh, m68k, ...): the host target for a 64-bit
+# --target of a little-endian ARCH without a `_TARGETS` entry (tile, blackfin, sh, ...): the host target for a 64-bit
 # configuration, a 32-bit triple for a 32-bit one, so `sizeof(long)` agrees with the configuration's
 # `BITS_PER_LONG` (with a 64-bit `long`, `CPU_MASK_ALL`'s `[0 ... BITS_TO_LONGS(NR_CPUS) - 2]` wraps to
 # `[0 ... SIZE_MAX]`, a range designator libclang expands element by element without end)
 _GENERIC_TARGETS: tuple[str | None, str | None] = (None, "i386-linux-gnu")
+# --target of a big-endian ARCH without a `_TARGETS` entry (parisc, h8300, openrisc, sh with CPU_BIG_ENDIAN, ...):
+# big-endian triples of the same `long` widths, so `__BYTE_ORDER__` / `__BIG_ENDIAN__` and the byte-order
+# branches of the headers follow the configuration (`ArchEnv.is_big_endian()`)
+_GENERIC_BE_TARGETS: tuple[str | None, str | None] = ("powerpc64-linux-gnu", "powerpc-linux-gnu")
+# Big-endian ARCHes whose own triple libclang may have a backend for: taken when the loaded libclang accepts it
+# (`target_supported()`), so the ARCH's inline-assembly constraints ("a" / "d" registers) validate
+_NATIVE_BE_TARGETS: dict[str, tuple[str | None, str | None]] = {
+    "m68k": ("m68k-linux-gnu", "m68k-linux-gnu"), "m68knommu": ("m68k-linux-gnu", "m68k-linux-gnu"),
+}
+# Unmapped ARCHes that are big-endian when the configuration names no byte order (their Kconfig has no
+# CPU_BIG_ENDIAN / CPU_LITTLE_ENDIAN symbol before 5.0, or none at all); m32r and microblaze default to big-endian
+_BIG_ENDIAN_ARCHES = frozenset({
+    "m68k", "m68knommu", "parisc", "parisc64", "h8300", "avr32", "frv", "m32r", "openrisc", "microblaze",
+})
+_BIG_ENDIAN_SYMBOLS = ("CPU_BIG_ENDIAN", "BIG_ENDIAN")
+_LITTLE_ENDIAN_SYMBOLS = ("CPU_LITTLE_ENDIAN", "LITTLE_ENDIAN")
 
 _ACTIVE: CompileEnv | None = None
+_TARGET_SUPPORT: dict[str, bool] = {}
 _TREE_ENVS: dict[str, CompileEnv] = {}
 _LOCK = threading.Lock()
 _RESOURCE: list[str | None] = []
@@ -121,6 +140,34 @@ def _atexit_cleanup() -> None:
 
 
 atexit.register(_atexit_cleanup)
+
+
+def target_supported(triple: str) -> bool:
+    """True when the loaded libclang parses a translation unit for `--target=<triple>` (cached per triple)."""
+    known = _TARGET_SUPPORT.get(triple)
+    if known is not None:
+        return known
+    try:
+        import clang.cindex as cc
+        tu = cc.Index.create().parse("kip_target_probe.c", args=["-nostdinc", f"--target={triple}"],
+                                     unsaved_files=[("kip_target_probe.c", "int kip_target_probe;\n")])
+        ok = not any(d.severity >= cc.Diagnostic.Error for d in tu.diagnostics)
+    except Exception:  # noqa: BLE001 - no libclang, or a triple without a backend (TranslationUnitLoadError)
+        ok = False
+    _TARGET_SUPPORT[triple] = ok
+    return ok
+
+
+def generic_targets(env: ArchEnv) -> tuple[str | None, str | None]:
+    """(64-bit, 32-bit) `--target` pair of an ARCH without a `_TARGETS` entry: `_GENERIC_TARGETS` for a
+    little-endian configuration; for a big-endian one the ARCH's `_NATIVE_BE_TARGETS` pair when libclang supports
+    it, else `_GENERIC_BE_TARGETS`."""
+    if not env.is_big_endian():
+        return _GENERIC_TARGETS
+    native = _NATIVE_BE_TARGETS.get(env.srcarch) or _NATIVE_BE_TARGETS.get(env.arch)
+    if native and all(t is None or target_supported(t) for t in native):
+        return native
+    return _GENERIC_BE_TARGETS
 
 
 def clang_resource_include() -> str | None:
@@ -220,6 +267,17 @@ class ArchEnv:
         if "64BIT" in self.config:
             return self.config["64BIT"][1] == "y"
         return self.arch.endswith("64") or self.arch in ("x86_64", "arm64", "s390")
+
+    def is_big_endian(self) -> bool:
+        """Byte order of the configuration: CPU_BIG_ENDIAN / BIG_ENDIAN when the configuration has one, else
+        CPU_LITTLE_ENDIAN / LITTLE_ENDIAN (a big-endian build when it is not set), else `_BIG_ENDIAN_ARCHES`."""
+        for name in _BIG_ENDIAN_SYMBOLS:
+            if name in self.config:
+                return self.config[name][1] == "y"
+        for name in _LITTLE_ENDIAN_SYMBOLS:
+            if name in self.config:
+                return self.config[name][1] != "y"
+        return self.srcarch in _BIG_ENDIAN_ARCHES or self.arch in _BIG_ENDIAN_ARCHES
 
 
 class CompileEnv:
@@ -475,7 +533,9 @@ class CompileEnv:
                              if self.configure else ({}, None))
         env = ArchEnv(arch, layout, config, defconfig, config_digest(config))
         bits64 = env.is_64bit()
-        pair = _TARGETS.get(layout.srcarch) or _TARGETS.get(arch) or _GENERIC_TARGETS
+        pair = _TARGETS.get(layout.srcarch) or _TARGETS.get(arch)
+        if pair is None:
+            pair = generic_targets(env)
         env.target = pair[0] if bits64 else pair[1]
         digest = hashlib.sha1(f"{self.key}\0{arch}\0{env.config_hash}".encode("utf-8", "surrogatepass")).hexdigest()[:16]
         env.build_dir = os.path.join(self.build_base, f"{digest}-{arch}")

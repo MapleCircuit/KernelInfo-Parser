@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable
 
 from core import ingest_state
 from db_engine import DBError
-from db_engine.spec import Agg, AnyOf, Col, Const, Join, Select, Value, exists_select, gt, is_null, le, lt
+from db_engine.spec import Agg, AnyOf, Col, Const, Join, Select, Value, exists_select, gt, is_null, le, lt, ne
 
 logger = logging.getLogger(__name__)
 
@@ -845,6 +845,148 @@ def backfill_kapi(
     return guarded("Backfill KAPI", db, run)
 
 
+# -----------------------------------------------------------------------------
+# D11: raw-fallback blobs (--reparse-raw-fallbacks [--dry-run])
+# -----------------------------------------------------------------------------
+
+# Rows Step 6.6 derives from a blob's content whatever parser read it (written for new (path, blob) pairs only)
+RAW_FALLBACK_KEEP = ("m_file_reference", "m_kbuild_symbol")
+RAW_FALLBACK_CHUNK = 500
+_RAW_FALLBACK_PATHS = 3
+
+
+def _structured_types() -> dict[int, str]:
+    """File types whose parser never writes an `ASTT.Raw_Content` tag itself. Rust is not one: `rust_ast` stages a
+    whole-file raw tag for a file rustc yields no AST for, so a raw-only Rust blob is not a raw-fallback marker."""
+    from core.globalstuff import T_ASM, T_C, T_CREDITS, T_KCONFIG, T_MAINTAINERS
+    return {T_C: "C", T_ASM: "ASM", T_KCONFIG: "KCONFIG", T_MAINTAINERS: "MAINTAINERS", T_CREDITS: "CREDITS"}
+
+
+def raw_fallback_blobs(db: Any, blob_ids: Iterable[int] | None = None) -> list[tuple[int, int]]:
+    """(blob_id, ftype) of the blobs of a structured file type (`_structured_types()`: C, ASM, Kconfig,
+    MAINTAINERS, CREDITS) whose only tags are `raw_ast` whole-file tags (`ASTT.Raw_Content`): files the raw
+    fallback stage of `pipeline/worker_stage.py` parsed after they killed or stalled a worker. The parsers of
+    these types never emit `Raw_Content`, so an empty or comment-only source (no tags, or structured ones) never
+    matches.
+    `blob_ids` restricts the search to those blobs."""
+    from core.globalstuff import ASTT
+    raw = int(ASTT.Raw_Content)
+    where: dict[str, Any] = {"a.type_id": raw, "b.ftype": sorted(_structured_types())}
+    if blob_ids is not None:
+        wanted = sorted({int(b) for b in blob_ids})
+        if not wanted:
+            return []
+        where["bt.blob_id"] = wanted
+    # From the Raw_Content AST nodes (one per raw file content; m_ast has no type_id index, so one full scan of it)
+    # down through the m_tag.ast_id, m_bridge_tag.tag_id and m_file_blob primary key indexes
+    rows = db.select_rows(
+        ("m_ast", "a"),
+        ["bt.blob_id", "b.ftype"],
+        where,
+        joins=[
+            Join(("m_tag", "t"), {"t.ast_id": "a.ast_id"}),
+            Join(("m_bridge_tag", "bt"), {"bt.tag_id": "t.tag_id"}),
+            Join(("m_file_blob", "b"), {"b.blob_id": "bt.blob_id"}),
+        ],
+        distinct=True,
+        hint="straight_join",
+        as_dict=False,
+    )
+    found = {int(b): int(f) for b, f in rows}
+    ids = sorted(found)
+    structured: set[int] = set()
+    for i in range(0, len(ids), RAW_FALLBACK_CHUNK):
+        chunk = ids[i:i + RAW_FALLBACK_CHUNK]
+        structured.update(int(b) for b in db.select_values(
+            ("m_bridge_tag", "bt"), "bt.blob_id", {"bt.blob_id": chunk, "a.type_id": ne(raw)},
+            joins=[Join(("m_tag", "t"), {"t.tag_id": "bt.tag_id"}), Join(("m_ast", "a"), {"a.ast_id": "t.ast_id"})],
+            distinct=True,
+        ))
+    return [(b, found[b]) for b in ids if b not in structured]
+
+
+def _describe_raw_fallbacks(db: Any, blobs: list[tuple[int, int]], network_id: int, repo_id: int) -> list[dict[str, Any]]:
+    """Report rows of `blobs`: blob id, file type, up to `_RAW_FALLBACK_PATHS` paths, the number of checkpoints
+    holding the blob and the first / latest finished version (ingestion order) holding it."""
+    names = _structured_types()
+    order = {cid: (i, name) for i, (name, cid, _base) in enumerate(finished_versions(db, network_id, repo_id))}
+    paths: dict[int, set[str]] = {}
+    commits: dict[int, set[int]] = {}
+    ids = [b for b, _ in blobs]
+    for i in range(0, len(ids), RAW_FALLBACK_CHUNK):
+        rows = db.select_rows(
+            ("m_bridge_checkpoint", "cp"), ["cp.blob_id", "cp.commit_id", "f.fname"], {"cp.blob_id": ids[i:i + RAW_FALLBACK_CHUNK]},
+            joins=[Join(("m_file_name", "f"), {"f.fnid": "cp.fnid"})], as_dict=False,
+        )
+        for blob_id, cid, fname in rows:
+            if isinstance(fname, (bytes, bytearray)):
+                fname = fname.decode("utf-8", "replace")
+            paths.setdefault(int(blob_id), set()).add(str(fname))
+            commits.setdefault(int(blob_id), set()).add(int(cid))
+    report = []
+    for blob_id, ftype in blobs:
+        held = sorted((order[c] for c in commits.get(blob_id, ()) if c in order))
+        report.append({
+            "blob_id": blob_id,
+            "ftype": names.get(ftype, str(ftype)),
+            "paths": sorted(paths.get(blob_id, ()))[:_RAW_FALLBACK_PATHS],
+            "checkpoints": len(commits.get(blob_id, ())),
+            "first_version": held[0][1] if held else None,
+            "latest_version": held[-1][1] if held else None,
+        })
+    return report
+
+
+def reparse_raw_fallbacks(db: Any, network_id: int, repo_id: int, dry_run: bool = False) -> dict[str, Any]:
+    """Find the raw-fallback blobs (`raw_fallback_blobs()`) and, unless `dry_run`, reset them to unparsed.
+
+    The reset deletes, per chunk of `RAW_FALLBACK_CHUNK` blobs in one transaction (each chunk checked again
+    inside it), the rows parsing produced (`ingest_state.blob_rows_plan()`: `m_bridge_tag`, `m_blob_symbol*`,
+    `m_symbol_own`, maintainer / credits rows) except `RAW_FALLBACK_KEEP`. `m_file_blob`, the checkpoints, commit
+    file and commit tag rows and the shared `m_tag` / `m_ast` rows stay, so every version still holds the
+    file; until an ingestion parses it again, those versions list the file without tags. Step 4.5 reuses
+    tagged blobs only: the next ingestion whose change list holds a reset blob parses it with the structured
+    parser. Refused (`deferred`) while any version is being ingested. Idempotent: a reset blob no
+    longer matches."""
+    label = "Reparse raw fallbacks"
+
+    def run() -> dict[str, Any]:
+        blobs = raw_fallback_blobs(db)
+        report = _describe_raw_fallbacks(db, blobs, network_id, repo_id)
+        for row in report:
+            logger.info(
+                f"[{label}] blob {row['blob_id']} {row['ftype']} {', '.join(row['paths']) or '(no checkpoint)'}: "
+                f"{row['checkpoints']} checkpoint(s), first {row['first_version']}, latest {row['latest_version']}"
+            )
+        logger.info(f"[{label}] {len(blobs)} raw-fallback blob(s){' (dry run, nothing changed)' if dry_run else ''}.")
+        summary: dict[str, Any] = {"blobs": len(blobs), "items": report}
+        if dry_run or not blobs:
+            return {"state": "dry_run" if dry_run else "done", **summary, "reset": 0}
+        parsing = db.count_rows("m_ingest_state", {"status": ingest_state.INGEST_PARSING})
+        if parsing:
+            logger.info(f"[{label}] Not reset: {parsing} version ingestion(s) in progress; run it again once they finish.")
+            return {"state": "deferred", **summary, "reset": 0}
+        from core.DBLayout import TABLES
+        ids = [b for b, _ in blobs]
+        progress = Progress(label, len(ids))
+        reset = 0
+        deleted: dict[str, int] = {}
+        for i in range(0, len(ids), RAW_FALLBACK_CHUNK):
+            with db.transaction():
+                still = [b for b, _ in raw_fallback_blobs(db, ids[i:i + RAW_FALLBACK_CHUNK])]
+                for step in ingest_state.blob_rows_plan(TABLES, still, keep=RAW_FALLBACK_KEEP):
+                    n = step.run(db)
+                    if n:
+                        deleted[step.table] = deleted.get(step.table, 0) + n
+            reset += len(still)
+            progress.step(len(ids[i:i + RAW_FALLBACK_CHUNK]))
+        logger.info(f"[{label}] Reset {reset} blob(s) to unparsed in {progress.seconds}s; deleted rows: {deleted}. "
+                    "They have no tags until an ingestion whose change list holds them parses them again.")
+        return {"state": "done", **summary, "reset": reset, "deleted": deleted}
+
+    return guarded(label, db, run)
+
+
 BACKFILL_HANDLERS: dict[str, Any] = {
     "maintainer_files": backfill_maintainer_files,
     "kbuild": backfill_kbuild,
@@ -857,4 +999,5 @@ BACKFILL_HANDLERS: dict[str, Any] = {
     "insights_deltas": backfill_insights_deltas,
     "cve_releases": backfill_cve_releases,
     "kapi": backfill_kapi,
+    "reparse_raw_fallbacks": reparse_raw_fallbacks,
 }
