@@ -446,6 +446,9 @@ def rollback_id_ranges(
             "m_commit",
         ):
             continue
+        if getattr(tbl, "db_assigned_ids", False):
+            # AUTO_INCREMENT ids are not leased: a range recorded for such a table holds other runs' rows
+            continue
         pk = id_column(tbl)
         if not pk:
             continue

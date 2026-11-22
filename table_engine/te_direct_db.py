@@ -152,7 +152,6 @@ class TEDirectDB:
             "m_blob_symbol_ref": 50_000,
             "m_tag": 10_000,
             "m_blob_symbol_def": 10_000,
-            "m_file_reference": 10_000,
             "m_file_blob": 1_000,
             "m_file_name": 1_000,
             "m_commit": 1_000,
@@ -551,6 +550,11 @@ class TEDirectDB:
             return assigned_id
 
         table = self.tables.get(table_id)
+        if table is not None and getattr(table, "db_assigned_ids", False):
+            raise ValueError(
+                f"{table.table_name} ids are assigned by the database (Table.db_assigned_ids): write its rows with "
+                f"db.insert_rows() omitting the primary key instead of staging them in the TableEngine"
+            )
         if self.distributed and self.db is not None and table is not None:
             block_size = self._id_block_sizes.get(table.table_name, self.DEFAULT_ID_BLOCK_SIZE)
             start_id, end_id = self.db.reserve_id_block(table, block_size, commit_id=self.current_commit_id)

@@ -429,7 +429,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--backfill-doc-references",
         dest="backfill_doc_references",
         action="store_true",
-        help="Scan documentation files across finished versions and stage cross-file references into m_file_reference (core/API.md section 12)",
+        help="Scan documentation files across finished versions and insert cross-file references into m_file_reference (core/API.md section 12)",
     )
     parser.add_argument(
         "--backfill-cve-files",

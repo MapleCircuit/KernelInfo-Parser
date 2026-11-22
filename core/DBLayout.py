@@ -889,6 +889,10 @@ m_file_reference = Table(
     # The unique key's (source_blob_id, source_fnid, ...) prefix serves lookups from the source side.
     unique_keys=(("source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no"),),
     hashing_table=False,
+    # ref_id comes from AUTO_INCREMENT alone: the include copy is a set-based INSERT ... SELECT, so every writer
+    # (Step 6.6, --backfill-doc-references) omits the key and inserts with on_conflict="ignore". Rows are owned
+    # by their (source_blob_id, source_fnid) pair, which Step 6.6 clears and recomputes, never by an id range.
+    db_assigned_ids=True,
 )
 setattr(m_file_reference, "source_fid", m_file_reference.source_blob_id)
 

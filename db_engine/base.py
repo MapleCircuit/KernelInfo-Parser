@@ -979,6 +979,46 @@ class BaseDBEngine(ABC):
 
         return self._retry_deadlock(_attempt, max_attempts=max_attempts)
 
+    def run_transaction(
+        self,
+        fn: Callable[[], Any],
+        *,
+        max_attempts: int = 5,
+        backoff_s: float = 0.02,
+        label: str = "",
+    ) -> Any:
+        """Run `fn()` inside `transaction()`; re-run the whole transaction on a transient `DeadlockError`.
+
+        On engines whose `transaction()` rolls back (`MariaDB`, `SQLiteDB`, `MockDB`) a failed attempt is undone
+        before the next one, so `fn` writes only through this engine. Attempt `n` waits `backoff_s * 2**(n-1)`
+        plus up to `backoff_s` of jitter. After `max_attempts` the last `DeadlockError` propagates; any other error
+        propagates at once.
+
+        Raises:
+            UnsupportedOperation: Inside `transaction()` (a nested block cannot roll back alone, so a retry would
+                re-run `fn` on top of the outer transaction's partial work).
+        """
+        if getattr(self, "_in_txn", False):
+            raise UnsupportedOperation(
+                "run_transaction() owns its transaction and cannot run inside transaction(); call it outside - "
+                "see DB_API.md 'Lifecycle, Session & Health'"
+            )
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                with self.transaction():
+                    return fn()
+            except DeadlockError as exc:
+                if attempt >= attempts:
+                    raise
+                delay = backoff_s * (2 ** (attempt - 1)) + random.uniform(0.0, backoff_s)
+                logger.warning(
+                    f"[DB] Transient conflict in {label or 'transaction'} (attempt {attempt}/{attempts}), "
+                    f"retrying in {delay:.2f}s: {exc}"
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
     # -------------------------------------------------------------------------
     # Read Primitives (§2)
     # -------------------------------------------------------------------------

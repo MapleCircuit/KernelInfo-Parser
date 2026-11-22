@@ -18,31 +18,31 @@ agents.
   - Relational Table Families (`core/DBLayout.py`) [L537-L606]
   - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L607-L695]
   - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L696-L722]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L723-L913]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L723-L918]
   - 5.1. Data Sanitization Helpers [L725-L731]
-  - 5.2. `Table` Class Interface [L732-L760]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L761-L866]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L867-L889]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L890-L913]
-- 6. End-to-End Inter-Module Execution Lifecycle [L914-L1061]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1062-L1445]
-  - 7.1. Unified Configuration Hierarchy [L1064-L1174]
-  - 7.1.1. Repository Auto-Detection & Selection [L1175-L1240]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1241-L1291]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1292-L1339]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1340-L1445]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1446-L1716]
-  - 8.1. High-Level Architecture [L1448-L1491]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1492-L1517]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1518-L1716]
-- 9. CVE List Ingestion (`parser/cve/`) [L1717-L1773]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1774-L1841]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1842-L1972]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1850-L1881]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1882-L1922]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1923-L1955]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1956-L1972]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1973-L2018]
+  - 5.2. `Table` Class Interface [L732-L765]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L766-L871]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L872-L894]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L895-L918]
+- 6. End-to-End Inter-Module Execution Lifecycle [L919-L1066]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1067-L1459]
+  - 7.1. Unified Configuration Hierarchy [L1069-L1179]
+  - 7.1.1. Repository Auto-Detection & Selection [L1180-L1245]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1246-L1296]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1297-L1344]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1345-L1459]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1460-L1730]
+  - 8.1. High-Level Architecture [L1462-L1505]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1506-L1531]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1532-L1730]
+- 9. CVE List Ingestion (`parser/cve/`) [L1731-L1787]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1788-L1855]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1856-L1990]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1864-L1895]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1896-L1940]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1941-L1973]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1974-L1990]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L1991-L2036]
 <!-- toc:end -->
 
 ---
@@ -208,7 +208,7 @@ agents.
     C references libclang leaves unresolved (inactive `#if` branches, undeclared names) are recovered from the
     token stream with one of these roles (`parser/c_ast/lexical_refs.py`).
 
-  - `FileRefType(IntEnum)`: Categorical classification for cross-file references staged in `m_file_reference`:
+  - `FileRefType(IntEnum)`: Categorical classification for cross-file references stored in `m_file_reference`:
     - `Include = 1`: C and Preprocessor `#include <...>` or Assembly include statements, and Rust `mod x;`
       declarations (the file the module loads, `parser/rust_ast/RUST_API.md` §5).
     - `Kconfig = 2`: Kconfig `source`, `rsource` and `osource` references with a literal path (a path naming
@@ -738,6 +738,11 @@ preload `commit_id >= Old_VID`, `processing_unchanges()`, `db.new_checkpoint_pai
   - `table.idempotent_pk`: Flag enabling deduplicated insertion: rows whose primary key already exists are
     skipped individually (`MariaDB.insert` appends a no-op `ON DUPLICATE KEY UPDATE`).
   - `table.blob_scoped`: Flag marking blob-scoped content-addressable preloading.
+  - `table.db_assigned_ids`: Flag marking the database's `AUTO_INCREMENT` as the only allocator of the
+    auto-increment primary key (set on `m_file_reference`). Its rows are written through `db_engine` with the key
+    omitted; `TableEngine._allocate_id()` raises `ValueError` for it, and `rollback_id_ranges()` ignores the
+    `m_ingest_id_range` rows recorded for it (its rows are owned by their `(source_blob_id, source_fnid)` pair).
+    Requires an auto-increment column (`ValueError` otherwise).
   - Backward-compatible column aliases: `m_file_blob.fid = m_file_blob.blob_id`, `m_git_ref.vid =
     m_git_ref.commit_id`, `m_git_ref.vname = m_git_ref.ref_name`.
 - **Operation Builders**:
@@ -1364,7 +1369,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     their tags to this range's commits.
 - **Referential Integrity & Staged Pipeline Commit Boundaries**:
   - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`)
-    enforce full TableEngine commits prior to initiating downstream child table staging (`m_file_reference`,
+    enforce full TableEngine commits prior to initiating downstream child table writes (`m_file_reference`,
     `m_maintainer_file`). Both commits at the end of Stage 2 (inside `scheduler.finalize()` and the one after
     it) keep the in-memory caches (`G.TE.commit_all()`): Step 6.1 stages `m_file_name` / `m_file_blob` rows,
     and a cleared cache would mint new ids for paths and blobs already in the database (duplicate
@@ -1380,7 +1385,16 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `insert_include_references()`), which the clearing deletes and the include copy
     reuse; how the engine holds them is its own business (MariaDB: a connection-local temporary table, ~7 s on the
     reference database, with an inline anti-join when it cannot be created; MockDB and SQLiteDB: `SpecNewPairs`, the
-    anti-join as a query spec). The two clearing deletes run in one transaction. Rows are keyed by the source file's blob and path (`source_blob_id`,
+    anti-join as a query spec). Every `m_file_reference` row gets its `ref_id` from the database alone
+    (`Table.db_assigned_ids`, §5.2): the include copy is a set-based `INSERT ... SELECT` and the documentation
+    rows are `db.insert_rows(..., on_conflict="ignore")` with the key omitted, so distributed workers share
+    `AUTO_INCREMENT` as their only allocator and no TableEngine block (`m_table_sequence`) overlaps it. Each
+    clearing delete, the include copy and each documentation chunk is its own short transaction run by
+    `db.run_transaction()` (`db_engine/DB_API.md` §2.1), which re-runs it on a transient `DeadlockError`
+    (deadlock, lock wait timeout, AUTO-INC lock failure) with exponential backoff; the deletes commit before the
+    copy, so no worker holds their row and gap locks while waiting for the copy's AUTO-INC lock. A write that
+    still fails raises out of Step 6.6: the version is not finished, and its rerun clears and recomputes the same
+    pairs (every write is pair-scoped and idempotent). Rows are keyed by the source file's blob and path (`source_blob_id`,
     `source_fnid`): Kbuild targets resolve against the Makefile's directory, so identical copies of a Makefile
     in two directories have rows of their own, and a blob that appears at a path it did not have before (a
     copy, a rename) gets rows for that path while pairs carried over keep theirs. Include rows take their
@@ -1889,7 +1903,11 @@ strict local capability matching, and singleton PID lock exclusivity.
     autocommit state in a `finally` block. On deadlock or retryable database error, it retries up to 3 times before raising,
     logging failures with `logger.warning`.
   - Active blocks leased by a version run are recorded in `m_ingest_id_range(commit_id, marked_table_id,
-    start_id, end_id)`.
+    start_id, end_id)`. A table with `db_assigned_ids` (`m_file_reference`) is never leased: its rows take
+    `AUTO_INCREMENT` ids, and `rollback_id_ranges()` skips any range recorded for it, since such a range can
+    hold rows of other runs. The interrupted run's own rows of that table go with the blob-derived deletes or
+    are cleared and recomputed by the rerun's Step 6.6 (they are keyed by their `(source_blob_id, source_fnid)`
+    pair, whose content is the same whichever run computes it).
   - During Git DAG ingestion (`ingest_git_dag`), new commits in `m_commit` and reference records in `m_git_ref`
     atomically reserve their primary key IDs using `db.reserve_id_block(table, 1)` via `m_table_sequence`
     whenever distributed mode (`G.distributed`) is enabled, preventing ID allocation collisions across concurrent workers.
@@ -1991,7 +2009,7 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 
 | `--backfill-kbuild` | `m_kbuild_symbol` (§4 row 61) | The Makefile/Kbuild (path, blob) pairs of every finished version's checkpoint (read by primary key, restricted to those paths) without rows: each blob read from Git by SHA (`git cat-file --batch`) and parsed against its directory; also deletes the old `m_file_reference` rows of `ref_type` 3/4. Runs once automatically at start when the table is empty and the database holds finished versions, unless the run's repository is not a kernel tree (`man-pages`). |
 
-| `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, staging cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference`. |
+| `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, inserting cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference` (`ref_id` omitted: AUTO_INCREMENT assigns it, `Table.db_assigned_ids`). |
 
 | `--backfill-cve-files` | `m_cve_file` (§4 row 65) | Populates affected source and header file paths for CVE records from parsed `m_cve.data`. |
 

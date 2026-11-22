@@ -1582,6 +1582,7 @@ class Table:
         unique_keys: tuple[tuple[str, ...], ...] | None = None,
         idempotent_pk: bool = False,
         blob_scoped: bool = False,
+        db_assigned_ids: bool = False,
     ) -> None:
         """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
 
@@ -1601,6 +1602,9 @@ class Table:
             unique_keys: Optional tuple of unique key definitions: `(("col1",), ("col2", "col3"))`.
             idempotent_pk: If True, duplicate primary key inserts are treated idempotently as no-ops.
             blob_scoped: If True, enables content-addressable blob-scoped preloading and caching in Table Engine.
+            db_assigned_ids: If True, the database's AUTO_INCREMENT is the only allocator of the auto-increment
+                primary key: rows are written through `db_engine` with the key omitted, the Table Engine never
+                allocates ids for the table (`_allocate_id` raises), and `rollback_id_ranges()` ignores its leased ranges.
 
         Side Effects:
             1. Binds column attribute pointers directly on this instance:
@@ -1663,6 +1667,9 @@ class Table:
 
         self.hashing_table = hashing_table
         self.has_auto_increment = any(col[1].auto_increment for col in self.init_columns)
+        if db_assigned_ids and not self.has_auto_increment:
+            raise ValueError(f"db_assigned_ids requires an auto-increment primary key (table '{table_name}')")
+        self.db_assigned_ids = db_assigned_ids
 
         # Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
         for x, column in enumerate(self.init_columns):

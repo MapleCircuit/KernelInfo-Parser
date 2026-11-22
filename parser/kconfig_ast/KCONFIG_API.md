@@ -55,7 +55,7 @@ Kconfig Source File (`Kconfig` and `Kconfig.*` fragments such as lib/Kconfig.deb
            m_map_ast keyed by the tag, m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
   │
   ▼ [Post-Processing: processing_kbuild(version) (pipeline/file_references.py + kbuild_parser.py), Step 6.6]
-Kbuild rules & references: new Makefile/Kbuild (path, blob) pairs ──► m_kbuild_symbol (Table 61) & m_file_reference (ref_type 3 = Kbuild)
+Kbuild rules & references: new Makefile/Kbuild (path, blob) pairs ──► m_kbuild_symbol (Table 61)
 ==================================================================================================
 ```
 
@@ -132,7 +132,7 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 
 ### 6.1. Architecture & Execution
 - **Location**: [parser/kbuild_parser.py](parser/kbuild_parser.py)
-- **Database**: `pipeline/file_references.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild files whose (path, blob) pair is new in the version and stages their rules and governing symbols into Table 61 `m_kbuild_symbol` (`(source_blob_id, source_fnid, idx, symbol, via, line_no, compile_mode, kind, target_obj, target_path, target_fnid, rule)`) and `m_file_reference` (ref_type 3 = Kbuild) per built file (`source_blob_id`, `source_fnid` = the Makefile's blob and path). Targets resolve against the Makefile's directory, so identical Makefiles in two directories have rows of their own, and a Makefile carried over at the same path keeps its rows.
+- **Database**: `pipeline/file_references.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild files whose (path, blob) pair is new in the version and stages their rules and governing symbols into Table 61 `m_kbuild_symbol` (`(source_blob_id, source_fnid, idx, symbol, via, line_no, compile_mode, kind, target_obj, target_path, target_fnid, rule)`) per built file (`source_blob_id`, `source_fnid` = the Makefile's blob and path). Targets resolve against the Makefile's directory, so identical Makefiles in two directories have rows of their own, and a Makefile carried over at the same path keeps its rows.
 - **Webapp**: `KconfigService.kbuild_usage()` greps the revision for `CONFIG_<name>` in Makefiles and parses the matches with `KbuildParser` (rules, lines, kind, `via` rule/condition, `other_arch`); `compiled_files` is the existing files among them.
 - **Workflow**: joins backslash continuations, evaluates `OBJ_ASSIGN_RE` (`obj-$(CONFIG_XYZ) += target.o`, `obj-y`, `obj-m`) and `COMPOSITE_RE` (`target-y := a.o b.o`, `target-objs := ...`), resolves `.o` goals to `.c`/`.S` sources.
 

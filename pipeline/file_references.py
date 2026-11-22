@@ -9,11 +9,11 @@ import os
 
 import time
 from collections.abc import Callable
+from typing import Any
 from db_engine import (
     NewPairs,
 )
 from core.DBLayout import (
-    m_file_reference,
     m_kbuild_symbol,
 )
 from pipeline.changesets import get_fid_for_path, get_fnid_for_path
@@ -44,8 +44,17 @@ def _reference_sources(
     return sources
 
 
-def _stage_file_reference(
+_FILE_REFERENCE_COLUMNS = ("source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details")
+# Rows per INSERT transaction of the documentation references
+_DOC_INSERT_CHUNK = 5_000
+# Step 6.6 transactions re-run on a transient conflict (deadlock, lock wait timeout, AUTO-INC lock failure)
+_TX_ATTEMPTS = 5
+_TX_BACKOFF_S = 0.5
+
+
+def _collect_file_reference(
     staged_file_refs: set[tuple[int, int, int, int, int]],
+    rows: list[tuple[Any, ...]],
     blob_id: int,
     fnid: int,
     target_fnid: int,
@@ -53,13 +62,28 @@ def _stage_file_reference(
     line_no: int,
     details: str,
 ) -> bool:
-    """Stage one m_file_reference row of the source file (fnid, blob_id) unless already staged; True if staged."""
+    """Append one m_file_reference row (without `ref_id`) of the source file (fnid, blob_id) unless already
+    collected; True if appended."""
     key = (blob_id, fnid, target_fnid, ref_type, line_no)
     if key in staged_file_refs:
         return False
     staged_file_refs.add(key)
-    G.TE.set(m_file_reference.table_id, (None, blob_id, fnid, target_fnid, ref_type, line_no, details[:255]))
+    rows.append((blob_id, fnid, target_fnid, ref_type, line_no, details[:255]))
     return True
+
+
+def _insert_file_references(db: Any, rows: list[tuple[Any, ...]]) -> int:
+    """Insert m_file_reference rows with the key omitted (AUTO_INCREMENT assigns `ref_id`, `Table.db_assigned_ids`),
+    skipping rows whose unique key exists; each chunk is one transaction re-run on a transient conflict."""
+    for i in range(0, len(rows), _DOC_INSERT_CHUNK):
+        chunk = rows[i : i + _DOC_INSERT_CHUNK]
+        db.run_transaction(
+            lambda chunk=chunk: db.insert_rows("m_file_reference", list(_FILE_REFERENCE_COLUMNS), chunk, on_conflict="ignore"),
+            max_attempts=_TX_ATTEMPTS,
+            backoff_s=_TX_BACKOFF_S,
+            label="m_file_reference documentation insert",
+        )
+    return len(rows)
 
 
 def _version_file_list(version: str, purpose: str) -> list[str]:
@@ -127,15 +151,18 @@ def processing_doc_references(
     version: str,
     staged_file_refs: set[tuple[int, int, int, int, int]] | None = None,
     new_pairs: set[tuple[int, int]] | None = None,
-) -> None:
+    db: Any = None,
+) -> int:
     """Scan documentation and text files for active version and map cross-file references into m_file_reference.
 
     Rows are keyed by the document's (blob, path) like every m_file_reference row (the scan also skips
     references to the document's own path); `new_pairs` limits the scan to the (fnid, blob_id) pairs new
-    in this version (None: all).
+    in this version (None: all). The rows are written through `db` (default: a `G.DB()` session) with
+    `ref_id` omitted, so the database is the only allocator of the key (`Table.db_assigned_ids`), and
+    rows whose unique key exists are skipped. Returns the rows sent.
     """
     if gp.VID == 0 or not feature_enabled("docs"):
-        return
+        return 0
     if staged_file_refs is None:
         staged_file_refs = set()
 
@@ -145,7 +172,7 @@ def processing_doc_references(
     all_files = _version_file_list(version, "doc reference parsing")
     docs = _reference_sources(all_files, scanner.is_doc_candidate, new_pairs)
     if not docs:
-        return
+        return 0
 
     logger.info(f"Processing {len(docs)} documentation/text files for version '{version}'...")
 
@@ -155,7 +182,7 @@ def processing_doc_references(
         if fnid is not None:
             fnid_by_path[p] = fnid
 
-    count = 0
+    rows: list[tuple[Any, ...]] = []
     doc_type = int(FileRefType.Documentation)
     for doc_p, doc_fnid, doc_blob in docs:
         if G.is_deadline_exceeded():
@@ -166,11 +193,19 @@ def processing_doc_references(
             if not content:
                 continue
             for r in scanner.scan_file_content(content, doc_blob, fnid_by_path, source_path=doc_p):
-                count += _stage_file_reference(staged_file_refs, doc_blob, doc_fnid, r.target_fnid, doc_type, int(r.line_no), r.details)
+                _collect_file_reference(staged_file_refs, rows, doc_blob, doc_fnid, r.target_fnid, doc_type, int(r.line_no), r.details)
         except Exception as e:
             logger.debug(f"Error parsing documentation references in '{doc_p}': {e}")
 
-    logger.info(f"Staged {count} documentation cross-file references into m_file_reference for version '{version}'.")
+    if not rows:
+        return 0
+    if db is None:
+        with G.DB() as own_db:
+            _insert_file_references(own_db, rows)
+    else:
+        _insert_file_references(db, rows)
+    logger.info(f"Wrote {len(rows)} documentation cross-file references into m_file_reference for version '{version}'.")
+    return len(rows)
 
 
 def processing_include_references(version: str, new_pairs: NewPairs) -> None:
@@ -192,14 +227,6 @@ def processing_include_references(version: str, new_pairs: NewPairs) -> None:
 _FILE_REFERENCE_TABLES = ("m_file_reference", "m_kbuild_symbol")
 
 
-def _resync_file_reference_ids() -> None:
-    """Re-read the next m_file_reference id from the database after rows were written outside the TableEngine."""
-    try:
-        G.TE.resync_next_id(m_file_reference)
-    except Exception as exc:  # noqa: BLE001 - the TableEngine keeps its own cursor
-        logger.debug(f"Could not resynchronize the m_file_reference id sequence: {exc}")
-
-
 def processing_file_references(version: str) -> None:
     """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig).
 
@@ -207,6 +234,13 @@ def processing_file_references(version: str) -> None:
     (`source_blob_id`, `source_fnid`), so only the pairs new in this version are cleared and recomputed;
     pairs carried over keep their rows. The new pairs are computed once by `db.new_checkpoint_pairs()`; the
     clearing deletes and the include copy reuse them (the engine decides how they are held).
+
+    Every m_file_reference row is written by the database with `ref_id` omitted (`Table.db_assigned_ids`):
+    AUTO_INCREMENT is the single id authority across distributed workers. Each write runs in its own short
+    transaction (`run_transaction()`), re-run on a transient conflict; the clearing deletes commit before the
+    include copy, so no worker holds the deletes' row and gap locks while it waits for the AUTO-INC lock of the
+    `INSERT ... SELECT`. A step that still fails raises: the version is not finished, and its rerun clears and
+    recomputes the same pairs (every write is pair-scoped and idempotent).
     """
     if gp.VID == 0:
         return
@@ -216,30 +250,29 @@ def processing_file_references(version: str) -> None:
     with G.DB() as pairs_db:
         started = time.perf_counter()
         with pairs_db.new_checkpoint_pairs(gp.VID, gp.Old_VID or 0) as new_pairs:
-            # 1. Clear stale rows and re-insert set-based include references atomically in one transaction
-            try:
-                with pairs_db.transaction():
-                    for table in _FILE_REFERENCE_TABLES:
-                        new_pairs.delete_rows_of(table)
-                    processing_include_references(version, new_pairs)
-            except Exception as e:
-                logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
+            # 1. Clear the rows of the new pairs (one transaction per table)
+            for table in _FILE_REFERENCE_TABLES:
+                pairs_db.run_transaction(
+                    lambda table=table: new_pairs.delete_rows_of(table),
+                    max_attempts=_TX_ATTEMPTS,
+                    backoff_s=_TX_BACKOFF_S,
+                    label=f"{table} clearing delete",
+                )
             logger.info(f"[Step 6.6] New (path, blob) pairs computed once and cleared in {time.perf_counter() - started:.1f}s.")
             logger.info(f"Recomputing file references for {len(new_pairs.pairs)} (path, blob) pairs new in version '{version}'.")
 
-            # 2. Resynchronize TableEngine sequence next_id after include copy before staging Kbuild/Doc rows
-            _resync_file_reference_ids()
+            # 2. Set-based include / Kconfig references
+            pairs_db.run_transaction(
+                lambda: processing_include_references(version, new_pairs),
+                max_attempts=_TX_ATTEMPTS,
+                backoff_s=_TX_BACKOFF_S,
+                label="m_file_reference include copy",
+            )
 
-            # Rows staged in this run (rows of other pairs were cleared or are not recomputed)
+            # Rows collected in this run (rows of other pairs were cleared or are not recomputed)
             staged_file_refs: set[tuple[int, int, int, int, int]] = set()
 
-            # 3. Parse Kbuild and Documentation files and stage into TableEngine (fnids come from the committed TE cache)
+            # 3. Kbuild rules are staged into the TableEngine (m_kbuild_symbol, committed by the caller's
+            # commit_all); documentation references are written directly (fnids come from the committed TE cache)
             processing_kbuild(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs.pairs)
-            processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs.pairs)
-
-            # 4. Commit TableEngine queued m_file_reference rows
-            if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
-                G.TE.commit(m_file_reference.table_id, update_in_mem_indexes=False)
-
-    # 5. Resynchronize next_id so subsequent operations and commit_all have the accurate sequence boundary
-    _resync_file_reference_ids()
+            processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs.pairs, db=pairs_db)

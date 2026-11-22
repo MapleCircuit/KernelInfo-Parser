@@ -51,14 +51,15 @@ class ReadOnlyViolation(DBError):
 
 
 class DeadlockError(DBError):
-    """A transaction failed due to a lock deadlock, lock wait timeout, or snapshot conflict; callers may retry."""
+    """A transaction failed due to a lock deadlock, lock wait timeout, snapshot conflict, or auto-increment lock failure; callers may retry."""
 
 
 # MySQL / MariaDB client error numbers
 _DUP_ERRNOS = frozenset({1062, 1586})
 _MISSING_TABLE_ERRNOS = frozenset({1146, 1051})
 _PACKET_ERRNOS = frozenset({1153, 1154})
-_DEADLOCK_ERRNOS = frozenset({1213, 1205, 1020})
+# 1467 (failed to read auto-increment value): InnoDB reports a deadlock or timeout on the table AUTO-INC lock this way
+_DEADLOCK_ERRNOS = frozenset({1213, 1205, 1020, 1467})
 _CONN_ERRNOS = frozenset({2002, 2003, 2006, 2013, 2055, 1927})
 _CONN_CLASS_NAMES = frozenset({"InterfaceError", "PoolError"})
 

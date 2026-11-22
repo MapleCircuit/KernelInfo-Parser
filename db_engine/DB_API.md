@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L622]
-  - 2.1. Lifecycle, Session & Health [L150-L229]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L230-L277]
-  - 2.3. Multi-Table Relational Views [L278-L287]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L288-L326]
-  - 2.5. DDL & Index Management [L327-L368]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L369-L419]
-  - 2.7. Spec Read Primitives [L420-L447]
-  - 2.8. Spec Write Primitives [L448-L464]
-  - 2.9. Catalog & Server Introspection [L465-L480]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L481-L497]
-  - 2.11. Pipeline Intent Methods [L498-L515]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L516-L541]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L542-L553]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L554-L561]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L562-L622]
-- 3. Factory Resolver (`get_db_engine`) [L623-L644]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L645-L671]
+- 2. Core Method Specifications [L148-L628]
+  - 2.1. Lifecycle, Session & Health [L150-L235]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L236-L283]
+  - 2.3. Multi-Table Relational Views [L284-L293]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L294-L332]
+  - 2.5. DDL & Index Management [L333-L374]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L375-L425]
+  - 2.7. Spec Read Primitives [L426-L453]
+  - 2.8. Spec Write Primitives [L454-L470]
+  - 2.9. Catalog & Server Introspection [L471-L486]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L487-L503]
+  - 2.11. Pipeline Intent Methods [L504-L521]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L522-L547]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L548-L559]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L560-L567]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L568-L628]
+- 3. Factory Resolver (`get_db_engine`) [L629-L650]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L651-L677]
 <!-- toc:end -->
 
 ---
@@ -96,7 +96,7 @@ Callers catch only these classes; each driver maps its native errors at its boun
 | `PacketTooLargeError` | | Statement above the server packet limit (errno 1153/1154, `max_allowed_packet`); batch writers bisect internally first. |
 | `ConfigurationError` | | The connection settings are incomplete (`MariaDB` without `DB_USER` / `DB_PASSWORD`, i.e. `database.user` / `database.password`): no default account exists, and the error names the keys to set. |
 | `ReadOnlyViolation` | | A write entry point was called on a read-only session (`ReadSession`, `MockReadSession`, a `MariaDB` driver backing a reader); the message points at the writer engine. |
-| `DeadlockError` | | A transaction failed due to a lock deadlock, lock wait timeout, or snapshot isolation conflict (`Record has changed since last read`, MariaDB errno 1213/1205/1020); callers may retry the transaction. |
+| `DeadlockError` | | A transaction failed due to a lock deadlock, lock wait timeout, or snapshot isolation conflict (`Record has changed since last read`, MariaDB errno 1213/1205/1020), or a failed read of the auto-increment value (errno 1467, InnoDB's report of a deadlock or timeout on the table AUTO-INC lock); callers may retry the transaction (`run_transaction()`). |
 
 Every error raised by `db_engine` that a caller can fix (`UnsupportedOperation`, `SpecError`, `ReadOnlyViolation`, `PoolConfigError`, `ConfigurationError`, `MissingTableError`) names the replacement API and the section of this document by name, in one or two lines. `tests/test_db_boundary.py` failures carry the same hint per rule.
 
@@ -212,6 +212,12 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
     `ROLLBACK` on error). Inside it `insert()` / `update()` neither commit per call nor reconnect and retry
     per chunk, so a table is written completely or not at all and can be retried as a whole.
     `reserve_id_block()` commits on its own and raises `UnsupportedOperation` inside it (`MariaDB`, `SQLiteDB`, `MockDB`).
+- **`run_transaction(fn: Callable[[], Any], *, max_attempts: int = 5, backoff_s: float = 0.02, label: str = "") -> Any`**
+  - Runs `fn()` inside `transaction()` and returns its result. On a `DeadlockError` the failed attempt is rolled
+    back, a warning naming `label` is logged, and the whole transaction runs again after `backoff_s * 2**(n-1)`
+    plus up to `backoff_s` of jitter; after `max_attempts` the last `DeadlockError` propagates, any other error at
+    once. `fn` writes only through this engine, so re-running it is safe. Implemented once in `BaseDBEngine`
+    (`MariaDB`, `SQLiteDB`, `MockDB`).
 - **`apply_server_tuning(settings: dict[str, Any] | None = None, *, tunnel_active: bool | None = None, mem_max_gb: float = 0.0) -> list[str]`**
   - `BaseDBEngine` and `MockDB` return no notes; `MariaDB` raises global server variables with `SET GLOBAL` (needs SUPER; lasts until the server restarts) and
     returns one note per change or failure. With `tunnel_active` given (`False` = the server is local, `True` = reached
@@ -499,7 +505,7 @@ Introspection primitives exposing database metadata and runtime configuration.
 Specialized high-level database operations driving parser pipeline workers.
 
 - **`new_checkpoint_pairs(commit_id: int, prev_commit_id: int) -> Iterator[NewPairs]`**
-  - Context manager yielding a `NewPairs` for the `(fnid, blob_id)` pairs of `commit_id`'s checkpoint that `prev_commit_id`'s lacks: `pairs: set[tuple[int, int]]`, `delete_rows_of(table) -> int` (rows whose `(source_blob_id, source_fnid)` is a new pair) and `insert_include_references(kconfig_type_ids, kconfig_ref_type, include_ref_type) -> int` (`m_file_reference` rows of the new pairs' `#include` / Kconfig source tags, `INSERT IGNORE`-style). The base implementation `SpecNewPairs` (`db_engine/base.py`, used by `MockDB` and `SQLiteDB`) holds no connection-local state: the deletes use `in_select`, the copy is one `copy_rows(Select(..., hint="straight_join", distinct=True))` with `Case` / `Substr`. `MariaDB` overrides it with a connection-local temporary table (`tmp_new_pairs`) for speed and falls back to the inline anti-join when the table cannot be created.
+  - Context manager yielding a `NewPairs` for the `(fnid, blob_id)` pairs of `commit_id`'s checkpoint that `prev_commit_id`'s lacks: `pairs: set[tuple[int, int]]`, `delete_rows_of(table) -> int` (rows whose `(source_blob_id, source_fnid)` is a new pair) and `insert_include_references(kconfig_type_ids, kconfig_ref_type, include_ref_type) -> int` (`m_file_reference` rows of the new pairs' `#include` / Kconfig source tags, `INSERT IGNORE`-style). The base implementation `SpecNewPairs` (`db_engine/base.py`, used by `MockDB` and `SQLiteDB`) holds no connection-local state: the deletes use `in_select`, the copy is one `copy_rows(Select(..., hint="straight_join", distinct=True))` with `Case` / `Substr`. `MariaDB` overrides it with a connection-local temporary table (`tmp_new_pairs`) for speed and falls back to the inline anti-join when the table cannot be created. Its statements map driver errors to the neutral classes (1213 / 1205 / 1467 become `DeadlockError`), so callers retry them with `run_transaction()`. `insert_include_references` omits `ref_id`: `m_file_reference` keys come from `AUTO_INCREMENT` alone (`Table.db_assigned_ids`).
 - **`enqueue_parse_tasks(rows: Sequence[Sequence[Any]]) -> int`**
   - Publishes `(network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name, base_commit_id, status)` rows to `m_parse_task` (identity `(network_id, ref_name)`) as one chunked multi-row `insert_rows(on_conflict="update", update_exprs=...)` inside one transaction; returns how many rows were written (every offered row). Rows are applied in order, each against the row stored so far, so a task listed twice ends as if published twice and the result equals one call per row. The status the row already has decides what is kept: a FAILED task, or a DONE one published as not done, starts over (published status, `retry_count` 0, `error_msg` cleared); a LEASED / RECLAIMING task keeps its state unless published as DONE; any other takes the published status. A known `commit_id` / `base_commit_id` is never replaced by 0. `retry_count` / `error_msg` precede `status` in the assignments, so they read the stored status on MariaDB's left-to-right evaluation as well as on SQLite and `MockDB`. Implemented once in `BaseDBEngine`.
 - **`record_task_failure(task_id: int, error_msg: str, *, worker_id: str | None = None, max_attempts: int = 3) -> int`**

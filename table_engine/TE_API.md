@@ -15,14 +15,14 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - 3.3. `get_table_engine(name: str | type | None) -> type[TEDirectDB | TECachedDB]` [L140-L153]
   - 3.4. `TECachedDB` Internal Cache Management [L154-L188]
   - 3.5. Structured Shared Memory with Huge Pages (`table_engine/shared_buffer.py`) [L189-L229]
-- 4. Exhaustive API Method Specifications [L230-L599]
+- 4. Exhaustive API Method Specifications [L230-L602]
   - 4.1. Lifecycle & Connection Management [L232-L346]
-  - 4.2. Single-Table Operations (`get`, `set`, `update`) [L347-L446]
-  - 4.3. Multi-Table Relational Views (`view_get`, `view_get_multiple`, `view_set`) [L447-L521]
-  - 4.4. Transaction Commit Protocol (`commit`, `commit_all`) [L522-L599]
-- 5. Expected Database Driver Interface (`G.DB` / `BaseDBEngine`) [L600-L619]
-- 6. Critical Invariants for Custom Implementations [L620-L713]
-- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L714-L741]
+  - 4.2. Single-Table Operations (`get`, `set`, `update`) [L347-L449]
+  - 4.3. Multi-Table Relational Views (`view_get`, `view_get_multiple`, `view_set`) [L450-L524]
+  - 4.4. Transaction Commit Protocol (`commit`, `commit_all`) [L525-L602]
+- 5. Expected Database Driver Interface (`G.DB` / `BaseDBEngine`) [L603-L622]
+- 6. Critical Invariants for Custom Implementations [L623-L716]
+- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L717-L744]
 <!-- toc:end -->
 
 ---
@@ -404,7 +404,10 @@ querying the database driver:
       `_queued_sec_indexes`, returns it; a key in `_committed_unique_keys` (written by an earlier commit)
       returns the stored row read by its unique columns (`db.select()`), so the caller gets its id, without
       allocating a new ID or queuing duplicate entries.
-    - Assigns `assigned_id = next_id[table_id]`, increments `next_id[table_id] += 1`.
+    - Assigns `assigned_id = next_id[table_id]`, increments `next_id[table_id] += 1` (`_allocate_id()`; in
+      distributed mode from a block leased by `db.reserve_id_block()`). A table with `db_assigned_ids`
+      (`m_file_reference`, `core/API.md` §5.2) raises `ValueError` here: its ids come from the database's
+      `AUTO_INCREMENT` alone, so its rows are written through `db_engine` with the key omitted.
     - Builds `row = (assigned_id, *columns[1:])`.
     - Stages `queued_set[table_id][assigned_id] = row`.
     - In `TECachedDB`: Appends row to `_cached_rows` and calls `_index_row()`.

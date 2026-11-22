@@ -210,28 +210,37 @@ class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
         self.assertEqual(format_ref_type_label(FileRefType.Makefile), "Makefile")
         self.assertEqual(format_ref_type_label(FileRefType.Documentation), "Documentation")
 
-    def test_m_file_reference_unique_key_and_table_engine_deduplication(self) -> None:
-        """Verify TableEngine deduplicates duplicate unique key entries for m_file_reference."""
+    def test_m_file_reference_ids_come_from_the_database_alone(self) -> None:
+        """m_file_reference is db_assigned_ids: the TableEngine refuses to allocate its ids, and the database
+        assigns them and skips rows whose unique key exists."""
         from table_engine.te_direct_db import TEDirectDB
-        te = TEDirectDB()
-        te._register_table(m_file_reference)
-        te.next_id[m_file_reference.table_id] = 1
+        from db_engine import SQLiteDB
 
-        # First insert: (ref_id, source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
-        row1 = te.set(m_file_reference.table_id, (None, 18278, 500, 18291, 3, 9, "details 1"))
-        self.assertEqual(row1[0], 1)
-        self.assertEqual(tuple(row1[1:6]), (18278, 500, 18291, 3, 9))
+        self.assertTrue(m_file_reference.db_assigned_ids)
+        for distributed in (False, True):
+            te = TEDirectDB()
+            te._register_table(m_file_reference)
+            te.distributed = distributed
+            with self.assertRaisesRegex(ValueError, "assigned by the database"):
+                te.set(m_file_reference.table_id, (None, 18278, 500, 18291, 3, 9, "details 1"))
 
-        # Duplicate insert with identical (source_blob_id, source_fnid, target_fnid, ref_type, line_no)
-        row2 = te.set(m_file_reference.table_id, (None, 18278, 500, 18291, 3, 9, "details 2"))
-        # Must return the existing staged row without allocating a new ID
-        self.assertEqual(row2[0], 1)
-        self.assertEqual(len(te.queued_set[m_file_reference.table_id]), 1)
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([m_file_reference])
+        cols = ["source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"]
+        db.insert_rows("m_file_reference", cols, [(18278, 500, 18291, 3, 9, "details 1")], on_conflict="ignore")
+        # Duplicate unique key (another details text) is skipped; the same blob at another path is its own row
+        db.insert_rows("m_file_reference", cols, [(18278, 500, 18291, 3, 9, "details 2"), (18278, 501, 18291, 3, 9, "details 1")],
+                       on_conflict="ignore")
+        rows = db.select_rows("m_file_reference", ["ref_id", "source_fnid", "details"], order_by=["ref_id"], as_dict=False)
+        self.assertEqual([tuple(r[1:]) for r in rows], [(500, "details 1"), (501, "details 1")])
+        self.assertLess(rows[0][0], rows[1][0])
 
-        # The same blob at another path is another source: its own row
-        row3 = te.set(m_file_reference.table_id, (None, 18278, 501, 18291, 3, 9, "details 1"))
-        self.assertEqual(row3[0], 2)
-        self.assertEqual(len(te.queued_set[m_file_reference.table_id]), 2)
+    def test_db_assigned_ids_requires_auto_increment(self) -> None:
+        from core.TableHandling import Table
+        from core.DBLayout import INT
+
+        with self.assertRaisesRegex(ValueError, "auto-increment"):
+            Table(table_id=9999, table_name="t_bad", columns=(("a", INT()),), primary=("a",), db_assigned_ids=True)
 
 
 class TestPathScopedReferences(unittest.TestCase):
@@ -258,6 +267,23 @@ class TestPathScopedReferences(unittest.TestCase):
                 staged.append(row)
                 return row
 
+        from contextlib import contextmanager
+
+        class FakeDB:
+            """Collects the rows written directly (m_file_reference documentation rows, ref_id omitted)."""
+
+            def run_transaction(self, fn, **_kw):
+                return fn()
+
+            def insert_rows(self, table, columns, rows, on_conflict="error"):
+                assert table == "m_file_reference" and "ref_id" not in columns and on_conflict == "ignore"
+                staged.extend(rows)
+                return len(rows)
+
+        @contextmanager
+        def fake_db():
+            yield FakeDB()
+
         class FakeMF:
             def get_file(_self, path, version):
                 return self.MAKEFILE if path.endswith("Makefile") else self.DOC
@@ -266,6 +292,7 @@ class TestPathScopedReferences(unittest.TestCase):
                 return "\n".join(self.FNIDS) + "\n"
 
         with mock.patch.object(pipeline.file_references, "MF", FakeMF()), mock.patch.object(main.G, "TE", FakeTE()), \
+                mock.patch.object(main.G, "DB", fake_db), \
                 mock.patch.object(pipeline.file_references, "get_fnid_for_path", self.FNIDS.get), \
                 mock.patch.object(pipeline.file_references, "get_fid_for_path", self.BLOBS.get), \
                 mock.patch.object(main.gp, "VID", 2, create=True), \
@@ -293,7 +320,7 @@ class TestPathScopedReferences(unittest.TestCase):
     def test_documentation_rows_per_path(self) -> None:
         from pipeline.file_references import processing_doc_references
         doc = int(FileRefType.Documentation)
-        rows = {tuple(r[1:5]) for r in self._run(processing_doc_references, {(22, 40)})}
+        rows = {tuple(r[0:4]) for r in self._run(processing_doc_references, {(22, 40)})}
         self.assertEqual(rows, {(40, 22, 11, doc), (40, 22, 12, doc)})
 
 
@@ -332,51 +359,203 @@ class TestNewPairsOnce(unittest.TestCase):
         left = db.select_values("m_file_reference", "details", order_by=["ref_id"])
         self.assertEqual(left, ["kept"])
 
-    def test_processing_file_references_invalidates_te_id_cursor(self) -> None:
+    def _patched(self, db, **patches):
+        """Context of processing_file_references() for versions VID 2 / Old_VID 1 over `db`."""
+        from contextlib import ExitStack, contextmanager
         from unittest import mock
-        from contextlib import contextmanager
         import main
         import pipeline.file_references
+
+        @contextmanager
+        def fake_db():
+            yield db
+
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(main.G, "DB", fake_db))
+        stack.enter_context(mock.patch.object(main.G, "TE", mock.MagicMock()))
+        stack.enter_context(mock.patch.object(main.gp, "VID", 2, create=True))
+        stack.enter_context(mock.patch.object(main.gp, "Old_VID", 1, create=True))
+        stack.enter_context(mock.patch.object(pipeline.file_references, "_TX_BACKOFF_S", 0.0))
+        stack.enter_context(mock.patch.object(pipeline.file_references, "processing_kbuild"))
+        for name, value in patches.items():
+            stack.enter_context(mock.patch.object(pipeline.file_references, name, value))
+        return stack
+
+    def _include_db(self, engine):
+        """`_db()` on `engine` plus one include tag of blob 8 (the new pair (3, 8)) targeting fnid 5."""
+        from core.DBLayout import TABLES as ALL
+
+        db = engine(use_global=False) if engine.__name__ == "MockDB" else engine(":memory:", foreign_keys=False)
+        db.create_table(list(ALL))
+        db.insert_rows("m_bridge_checkpoint", ["commit_id", "fnid", "blob_id"], [(1, 1, 9), (2, 1, 9), (2, 2, 9), (2, 3, 8)])
+        cols = ["ref_id", "source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"]
+        db.insert_rows("m_file_reference", cols, [(1, 9, 1, 7, 1, 1, "kept"), (2, 9, 2, 7, 1, 1, "stale"), (3, 8, 3, 7, 1, 1, "stale")])
+        db.insert_rows("m_bridge_tag", ["blob_id", "tag_id", "line_s", "line_e", "char_s", "char_e"], [(8, 70, 4, 4, 0, 1)])
+        db.insert_rows("m_tag", ["tag_id", "hash", "ast_id", "hl_s", "hl_l"], [(70, b"\x01" * 32, 80, 0, 1)])
+        db.insert_rows("m_ast_include", ["ast_id", "fnid"], [(80, 5)])
+        db.insert_rows("m_ast", ["ast_id", "type_id", "name"], [(80, 1, "linux/x.h")])
+        return db
+
+    def test_sqlite_and_mock_parity_single_id_authority(self) -> None:
+        """Include and documentation rows share AUTO_INCREMENT (no TableEngine id) on SQLiteDB and MockDB, even
+        when a leased m_table_sequence block would overlap the database's next id; a rerun is idempotent."""
+        import pipeline.file_references
+        from db_engine import MockDB, SQLiteDB
         from core.DBLayout import m_file_reference
 
-        te_mock = mock.MagicMock()
-        te_mock.queued_set = {}
+        def docs(version, staged_file_refs=None, new_pairs=None, db=None):
+            assert new_pairs == {(2, 9), (3, 8)}
+            rows = []
+            for blob, fnid in ((8, 3), (9, 2)):
+                pipeline.file_references._collect_file_reference(staged_file_refs, rows, blob, fnid, 7, 5, 2, "doc")
+            # A duplicate of a collected row is dropped before the insert
+            pipeline.file_references._collect_file_reference(staged_file_refs, rows, 8, 3, 7, 5, 2, "doc again")
+            return pipeline.file_references._insert_file_references(db, rows)
+
+        results = {}
+        for engine in (SQLiteDB, MockDB):
+            db = self._include_db(engine)
+            # A stale TableEngine lease that would collide with the database's next id (4) is never consulted
+            db.insert_rows("m_table_sequence", ["seq_table_id", "next_id"], [(m_file_reference.table_id, 4)])
+            for _ in range(2):
+                with self._patched(db, processing_doc_references=docs):
+                    pipeline.file_references.processing_file_references("v3.1")
+            rows = db.select_rows("m_file_reference", ["ref_id", "source_blob_id", "source_fnid", "target_fnid", "ref_type", "details"],
+                                  order_by=["ref_id"], as_dict=False)
+            ids = [r[0] for r in rows]
+            self.assertEqual(len(ids), len(set(ids)))
+            results[engine.__name__] = sorted(tuple(r[1:]) for r in rows)
+        self.assertEqual(results["SQLiteDB"], results["MockDB"])
+        self.assertEqual(results["SQLiteDB"], [
+            (8, 3, 5, 1, "linux/x.h"), (8, 3, 7, 5, "doc"), (9, 1, 7, 1, "kept"), (9, 2, 7, 5, "doc"),
+        ])
+
+    def test_include_copy_retries_transient_conflicts(self) -> None:
+        """A DeadlockError (MariaDB 1213 / 1205 / 1467) re-runs the include transaction; the copy then completes."""
+        import pipeline.file_references
+        from db_engine import DeadlockError
+
         db = self._db()
+        calls = []
+        real = pipeline.file_references.processing_include_references
 
-        @contextmanager
-        def fake_db():
-            yield db
+        def flaky(version, new_pairs):
+            calls.append(version)
+            if len(calls) < 3:
+                raise DeadlockError("1467 (HY000): Failed to read auto-increment value from storage engine")
+            return real(version, new_pairs)
 
-        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", te_mock), \
-                mock.patch.object(pipeline.file_references, "processing_kbuild"), mock.patch.object(pipeline.file_references, "processing_doc_references"), \
-                mock.patch.object(pipeline.file_references, "processing_include_references"), \
-                mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
+        with self._patched(db, processing_include_references=flaky, processing_doc_references=lambda *a, **k: 0):
             pipeline.file_references.processing_file_references("v3.1")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(db.select_values("m_file_reference", "details", order_by=["ref_id"]), ["kept"])
 
-        te_mock.resync_next_id.assert_called_with(m_file_reference)
-
-    def test_b29_delete_rolls_back_when_include_insert_fails(self) -> None:
-        from contextlib import contextmanager
+    def test_exhausted_retries_propagate_without_doc_rows(self) -> None:
+        """When the include copy keeps failing the error propagates: no documentation rows are written after it."""
         from unittest import mock
-        import main
+        import pipeline.file_references
+        from db_engine import DeadlockError
+
+        db = self._db()
+        include = mock.MagicMock(side_effect=DeadlockError("Deadlock found when trying to get lock"))
+        doc = mock.MagicMock(return_value=0)
+        with self._patched(db, processing_include_references=include, processing_doc_references=doc):
+            with self.assertRaises(DeadlockError):
+                pipeline.file_references.processing_file_references("v3.1")
+        self.assertEqual(include.call_count, pipeline.file_references._TX_ATTEMPTS)
+        doc.assert_not_called()
+
+    def test_non_transient_failure_propagates_at_once(self) -> None:
+        """A non-transient error is not retried and is not swallowed (b29: the copy failure stops Step 6.6)."""
+        from unittest import mock
         import pipeline.file_references
 
         db = self._db()
+        include = mock.MagicMock(side_effect=RuntimeError("copy failed"))
+        doc = mock.MagicMock(return_value=0)
+        with self._patched(db, processing_include_references=include, processing_doc_references=doc):
+            with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                pipeline.file_references.processing_file_references("v3.1")
+        self.assertEqual(include.call_count, 1)
+        doc.assert_not_called()
 
-        @contextmanager
-        def fake_db():
-            yield db
+    def test_failed_doc_transaction_rolls_back_its_chunk(self) -> None:
+        """A failing documentation chunk is rolled back as a whole and the error propagates."""
+        from unittest import mock
+        import pipeline.file_references
 
-        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", mock.MagicMock()), \
-                mock.patch.object(pipeline.file_references, "processing_kbuild"), \
-                mock.patch.object(pipeline.file_references, "processing_doc_references"), \
-                mock.patch.object(pipeline.file_references, "processing_include_references", side_effect=RuntimeError("copy failed")), \
-                mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
-            pipeline.file_references.processing_file_references("v3.1")
+        db = self._db()
+        real_insert = db.insert_rows
 
-        # Transaction rolled back: stale rows must still be present
-        left = db.select_values("m_file_reference", "details", order_by=["ref_id"])
-        self.assertEqual(left, ["kept", "stale", "stale"])
+        def insert_then_fail(table, columns, rows, **kw):
+            real_insert(table, columns, rows, **kw)
+            raise RuntimeError("doc insert failed")
+
+        rows = [(9, 2, 7, 5, 2, "doc")]
+        with mock.patch.object(db, "insert_rows", side_effect=insert_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "doc insert failed"):
+                pipeline.file_references._insert_file_references(db, rows)
+        self.assertEqual(db.select_values("m_file_reference", "details", order_by=["ref_id"]), ["kept", "stale", "stale"])
+
+
+class TestRollbackSkipsDatabaseAssignedIds(unittest.TestCase):
+    """A leased m_ingest_id_range row of m_file_reference never deletes rows (AUTO_INCREMENT ids of other runs)."""
+
+    def test_rollback_id_ranges_ignores_m_file_reference_ranges(self) -> None:
+        from db_engine import SQLiteDB
+        from core.DBLayout import TABLES as ALL
+        from core.ingest_state import rollback_id_ranges
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table(list(ALL))
+        cols = ["ref_id", "source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"]
+        db.insert_rows("m_file_reference", cols, [(15477647, 9, 1, 7, 1, 1, "other run")])
+        rollback_id_ranges(db, 5, list(ALL), [(m_file_reference.table_id, 15477647, 15487646)])
+        self.assertEqual(db.select_values("m_file_reference", "details"), ["other run"])
+
+
+class TestRunTransaction(unittest.TestCase):
+    """`BaseDBEngine.run_transaction()` and the MariaDB errno mapping it relies on."""
+
+    def test_mariadb_transient_errnos_map_to_deadlock_error(self) -> None:
+        from db_engine import DeadlockError
+        from db_engine.errors import translate_mysql_error
+
+        class FakeMySQLError(Exception):
+            def __init__(self, errno, msg):
+                super().__init__(f"{errno} (HY000): {msg}")
+                self.errno = errno
+
+        for errno in (1213, 1205, 1467):
+            self.assertIsInstance(translate_mysql_error(FakeMySQLError(errno, "x")), DeadlockError)
+
+    def test_retries_then_rolls_back_and_propagates(self) -> None:
+        from db_engine import DeadlockError, SQLiteDB
+        from core.DBLayout import m_kbuild_symbol
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        db.create_table([m_file_reference, m_kbuild_symbol])
+        cols = ["source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no", "details"]
+        attempts = []
+
+        def op():
+            attempts.append(1)
+            db.insert_rows("m_file_reference", cols, [(1, 2, 3, 5, len(attempts), "x")])
+            raise DeadlockError("Lock wait timeout exceeded")
+
+        with self.assertRaises(DeadlockError):
+            db.run_transaction(op, max_attempts=3, backoff_s=0.0)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(db.select_values("m_file_reference", "line_no"), [])
+        self.assertEqual(db.run_transaction(lambda: 42, backoff_s=0.0), 42)
+
+    def test_refuses_to_nest_inside_a_transaction(self) -> None:
+        from db_engine import SQLiteDB, UnsupportedOperation
+
+        db = SQLiteDB(":memory:", foreign_keys=False)
+        with db.transaction():
+            with self.assertRaises(UnsupportedOperation):
+                db.run_transaction(lambda: None)
 
 
 if __name__ == "__main__":
