@@ -8,7 +8,7 @@
 import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, formatLockBadge, isCustomColor, paintOrder, visibleCanvasSlice } from "./canvas_model.js";
 import { arrowHeads, dashArray, edgePath, resolveEnds } from "./edge_router.js";
 import { headMetaOf, sourceLineSegments } from "./node_content.js";
-import { diffRows, kconfigValue, mailBadges, maintainerLines, statusClass, valueClass } from "./domain_nodes.js";
+import { commitRowKey, diffRows, kconfigValue, mailBadges, mailLineClass, mailRowKey, maintainerLines, releaseRowKey, statusClass, valueClass } from "./domain_nodes.js";
 import { countDirectives, esc as escHtml, paholeRows, structRows } from "./struct_view.js";
 
 export const EXPORT_METRICS = {
@@ -22,11 +22,13 @@ export const EXPORT_METRICS = {
   SRC_ROW_H: 16.5,
   DIFF_ROW_H: 16.5,
   PP_INDENT: 10,
+  ROW_BORDER: 2,
   MONO_CH: 6.6,
   SANS_CH: 6.2,
   TRACK_W: 6,
   MAIL_ROW_H: 18,
   MAIL_META_H: 14,
+  MAIL_BODY_BOX_H: 320,
   KC_ROW_H: 18,
   MT_ROW_H: 16,
   GUIDE_W: 12,
@@ -34,7 +36,7 @@ export const EXPORT_METRICS = {
 
 const {
   PAD, HEAD_H, BAR_H, OUTER_H, ROW_H, TABLE_ROW_H, LAYOUT_ROW_H, SRC_ROW_H,
-  PP_INDENT, MONO_CH, SANS_CH, TRACK_W, DIFF_ROW_H, MAIL_ROW_H, MAIL_META_H,
+  PP_INDENT, ROW_BORDER, MONO_CH, SANS_CH, TRACK_W, DIFF_ROW_H, MAIL_ROW_H, MAIL_META_H, MAIL_BODY_BOX_H,
   KC_ROW_H, MT_ROW_H, GUIDE_W,
 } = EXPORT_METRICS;
 
@@ -263,8 +265,10 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const rowsTop = y + 2;
     const rowsBottom = box.h - 2;
     const id = clip(0, rowsTop, box.w, rowsBottom - rowsTop);
+    // Same geometry as nodemap.css: rows start after a 2px left border; the #if cell spans
+    // [2, gutter + 6) with a 1px right border and a 4px flex gap before the controls column
     const gutter = model.tracks ? model.tracks * TRACK_W + TRACK_W : 0;
-    const cellRight = table && model.tracks ? gutter + 10 : 0;
+    const cellRight = table && model.tracks ? gutter + 5.5 : 0;
     const ctlW = table ? (editMode ? 30 : 14) : 0;
     const typeW = model.typeCh * MONO_CH;
     const rowH = table ? TABLE_ROW_H : ROW_H;
@@ -290,21 +294,26 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       const op = r.dim ? 0.45 : r.dead ? 0.6 : 1;
       let row = "";
       for (const [l, part] of r.bars) {
-        const bx = 6 + l * TRACK_W + 1;
+        const bx = ROW_BORDER + 7 + l * TRACK_W;
         const y1 = part === "start" ? mid : ry;
         const y2 = part === "end" ? mid : ry + rh;
         const alpha = [0.9, 0.7, 0.55, 0.4][l % 4];
         row += `<line x1="${bx}" y1="${r1(y1)}" x2="${bx}" y2="${r1(y2)}" stroke="${C.preproc}" stroke-opacity="${alpha}" stroke-width="2"/>`;
-        if (part === "start" || part === "end" || part === "mid") row += `<line x1="${bx}" y1="${r1(mid)}" x2="${bx + 4}" y2="${r1(mid)}" stroke="${C.preproc}" stroke-opacity="${alpha}" stroke-width="2"/>`;
+        if (part === "start" || part === "end" || part === "mid") row += `<line x1="${bx - 1}" y1="${r1(mid)}" x2="${bx + 4}" y2="${r1(mid)}" stroke="${C.preproc}" stroke-opacity="${alpha}" stroke-width="2"/>`;
       }
       if (table) row += `<line x1="0" y1="${r1(ry + rh)}" x2="${box.w}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
-      const x0 = cellRight ? cellRight + 4 : 6 + gutter + (table ? 0 : r.depth * 14);
+      const x0 = cellRight ? cellRight + 4.5 : ROW_BORDER + 4 + gutter + (table ? 0 : r.depth * 14);
       const lineNo = r.line ? txt(box.w - 8, base, esc(r.line), { fill: C.faint, size: 9, family: "monospace", anchor: "end" }) : "";
       if (r.kind === "pp" || r.kind === "summary") {
         const chev = r.count ? (r.folded ? "▸ " : "▾ ") : "";
         const extra = r.kind === "summary" ? ` · ${r.count} member${r.count === 1 ? "" : "s"}${r.auto ? " · compiled out" : " · folded"}` : "";
-        const px = (table ? x0 + ctlW + 4 : x0) + (r.ppLevel || 0) * PP_INDENT;
-        row += txt(px, base, `${esc(chev)}${esc(fit(r.text + extra, Math.floor((box.w - px - 40) / MONO_CH)))}`, { fill: C.preproc, family: "monospace", italic: true });
+        const ix = x0 + (r.ppLevel || 0) * PP_INDENT;
+        if (table) {
+          // chevron in the controls column, text after it (the indent steps both in, like the live row)
+          const px = ix + ctlW + 6;
+          if (chev) row += txt(ix, base, esc(chev), { fill: C.faint, family: "monospace" });
+          row += txt(px, base, esc(fit(r.text + extra, Math.floor((box.w - px - 40) / MONO_CH))), { fill: C.preproc, family: "monospace", italic: true });
+        } else row += txt(ix, base, `${esc(chev)}${esc(fit(r.text + extra, Math.floor((box.w - ix - 40) / MONO_CH)))}`, { fill: C.preproc, family: "monospace", italic: true });
       } else {
         fieldY.set(r.key, mid);
         const label = r.kind === "agg" ? `${r.name}${r.folded ? ` {${r.count}}` : ""}` : `${r.name}${r.suffix || ""}`;
@@ -314,8 +323,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
           row += txt(x0, base, esc(lead), { fill: C.faint, family: "monospace" });
           const typeText = r.kind === "agg" ? `${r.tag}${r.typeText ? ` ${r.typeText}` : ""}` : r.type;
           if (typeText) row += txt(tx + 4 + r.depth * 2 * MONO_CH, base, esc(fit(typeText, model.typeCh - r.depth * 2)), { fill: r.kind === "agg" ? C.keyword : C.type, family: "monospace" });
-          row += `<line x1="${r1(tx + typeW + 8)}" y1="${r1(ry)}" x2="${r1(tx + typeW + 8)}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
-          const nx = tx + typeW + 12;
+          row += `<line x1="${r1(tx + typeW + 10.5)}" y1="${r1(ry)}" x2="${r1(tx + typeW + 10.5)}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
+          const nx = tx + typeW + 17;
           const lkSpan = r.lock?.kind ? `<tspan fill="${C.orange}"> [${esc(formatLockBadge(r.lock))}]</tspan>` : "";
           row += txt(nx, base, `<tspan fill="${C.text}">${esc(r.kind === "agg" ? label : r.name)}</tspan>${r.kind === "field" && r.suffix ? `<tspan fill="${C.number}">${esc(r.suffix)}</tspan>` : ""}${lkSpan}`, { family: "monospace", weight: r.kind === "agg" ? "bold" : "" });
         } else {
@@ -424,6 +433,15 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return s;
   };
 
+  /** Clamp row anchors to the visible rows area and record them for the edges (`fromField`). */
+  const setRowAnchors = (n, box, top, rowY, end) => {
+    const lo = top + 4;
+    const hi = (n.autoFit ? Math.min(box.h, end) : box.h) - 4;
+    const ys = new Map();
+    for (const [k, y] of rowY) ys.set(k, Math.min(Math.max(y, lo), Math.max(lo, hi)));
+    anchors.set(n.id, ys);
+  };
+
   const mailBody = (n, box, top) => {
     const model = content(n);
     if (!model) return txt(10, top + 16, esc(n.data.subject || n.data.mid || "Mail thread"), { fill: C.faint });
@@ -431,11 +449,21 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     let inner = "";
     let y = top + 4;
     const cols = (x) => Math.max(4, Math.floor((box.w - x - 10) / SANS_CH));
+    const lineColor = { "nm-ml-add": C.add, "nm-ml-del": C.del, "nm-ml-hunk": C.cyan, "nm-ml-file": C.text, "nm-ml-sig": C.faint };
+    const rowY = new Map();
     for (const r of model.rows) {
-      if (y > box.h) break;
       const gx = 8;
       const mid = y + MAIL_ROW_H / 2;
-      const rowEnd = y + MAIL_ROW_H + MAIL_META_H + (r.open ? Math.max(1, r.excerpt.length) * 14 + 4 : 0);
+      rowY.set(mailRowKey(r.mid), mid);
+      // a thread scrolls each whole message in a box of MAIL_BODY_BOX_H (nodemap.css), a single message grows
+      const bodyLines = r.full && r.loaded ? r.body.split("\n") : null;
+      const boxed = bodyLines && !(model.single && r.focus) ? bodyLines.slice(0, Math.floor(MAIL_BODY_BOX_H / 14)) : bodyLines;
+      const lines = !r.open ? [] : r.full ? (boxed || ["Loading…"]) : (r.excerpt.length ? r.excerpt : ["…"]);
+      const rowEnd = y + MAIL_ROW_H + MAIL_META_H + (r.open ? Math.max(1, lines.length) * 14 + 4 : 0);
+      if (y > box.h) {
+        y = rowEnd;
+        continue;
+      }
       r.guides.forEach((g, k) => {
         const x = gx + k * GUIDE_W + GUIDE_W / 2;
         if (g === "pipe" || g === "tee") inner += `<line x1="${x}" y1="${r1(y)}" x2="${x}" y2="${r1(rowEnd)}" stroke="${C.border}"/>`;
@@ -454,13 +482,20 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       const mx = gx + r.guides.length * GUIDE_W;
       inner += txt(mx, y + MAIL_ROW_H + 9, esc(fit(`${r.author}${r.date ? ` · ${r.date}` : ""}`, cols(mx))), { fill: C.faint, size: 10 });
       if (r.open) {
-        (r.excerpt.length ? r.excerpt : ["…"]).forEach((l, k) => {
-          inner += txt(mx + 6, y + MAIL_ROW_H + MAIL_META_H + 12 + k * 14, esc(fit(l, Math.floor((box.w - mx - 16) / MONO_CH))), { fill: C.muted, size: 10, family: "monospace" });
+        const state = { patch: false, sig: false };
+        const w = Math.floor((box.w - mx - 16) / MONO_CH);
+        lines.forEach((l, k) => {
+          const ly = y + MAIL_ROW_H + MAIL_META_H + 12 + k * 14;
+          const cls = r.full ? mailLineClass(l, state) : "";
+          if (ly > box.h + 14) return;
+          const fill = cls.startsWith("nm-ml-q") ? C.green : lineColor[cls] || C.muted;
+          inner += txt(mx + 6, ly, esc(fit(l, w)), { fill, size: 10, family: "monospace", italic: cls.startsWith("nm-ml-q") });
         });
       }
       y = rowEnd;
     }
     used = y + 4;
+    setRowAnchors(n, box, top, rowY, used);
     return rowsClip(box, top, inner);
   };
 
@@ -635,21 +670,26 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     let inner = "";
     let y = top + 6;
     const cols = Math.floor((box.w - 16) / MONO_CH);
+    const rowY = new Map();
+    inner += txt(8, y + 12, esc(fit(model.mode === "blame" ? `${model.path || "Blame"} · ${model.commits.length} commits` : `${model.name || model.path || "History"} · ${model.changeCount} changes`, cols)), { fill: C.muted, size: 10, weight: "bold" });
     if (model.mode === "blame") {
+      y += 20; // the path / count head line
       for (const c of model.commits) {
-        if (y > box.h) break;
-        inner += txt(8, y + 12, esc(fit(`${c.commitHash.slice(0, 8)} ${c.author}: ${c.subject}`, cols)), { fill: C.text, size: 10, family: "monospace" });
+        rowY.set(commitRowKey(c.commitHash), y + 8);
+        if (y <= box.h) inner += txt(8, y + 12, esc(fit(`${c.commitHash.slice(0, 8)} ${c.author}: ${c.subject}`, cols)), { fill: C.text, size: 10, family: "monospace" });
         y += 16;
       }
     } else {
+      y += 20;
       for (const r of model.rows) {
-        if (y > box.h) break;
+        rowY.set(releaseRowKey(r.vname), y + 8);
         const col = r.status === "modified" ? C.orange : r.status === "introduced" || r.status === "added" ? C.green : r.status === "removed" ? C.red : C.muted;
-        inner += txt(8, y + 12, esc(fit(`${r.vname} [${r.status}]${r.added || r.removed ? ` +${r.added} -${r.removed}` : ""}`, cols)), { fill: col, size: 10, family: "monospace" });
+        if (y <= box.h) inner += txt(8, y + 12, esc(fit(`${r.vname} [${r.status}]${r.added || r.removed ? ` +${r.added} -${r.removed}` : ""}`, cols)), { fill: col, size: 10, family: "monospace" });
         y += 16;
       }
     }
     used = y + 4;
+    setRowAnchors(n, box, top, rowY, used);
     return rowsClip(box, top, inner);
   };
 
@@ -745,7 +785,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       }
     }
     const bid = clip(0, top, box.w, box.h - top);
-    const fo = n.type === "tab" || n.type === "man" ? foreignOf(n) : null;
+    const fo = n.type === "tab" || n.type === "man" || n.type === "doc" ? foreignOf(n) : null;
     if (fo?.html) {
       const bh = Math.max(0, box.h - top);
       body = `<foreignObject x="0" y="${top}" width="${box.w}" height="${bh}"><div xmlns="http://www.w3.org/1999/xhtml" style="width:${box.w}px;height:${bh}px;overflow:hidden">${String(fo.html).replace(XML_ILLEGAL, "")}</div></foreignObject>`;
@@ -945,8 +985,9 @@ export function captureNodeForeignObject(node, el) {
     if (!body || typeof XMLSerializer === "undefined") return null;
     let root = null;
     let win = null;
-    if (node.type === "man") {
-      root = body.querySelector(".nm-man");
+    if (node.type === "man" || node.type === "doc") {
+      // the live page (a beautified doc node keeps the Kernel Docs layout and styles)
+      root = body.querySelector(node.type === "man" ? ".nm-man" : ".nm-doc");
       win = el.ownerDocument?.defaultView || globalThis;
     } else if (node.type === "tab") {
       const frame = body.querySelector("iframe");

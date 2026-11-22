@@ -226,6 +226,27 @@ const normalizeNodeLocks = (raw) => {
   return out;
 };
 
+/** Characters kept of one saved mail message body (`fullBody`, `pinnedBodies`). */
+export const MAIL_BODY_MAX = 200_000;
+/** Saved message bodies of one thread node: at most this many messages and twice `MAIL_BODY_MAX` characters. */
+export const MAIL_PIN_MAX = 12;
+
+function pinnedMailBodies(m) {
+  const out = {};
+  if (!isObj(m)) return out;
+  let total = 0;
+  let n = 0;
+  for (const [k, v] of Object.entries(m)) {
+    if (typeof v !== "string" || !k || k.length > 512 || n >= MAIL_PIN_MAX) continue;
+    const body = v.slice(0, MAIL_BODY_MAX);
+    if (total + body.length > MAIL_BODY_MAX * 2) continue;
+    out[k] = body;
+    total += body.length;
+    n += 1;
+  }
+  return out;
+}
+
 /** Type-specific payload, normalized. */
 export function normalizeData(type, raw, depth = 0) {
   const d = isObj(raw) ? raw : {};
@@ -300,16 +321,24 @@ export function normalizeData(type, raw, depth = 0) {
         commitHash: /^[0-9a-f]{4,64}$/i.test(String(d.commitHash || "")) ? String(d.commitHash).toLowerCase() : "",
       };
     }
-    case "mail":
+    case "mail": {
+      // One message of a thread on its own ("Expand Thread to Nodes", the ⊕ of a message)
+      const single = Boolean(d.single) && Boolean(str(d.mid, "", 512));
       return {
         tid: Number.isInteger(d.tid) && d.tid > 0 ? d.tid : null,
         mid: str(d.mid, "", 512).replace(/^<|>$/g, ""),
         subject: str(d.subject, "", 512),
         // Messages whose body excerpt shows (message id -> true)
         openMids: trueMap(d.openMids),
-        // One message of a thread on its own ("Expand Thread to Nodes", the ⊕ of a message)
-        single: Boolean(d.single) && Boolean(str(d.mid, "", 512)),
+        // Messages of a thread shown whole instead of their 10-line excerpt
+        fullMids: trueMap(d.fullMids),
+        // Whole messages saved with the canvas (message id -> body), capped per message and per node
+        pinnedBodies: single ? {} : pinnedMailBodies(d.pinnedBodies),
+        single,
+        // The whole body of a single-message node, saved once it loads (shown without a refetch)
+        fullBody: single ? str(d.fullBody, "", MAIL_BODY_MAX) : "",
       };
+    }
     case "kconfig":
       return {
         symbol: str(d.symbol, "", 256).replace(/^CONFIG_/, ""),
@@ -487,7 +516,7 @@ export function normalizeEdge(raw, nodeIds = null) {
     to,
     fromSide: pick(raw.fromSide, SIDES, "auto"),
     toSide: pick(raw.toSide, SIDES, "auto"),
-    fromField: str(raw.fromField, "", 256) || null,
+    fromField: str(raw.fromField, "", 600) || null,
     toField: str(raw.toField, "", 256) || null,
     label: str(raw.label, "", 512),
     arrow: pick(raw.arrow, ARROWS, "forward"),

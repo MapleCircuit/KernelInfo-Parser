@@ -5,6 +5,9 @@
  *
  * DOM-free (unit tested).
  */
+import { MAIL_BODY_MAX } from "./canvas_model.js";
+import { renderHtmlFragment } from "../docs/html_renderer.js";
+import { renderDocument, renderKernelDocEntry } from "../docs/rst_renderer.js";
 import { esc } from "./struct_view.js";
 import { VIRTUAL_THRESHOLD, renderVirtualDiffWindow } from "./virtual_source.js";
 
@@ -183,6 +186,23 @@ export function bodyExcerpt(body, max = 10) {
   return out;
 }
 
+/** Row anchor key of a message inside a mail node (`fromField` of the edges spawned from it). */
+export const mailRowKey = (mid) => `mail:${cleanMid(mid)}`;
+
+/** Row anchor key of a commit (blame) or release (symbol history) row of a history node. */
+export const commitRowKey = (sha) => `commit:${String(sha || "")}`;
+export const releaseRowKey = (vname) => `ver:${String(vname || "")}`;
+
+/** A whole message body for display: LF line ends, tabs as 4 spaces, trailing blank lines dropped, capped. */
+export function fullMailBody(body, max = MAIL_BODY_MAX) {
+  let t = String(body || "").replace(/\r\n?/g, "\n").replace(/\t/g, "    ").replace(/\s+$/, "");
+  if (t.length > max) {
+    const note = `\n… (message cut at ${max} characters)`;
+    t = `${t.slice(0, Math.max(0, max - note.length))}${note}`;
+  }
+  return t;
+}
+
 export function mailThreadModel(payload, data = {}, bodies = null) {
   const p = isObj(payload) ? payload : {};
   const raw = Array.isArray(p.messages) ? p.messages : (p.message_id || p.subject ? [p] : []);
@@ -228,12 +248,25 @@ export function mailThreadModel(payload, data = {}, bodies = null) {
   const rows = [];
   const focus = cleanMid(data.mid);
   const open = data.openMids || {};
+  const fullMids = data.fullMids || {};
+  const pinned = isObj(data.pinnedBodies) ? data.pinnedBodies : {};
+  const bodyOf = (mid) => {
+    if (typeof pinned[mid] === "string") return pinned[mid];
+    const live = bodies?.get?.(mid);
+    if (live !== undefined && live !== null) return String(live);
+    if (data.single && mid === focus && data.fullBody) return String(data.fullBody);
+    return mid === cleanMid(p.message_id) && typeof p.body === "string" ? p.body : null;
+  };
   const walk = (key, depth, trail) => {
     const list = children.get(key) || [];
     list.forEach((x, idx) => {
       const last = idx === list.length - 1;
       const guides = depth ? [...trail.map((more) => (more ? "pipe" : "blank")), last ? "end" : "tee"] : [];
       const m = x.m;
+      const isPinned = typeof pinned[x.mid] === "string";
+      const full = (Boolean(data.single) && x.mid === focus) || Boolean(fullMids[x.mid]);
+      const isOpen = Boolean(open[x.mid]) || full;
+      const text = isOpen ? bodyOf(x.mid) : null;
       rows.push({
         mid: x.mid,
         parent: parentOf.get(x.mid) || null,
@@ -248,14 +281,19 @@ export function mailThreadModel(payload, data = {}, bodies = null) {
         patchIdx: m.patch_idx ?? null,
         patchTotal: m.patch_total ?? null,
         focus: Boolean(focus) && x.mid === focus,
-        open: Boolean(open[x.mid]) || (Boolean(data.single) && x.mid === focus),
-        excerpt: open[x.mid] || (data.single && x.mid === focus) ? bodyExcerpt(bodies?.get?.(x.mid) ?? (x.mid === cleanMid(p.message_id) ? p.body : "")) : [],
+        open: isOpen,
+        // the whole message (quotes, patch and signature kept) or its 10-line excerpt
+        full,
+        pinned: isPinned,
+        loaded: text !== null,
+        body: full && text !== null ? fullMailBody(text) : "",
+        excerpt: isOpen && !full ? bodyExcerpt(text ?? "") : [],
       });
       walk(x.mid, Math.min(depth + 1, 24), depth ? [...trail, !last] : []);
     });
   };
   walk("", 0, []);
-  return { tid: p.tid || null, total: p.total || rows.length, truncated: Boolean(p.truncated), rows };
+  return { tid: p.tid || null, total: p.total || rows.length, truncated: Boolean(p.truncated), single: Boolean(data.single), rows };
 }
 
 export function mailBadges(r) {
@@ -267,16 +305,53 @@ export function mailBadges(r) {
   return out;
 }
 
+/** CSS class of one line of a full message (quote depth, patch lines, signature). */
+export function mailLineClass(line, state) {
+  if (state.sig) return "nm-ml-sig";
+  if (/^-- $/.test(line)) {
+    state.sig = true;
+    return "nm-ml-sig";
+  }
+  if (/^(diff --git |Index: |--- a\/|\+\+\+ b\/)/.test(line)) state.patch = true;
+  const q = /^((?:>\s?)+)/.exec(line);
+  if (q) return `nm-ml-q nm-ml-q${Math.min(3, (q[1].match(/>/g) || []).length)}`;
+  if (!state.patch) return "";
+  if (/^(diff --git |index |--- |\+\+\+ )/.test(line)) return "nm-ml-file";
+  if (line.startsWith("@@")) return "nm-ml-hunk";
+  if (line.startsWith("+")) return "nm-ml-add";
+  if (line.startsWith("-")) return "nm-ml-del";
+  return "";
+}
+
+/** Escaped HTML of a full message body, one span per line. */
+export function mailBodyHtml(text) {
+  const state = { patch: false, sig: false };
+  return String(text || "").split("\n").map((l) => {
+    const cls = mailLineClass(l, state);
+    return cls ? `<span class="${cls}">${esc(l)}</span>` : esc(l);
+  }).join("\n");
+}
+
 export function renderMailBody(model) {
   if (!model.rows.length) return '<div class="nm-empty">No messages</div>';
   let html = "";
   for (const r of model.rows) {
     const guides = r.guides.map((g) => `<span class="nm-mail-guide nm-g-${g}"></span>`).join("");
     const badges = mailBadges(r).map((b) => `<span class="nm-mail-badge">${esc(b)}</span>`).join("");
-    html += `<div class="nm-mail-row${r.focus ? " nm-mail-focus" : ""}" data-mid="${esc(r.mid)}">
-      <div class="nm-mail-line">${guides}<button type="button" class="nm-mail-toggle" data-act="mail-open" data-key="${esc(r.mid)}" title="${r.open ? "Hide the message text" : "Show the start of the message text"}">${r.open ? "▾" : "▸"}</button>${badges}<span class="nm-mail-subj" title="${esc(r.subject)}">${esc(r.subject)}</span><button type="button" class="nm-mail-spawn" data-act="mail-spawn" data-key="${esc(r.mid)}" title="Add this message as a node connected to its parent">⊕</button></div>
-      <div class="nm-mail-meta" style="--nm-mail-depth:${r.guides.length}">${esc(r.author)}${r.date ? ` · ${esc(r.date)}` : ""}</div>
-      ${r.open ? `<pre class="nm-mail-excerpt" style="--nm-mail-depth:${r.guides.length}">${r.excerpt.length ? esc(r.excerpt.join("\n")) : "Loading…"}</pre>` : ""}
+    const key = mailRowKey(r.mid);
+    const ports = rowPorts(key);
+    const depth = `style="--nm-mail-depth:${r.guides.length}"`;
+    const selfMsg = model.single && r.focus;
+    const acts = r.open && !selfMsg
+      ? `<div class="nm-mail-acts" ${depth}><button type="button" class="nm-mail-act" data-act="mail-full" data-key="${esc(r.mid)}" aria-pressed="${r.full}" title="${r.full ? "Back to the start of the message" : "Show the whole message"}">${r.full ? "⤡ Excerpt" : "⤢ Show full message"}</button><button type="button" class="nm-mail-act${r.pinned ? " on" : ""}" data-act="mail-pin" data-key="${esc(r.mid)}" aria-pressed="${r.pinned}" title="${r.pinned ? "Stop saving this message with the NodeMap" : "Save the whole message with the NodeMap (kept across reloads and in exports)"}">📌 ${r.pinned ? "Pinned" : "Pin"}</button></div>`
+      : "";
+    let text = "";
+    if (r.open && r.full) text = `<pre class="nm-mail-body${selfMsg ? " nm-mail-body-single" : ""}" ${depth}>${r.loaded ? mailBodyHtml(r.body) : "Loading…"}</pre>`;
+    else if (r.open) text = `<pre class="nm-mail-excerpt" ${depth}>${r.excerpt.length ? esc(r.excerpt.join("\n")) : r.loaded ? "(empty message)" : "Loading…"}</pre>`;
+    html += `<div class="nm-mail-row${r.focus ? " nm-mail-focus" : ""}" data-mid="${esc(r.mid)}" data-key="${esc(key)}">
+      <div class="nm-mail-line nm-anchor-line">${ports}${guides}<button type="button" class="nm-mail-toggle" data-act="mail-open" data-key="${esc(r.mid)}" title="${r.open ? "Hide the message text" : "Show the start of the message text"}">${r.open ? "▾" : "▸"}</button>${badges}<span class="nm-mail-subj" title="${esc(r.subject)}">${esc(r.subject)}</span><button type="button" class="nm-mail-spawn" data-act="mail-spawn" data-key="${esc(r.mid)}" title="Add this message as a node connected to its row">⊕</button></div>
+      <div class="nm-mail-meta" ${depth}>${esc(r.author)}${r.date ? ` · ${esc(r.date)}` : ""}</div>
+      ${acts}${text}
     </div>`;
   }
   if (model.truncated || model.total > model.rows.length) html += `<div class="nm-empty">${model.rows.length} of ${model.total} messages</div>`;
@@ -658,6 +733,11 @@ export function renderKapiBody(model) {
 
 // ------------------------------------------------------------------ Kernel Docs (.rst / kernel-doc)
 
+/** kernel-doc entries and document characters a doc node renders. */
+export const DOC_ENTRY_MAX = 120;
+export const DOC_SOURCE_MAX = 400_000;
+const DOC_HTML_CACHE = new WeakMap();
+
 function stripRstTags(html) {
   return String(html || "")
     .replace(/<[^>]+>/g, " ")
@@ -706,7 +786,7 @@ export function docModel(res, data = {}) {
       path,
       title: path ? path.split("/").pop() : "kernel-doc",
       total: Number(r.total) || r.entries.length,
-      entries: r.entries.filter(isObj).slice(0, 60).map((e) => ({
+      entries: r.entries.filter(isObj).slice(0, DOC_ENTRY_MAX).map((e) => ({
         kind: String(e.kind || "doc"),
         name: String(e.name || ""),
         brief: String(e.brief || ""),
@@ -717,8 +797,9 @@ export function docModel(res, data = {}) {
       })),
     };
   }
-  const content = String(r.content || "");
+  const content = String(r.content || "").slice(0, DOC_SOURCE_MAX);
   const title = String(r.title || (path ? path.split("/").pop() : "Kernel Docs"));
+  // `sections` is the plain outline the vector SVG export draws when the live page is not mounted
   const sections = content ? parseRstSections(content, r.toc || []) : (r.html ? [{ heading: title, level: 1, text: stripRstTags(r.html).slice(0, 1500) }] : []);
   return {
     mode: "rst",
@@ -727,30 +808,84 @@ export function docModel(res, data = {}) {
     total: sections.length,
     sections,
     toc: Array.isArray(r.toc) ? r.toc.slice(0, 40) : [],
+    html: renderedDocHtml(r, path, content),
   };
 }
 
+const DOC_DROP_BLOCK = /<(script|style|iframe|frame|object|embed|form|template|noscript|svg|math)\b[\s\S]*?<\/\1\s*>/gi;
+const DOC_DROP_TAG = /<\/?(script|style|iframe|frame|frameset|object|embed|link|meta|base|form|input|button|textarea|select|template|noscript|svg|math)\b[^>]*>/gi;
+// inline handlers, inline styles (no overlaying the canvas) and the NodeMap's own action attributes
+const DOC_DROP_ATTR = /([\s/"'])(?:on[a-z]+|style|formaction|srcdoc|data-act|data-insp|data-node-id)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
+const DOC_URL_ATTR = /([\s/"'])(href|src|xlink:href|action|poster|background)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+
+/** An attribute value as a browser reads its scheme: entities decoded, whitespace and controls dropped. */
+function urlScheme(value) {
+  const named = { tab: "\t", newline: "\n", colon: ":", lpar: "(", rpar: ")", sol: "/", amp: "&" };
+  return String(value)
+    .replace(/&#x([0-9a-f]+);?/gi, (_, h) => String.fromCodePoint(parseInt(h, 16) || 32))
+    .replace(/&#(\d+);?/g, (_, d) => String.fromCodePoint(Number(d) || 32))
+    .replace(/&([a-z]+);?/gi, (m, n) => named[n.toLowerCase()] ?? m)
+    .replace(/[\u0000- \u007f-\u009f]+/g, "")
+    .toLowerCase();
+}
+
+const unsafeUrl = (v) => {
+  const u = urlScheme(v);
+  return /^(javascript|vbscript|livescript):/.test(u) || (/^data:/.test(u) && !/^data:image\/(png|gif|jpe?g|webp)[;,]/.test(u));
+};
+
+/**
+ * Defense in depth on top of the renderers' own escaping and `html_renderer.js` sanitizing: a doc node
+ * shares the page with the canvas, so no script, frame, form, SVG / MathML island, style sheet, inline
+ * handler or style, NodeMap action attribute, or script / non-image `data:` URL (entities decoded first).
+ * Every pass repeats until nothing changes, so a removal never stitches a new attack together.
+ */
+export function scrubDocHtml(html) {
+  let out = String(html || "");
+  for (let guard = 0; guard < 16; guard++) {
+    const next = out
+      .replace(DOC_DROP_BLOCK, "")
+      .replace(DOC_DROP_TAG, "")
+      .replace(DOC_DROP_ATTR, "$1")
+      .replace(DOC_URL_ATTR, (m, lead, name, dq, sq, bare) => (unsafeUrl(dq ?? sq ?? bare ?? "") ? `${lead}${name}="#"` : m));
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+/** Rendered page HTML of a document payload (`views/docs/` renderers), memoized per payload object. */
+function renderedDocHtml(r, path, content) {
+  const hit = DOC_HTML_CACHE.get(r);
+  if (hit !== undefined && hit.path === path) return hit.html;
+  let html = "";
+  try {
+    if (content) html = renderDocument(content, path || "doc.rst").html;
+    else if (r.html) html = renderHtmlFragment(String(r.html), path);
+  } catch {
+    html = content ? `<pre class="plain-text">${esc(content)}</pre>` : "";
+  }
+  html = scrubDocHtml(html);
+  DOC_HTML_CACHE.set(r, { path, html });
+  return html;
+}
+
+/**
+ * Body of a doc node: the document rendered by the Kernel Docs renderers (`.rst`, Markdown, HTML,
+ * DocBook templates) or kernel-doc definition cards, inside a `.kdoc-body` so `docs.css` styles it.
+ * Links keep their Kernel Docs attributes (`data-doc`, `data-src`, `data-symbol`, `data-kconfig`) and the
+ * NodeMap turns them into connected nodes (`nodemap_gestures.js` `onDocLink`).
+ */
 export function renderDocBody(model) {
   if (!model) return '<div class="nm-empty">No documentation loaded</div>';
   if (model.mode === "kernel-doc") {
     if (!model.entries.length) return '<div class="nm-empty">No kernel-doc comments found</div>';
-    const html = model.entries.map((e) => {
-      const srcBtn = e.line && model.path ? `<button type="button" class="nm-doc-btn" data-act="doc-spawn-source" data-key="${esc(`${model.path}:${e.line}`)}" title="Open source at line ${esc(e.line)}">⊕ :${esc(e.line)}</button>` : "";
-      const params = e.params.slice(0, 8).map((p) => `<div class="nm-doc-param"><code>@${esc(p.name)}</code> <span>${esc(p.desc)}</span></div>`).join("");
-      const secs = e.sections.slice(0, 4).map((s) => `<div class="nm-doc-sec-txt"><b>${esc(s.title)}:</b> ${esc(s.body.slice(0, 240))}</div>`).join("");
-      return `<div class="nm-doc-entry">
-        <div class="nm-doc-entry-head"><span class="nm-doc-kind">${esc(e.kind)}</span><span class="nm-doc-name">${esc(e.name)}</span>${srcBtn}</div>
-        ${e.brief ? `<div class="nm-doc-brief">${esc(e.brief)}</div>` : ""}
-        ${e.signature ? `<pre class="nm-doc-sig">${esc(e.signature)}</pre>` : ""}
-        ${params}${secs}
-      </div>`;
-    }).join("");
-    return `<div class="nm-doc nm-scroll">${html}</div>`;
+    const html = model.entries.map((e) => renderKernelDocEntry(e, { path: model.path, srcPath: model.path })).join("");
+    const more = model.total > model.entries.length ? `<p class="nm-empty">${model.entries.length} of ${model.total} entries</p>` : "";
+    return `<div class="nm-doc nm-doc-rendered nm-scroll"><div class="kdoc-body nm-doc-page">${html}${more}</div></div>`;
   }
-  const html = model.sections.length
-    ? model.sections.map((s) => `<div class="nm-doc-section"><div class="nm-doc-h">${esc(s.heading)}</div>${s.text ? `<pre class="nm-doc-text">${esc(s.text)}</pre>` : ""}</div>`).join("")
-    : '<div class="nm-empty">Empty document</div>';
-  return `<div class="nm-doc nm-scroll"><div class="nm-doc-title">${esc(model.title)}</div>${html}</div>`;
+  if (!model.html) return '<div class="nm-doc nm-scroll"><div class="nm-empty">Empty document</div></div>';
+  return `<div class="nm-doc nm-doc-rendered nm-scroll"><div class="kdoc-body nm-doc-page">${model.html}</div></div>`;
 }
 
 // ------------------------------------------------------------------ Symbol History / File Blame
@@ -810,12 +945,15 @@ export function historyModel(res, data = {}) {
   };
 }
 
+/** Left / right row ports of an anchored row (`fromField` = `key`). */
+const rowPorts = (key) => `<span class="nm-port nm-port-field nm-port-left" data-field="${esc(key)}" data-side="left"></span><span class="nm-port nm-port-field nm-port-right" data-field="${esc(key)}" data-side="right"></span>`;
+
 export function renderHistoryBody(model) {
   if (!model) return '<div class="nm-empty">No history loaded</div>';
   if (model.mode === "blame") {
     const head = `<div class="nm-hist-head"><span>${esc(model.path || "Blame")}</span><span class="nm-hist-cnt">${model.commits.length} commits · ${model.totalLines} lines</span></div>`;
     if (!model.commits.length) return `<div class="nm-hist nm-scroll">${head}<div class="nm-empty">No blame lines</div></div>`;
-    const rows = model.commits.map((c) => `<div class="nm-hist-row">
+    const rows = model.commits.map((c) => `<div class="nm-hist-row" data-key="${esc(commitRowKey(c.commitHash))}">${rowPorts(commitRowKey(c.commitHash))}
       <code class="nm-hist-sha">${esc(c.commitHash.slice(0, 8))}</code>
       <span class="nm-hist-author">${esc(c.author)}</span>
       <span class="nm-hist-subj" title="${esc(c.subject)}">${esc(c.subject)}</span>
@@ -826,7 +964,7 @@ export function renderHistoryBody(model) {
   }
   const head = `<div class="nm-hist-head"><span>${esc(model.name || model.path || "History")}</span><span class="nm-hist-cnt">${model.changeCount} changes / ${model.totalVersions} releases</span></div>`;
   if (!model.rows.length) return `<div class="nm-hist nm-scroll">${head}<div class="nm-empty">No history stops found</div></div>`;
-  const rows = model.rows.map((r) => `<div class="nm-hist-row">
+  const rows = model.rows.map((r) => `<div class="nm-hist-row" data-key="${esc(releaseRowKey(r.vname))}">${rowPorts(releaseRowKey(r.vname))}
     <span class="nm-hist-ver">${esc(r.vname)}</span>
     <span class="nm-hist-st nm-hist-${esc(r.status)}">${esc(r.status)}</span>
     <span class="nm-hist-delta">${r.added || r.removed ? `+${esc(r.added)} −${esc(r.removed)}` : (r.lineS ? `L${esc(r.lineS)}` : "")}</span>

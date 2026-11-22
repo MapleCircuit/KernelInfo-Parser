@@ -594,7 +594,7 @@ test("SVG export: whole canvas, struct rows and bars, folds, hidden items, scale
   assert.doesNotMatch(svg, /var\(--|<foreignObject|<image/, "pure vector, literal colors");
   assert.match(svg, /<tspan fill="#123456">b<\/tspan>/, "table rows draw their members");
   assert.doesNotMatch(svg, />a<\/tspan>/, "a hidden member is left out in View Mode");
-  assert.match(svg, /▸ #if defined\(CONFIG_B\) · 1 member/, "a Kconfig-folded branch is a summary row");
+  assert.match(svg, />▸ <\/text><text[^>]*>#if defined\(CONFIG_B\) · 1 member/, "a Kconfig-folded branch is a summary row (chevron in the controls column)");
   assert.match(svg, /stroke-width="2"\/>/);
   assert.ok((svg.match(/stroke-opacity="0\.9"/g) || []).length > 3, "scope bars of the outer block");
   assert.match(svg, /stroke="#ff8800"/, "custom node color");
@@ -716,8 +716,8 @@ test("table style: a bordered #ifdef cell on every row when there are tracks", (
   assert.doesNotMatch(renderStructBody(NESTED, d), /nm-sf-ppcell/, "list style keeps the gutter bars");
   const node = M.createNode("struct", { id: "s", x: 0, y: 0, w: 600, h: 900, data: { name: "n", style: "table" } });
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { content: () => NESTED });
-  // The divider closes the cell: gutter (tracks × 6 + 6) + 10, down the whole row block
-  const x = structRows(NESTED, node.data).tracks * 6 + 6 + 10;
+  // The divider closes the cell like nodemap.css: 2px row border + cell (gutter + 4, border-box) - half its 1px border
+  const x = structRows(NESTED, node.data).tracks * 6 + 6 + 5.5;
   assert.match(svg, new RegExp(`<line x1="${x}" y1="[\\d.]+" x2="${x}" y2="[\\d.]+" stroke="var\\(--border-muted\\)"/>`));
 });
 
@@ -934,7 +934,7 @@ test("domain node payloads normalize; titles", () => {
   assert.equal(c.data.commitHash, "abcdef0123456789");
   assert.equal(M.createNode("diff", { data: { mode: "commit", commitHash: "zz" } }).data.commitHash, "");
   const m = M.createNode("mail", { data: { tid: 7, mid: "<a@b>", openMids: { x: true, y: false }, single: true } });
-  assert.deepEqual(m.data, { tid: 7, mid: "a@b", subject: "", openMids: { x: true }, single: true });
+  assert.deepEqual(m.data, { tid: 7, mid: "a@b", subject: "", openMids: { x: true }, fullMids: {}, pinnedBodies: {}, single: true, fullBody: "" });
   assert.equal(M.createNode("mail", { data: { tid: -1, single: true } }).data.single, false, "a single message needs its id");
   const k = M.createNode("kconfig", { data: { symbol: "CONFIG_SMP" } });
   assert.deepEqual(k.data, { symbol: "SMP", arch: "x86_64" });
@@ -1013,7 +1013,8 @@ test("mail nodes: the reply tree with connector guides, badges and excerpts; exp
   const cyc = D.mailThreadModel({ messages: [{ message_id: "a", references: "<b>" }, { message_id: "b", references: "<a>" }] });
   assert.equal(cyc.rows.length, 2, "a reference cycle hides no message");
   const one = D.mailThreadModel({ message_id: "<m@x>", subject: "Hi", body: "Body text" }, { mid: "m@x", single: true });
-  assert.deepEqual(one.rows[0].excerpt, ["Body text"], "a single message shows its body");
+  assert.equal(one.rows[0].body, "Body text", "a single message shows its whole body");
+  assert.ok(one.rows[0].full && one.rows[0].open);
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("mail", { id: "m", data: { tid: 5 } })] }, named, { content: () => model });
   assert.match(svg, /\[PATCH v2 1\/2\] one/);
   assert.match(svg, />1\/2<\/text>/, "patch badges");

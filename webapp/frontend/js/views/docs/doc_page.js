@@ -12,20 +12,11 @@ import { openDefinition } from "../../utils/definition_picker.js";
 import { handleManLinkClick } from "../man/man_links.js";
 import { hasFeature } from "../../utils/projects.js";
 import { docSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
-import { renderDocument, renderRstFragment, extractTitle, escapeHtml, highlightCode, slugify } from "./rst_renderer.js";
+import { renderDocument, renderKernelDocEntry, extractTitle, escapeHtml, slugify } from "./rst_renderer.js";
 
 const TITLE_FETCH_LIMIT = 80;
 const TITLE_FETCH_CONCURRENCY = 4;
 const KERNEL_DOC_CONCURRENCY = 3;
-
-/** kernel-doc inline markup → reStructuredText (Documentation/doc-guide/kernel-doc.rst "Highlights"). */
-function kernelDocToRst(text) {
-  return String(text || "")
-    .replace(/&(struct|union|enum|typedef)\s+([A-Za-z_]\w*)(->\w+|\.\w+)?/g, (_, kind, name, member) => `:c:type:\`${kind} ${name}${member || ""} <${name}>\``)
-    .replace(/(^|[^\w`&])&([A-Za-z_]\w*)\b(?!\()/g, "$1:c:type:`$2`")
-    .replace(/(^|[^\w`])%([A-Za-z_][\w]*)/g, "$1``$2``")
-    .replace(/(^|[^\w`@.])@([A-Za-z_][\w.]*)/g, "$1**$2**");
-}
 
 export class DocPage {
   /**
@@ -304,30 +295,7 @@ export class DocPage {
   }
 
   renderKernelDocEntry(e, srcPath, docOnly) {
-    const path = this.opts.path;
-    const body = (text) => renderRstFragment(kernelDocToRst(text), path);
-    if (e.kind === "doc") {
-      return docOnly ? body(e.sections[0]?.body || "") : `<p class="rubric">${escapeHtml(e.name)}</p>${body(e.sections[0]?.body || "")}`;
-    }
-    const id = `c.${e.name}`;
-    const isFunc = e.kind === "function" || e.kind === "macro";
-    const sigText = isFunc ? (e.signature || `${e.name}()`).replace(/\s+/g, " ").replace(/\s*;\s*$/, "") : `${e.kind} ${e.name}`;
-    const params = e.params.length
-      ? `<p class="rubric">${isFunc ? "Parameters" : "Members"}</p><dl class="simple">${e.params.map((p) => `<dt><code class="docutils literal notranslate">${escapeHtml(p.name)}</code></dt><dd>${body(p.desc)}</dd>`).join("")}</dl>`
-      : "";
-    const definition = !isFunc && e.signature
-      ? `<p class="rubric">Definition</p><div class="highlight-c notranslate"><pre class="literal-block">${highlightCode(e.signature, "c")}</pre></div>`
-      : "";
-    const sections = e.sections.map((sec) => `<p class="rubric">${escapeHtml(sec.title)}</p>${body(sec.body)}`).join("");
-    return `
-      <dl class="c ${escapeHtml(e.kind)}">
-        <dt class="sig sig-object c" id="${escapeHtml(id)}">
-          <code class="sig-name">${isFunc ? highlightCode(sigText, "c") : `<span class="hl-k">${escapeHtml(e.kind)}</span> ${escapeHtml(e.name)}`}</code>
-          <a class="kdoc-headerlink" href="#${escapeHtml(id)}" title="Link to this definition">¶</a>
-          <a class="kdoc-src-link" href="#" data-src="${escapeHtml(srcPath)}" data-line="${e.line}" title="Open ${escapeHtml(srcPath)}:${e.line}">[source]</a>
-        </dt>
-        <dd>${e.brief ? `<p>${body(e.brief).replace(/^<p>|<\/p>$/g, "")}</p>` : ""}${definition}${params}${sections}</dd>
-      </dl>`;
+    return renderKernelDocEntry(e, { path: this.opts.path, srcPath, docOnly });
   }
 
   bindKernelDocSources(el) {

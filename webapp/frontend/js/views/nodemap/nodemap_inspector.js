@@ -145,6 +145,8 @@ export function renderInspector(ctrl) {
       }
       const loaded = ctrl.content.get(ctrl.fetchKeyOf(n));
       const hidden = loaded?.status === "ok" ? structRows(loaded.value, d, { editMode: true }).hidden : Object.keys(d.hiddenItems || {}).length;
+      const types = ctrl.expandableTypesOf ? ctrl.expandableTypesOf(n.id) : [];
+      if (types.length) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="struct-expand-types" title="${escapeHtml(`Add or connect a node for every non-standard type the visible members use: ${types.slice(0, 12).map((t) => `${t.ref.kind} ${t.ref.name}`).join(", ")}${types.length > 12 ? ", …" : ""}`)}">⇶ Expand Types (${types.length})</button></div>`;
       if (hidden) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="show-hidden" title="Restore every hidden member, aggregate, #ifdef block and the outer conditions">Show all hidden (${hidden})</button></div>`;
       const layout = ctrl.content.get(ctrl.fetchKeyOf(n))?.value;
       if (layout) html += `<div class="inspector-field"><span class="inspector-label">Definition</span><span class="inspector-val">${escapeHtml(`${layout.file_path}:${layout.line_s}-${layout.line_e}`)} · span from ${layout.span_source === "db" ? "the index" : "the source text"}; guards read from the source</span></div>`;
@@ -178,6 +180,14 @@ export function renderInspector(ctrl) {
     } else if (n.type === "mail") {
       html += `<div class="nm-insp-pair">${row("Thread id", input("d-tid", d.tid || "", 'type="number" min="1"'))}${row("Message-ID", input("d-mid", d.mid, 'spellcheck="false"'))}</div>`;
       if (!d.single) html += '<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="mail-expand" title="One node per message, connected by reply edges as the thread replies">⇶ Expand Thread to Nodes</button></div>';
+      if (d.single) {
+        html += `<div class="inspector-field"><span class="inspector-label">Message</span><span class="inspector-val">${d.fullBody ? `whole message saved with the NodeMap (${d.fullBody.length.toLocaleString()} characters)` : "shown whole once it loads"}</span></div>`;
+      } else {
+        const open = Object.keys(d.openMids || {});
+        const pins = Object.keys(d.pinnedBodies || {});
+        const allFull = open.length > 0 && open.every((m) => d.fullMids?.[m]);
+        html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="mail-full-open" aria-pressed="${allFull}" ${open.length ? "" : "disabled"} title="Show every open message whole instead of its 10-line excerpt">${allFull ? "⤡ Excerpts" : "⤢ Full messages"}${open.length ? ` (${open.length} open)` : ""}</button>${pins.length ? `<button type="button" class="nodemap-btn" data-insp="mail-unpin-all" title="Stop saving the pinned messages with the NodeMap">📌 Unpin all (${pins.length})</button>` : ""}</div>`;
+      }
     } else if (n.type === "kconfig") {
       html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false" data-ac="kconfig"'))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
       const values = ctrl.kconfigValuesFor(n);
@@ -527,6 +537,18 @@ export function onInspectorClick(ctrl, e) {
   } else if (k === "copy-session" && node) ctrl.copyNodeToSession(node.id, ctrl.copyTarget);
   else if (k === "mail-expand" && node) ctrl.expandThreadToNodes(node.id);
   else if (k === "kc-expand" && node) ctrl.expandKconfigRelations(node.id);
+  else if (k === "struct-expand-types" && node) ctrl.expandStructTypes(node.id);
+  else if (k === "mail-full-open" && node?.type === "mail") {
+    const d = node.data;
+    const open = Object.keys(d.openMids || {});
+    const allFull = open.every((m) => d.fullMids?.[m]);
+    d.fullMids = allFull ? {} : Object.fromEntries(open.map((m) => [m, true]));
+    if (node.autoFit) ctrl.fitQueue.add(node.id);
+    ctrl.commit();
+  } else if (k === "mail-unpin-all" && node?.type === "mail") {
+    node.data.pinnedBodies = {};
+    ctrl.commit();
+  }
   else if (k === "cg-callers" && node) ctrl.expandCallgraph(node.id, "callers");
   else if (k === "cg-callees" && node) ctrl.expandCallgraph(node.id, "callees");
   else if (k === "cg-path" && node) ctrl.promptCallPath(node.id);

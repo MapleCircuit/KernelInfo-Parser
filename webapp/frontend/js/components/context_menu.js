@@ -1259,6 +1259,8 @@ class ContextMenu {
       }
       if (node.type === "mail" && !d.single) items.push({ label: "Expand Thread to Nodes", icon: "⇶", onClick: () => controller.expandThreadToNodes(node.id) });
       if (node.type === "kconfig") items.push({ label: "Expand Relations", icon: "⇶", onClick: () => controller.expandKconfigRelations(node.id) });
+      const typeCount = node.type === "struct" ? controller.expandableTypesOf?.(node.id)?.length || 0 : 0;
+      if (typeCount) items.push({ label: `Expand Types (${typeCount})`, icon: "⇶", onClick: () => controller.expandStructTypes(node.id) });
       if (node.type === "group") {
         items.push({
           label: d.subCanvas ? "Enter Sub-Map Portal" : "Convert Group to Sub-Map Portal",

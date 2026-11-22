@@ -23,7 +23,7 @@ import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.j
 import { mountManDocument } from "../man/man_view.js";
 import * as M from "./canvas_model.js";
 import {
-  cveModel, diffPayload, diffRows, docModel, historyModel, kapiModel, kconfigModel, kconfigValue,
+  cveModel, diffPayload, diffRows, docModel, fullMailBody, historyModel, kapiModel, kconfigModel, kconfigValue,
   mailThreadModel, maintainerModel,
   renderCveBody, renderDiffBody, renderDocBody, renderHistoryBody, renderKapiBody, renderKconfigBody,
   renderMailBody, renderMaintainerBody,
@@ -41,7 +41,7 @@ import {
 import { canvasToSvg, captureNodeForeignObject } from "./nodemap_export.js";
 import {
   attachCanvasEvents, beginEdgeLabelEdit, beginNoteEdit, beginTitleEdit, clearAlignmentGuides,
-  clearTextSelection, expandCallPath, expandCallgraph, expandKconfigRelations, expandThreadToNodes,
+  clearTextSelection, expandCallPath, expandCallgraph, expandKconfigRelations, expandStructTypes, expandThreadToNodes, expandableTypesOf,
   finishWire, followStructType, followableTypeFor, inlineInput, mailNodeOf, onClick, onContextMenu,
   onDblClick, onKeyDown, onPointerDown, onPointerMove, onPointerUp, onStructAction, onWheel,
   selectEdge, selectOnly, setTitle, spawnFromCveDiff, spawnLinkedNode, spawnMailMessages,
@@ -66,6 +66,12 @@ export { EMBED_TAB_TYPES };
 const PASTE_STEP = 24;
 const UNDO_LIMIT = 80;
 const cssEsc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+/** Rows an edge end can anchor to (`fromField` / `toField`): struct members, mail messages, history rows. */
+const ANCHOR_ROWS = [".nm-sf", ".nm-mail-row", ".nm-hist-row"];
+export const ANCHOR_ROW_SEL = ANCHOR_ROWS.map((c) => `${c}[data-key]`).join(", ");
+const anchorRowSel = (key) => ANCHOR_ROWS.map((c) => `${c}[data-key="${cssEsc(key)}"]`).join(", ");
+/** The rectangle a row anchors at: its header line when it has one (an open mail message), else the row. */
+const anchorRectOf = (row) => (row.querySelector?.(".nm-anchor-line") || row).getBoundingClientRect?.();
 
 export class NodeMapController {
   constructor() {
@@ -924,6 +930,12 @@ export class NodeMapController {
         }
         const sc = body.querySelector(".nm-scroll");
         if (sc && !sc.classList?.contains?.("nm-virtual")) sc.scrollTop = prevScroll;
+        // mail messages and history rows anchor edges like struct members
+        if (node.type === "mail" || node.type === "history") {
+          const nodeEl = this.renderer?.element?.(node.id);
+          if (!node.autoFit && !nodeEl?.classList?.contains?.("nm-culled")) this.refreshPortOffsets(node.id);
+          else this.portOffsets.delete(node.id);
+        }
       }
     } else if (node.type === "symbol") {
       const list = node.data.constituents || [];
@@ -979,7 +991,19 @@ export class NodeMapController {
     const client = this.api || api;
     const oldKey = this.fetchKeyOf(node);
     const res = d.single ? await client.getMailMessage(d.mid) : await client.getMailThread(d.tid || 0, d.mid || "");
-    if (d.single && res?.body && d.mid) this.mailBodies.set(d.mid, String(res.body));
+    if (d.single && res?.body && d.mid) {
+      this.mailBodies.set(d.mid, String(res.body));
+      // the whole message is saved with the canvas: it shows (and exports) before a refetch
+      const full = M.normalizeData("mail", { ...d, fullBody: fullMailBody(res.body) }).fullBody;
+      const mid = d.mid;
+      if (full !== d.fullBody) {
+        setTimeout(() => {
+          if (node.data.mid !== mid || !node.data.single || node.data.fullBody === full) return;
+          node.data.fullBody = full;
+          if (this.containerEl?.isConnected) this.commit({ absorb: true });
+        }, 0);
+      }
+    }
     if (res && res.available === false) throw new Error(res.error || "Not in the mailing-list archive");
     const tid = res?.tid || res?.messages?.[0]?.tid || null;
     const subject = res?.subject || res?.messages?.[0]?.subject || "";
@@ -1137,6 +1161,7 @@ export class NodeMapController {
     if (node.type === "symbol") s += b("expand", node.data.expanded ? "−" : "+", node.data.expanded ? "Collapse members" : "Expand members");
     if (node.type === "mail") s += b("mail-expand", "⇶", "Expand Thread to Nodes: one connected node per message");
     if (node.type === "kconfig") s += b("kc-expand", "⇶", "Expand Relations: add or connect every related symbol");
+    if (node.type === "struct") s += b("expand-types", "⇶", "Expand Types: add or connect every non-standard type the members use");
     if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) s += b("refresh", "⟳", "Load again");
     if (M.TAB_OPENABLE_TYPES.includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
     return s;
@@ -1388,10 +1413,10 @@ export class NodeMapController {
     const rows = sc?.getBoundingClientRect?.() || nr;
     const rowsBottom = rows.bottom ?? ((rows.top || 0) + (rows.height || 0));
     const map = new Map();
-    for (const row of el.querySelectorAll(".nm-sf[data-key]")) {
+    for (const row of el.querySelectorAll(ANCHOR_ROW_SEL)) {
       const key = row.dataset?.key;
       if (!key) continue;
-      const rr = row.getBoundingClientRect?.();
+      const rr = anchorRectOf(row);
       if (!rr) continue;
       const cy = Math.min(Math.max(rr.top + rr.height / 2, rows.top + 4), rowsBottom - 4);
       map.set(key, (cy - nr.top) / z);
@@ -1403,11 +1428,13 @@ export class NodeMapController {
     const cached = this.portOffsets.get(node.id)?.get(key);
     if (cached !== undefined) return { x: side === "left" ? node.x : node.x + node.w, y: node.y + cached };
     const el = this.renderer?.element(node.id);
-    const row = el?.querySelector(`.nm-sf[data-key="${cssEsc(key)}"]`);
+    const row = el?.querySelector(anchorRowSel(key));
     if (!row) return null;
     const z = this.zoom || 1;
     const nr = el.getBoundingClientRect();
-    const rr = row.getBoundingClientRect();
+    // a culled or not yet laid out node has no geometry to anchor to: measure it again once it shows
+    if (!nr?.height || el.classList?.contains?.("nm-culled")) return null;
+    const rr = anchorRectOf(row);
     const rows = row.closest(".nm-scroll")?.getBoundingClientRect() || nr;
     const rowsBottom = rows.bottom ?? ((rows.top || 0) + (rows.height || 0));
     const cy = Math.min(Math.max(rr.top + rr.height / 2, rows.top + 4), rowsBottom - 4);
@@ -1598,7 +1625,7 @@ export class NodeMapController {
   onClick(e) { return onClick(this, e); }
   _spawnLinkedNode(from, spec, label = "") { return spawnLinkedNode(this, from, spec, label); }
   _spawnFromCveDiff(node, key) { return spawnFromCveDiff(this, node, key); }
-  toggleMailMessage(id, mid) { return toggleMailMessage(this, id, mid); }
+  toggleMailMessage(id, mid, mode = "open") { return toggleMailMessage(this, id, mid, mode); }
   mailNodeOf(mid) { return mailNodeOf(this, mid); }
   spawnMailMessages(id, mids, opts) { return spawnMailMessages(this, id, mids, opts); }
   expandThreadToNodes(id) { return expandThreadToNodes(this, id); }
@@ -1612,6 +1639,8 @@ export class NodeMapController {
   beginEdgeLabelEdit(id) { return beginEdgeLabelEdit(this, id); }
   followableTypeFor(nodeId, fieldKey) { return followableTypeFor(this, nodeId, fieldKey); }
   followStructType(nodeId, fieldKey) { return followStructType(this, nodeId, fieldKey); }
+  expandableTypesOf(id) { return expandableTypesOf(this, id); }
+  expandStructTypes(id) { return expandStructTypes(this, id); }
   expandCallgraph(id, direction = "both") { return expandCallgraph(this, id, direction); }
   expandCallPath(fromId, targetFn, opts) { return expandCallPath(this, fromId, targetFn, opts); }
 

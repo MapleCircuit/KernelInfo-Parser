@@ -1020,6 +1020,46 @@ export function renderRstFragment(source, path) {
   return new RstRenderer(source, { path, plainText: false }).render().html;
 }
 
+/** kernel-doc inline markup → reStructuredText (Documentation/doc-guide/kernel-doc.rst "Highlights"). */
+export function kernelDocToRst(text) {
+  return String(text || "")
+    .replace(/&(struct|union|enum|typedef)\s+([A-Za-z_]\w*)(->\w+|\.\w+)?/g, (_, kind, name, member) => `:c:type:\`${kind} ${name}${member || ""} <${name}>\``)
+    .replace(/(^|[^\w`&])&([A-Za-z_]\w*)\b(?!\()/g, "$1:c:type:`$2`")
+    .replace(/(^|[^\w`])%([A-Za-z_][\w]*)/g, "$1``$2``")
+    .replace(/(^|[^\w`@.])@([A-Za-z_][\w.]*)/g, "$1**$2**");
+}
+
+/**
+ * HTML of one kernel-doc entry (`GET /api/docs/.../kernel-doc` `entries[]`): a `dl.c` definition card with a
+ * syntax-highlighted signature, parameters / members and sections, rendered as reStructuredText.
+ * `opts.path` is the document the entry renders in, `opts.srcPath` the source file it was read from.
+ */
+export function renderKernelDocEntry(e, { path = "", srcPath = "", docOnly = false } = {}) {
+  const body = (text) => renderRstFragment(kernelDocToRst(text), path);
+  if (e.kind === "doc") {
+    return docOnly ? body(e.sections[0]?.body || "") : `<p class="rubric">${escapeHtml(e.name)}</p>${body(e.sections[0]?.body || "")}`;
+  }
+  const id = `c.${e.name}`;
+  const isFunc = e.kind === "function" || e.kind === "macro";
+  const sigText = isFunc ? (e.signature || `${e.name}()`).replace(/\s+/g, " ").replace(/\s*;\s*$/, "") : `${e.kind} ${e.name}`;
+  const params = e.params.length
+    ? `<p class="rubric">${isFunc ? "Parameters" : "Members"}</p><dl class="simple">${e.params.map((p) => `<dt><code class="docutils literal notranslate">${escapeHtml(p.name)}</code></dt><dd>${body(p.desc)}</dd>`).join("")}</dl>`
+    : "";
+  const definition = !isFunc && e.signature
+    ? `<p class="rubric">Definition</p><div class="highlight-c notranslate"><pre class="literal-block">${highlightCode(e.signature, "c")}</pre></div>`
+    : "";
+  const sections = e.sections.map((sec) => `<p class="rubric">${escapeHtml(sec.title)}</p>${body(sec.body)}`).join("");
+  return `
+    <dl class="c ${escapeHtml(e.kind)}">
+      <dt class="sig sig-object c" id="${escapeHtml(id)}">
+        <code class="sig-name">${isFunc ? highlightCode(sigText, "c") : `<span class="hl-k">${escapeHtml(e.kind)}</span> ${escapeHtml(e.name)}`}</code>
+        <a class="kdoc-headerlink" href="#${escapeHtml(id)}" title="Link to this definition">¶</a>
+        <a class="kdoc-src-link" href="#" data-src="${escapeHtml(srcPath)}" data-line="${e.line}" title="Open ${escapeHtml(srcPath)}:${e.line}">[source]</a>
+      </dt>
+      <dd>${e.brief ? `<p>${body(e.brief).replace(/^<p>|<\/p>$/g, "")}</p>` : ""}${definition}${params}${sections}</dd>
+    </dl>`;
+}
+
 /** Export the slug function so cross-document anchors match generated heading ids. */
 export { slugify, isMarkdownPath, renderMarkdownDocument, isTmplPath, renderTmplDocument, isHtmlPath, renderHtmlDocument };
 

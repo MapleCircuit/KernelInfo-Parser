@@ -67,6 +67,210 @@ export function extractReferencedStruct(typeStr) {
   };
 }
 
+// ------------------------------------------------------------------ non-standard C types ("Expand Types")
+
+/**
+ * Names that never become a type node: C keywords, qualifiers and storage classes, the standard C
+ * primitives, and the fixed-width / address-sized scalar typedefs of libc and the kernel (`u8`..`u64`,
+ * `__le32`, `size_t`, `dma_addr_t`, ...). Everything else in type position is a non-standard type.
+ */
+const QUALIFIERS = new Set([
+  // keywords, qualifiers, storage classes
+  "const", "volatile", "restrict", "__restrict", "__restrict__", "static", "extern", "inline", "__inline", "__inline__",
+  "register", "auto", "typedef", "_Atomic", "_Noreturn", "_Thread_local", "__extension__",
+  // sparse / section annotations that sit in member types
+  "__user", "__kernel", "__iomem", "__percpu", "__rcu", "__force", "__bitwise", "__private", "__must_check",
+  "__read_mostly", "__packed", "__randomize_layout", "__nocast", "__safe", "__data_racy",
+]);
+
+const SCALARS = new Set([
+  // standard C primitives
+  "void", "char", "short", "int", "long", "float", "double", "bool", "_Bool", "_Complex", "__int128",
+  "signed", "__signed__", "unsigned",
+  // libc / C99 scalar typedefs
+  "size_t", "ssize_t", "ptrdiff_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t", "wchar_t", "off_t", "loff_t",
+  "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+  "u_int8_t", "u_int16_t", "u_int32_t", "u_int64_t", "u_char", "u_short", "u_int", "u_long", "uint", "ulong", "ushort", "uchar",
+  // kernel fixed-width and endian scalars
+  "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "u128", "s128",
+  "__u8", "__u16", "__u32", "__u64", "__s8", "__s16", "__s32", "__s64", "__u128", "__s128",
+  "__le16", "__le32", "__le64", "__be16", "__be32", "__be64", "__sum16", "__wsum",
+  // POSIX / kernel scalar ids, sizes and times
+  "pid_t", "uid_t", "gid_t", "dev_t", "ino_t", "mode_t", "umode_t", "nlink_t", "time_t", "clock_t", "key_t",
+  "timer_t", "clockid_t", "fmode_t", "sector_t", "blkcnt_t", "ktime_t", "__kernel_pid_t", "__kernel_uid_t",
+  "__kernel_gid_t", "__kernel_time_t", "__kernel_off_t", "__kernel_loff_t",
+  // kernel address-sized scalars
+  "phys_addr_t", "dma_addr_t", "resource_size_t", "__kernel_size_t", "__kernel_ssize_t",
+]);
+
+/**
+ * Names that never become a type node: C keywords, qualifiers, storage classes and sparse
+ * annotations (skipped), plus the standard C primitives and the fixed-width / address-sized scalar
+ * typedefs of libc and the kernel (`u8`..`u64`, `__le32`, `size_t`, `dma_addr_t`, ...), which make a
+ * member scalar. Every other identifier in type position is a non-standard type.
+ */
+export const STANDARD_C_TYPES = new Set([...QUALIFIERS, ...SCALARS]);
+
+const TAG_KINDS = new Set(["struct", "union", "enum"]);
+
+const CALL_ANNOTATION = /\b(?:__attribute__|__aligned|__section|typeof|__typeof|__typeof__|__cacheline_aligned\w*|____cacheline_aligned\w*|__counted_by\w*|__guarded_by|__pt_guarded_by)\s*\(/g;
+
+/** `type` stripped of comments and of call-like annotations with their balanced argument list (`__attribute__((...))`, `typeof(x)`). */
+function cleanTypeText(type) {
+  const s = String(type || "").replace(/\/\*.*?\*\/|\/\/.*$/g, " ");
+  let out = "";
+  let at = 0;
+  CALL_ANNOTATION.lastIndex = 0;
+  for (let m = CALL_ANNOTATION.exec(s); m; m = CALL_ANNOTATION.exec(s)) {
+    let depth = 0;
+    let end = s.length;
+    for (let i = m.index + m[0].length - 1; i < s.length; i++) {
+      if (s[i] === "(") depth += 1;
+      else if (s[i] === ")" && --depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+    out += `${s.slice(at, m.index)} `;
+    at = end;
+    CALL_ANNOTATION.lastIndex = end;
+  }
+  return out + s.slice(at);
+}
+
+/** The first type specifier of one declaration segment (`const struct file *filp` -> struct file). */
+function segmentRef(seg, label) {
+  const toks = String(seg).match(/[A-Za-z_]\w*|\*/g) || [];
+  const isPointer = toks.includes("*");
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === "*") continue;
+    if (TAG_KINDS.has(t)) {
+      const name = toks[i + 1];
+      if (!name || name === "*" || TAG_KINDS.has(name) || STANDARD_C_TYPES.has(name)) return null;
+      return { kind: t, name, isPointer, edgeLabel: label || (isPointer ? "points to" : t === "enum" ? "type" : "embeds") };
+    }
+    if (QUALIFIERS.has(t)) continue;
+    // bare compiler / section annotations (`____cacheline_aligned_in_smp`, `__randomize_layout`)
+    if (/^_{2,}[a-z]\w*$/.test(t) && !SCALARS.has(t) && !/_t$/.test(t)) continue;
+    // a scalar specifier decides the segment (`unsigned long flags`, `u32 len`)
+    if (SCALARS.has(t)) return null;
+    // macros and constants (`DECLARE_BITMAP`, `NR_CPUS`) are not types
+    if (/^[A-Z0-9_]+$/.test(t)) return null;
+    return { kind: "typedef", name: t, isPointer, edgeLabel: label || (isPointer ? "points to" : "type") };
+  }
+  return null;
+}
+
+/** Split `s` at top-level commas. */
+function splitTop(s) {
+  const out = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of s) {
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth -= 1;
+    if (ch === "," && depth === 0) {
+      out.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Every non-standard C type a member type string references, deduplicated in order:
+ * `struct` / `union` / `enum` tags and kernel or custom typedefs (`spinlock_t`, `atomic_t`, `gfp_t`).
+ * A function pointer (`int (*)(struct inode *, struct file *)`) yields its return and parameter types
+ * (edge label `type`); parameter names never count. Standard primitives and scalar typedefs
+ * (`STANDARD_C_TYPES`) are left out. Each entry: `{ kind, name, isPointer, edgeLabel }` with
+ * `kind` in `struct` | `union` | `enum` | `typedef`.
+ */
+export function extractTypeRefs(typeStr) {
+  const s = cleanTypeText(typeStr).trim();
+  if (!s) return [];
+  const fp = /\(\s*\*/.exec(s);
+  const refs = [];
+  if (fp) {
+    refs.push(segmentRef(s.slice(0, fp.index), "type"));
+    // the parameter list is the parenthesized group right after the `(*name)` declarator
+    const close = s.indexOf(")", fp.index);
+    const open = close >= 0 ? s.indexOf("(", close) : -1;
+    if (open >= 0) {
+      let depth = 0;
+      let end = -1;
+      for (let i = open; i < s.length; i++) {
+        if (s[i] === "(") depth += 1;
+        else if (s[i] === ")" && --depth === 0) {
+          end = i;
+          break;
+        }
+      }
+      for (const p of splitTop(s.slice(open + 1, end < 0 ? s.length : end))) refs.push(segmentRef(p, "type"));
+    }
+  } else refs.push(segmentRef(s, ""));
+  const seen = new Set();
+  return refs.filter((r) => {
+    if (!r) return false;
+    const k = `${r.kind} ${r.name}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/** The first non-standard type a member type references (`extractTypeRefs`), or null. */
+export function extractNonStandardType(typeStr) {
+  return extractTypeRefs(typeStr)[0] || null;
+}
+
+/** Type string of a layout item (aggregates carry their tag apart from the type name). */
+const itemTypeText = (it) => (it.kind === "aggregate" ? (it.type_name ? `${it.tag} ${String(it.type_name).replace(/^(struct|union)\s+/, "")}` : "") : it.type || "");
+
+/** The referenced type of member `key` of a struct node: `layout` items or `pahole` rows (`po:` keys). */
+export function typeRefOfField(layout, key, pahole = null) {
+  if (!key) return null;
+  if (String(key).startsWith("po:")) {
+    const row = pahole ? paholeRows(pahole, { showTypes: true }).rows.find((r) => r.key === key) : null;
+    return row ? extractNonStandardType(row.type) : null;
+  }
+  const item = layout ? findItem(layout.items, key) : null;
+  return item ? extractNonStandardType(itemTypeText(item)) : null;
+}
+
+/**
+ * The unique non-standard types referenced by the visible members of a struct node (`structRows`
+ * under `data` and `opts`, or the pahole rows in `layout` style): `[{ key, ref }]`, `key` being the
+ * first member that references `ref` (the field the edge anchors to). The struct itself is left out.
+ */
+export function collectExpandableTypes(layout, data, opts = {}) {
+  const out = [];
+  const seen = new Set([`${data?.kind || "struct"} ${data?.name || ""}`]);
+  const add = (key, refs) => {
+    for (const ref of refs) {
+      const k = `${ref.kind} ${ref.name}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ key, ref });
+    }
+  };
+  if (data?.style === "layout") {
+    const pahole = opts.pahole || layout?.pahole || null;
+    if (!pahole || pahole.unavailable) return out;
+    for (const r of paholeRows(pahole, { ...data, showTypes: true }).rows) if (r.kind === "field") add(r.key, extractTypeRefs(r.type));
+    return out;
+  }
+  if (!layout) return out;
+  const model = structRows(layout, { ...data, showTypes: true, typeOverrides: {} }, { ...opts, editMode: false, model: undefined });
+  for (const r of model.rows) {
+    if (r.kind !== "field" && r.kind !== "agg") continue;
+    const item = findItem(layout.items, r.key);
+    if (item) add(r.key, extractTypeRefs(itemTypeText(item)));
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ #if blocks and Kconfig truth
 
 /** Tri-state of a condition (the values `DirectiveEvaluator` uses). */
@@ -210,13 +414,13 @@ export function structRows(layout, data, opts = {}) {
     if (it.kind === "aggregate") {
       const folded = Boolean(data.collapsed?.[key]);
       const typeText = showType && it.type_name ? it.type_name.replace(/^(struct|union)\s+/, "") : "";
-      const refType = it.type_name ? extractReferencedStruct(`${it.tag} ${it.type_name}`) : null;
+      const refType = extractNonStandardType(itemTypeText(it));
       noteType(`${it.tag} ${typeText}`, depth);
       rows.push({ ...base, kind: "agg", tag: it.tag, typeText, label: it.type_name || `${it.tag} {…}`, name: it.name || "(anonymous)", folded, count: flattenMembers(it.children).length, refType });
       if (!folded) walk(it.children || [], depth + 1, level, eff, dim);
     } else {
       if (showType) noteType(it.type, depth);
-      const refType = extractReferencedStruct(it.type);
+      const refType = extractNonStandardType(it.type);
       rows.push({ ...base, kind: "field", type: showType ? it.type || "" : "", name: it.name, suffix: `${it.array || ""}${it.bits != null ? ` : ${it.bits}` : ""}`, refType });
     }
   };
@@ -295,7 +499,7 @@ export function paholeRows(pahole, data = {}) {
       type,
       name: String(m.name || "(anon)"),
       estimated: Boolean(m.estimated),
-      refType: extractReferencedStruct(m.type),
+      refType: extractNonStandardType(m.type),
       lock: findFieldLock(data, key, m.name),
     });
   }
@@ -450,11 +654,13 @@ export function renderStructBody(layout, data, opts = {}) {
     ? `<button type="button" class="nm-chip${data.showTypes ? " on" : ""}" data-act="all-types" aria-pressed="${data.showTypes}" title="Show or hide every member type">Types</button>
       <button type="button" class="nm-chip${data.showGuards ? " on" : ""}" data-act="guards" aria-pressed="${data.showGuards}" ${directives ? "" : "disabled"} title="${directives ? `Show or hide the ${directives} preprocessor lines` : "No preprocessor lines inside this definition"}">#ifdef${directives ? ` ${directives}` : ""}</button>`
     : "";
+  const typeCount = editMode ? collectExpandableTypes(layout, data, opts).length : 0;
+  const expandChip = typeCount ? `<button type="button" class="nm-chip" data-act="expand-types" title="Add or connect a node for each of the ${typeCount} non-standard types the visible members use">⇶ Types ${typeCount}</button>` : "";
   const hiddenNote = editMode && model.hidden ? `<span class="nm-chip nm-chip-note" title="Hidden items show dimmed in Edit Mode">${model.hidden} hidden</span>` : "";
   const cell = table && model.tracks > 0;
   const rowsHtml = model.rows.map((r) => rowHtml(r, data, editMode, table, cell)).join("");
   const vars = `--nm-pp-tracks:${model.tracks};--nm-gutter:${model.tracks ? model.tracks * BAR_W + BAR_W : 0}px;--nm-type-col:${model.typeCh}ch`;
-  const bar = editMode ? `<div class="nm-struct-bar">${chips}${hiddenNote}</div>` : "";
+  const bar = editMode ? `<div class="nm-struct-bar">${chips}${expandChip}${hiddenNote}</div>` : "";
   return `${bar}${diffBanner}${outer}
     <div class="nm-struct-rows nm-scroll nm-style-${table ? "table" : "list"}${cell ? " nm-pp-cells" : ""}" style="${vars}">${rowsHtml || '<div class="nm-empty">No members</div>'}</div>`;
 }

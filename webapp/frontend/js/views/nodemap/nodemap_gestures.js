@@ -6,15 +6,16 @@ import { api } from "../../api.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { toast } from "../../components/toast.js";
 import * as M from "./canvas_model.js";
-import { mailThreadLayout, relationTargets } from "./domain_nodes.js";
+import { commitRowKey, fullMailBody, mailRowKey, mailThreadLayout, relationTargets, releaseRowKey } from "./domain_nodes.js";
 import { cveSpec, kapiSpec } from "./nodemap_bridge.js";
-import { extractReferencedStruct, findItem, guardAutoCollapsed } from "./struct_view.js";
+import { collectExpandableTypes, findItem, guardAutoCollapsed, typeRefOfField } from "./struct_view.js";
 
 const DRAG_THRESHOLD = 3;
 const ALIGN_SNAP_THRESHOLD = 6;
 const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards", "toggle-header", "field-lock"]);
 const MAIL_EXPAND_MAX = 60;
 const KC_EXPAND_MAX = 40;
+const TYPE_EXPAND_MAX = 40;
 
 const isTyping = (el) => Boolean(el && (el.closest?.("input, textarea, select, [contenteditable='true']")));
 
@@ -735,14 +736,21 @@ export function beginEdgeLabelEdit(ctrl, id) {
 
 // ------------------------------------------------------------------ node click, spawn & graph expansion actions
 
-export function spawnLinkedNode(ctrl, from, spec, label = "") {
+/**
+ * Add the node of `spec` to the right of `from`, connected by an edge labeled `label`. `opts.fromField`
+ * anchors the edge to one row of `from` (a struct member, a mail message `mail:<mid>`, a history row
+ * `commit:<sha>` / `ver:<release>`).
+ */
+export function spawnLinkedNode(ctrl, from, spec, label = "", { fromField = null } = {}) {
   if (!from || !spec) return null;
   const siblingCount = ctrl.canvas.edges.filter((e) => e.from === from.id).length;
   const node = ctrl.nodeFromSpec(spec, { x: from.x + from.w + 100, y: from.y + siblingCount * 110 });
   if (!node) return null;
   ctrl.canvas.nodes.push(node);
   M.reassignGroups(ctrl.canvas.nodes, [node]);
-  const edge = M.createEdge({ from: from.id, to: node.id, label });
+  const edge = M.createEdge(fromField
+    ? { from: from.id, to: node.id, label, fromSide: "right", fromField, toSide: "left" }
+    : { from: from.id, to: node.id, label });
   if (edge) ctrl.canvas.edges.push(edge);
   ctrl.selected = new Set([node.id]);
   ctrl.selectedEdge = null;
@@ -767,6 +775,7 @@ export function spawnFromCveDiff(ctrl, node, key) {
 export function onClick(ctrl, e) {
   const btn = e.target.closest("[data-act]");
   const nodeEl = e.target.closest(".nm-node");
+  if (!btn && nodeEl && e.target.closest(".nm-doc-page")) return onDocLink(ctrl, e, nodeEl);
   if (!btn || !nodeEl) return;
   const node = ctrl.byId(nodeEl.dataset.nodeId);
   if (!node) return;
@@ -792,11 +801,14 @@ export function onClick(ctrl, e) {
   else if (act === "expand") ctrl.toggleExpandNode(node.id);
   else if (act === "field-lock") ctrl.promptFieldLock(node, btn.dataset.key);
   else if (act === "mail-open") ctrl.toggleMailMessage(node.id, btn.dataset.key);
+  else if (act === "mail-full") ctrl.toggleMailMessage(node.id, btn.dataset.key, "full");
+  else if (act === "mail-pin") ctrl.toggleMailMessage(node.id, btn.dataset.key, "pin");
   else if (act === "mail-spawn") ctrl.spawnMailMessages(node.id, [btn.dataset.key]);
   else if (act === "mail-expand") ctrl.expandThreadToNodes(node.id);
   else if (act === "kc-rel") ctrl.expandKconfigRelations(node.id, btn.dataset.key);
   else if (act === "kc-expand") ctrl.expandKconfigRelations(node.id);
   else if (act === "follow-type") ctrl.followStructType(node.id, btn.dataset.key);
+  else if (act === "expand-types") ctrl.expandStructTypes(node.id);
   else if (act === "cve-spawn-diff") spawnFromCveDiff(ctrl, node, btn.dataset.key);
   else if (act === "cve-spawn-source") spawnLinkedNode(ctrl, node, { type: "source", version: node.version, data: { path: btn.dataset.key, mode: "file" } }, "affects");
   else if (act === "cve-spawn-cve") spawnLinkedNode(ctrl, node, cveSpec({ cveId: btn.dataset.key, version: node.version, repo: node.repo }), "related");
@@ -814,36 +826,133 @@ export function onClick(ctrl, e) {
     const line = idx > 0 ? Math.max(1, parseInt(raw.slice(idx + 1), 10) || 1) : 1;
     spawnLinkedNode(ctrl, node, { type: "source", version: node.version, repo: node.repo, data: { path, mode: "range", start: line, end: line + 30 } }, act === "doc-spawn-source" ? "documents" : "defined in");
   } else if (act === "hist-spawn-commit") {
-    spawnLinkedNode(ctrl, node, { type: "diff", version: node.version, repo: node.repo, data: { mode: "commit", commitHash: btn.dataset.key, path: "" } }, "blame commit");
+    spawnLinkedNode(ctrl, node, { type: "diff", version: node.version, repo: node.repo, data: { mode: "commit", commitHash: btn.dataset.key, path: "" } }, "blame commit", { fromField: commitRowKey(btn.dataset.key) });
   } else if (act === "hist-spawn-diff") {
     const raw = String(btn.dataset.key || "");
     const sep = raw.indexOf(":");
     const revRange = sep >= 0 ? raw.slice(0, sep) : raw;
     const path = sep >= 0 ? raw.slice(sep + 1) : node.data.path;
     const [versionA, versionB] = revRange.split("..");
-    spawnLinkedNode(ctrl, node, { type: "diff", version: versionB || node.version, repo: node.repo, data: { mode: "file", versionA, versionB, path } }, "changed in");
+    spawnLinkedNode(ctrl, node, { type: "diff", version: versionB || node.version, repo: node.repo, data: { mode: "file", versionA, versionB, path } }, "changed in", { fromField: versionB ? releaseRowKey(versionB) : null });
   } else if (node.type === "struct") ctrl.onStructAction(node, act, btn.dataset.key);
 }
 
-export async function toggleMailMessage(ctrl, id, mid) {
-  const node = ctrl.byId(id);
+/**
+ * A click on a link of a rendered doc node: documentation links (`data-doc`) and kernel-doc directives
+ * add a connected doc node, `data-src` a source slice, `data-symbol` a symbol node, `data-kconfig` a
+ * Kconfig node; `#anchor` links scroll inside the node; external links open in a new browser tab.
+ */
+export function onDocLink(ctrl, e, nodeEl) {
+  const node = ctrl.byId(nodeEl.dataset.nodeId);
+  if (!node) return;
+  const kd = e.target.closest(".kdoc-kerneldoc[data-kdoc-path]");
+  const a = e.target.closest("a");
+  if (!a && !kd) return;
+  if (a && /^(https?|mailto):/i.test(a.getAttribute("href") || "")) return; // external: the browser opens it (target=_blank)
+  e.preventDefault();
+  e.stopPropagation();
+  const base = { version: node.version, repo: node.repo };
+  if (kd && !a) {
+    spawnLinkedNode(ctrl, node, { type: "doc", ...base, data: { path: kd.dataset.kdocPath, mode: "kernel-doc" } }, "includes");
+  } else if (a.dataset.doc) {
+    const path = String(a.dataset.doc).split("#")[0];
+    if (path) spawnLinkedNode(ctrl, node, { type: "doc", ...base, data: { path } }, "links to");
+  } else if (a.dataset.src) {
+    const line = Math.max(1, parseInt(a.dataset.line, 10) || 1);
+    spawnLinkedNode(ctrl, node, { type: "source", ...base, data: { path: a.dataset.src, mode: "range", start: line, end: line + 30 } }, "documents");
+  } else if (a.dataset.symbol) {
+    spawnLinkedNode(ctrl, node, { type: "symbol", ...base, data: { name: a.dataset.symbol } }, "mentions");
+  } else if (a.dataset.kconfig) {
+    spawnLinkedNode(ctrl, node, { type: "kconfig", ...base, data: { symbol: a.dataset.kconfig } }, "mentions");
+  } else {
+    const href = a.getAttribute("href") || "";
+    if (href.startsWith("#") && href.length > 1) {
+      const page = nodeEl.querySelector(".nm-doc-page");
+      let id = href.slice(1);
+      try {
+        id = decodeURIComponent(id);
+      } catch {
+        // a malformed escape: match the raw fragment
+      }
+      const target = [...(page?.querySelectorAll?.("[id]") || [])].find((x) => x.id === id);
+      const sc = target?.closest?.(".nm-scroll");
+      if (target && sc) sc.scrollTop += target.getBoundingClientRect().top - sc.getBoundingClientRect().top;
+    }
+  }
+}
+
+/**
+ * Show or hide a message of a mail node. `mode` "open" toggles its excerpt, "full" the whole message,
+ * "pin" saves the whole message with the canvas (`pinnedBodies`, capped by `canvas_model.js`).
+ */
+export async function toggleMailMessage(ctrl, id, mid, mode = "open") {
+  let node = ctrl.byId(id);
   if (!node || node.type !== "mail" || !mid) return;
-  const open = { ...node.data.openMids };
-  if (open[mid]) delete open[mid];
-  else open[mid] = true;
-  node.data.openMids = open;
+  let pinBody = null;
+  if (mode === "pin" && node.data.pinnedBodies?.[mid] === undefined) {
+    if (Object.keys(node.data.pinnedBodies || {}).length >= M.MAIL_PIN_MAX) return toast.info(`At most ${M.MAIL_PIN_MAX} messages are saved per thread node`);
+    const body = await loadMailBody(ctrl, mid);
+    if (body === null) return toast.warning("Could not load the message to pin it");
+    pinBody = fullMailBody(body);
+    // the node (and its state) as it is once the message has loaded
+    node = ctrl.byId(id);
+    if (!node || node.type !== "mail") return;
+  }
+  const d = node.data;
+  const open = { ...d.openMids };
+  const full = { ...d.fullMids };
+  const pins = { ...d.pinnedBodies };
+  if (mode === "pin") {
+    if (pinBody === null) delete pins[mid];
+    else {
+      pins[mid] = pinBody;
+      open[mid] = true;
+      full[mid] = true;
+      if (M.normalizeData("mail", { ...d, pinnedBodies: pins }).pinnedBodies[mid] === undefined) {
+        return toast.info("This thread node keeps no more saved message text: unpin another message first");
+      }
+    }
+  } else if (mode === "full") {
+    // the full view only: a pin stays until it is unpinned
+    if (full[mid]) delete full[mid];
+    else {
+      full[mid] = true;
+      open[mid] = true;
+    }
+  } else if (open[mid]) {
+    delete open[mid];
+    delete full[mid];
+  } else open[mid] = true;
+  d.openMids = open;
+  d.fullMids = full;
+  d.pinnedBodies = M.normalizeData("mail", { ...d, pinnedBodies: pins }).pinnedBodies;
   if (node.autoFit) ctrl.fitQueue.add(id);
   ctrl.commit();
-  if (!open[mid] || ctrl.mailBodies.has(mid) || mid.startsWith("#")) return;
-  try {
-    const res = await (ctrl.api || api).getMailMessage(mid);
-    ctrl.mailBodies.set(mid, String(res?.body || res?.text || ""));
-  } catch (err) {
-    ctrl.mailBodies.set(mid, `(${err.message})`);
-  }
+  if (!open[mid] || pins[mid] !== undefined || (ctrl.mailBodies.has(mid) && !ctrl.mailBodyErrors?.has(mid)) || mid.startsWith("#")) return;
+  await loadMailBody(ctrl, mid);
   ctrl.mailEpoch = (ctrl.mailEpoch || 0) + 1;
   for (const n of ctrl.canvas.nodes) if (n.type === "mail" && n.autoFit) ctrl.fitQueue.add(n.id);
   if (ctrl.containerEl?.isConnected || !ctrl.containerEl) ctrl.commit({ save: false, inspector: false });
+}
+
+/**
+ * Body of message `mid` (cached in `ctrl.mailBodies`), or null for a message without an id or a failed
+ * fetch (whose error text shows in the row until the next attempt retries it, never pinned).
+ */
+async function loadMailBody(ctrl, mid) {
+  ctrl.mailBodyErrors = ctrl.mailBodyErrors || new Set();
+  if (ctrl.mailBodies.has(mid) && !ctrl.mailBodyErrors.has(mid)) return ctrl.mailBodies.get(mid);
+  if (mid.startsWith("#")) return null;
+  try {
+    const res = await (ctrl.api || api).getMailMessage(mid);
+    ctrl.mailBodies.set(mid, String(res?.body || res?.text || ""));
+    ctrl.mailBodyErrors.delete(mid);
+    return ctrl.mailBodies.get(mid);
+  } catch (err) {
+    ctrl.mailBodies.set(mid, `(${err.message})`);
+    ctrl.mailBodyErrors.add(mid);
+    return null;
+  }
 }
 
 export function mailNodeOf(ctrl, mid) {
@@ -872,9 +981,12 @@ export function spawnMailMessages(ctrl, id, mids, { select = true, layout = null
       created.push(n);
       k += 1;
     }
+    // a reply wires from its parent's own node, else from its row inside the thread node
     const parentNode = (r.parent && ctrl.mailNodeOf(r.parent)) || thread;
     if (parentNode.id !== n.id && !ctrl.canvas.edges.some((e) => e.from === parentNode.id && e.to === n.id)) {
-      const edge = M.createEdge({ from: parentNode.id, to: n.id, label: "reply" });
+      const edge = M.createEdge(parentNode === thread && !thread.data.single
+        ? { from: thread.id, to: n.id, label: "reply", fromSide: "right", fromField: mailRowKey(mid), toSide: "left" }
+        : { from: parentNode.id, to: n.id, label: "reply" });
       if (edge) ctrl.canvas.edges.push(edge);
     }
   }
@@ -990,40 +1102,109 @@ export async function toggleExpandNode(ctrl, id) {
   ctrl.commit();
 }
 
+/** The non-standard type member `fieldKey` of struct node `node` references (`struct_view.js` `typeRefOfField`). */
+function fieldTypeRef(ctrl, node, fieldKey) {
+  const layout = ctrl.content.get(ctrl.fetchKeyOf(node))?.value;
+  const pahole = String(fieldKey).startsWith("po:") ? ctrl.paholeFor?.(node) : null;
+  return typeRefOfField(layout, fieldKey, pahole);
+}
+
 export function followableTypeFor(ctrl, nodeId, fieldKey) {
   const node = ctrl.byId(nodeId);
   if (!node || node.type !== "struct" || !fieldKey) return null;
-  const layout = ctrl.content.get(ctrl.fetchKeyOf(node))?.value;
-  const item = layout ? findItem(layout.items, fieldKey) : null;
-  const ref = item ? extractReferencedStruct(item.type || item.type_name || "") : null;
+  const ref = fieldTypeRef(ctrl, node, fieldKey);
   return ref ? `${ref.kind} ${ref.name}` : null;
+}
+
+/** The canvas node showing type `ref` at `version` (struct node for a struct / union, else symbol node). */
+function typeNodeOf(ctrl, ref, version, repo = "") {
+  return ctrl.canvas.nodes.find((n) => n.version === version && (n.repo || "") === (repo || "") && (ref.kind === "struct" || ref.kind === "union"
+    ? n.type === "struct" && n.data.name === ref.name && n.data.kind === ref.kind
+    : (n.type === "symbol" && n.data.name === ref.name) || (n.type === "struct" && n.data.name === ref.name))) || null;
+}
+
+/**
+ * A new node for type `ref`: a struct node for a `struct` / `union` (`GET /api/nodemap/{v}/struct/{name}`),
+ * a symbol node for an `enum` or typedef (its definition resolves through `getSymbolDetail` and
+ * its members expand like any symbol node).
+ */
+function createTypeNode(from, ref, at) {
+  if (ref.kind === "struct" || ref.kind === "union") {
+    return M.createNode("struct", { ...at, version: from.version, repo: from.repo, data: { name: ref.name, kind: ref.kind } });
+  }
+  return M.createNode("symbol", { ...at, version: from.version, repo: from.repo, data: { name: ref.name, kind: ref.kind } });
+}
+
+/** Connect member `fieldKey` of `node` to `target` (once per member and target). */
+function linkTypeEdge(ctrl, node, target, fieldKey, ref) {
+  if (ctrl.canvas.edges.some((e) => e.from === node.id && e.to === target.id && e.fromField === fieldKey)) return;
+  const edge = M.createEdge({ from: node.id, to: target.id, fromSide: "right", fromField: fieldKey, toSide: "left", label: ref.edgeLabel });
+  if (edge) ctrl.canvas.edges.push(edge);
 }
 
 export function followStructType(ctrl, nodeId, fieldKey) {
   const node = ctrl.byId(nodeId);
   if (!node || node.type !== "struct" || !fieldKey) return null;
-  const layout = ctrl.content.get(ctrl.fetchKeyOf(node))?.value;
-  const item = layout ? findItem(layout.items, fieldKey) : null;
-  const ref = item ? extractReferencedStruct(item.type || item.type_name || "") : null;
+  const ref = fieldTypeRef(ctrl, node, fieldKey);
   if (!ref) return null;
-  let target = ctrl.canvas.nodes.find((n) => n.type === "struct" && n.data.name === ref.name && n.data.kind === ref.kind && n.version === node.version);
+  let target = typeNodeOf(ctrl, ref, node.version, node.repo);
   if (!target) {
     const siblingCount = ctrl.canvas.edges.filter((e) => e.from === node.id).length;
-    target = M.createNode("struct", {
-      x: node.x + node.w + 110, y: node.y + siblingCount * 120, version: node.version, repo: node.repo,
-      data: { name: ref.name, kind: ref.kind },
-    });
+    target = createTypeNode(node, ref, { x: node.x + node.w + 110, y: node.y + siblingCount * 120 });
     ctrl.canvas.nodes.push(target);
     M.reassignGroups(ctrl.canvas.nodes, [target]);
   }
-  if (!ctrl.canvas.edges.some((e) => e.from === node.id && e.to === target.id && e.fromField === fieldKey)) {
-    const edge = M.createEdge({ from: node.id, to: target.id, fromSide: "right", fromField: fieldKey, toSide: "left", label: ref.edgeLabel });
-    if (edge) ctrl.canvas.edges.push(edge);
-  }
+  linkTypeEdge(ctrl, node, target, fieldKey, ref);
   ctrl.selected = new Set([target.id]);
   ctrl.selectedEdge = null;
   ctrl.commit();
   return target;
+}
+
+/** The unique non-standard types of the visible members of struct node `id` (`[{ key, ref }]`). */
+export function expandableTypesOf(ctrl, id) {
+  const node = ctrl.byId(id);
+  if (!node || node.type !== "struct") return [];
+  const entry = ctrl.content.get(ctrl.fetchKeyOf(node));
+  if (entry?.status !== "ok") return [];
+  const so = ctrl.structOpts ? ctrl.structOpts(node) : {};
+  return collectExpandableTypes(entry.value, node.data, { evaluator: so.evaluator || null, pahole: so.pahole || null });
+}
+
+/**
+ * "Expand Types": one node per unique non-standard type the visible members of struct node `id`
+ * reference (existing nodes of the type are reused), stacked to the right of the struct and wired from
+ * the first referencing member (`fromField`) with a `points to` / `embeds` / `type` edge. One undo step.
+ */
+export function expandStructTypes(ctrl, id) {
+  const node = ctrl.byId(id);
+  if (!node || node.type !== "struct") return [];
+  if (ctrl.content.get(ctrl.fetchKeyOf(node))?.status !== "ok") return toast.info("The struct has not loaded yet"), [];
+  const all = expandableTypesOf(ctrl, id);
+  if (!all.length) return toast.info("No non-standard member types to expand"), [];
+  const list = all.slice(0, TYPE_EXPAND_MAX);
+  const created = [];
+  let y = node.y;
+  for (const { key, ref } of list) {
+    let target = typeNodeOf(ctrl, ref, node.version, node.repo);
+    if (!target) {
+      target = createTypeNode(node, ref, { x: node.x + node.w + 120, y });
+      const lim = M.SIZE_LIMITS[target.type];
+      if (target.type === "struct") target.h = Math.round(lim.h * 0.6);
+      y += target.h + 24;
+      ctrl.canvas.nodes.push(target);
+      created.push(target);
+    }
+    linkTypeEdge(ctrl, node, target, key, ref);
+  }
+  if (created.length) {
+    M.reassignGroups(ctrl.canvas.nodes, created);
+    ctrl.selected = new Set(created.map((x) => x.id));
+    ctrl.selectedEdge = null;
+  }
+  if (all.length > list.length) toast.info(`Added the first ${list.length} of ${all.length} types`);
+  ctrl.commit();
+  return created;
 }
 
 export async function expandCallgraph(ctrl, id, direction = "both") {
