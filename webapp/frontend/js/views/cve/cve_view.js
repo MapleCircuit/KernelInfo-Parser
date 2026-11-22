@@ -11,6 +11,8 @@ import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { buildDeepLink } from "../../tab_routes.js";
 import { chipCounts, filterRows, formatChips, parseChips, toTsv } from "../sections/section_model.js";
+import { hasFeature } from "../../utils/projects.js";
+import { cveSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { NOT_INGESTED_HTML, SETUP_HTML, renderCveDetailHtml, severityTag } from "./cve_render.js";
 
 export const CVE_CHIPS = [
@@ -274,15 +276,25 @@ export class CveView {
       return;
     }
     if (seq !== this.detailSeq || !this.containerEl?.isConnected) return;
+    const repo = this.tab?.repo || state.repoOf(this.tab) || state.activeRepo();
     el.innerHTML = renderCveDetailHtml(detail, {
       release: detail?.release_state?.release || "",
       showCopyLink: true,
+      showNodemap: hasFeature(repo, "nodemap"),
       showCheckRelease: true,
       checkedRelease: release,
     });
   }
 
   onDetailClick(e, forceNew) {
+    const nmBtn = e.target.closest("[data-nodemap-cve]");
+    if (nmBtn) {
+      e.preventDefault();
+      const repo = this.tab?.repo || state.repoOf(this.tab) || state.activeRepo();
+      const ver = nmBtn.dataset.nodemapRelease || this.version || state.activeVersion();
+      sendToNodemap(cveSpec({ cveId: nmBtn.dataset.nodemapCve, version: ver, repo }), { repo, version: ver });
+      return;
+    }
     const copyBtn = e.target.closest("[data-copy-cve]");
     if (copyBtn) {
       e.preventDefault();

@@ -1,29 +1,30 @@
 /**
  * nodemap_bridge.js - "Send to NodeMap" from other views (`webapp/API_FRONTEND.md` §5.3.5).
  *
- * `nodeSpecsForTab()` (pure) turns a tab into the node that shows it natively (code tab → source node,
- * man tab → man page node, pahole tab → struct node, a Compare tab showing one file and a Commits tab
- * showing one commit → diff node, a Mailing List tab on a thread → mail node, a Kconfig tab on a symbol →
- * kconfig node, a Maintainers tab on a section → maintainer node) or, for every other tab, a live tab
- * node embedding the tab's address. `tabForNode()` (pure) is the reverse: the workspace tab a node opens
- * as (Open as tab, Copy to Session). `sendToNodemap()` queues specs on an open NodeMap tab of the same project (or opens
- * one) as `pendingNodes`; the canvas adds them next to its viewport center and announces nothing else.
+ * `nodeSpecsForTab()` (pure) turns a tab into the node that shows it natively (code tab → source or
+ * Documentation `.rst` → doc node, man tab → man page node, pahole tab → struct node, Compare/Commits
+ * → diff node, Mailing List → mail node, Kconfig → kconfig node, Maintainers → maintainer node,
+ * CVE → cve node, Kernel API → kapi node) or, for every other tab, a live tab node embedding the
+ * tab's address. `tabForNode()` (pure) is the reverse.
  */
 import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
+import { isDocumentationPath } from "../docs/rst_renderer.js";
 
-/** Tab types a tab node does not embed (the canvas itself; versionless chrome views stay tabs). */
+/** Tab types a tab node does not embed (the canvas itself). */
 export const NON_EMBEDDABLE_TABS = new Set(["nodemap"]);
 
 /**
- * Node specs (`{type, data, version, repo, title?}`) for a tab. `hashOf(tab)` gives the tab's address
- * (`urlSync.paramsForTab(tab).toString()`); `live` forces a tab node even where a native node exists.
+ * Node specs (`{type, data, version, repo, title?}`) for a tab.
  */
 export function nodeSpecsForTab(tab, hashOf, { live = false } = {}) {
   if (!tab || NON_EMBEDDABLE_TABS.has(tab.type)) return [];
   const base = { version: tab.version || "", repo: tab.repo || "" };
   if (!live) {
     if (tab.type === "code" && tab.path && !/\/$/.test(tab.path)) {
+      if (isDocumentationPath(tab.path) && tab.docMode !== "source") {
+        return [{ ...base, type: "doc", data: { path: tab.path, mode: "auto" } }];
+      }
       const start = tab.cursorLine && tab.lineEnd && tab.lineEnd > tab.cursorLine ? tab.cursorLine : null;
       return [{ ...base, type: "source", data: start ? { path: tab.path, mode: "range", start, end: tab.lineEnd } : { path: tab.path, mode: "file" } }];
     }
@@ -48,22 +49,25 @@ export function nodeSpecsForTab(tab, hashOf, { live = false } = {}) {
     if (tab.type === "maintainers" && tab.secId) {
       return [{ ...base, type: "maintainer", data: { secId: Number(tab.secId) || null, title: tab.section || "" } }];
     }
+    if (tab.type === "cve" && tab.sel) {
+      return [{ ...base, type: "cve", data: { cveId: tab.sel, release: tab.cveVersion || "" } }];
+    }
+    if (tab.type === "api") {
+      return [{ ...base, type: "kapi", data: { catalog: tab.view || "summary", query: tab.query || "", symbol: tab.sel || "", arch: tab.arch || "x86_64" } }];
+    }
   }
   const hash = hashOf ? hashOf(tab) : "";
   if (!hash) return [];
   return [{ ...base, type: "tab", title: tab.title || "", data: { tabType: tab.type, hash } }];
 }
 
-/** Specs for the source view's context: the file, a line range, or one symbol's definition. */
 export function sourceSpec({ path, version, repo = "", start = null, end = null, symbol = "", kind = "" }) {
-  // A symbol slice may leave the file to the revision's index
   if (!path && !symbol) return null;
   if (symbol) return { type: "source", version, repo, data: { path, mode: "symbol", symbol, symbolKind: kind } };
   if (start) return { type: "source", version, repo, data: { path, mode: "range", start, end: end || start } };
   return { type: "source", version, repo, data: { path, mode: "file" } };
 }
 
-/** The NodeMap tab "Send to NodeMap" targets: one of the project in the active pane, else in any pane. */
 export function targetNodemapTab(panes, activePaneId, repoOf, repo) {
   const ordered = [...panes].sort((a, b) => (a.id === activePaneId ? -1 : b.id === activePaneId ? 1 : 0));
   for (const p of ordered) {
@@ -73,7 +77,6 @@ export function targetNodemapTab(panes, activePaneId, repoOf, repo) {
   return null;
 }
 
-/** Queue node specs on the project's NodeMap (opened when none is) and show it. */
 export function sendToNodemap(specs, { repo = state.activeRepo(), version = state.activeVersion() } = {}) {
   const list = (Array.isArray(specs) ? specs : [specs]).filter(Boolean);
   if (!list.length) return false;
@@ -89,7 +92,6 @@ export function sendToNodemap(specs, { repo = state.activeRepo(), version = stat
   return true;
 }
 
-/** Spec for a code token: struct/union tokens become struct nodes (the file is the fallback lookup place). */
 export function tokenSpec({ name, typeId = null, astId = null, path = "", version = "", repo = "" }) {
   const raw = String(name || "").trim();
   if (!raw) return null;
@@ -101,33 +103,52 @@ export function tokenSpec({ name, typeId = null, astId = null, path = "", versio
   return { type: "symbol", version, repo, data: { name: raw.replace(/\(\)$/, ""), kind: func ? "func" : "symbol", astId: Number.isInteger(astId) && astId > 0 ? astId : null } };
 }
 
-/** Spec of a diff node: one file between two revisions, or one commit (optionally one of its files). */
 export function diffSpec({ versionA = "", versionB = "", path = "", oldPath = "", commitHash = "", version = "", repo = "" }) {
   if (commitHash) return { type: "diff", version: version || versionB, repo, data: { mode: "commit", commitHash, path } };
   if (!path) return null;
   return { type: "diff", version: version || versionB, repo, data: { mode: "file", versionA, versionB, path, oldPath } };
 }
 
-/** Spec of a mail node: a thread (`tid`), focused on one message (`mid`) when given. */
 export function mailSpec({ tid = null, mid = "", subject = "", version = "", repo = "" }) {
   if (!tid && !mid) return null;
   return { type: "mail", version, repo, data: { tid: Number(tid) || null, mid: String(mid || ""), subject } };
 }
 
-/** Spec of a Kconfig symbol node. */
 export function kconfigSpec({ symbol, arch = "x86_64", version = "", repo = "" }) {
   const name = String(symbol || "").trim().replace(/^CONFIG_/, "");
   if (!/^[A-Za-z0-9_]+$/.test(name)) return null;
   return { type: "kconfig", version, repo, data: { symbol: name, arch } };
 }
 
-/** Spec of a MAINTAINERS section node (by id, or resolved from a path or a name query). */
 export function maintainerSpec({ secId = null, title = "", path = "", query = "", version = "", repo = "" }) {
   if (!secId && !path && !query) return null;
   return { type: "maintainer", version, repo, data: { secId: Number(secId) || null, title, path, query } };
 }
 
-/** Parameters of a tab address (`hash`) a tab node embeds, as the fields of a workspace tab. */
+export function cveSpec({ cveId = "", release = "", filePath = "", version = "", repo = "" }) {
+  const id = String(cveId || "").trim().toUpperCase();
+  const fp = String(filePath || "").trim();
+  if (!id && !fp) return null;
+  return { type: "cve", version: version || release, repo, data: { cveId: id, release: String(release || ""), filePath: fp } };
+}
+
+export function kapiSpec({ catalog = "summary", query = "", symbol = "", arch = "x86_64", version = "", repo = "" }) {
+  return { type: "kapi", version, repo, data: { catalog: catalog || "summary", query: String(query || ""), symbol: String(symbol || ""), arch: arch || "x86_64" } };
+}
+
+export function docSpec({ path = "", mode = "auto", functions = "", version = "", repo = "" }) {
+  const p = String(path || "").trim();
+  if (!p) return null;
+  return { type: "doc", version, repo, data: { path: p, mode, functions: String(functions || "") } };
+}
+
+export function historySpec({ mode = "symbol", path = "", line = 1, name = "", astId = null, version = "", repo = "" }) {
+  const p = String(path || "").trim();
+  const n = String(name || "").trim();
+  if (!p && !n) return null;
+  return { type: "history", version, repo, data: { mode, path: p, line: Number(line) || 1, name: n, astId: Number.isInteger(astId) ? astId : null } };
+}
+
 function tabFieldsOfHash(hash) {
   const p = new URLSearchParams(String(hash || "").replace(/^#/, ""));
   const out = {};
@@ -144,11 +165,6 @@ function tabFieldsOfHash(hash) {
   return out;
 }
 
-/**
- * The workspace tab a node opens as (`state.openTab()` descriptor, no id): `node` the canvas node,
- * `loaded` its loaded content (a struct layout's definition opens the file; a source symbol slice opens
- * at its line), `fallback` `{repo, version}` of the canvas. Null for nodes without a tab (notes, groups).
- */
 export function tabForNode(node, loaded = null, fallback = {}) {
   if (!node) return null;
   const d = node.data || {};
@@ -160,6 +176,7 @@ export function tabForNode(node, loaded = null, fallback = {}) {
       return { type: "code", title: file(d.path || loaded?.path), path: d.path || loaded?.path || "", cursorLine: line || 1, ...(d.mode === "range" && d.end > d.start ? { lineEnd: d.end } : {}), ...base };
     }
     case "struct":
+      if (d.style === "layout") return { type: "pahole", title: `struct ${d.name}`, structName: d.name, ...base };
       if (loaded?.file_path) return { type: "code", title: file(loaded.file_path), path: loaded.file_path, cursorLine: loaded.line_s, ...base };
       return { type: "pahole", title: `struct ${d.name}`, structName: d.name, ...base };
     case "man":
@@ -178,6 +195,15 @@ export function tabForNode(node, loaded = null, fallback = {}) {
       return { type: "kconfig", title: `KConfig (${d.arch})`, symbol: d.symbol, arch: d.arch, ...base };
     case "maintainer":
       return { type: "maintainers", title: d.title ? `Maintainers: ${d.title}` : "Maintainers", ...(d.secId ? { secId: d.secId } : {}), ...(d.title ? { section: d.title } : {}), ...base };
+    case "cve":
+      return { type: "cve", title: d.cveId ? `CVE · ${d.cveId}` : "CVE Records", ...(d.cveId ? { sel: d.cveId } : {}), ...(d.release ? { cveVersion: d.release } : {}), ...base };
+    case "kapi":
+      return { type: "api", title: `Kernel API · ${d.catalog || "summary"}`, view: d.catalog || "summary", arch: d.arch || "x86_64", ...(d.query ? { query: d.query } : {}), ...(d.symbol ? { sel: d.symbol } : {}), ...base };
+    case "doc":
+      return d.path ? { type: "code", title: file(d.path), path: d.path, docMode: isDocumentationPath(d.path) ? "doc" : "source", ...base } : null;
+    case "history":
+      if (d.path) return { type: "code", title: file(d.path), path: d.path, cursorLine: d.line || 1, showBlame: d.mode === "blame", ...base };
+      return null;
     default:
       return null;
   }

@@ -1,10 +1,12 @@
 /**
  * node_content.js - HTML of NodeMap content bodies that need no live DOM: note cards (lightweight
- * Markdown) and syntax-highlighted source slices (the code view's lexical highlighter, `AstOverlay`).
+ * Markdown) and syntax-highlighted source slices (the code view's lexical highlighter, `AstOverlay`,
+ * plus virtualized window support via `virtual_source.js`).
  * DOM-free (unit tested).
  */
 import { AstOverlay } from "../code_view/ast_overlay.js";
 import { esc } from "./struct_view.js";
+import { VIRTUAL_THRESHOLD, renderVirtualSourceWindow } from "./virtual_source.js";
 
 function inline(text) {
   // Code spans first (their content stays literal), then emphasis on the escaped remainder
@@ -78,16 +80,27 @@ export function renderNoteMarkdown(text) {
 /**
  * Source lines as highlighted rows with their file line numbers. `lines` is the slice, `startLine` the
  * file line of its first entry; `highlight` (Set of file lines) marks the symbol's own span.
+ * Above `VIRTUAL_THRESHOLD` lines (unless `opts.virtual === false`), renders a virtualized viewport window.
  */
-export function renderSourceRows(lines, startLine, path, highlight = null) {
-  const ov = new AstOverlay();
-  ov.setFileInfo(null, path || "", lines[0] || "");
-  ov.indexMultiLineSpans(lines);
+export function renderSourceRows(lines, startLine, path, highlight = null, opts = {}) {
+  const arr = Array.isArray(lines) ? lines : [];
+  if (arr.length > VIRTUAL_THRESHOLD && opts.virtual !== false) {
+    return renderVirtualSourceWindow(arr, startLine, path, highlight, opts.range || null, opts.htmlRows || null);
+  }
+  const htmlRows = opts.htmlRows || null;
+  let ov = null;
+  if (!htmlRows) {
+    ov = new AstOverlay();
+    ov.setFileInfo(null, path || "", arr[0] || "");
+    ov.indexMultiLineSpans(arr);
+  }
   let html = "";
-  for (let i = 0; i < lines.length; i++) {
-    const no = startLine + i;
+  const baseLine = Number(startLine) || 1;
+  for (let i = 0; i < arr.length; i++) {
+    const no = baseLine + i;
     const mark = highlight && highlight.has(no) ? " nm-src-hl" : "";
-    html += `<div class="nm-src-row${mark}"><span class="nm-src-no">${no}</span><span class="nm-src-code">${ov.renderLineHtml(i + 1, lines[i])}</span></div>`;
+    const codeHtml = htmlRows ? String(htmlRows[i] ?? "") : ov.renderLineHtml(i + 1, arr[i]);
+    html += `<div class="nm-src-row${mark}"><span class="nm-src-no">${no}</span><span class="nm-src-code">${codeHtml}</span></div>`;
   }
   return html;
 }
@@ -98,7 +111,6 @@ const decodeEntities = (t) => t.replace(/&(?:(amp|lt|gt|quot|apos|nbsp)|#(\d{1,6
 /**
  * Lexical highlighting of source lines as plain segments, for the SVG export: one array per line of
  * `{text, cls}` where `cls` is the `tok-*` class the code view colors the run with (`""` plain text).
- * Same highlighter as `renderSourceRows()` (`AstOverlay`), so the image shows the node's colors.
  */
 export function sourceLineSegments(lines, path) {
   const ov = new AstOverlay();
@@ -132,11 +144,7 @@ export function htmlSegments(html) {
 }
 
 /**
- * Compact source reference a node header shows on the right (`.nm-head-meta`), with its full form as
- * the tooltip: a struct's `file:line` of its definition, a source slice's `path · start–end`, a diff's
- * `path · vA..vB` (or short commit), a thread's message count, a Kconfig symbol's definition, a
- * MAINTAINERS section's status. `payload` is the node's loaded content (the `domain_nodes.js` model for
- * mail, kconfig and maintainer nodes; null while not loaded: no reference).
+ * Compact source reference a node header shows on the right (`.nm-head-meta`).
  */
 export function headMetaOf(type, payload) {
   if (!payload) return { text: "", title: "" };
@@ -168,6 +176,28 @@ export function headMetaOf(type, payload) {
   }
   if (type === "maintainer" && payload.status) {
     return { text: payload.status, title: `S: ${payload.status}` };
+  }
+  if (type === "cve") {
+    if (payload.mode === "file") {
+      const text = `${payload.affectedCount || 0}/${payload.total || 0}`;
+      return { text, title: `${payload.filePath}: ${text} CVEs` };
+    }
+    const text = payload.state || (payload.score != null ? `CVSS ${payload.score}` : "");
+    return { text, title: `${payload.cveId}${text ? ` · ${text}` : ""}` };
+  }
+  if (type === "kapi") {
+    const text = `${payload.catalog || "summary"}${payload.arch ? ` · ${payload.arch}` : ""}`;
+    return { text, title: `${text} (${payload.total || 0} items)` };
+  }
+  if (type === "doc" && payload.path) {
+    const text = payload.mode === "kernel-doc" ? `${payload.total || 0} entries` : `${payload.path}`;
+    return { text, title: payload.path };
+  }
+  if (type === "history") {
+    const text = payload.mode === "blame"
+      ? `${payload.commits?.length || 0} commits`
+      : `${payload.changeCount || 0} changes`;
+    return { text, title: `${payload.path || ""} · ${text}` };
   }
   return { text: "", title: "" };
 }

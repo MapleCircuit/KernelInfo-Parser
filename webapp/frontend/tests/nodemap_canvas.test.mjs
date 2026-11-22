@@ -315,7 +315,7 @@ test("SVG export draws groups, nodes, styled edges and labels with resolved colo
 test("settings: Edit Mode off, Kconfig folding on, auto engine by default", () => {
   assert.deepEqual(M.emptyCanvas().settings, {
     snap: false, grid: M.GRID_DEFAULT, editMode: false, kconfigCollapse: true, kconfigEngine: "", bgColor: "",
-    embedSessions: [{ id: "nms-1", name: "Canvas Session 1" }], followSession: "nms-1",
+    embedSessions: [{ id: "nms-1", name: "Canvas Session 1" }], followSession: "nms-1", layers: [],
   });
   const st = M.normalizeSettings({ editMode: true, kconfigCollapse: false, kconfigEngine: "tab-7", grid: 2 });
   assert.equal(st.editMode, true);
@@ -864,7 +864,7 @@ test("content scale: every non-group node scales its content; outer box stays wi
   M.setContentScale(n, 2);
   assert.deepEqual([n.w, n.h, n.scale], [600, 400, 2], "the footprint stays");
   assert.deepEqual(M.contentBox(n), { w: 300, h: 200, s: 2 });
-  assert.deepEqual(nodeBox(n), { width: 300, height: 200, transform: "scale(2)" });
+  assert.deepEqual(nodeBox(n), { width: 300, height: 200, transform: "translate3d(0px, 0px, 0) scale(2)" });
   assert.equal(M.normalizeNode(JSON.parse(JSON.stringify(n))).scale, 2, "persisted for nodes without auto-fit");
   M.setContentScale(n, 99);
   assert.equal(n.scale, M.SCALE_MAX);

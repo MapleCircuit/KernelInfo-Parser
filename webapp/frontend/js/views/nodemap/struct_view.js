@@ -1,20 +1,9 @@
 /**
- * struct_view.js - NodeMap struct node body from `GET /api/nodemap/{v}/struct/{name}`
- * (`webapp/API_ENDPOINTS.md` §4.14): fields, nested struct/union members, and the `#if` / `#ifdef` /
- * `#ifndef` / `#elif` / `#else` / `#endif` lines guarding them.
+ * struct_view.js - NodeMap struct node body from `GET /api/nodemap/{v}/struct/{name}` and
+ * `GET /api/tools/{v}/pahole/{name}` (`webapp/API_ENDPOINTS.md` §4.14): fields, nested struct/union
+ * members, `#if` / `#ifdef` lines, pointer/type follow links, and `layout` cache-line view.
  *
- * DOM-free (unit tested). `structRows()` turns a layout and the node's struct state into display rows
- * (shared by the HTML body and the SVG export); `renderStructBody()` draws them in the node's `list` or
- * `table` style. Toggles are `data-act` buttons the controller delegates:
- *   collapse     (data-key)  fold a nested struct/union                       (always)
- *   guard-fold   (data-key)  fold / unfold one #if branch                     (always)
- *   toggle-type  (data-key)  one member's type, an aggregate's with its subtree (Edit Mode)
- *   hide-item    (data-key)  hide / restore a member, aggregate, #if block or   (Edit Mode)
- *                           the outer conditions banner (key OUTER_KEY)
- *   all-types, guards        struct-wide type and guard-line toggles         (Edit Mode)
- * Every member row carries `data-key` (canvas_model.structItemKey) so edges can attach to a field.
- * The toolbar (`.nm-struct-bar`) exists in Edit Mode only; the definition's source shows in the node
- * header (`node_content.headMetaOf`).
+ * DOM-free (unit tested).
  */
 import { OUTER_KEY, structItemKey, typeVisible } from "./canvas_model.js";
 
@@ -42,6 +31,29 @@ export function flattenMembers(items, out = []) {
   return out;
 }
 
+/**
+ * Parse a referenced `struct` or `union` type from a C member type string (`struct task_struct *`,
+ * `const union foo`, `struct list_head`, etc.). Returns `{ kind, name, isPointer, edgeLabel }` or null.
+ */
+export function extractReferencedStruct(typeStr) {
+  const s = String(typeStr || "").trim();
+  if (!s || /\(\s*\*/.test(s)) {
+    // Function pointers: still inspect return/arg structs? Avoid noisy matches unless simple struct ptr
+    const fm = /\b(struct|union)\s+([A-Za-z_]\w*)\b/.exec(s);
+    if (!fm) return null;
+    return { kind: fm[1], name: fm[2], isPointer: s.includes("*"), edgeLabel: s.includes("*") ? "points to" : "embeds" };
+  }
+  const m = /\b(struct|union)\s+([A-Za-z_]\w*)\b/.exec(s);
+  if (!m) return null;
+  const isPointer = s.includes("*");
+  return {
+    kind: m[1],
+    name: m[2],
+    isPointer,
+    edgeLabel: isPointer ? "points to" : "embeds",
+  };
+}
+
 // ------------------------------------------------------------------ #if blocks and Kconfig truth
 
 /** Tri-state of a condition (the values `DirectiveEvaluator` uses). */
@@ -56,9 +68,6 @@ const OPENERS = new Set(["if", "ifdef", "ifndef"]);
 /**
  * The items of one layout level grouped into `#if` blocks:
  *   {kind: "guard", key, open, end, branches: [{key, dir, items}]}
- * (`key` of a block and of each branch is the structItemKey of its directive line). Members outside
- * any block, and directives that close or continue nothing, stay as they are; a block left open at the
- * end of the level ends there.
  */
 export function guardTree(items) {
   const root = [];
@@ -95,8 +104,7 @@ function macroOf(dir) {
 }
 
 /**
- * Truth of one directive's own condition under `evaluator` (a `DirectiveEvaluator`, or anything with
- * `isDefined(macro)` and `evalExpression(expr)`): `#else` is true, no evaluator is unknown.
+ * Truth of one directive's own condition under `evaluator`.
  */
 export function directiveTruth(evaluator, dir) {
   if (!evaluator) return U;
@@ -137,16 +145,12 @@ const condTitle = (conds) => (conds && conds.length ? `Built when: ${conds.join(
  * Display rows of a struct layout under the node's struct state `data`:
  *   opts.editMode   hidden items show dimmed with a restore button (else they are left out)
  *   opts.evaluator  Kconfig evaluator; branches it compiles out start folded (null: no auto-collapse)
- * Returns `{rows, tracks, typeCh, hidden, outerHidden}`: `tracks` is the number of nested `#if` bar
- * tracks, `typeCh` the width (ch) of the type column in table style, `hidden` how many items are hidden
- * (the outer conditions banner counts as one), `outerHidden` whether that banner is.
- * Row kinds: field, agg, pp (a directive line), summary (a folded branch). Each row has `depth`
- * (aggregate nesting) and `bars` ([level, "full"|"start"|"mid"|"end"] of the guard tracks it crosses);
- * directive rows also have `ppLevel`, how many `#if` blocks enclose the directive (its text indent).
+ *   opts.versionDiff optional diff result (`version_diff.js`) highlighting added/changed rows
  */
 export function structRows(layout, data, opts = {}) {
   const editMode = Boolean(opts.editMode);
   const evaluator = opts.evaluator || null;
+  const diffStatus = opts.versionDiff?.fieldStatus || null;
   const showGuards = Boolean(data.showGuards);
   const hiddenMap = data.hiddenItems || {};
   const manual = data.collapsedGuards || {};
@@ -187,16 +191,19 @@ export function structRows(layout, data, opts = {}) {
     if (own && !editMode) return;
     const dim = dimmed || own;
     const showType = typeVisible(data, key);
-    const base = { key, depth, bars: barsAt(level), line: it.line || null, conds: it.conds || [], hidden: own, dim, dead: eff === F, showType };
+    const diff = it.name && diffStatus ? diffStatus.get(it.name) || "" : "";
+    const base = { key, depth, bars: barsAt(level), line: it.line || null, conds: it.conds || [], hidden: own, dim, dead: eff === F, showType, diff };
     if (it.kind === "aggregate") {
       const folded = Boolean(data.collapsed?.[key]);
       const typeText = showType && it.type_name ? it.type_name.replace(/^(struct|union)\s+/, "") : "";
+      const refType = it.type_name ? extractReferencedStruct(`${it.tag} ${it.type_name}`) : null;
       noteType(`${it.tag} ${typeText}`, depth);
-      rows.push({ ...base, kind: "agg", tag: it.tag, typeText, label: it.type_name || `${it.tag} {…}`, name: it.name || "(anonymous)", folded, count: flattenMembers(it.children).length });
+      rows.push({ ...base, kind: "agg", tag: it.tag, typeText, label: it.type_name || `${it.tag} {…}`, name: it.name || "(anonymous)", folded, count: flattenMembers(it.children).length, refType });
       if (!folded) walk(it.children || [], depth + 1, level, eff, dim);
     } else {
       if (showType) noteType(it.type, depth);
-      rows.push({ ...base, kind: "field", type: showType ? it.type || "" : "", name: it.name, suffix: `${it.array || ""}${it.bits != null ? ` : ${it.bits}` : ""}` });
+      const refType = extractReferencedStruct(it.type);
+      rows.push({ ...base, kind: "field", type: showType ? it.type || "" : "", name: it.name, suffix: `${it.array || ""}${it.bits != null ? ` : ${it.bits}` : ""}`, refType });
     }
   };
 
@@ -226,18 +233,74 @@ export function structRows(layout, data, opts = {}) {
 
   walk(layout?.items || [], 0, 0, T, false);
   const outerHidden = Boolean(layout?.outer_conds?.length) && isHidden(OUTER_KEY);
-  // `hidden` counts the hidden items this layout reaches (inside a folded part they are not visited)
   return { rows, tracks, typeCh: Math.max(4, Math.min(48, typeCh + 1)), hidden: hiddenHit, outerHidden };
+}
+
+// ------------------------------------------------------------------ pahole layout rows (`style === "layout"`)
+
+/**
+ * Display rows for `style === "layout"` from `GET /api/tools/{v}/pahole/{name}` (`pahole`):
+ * interleaves 64-byte cache-line boundary markers (`kind: "cacheline"`), padding hole rows
+ * (`kind: "hole"`), and member rows (`kind: "field"`) with `offset`, `size`, `cachelineIdx`, and `refType`.
+ */
+export function paholeRows(pahole, data = {}) {
+  const members = Array.isArray(pahole?.members) ? pahole.members : [];
+  const rows = [];
+  let lastCl = -1;
+  let typeCh = 8;
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i];
+    const off = Number(m.offset) || 0;
+    const sz = Number(m.size) || 0;
+    const pad = Number(m.padding_before) || 0;
+    const cl = Number.isInteger(m.cacheline_idx) ? m.cacheline_idx : Math.floor(off / 64);
+    if (pad > 0) {
+      const holeOff = Math.max(0, off - pad);
+      const holeCl = Math.floor(holeOff / 64);
+      if (holeCl !== lastCl) {
+        lastCl = holeCl;
+        rows.push({ kind: "cacheline", cl: holeCl, offset: holeCl * 64, key: `cl:${holeCl}` });
+      }
+      rows.push({ kind: "hole", offset: holeOff, size: pad, key: `hole:${holeOff}` });
+    }
+    if (cl !== lastCl) {
+      lastCl = cl;
+      rows.push({ kind: "cacheline", cl, offset: cl * 64, key: `cl:${cl}` });
+    }
+    const type = data.showTypes !== false ? String(m.type || "") : "";
+    if (type) typeCh = Math.max(typeCh, type.length + 1);
+    const key = `po:${off}:${m.name || i}`;
+    rows.push({
+      kind: "field",
+      key,
+      offset: off,
+      size: sz,
+      cachelineIdx: cl,
+      crosses: Boolean(m.crosses_cacheline),
+      bitfield: m.bitfield_width != null ? `:${m.bitfield_width}` : "",
+      type,
+      name: String(m.name || "(anon)"),
+      estimated: Boolean(m.estimated),
+      refType: extractReferencedStruct(m.type),
+    });
+  }
+  return {
+    rows,
+    typeCh: Math.max(6, Math.min(40, typeCh)),
+    totalSize: Number(pahole?.total_size) || 0,
+    alignment: Number(pahole?.alignment) || 0,
+    paddingBytes: Number(pahole?.padding_bytes) || 0,
+    holesCount: Number(pahole?.holes_count) || 0,
+    cacheLines: Number(pahole?.cache_lines_used) || 0,
+    isEstimate: Boolean(pahole?.is_estimate),
+    optimization: pahole?.optimization || null,
+  };
 }
 
 // ------------------------------------------------------------------ HTML
 
 const BAR_W = 6; // canvas units per #if track (struct rows are zoom-controlled, not UI-scaled)
 
-/**
- * Scope bars of a row: absolute in the row's left gutter (list style), or inside the dedicated `#ifdef`
- * cell that starts every row of a table-style struct with tracks (`cell`).
- */
 function barsHtml(bars, cell = false) {
   const html = bars.map(([l, part]) => `<span class="nm-pp-bar nm-pp-${part} nm-pp-l${l % 4}" style="--nm-pp-level:${l}"></span>`).join("");
   return cell ? `<span class="nm-sf-ppcell" aria-hidden="true">${html}</span>` : html;
@@ -248,8 +311,14 @@ function hideBtn(r, editMode, key) {
   return `<button type="button" class="nm-sf-hide${r.hidden ? " on" : ""}" data-act="hide-item" data-key="${esc(key)}" title="${r.hidden ? "Restore" : "Hide"} this ${r.kind === "field" ? "member" : r.kind === "agg" ? "aggregate and its members" : "#if block"}">${r.hidden ? "↺" : "✕"}</button>`;
 }
 
+function followBtn(r) {
+  if (!r.refType) return "";
+  return `<button type="button" class="nm-sf-follow" data-act="follow-type" data-key="${esc(r.key)}" title="Follow ${esc(r.refType.kind)} ${esc(r.refType.name)} (${esc(r.refType.edgeLabel)})">↗</button>`;
+}
+
 function rowClass(r, extra) {
-  return `nm-sf ${extra}${r.dim ? " nm-sf-dim" : ""}${r.hidden ? " nm-sf-hidden" : ""}${r.dead ? " nm-sf-dead" : ""}`;
+  const diffCls = r.diff ? ` nm-sf-diff-${r.diff}` : "";
+  return `nm-sf ${extra}${r.dim ? " nm-sf-dim" : ""}${r.hidden ? " nm-sf-hidden" : ""}${r.dead ? " nm-sf-dead" : ""}${diffCls}`;
 }
 
 function rowHtml(r, data, editMode, table, cell = false) {
@@ -266,7 +335,6 @@ function rowHtml(r, data, editMode, table, cell = false) {
       ? `<button type="button" class="nm-sf-ppsum-label" data-act="guard-fold" data-key="${esc(r.key)}" title="Show the members of this branch">${r.count} member${r.count === 1 ? "" : "s"}${r.auto ? " · compiled out" : " · folded"}</button>`
       : "";
     const dirClass = r.directive ? ` nm-pp-${esc(r.directive)}` : "";
-    // Nested directives step in, one indent per enclosing #if block (fold chevron and text alike)
     const indent = r.ppLevel ? `<span class="nm-pp-indent" style="--nm-pp-lvl:${r.ppLevel}"></span>` : "";
     return `<div class="${rowClass(r, `nm-sf-pp${r.kind === "summary" ? " nm-sf-ppsum" : ""}${dirClass}${truth}`)}" data-pp-key="${esc(r.key)}" ${style} title="line ${esc(r.line)}${r.truth === "false" ? " · compiled out by the Kconfig engine" : r.truth === "true" ? " · built by the Kconfig engine" : ""}">
     ${barsHtml(r.bars, cell)}${indent}<span class="nm-sf-ctl">${fold}</span><span class="nm-sf-pptext">${esc(r.text)}</span>${summary}${line}${r.opener ? hideBtn(r, editMode, r.blockKey) : ""}
@@ -276,13 +344,14 @@ function rowHtml(r, data, editMode, table, cell = false) {
   const guarded = r.conds.length && !data.showGuards;
   const tt = editMode ? `<button type="button" class="nm-sf-tt${r.showType ? " on" : ""}" data-act="toggle-type" data-key="${esc(r.key)}" title="${r.showType ? "Hide" : "Show"} the type${r.kind === "agg" ? "s inside" : " of"} ${esc(r.kind === "agg" ? r.label : r.name)}">T</button>` : "";
   const marker = guarded ? `<span class="nm-sf-guard" aria-label="${esc(condTitle(r.conds))}">#</span>` : "";
+  const fl = followBtn(r);
   if (r.kind === "agg") {
     const fold = `<button type="button" class="nm-sf-fold" data-act="collapse" data-key="${esc(r.key)}" aria-expanded="${r.folded ? "false" : "true"}" title="${r.folded ? "Expand" : "Collapse"} ${esc(r.label)}">${r.folded ? "▸" : "▾"}</button>`;
     const typeCell = table
       ? `<span class="nm-sf-type nm-sf-cell"><span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? ` ${esc(r.typeText)}` : ""}</span>`
       : `<span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? `<span class="nm-sf-type">${esc(r.typeText)}</span>` : ""}`;
     return `<div class="${rowClass(r, `nm-sf-agg${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
   }
   const suffix = r.suffix ? `<span class="nm-sf-suffix">${esc(r.suffix)}</span>` : "";
@@ -290,14 +359,39 @@ function rowHtml(r, data, editMode, table, cell = false) {
     ? `<span class="nm-sf-type nm-sf-cell">${esc(r.type)}</span>`
     : (r.showType ? `<span class="nm-sf-type">${esc(r.type)}</span>` : "");
   return `<div class="${rowClass(r, `nm-sf-field${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
 }
 
-/**
- * The struct-wide conditions banner (`layout.outer_conds`): left out when hidden in View Mode, dimmed
- * with a restore button in Edit Mode (only the banner dims, never the member rows).
- */
+/** Render the 3rd struct window style `layout` (memory offsets, holes, 64-byte cache-line dividers). */
+export function renderPaholeBody(pahole, data = {}, opts = {}) {
+  if (!pahole || pahole.unavailable) {
+    const reason = pahole?.error ? `: ${esc(pahole.error)}` : "";
+    return `<div class="nm-status">Memory layout (pahole) unavailable for this revision${reason}. Switch to list or table style to inspect AST fields.</div>`;
+  }
+  const m = paholeRows(pahole, data);
+  const summary = `<div class="nm-layout-summary"><span>${m.totalSize}B</span><span>align ${m.alignment}B</span><span>${m.cacheLines} cache line${m.cacheLines === 1 ? "" : "s"}</span>${m.paddingBytes ? `<span class="nm-layout-pad-badge">${m.paddingBytes}B pad (${m.holesCount} hole${m.holesCount === 1 ? "" : "s"})</span>` : ""}${m.isEstimate ? '<span class="nm-layout-est">est.</span>' : ""}</div>`;
+  const rowsHtml = m.rows.map((r) => {
+    if (r.kind === "cacheline") {
+      return `<div class="nm-sf nm-sf-cl" data-pp-key="${esc(r.key)}"><span class="nm-sf-cl-label">Cache line ${r.cl} · +${r.offset}B</span></div>`;
+    }
+    if (r.kind === "hole") {
+      return `<div class="nm-sf nm-sf-hole" data-pp-key="${esc(r.key)}"><span class="nm-sf-off">+${r.offset}</span><span class="nm-sf-sz">${r.size}B</span><span class="nm-sf-hole-label">/* ${r.size} byte padding hole */</span></div>`;
+    }
+    const fl = followBtn(r);
+    return `<div class="nm-sf nm-sf-field nm-sf-layout${r.crosses ? " nm-sf-crosses" : ""}" data-key="${esc(r.key)}">
+      <span class="nm-port nm-port-field nm-port-left" data-field="${esc(r.key)}" data-side="left"></span>
+      <span class="nm-sf-off">+${r.offset}</span><span class="nm-sf-sz">${r.size}B</span>
+      ${r.type ? `<span class="nm-sf-type nm-sf-cell">${esc(r.type)}</span>` : ""}
+      <span class="nm-sf-name nm-sf-cell">${esc(r.name)}${r.bitfield ? `<span class="nm-sf-suffix">${esc(r.bitfield)}</span>` : ""}</span>
+      ${fl}${r.crosses ? '<span class="nm-sf-cross-tag" title="Crosses 64-byte cache-line boundary">⇄CL</span>' : ""}
+      <span class="nm-port nm-port-field nm-port-right" data-field="${esc(r.key)}" data-side="right"></span>
+    </div>`;
+  }).join("");
+  const diffHtml = opts.diffHtml || "";
+  return `${diffHtml}${summary}<div class="nm-struct-rows nm-scroll nm-style-layout" style="--nm-type-col:${m.typeCh}ch">${rowsHtml || '<div class="nm-empty">No members</div>'}</div>`;
+}
+
 function outerHtml(layout, model, editMode) {
   if (!layout.outer_conds?.length || (model.outerHidden && !editMode)) return "";
   const h = model.outerHidden;
@@ -308,27 +402,28 @@ function outerHtml(layout, model, editMode) {
 }
 
 /**
- * Body HTML of a struct node: the toolbar (Edit Mode only: struct-wide type and guard toggles, hidden
- * count), the outer conditions banner and the member rows in the node's style. `layout` is the
- * endpoint's response, `data` the node's struct state, `opts` as for `structRows()`.
+ * Body HTML of a struct node in `list`, `table`, or `layout` style.
  */
 export function renderStructBody(layout, data, opts = {}) {
+  if (data.style === "layout") {
+    return renderPaholeBody(opts.pahole || layout?.pahole || null, data, opts);
+  }
   const editMode = Boolean(opts.editMode);
   const table = data.style === "table";
   const directives = countDirectives(layout.items);
   const model = opts.model || structRows(layout, data, opts);
   const outer = outerHtml(layout, model, editMode);
+  const diffBanner = opts.diffHtml || "";
   const chips = editMode
     ? `<button type="button" class="nm-chip${data.showTypes ? " on" : ""}" data-act="all-types" aria-pressed="${data.showTypes}" title="Show or hide every member type">Types</button>
       <button type="button" class="nm-chip${data.showGuards ? " on" : ""}" data-act="guards" aria-pressed="${data.showGuards}" ${directives ? "" : "disabled"} title="${directives ? `Show or hide the ${directives} preprocessor lines` : "No preprocessor lines inside this definition"}">#ifdef${directives ? ` ${directives}` : ""}</button>`
     : "";
   const hiddenNote = editMode && model.hidden ? `<span class="nm-chip nm-chip-note" title="Hidden items show dimmed in Edit Mode">${model.hidden} hidden</span>` : "";
-  // Table style with #if tracks: the scope bars get their own bordered column on the left of every row
   const cell = table && model.tracks > 0;
   const rowsHtml = model.rows.map((r) => rowHtml(r, data, editMode, table, cell)).join("");
   const vars = `--nm-pp-tracks:${model.tracks};--nm-gutter:${model.tracks ? model.tracks * BAR_W + BAR_W : 0}px;--nm-type-col:${model.typeCh}ch`;
   const bar = editMode ? `<div class="nm-struct-bar">${chips}${hiddenNote}</div>` : "";
-  return `${bar}${outer}
+  return `${bar}${diffBanner}${outer}
     <div class="nm-struct-rows nm-scroll nm-style-${table ? "table" : "list"}${cell ? " nm-pp-cells" : ""}" style="${vars}">${rowsHtml || '<div class="nm-empty">No members</div>'}</div>`;
 }
 

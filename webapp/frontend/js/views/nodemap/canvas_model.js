@@ -1,38 +1,28 @@
 /**
- * canvas_model.js - NodeMap canvas document: schema, normalization, geometry, groups, selection and layout.
+ * canvas_model.js - NodeMap canvas document: schema, normalization, geometry, groups, selection,
+ * visibility layers, focus subgraph BFS, sub-map portals, tours, structural-sharing undo history,
+ * and async IndexedDB persistence (`webapp/API_FRONTEND.md` §5.3).
  *
  * DOM-free and dependency-free (unit tested in `webapp/frontend/tests/nodemap_canvas.test.mjs`). The
  * controller owns one canvas document per NodeMap tab; every mutation goes through these helpers so the
- * persisted JSON (localStorage and Export JSON) always has the shape `normalizeCanvas()` produces.
- *
- * Canvas JSON (`schema: "kip-nodemap-canvas"`, `version: 1`):
- *   { schema, version, nodes: [Node], edges: [Edge], viewport: {x, y, zoom},
- *     settings: {snap, grid, editMode, kconfigCollapse, kconfigEngine, bgColor, embedSessions, followSession} }
- *   Node  { id, type, x, y, w, h, title, customTitle, color, bgColor, hideHeader, groupId, version, repo,
- *           data, autoFit, baseW, baseH, scale }
- *   Edge  { id, from, to, fromSide, toSide, fromField, toField, label, arrow, style, curve, color }
- * `color` (accent) and `bgColor` (node / canvas background, `bgVar()`) are a preset accent id (`ACCENTS`)
- * or a custom `#rrggbb`; `""` is the theme default. `hideHeader` leaves the node header out in View Mode
- * (Edit Mode shows it dimmed). `scale` is the content scale of every non-group node: with `autoFit` the
- * node is sized to its content (`baseW`×`baseH` is the natural, unscaled size and `w`/`h` = base ×
- * `scale`); without it the outer box stays `w`×`h` and the content lays out in `w/scale`×`h/scale`
- * (`contentBox()`). `embedSessions` are the NodeMap-scoped embedded sessions its tab nodes run in
- * (`data.embedSessionId`), `followSession` the one whose Kconfig engines the canvas follows (`""` =
- * the host workspace session).
- *
- * `UndoStack` / `historySnapshot()` hold the controller's bounded undo / redo history of the document
- * (nodes, edges, settings; viewport, Edit Mode and snap are view state and stay out of it).
+ * persisted JSON (IndexedDB USER_STORE, localStorage fallback, and Export JSON) always has the shape
+ * `normalizeCanvas()` produces.
  */
 
 export const CANVAS_SCHEMA = "kip-nodemap-canvas";
 export const CANVAS_VERSION = 1;
 export const STORAGE_PREFIX = "kip-nodemap-canvas:";
+export const USER_CANVAS_KIND = "nodemap-canvas";
 
-export const NODE_TYPES = ["struct", "symbol", "source", "man", "tab", "note", "group", "diff", "mail", "kconfig", "maintainer"];
+export const NODE_TYPES = [
+  "struct", "symbol", "source", "man", "tab", "note", "group",
+  "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history",
+];
 /** Header badge of each node type (live node and SVG export). */
 export const NODE_BADGES = {
   struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group",
   diff: "diff", mail: "mail", kconfig: "kconfig", maintainer: "maint",
+  cve: "cve", kapi: "kapi", doc: "doc", history: "hist",
 };
 export const SIDES = ["auto", "top", "right", "bottom", "left"];
 export const ARROWS = ["none", "forward", "backward", "both"];
@@ -41,18 +31,39 @@ export const CURVES = ["bezier", "straight", "orthogonal"];
 export const SOURCE_MODES = ["file", "range", "symbol"];
 export const SYMBOL_KINDS = ["", "struct", "union", "function", "macro", "enum"];
 export const DIFF_MODES = ["file", "commit"];
+export const KAPI_CATALOGS = ["summary", "syscalls", "exports", "params", "tracepoints", "modules", "devices"];
+export const DOC_MODES = ["auto", "rst", "kernel-doc"];
+export const HISTORY_MODES = ["symbol", "blame"];
 export const ALIGN_MODES = ["left", "center", "right", "top", "middle", "bottom"];
-export const STRUCT_STYLES = ["list", "table"];
+export const STRUCT_STYLES = ["list", "table", "layout"];
 /** Node types whose content can be measured and scaled (`autoFit`); groups and live tab iframes cannot. */
-export const AUTOFIT_TYPES = ["struct", "symbol", "note", "source", "man", "diff", "mail", "kconfig", "maintainer"];
+export const AUTOFIT_TYPES = [
+  "struct", "symbol", "note", "source", "man", "diff", "mail", "kconfig", "maintainer",
+  "cve", "kapi", "doc", "history",
+];
 /** Node types a tab of the workspace can open (Open as tab, Copy to Session). */
-export const TAB_OPENABLE_TYPES = ["struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer"];
+export const TAB_OPENABLE_TYPES = [
+  "struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer",
+  "cve", "kapi", "doc", "history",
+];
 /** Node types whose content scales (`scale`): every type but groups. */
 export const scalable = (type) => type !== "group";
 export const SCALE_MIN = 0.2;
 export const SCALE_MAX = 4;
 /** Largest natural size an auto-fitted node takes (canvas units, before scaling). */
 export const AUTOFIT_MAX = { w: 4000, h: 8000 };
+
+/** Semantic edge presets (Edge Inspector quick style + label). */
+export const EDGE_PRESETS = [
+  { id: "", label: "Custom" },
+  { id: "calls", label: "calls", arrow: "forward", style: "solid", color: "blue" },
+  { id: "points to", label: "points to", arrow: "forward", style: "solid", color: "cyan" },
+  { id: "embeds", label: "embeds", arrow: "forward", style: "dashed", color: "purple" },
+  { id: "locks", label: "locks / RCU", arrow: "forward", style: "dashed", color: "orange" },
+  { id: "depends on", label: "depends on", arrow: "forward", style: "solid", color: "yellow" },
+  { id: "fixes", label: "fixes", arrow: "forward", style: "solid", color: "green" },
+  { id: "replies to", label: "replies to", arrow: "forward", style: "solid", color: "pink" },
+];
 
 /** Preset accents: ids map to theme tokens, so every theme (dark, light, high contrast) recolors them. */
 export const ACCENTS = [
@@ -151,6 +162,10 @@ export const SIZE_LIMITS = {
   mail: { w: 480, h: 360, minW: 240, minH: 120, maxW: 1800, maxH: 2400 },
   kconfig: { w: 340, h: 300, minW: 200, minH: 100, maxW: 1400, maxH: 2000 },
   maintainer: { w: 380, h: 320, minW: 220, minH: 100, maxW: 1400, maxH: 2000 },
+  cve: { w: 420, h: 360, minW: 240, minH: 140, maxW: 1600, maxH: 2400 },
+  kapi: { w: 400, h: 340, minW: 240, minH: 120, maxW: 1600, maxH: 2400 },
+  doc: { w: 480, h: 380, minW: 260, minH: 140, maxW: 2000, maxH: 2400 },
+  history: { w: 440, h: 340, minW: 240, minH: 140, maxW: 1800, maxH: 2400 },
 };
 
 export const GRID_DEFAULT = 20;
@@ -185,7 +200,7 @@ const trueMap = (m) => {
 };
 
 /** Type-specific payload, normalized. */
-export function normalizeData(type, raw) {
+export function normalizeData(type, raw, depth = 0) {
   const d = isObj(raw) ? raw : {};
   switch (type) {
     case "struct":
@@ -279,8 +294,37 @@ export function normalizeData(type, raw) {
         query: str(d.query, "", 256),
         path: str(d.path, "", 1024),
       };
+    case "cve":
+      return {
+        cveId: str(d.cveId, "", 64).trim().toUpperCase(),
+        release: str(d.release, "", 128).trim(),
+        filePath: str(d.filePath, "", 1024).trim(),
+      };
+    case "kapi":
+      return {
+        catalog: pick(d.catalog, KAPI_CATALOGS, "summary"),
+        query: str(d.query, "", 256).trim(),
+        symbol: str(d.symbol, "", 256).trim(),
+        arch: str(d.arch, "", 64).trim() || "x86_64",
+      };
+    case "doc":
+      return {
+        path: str(d.path, "", 1024).trim(),
+        mode: pick(d.mode, DOC_MODES, "auto"),
+        functions: str(d.functions, "", 256).trim(),
+      };
+    case "history":
+      return {
+        mode: pick(d.mode, HISTORY_MODES, "symbol"),
+        path: str(d.path, "", 1024).trim(),
+        line: posInt(d.line) || 1,
+        name: str(d.name, "", 256).trim(),
+        astId: Number.isInteger(d.astId) ? d.astId : null,
+      };
     case "note":
       return { text: str(d.text, "", 20000), markdown: d.markdown !== false };
+    case "group":
+      return depth < 8 && isObj(d.subCanvas) ? { subCanvas: normalizeCanvas(d.subCanvas, depth + 1) } : {};
     default:
       return {};
   }
@@ -306,7 +350,7 @@ export function defaultTitle(type, data) {
     case "note":
       return "Note";
     case "group":
-      return "Group";
+      return data.subCanvas ? "Sub-Map" : "Group";
     case "diff":
       if (data.mode === "commit") return data.commitHash ? `${data.path ? `${data.path.split("/").pop()} @ ` : ""}${data.commitHash.slice(0, 12)}` : "Commit diff";
       return data.path ? `${data.path.split("/").pop()} · ${data.versionA || "?"}..${data.versionB || "?"}` : "Diff";
@@ -316,6 +360,15 @@ export function defaultTitle(type, data) {
       return data.symbol ? `CONFIG_${data.symbol}` : "Kconfig symbol";
     case "maintainer":
       return data.title || data.path || data.query || "Maintainers";
+    case "cve":
+      return data.cveId || (data.filePath ? `CVEs · ${data.filePath.split("/").pop()}` : "CVE Record");
+    case "kapi":
+      return data.symbol ? `KAPI · ${data.symbol}` : data.query ? `KAPI · ${data.query}` : `Kernel API (${data.catalog || "summary"})`;
+    case "doc":
+      return data.path ? data.path.split("/").pop() : "Kernel Docs";
+    case "history":
+      if (data.mode === "blame") return data.path ? `Blame · ${data.path.split("/").pop()}` : "File Blame";
+      return data.name ? `History · ${data.name}` : (data.path ? `History · ${data.path.split("/").pop()}:${data.line || 1}` : "Symbol History");
     default:
       return "Node";
   }
@@ -327,11 +380,11 @@ export function displayTitle(node) {
 }
 
 /** One node, normalized (null when it cannot be repaired: unknown type). */
-export function normalizeNode(raw) {
+export function normalizeNode(raw, depth = 0) {
   if (!isObj(raw) || !NODE_TYPES.includes(raw.type)) return null;
   const type = raw.type;
   const lim = SIZE_LIMITS[type];
-  const data = normalizeData(type, raw.data);
+  const data = normalizeData(type, raw.data, depth);
   const autoFit = AUTOFIT_TYPES.includes(type) && raw.autoFit === true;
   let w = Math.round(clamp(num(raw.w, lim.w), lim.minW, lim.maxW));
   let h = Math.round(clamp(num(raw.h, lim.h), lim.minH, lim.maxH));
@@ -356,6 +409,7 @@ export function normalizeNode(raw) {
     bgColor: normalizeColor(raw.bgColor),
     hideHeader: raw.hideHeader === true,
     groupId: typeof raw.groupId === "string" && ID_RE.test(raw.groupId) ? raw.groupId : null,
+    layerId: typeof raw.layerId === "string" && ID_RE.test(raw.layerId) ? raw.layerId : "",
     version: str(raw.version, "", 256),
     repo: str(raw.repo, "", 128),
     data,
@@ -369,6 +423,26 @@ export function normalizeNode(raw) {
 /** A new node of `type` with defaults filled in. */
 export function createNode(type, opts = {}) {
   return normalizeNode({ ...opts, type, id: opts.id || newId("n") });
+}
+
+function normalizeWaypoints(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const w of raw.slice(0, 64)) {
+    if (!isObj(w)) continue;
+    const x = num(w.x, NaN);
+    const y = num(w.y, NaN);
+    if (Number.isFinite(x) && Number.isFinite(y)) out.push({ x: Math.round(x), y: Math.round(y) });
+  }
+  return out;
+}
+
+function normalizeCallSite(raw) {
+  if (!isObj(raw)) return null;
+  const path = str(raw.path, "", 1024);
+  if (!path) return null;
+  const line = posInt(raw.line) || 1;
+  return { path, line };
 }
 
 /** One edge, normalized (null without both ends). */
@@ -391,6 +465,9 @@ export function normalizeEdge(raw, nodeIds = null) {
     style: pick(raw.style, LINE_STYLES, "solid"),
     curve: pick(raw.curve, CURVES, "bezier"),
     color: normalizeColor(raw.color),
+    waypoints: normalizeWaypoints(raw.waypoints),
+    layerId: typeof raw.layerId === "string" && ID_RE.test(raw.layerId) ? raw.layerId : "",
+    callSite: normalizeCallSite(raw.callSite),
   };
 }
 
@@ -398,15 +475,132 @@ export function createEdge(opts = {}) {
   return normalizeEdge({ ...opts, id: opts.id || newId("e") });
 }
 
+/** Apply a semantic edge preset (`EDGE_PRESETS`) to an edge object (mutated). */
+export function applyEdgePreset(edge, presetId) {
+  const p = EDGE_PRESETS.find((x) => x.id === presetId);
+  if (!edge || !p || !p.id) return false;
+  edge.label = p.label;
+  edge.arrow = p.arrow;
+  edge.style = p.style;
+  edge.color = p.color;
+  return true;
+}
+
+// ------------------------------------------------------------------ visibility layers
+
+function normalizeLayers(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const l of raw.slice(0, 64)) {
+    if (!isObj(l) || typeof l.id !== "string" || !ID_RE.test(l.id) || seen.has(l.id)) continue;
+    seen.add(l.id);
+    out.push({
+      id: l.id,
+      name: str(l.name, "", 128).trim() || l.id,
+      visible: l.visible !== false,
+      color: normalizeColor(l.color) || "blue",
+    });
+  }
+  return out;
+}
+
+export function addLayer(settings, name = "", color = "blue") {
+  if (!settings) return null;
+  if (!Array.isArray(settings.layers)) settings.layers = [];
+  if (settings.layers.length >= 64) return null;
+  const layer = {
+    id: newId("lyr"),
+    name: str(name, "", 128).trim() || `Layer ${settings.layers.length + 1}`,
+    visible: true,
+    color: normalizeColor(color) || "blue",
+  };
+  settings.layers.push(layer);
+  return layer;
+}
+
+export function toggleLayerVisibility(settings, id) {
+  const layer = (settings?.layers || []).find((l) => l.id === id);
+  if (!layer) return null;
+  layer.visible = !layer.visible;
+  return layer.visible;
+}
+
+export function removeLayer(canvas, id) {
+  if (!canvas?.settings?.layers) return false;
+  const before = canvas.settings.layers.length;
+  canvas.settings.layers = canvas.settings.layers.filter((l) => l.id !== id);
+  if (canvas.settings.layers.length === before) return false;
+  for (const n of canvas.nodes || []) if (n.layerId === id) n.layerId = "";
+  for (const e of canvas.edges || []) if (e.layerId === id) e.layerId = "";
+  return true;
+}
+
+export function isLayerVisible(settings, layerId) {
+  if (!layerId) return true;
+  const layer = (settings?.layers || []).find((l) => l.id === layerId);
+  return layer ? layer.visible !== false : true;
+}
+
+/** Filter canvas nodes & edges to only those visible in active visibility layers. */
+export function visibleCanvasSlice(canvas) {
+  if (!canvas) return canvas;
+  const st = canvas.settings || {};
+  if (!st.layers?.length) return canvas;
+  const visNodes = canvas.nodes.filter((n) => isLayerVisible(st, n.layerId));
+  const visIds = new Set(visNodes.map((n) => n.id));
+  const visEdges = canvas.edges.filter((e) => visIds.has(e.from) && visIds.has(e.to) && isLayerVisible(st, e.layerId));
+  return { ...canvas, nodes: visNodes, edges: visEdges };
+}
+
+// ------------------------------------------------------------------ tours normalization
+
+function normalizeTours(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const t of raw.slice(0, 32)) {
+    if (!isObj(t) || typeof t.id !== "string" || !ID_RE.test(t.id) || seen.has(t.id)) continue;
+    seen.add(t.id);
+    const steps = [];
+    const stepSeen = new Set();
+    for (const s of Array.isArray(t.steps) ? t.steps.slice(0, 200) : []) {
+      if (!isObj(s)) continue;
+      const sid = typeof s.id === "string" && ID_RE.test(s.id) && !stepSeen.has(s.id) ? s.id : newId("step");
+      stepSeen.add(sid);
+      const vp = isObj(s.viewport) ? s.viewport : {};
+      steps.push({
+        id: sid,
+        title: str(s.title, "", 256) || "Step",
+        caption: str(s.caption, "", 2000),
+        nodeIds: Array.isArray(s.nodeIds) ? s.nodeIds.filter((x) => typeof x === "string" && ID_RE.test(x)).slice(0, 500) : [],
+        edgeIds: Array.isArray(s.edgeIds) ? s.edgeIds.filter((x) => typeof x === "string" && ID_RE.test(x)).slice(0, 500) : [],
+        viewport: { x: Math.round(num(vp.x, 0)), y: Math.round(num(vp.y, 0)), zoom: clamp(num(vp.zoom, 1), ZOOM_MIN, ZOOM_MAX) },
+      });
+    }
+    out.push({ id: t.id, title: str(t.title, "", 128).trim() || "Walkthrough", steps });
+  }
+  return out;
+}
+
 export function emptyCanvas() {
-  return { schema: CANVAS_SCHEMA, version: CANVAS_VERSION, nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 }, settings: normalizeSettings({}) };
+  return {
+    schema: CANVAS_SCHEMA,
+    version: CANVAS_VERSION,
+    nodes: [],
+    edges: [],
+    viewport: { x: 0, y: 0, zoom: 1 },
+    settings: normalizeSettings({}),
+    tours: [],
+  };
 }
 
 /**
  * Canvas-wide settings: snap grid; `editMode` (node editing controls shown); `kconfigCollapse` (fold #if
  * branches a Kconfig engine compiles out) and `kconfigEngine` (engine tab id, `""` = the engine of each
  * node's revision); `bgColor` the canvas background (`bgVar()` over `--bg-canvas`); `embedSessions`
- * (1+ `{id, name}`) and `followSession` (`""` or one of their ids, default the first).
+ * (1+ `{id, name}`) and `followSession` (`""` or one of their ids, default the first); `layers`
+ * (visibility layers `[{id, name, visible, color}]`).
  */
 export function normalizeSettings(raw) {
   const st = isObj(raw) ? raw : {};
@@ -421,6 +615,7 @@ export function normalizeSettings(raw) {
     embedSessions,
     followSession: typeof st.followSession === "string" && (st.followSession === "" || embedSessions.some((x) => x.id === st.followSession))
       ? st.followSession : embedSessions[0].id,
+    layers: normalizeLayers(st.layers),
   };
 }
 
@@ -491,12 +686,12 @@ export function removeEmbedSession(canvas, id) {
  * not an object). Invalid nodes and dangling edges are dropped; group references to missing or cyclic
  * groups are cleared.
  */
-export function normalizeCanvas(raw) {
+export function normalizeCanvas(raw, depth = 0) {
   if (!isObj(raw) || raw.schema !== CANVAS_SCHEMA || raw.version !== CANVAS_VERSION || !Array.isArray(raw.nodes)) return null;
   const nodes = [];
   const seen = new Set();
   for (const n of raw.nodes.slice(0, 5000)) {
-    const node = normalizeNode(n);
+    const node = normalizeNode(n, depth);
     if (!node || seen.has(node.id)) continue;
     seen.add(node.id);
     nodes.push(node);
@@ -523,6 +718,7 @@ export function normalizeCanvas(raw) {
     edges,
     viewport: { x: num(vp.x, 0), y: num(vp.y, 0), zoom: clamp(num(vp.zoom, 1), ZOOM_MIN, ZOOM_MAX) },
     settings: normalizeSettings(raw.settings),
+    tours: normalizeTours(raw.tours),
   };
 }
 
@@ -546,6 +742,7 @@ export function serializeCanvas(canvas) {
     edges: canvas.edges,
     viewport: canvas.viewport,
     settings: canvas.settings,
+    tours: canvas.tours || [],
   }));
 }
 
@@ -583,6 +780,139 @@ export function saveCanvas(storage, key, canvas) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Persist a canvas asynchronously to IndexedDB `USER_STORE` (`localDB.userPut`, `kind: "nodemap-canvas"`),
+ * falling back to synchronous `localStorage` when IndexedDB is unavailable (e.g. unit tests or private mode).
+ */
+export async function saveCanvasAsync(userDb, key, canvas, meta = {}, fallbackStorage = null) {
+  const data = serializeCanvas(canvas);
+  if (userDb && typeof userDb.userPut === "function") {
+    try {
+      const now = Date.now();
+      const rec = {
+        key,
+        kind: USER_CANVAS_KIND,
+        repo: String(meta.repo || ""),
+        id: String(meta.id || key),
+        created_at: Number(meta.created_at) || now,
+        updated_at: now,
+        data,
+      };
+      const ok = await userDb.userPut(rec);
+      if (ok) return { ok: true, backend: "indexeddb", created_at: rec.created_at };
+    } catch {
+      // fall back to localStorage
+    }
+  }
+  const ok = saveCanvas(fallbackStorage, key, data);
+  return { ok, backend: "localStorage", created_at: meta.created_at || null };
+}
+
+/**
+ * Load a canvas asynchronously from IndexedDB `USER_STORE` (`localDB.userGet`), falling back to
+ * `localStorage` when absent or unavailable.
+ */
+export async function loadCanvasAsync(userDb, key, fallbackStorage = null) {
+  if (userDb && typeof userDb.userGet === "function") {
+    try {
+      const rec = await userDb.userGet(key);
+      if (rec?.data) {
+        const canvas = normalizeCanvas(rec.data);
+        if (canvas) return { canvas, created_at: rec.created_at || null, backend: "indexeddb" };
+      }
+    } catch {
+      // fall back to localStorage
+    }
+  }
+  const canvas = loadCanvas(fallbackStorage, key);
+  return { canvas, created_at: null, backend: "localStorage" };
+}
+
+// ------------------------------------------------------------------ Sub-Map Portals
+
+/** Convert a `group` node into a Sub-Map portal (creates an empty nested child canvas if absent). */
+export function convertGroupToSubMap(groupNode) {
+  if (!groupNode || groupNode.type !== "group") return null;
+  if (!isObj(groupNode.data)) groupNode.data = {};
+  if (!groupNode.data.subCanvas) {
+    groupNode.data.subCanvas = emptyCanvas();
+    if (!groupNode.customTitle && groupNode.title === "Group") groupNode.title = "Sub-Map";
+  }
+  return groupNode.data.subCanvas;
+}
+
+/**
+ * Resolve a breadcrumb path of `group` portal ids `[g1, g2, ...]` from `rootCanvas`:
+ * returns `{ canvas, trail: [{ id, title, groupNode }] }`. Invalid ids stop traversal cleanly.
+ */
+export function resolveSubMapAtPath(rootCanvas, pathIds = []) {
+  let cur = rootCanvas;
+  const trail = [];
+  for (const id of Array.isArray(pathIds) ? pathIds : []) {
+    const grp = cur?.nodes?.find((n) => n.id === id && n.type === "group");
+    if (!grp?.data?.subCanvas) break;
+    trail.push({ id: grp.id, title: displayTitle(grp), groupNode: grp });
+    cur = grp.data.subCanvas;
+  }
+  return { canvas: cur, trail };
+}
+
+// ------------------------------------------------------------------ Focus / Trace BFS
+
+/**
+ * Connected subgraph reachable from `seedNodeIds` within `maxHops` undirected edge hops.
+ * Returns `{ nodeIds: Set<string>, edgeIds: Set<string>, distances: Map<string, number> }`.
+ */
+export function connectedSubgraph(canvas, seedNodeIds, maxHops = 1) {
+  const limit = maxHops === Infinity || maxHops < 0 ? Infinity : Math.max(0, Math.floor(Number(maxHops) || 0));
+  const seeds = [...(seedNodeIds || [])].filter(Boolean);
+  const nodeIds = new Set();
+  const edgeIds = new Set();
+  const distances = new Map();
+  if (!canvas || !seeds.length) return { nodeIds, edgeIds, distances };
+
+  const adj = new Map();
+  for (const e of canvas.edges || []) {
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    if (!adj.has(e.to)) adj.set(e.to, []);
+    adj.get(e.from).push({ other: e.to, edgeId: e.id });
+    adj.get(e.to).push({ other: e.from, edgeId: e.id });
+  }
+
+  const validIds = new Set((canvas.nodes || []).map((n) => n.id));
+  const queue = [];
+  for (const id of seeds) {
+    if (!validIds.has(id) || nodeIds.has(id)) continue;
+    nodeIds.add(id);
+    distances.set(id, 0);
+    queue.push(id);
+  }
+
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++];
+    const dist = distances.get(cur);
+    if (dist >= limit) continue;
+    for (const { other, edgeId } of adj.get(cur) || []) {
+      edgeIds.add(edgeId);
+      if (!nodeIds.has(other) && validIds.has(other)) {
+        nodeIds.add(other);
+        distances.set(other, dist + 1);
+        queue.push(other);
+      }
+    }
+  }
+  // Include edges between already-discovered nodes within hop limit
+  for (const e of canvas.edges || []) {
+    if (nodeIds.has(e.from) && nodeIds.has(e.to)) {
+      const da = distances.get(e.from);
+      const db = distances.get(e.to);
+      if (da < limit || db < limit || limit === Infinity) edgeIds.add(e.id);
+    }
+  }
+  return { nodeIds, edgeIds, distances };
 }
 
 // ------------------------------------------------------------------ geometry
@@ -1023,24 +1353,103 @@ export function toggleGuardCollapse(structData, key, autoCollapsed = false) {
   return next;
 }
 
-// ------------------------------------------------------------------ undo / redo
+// ------------------------------------------------------------------ undo / redo (structural sharing)
 
 /** Settings that are view state, not document: undo never flips them. */
 const VIEW_SETTINGS = ["editMode", "snap"];
 
-/** Comparable snapshot (JSON text) of what undo restores: nodes, edges and the document settings. */
+/** Comparable snapshot (JSON text) of what undo restores: nodes, edges, tours and document settings. */
 export function historySnapshot(canvas) {
   const settings = { ...(canvas?.settings || {}) };
   for (const k of VIEW_SETTINGS) delete settings[k];
-  return JSON.stringify({ nodes: canvas?.nodes || [], edges: canvas?.edges || [], settings });
+  return JSON.stringify({
+    nodes: canvas?.nodes || [],
+    edges: canvas?.edges || [],
+    tours: canvas?.tours || [],
+    settings,
+  });
 }
 
 /**
- * Bounded undo / redo history of snapshots. `base` is the document as last seen; `record(snap)` pushes the
- * previous base when the document changed (no-op snapshots are not pushed) and clears the redo stack;
- * consecutive records with the same `coalesce` key (live color drags, typing) fold into one step, up to
- * and including the record that has `end` set (the final change event of that edit).
- * `absorb(snap)` takes a change that is not the user's (auto-fit sizes, a resolved man page) into the base.
+ * Lightweight structural snapshot sharing unchanged serialized node/edge entries with `prev` (a prior
+ * structural snapshot), eliminating redundant full-canvas JSON duplication across the undo stack.
+ */
+export function structuralSnapshot(canvas, prev = null) {
+  const settings = { ...(canvas?.settings || {}) };
+  for (const k of VIEW_SETTINGS) delete settings[k];
+  const settingsJson = JSON.stringify(settings);
+  const toursJson = JSON.stringify(canvas?.tours || []);
+
+  const prevNodes = prev?.__structural ? prev.nodeMap : null;
+  const nodeMap = new Map();
+  const nodeOrder = [];
+  for (const n of canvas?.nodes || []) {
+    const js = JSON.stringify(n);
+    const prevJs = prevNodes?.get(n.id);
+    // Share the existing immutable string reference whenever the serialized item matches
+    nodeMap.set(n.id, prevJs === js ? prevJs : js);
+    nodeOrder.push(n.id);
+  }
+
+  const prevEdges = prev?.__structural ? prev.edgeMap : null;
+  const edgeMap = new Map();
+  const edgeOrder = [];
+  for (const e of canvas?.edges || []) {
+    const js = JSON.stringify(e);
+    const prevJs = prevEdges?.get(e.id);
+    edgeMap.set(e.id, prevJs === js ? prevJs : js);
+    edgeOrder.push(e.id);
+  }
+
+  const sameSettings = prev?.__structural && prev.settingsJson === settingsJson && prev.toursJson === toursJson;
+  return {
+    __structural: true,
+    nodeMap,
+    nodeOrder,
+    edgeMap,
+    edgeOrder,
+    settingsJson: sameSettings ? prev.settingsJson : settingsJson,
+    toursJson: sameSettings ? prev.toursJson : toursJson,
+  };
+}
+
+/** Materialize a structural (or string) snapshot into `{ nodes, edges, tours, settings }`. */
+export function materializeSnapshot(snap) {
+  if (!snap) return null;
+  if (typeof snap === "string") return JSON.parse(snap);
+  if (snap.__structural) {
+    return {
+      nodes: snap.nodeOrder.map((id) => JSON.parse(snap.nodeMap.get(id))),
+      edges: snap.edgeOrder.map((id) => JSON.parse(snap.edgeMap.get(id))),
+      tours: JSON.parse(snap.toursJson || "[]"),
+      settings: JSON.parse(snap.settingsJson || "{}"),
+    };
+  }
+  return snap;
+}
+
+function snapshotsEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a === "string" || typeof b === "string") return false;
+  if (!a.__structural || !b.__structural) return false;
+  if (a.settingsJson !== b.settingsJson || a.toursJson !== b.toursJson) return false;
+  if (a.nodeOrder.length !== b.nodeOrder.length || a.edgeOrder.length !== b.edgeOrder.length) return false;
+  for (let i = 0; i < a.nodeOrder.length; i++) {
+    const id = a.nodeOrder[i];
+    if (id !== b.nodeOrder[i] || a.nodeMap.get(id) !== b.nodeMap.get(id)) return false;
+  }
+  for (let i = 0; i < a.edgeOrder.length; i++) {
+    const id = a.edgeOrder[i];
+    if (id !== b.edgeOrder[i] || a.edgeMap.get(id) !== b.edgeMap.get(id)) return false;
+  }
+  return true;
+}
+
+/**
+ * Bounded undo / redo history of snapshots (string or structural-sharing). `base` is the document as last
+ * seen; `record(snap)` pushes the previous base when the document changed (no-op snapshots are not pushed)
+ * and clears the redo stack; consecutive records with the same `coalesce` key fold into one step.
+ * `absorb(snap)` takes a non-user change into the base.
  */
 export class UndoStack {
   constructor(limit = 80) {
@@ -1082,7 +1491,7 @@ export class UndoStack {
       this.base = snap;
       return false;
     }
-    if (snap === this.base) {
+    if (snapshotsEqual(snap, this.base)) {
       // A no-op of another kind, or the `end` of the run, ends a coalescing run
       if (end || coalesce !== this.lastKey) this.lastKey = null;
       return false;
@@ -1102,7 +1511,7 @@ export class UndoStack {
 
   /** Snapshot to restore (the step before `current`), or null when there is none. */
   undo(current) {
-    if (current !== undefined && current !== null && current !== this.base) this.record(current);
+    if (current !== undefined && current !== null && !snapshotsEqual(current, this.base)) this.record(current);
     if (!this.undoList.length) return null;
     this.redoList.push(this.base);
     this.base = this.undoList.pop();
@@ -1112,7 +1521,7 @@ export class UndoStack {
 
   /** Snapshot to restore (the step undone last), or null; a change since the undo drops the redo stack. */
   redo(current) {
-    if (current !== undefined && current !== null && current !== this.base) {
+    if (current !== undefined && current !== null && !snapshotsEqual(current, this.base)) {
       this.record(current);
       return null;
     }

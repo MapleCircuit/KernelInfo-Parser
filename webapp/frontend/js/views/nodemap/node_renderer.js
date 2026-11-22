@@ -1,25 +1,13 @@
 /**
  * node_renderer.js - Incremental DOM of NodeMap nodes (`webapp/API_FRONTEND.md` §5.3.2).
  *
- * One element per node, kept across updates: moving, resizing, recoloring or retitling a node patches
- * its element, and the body is rebuilt only when the node's content key changes, so a live tab iframe,
- * a man page or a scrolled source slice survives drags. Pointer handling is delegated to the controller
- * (one listener set on the canvas); elements only carry `data-*` hooks:
- *   .nm-node[data-node-id]   .nm-node-head (drag handle)   .nm-title (inline title edit)
- *   .nm-head-meta            source reference (`headMeta` hook) before the header tools
- *   .nm-rz[data-rz]          resize handles (n, s, e, w, ne, nw, se, sw)
- *   .nm-port[data-side]      side ports; struct rows add .nm-port-field[data-field]
- *   [data-act]               header and body buttons
- * Every non-group node has a content scale (`scale`): an auto-fitted node (`autoFit`) lays out at its
- * natural `baseW`×`baseH`, any other at `w/scale`×`h/scale` (`contentBox()`), and is drawn scaled by
- * `scale` (transform origin top left), so its on-screen box is `w`×`h` and content grows and shrinks
- * with it; field rows scale along (wires still meet them), side ports and resize handles are
- * counter-scaled (`--nm-scale`) so they keep their on-screen size.
- * `hideHeader` sets `.nm-head-hidden` (nodemap.css: dimmed header in Edit Mode, none in View Mode);
- * `bgColor` sets `--nm-node-bg` (`.nm-has-bg`).
+ * Uses GPU `translate3d(x, y, 0)` transforms for layout-free dragging, viewport LOD culling
+ * (`content-visibility: hidden` off-screen and low-detail mode below 25% zoom), and visibility
+ * layer filtering.
  */
-import { NODE_BADGES, accentVar, bgVar, contentBox, displayTitle, paintOrder } from "./canvas_model.js";
+import { NODE_BADGES, accentVar, bgVar, contentBox, displayTitle, isLayerVisible, paintOrder } from "./canvas_model.js";
 import { esc } from "./struct_view.js";
+import { isNodeInViewport, lodTierForViewport } from "./virtual_source.js";
 
 const HANDLES = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 const SIDE_PORTS = ["top", "right", "bottom", "left"];
@@ -33,11 +21,17 @@ export function contentKey(node, extra = "") {
   return JSON.stringify([node.type, node.version, node.repo, node.data, extra]);
 }
 
-/** CSS box and transform of a node element: its content box, scaled by the content scale. */
+/** CSS box and GPU transform of a node element: positioned with `translate3d(x, y, 0)` + content scale. */
 export function nodeBox(node) {
   const box = contentBox(node);
   const r = (v) => Math.round(v * 100) / 100;
-  return { width: r(box.w), height: r(box.h), transform: box.s !== 1 ? `scale(${box.s})` : "" };
+  const tx = Math.round(node.x || 0);
+  const ty = Math.round(node.y || 0);
+  return {
+    width: r(box.w),
+    height: r(box.h),
+    transform: box.s !== 1 ? `translate3d(${tx}px, ${ty}px, 0) scale(${box.s})` : `translate3d(${tx}px, ${ty}px, 0)`,
+  };
 }
 
 export class NodeRenderer {
@@ -66,7 +60,7 @@ export class NodeRenderer {
   }
 
   /** Bring the DOM in line with `nodes`; `selected` (Set) and `active` (interacting node id) set classes. */
-  sync(nodes, selected, active = null) {
+  sync(nodes, selected, active = null, settings = null) {
     const live = new Set(nodes.map((n) => n.id));
     for (const [id, el] of this.els) {
       if (!live.has(id)) {
@@ -76,8 +70,6 @@ export class NodeRenderer {
         this.keys.delete(id);
       }
     }
-    // Paint order inside each z tier (nodemap.css: groups < wires < nodes); elements already in place
-    // are not moved, since moving an iframe reloads it
     let prev = null;
     for (const node of paintOrder(nodes)) {
       let el = this.els.get(node.id);
@@ -85,7 +77,7 @@ export class NodeRenderer {
         el = this.create(node);
         this.els.set(node.id, el);
       }
-      this.patch(el, node, selected.has(node.id), active === node.id);
+      this.patch(el, node, selected.has(node.id), active === node.id, settings);
       if (!el.isConnected || (prev && el.previousElementSibling !== prev && !this.orderedAfter(prev, el))) {
         if (prev) prev.after(el);
         else this.layer.appendChild(el);
@@ -117,23 +109,24 @@ export class NodeRenderer {
     return el;
   }
 
-  patch(el, node, isSelected, isActive) {
+  patch(el, node, isSelected, isActive, settings = null) {
     this.place(el, node);
     el.classList.toggle("selected", isSelected);
     el.classList.toggle("nm-interacting", isActive);
     el.classList.toggle("nm-has-accent", Boolean(node.color));
     el.classList.toggle("nm-autofit", Boolean(node.autoFit));
     el.classList.toggle("nm-scaled", node.type !== "group" && Boolean(node.scale) && node.scale !== 1);
-    el.style.setProperty("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
+    el.classList.toggle("nm-submap-portal", node.type === "group" && Boolean(node.data?.subCanvas));
+    el.classList.toggle("nm-layer-hidden", settings ? !isLayerVisible(settings, node.layerId) : false);
+    el.style?.setProperty?.("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
     el.classList.toggle("nm-head-hidden", Boolean(node.hideHeader));
     el.classList.toggle("nm-has-bg", Boolean(node.bgColor));
-    if (node.bgColor) el.style.setProperty("--nm-node-bg", bgVar(node.bgColor, "var(--bg-secondary)"));
-    else el.style.removeProperty?.("--nm-node-bg");
+    if (node.bgColor) el.style?.setProperty?.("--nm-node-bg", bgVar(node.bgColor, "var(--bg-secondary)"));
+    else el.style?.removeProperty?.("--nm-node-bg");
     const meta = this.hooks.headMeta ? this.hooks.headMeta(node) : null;
     const metaEl = el.querySelector(".nm-head-meta");
     if (metaEl && metaEl.dataset.text !== (meta?.text || "")) {
       metaEl.dataset.text = meta?.text || "";
-      // An isolated LTR run inside the RTL box: a long path loses its start, never the line numbers
       metaEl.innerHTML = meta?.text ? `<bdi>${esc(meta.text)}</bdi>` : "";
       metaEl.title = meta?.title || "";
       metaEl.hidden = !meta?.text;
@@ -157,16 +150,28 @@ export class NodeRenderer {
     }
   }
 
-  /** Position and size an element (live drags and resizes call this directly). */
+  /** Position and size an element via GPU `translate3d` (zero layout thrashing during drags). */
   place(el, node) {
     const box = nodeBox(node);
-    el.style.left = `${node.x}px`;
-    el.style.top = `${node.y}px`;
+    el.style.left = "0px";
+    el.style.top = "0px";
     el.style.width = `${box.width}px`;
     el.style.height = `${box.height}px`;
     el.style.transform = box.transform;
-    // Handles and side ports are counter-scaled (nodemap.css) so they stay grabbable at any content scale
-    el.style.setProperty("--nm-scale", String(node.type !== "group" && node.scale ? node.scale : 1));
+    el.style?.setProperty?.("--nm-scale", String(node.type !== "group" && node.scale ? node.scale : 1));
+  }
+
+  /** Update viewport LOD culling (`nm-culled` outside `visRect`, `nm-lod-low` below 25% zoom). */
+  updateViewportCulling(nodes, visRect, zoom, activeId = null) {
+    const low = lodTierForViewport(zoom) === "low";
+    this.layer?.classList?.toggle?.("nm-lod-low", low);
+    for (const n of nodes) {
+      const el = this.els.get(n.id);
+      if (!el) continue;
+      // Keep active tab iframes and groups unculled so iframes/frames don't pop awkwardly
+      const keep = n.id === activeId || n.type === "tab" || isNodeInViewport(n, visRect);
+      el.classList?.toggle?.("nm-culled", !keep);
+    }
   }
 
   /** Force a body rebuild on the next sync (content fetched again, toggles flipped). */

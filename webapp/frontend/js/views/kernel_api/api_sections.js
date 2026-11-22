@@ -12,6 +12,7 @@ import { openDefinition } from "../../utils/definition_picker.js";
 import { showSymbolHistoryModal } from "../../components/symbol_history_modal.js";
 import { handleManLinkClick, manLinkHtml } from "../man/man_links.js";
 import { hasFeature } from "../../utils/projects.js";
+import { kapiSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 
 const fileLink = (path, line, label = null, version = "") =>
   `<a href="#" data-open-file="${escapeHtml(path)}" data-line="${line || 1}"${version ? ` data-version="${escapeHtml(version)}"` : ""}>${escapeHtml(label || `${path}:${line || 1}`)}</a>`;
@@ -74,6 +75,18 @@ function commonClicks(e, ctx) {
     state.openTab({ type: "callgraph", title: `Callgraph: ${cg.dataset.callgraph}`, functionName: cg.dataset.callgraph, version: ctx.version, forceNew: nt });
     return true;
   }
+  const nm = e.target.closest("[data-nodemap-kapi]");
+  if (nm && hasFeature(repo, "nodemap")) {
+    e.preventDefault();
+    sendToNodemap(kapiSpec({
+      catalog: nm.dataset.nodemapKapi,
+      symbol: nm.dataset.nodemapName || "",
+      arch: ctx.arch || state.kconfigArch(),
+      version: ctx.version,
+      repo,
+    }), { repo, version: ctx.version });
+    return true;
+  }
   return false;
 }
 
@@ -124,6 +137,7 @@ registerApiSection({
       if (hasFeature(repo, "callgraph")) actions.push(`<a href="#" data-callgraph="${escapeHtml(r.entry)}">Callers</a>`);
     }
     if (hasFeature(repo, "man")) actions.push(manLinkHtml(r.name, "2", `man 2 ${escapeHtml(r.name)}`));
+    if (hasFeature(repo, "nodemap")) actions.push(`<a href="#" data-nodemap-kapi="syscalls" data-nodemap-name="${escapeHtml(r.name)}">🗺 NodeMap</a>`);
     return `<h2>${escapeHtml(r.name)}</h2>
       <dl class="sv-kv"><dt>Number</dt><dd>${syscallNumberHtml(r)}</dd>
       <dt>Entry point</dt><dd><code>${escapeHtml(r.entry)}</code>${r.compat_entry ? ` · compat <code>${escapeHtml(r.compat_entry)}</code>` : ""}</dd>
@@ -152,13 +166,16 @@ registerApiSection({
   rowHtml: (r) => `<span class="sv-row-main">${escapeHtml(r.symbol)}</span>${r.variant !== "plain" ? `<span class="sv-tag ${r.variant.includes("gpl") ? "warn" : "info"}">${escapeHtml(VARIANT[r.variant] || r.variant)}</span>` : ""}${r.namespace ? `<span class="sv-tag info">${escapeHtml(r.namespace)}</span>` : ""}<span class="sv-row-sub">${escapeHtml(r.path.split("/").slice(-2).join("/"))}</span>`,
   chips: Object.entries(VARIANT).map(([id, label]) => ({ id, label, test: (r) => r.variant === id })),
   fetchDetail: (ctx, key, row) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/exports/${encodeURIComponent(row?.symbol || key.split("@")[0])}?arch=${encodeURIComponent(state.kconfigArch())}`),
-  detailHtml: (d, ctx) => `<h2>${escapeHtml(d.symbol)}</h2>
+  detailHtml: (d, ctx) => {
+    const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
+    return `<h2>${escapeHtml(d.symbol)}</h2>
     <h3>Exported at</h3>${d.sites.map((s) => {
       const built = s.owner ? builtUnderEngine(s.owner.expr, ctx.version, "") : "";
       return `<div>${fileLink(s.path, s.line, null, ctx.version)} <span class="sv-tag info">${escapeHtml(VARIANT[s.variant])}</span>${s.namespace ? ` namespace <code>${escapeHtml(s.namespace)}</code>` : ""}
         <div class="sv-row-sub">${s.owner ? `${escapeHtml(s.owner.modname)} (<code>${escapeHtml(s.owner.target)}</code>) when <code>${escapeHtml(exprText(s.owner.expr))}</code>${built ? ` · built: <b>${escapeHtml(built)}</b>` : ""}` : "no Kbuild object found for this file"}</div></div>`;
     }).join("")}
-    <p><a href="#" data-definition="${escapeHtml(d.symbol)}">Go to definition</a> · <a href="#" data-symbol="${escapeHtml(d.symbol)}">Search uses</a></p>`,
+    <p><a href="#" data-definition="${escapeHtml(d.symbol)}">Go to definition</a> · <a href="#" data-symbol="${escapeHtml(d.symbol)}">Search uses</a>${hasFeature(repo, "nodemap") ? ` · <a href="#" data-nodemap-kapi="exports" data-nodemap-name="${escapeHtml(d.symbol)}">🗺 NodeMap</a>` : ""}</p>`;
+  },
   onDetailClick: commonClicks,
   downloads: [
     { label: "Symbols", ext: "txt", build: (rows) => [...new Set(rows.map((r) => r.symbol))].join("\n") + "\n" },
@@ -197,7 +214,8 @@ registerApiSection({
     ${r.description ? `<dt>Description</dt><dd>${escapeHtml(r.description)}</dd>` : ""}
     <dt>Defined in</dt><dd>${fileLink(r.path, r.line, null, ctx.version)}</dd></dl>
     ${r.snippet ? `<pre>${escapeHtml(r.snippet)}</pre>` : ""}
-    ${r.docText ? `<h3>Documentation ${fileLink(r.docText.path, r.docText.line, `${r.docText.path}:${r.docText.line}`, ctx.version)}</h3><pre>${escapeHtml(r.docText.text)}</pre>` : (r.kind !== "module" ? '<p class="sv-empty">No entry in kernel-parameters.txt.</p>' : "")}`),
+    ${r.docText ? `<h3>Documentation ${fileLink(r.docText.path, r.docText.line, `${r.docText.path}:${r.docText.line}`, ctx.version)}</h3><pre>${escapeHtml(r.docText.text)}</pre>` : (r.kind !== "module" ? '<p class="sv-empty">No entry in kernel-parameters.txt.</p>' : "")}
+    ${hasFeature(ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo(), "nodemap") ? `<p><a href="#" data-nodemap-kapi="params" data-nodemap-name="${escapeHtml(r.full_name)}">🗺 Send to NodeMap</a></p>` : ""}`),
   onDetailClick: commonClicks,
   downloads: [{ label: "Parameters", ext: "tsv", build: (rows) => toTsv(rows, [["kind", (r) => r.kind], ["name", (r) => r.full_name], ["type", (r) => r.type || ""], ["perm", (r) => r.perm || ""], ["path", (r) => `${r.path}:${r.line}`], ["documented", (r) => (r.doc ? "yes" : "no")]]) }],
 });
@@ -225,7 +243,8 @@ registerApiSection({
     ${t.proto ? `<h3>Prototype</h3><pre>${escapeHtml(t.proto)}</pre>` : ""}
     ${(t.fields || []).length ? `<h3>Fields</h3><table>${t.fields.map((f) => `<tr><td><code>${escapeHtml(f.type)}</code></td><td>${escapeHtml(f.name)}</td><td class="sv-row-sub">${escapeHtml(f.kind)}${f.size ? ` [${escapeHtml(f.size)}]` : ""}</td></tr>`).join("")}</table>` : ""}
     ${t.printk ? `<h3>Format</h3><pre>${escapeHtml(t.printk)}</pre>` : ""}
-    ${t.sites ? `<h3>Call sites (${t.sites.call_sites.length}${t.sites.truncated ? "+" : ""})</h3>${t.sites.call_sites.map((s) => `<div>${fileLink(s.path, s.line, null, ctx.version)} <code class="sv-row-sub">${escapeHtml(s.text)}</code></div>`).join("") || '<p class="sv-empty">No caller found.</p>'}` : ""}`,
+    ${t.sites ? `<h3>Call sites (${t.sites.call_sites.length}${t.sites.truncated ? "+" : ""})</h3>${t.sites.call_sites.map((s) => `<div>${fileLink(s.path, s.line, null, ctx.version)} <code class="sv-row-sub">${escapeHtml(s.text)}</code></div>`).join("") || '<p class="sv-empty">No caller found.</p>'}` : ""}
+    ${hasFeature(ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo(), "nodemap") ? `<p><a href="#" data-nodemap-kapi="tracepoints" data-nodemap-name="${escapeHtml(t.name)}">🗺 Send to NodeMap</a></p>` : ""}`,
   downloads: [{ label: "Tracepoints", ext: "tsv", build: (rows) => toTsv(rows, [["system", (r) => r.system], ["name", (r) => r.name], ["kind", (r) => r.kind], ["class", (r) => r.class], ["path", (r) => `${r.path}:${r.line}`]]) }],
 });
 
@@ -266,7 +285,8 @@ registerApiSection({
     ${m.device_tables.length ? `<h3>Device tables</h3>${m.device_tables.map((t) => `<div>${escapeHtml(t.bus)}: ${fileLink(t.path, t.line, t.table, ctx.version)} <a href="#" data-devtable="${escapeHtml(t.table)}">devices</a></div>`).join("")}` : ""}
     ${m.params?.length ? `<h3>Parameters</h3><table>${m.params.map((p) => `<tr><td>${escapeHtml(p.full_name)}</td><td><code>${escapeHtml(p.type)}</code></td><td>${escapeHtml(p.description || "")}</td></tr>`).join("")}</table>` : ""}
     ${m.exports?.length ? `<h3>Exports (${m.exports.length})</h3><div>${m.exports.slice(0, 100).map((e) => `<code>${escapeHtml(e.symbol)}</code>`).join(" ")}</div>` : ""}
-    ${(m.maintainers || []).length && hasFeature(repo, "maintainers") ? `<h3>Maintainers</h3>${m.maintainers.slice(0, 8).map((s) => `<div><a href="#" data-maint="${escapeHtml(s.sec_id ?? "")}">${escapeHtml(s.name || s.section || "")}</a></div>`).join("")}` : ""}`;
+    ${(m.maintainers || []).length && hasFeature(repo, "maintainers") ? `<h3>Maintainers</h3>${m.maintainers.slice(0, 8).map((s) => `<div><a href="#" data-maint="${escapeHtml(s.sec_id ?? "")}">${escapeHtml(s.name || s.section || "")}</a></div>`).join("")}` : ""}
+    ${hasFeature(repo, "nodemap") ? `<p><a href="#" data-nodemap-kapi="modules" data-nodemap-name="${escapeHtml(m.modname)}">🗺 Send to NodeMap</a></p>` : ""}`;
   },
   onDetailClick(e, ctx) {
     if (commonClicks(e, ctx)) return true;

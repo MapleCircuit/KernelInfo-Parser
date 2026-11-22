@@ -16,6 +16,7 @@ _CSP = (
     # No frontend module evaluates code from a string (no eval, no new Function), so
     # 'unsafe-eval' would only widen what an injected string could do.
     b"script-src 'self'; "
+    b"worker-src 'self'; "
     b"style-src 'self' 'unsafe-inline'; "
     b"img-src 'self' data: blob:; "
     b"connect-src 'self'; "

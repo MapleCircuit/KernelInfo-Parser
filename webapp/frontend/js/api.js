@@ -1216,6 +1216,27 @@ class ApiClient {
     return this.request(`/api/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);
   }
 
+  /**
+   * Shortest call paths between two functions (`GET /api/tools/{v}/callpath`, §4.4 / N2).
+   * Polls while the callpath index is built (`202` -> `200`).
+   */
+  async getCallpath(version, { from = "", to = "", maxDepth = 6, k = 5, exclude = "", indirect = false, arch = "" } = {}, { onProgress = null, signal = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams();
+    params.set("from", String(from || "").trim());
+    params.set("to", String(to || "").trim());
+    params.set("max_depth", String(maxDepth));
+    params.set("k", String(k));
+    if (exclude) params.set("exclude", String(exclude));
+    if (indirect) params.set("indirect", "true");
+    if (arch) params.set("arch", String(arch));
+    return this.requestJob(`/api/tools/${encodeURIComponent(ver)}/callpath?${params.toString()}`, {
+      onProgress,
+      signal,
+      timeoutMs: CALLGRAPH_TIMEOUT_MS,
+    });
+  }
+
   async getVersionsDiff(versionA, versionB) {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);

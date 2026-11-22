@@ -14,6 +14,8 @@ import { state } from "../state.js";
 import { openModal, escapeHtml } from "./modal.js";
 import { renamedNoteHtml } from "./symbol_history_render.js";
 import { shortRef } from "./ref_picker.js";
+import { hasFeature } from "../utils/projects.js";
+import { historySpec, sendToNodemap } from "../views/nodemap/nodemap_bridge.js";
 
 const STATUS_LABEL = {
   introduced: "introduced",
@@ -50,6 +52,7 @@ export function showSymbolHistoryModal(version, filePath, line, astId = null, na
     title: name || `${filePath.split("/").pop()}:${line}`,
     subtitle: `${filePath}:${line} @ ${shortRef(version)}`,
     version,
+    nodemapSpec: { mode: "symbol", path: filePath, line, astId, name, version },
     load: ({ includeRc, branch }) => api.getSymbolHistory(version, filePath, line, astId, { name, includeRc, branch }),
   });
 }
@@ -65,7 +68,7 @@ export function showKconfigHistoryModal(version, name) {
   });
 }
 
-function openHistory({ title, subtitle, version, load }) {
+function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
   const ui = {
     includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null,
     branch: null, // branch the timeline follows ("" = chosen by the server for `version`), set on first load
@@ -181,6 +184,7 @@ function openHistory({ title, subtitle, version, load }) {
         <label title="Show every release instead of collapsing unchanged ones"><input type="checkbox" data-act="expand" ${ui.expandAll ? "checked" : ""}> All releases</label>
         <label title="${noRc ? `No release candidate is indexed on ${escapeHtml(res.branch || "this branch")}` : "Also list release candidates (more detail)"}"><input type="checkbox" data-act="rc" ${ui.includeRc ? "checked" : ""} ${noRc ? "disabled" : ""}> Include RCs${rcCount ? ` (${rcCount})` : ""}</label>
         ${branchOptions ? `<label title="Branch the timeline follows: only the releases reachable from it are listed"><select class="symhist-branch" data-act="branch">${branchOptions}</select></label>` : ""}
+        ${nodemapSpec && hasFeature(state.activeRepo(), "nodemap") ? '<button class="code-btn" data-act="nodemap" type="button" title="Send Symbol History to NodeMap">🗺 NodeMap</button>' : ""}
       </div>
       <div class="symhist-track">
         ${items.length === 0 ? `<span class="ki-modal-empty">No indexed release in this repository yet.</span>` : items.map((s) => {
@@ -238,6 +242,10 @@ function openHistory({ title, subtitle, version, load }) {
         ui.expanded.clear();
         fetchAndRender(current?.vname);
       };
+    }
+    const nmBtn = body.querySelector('[data-act="nodemap"]');
+    if (nmBtn && nodemapSpec) {
+      nmBtn.onclick = () => sendToNodemap(historySpec(nodemapSpec), { version: nodemapSpec.version });
     }
     body.querySelectorAll("[data-stop]").forEach((btn) => {
       btn.onclick = () => {

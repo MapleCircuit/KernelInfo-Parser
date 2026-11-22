@@ -1,58 +1,52 @@
 /**
- * nodemap_export.js - SVG (and, through it, PNG) of a whole NodeMap canvas: the bounding box of every
- * node and wire plus a margin, never the viewport. Nodes are drawn with what they show, as vectors:
- * group frames, note text, symbol member lists, source slices (code lines with the code view's lexical
- * colors), diffs (hunks, old/new line numbers, added / removed colors), mail threads (reply tree with
- * connectors and badges), Kconfig symbols (value badge, relation groups), MAINTAINERS sections, struct
- * members in the node's
- * `list` or `table` style (types, `#if` lines indented per nesting level with their scope bars, the
- * table's `#ifdef` cell, folded branches, hidden items and the outer conditions banner as the node shows
- * them); headers with their source reference (left out for `hideHeader` nodes in View Mode), node and
- * canvas backgrounds, accents (preset or custom), the content scale of every node and edges anchored at
- * the struct rows they leave from. Every node interior (panel, header, accent strip, body) is clipped to
- * the node's rounded `rx="6"` box, the border drawn on top. Struct rows take the live rows' measured
- * heights when given (`opts.rowHeights`), and an auto-fitted node ends where its drawn content ends, so
- * folded `#if` branches leave no empty band at the bottom. Man pages and live tab iframes are hybrid: a DOM snapshot of their rendered content
- * (`captureNodeForeignObject()`, XHTML with inlined computed styles in a `<foreignObject>`), or a
- * placeholder card when nothing is mounted. Theme tokens are resolved to literal colors so the file looks
- * the same outside the app. `canvasToSvg()` and the size helpers are DOM-free (unit tested);
- * `captureNodeForeignObject()` reads the live DOM.
+ * nodemap_export.js - SVG (and, through it, PNG) of a whole NodeMap canvas (`webapp/API_FRONTEND.md` §5.3).
+ *
+ * Respects visibility layers (`visibleCanvasSlice`), edge waypoints, struct `layout` (pahole
+ * cache-line offsets/holes), and all 15 node types including `cve`, `kapi`, `doc`, and `history`.
+ * `canvasToSvg()` and the size helpers are DOM-free (unit tested).
  */
-import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, isCustomColor, paintOrder } from "./canvas_model.js";
+import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, isCustomColor, paintOrder, visibleCanvasSlice } from "./canvas_model.js";
 import { arrowHeads, dashArray, edgePath, resolveEnds } from "./edge_router.js";
 import { headMetaOf, sourceLineSegments } from "./node_content.js";
 import { diffRows, kconfigValue, mailBadges, maintainerLines, statusClass, valueClass } from "./domain_nodes.js";
-import { countDirectives, esc as escHtml, structRows } from "./struct_view.js";
+import { countDirectives, esc as escHtml, paholeRows, structRows } from "./struct_view.js";
 
-const PAD = 40;
-// Canvas-unit metrics of the drawn node chrome (they follow nodemap.css)
-const HEAD_H = 26;
-const BAR_H = 22;
-const OUTER_H = 16;
-const ROW_H = 16; // list rows
-const TABLE_ROW_H = 18; // table rows: 17 units and their bottom border
-const SRC_ROW_H = 16.5;
-const PP_INDENT = 10; // per enclosing #if block (nodemap.css .nm-pp-indent)
-const MONO_CH = 6.6; // width of one 11-unit monospace character
-const SANS_CH = 6.2;
-const TRACK_W = 6;
-const DIFF_ROW_H = 16.5;
-const MAIL_ROW_H = 18;
-const MAIL_META_H = 14;
-const KC_ROW_H = 18;
-const MT_ROW_H = 16;
-const GUIDE_W = 12;
+export const EXPORT_METRICS = {
+  PAD: 40,
+  HEAD_H: 26,
+  BAR_H: 22,
+  OUTER_H: 16,
+  ROW_H: 16,
+  TABLE_ROW_H: 18,
+  LAYOUT_ROW_H: 18,
+  SRC_ROW_H: 16.5,
+  DIFF_ROW_H: 16.5,
+  PP_INDENT: 10,
+  MONO_CH: 6.6,
+  SANS_CH: 6.2,
+  TRACK_W: 6,
+  MAIL_ROW_H: 18,
+  MAIL_META_H: 14,
+  KC_ROW_H: 18,
+  MT_ROW_H: 16,
+  GUIDE_W: 12,
+};
+
+const {
+  PAD, HEAD_H, BAR_H, OUTER_H, ROW_H, TABLE_ROW_H, LAYOUT_ROW_H, SRC_ROW_H,
+  PP_INDENT, MONO_CH, SANS_CH, TRACK_W, DIFF_ROW_H, MAIL_ROW_H, MAIL_META_H,
+  KC_ROW_H, MT_ROW_H, GUIDE_W,
+} = EXPORT_METRICS;
+
 /** Type-default accents (nodemap.css): groups are blue like every node, notes yellow. */
 export function defaultAccent(type) {
   return type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)";
 }
 
 const r1 = (v) => Math.round(v * 10) / 10;
-// Characters XML 1.0 does not allow (form feeds in kernel sources, NULs): dropped so the document parses
 const XML_ILLEGAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
 const esc = (s) => escHtml(String(s ?? "").replace(XML_ILLEGAL, ""));
 
-/** `#rrggbb` mix of two resolved colors (`t` of `a`), null when either cannot be read. */
 function mixColors(a, b, t) {
   const ha = colorToHex(a);
   const hb = colorToHex(b);
@@ -61,18 +55,15 @@ function mixColors(a, b, t) {
   return `#${[0, 1, 2].map((i) => Math.round(ch(ha, i) * t + ch(hb, i) * (1 - t)).toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** Box the content of a node is laid out in (natural size for auto-fitted nodes) and its scale. */
 function layoutBox(n) {
   return contentBox(n);
 }
 
-/** Text cut to `max` characters with an ellipsis. */
 function fit(text, max) {
   const t = String(text ?? "");
   return max > 1 && t.length > max ? `${t.slice(0, Math.max(1, max - 1))}…` : t;
 }
 
-/** Word-wrapped lines of `text` at `cols` characters (longer words are cut). */
 function wrap(text, cols) {
   const out = [];
   for (const para of String(text || "").split(/\r?\n/)) {
@@ -95,7 +86,6 @@ function wrap(text, cols) {
   return out;
 }
 
-/** Markdown markers a note shows as structure, left out of the plain text the SVG draws. */
 function plainNoteLine(line) {
   return line.replace(/^#{1,3}\s+/, "").replace(/^\s*[-*]\s+\[( |x|X)\]\s+/, (m, x) => (x === " " ? "☐ " : "☑ ")).replace(/^\s*[-*]\s+/, "• ")
     .replace(/^>\s?/, "│ ").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1").replace(/~~([^~]+)~~/g, "$1");
@@ -103,24 +93,15 @@ function plainNoteLine(line) {
 
 /**
  * Standalone SVG document of the canvas.
- *   resolve(cssColor)   turns `var(--x)` into a literal color
- *   opts.content(node)  loaded payload of a struct / source node (null while not loaded)
- *   opts.structOpts(node)  `{editMode, evaluator}` the node's struct rows are drawn with
- *   opts.rowHeights(node)  measured heights of the live struct rows (content units), or null
- *   opts.kconfigValues(node)  assignments of the Kconfig engine a kconfig node shows values from, or null
- *   opts.editMode       Edit Mode (struct toolbar chips, hidden items and headers dimmed instead of left out)
- *   opts.foreign(node)  `{html}` DOM snapshot of a man / tab node (`captureNodeForeignObject()`), or null
- *   opts.transparent    no canvas background and no canvas-colored halo behind edge labels
- *   opts.pixelScale     the document's width/height are this many times its viewBox (PNG rasterizing)
  */
 export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
+  const visCanvas = visibleCanvasSlice(canvas);
   const content = typeof opts.content === "function" ? opts.content : () => null;
   const foreignOf = typeof opts.foreign === "function" ? opts.foreign : () => null;
   const editMode = Boolean(opts.editMode);
   const structOptsOf = typeof opts.structOpts === "function" ? opts.structOpts : () => ({ editMode });
   const rowHeightsOf = typeof opts.rowHeights === "function" ? opts.rowHeights : () => null;
   const kcValuesOf = typeof opts.kconfigValues === "function" ? opts.kconfigValues : () => null;
-  /** Background of a node or the canvas: theme token, custom color, or a preset tinted into the token. */
   const bgOf = (id, base) => {
     const b = resolve(base);
     if (!id) return b;
@@ -129,7 +110,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return mixColors(acc, b, BG_TINT) || acc;
   };
   const C = {
-    bg: bgOf(canvas.settings?.bgColor || "", "var(--bg-canvas)"),
+    bg: bgOf(visCanvas.settings?.bgColor || "", "var(--bg-canvas)"),
     panel: resolve("var(--bg-secondary)"),
     head: resolve("var(--bg-tertiary)"),
     code: resolve("var(--bg-primary)"),
@@ -149,8 +130,9 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     red: resolve("var(--accent-red)"),
     orange: resolve("var(--accent-orange)"),
     blue: resolve("var(--accent-blue)"),
+    cyan: resolve("var(--accent-cyan)"),
+    purple: resolve("var(--accent-purple)"),
   };
-  // Lexical token colors of the code view (codeview.css `.tok-*`)
   const TOK = {
     "tok-keyword": "var(--syn-keyword)", "tok-type": "var(--syn-type)", "tok-string": "var(--syn-string)",
     "tok-number": "var(--syn-number)", "tok-comment": "var(--syn-comment)", "tok-preproc": "var(--syn-preproc)",
@@ -164,8 +146,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     if (!tokColor.has(cls)) tokColor.set(cls, resolve(TOK[cls]));
     return tokColor.get(cls);
   };
-  let used = 0; // bottom of what the last body drew (local units): auto-fitted nodes end there
-  const anchors = new Map(); // node id -> Map(field key -> canvas y)
+  let used = 0;
+  const anchors = new Map();
   let defs = "";
   let clipN = 0;
   const clip = (x, y, w, h) => {
@@ -183,18 +165,75 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   const txt = (x, y, s, { fill = C.text, size = 11, family = "sans-serif", weight = "", anchor = "", italic = false, opacity = 1 } = {}) =>
     `<text x="${r1(x)}" y="${r1(y)}" fill="${fill}" font-family="${family}" font-size="${size}"${weight ? ` font-weight="${weight}"` : ""}${anchor ? ` text-anchor="${anchor}"` : ""}${italic ? ' font-style="italic"' : ""}${opacity !== 1 ? ` opacity="${opacity}"` : ""} xml:space="preserve">${s}</text>`;
 
+  const rowsClip = (box, top, inner) => {
+    const id = clip(0, top, box.w, box.h - top);
+    return `<g clip-path="url(#${id})">${inner}</g>`;
+  };
+
+  const structLayoutBody = (n, box, top, so) => {
+    const pahole = so.pahole || content(n)?.pahole || null;
+    if (!pahole || pahole.unavailable) {
+      used = top + 24;
+      return txt(10, top + 16, "Memory layout (pahole) unavailable", { fill: C.faint, italic: true });
+    }
+    const m = paholeRows(pahole, n.data);
+    let s = "";
+    let y = top;
+    const sum = `${m.totalSize}B · align ${m.alignment}B · ${m.cacheLines} CL${m.paddingBytes ? ` · ${m.paddingBytes}B pad (${m.holesCount} holes)` : ""}`;
+    s += `<rect x="0" y="${y}" width="${box.w}" height="${BAR_H}" fill="${C.head}"/>`;
+    s += txt(8, y + 14.5, esc(fit(sum, Math.floor((box.w - 16) / 6))), { fill: C.muted, size: 10, family: "monospace" });
+    s += `<line x1="0" y1="${y + BAR_H}" x2="${box.w}" y2="${y + BAR_H}" stroke="${C.rule}"/>`;
+    y += BAR_H;
+    const rowsTop = y + 2;
+    const rowsBottom = box.h - 2;
+    const fieldY = new Map();
+    let inner = "";
+    let ry = rowsTop;
+    for (const r of m.rows) {
+      const mid = ry + LAYOUT_ROW_H / 2;
+      const base = ry + LAYOUT_ROW_H / 2 + 4;
+      if (r.kind === "cacheline") {
+        inner += `<rect x="0" y="${r1(ry)}" width="${box.w}" height="${LAYOUT_ROW_H}" fill="${C.blue}" fill-opacity="0.08"/>`;
+        inner += `<line x1="0" y1="${r1(ry)}" x2="${box.w}" y2="${r1(ry)}" stroke="${C.blue}" stroke-opacity="0.4" stroke-dasharray="4 3"/>`;
+        inner += txt(8, base, esc(`Cache line ${r.cl} · +${r.offset}B`), { fill: C.blue, size: 10, family: "monospace", weight: "bold" });
+      } else if (r.kind === "hole") {
+        inner += `<rect x="0" y="${r1(ry)}" width="${box.w}" height="${LAYOUT_ROW_H}" fill="${C.orange}" fill-opacity="0.1"/>`;
+        inner += txt(8, base, esc(`+${r.offset}`), { fill: C.orange, size: 10, family: "monospace" });
+        inner += txt(52, base, esc(`${r.size}B`), { fill: C.orange, size: 10, family: "monospace" });
+        inner += txt(92, base, esc(`/* ${r.size}B padding hole */`), { fill: C.orange, size: 10, family: "monospace", italic: true });
+      } else {
+        fieldY.set(r.key, mid);
+        inner += `<line x1="0" y1="${r1(ry + LAYOUT_ROW_H)}" x2="${box.w}" y2="${r1(ry + LAYOUT_ROW_H)}" stroke="${C.rule}"/>`;
+        inner += txt(8, base, esc(`+${r.offset}`), { fill: C.faint, size: 10, family: "monospace" });
+        inner += txt(52, base, esc(`${r.size}B`), { fill: C.number, size: 10, family: "monospace" });
+        const tx = 92;
+        if (r.type) inner += txt(tx, base, esc(fit(r.type, m.typeCh)), { fill: C.type, family: "monospace" });
+        const nx = tx + (r.type ? m.typeCh * MONO_CH + 6 : 0);
+        inner += txt(nx, base, esc(`${r.name}${r.bitfield || ""}`), { fill: C.text, family: "monospace" });
+      }
+      ry += LAYOUT_ROW_H;
+    }
+    const visBottom = n.autoFit ? Math.min(rowsBottom, ry) : rowsBottom;
+    const ys = new Map();
+    for (const [k, my] of fieldY) ys.set(k, Math.min(Math.max(my, rowsTop + 4), visBottom - 4));
+    anchors.set(n.id, ys);
+    used = m.rows.length ? ry + 2 : rowsTop + 18;
+    const cid = clip(0, rowsTop, box.w, rowsBottom - rowsTop);
+    return `${s}<g clip-path="url(#${cid})">${inner}</g>`;
+  };
+
   /** Struct body rows (local coordinates); records field anchors for the edges. */
   const structBody = (n, box, top, accent) => {
     const layout = content(n);
     const d = n.data;
-    if (!layout) return txt(10, top + 16, esc(`${d.kind} ${d.name}`), { fill: C.faint });
     const so = structOptsOf(n) || {};
+    if (d.style === "layout") return structLayoutBody(n, box, top, so);
+    if (!layout) return txt(10, top + 16, esc(`${d.kind} ${d.name}`), { fill: C.faint });
     const editMode = Boolean(so.editMode);
     const model = structRows(layout, d, so);
     const table = d.style === "table";
     let s = "";
     let y = top;
-    // Toolbar (Edit Mode only): the struct-wide chips and the hidden count; the source is in the header
     if (editMode) {
       s += `<line x1="0" y1="${y + BAR_H}" x2="${box.w}" y2="${y + BAR_H}" stroke="${C.rule}"/>`;
       let cx = 8;
@@ -214,7 +253,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       }
       y += BAR_H;
     }
-    // Outer conditions: left out when hidden in View Mode; in Edit Mode a hidden banner dims (rows do not)
     if (layout.outer_conds?.length && (!model.outerHidden || editMode)) {
       const banner = txt(8, y + 12, esc(fit(layout.outer_conds.join(" && "), Math.floor((box.w - 16) / 6))), { fill: C.preproc, size: 10, family: "monospace" });
       s += model.outerHidden ? `<g opacity="0.45">${banner}</g>` : banner;
@@ -225,13 +263,10 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const rowsBottom = box.h - 2;
     const id = clip(0, rowsTop, box.w, rowsBottom - rowsTop);
     const gutter = model.tracks ? model.tracks * TRACK_W + TRACK_W : 0;
-    // Table style with tracks: the scope bars have their own cell, closed by a column divider
     const cellRight = table && model.tracks ? gutter + 10 : 0;
     const ctlW = table ? (editMode ? 30 : 14) : 0;
     const typeW = model.typeCh * MONO_CH;
     const rowH = table ? TABLE_ROW_H : ROW_H;
-    // The live rows' heights (folded branches and their labels are taller than member rows), else the
-    // export's own metrics
     const measured = rowHeightsOf(n);
     const hs = Array.isArray(measured) && measured.length === model.rows.length && measured.every((v) => v > 0) ? measured : null;
     const rowTops = [];
@@ -300,7 +335,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       s += op !== 1 ? `<g opacity="${op}">${row}</g>` : row;
     });
     s += "</g>";
-    // Field anchors: the row's middle, kept inside the visible rows (as the live view does)
     const ys = new Map();
     const visBottom = n.autoFit ? Math.min(rowsBottom, rowsEnd) : rowsBottom;
     for (const [k, my] of fieldY) ys.set(k, Math.min(Math.max(my, rowsTop + 4), visBottom - 4));
@@ -312,7 +346,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const r = content(n);
     const d = n.data;
     if (!r) return txt(10, top + 16, esc(d.path || "Source"), { fill: C.faint });
-    // The code area keeps the theme's code background unless the node has its own (as in nodemap.css)
     let s = n.bgColor ? "" : `<rect x="0" y="${top}" width="${box.w}" height="${box.h - top}" fill="${C.code}"/>`;
     const y0 = top;
     const lines = Array.isArray(r.lines) ? r.lines : [];
@@ -322,8 +355,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const id = clip(0, y0, box.w, box.h - y0);
     s += `<g clip-path="url(#${id})">`;
     const shown = Math.min(lines.length, max);
-    // The code view's lexical highlighter over the whole slice (multi-line comments and strings)
-    const segs = sourceLineSegments(lines.map((l) => String(l ?? "")), r.path || d.path);
+    const segs = sourceLineSegments(lines.slice(0, shown).map((l) => String(l ?? "")), r.path || d.path);
     for (let i = 0; i < shown; i++) {
       const no = r.start_line + i;
       const ly = y0 + i * SRC_ROW_H;
@@ -352,12 +384,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       s += txt(10, top + 18 + i * 16, esc(l), { fill: C.text });
     });
     return s;
-  };
-
-  /** Rows of text clipped to the body, with a fixed row height; records how far they reach. */
-  const rowsClip = (box, top, inner) => {
-    const id = clip(0, top, box.w, box.h - top);
-    return `<g clip-path="url(#${id})">${inner}</g>`;
   };
 
   const diffBody = (n, box, top) => {
@@ -407,7 +433,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       const gx = 8;
       const mid = y + MAIL_ROW_H / 2;
       const rowEnd = y + MAIL_ROW_H + MAIL_META_H + (r.open ? Math.max(1, r.excerpt.length) * 14 + 4 : 0);
-      // Connectors: an ancestor's continuing line (pipe), this row's elbow (tee / end)
       r.guides.forEach((g, k) => {
         const x = gx + k * GUIDE_W + GUIDE_W / 2;
         if (g === "pipe" || g === "tee") inner += `<line x1="${x}" y1="${r1(y)}" x2="${x}" y2="${r1(rowEnd)}" stroke="${C.border}"/>`;
@@ -505,6 +530,126 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return rowsClip(box, top, inner);
   };
 
+  const cveBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.cveId || n.data.filePath || "CVE"), { fill: C.faint });
+    let inner = "";
+    let y = top + 6;
+    const cols = Math.floor((box.w - 16) / SANS_CH);
+    if (model.mode === "file") {
+      inner += txt(8, y + 12, esc(fit(`${model.filePath} (${model.affectedCount}/${model.total})`, cols)), { fill: C.text, weight: "bold" });
+      y += 18;
+      for (const c of model.cves) {
+        if (y > box.h) break;
+        const sc = c.state === "affected" ? C.red : c.state === "fixed" ? C.green : C.orange;
+        inner += txt(8, y + 12, esc(c.state), { fill: sc, size: 10, family: "monospace" });
+        inner += txt(66, y + 12, esc(fit(`${c.cveId} ${c.title}`, cols - 10)), { fill: C.text, size: 10 });
+        y += 16;
+      }
+    } else {
+      inner += txt(8, y + 12, esc(`${model.cveId}${model.score != null ? ` · CVSS ${model.score}` : ""}${model.state ? ` · ${model.state}` : ""}`), { fill: model.state === "affected" ? C.red : C.text, weight: "bold" });
+      y += 18;
+      if (model.title) {
+        for (const l of wrap(model.title, cols).slice(0, 3)) {
+          inner += txt(8, y + 12, esc(l), { fill: C.muted });
+          y += 15;
+        }
+      }
+      for (const rg of model.ranges) {
+        if (y > box.h) break;
+        const intro = rg.introduced || rg.inferred[0]?.sha || "";
+        if (intro) {
+          inner += txt(8, y + 12, esc(`intro ${intro.slice(0, 10)} ${fit(rg.introducedSubject || "", cols - 18)}`), { fill: C.orange, size: 10, family: "monospace" });
+          y += 16;
+        }
+        if (rg.fixed) {
+          inner += txt(8, y + 12, esc(`fix   ${rg.fixed.slice(0, 10)} ${fit(rg.fixedSubject || "", cols - 18)}`), { fill: C.green, size: 10, family: "monospace" });
+          y += 16;
+        }
+      }
+      for (const f of model.files.slice(0, 8)) {
+        if (y > box.h) break;
+        inner += txt(8, y + 12, esc(fit(`• ${f}`, cols)), { fill: C.faint, size: 10, family: "monospace" });
+        y += 15;
+      }
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
+  const kapiBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.symbol || n.data.catalog || "Kernel API"), { fill: C.faint });
+    let inner = "";
+    let y = top + 6;
+    const cols = Math.floor((box.w - 16) / MONO_CH);
+    inner += txt(8, y + 12, esc(`${model.catalog}${model.arch ? ` (${model.arch})` : ""} · ${model.total} entries`), { fill: C.blue, weight: "bold", family: "monospace" });
+    y += 18;
+    for (const it of model.items) {
+      if (y > box.h) break;
+      inner += txt(8, y + 12, esc(fit(`[${it.kind}] ${it.name}${it.subtitle ? ` — ${it.subtitle}` : ""}`, cols)), { fill: C.text, size: 10, family: "monospace" });
+      y += 16;
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
+  const docBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.path || "Kernel Docs"), { fill: C.faint });
+    let inner = "";
+    let y = top + 6;
+    const cols = Math.floor((box.w - 16) / SANS_CH);
+    if (model.mode === "kernel-doc") {
+      for (const e of model.entries) {
+        if (y > box.h) break;
+        inner += txt(8, y + 12, esc(fit(`${e.kind} ${e.name}${e.brief ? ` — ${e.brief}` : ""}`, cols)), { fill: C.text, weight: "bold" });
+        y += 16;
+        if (e.signature) {
+          inner += txt(12, y + 12, esc(fit(e.signature, cols)), { fill: C.type, size: 10, family: "monospace" });
+          y += 15;
+        }
+      }
+    } else {
+      for (const sec of model.sections) {
+        if (y > box.h) break;
+        inner += txt(8, y + 12, esc(fit(sec.heading, cols)), { fill: C.text, weight: "bold" });
+        y += 17;
+        for (const l of wrap(sec.text, cols).slice(0, 4)) {
+          if (y > box.h) break;
+          inner += txt(8, y + 12, esc(l), { fill: C.muted, size: 10 });
+          y += 14;
+        }
+      }
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
+  const historyBody = (n, box, top) => {
+    const model = content(n);
+    if (!model) return txt(10, top + 16, esc(n.data.name || n.data.path || "History"), { fill: C.faint });
+    let inner = "";
+    let y = top + 6;
+    const cols = Math.floor((box.w - 16) / MONO_CH);
+    if (model.mode === "blame") {
+      for (const c of model.commits) {
+        if (y > box.h) break;
+        inner += txt(8, y + 12, esc(fit(`${c.commitHash.slice(0, 8)} ${c.author}: ${c.subject}`, cols)), { fill: C.text, size: 10, family: "monospace" });
+        y += 16;
+      }
+    } else {
+      for (const r of model.rows) {
+        if (y > box.h) break;
+        const col = r.status === "modified" ? C.orange : r.status === "introduced" || r.status === "added" ? C.green : r.status === "removed" ? C.red : C.muted;
+        inner += txt(8, y + 12, esc(fit(`${r.vname} [${r.status}]${r.added || r.removed ? ` +${r.added} -${r.removed}` : ""}`, cols)), { fill: col, size: 10, family: "monospace" });
+        y += 16;
+      }
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
   const symbolBody = (n, box, top) => {
     const d = n.data;
     if (!d.expanded) return txt(10, top + 18, esc(`${d.kind === "func" ? "Function" : "Symbol"} · ${n.version}`), { fill: C.faint });
@@ -518,7 +663,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return s;
   };
 
-  /** Placeholder card body: what a live view shows cannot be vectorized. */
   const cardBody = (box, top, lines) => {
     let s = "";
     lines.forEach(([t, o], i) => {
@@ -527,12 +671,12 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return s;
   };
 
-  const rects = new Map(); // node id -> exported canvas rect (auto-fitted nodes end where their content does)
+  const rects = new Map();
   const nodeSvg = (n) => {
     const accent = resolve(accentVar(n.color, defaultAccent(n.type)));
     if (n.type === "group") {
       rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: n.h });
-      return `<g><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${accent}" fill-opacity="0.06" stroke="${accent}" stroke-dasharray="6 4"/>` +
+      return `<g><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${accent}" fill-opacity="0.06" stroke="${accent}" stroke-dasharray="${n.data?.subCanvas ? "3 2" : "6 4"}"/>` +
         `${txt(n.x + 10, n.y + 18, esc(displayTitle(n)), { weight: "bold", size: 12 })}</g>\n`;
     }
     let box = layoutBox(n);
@@ -548,21 +692,19 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     else if (n.type === "mail") body = mailBody(n, box, top);
     else if (n.type === "kconfig") body = kconfigBody(n, box, top);
     else if (n.type === "maintainer") body = maintainerBody(n, box, top);
-    // An auto-fitted node is as tall as its content: what the export draws of it ends the node (the live
-    // rows' rounding, folded #if branches), never an empty band below
+    else if (n.type === "cve") body = cveBody(n, box, top);
+    else if (n.type === "kapi") body = kapiBody(n, box, top);
+    else if (n.type === "doc") body = docBody(n, box, top);
+    else if (n.type === "history") body = historyBody(n, box, top);
     if (n.autoFit && used > top && used < box.h) box = { ...box, h: Math.ceil(used) };
     rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: Math.round(box.h * box.s) });
     const tf = box.s !== 1 ? `translate(${n.x} ${n.y}) scale(${box.s})` : `translate(${n.x} ${n.y})`;
     let s = `<g transform="${tf}">`;
     const panel = n.bgColor ? bgOf(n.bgColor, "var(--bg-secondary)") : C.panel;
-    // Everything inside the node is clipped to its rounded box: the square header fill and accent strip
-    // never stick out of the corners; the border is drawn on top
     const rid = clipRound(box.w, box.h);
     s += `<g clip-path="url(#${rid})">`;
     s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" fill="${panel}"/>`;
     if (n.type === "note" && !n.bgColor) s += `<rect x="0" y="0" width="${box.w}" height="${box.h}" fill="${accent}" fill-opacity="0.08"/>`;
-    // Header (accent strip, type badge, title, source reference): none for a hidden header in View
-    // Mode, dimmed in Edit Mode
     if (headShown) {
       let h = `<rect x="0" y="0" width="${box.w}" height="${HEAD_H}" fill="${C.head}"/>` +
         `<rect x="0" y="0" width="${box.w}" height="3" fill="${n.color ? accent : C.rule}"/>`;
@@ -572,7 +714,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       h += `<rect x="8" y="8" width="${r1(bw)}" height="13" rx="3" fill="${accent}" fill-opacity="0.16"/>`;
       h += txt(8 + bw / 2, 17.5, esc(badge.toUpperCase()), { fill: accent, size: 9, anchor: "middle" });
       const meta = headMetaOf(n.type, n.type === "symbol" || n.type === "note" || n.type === "tab" || n.type === "man" ? null : content(n)).text;
-      // The reference takes at most 55% of the header (as .nm-head-meta), keeping its end (line numbers)
       const metaCols = meta ? Math.min(meta.length, Math.floor((box.w * 0.55) / 6)) : 0;
       if (meta) {
         const shown = meta.length > metaCols ? `…${meta.slice(meta.length - metaCols + 1)}` : meta;
@@ -584,7 +725,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const bid = clip(0, top, box.w, box.h - top);
     const fo = n.type === "tab" || n.type === "man" ? foreignOf(n) : null;
     if (fo?.html) {
-      // Live rendered content: XHTML snapshot, clipped to the body like the node shows it
       const bh = Math.max(0, box.h - top);
       body = `<foreignObject x="0" y="${top}" width="${box.w}" height="${bh}"><div xmlns="http://www.w3.org/1999/xhtml" style="width:${box.w}px;height:${bh}px;overflow:hidden">${String(fo.html).replace(XML_ILLEGAL, "")}</div></foreignObject>`;
     } else if (n.type === "tab") {
@@ -600,12 +740,10 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return `${s}</g>\n`;
   };
 
-  // Nodes first (struct rows record field anchors), painted groups < edges < nodes
-  const ordered = paintOrder(canvas.nodes);
+  const ordered = paintOrder(visCanvas.nodes);
   const groupsSvg = ordered.filter((x) => x.type === "group").map(nodeSvg).join("");
   const nodesSvg = ordered.filter((x) => x.type !== "group").map(nodeSvg).join("");
-  // Edges and bounds use the exported boxes
-  const byId = new Map(canvas.nodes.map((n) => [n.id, { ...n, ...(rects.get(n.id) || {}) }]));
+  const byId = new Map(visCanvas.nodes.map((n) => [n.id, { ...n, ...(rects.get(n.id) || {}) }]));
   const pointOf = (n, field, side) => {
     const y = field ? anchors.get(n.id)?.get(field) : undefined;
     if (y === undefined) return null;
@@ -614,7 +752,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   };
   let edgesSvg = "";
   const extra = [];
-  for (const e of canvas.edges) {
+  for (const e of visCanvas.edges) {
     const a = byId.get(e.from);
     const b = byId.get(e.to);
     if (!a || !b) continue;
@@ -623,11 +761,10 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const p1 = pointOf(a, e.fromField, fs);
     const p2 = pointOf(b, e.toField, ts);
     const ends = resolveEnds({ rect: a, side: p1 ? fs : e.fromSide, point: p1 }, { rect: b, side: p2 ? ts : e.toSide, point: p2 });
-    const g = edgePath(ends.p1, ends.p2, ends.fromSide, ends.toSide, e.curve);
+    const g = edgePath(ends.p1, ends.p2, ends.fromSide, ends.toSide, e.curve, e.waypoints);
     const heads = arrowHeads(g, ends.p1, ends.p2, e.arrow);
-    extra.push(ends.p1, ends.p2, g.mid, ...(g.controls || []));
+    extra.push(ends.p1, ends.p2, g.mid, ...(g.controls || []), ...(e.waypoints || []));
     if (e.label) {
-      // The label's extent (11-unit sans text centered above the midpoint)
       const half = (e.label.length * SANS_CH) / 2 + 4;
       extra.push({ x: g.mid.x - half, y: g.mid.y - 20 }, { x: g.mid.x + half, y: g.mid.y });
     }
@@ -635,7 +772,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const dash = dashArray(e.style);
     edgesSvg += `<path d="${g.d}" fill="none" stroke="${c}" stroke-width="2"${dash ? ` stroke-dasharray="${dash}"` : ""}/>\n`;
     for (const h of heads) edgesSvg += `<polygon points="${h}" fill="${c}"/>\n`;
-    // The canvas-colored halo keeps a label readable over wires; a transparent image has no canvas color
     const halo = opts.transparent ? "" : ` stroke="${C.bg}" stroke-width="4" paint-order="stroke"`;
     if (e.label) edgesSvg += `<text x="${r1(g.mid.x)}" y="${r1(g.mid.y - 6)}" text-anchor="middle" fill="${C.text}"${halo} font-family="sans-serif" font-size="11">${esc(e.label)}</text>\n`;
   }
@@ -652,7 +788,6 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   const vx = Math.floor(x1 - PAD), vy = Math.floor(y1 - PAD);
   const vw = Math.ceil(x2 - x1 + PAD * 2), vh = Math.ceil(y2 - y1 + PAD * 2);
   const ps = Number(opts.pixelScale) > 0 ? Number(opts.pixelScale) : 1;
-  // Same rounding as pngSize(): the rasterized document is exactly the PNG's size
   const pw = ps === 1 ? vw : Math.max(1, Math.floor(vw * ps)), ph = ps === 1 ? vh : Math.max(1, Math.floor(vh * ps));
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pw}" height="${ph}" viewBox="${vx} ${vy} ${vw} ${vh}">\n`;
   if (defs) s += `<defs>${defs}</defs>\n`;
@@ -663,23 +798,16 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
 
 // ------------------------------------------------------------------ image sizes
 
-/** PNG scale factors the export dialog offers (default `PNG_DEFAULT_SCALE`). */
 export const PNG_SCALES = [1, 2, 3, 4];
 export const PNG_DEFAULT_SCALE = 3;
-/** Largest PNG side and area browsers rasterize into a `<canvas>` reliably. */
 export const PNG_MAX_SIDE = 16384;
 export const PNG_MAX_AREA = 268435456;
 
-/** `{w, h}` of an SVG document's root `width` / `height` (0 when absent). */
 export function svgSize(svg) {
   const m = /<svg\b[^>]*?\bwidth="([\d.]+)"[^>]*?\bheight="([\d.]+)"/.exec(String(svg || ""));
   return m ? { w: Number(m[1]), h: Number(m[2]) } : { w: 0, h: 0 };
 }
 
-/**
- * Output size of a `w`×`h` image upscaled by `scale`, clamped so neither side exceeds `maxSide` and the
- * area stays under `maxArea`: `{w, h, scale, clamped}` (`scale` is the factor actually used).
- */
 export function pngSize(w, h, scale = PNG_DEFAULT_SCALE, maxSide = PNG_MAX_SIDE, maxArea = PNG_MAX_AREA) {
   const want = Number(scale) > 0 ? Number(scale) : 1;
   if (!(w > 0 && h > 0)) return { w: 0, h: 0, scale: want, clamped: false };
@@ -689,7 +817,6 @@ export function pngSize(w, h, scale = PNG_DEFAULT_SCALE, maxSide = PNG_MAX_SIDE,
 
 // ------------------------------------------------------------------ DOM snapshots (man pages, tabs)
 
-// Computed properties inlined onto every cloned element: the snapshot needs no stylesheet
 const FO_PROPS = [
   "display", "position", "top", "right", "bottom", "left", "box-sizing", "width", "min-width", "max-width",
   "margin-top", "margin-right", "margin-bottom", "margin-left", "padding-top", "padding-right", "padding-bottom", "padding-left",
@@ -706,16 +833,11 @@ const FO_PROPS = [
   "list-style-position", "table-layout", "border-collapse", "border-spacing", "tab-size",
   "fill", "stroke", "stroke-width", "overflow-x", "overflow-y",
 ];
-// Never part of a snapshot: scripts and resources, nested frames, transient overlays and controls
 const FO_DROP_TAGS = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "frame", "object", "embed", "audio", "video"]);
 const FO_DROP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner";
-// Larger subtrees are not snapshotted (placeholder card): inlining styles is main-thread work per element
 const FO_MAX_ELEMENTS = 8000;
-// Plain names only: a prefixed (`xlink:href`, `xml:lang`) or `xmlns` attribute of an HTML element would
-// serialize with an unbound prefix and break the whole document
 const ATTR_NAME_RE = /^(?!xmlns)[A-Za-z_][\w.-]*$/i;
 
-/** Data URL of a same-origin image or canvas (null when it is cross-origin or not loaded). */
 function dataUrlOf(src, doc) {
   try {
     if (src.localName === "canvas") return src.toDataURL("image/png");
@@ -728,11 +850,10 @@ function dataUrlOf(src, doc) {
     c.getContext("2d").drawImage(src, 0, 0);
     return c.toDataURL("image/png");
   } catch {
-    return null; // tainted (cross-origin): left out, the export must not taint the PNG canvas
+    return null;
   }
 }
 
-/** Clone of `src` (an element of `win`'s document) with computed styles inlined; null to leave it out. */
 function cloneStyled(src, win, budget) {
   if (src.nodeType === 3) return src.cloneNode(false);
   if (src.nodeType !== 1 || budget.n-- <= 0) return null;
@@ -759,7 +880,6 @@ function cloneStyled(src, win, budget) {
     el = src.cloneNode(false);
     for (const a of [...(el.attributes || [])]) {
       const name = a.name.toLowerCase();
-      // Event handlers, ids (they would collide across snapshots), resources and invalid XML names go
       if (name.startsWith("on") || name === "id" || name === "style" || name === "srcset" || !ATTR_NAME_RE.test(a.name)) el.removeAttribute(a.name);
       else if ((name === "src" || name === "poster") && !String(a.value).startsWith("data:")) el.removeAttribute(a.name);
     }
@@ -769,7 +889,7 @@ function cloneStyled(src, win, budget) {
   for (const p of FO_PROPS) {
     let v = cs.getPropertyValue(p);
     if (!v) continue;
-    if (p === "background-image" && /url\(/i.test(v)) continue; // external images: not same-origin data
+    if (p === "background-image" && /url\(/i.test(v)) continue;
     if ((p === "overflow-x" || p === "overflow-y") && (v === "auto" || v === "scroll")) v = "hidden";
     style += `${p}:${v};`;
   }
@@ -779,7 +899,6 @@ function cloneStyled(src, win, budget) {
     return el;
   }
   let host = el;
-  // A scrolled box shows what it scrolled to: its content moves up / left inside it
   const st = src.scrollTop || 0;
   const sl = src.scrollLeft || 0;
   if ((st || sl) && !/^(flex|inline-flex|grid|inline-grid|table)/.test(cs.getPropertyValue("display"))) {
@@ -794,13 +913,6 @@ function cloneStyled(src, win, budget) {
   return el;
 }
 
-/**
- * The live rendered content of a man (`.nm-man`) or tab node (the same-origin `?embed=1` iframe's
- * `#workspace`) as an XHTML string for `canvasToSvg`'s `opts.foreign`: a clone with computed styles
- * inlined, scripts / frames / overlays left out, canvases and same-origin images as data URLs, sized to
- * the node body. `{html, w, h}` (body size, layout units), or null when nothing is mounted (an unloaded
- * node, a cross-origin or not yet loaded frame, no DOM).
- */
 export function captureNodeForeignObject(node, el) {
   try {
     const body = el?.querySelector?.(".nm-node-body");
@@ -820,7 +932,6 @@ export function captureNodeForeignObject(node, el) {
     if (!root || !win?.getComputedStyle) return null;
     const budget = { n: FO_MAX_ELEMENTS };
     const clone = cloneStyled(root, win, budget);
-    // A truncated snapshot would misstate the content: the placeholder card stands in for it
     if (!clone || budget.n < 0) return null;
     const w = body.offsetWidth || root.offsetWidth || 0;
     const h = body.offsetHeight || root.offsetHeight || 0;

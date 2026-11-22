@@ -77,7 +77,7 @@ export function renderCveDetailHtml(c, opts = {}) {
   const kindText = KIND[c.kind] || "";
 
   return `<h2>${escapeHtml(c.id)} ${escapeHtml(c.title || "")}</h2>
-  <p class="cve-meta-line"><a href="${escapeHtml(cveUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.id)} at cve.org ↗</a>${opts.showCopyLink ? ` <button type="button" class="cve-copy-btn" data-copy-cve="${escapeHtml(c.id)}" title="Copy deep link to this CVE">Copy link</button>` : ""}${c.published ? ` · published ${escapeHtml(c.published)}` : ""}${c.updated ? ` · updated ${escapeHtml(c.updated)}` : ""}${kindText ? ` · ${escapeHtml(kindText)}` : ""}</p>
+  <p class="cve-meta-line"><a href="${escapeHtml(cveUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.id)} at cve.org ↗</a>${opts.showCopyLink ? ` <button type="button" class="cve-copy-btn" data-copy-cve="${escapeHtml(c.id)}" title="Copy deep link to this CVE">Copy link</button>` : ""}${opts.showNodemap ? ` <button type="button" class="cve-copy-btn" data-nodemap-cve="${escapeHtml(c.id)}" data-nodemap-release="${escapeHtml(opts.release || opts.checkedRelease || "")}" title="Send CVE &amp; fix chain to NodeMap">🗺 NodeMap</button>` : ""}${c.published ? ` · published ${escapeHtml(c.published)}` : ""}${c.updated ? ` · updated ${escapeHtml(c.updated)}` : ""}${kindText ? ` · ${escapeHtml(kindText)}` : ""}</p>
   ${st && st.state !== "unknown" ? `<p><span class="sv-tag ${STATE_TAG[st.state] || "info"}">${escapeHtml(st.state)}</span> in ${escapeHtml(st.release)}${BASIS[st.basis] ? `, from ${escapeHtml(BASIS[st.basis])}` : ""}.</p>` : ""}
   ${renderVersionSummaryHtml(c.version_summary)}
   ${opts.showCheckRelease ? `<form class="cve-check-release-form" data-check-release-form="${escapeHtml(c.id)}">

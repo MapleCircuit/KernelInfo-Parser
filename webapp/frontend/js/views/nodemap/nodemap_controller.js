@@ -36,6 +36,7 @@
  * panes never collide.
  */
 import { api } from "../../api.js";
+import { localDB } from "../../db.js";
 import { state } from "../../state.js";
 import { sessionManager } from "../../session_manager.js";
 import { urlSync } from "../../url_sync.js";
@@ -50,17 +51,28 @@ import { embedSessionChannel } from "../../utils/embed_mode.js";
 import { mayCarryTab, tabDragPayload } from "../../utils/tab_drag.js";
 import { mountManDocument } from "../man/man_view.js";
 import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.js";
+import { isDocumentationPath } from "../docs/rst_renderer.js";
 import * as M from "./canvas_model.js";
-import { computeEdgeGeometry, dashArray } from "./edge_router.js";
+import { computeEdgeGeometry, dashArray, nearestWaypointSegment } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
-import { findItem, guardAutoCollapsed, renderStructBody, structRows } from "./struct_view.js";
+import { extractReferencedStruct, findItem, guardAutoCollapsed, paholeRows, renderStructBody, structRows } from "./struct_view.js";
 import { headMetaOf, renderNoteMarkdown, renderSourceRows } from "./node_content.js";
 import {
-  diffPayload, kconfigModel, kconfigValue, mailThreadLayout, mailThreadModel, maintainerModel, relationTargets,
-  renderDiffBody, renderKconfigBody, renderMailBody, renderMaintainerBody,
+  cveModel, diffPayload, diffRows, docModel, historyModel, kapiModel, kconfigModel, kconfigValue,
+  mailThreadLayout, mailThreadModel, maintainerModel, relationTargets,
+  renderCveBody, renderDiffBody, renderDocBody, renderHistoryBody, renderKapiBody, renderKconfigBody,
+  renderMailBody, renderMaintainerBody,
 } from "./domain_nodes.js";
-import { nodeSpecsForTab, tabForNode } from "./nodemap_bridge.js";
+import { cveSpec, docSpec, historySpec, kapiSpec, nodeSpecsForTab, tabForNode } from "./nodemap_bridge.js";
 import { PNG_DEFAULT_SCALE, PNG_SCALES, canvasToSvg, captureNodeForeignObject, pngSize, svgSize } from "./nodemap_export.js";
+import { NodeMapWorkerPool } from "./worker_pool.js";
+import { layoutGraphJob } from "./nodemap_worker.js";
+import {
+  VIRTUAL_THRESHOLD, estimateNaturalSourceSize, mountVirtualDiff, mountVirtualSource, visibleCanvasRect,
+} from "./virtual_source.js";
+import { applyCanvasVersion, diffStructLayouts, renderStructDiffBadge, revertCanvasVersion } from "./version_diff.js";
+import { NodeMapMinimap, NodeMapSearch } from "./minimap_search.js";
+import { NodeMapTourPlayer, captureTourStep, createTour, removeTourStep, reorderTourStep } from "./tour_mode.js";
 
 /** Tab types a KernelInfo tab node offers (feature-gated per project). */
 export const EMBED_TAB_TYPES = [
@@ -73,7 +85,9 @@ export const EMBED_TAB_TYPES = [
 const ADD_MENU = [
   ["struct", "Struct / Union…", "🧱"], ["source", "Source File / Slice…", "📄"], ["diff", "Diff…", "±"],
   ["mail", "Mailing List Thread…", "✉"], ["kconfig", "Kconfig Symbol…", "⚙"], ["maintainer", "Maintainers…", "👥"],
-  ["man", "Man Page…", "📘"], ["tab", "KernelInfo Tab…", "🗔"], ["symbol", "Symbol…", "🔣"], ["note", "Note Card", "📝"], ["group", "Group", "▭"],
+  ["cve", "CVE / Fix-Chain…", "🛡"], ["kapi", "Kernel API…", "🔌"], ["doc", "Kernel Docs (.rst)…", "📖"],
+  ["history", "Symbol History / Blame…", "🕰"], ["man", "Man Page…", "📘"], ["tab", "KernelInfo Tab…", "🗔"],
+  ["symbol", "Symbol…", "🔣"], ["note", "Note Card", "📝"], ["group", "Group", "▭"],
 ];
 
 const SAVE_DELAY_MS = 300;
@@ -109,6 +123,8 @@ function hasTextSelection(root) {
 export class NodeMapController {
   constructor() {
     this.canvas = null;
+    this.rootCanvas = null;
+    this.subMapPath = [];
     this.selected = new Set();
     this.selectedEdge = null;
     this.active = null; // node whose embedded content takes the pointer (tab iframes)
@@ -130,6 +146,29 @@ export class NodeMapController {
     this.embedEngines = new Map(); // Kconfig engines of the followed embedded session: tabId -> engine
     this.followChannel = null; // BroadcastChannel of the followed embedded session
     this.followKey = "";
+    this.focusHops = null; // null = off, 1, 2, or Infinity
+    this.focusSeedIds = new Set();
+    this.versionDiffTarget = "";
+    this.versionDiffCache = new Map();
+    this.versionRevertMap = null;
+    this.wireEls = new Map(); // edgeId -> SVGGElement (incremental SVG patching)
+    this.edgeEnds = new Map(); // edgeId -> ends array for tagConnectedPorts
+    this.pendingWireEl = null;
+    this.dirtyWireNodes = null; // null = full wire pass, Set<nodeId> = incremental
+    this.portOffsets = new Map(); // nodeId -> Map<fieldKey, relY>
+    this.workerStructModels = new Map(); // nodeId -> { key, model } from batch worker
+    this.highlightTokens = new Map();
+    this.workerPool = new NodeMapWorkerPool();
+    this.minimap = new NodeMapMinimap(this);
+    this.searchBar = new NodeMapSearch(this);
+    this.tourPlayer = new NodeMapTourPlayer(this);
+    this.activeTourId = "";
+    this.canvasMeta = {};
+    this.userDb = localDB;
+    this._disposeGen = 0;
+    this._seededAtMount = false;
+    this._incomingAtMount = [];
+    this._userEdited = false;
     // Where the followed embedded session's channel comes from (tests swap it)
     this.channelFactory = (name) => (typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(name) : null);
     // Where Kconfig engines come from (tests swap it)
@@ -148,9 +187,11 @@ export class NodeMapController {
     this.repo = tabData?.repo || state.activeRepo();
     this.storageKey = `${M.STORAGE_PREFIX}${tabData?.id || "default"}`;
 
-    if (!this.canvas) {
-      this.canvas = M.loadCanvas(globalThis.localStorage, this.storageKey) || M.emptyCanvas();
-      this.history.reset(M.historySnapshot(this.canvas));
+    const firstInit = !this.canvas;
+    if (firstInit) {
+      this.rootCanvas = M.loadCanvas(globalThis.localStorage, this.storageKey) || M.emptyCanvas();
+      this.canvas = this.rootCanvas;
+      this.history.reset(M.structuralSnapshot(this.canvas));
     }
     // Re-activation of the tab: the canvas DOM built before moves into the new container as it is (loaded
     // struct, source and man bodies, scroll positions and listeners kept; browsers reload moved iframes)
@@ -160,6 +201,8 @@ export class NodeMapController {
       this.subscribe();
       this.consumeIncoming(tabData);
       this.applyTransform();
+      this.renderBreadcrumbs();
+      this.minimap?.render();
       // Content that changed while the tab was hidden (folds, engines) could not be measured then
       for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
       this.commit({ save: false, record: true });
@@ -178,6 +221,7 @@ export class NodeMapController {
     this.inspectorEl = q(".nm-inspector-content");
     this.zoomLabel = q(".nm-zoom-label");
     this.hintEl = q(".nm-empty-hint");
+    this.breadcrumbsEl = q(".nm-breadcrumbs");
 
     this.renderer = new NodeRenderer(this.layerEl, {
       renderBody: (node, body) => this.renderBody(node, body),
@@ -190,17 +234,67 @@ export class NodeMapController {
     this.attachToolbar();
     this.attachCanvasEvents();
     this.attachTabDrop();
+    this.minimap.mount(this.wrapEl);
+    this.searchBar.mount(this.wrapEl);
+    this.tourPlayer.mount(this.wrapEl);
     this.subscribe();
-    this.consumeIncoming(tabData);
+    this._seededAtMount = Boolean(Array.isArray(tabData?.initialNodes));
+    this._incomingAtMount = this._seededAtMount ? [] : this.consumeIncoming(tabData);
+    if (this._seededAtMount) this.consumeIncoming(tabData);
     this.applyTransform();
+    this.renderBreadcrumbs();
     // Nodes handed over by another view are an undoable change of the canvas
     this.commit({ save: false, record: true });
+    if (firstInit && !this._seededAtMount && this._hasIndexedDbBackend()) this.loadFromIndexedDB();
+  }
+
+  _hasIndexedDbBackend() {
+    return Boolean(this.userDb && (this.userDb !== localDB || typeof indexedDB !== "undefined") && typeof this.userDb.userGet === "function");
+  }
+
+  async loadFromIndexedDB() {
+    const gen = this._disposeGen;
+    try {
+      const res = await M.loadCanvasAsync(this.userDb, this.storageKey, null);
+      if (gen !== this._disposeGen || !this.containerEl?.isConnected || this._seededAtMount || this._userEdited) return;
+      if (res?.backend === "indexeddb" && res.canvas) {
+        this.canvasMeta.created_at = res.created_at || this.canvasMeta.created_at;
+        this.rootCanvas = res.canvas;
+        const incoming = this._incomingAtMount || [];
+        this._incomingAtMount = [];
+        for (const n of incoming) {
+          if (!this.rootCanvas.nodes.some((x) => x.id === n.id)) {
+            this.rootCanvas.nodes.push(n);
+            if (n.type !== "group") M.reassignGroups(this.rootCanvas.nodes, [n]);
+          }
+        }
+        const resolved = M.resolveSubMapAtPath(this.rootCanvas, this.subMapPath);
+        this.canvas = resolved.canvas;
+        if (incoming.length) this.selected = new Set(incoming.map((n) => n.id));
+        this.history.reset(M.structuralSnapshot(this.canvas));
+        this.syncFollowChannel();
+        this.applyTransform();
+        this.renderBreadcrumbs();
+        this.commit({ save: incoming.length > 0, absorb: true });
+      }
+    } catch {
+      // Keep localStorage/empty canvas on IDB errors
+    }
   }
 
   dispose() {
+    this._disposeGen += 1;
     this.flushSave();
+    clearTimeout(this.kconfigTimer);
+    this.kconfigTimer = null;
+    if (this.wireFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.wireFrame);
+    this.wireFrame = null;
     for (const u of this.unsubs) u();
     this.unsubs = [];
+    this.minimap?.dispose?.();
+    this.searchBar?.dispose?.();
+    this.tourPlayer?.dispose?.();
+    this.workerPool?.dispose?.();
     this.renderer?.clear();
     this.mounts.clear();
     if (this.onWinMove) window.removeEventListener("pointermove", this.onWinMove);
@@ -212,7 +306,31 @@ export class NodeMapController {
     this.onWinMove = this.onWinUp = this.onMessage = null;
     this.closeFollowChannel();
     this.connectedPorts = new Set();
+    this.wireEls.clear();
+    this.edgeEnds.clear();
+    this.edgeGeoms?.clear?.();
+    this.pendingWireEl = null;
+    this.portOffsets.clear();
+    this.workerStructModels.clear();
+    this.highlightTokens.clear();
+    this.content.clear();
+    this.evalCache.clear();
+    this.mailBodies.clear();
+    this.versionDiffCache.clear();
+    this.fitQueue.clear();
+    this._incomingAtMount = [];
+    this.gesture = null;
+    this.renderer = null;
     this.rootEl = null;
+    this.containerEl = null;
+    this.wrapEl = null;
+    this.layerEl = null;
+    this.wireSvg = null;
+    this.marqueeEl = null;
+    this.inspectorEl = null;
+    this.zoomLabel = null;
+    this.hintEl = null;
+    this.breadcrumbsEl = null;
   }
 
   subscribe() {
@@ -225,16 +343,19 @@ export class NodeMapController {
         this.commit();
       }
     });
-    this.unsubs.push(typeof offPending === "function" ? offPending : () => {});
-    const offScale = onUiScaleChanged(() => this.renderWires());
-    this.unsubs.push(typeof offScale === "function" ? offScale : () => {});
+    this.unsubs.push(typeof offPending === "function" ? offPending : () => { });
+    const offScale = onUiScaleChanged(() => {
+      this.portOffsets.clear();
+      this.renderWires();
+    });
+    this.unsubs.push(typeof offScale === "function" ? offScale : () => { });
     const onTheme = () => this.renderWires();
     window.addEventListener("kip:theme-changed", onTheme);
     this.unsubs.push(() => window.removeEventListener("kip:theme-changed", onTheme));
     // Kconfig engines opened, closed or re-resolved: struct nodes fold their branches again
     for (const ev of ["kconfig:engine:changed", "kconfig:assignments:updated"]) {
       const off = state.subscribe(ev, () => this.onKconfigChanged());
-      this.unsubs.push(typeof off === "function" ? off : () => {});
+      this.unsubs.push(typeof off === "function" ? off : () => { });
     }
     this.syncFollowChannel();
   }
@@ -242,10 +363,57 @@ export class NodeMapController {
   onKconfigChanged() {
     this.kconfigEpoch += 1;
     this.evalCache.clear();
+    this.workerStructModels.clear();
     // Folded or unfolded branches change the height of auto-fitted struct nodes
     for (const n of this.canvas?.nodes || []) if (n.autoFit && (n.type === "struct" || n.type === "kconfig")) this.fitQueue.add(n.id);
     clearTimeout(this.kconfigTimer);
-    this.kconfigTimer = setTimeout(() => {
+    this.kconfigTimer = setTimeout(async () => {
+      if (!this.containerEl?.isConnected) return;
+      if (this.workerPool?.workerSupported && this.canvas?.settings.kconfigCollapse && this.canvas?.nodes?.some((n) => n.type === "struct")) {
+        const byEngine = new Map();
+        for (const n of this.canvas.nodes) {
+          if (n.type !== "struct" || n.data?.disableKconfigEngine) continue;
+          const entry = this.content.get(this.fetchKeyOf(n));
+          const eng = this.kconfigEngineFor(n);
+          const ctx = eng ? this.engineContext(eng.tabId) : null;
+          if (entry?.status === "ok" && ctx?.assignments) {
+            if (!byEngine.has(eng.tabId)) {
+              byEngine.set(eng.tabId, {
+                assignments: ctx.assignments,
+                arch: ctx.arch || "x86_64",
+                strict: Boolean(ctx.strict),
+                structs: [],
+              });
+            }
+            byEngine.get(eng.tabId).structs.push({
+              nodeId: n.id,
+              layout: entry.value,
+              data: n.data,
+              editMode: Boolean(this.canvas?.settings.editMode),
+            });
+          }
+        }
+        const batches = [...byEngine.values()];
+        const total = batches.reduce((sum, b) => sum + b.structs.length, 0);
+        if (total > 1) {
+          try {
+            const epoch = this.kconfigEpoch;
+            const settled = await Promise.all(
+              batches.map((b, i) => this.workerPool.evaluateKconfigBatch(b, { key: `kconfig:${i}` })),
+            );
+            if (epoch === this.kconfigEpoch && this.containerEl?.isConnected) {
+              for (const res of settled) {
+                for (const item of res?.results || []) {
+                  const n = this.byId(item.nodeId);
+                  if (n) this.workerStructModels.set(n.id, { key: this.bodyKey(n), data: n.data, model: item.model });
+                }
+              }
+            }
+          } catch {
+            // Fall through cleanly to normal commit
+          }
+        }
+      }
       if (this.containerEl?.isConnected) this.commit({ save: false });
     }, 120);
   }
@@ -334,12 +502,94 @@ export class NodeMapController {
 
   /** Options a struct node's rows are drawn with (live body and SVG export alike). */
   structOpts(node) {
-    return { editMode: Boolean(this.canvas?.settings.editMode), evaluator: this.evaluatorFor(node) };
+    const vdiff = this.versionDiffFor(node);
+    const pahole = node.data?.style === "layout" ? this.paholeFor(node) : null;
+    const wm = this.workerStructModels.get(node.id);
+    const model = wm && wm.key === this.bodyKey(node) && wm.data === node.data ? wm.model : undefined;
+    if (wm && !model) this.workerStructModels.delete(node.id);
+    return {
+      editMode: Boolean(this.canvas?.settings.editMode),
+      evaluator: this.evaluatorFor(node),
+      model,
+      pahole,
+      diffHtml: vdiff?.badgeHtml || "",
+      versionDiff: vdiff?.diff || null,
+    };
   }
 
-  /** View state outside a node that its body depends on (Edit Mode, the Kconfig engine). */
+  /** Fetch key of a struct's `pahole` layout (`style === "layout"`). */
+  paholeKeyOf(node) {
+    return JSON.stringify(["pahole", node.repo, node.version, node.data?.name]);
+  }
+
+  /** Cached or lazily-loaded `pahole` response for a struct node in `layout` mode. */
+  paholeFor(node) {
+    if (!node?.data?.name) return null;
+    const key = this.paholeKeyOf(node);
+    let entry = this.content.get(key);
+    if (!entry) {
+      entry = { status: "loading" };
+      this.content.set(key, entry);
+      const client = this.clientFor(node);
+      if (typeof client.getPaholeLayout === "function") {
+        client.getPaholeLayout(node.version || this.currentVersion, node.data.name).then((value) => {
+          entry.status = "ok";
+          entry.value = value;
+        }, (err) => {
+          entry.status = "ok";
+          entry.value = { unavailable: true, error: err?.message || "pahole layout unavailable" };
+        }).finally(() => {
+          for (const n of this.canvas?.nodes || []) if (n.type === "struct" && this.paholeKeyOf(n) === key) this.renderer?.invalidate(n.id);
+          if (this.containerEl?.isConnected) this.commit({ save: false, inspector: false });
+        });
+      } else {
+        entry.status = "ok";
+        entry.value = { unavailable: true, error: "pahole endpoint unavailable" };
+      }
+    }
+    return entry.status === "ok" ? entry.value : null;
+  }
+
+  /** Cached or lazily-loaded Version Time-Travel comparison for a struct node against `versionDiffTarget`. */
+  versionDiffFor(node) {
+    const target = this.versionDiffTarget;
+    if (!target || node?.type !== "struct" || !node.data?.name || node.version === target) return null;
+    const baseEntry = this.content.get(this.fetchKeyOf(node));
+    if (baseEntry?.status !== "ok") return null;
+    const key = JSON.stringify(["vdiff", node.repo, node.version, target, node.data.name, node.data.kind, node.data.path]);
+    let entry = this.versionDiffCache.get(key);
+    if (!entry) {
+      entry = { status: "loading" };
+      this.versionDiffCache.set(key, entry);
+      const client = this.clientFor(node);
+      if (typeof client.getNodemapStruct === "function") {
+        client.getNodemapStruct(target, node.data.name, { path: node.data.path, kind: node.data.kind }).then((val) => {
+          const diff = diffStructLayouts(baseEntry.value, val);
+          entry.status = "ok";
+          entry.value = { diff, badgeHtml: renderStructDiffBadge(diff, node.version, target) };
+        }, (err) => {
+          entry.status = "error";
+          entry.error = err;
+        }).finally(() => {
+          for (const n of this.canvas?.nodes || []) if (n.type === "struct" && n.data?.name === node.data.name) this.renderer?.invalidate(n.id);
+          if (this.containerEl?.isConnected) this.commit({ save: false, inspector: false });
+        });
+      }
+    }
+    return entry.status === "ok" ? entry.value : null;
+  }
+
+  /** View state outside a node that its body depends on (Edit Mode, the Kconfig engine, version diff). */
   bodyKey(node) {
-    if (node.type === "struct") return JSON.stringify([Boolean(this.canvas.settings.editMode), this.kconfigEngineFor(node)?.tabId || "", this.kconfigEpoch]);
+    if (node.type === "struct") {
+      return JSON.stringify([
+        Boolean(this.canvas.settings.editMode),
+        this.kconfigEngineFor(node)?.tabId || "",
+        this.kconfigEpoch,
+        this.versionDiffTarget || "",
+        node.data?.style === "layout" ? Boolean(this.content.get(this.paholeKeyOf(node))?.value) : false,
+      ]);
+    }
     if (node.type === "note") return this.canvas.settings.editMode ? "edit" : "";
     if (node.type === "kconfig") {
       // Live value and which relations are already on the canvas
@@ -443,7 +693,7 @@ export class NodeMapController {
 
   /** Nodes handed over by other views: `initialNodes`/`initialEdges`, `initialNode`, `pendingNodes`. */
   consumeIncoming(tab) {
-    if (!tab) return;
+    if (!tab) return [];
     const added = [];
     const seeded = Array.isArray(tab.initialNodes);
     if (seeded) {
@@ -482,6 +732,7 @@ export class NodeMapController {
       if (seeded || added.length > 1) this.fitView(false);
       this.scheduleSave();
     }
+    return added;
   }
 
   // ------------------------------------------------------------------ node creation
@@ -500,6 +751,8 @@ export class NodeMapController {
       title: spec.title,
       customTitle: spec.customTitle,
       color: spec.color,
+      bgColor: spec.bgColor,
+      layerId: spec.layerId,
       scale: spec.scale,
       version: spec.version || this.currentVersion,
       repo: spec.repo || this.repo,
@@ -577,7 +830,7 @@ export class NodeMapController {
     return `
       <div class="nodemap-container" tabindex="0" aria-label="NodeMap canvas">
         <div class="nodemap-toolbar" role="toolbar" aria-label="NodeMap tools">
-          <button type="button" class="nodemap-btn" data-tb="add" aria-haspopup="menu" title="Add a struct, source, man page, tab, symbol, note or group">+ Add Node</button>
+          <button type="button" class="nodemap-btn" data-tb="add" aria-haspopup="menu" title="Add a kernel node, note or group">+ Add Node</button>
           <button type="button" class="nodemap-btn" data-tb="tool" aria-pressed="${this.tool === "select"}" title="Select tool: drag on the canvas draws a selection box (Shift/Ctrl+drag does it with either tool)">▭ Select</button>
           <button type="button" class="nodemap-btn" data-tb="snap" aria-pressed="${this.canvas.settings.snap}" title="Snap positions and sizes to the grid">Snap</button>
           <div class="nodemap-sep"></div>
@@ -591,6 +844,9 @@ export class NodeMapController {
           <button type="button" class="nodemap-btn" data-tb="reset" title="Reset pan and zoom (100%)">1:1</button>
           <div class="nodemap-sep"></div>
           <button type="button" class="nodemap-btn" data-tb="layout" title="Arrange nodes by their connections">Auto-Layout</button>
+          <button type="button" class="nodemap-btn" data-tb="focus" aria-pressed="${this.focusHops != null}" title="Focus / Trace Mode: highlight N-hop connected subgraph">Focus</button>
+          <button type="button" class="nodemap-btn" data-tb="search" title="Find node (Ctrl+F)">Find</button>
+          <button type="button" class="nodemap-btn" data-tb="minimap" aria-pressed="${Boolean(this.minimap?.visible)}" title="Toggle corner minimap">Map</button>
           <div class="nodemap-sep"></div>
           <button type="button" class="nodemap-btn" data-tb="export" aria-haspopup="menu">Export ▾</button>
           <button type="button" class="nodemap-btn" data-tb="import" title="Replace this canvas with an exported JSON file">Import</button>
@@ -601,6 +857,7 @@ export class NodeMapController {
             <svg class="nm-wire-layer" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
             <div class="nm-marquee" hidden></div>
           </div>
+          <div class="nm-breadcrumbs" hidden></div>
           <div class="nm-empty-hint" hidden>
             <b>Empty canvas</b>
             <span>+ Add Node, double-click to write a note, or use “Send to NodeMap” in source, man page and tab menus.</span>
@@ -638,7 +895,12 @@ export class NodeMapController {
       else if (act === "redo") this.redo();
       else if (act === "reset") this.resetTransform();
       else if (act === "layout") this.autoLayoutDAG();
-      else if (act === "export") this.showExportMenu(r.left, r.bottom + 4);
+      else if (act === "focus") this.cycleFocusHops();
+      else if (act === "search") this.searchBar?.open();
+      else if (act === "minimap") {
+        this.minimap?.toggle();
+        btn.setAttribute("aria-pressed", String(Boolean(this.minimap?.visible)));
+      } else if (act === "export") this.showExportMenu(r.left, r.bottom + 4);
       else if (act === "import") fileInput.click();
     });
     fileInput.onchange = (e) => {
@@ -723,6 +985,27 @@ export class NodeMapController {
       body += field("query", "Section name", "", 'placeholder="SCHEDULER" spellcheck="false"');
       body += field("path", "Or the section of a file", "", 'placeholder="kernel/sched/core.c" spellcheck="false"');
       body += field("secId", "Or a section id", "", 'type="number" min="1"');
+    } else if (type === "cve") {
+      title = "Add CVE / Fix-Chain";
+      body += field("cveId", "CVE ID", "", 'placeholder="CVE-2024-1234" spellcheck="false"');
+      body += field("release", "Release state check (optional)", v, 'placeholder="v6.6" spellcheck="false"');
+      body += field("filePath", "Or all CVEs for a file", "", 'placeholder="mm/slub.c" spellcheck="false"');
+    } else if (type === "kapi") {
+      title = "Add Kernel API / Boundary";
+      body += `<label class="nm-form-row"><span>Catalog</span><select name="catalog">${M.KAPI_CATALOGS.map((c) => `<option value="${c}">${c}</option>`).join("")}</select></label>`;
+      body += field("symbol", "Symbol / Name filter", "", 'placeholder="openat" spellcheck="false"');
+      body += field("query", "Query", "", 'placeholder="pci" spellcheck="false"');
+      body += field("arch", "ARCH", "x86_64", 'spellcheck="false"');
+    } else if (type === "doc") {
+      title = "Add Kernel Docs (.rst / kernel-doc)";
+      body += field("path", "Documentation or source file", "", 'placeholder="Documentation/core-api/kernel-api.rst" spellcheck="false" required');
+      body += `<label class="nm-form-row"><span>Mode</span><select name="mode">${M.DOC_MODES.map((m) => `<option value="${m}">${m}</option>`).join("")}</select></label>`;
+      body += field("functions", "kernel-doc filter (optional)", "", 'placeholder="kmalloc" spellcheck="false"');
+    } else if (type === "history") {
+      title = "Add Symbol History / Blame";
+      body += `<label class="nm-form-row"><span>Mode</span><select name="mode"><option value="symbol">Symbol timeline</option><option value="blame">File blame commits</option></select></label>`;
+      body += field("path", "File path", "", 'placeholder="kernel/fork.c" spellcheck="false" required');
+      body += `<div class="nm-form-pair">${field("line", "Line", "1", 'type="number" min="1"')}${field("name", "Symbol name (optional)", "", 'placeholder="copy_process" spellcheck="false"')}</div>`;
     } else if (type === "tab") {
       title = "Add KernelInfo Tab";
       const repo = this.repo;
@@ -735,7 +1018,7 @@ export class NodeMapController {
     const modal = openModal({ title, subtitle: "The node is placed at the center of the view", width: "480px", footerHtml: '<button type="button" class="code-btn primary" data-act="add">Add</button>' });
     modal.body.innerHTML = `<form class="nm-form">${body}</form>`;
     const form = modal.body.querySelector("form");
-    form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query']")?.focus();
+    form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query'], input[name='cveId']")?.focus();
     const submit = async () => {
       const f = Object.fromEntries(new FormData(form).entries());
       const spec = await this.specFromForm(type, f);
@@ -803,6 +1086,24 @@ export class NodeMapController {
       if (!secId && !query && !path) return toast.warning("Enter a section name, a file or a section id"), null;
       return { type, version, data: { secId, query, path } };
     }
+    if (type === "cve") {
+      const spec = cveSpec({ cveId: f.cveId, release: f.release, filePath: f.filePath, version });
+      if (!spec) return toast.warning("Enter a CVE ID or a file path"), null;
+      return spec;
+    }
+    if (type === "kapi") {
+      return kapiSpec({ catalog: f.catalog, symbol: f.symbol, query: f.query, arch: f.arch, version });
+    }
+    if (type === "doc") {
+      const spec = docSpec({ path: f.path, mode: f.mode, functions: f.functions, version });
+      if (!spec) return toast.warning("Enter a documentation or source file path"), null;
+      return spec;
+    }
+    if (type === "history") {
+      const spec = historySpec({ mode: f.mode, path: f.path, line: int(f.line) || 1, name: f.name, version });
+      if (!spec) return toast.warning("Enter a file path or symbol name"), null;
+      return spec;
+    }
     if (type === "tab") {
       if (f.openTab) {
         const t = state.findTab(f.openTab);
@@ -828,7 +1129,22 @@ export class NodeMapController {
     if (node.type === "mail") return JSON.stringify(["mail", d.tid, d.mid, d.single]);
     if (node.type === "kconfig") return JSON.stringify(["kconfig", node.repo, node.version, d.symbol, d.arch]);
     if (node.type === "maintainer") return JSON.stringify(["maintainer", node.repo, node.version, d.secId, d.query, d.path]);
+    if (node.type === "cve") return JSON.stringify(["cve", node.repo, node.version, d.cveId, d.release, d.filePath]);
+    if (node.type === "kapi") return JSON.stringify(["kapi", node.repo, node.version, d.catalog, d.query, d.symbol, d.arch]);
+    if (node.type === "doc") return JSON.stringify(["doc", node.repo, node.version, d.path, d.mode, d.functions]);
+    if (node.type === "history") return JSON.stringify(["history", node.repo, node.version, d.mode, d.path, d.line, d.name, d.astId]);
     return null;
+  }
+
+  rawContentOf(node) {
+    const key = this.fetchKeyOf(node);
+    if (!key) return null;
+    const entry = this.content.get(key);
+    return entry?.status === "ok" ? entry.value : null;
+  }
+
+  isNodeVisibleInLayer(node) {
+    return M.isLayerVisible(this.canvas?.settings, node?.layerId);
   }
 
   /**
@@ -843,6 +1159,10 @@ export class NodeMapController {
     if (node.type === "mail") return mailThreadModel(v, node.data, this.mailBodies);
     if (node.type === "kconfig") return kconfigModel(v?.detail, v?.graph, node.data.symbol);
     if (node.type === "maintainer") return maintainerModel(v);
+    if (node.type === "cve") return cveModel(v, node.data);
+    if (node.type === "kapi") return kapiModel(v, node.data);
+    if (node.type === "doc") return docModel(v, node.data);
+    if (node.type === "history") return historyModel(v, node.data);
     return v;
   }
 
@@ -891,6 +1211,8 @@ export class NodeMapController {
         body.innerHTML = renderStructBody(entry.value, node.data, this.structOpts(node));
         const rows = body.querySelector(".nm-struct-rows");
         if (rows) rows.scrollTop = prevScroll;
+        const nodeEl = this.renderer?.element?.(node.id);
+        if (!node.autoFit && !nodeEl?.classList?.contains?.("nm-culled")) this.refreshPortOffsets(node.id);
       }
     } else if (node.type === "source") {
       const prevScroll = body.querySelector(".nm-src")?.scrollTop || 0;
@@ -903,16 +1225,32 @@ export class NodeMapController {
       else if (entry.status === "error") {
         body.innerHTML = status(entry.error?.message || "Could not load the file", true) +
           (node.data.path ? "" : status("Set the defining file in the inspector to read it from the source (unparsed revisions)."));
-      }
-      else {
+      } else {
         const r = entry.value;
         const hl = r.symbol && (r.symbol.line_s > r.start_line || r.symbol.line_e < r.end_line)
           ? new Set(Array.from({ length: r.symbol.line_e - r.symbol.line_s + 1 }, (_, i) => r.symbol.line_s + i)) : null;
         const lines = Array.isArray(r.lines) ? r.lines : [];
-        // The slice's path and lines show in the header (headMeta)
-        body.innerHTML = `<div class="nm-src nm-scroll">${renderSourceRows(lines, r.start_line, r.path, hl)}</div>`;
-        const src = body.querySelector(".nm-src");
-        if (src) src.scrollTop = prevScroll;
+        if (lines.length > VIRTUAL_THRESHOLD) {
+          body.innerHTML = '<div class="nm-src nm-scroll nm-virtual"></div>';
+          const src = body.querySelector(".nm-src");
+          if (src) {
+            if (prevScroll) src.scrollTop = prevScroll;
+            const mount = mountVirtualSource(src, { lines, startLine: r.start_line, path: r.path, highlight: hl });
+            this.mounts.set(node.id, { dispose: () => mount.dispose() });
+            if (this.workerPool?.workerSupported) {
+              this.workerPool.tokenizeSource({ lines, path: r.path }, { key: `hl:${node.id}` }).then((res) => {
+                if (res?.htmlRows && src.isConnected) {
+                  mount.setHtmlRows(res.htmlRows);
+                }
+              }).catch(() => { });
+            }
+          }
+        } else {
+          // The slice's path and lines show in the header (headMeta)
+          body.innerHTML = `<div class="nm-src nm-scroll">${renderSourceRows(lines, r.start_line, r.path, hl)}</div>`;
+          const src = body.querySelector(".nm-src");
+          if (src) src.scrollTop = prevScroll;
+        }
       }
     } else if (node.type === "man") {
       this.mountMan(node, body);
@@ -927,24 +1265,49 @@ export class NodeMapController {
           <iframe class="nm-iframe" src="${escapeHtml(src)}" title="${escapeHtml(M.displayTitle(node))}" loading="lazy" referrerpolicy="same-origin"></iframe>
           <button type="button" class="nm-shield" data-act="interact" title="Click to interact with this tab (Esc or a click on the canvas leaves it)">Click to interact</button>
         </div>`;
-    } else if (["diff", "mail", "kconfig", "maintainer"].includes(node.type)) {
+    } else if (["diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) {
       const prevScroll = body.querySelector(".nm-scroll")?.scrollTop || 0;
-      const load = { diff: () => this.loadDiff(node), mail: () => this.loadMail(node), kconfig: () => this.loadKconfig(node), maintainer: () => this.loadMaintainer(node) }[node.type];
-      const entry = this.ensureContent(node, load);
+      const loaders = {
+        diff: () => this.loadDiff(node),
+        mail: () => this.loadMail(node),
+        kconfig: () => this.loadKconfig(node),
+        maintainer: () => this.loadMaintainer(node),
+        cve: () => this.loadCve(node),
+        kapi: () => this.loadKapi(node),
+        doc: () => this.loadDoc(node),
+        history: () => this.loadHistory(node),
+      };
+      const entry = this.ensureContent(node, loaders[node.type]);
       if (entry.status === "loading") body.innerHTML = status(`Loading ${M.displayTitle(node)}…`);
       else if (entry.status === "error") body.innerHTML = status(entry.error?.message || "Could not load it", true);
       else {
         const model = this.modelOf(node);
-        if (node.type === "diff") body.innerHTML = renderDiffBody(model);
-        else if (node.type === "mail") body.innerHTML = renderMailBody(model);
+        if (node.type === "diff") {
+          const rows = diffRows(model);
+          if (rows.length > VIRTUAL_THRESHOLD) {
+            body.innerHTML = '<div class="nm-diff nm-scroll nm-virtual"></div>';
+            const sc = body.querySelector(".nm-diff");
+            if (sc) {
+              if (prevScroll) sc.scrollTop = prevScroll;
+              const mount = mountVirtualDiff(sc, { rows });
+              this.mounts.set(node.id, { dispose: () => mount.dispose() });
+            }
+          } else {
+            body.innerHTML = renderDiffBody(model);
+          }
+        } else if (node.type === "mail") body.innerHTML = renderMailBody(model);
         else if (node.type === "maintainer") body.innerHTML = renderMaintainerBody(model);
+        else if (node.type === "cve") body.innerHTML = renderCveBody(model);
+        else if (node.type === "kapi") body.innerHTML = renderKapiBody(model);
+        else if (node.type === "doc") body.innerHTML = renderDocBody(model);
+        else if (node.type === "history") body.innerHTML = renderHistoryBody(model);
         else {
           const values = this.kconfigValuesFor(node);
           const onCanvas = new Set(this.canvas.nodes.filter((n) => n.type === "kconfig" && n.id !== node.id).map((n) => n.data.symbol));
           body.innerHTML = renderKconfigBody(model, values ? kconfigValue(values, model.name) : null, onCanvas);
         }
         const sc = body.querySelector(".nm-scroll");
-        if (sc) sc.scrollTop = prevScroll;
+        if (sc && !sc.classList?.contains?.("nm-virtual")) sc.scrollTop = prevScroll;
       }
     } else if (node.type === "symbol") {
       const list = node.data.constituents || [];
@@ -958,6 +1321,9 @@ export class NodeMapController {
     const m = this.mounts.get(id);
     if (m?.dispose) m.dispose();
     this.mounts.delete(id);
+    this.portOffsets.delete(id);
+    this.highlightTokens.delete(id);
+    this.workerPool?.cancel?.(`hl:${id}`);
   }
 
   async loadStruct(node) {
@@ -1050,6 +1416,61 @@ export class NodeMapController {
     return client.getMaintainerSection(version, secId);
   }
 
+  async loadCve(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    if (d.filePath && !d.cveId) return client.getFileCves(node.version || this.currentVersion, d.filePath);
+    if (!d.cveId) throw new Error("Set a CVE ID or file path in the inspector");
+    return client.getCveDetail(d.cveId, d.release || "");
+  }
+
+  async loadKapi(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    const v = node.version || this.currentVersion;
+    const cat = d.catalog || "summary";
+    if (cat === "summary") return client.getKapi(v, "summary");
+    if (cat === "syscalls") return client.getKapi(v, `syscalls?arch=${encodeURIComponent(d.arch || "x86_64")}`);
+    if (cat === "exports") {
+      return d.symbol
+        ? client.request(`/api/kapi/${encodeURIComponent(v)}/exports/${encodeURIComponent(d.symbol)}?arch=${encodeURIComponent(d.arch || "x86_64")}`)
+        : client.getKapi(v, "exports");
+    }
+    if (cat === "params") return client.getKapi(v, `params?arch=${encodeURIComponent(d.arch || "x86_64")}`);
+    if (cat === "tracepoints") return client.getKapi(v, "tracepoints");
+    if (cat === "modules") return client.getKapi(v, `modules?arch=${encodeURIComponent(d.arch || "x86_64")}`);
+    if (cat === "devices") return client.getKapi(v, `devices?arch=${encodeURIComponent(d.arch || "x86_64")}${d.query ? `&q=${encodeURIComponent(d.query)}` : ""}`);
+    return client.getKapi(v, "summary");
+  }
+
+  async loadDoc(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    const v = node.version || this.currentVersion;
+    if (!d.path) throw new Error("Set a documentation or source file path in the inspector");
+    if (d.mode === "rst" || (d.mode !== "kernel-doc" && isDocumentationPath(d.path))) {
+      try {
+        const fc = await client.getFileContent(v, d.path);
+        if (fc && typeof fc.content === "string") return { path: d.path, content: fc.content };
+      } catch {
+        // Fallback to kernel-doc extraction when raw file content fails
+      }
+    }
+    return client.getKernelDoc(v, d.path, { functions: d.functions || "" });
+  }
+
+  async loadHistory(node) {
+    const d = node.data;
+    const client = this.clientFor(node);
+    const v = node.version || this.currentVersion;
+    if (d.mode === "blame") {
+      if (!d.path) throw new Error("Set a file path in the inspector");
+      return client.getFileBlame(v, d.path);
+    }
+    if (!d.path) throw new Error("Set a file path in the inspector");
+    return client.getSymbolHistory(v, d.path, d.line || 1, d.astId || null, { name: d.name || "" });
+  }
+
   /** Whether ⟳ asked for this node's content from the server (past the local API cache); asked once. */
   takeFresh(id) {
     const hit = Boolean(this.fresh?.has(id));
@@ -1117,14 +1538,14 @@ export class NodeMapController {
     if (node.type === "symbol") s += b("expand", node.data.expanded ? "−" : "+", node.data.expanded ? "Collapse members" : "Expand members");
     if (node.type === "mail") s += b("mail-expand", "⇶", "Expand Thread to Nodes: one connected node per message");
     if (node.type === "kconfig") s += b("kc-expand", "⇶", "Expand Relations: add or connect every related symbol");
-    if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) s += b("refresh", "⟳", "Load again");
+    if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) s += b("refresh", "⟳", "Load again");
     if (M.TAB_OPENABLE_TYPES.includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
     return s;
   }
 
   /** Source reference shown at the right of a struct / source header (from its loaded content). */
   headMeta(node) {
-    if (!["struct", "source", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) return null;
+    if (!["struct", "source", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) return null;
     return headMetaOf(node.type, this.modelOf(node));
   }
 
@@ -1148,19 +1569,28 @@ export class NodeMapController {
    */
   commit({ save = true, inspector = true, record = save, coalesce = null, coalesceEnd = false, absorb = false } = {}) {
     if (!this.renderer) return;
+    if (!this.rootCanvas) this.rootCanvas = this.canvas;
     const ids = new Set(this.canvas.nodes.map((n) => n.id));
     for (const id of [...this.selected]) if (!ids.has(id)) this.selected.delete(id);
     if (this.selectedEdge && !this.canvas.edges.some((e) => e.id === this.selectedEdge)) this.selectedEdge = null;
     if (this.active && !ids.has(this.active)) this.active = null;
     this.rootEl?.classList.toggle("nm-edit", Boolean(this.canvas.settings.editMode));
-    this.renderer.sync(this.canvas.nodes, this.selected, this.active);
+    this.renderer.sync(this.canvas.nodes, this.selected, this.active, this.canvas.settings);
+    this.updateViewportCulling();
     const fitted = this.autoFitPass();
     this.applyBackground();
-    this.renderWires();
+    this.renderWires(null);
+    this.applyFocusStyling();
+    this.tourPlayer?.applyHighlights?.();
+    this.minimap?.render();
+    this.renderBreadcrumbs();
     if (this.hintEl) this.hintEl.hidden = this.canvas.nodes.length > 0;
     this.trackHistory({ record, coalesce, coalesceEnd, absorb: absorb || (fitted && !record) });
     if (inspector) this.renderInspector();
-    if (save || fitted) this.scheduleSave();
+    if (save || fitted) {
+      if (save) this._userEdited = true;
+      this.scheduleSave();
+    }
   }
 
   // ------------------------------------------------------------------ undo / redo
@@ -1168,11 +1598,12 @@ export class NodeMapController {
   trackHistory({ record, coalesce, coalesceEnd = false, absorb }) {
     const h = this.history;
     if (!h || !this.canvas) return;
-    if (h.base === null) h.absorb(M.historySnapshot(this.canvas));
+    const snap = () => M.structuralSnapshot(this.canvas, h.base);
+    if (h.base === null) h.absorb(snap());
     // A gesture in progress keeps the baseline from before it: its end records the whole gesture
     else if (absorb) {
-      if (!this.gesture) h.absorb(M.historySnapshot(this.canvas));
-    } else if (record) h.record(M.historySnapshot(this.canvas), coalesce, coalesceEnd);
+      if (!this.gesture) h.absorb(snap());
+    } else if (record) h.record(snap(), coalesce, coalesceEnd);
     this.updateHistoryButtons();
   }
 
@@ -1188,7 +1619,7 @@ export class NodeMapController {
   /** Undo the last document change (false when there is none or a gesture is in progress). */
   undo() {
     if (this.gesture) return false;
-    const snap = this.history.undo(M.historySnapshot(this.canvas));
+    const snap = this.history.undo(M.structuralSnapshot(this.canvas, this.history.base));
     if (!snap) return false;
     this.restoreSnapshot(snap);
     return true;
@@ -1197,7 +1628,7 @@ export class NodeMapController {
   /** Redo the change undone last (false when there is none). */
   redo() {
     if (this.gesture) return false;
-    const snap = this.history.redo(M.historySnapshot(this.canvas));
+    const snap = this.history.redo(M.structuralSnapshot(this.canvas, this.history.base));
     if (!snap) return false;
     this.restoreSnapshot(snap);
     return true;
@@ -1209,7 +1640,7 @@ export class NodeMapController {
    * the nodes that still exist.
    */
   restoreSnapshot(snap) {
-    const doc = JSON.parse(snap);
+    const doc = M.materializeSnapshot(snap);
     const st = this.canvas.settings || {};
     // Nodes and edges that still exist keep their object (bodies, man page callbacks and open editors hold
     // it): their fields are replaced in place
@@ -1224,6 +1655,7 @@ export class NodeMapController {
     };
     this.canvas.nodes = reuse(this.canvas.nodes, doc.nodes);
     this.canvas.edges = reuse(this.canvas.edges, doc.edges);
+    if (Array.isArray(doc.tours)) this.canvas.tours = doc.tours;
     this.canvas.settings = { ...doc.settings, editMode: st.editMode, snap: st.snap };
     for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
     // The followed embedded session may be another one now
@@ -1257,6 +1689,7 @@ export class NodeMapController {
       const nat = this.measureNatural(node);
       if (nat && M.applyNaturalSize(node, nat.w, nat.h)) {
         changed = true;
+        this.portOffsets.delete(id);
         const el = this.renderer.element(id);
         if (el && this.renderer.place) this.renderer.place(el, node);
       }
@@ -1269,6 +1702,18 @@ export class NodeMapController {
    * and man pages wrap, so they keep their width and grow in height). Null without a live element.
    */
   measureNatural(node) {
+    if (node.type === "source") {
+      const entry = this.content.get(this.fetchKeyOf(node));
+      if (entry?.status === "ok" && (entry.value?.lines?.length || 0) > VIRTUAL_THRESHOLD) {
+        return estimateNaturalSourceSize(entry.value.lines, entry.value.start_line || 1);
+      }
+    } else if (node.type === "diff") {
+      const entry = this.content.get(this.fetchKeyOf(node));
+      if (entry?.status === "ok") {
+        const rows = diffRows(entry.value);
+        if (rows.length > VIRTUAL_THRESHOLD) return estimateNaturalSourceSize(rows.map((r) => r.text || ""), 1);
+      }
+    }
     const el = this.renderer?.element(node.id);
     if (!el?.isConnected || typeof el.offsetWidth !== "number") return null;
     const wraps = node.type === "note" || node.type === "man";
@@ -1298,7 +1743,24 @@ export class NodeMapController {
     if (!this.saveTimer || !this.canvas) return;
     clearTimeout(this.saveTimer);
     this.saveTimer = null;
-    if (!M.saveCanvas(globalThis.localStorage, this.storageKey, this.canvas) && !this.warnedQuota) {
+    const doc = this.rootCanvas || this.canvas;
+    if (this._hasIndexedDbBackend()) {
+      M.saveCanvasAsync(
+        this.userDb,
+        this.storageKey,
+        doc,
+        { repo: this.repo, id: this.tab?.id || this.storageKey, created_at: this.canvasMeta.created_at },
+        globalThis.localStorage,
+      ).then((res) => {
+        if (res?.created_at && !this.canvasMeta.created_at) this.canvasMeta.created_at = res.created_at;
+        if (!res?.ok && !this.warnedQuota) {
+          this.warnedQuota = true;
+          toast.warning("NodeMap could not save this canvas in the browser storage (full?): export it as JSON to keep it");
+        }
+      }).catch(() => { });
+      return;
+    }
+    if (!M.saveCanvas(globalThis.localStorage, this.storageKey, doc) && !this.warnedQuota) {
       this.warnedQuota = true;
       toast.warning("NodeMap could not save this canvas in the browser storage (full?): export it as JSON to keep it");
     }
@@ -1314,6 +1776,25 @@ export class NodeMapController {
     this.wrapEl.style.setProperty("--nm-grid", `${g}px`);
     this.wrapEl.style.setProperty("--nm-grid-x", `${x}px`);
     this.wrapEl.style.setProperty("--nm-grid-y", `${y}px`);
+    this.updateViewportCulling();
+    this.minimap?.render();
+  }
+
+  updateViewportCulling() {
+    if (!this.renderer?.updateViewportCulling || !this.wrapEl || !this.canvas) return;
+    const r = this.wrapEl.getBoundingClientRect?.();
+    if (!r?.width || !r?.height) return;
+    const wasCulled = new Set();
+    for (const n of this.canvas.nodes) {
+      const el = this.renderer.element?.(n.id);
+      if (el?.classList?.contains?.("nm-culled")) wasCulled.add(n.id);
+    }
+    const visRect = visibleCanvasRect(this.canvas.viewport, r.width, r.height);
+    this.renderer.updateViewportCulling(this.canvas.nodes, visRect, this.zoom, this.active);
+    for (const id of wasCulled) {
+      const el = this.renderer.element?.(id);
+      if (el && !el.classList?.contains?.("nm-culled")) this.portOffsets.delete(id);
+    }
   }
 
   get zoom() {
@@ -1373,19 +1854,50 @@ export class NodeMapController {
     this.scheduleSave();
   }
 
-  // ------------------------------------------------------------------ wires
+  // ------------------------------------------------------------------ wires & cached field ports
 
-  /** Canvas point of a struct field row's port, kept inside the node's visible rows. */
+  /** Cache relative Y center offsets of all struct field rows inside `nodeId` (avoids DOM layout reads on drag). */
+  refreshPortOffsets(nodeId) {
+    const el = this.renderer?.element?.(nodeId);
+    const node = this.byId(nodeId);
+    if (!el?.querySelectorAll || !node) return;
+    const z = this.zoom || 1;
+    const nr = el.getBoundingClientRect?.();
+    if (!nr || !nr.height) return;
+    const sc = el.querySelector(".nm-scroll");
+    const rows = sc?.getBoundingClientRect?.() || nr;
+    const rowsBottom = rows.bottom ?? ((rows.top || 0) + (rows.height || 0));
+    const map = new Map();
+    for (const row of el.querySelectorAll(".nm-sf[data-key]")) {
+      const key = row.dataset?.key;
+      if (!key) continue;
+      const rr = row.getBoundingClientRect?.();
+      if (!rr) continue;
+      const cy = Math.min(Math.max(rr.top + rr.height / 2, rows.top + 4), rowsBottom - 4);
+      map.set(key, (cy - nr.top) / z);
+    }
+    this.portOffsets.set(nodeId, map);
+  }
+
+  /** Canvas point of a struct field row's port, served from cache during drags. */
   fieldPoint(node, key, side) {
+    const cached = this.portOffsets.get(node.id)?.get(key);
+    if (cached !== undefined) {
+      return { x: side === "left" ? node.x : node.x + node.w, y: node.y + cached };
+    }
     const el = this.renderer?.element(node.id);
     const row = el?.querySelector(`.nm-sf[data-key="${cssEsc(key)}"]`);
     if (!row) return null;
-    const z = this.zoom;
+    const z = this.zoom || 1;
     const nr = el.getBoundingClientRect();
     const rr = row.getBoundingClientRect();
     const rows = row.closest(".nm-scroll")?.getBoundingClientRect() || nr;
-    const cy = Math.min(Math.max(rr.top + rr.height / 2, rows.top + 4), rows.bottom - 4);
-    return { x: side === "left" ? node.x : node.x + node.w, y: node.y + (cy - nr.top) / z };
+    const rowsBottom = rows.bottom ?? ((rows.top || 0) + (rows.height || 0));
+    const cy = Math.min(Math.max(rr.top + rr.height / 2, rows.top + 4), rowsBottom - 4);
+    const relY = (cy - nr.top) / z;
+    if (!this.portOffsets.has(node.id)) this.portOffsets.set(node.id, new Map());
+    this.portOffsets.get(node.id).set(key, relY);
+    return { x: side === "left" ? node.x : node.x + node.w, y: node.y + relY };
   }
 
   endOf(node, side, field) {
@@ -1393,32 +1905,24 @@ export class NodeMapController {
     return { rect: M.rectOf(node), side: point ? (side === "left" ? "left" : "right") : side, point };
   }
 
-  renderWires() {
+  _edgeInnerSvg(e, g) {
+    const dash = dashArray(e.style);
+    const sel = e.id === this.selectedEdge;
+    const heads = g.heads.map((h) => `<polygon class="nm-edge-head" points="${h}"/>`).join("");
+    const label = e.label ? `<text class="nm-edge-label" x="${g.mid.x}" y="${g.mid.y - 6}" text-anchor="middle">${escapeHtml(e.label)}</text>` : "";
+    const wps = sel && Array.isArray(e.waypoints) && e.waypoints.length
+      ? e.waypoints.map((wp, idx) => `<circle class="nm-edge-wp" data-edge-id="${escapeHtml(e.id)}" data-wp-idx="${idx}" cx="${wp.x}" cy="${wp.y}" r="5"/>`).join("")
+      : "";
+    return `<path class="nm-edge-hit" d="${g.d}"/><path class="nm-edge-line" d="${g.d}"${dash ? ` stroke-dasharray="${dash}"` : ""}/>${heads}${label}${wps}`;
+  }
+
+  renderWires(dirtyNodeIds = null) {
     if (!this.wireSvg || !this.canvas) return;
-    let s = "";
     const byId = new Map(this.canvas.nodes.map((n) => [n.id, n]));
-    this.edgeGeoms = new Map();
-    const ends = [];
-    for (const e of this.canvas.edges) {
-      const a = byId.get(e.from);
-      const b = byId.get(e.to);
-      if (!a || !b) continue;
-      const fromEnd = this.endOf(a, e.fromSide, e.fromField);
-      const toEnd = this.endOf(b, e.toSide, e.toField);
-      const g = computeEdgeGeometry(fromEnd, toEnd, { curve: e.curve, arrow: e.arrow });
-      this.edgeGeoms.set(e.id, g);
-      ends.push([a.id, fromEnd.point ? e.fromField : null, g.fromSide], [b.id, toEnd.point ? e.toField : null, g.toSide]);
-      const dash = dashArray(e.style);
-      const sel = e.id === this.selectedEdge ? " selected" : "";
-      s += `<g class="nm-edge${sel}" data-edge-id="${escapeHtml(e.id)}" style="--nm-edge:${M.accentVar(e.color, "var(--accent-blue)")}">
-        <path class="nm-edge-hit" d="${g.d}"/>
-        <path class="nm-edge-line" d="${g.d}"${dash ? ` stroke-dasharray="${dash}"` : ""}/>
-        ${g.heads.map((h) => `<polygon class="nm-edge-head" points="${h}"/>`).join("")}
-        ${e.label ? `<text class="nm-edge-label" x="${g.mid.x}" y="${g.mid.y - 6}" text-anchor="middle">${escapeHtml(e.label)}</text>` : ""}
-      </g>`;
-    }
+    if (!this.edgeGeoms) this.edgeGeoms = new Map();
+    if (!this.edgeEnds) this.edgeEnds = new Map();
+
     const p = this.gesture?.kind === "wire" ? this.gesture : null;
-    // The layer is as large as what it draws (hit testing does not reach outside an svg's box)
     const b = M.boundsOf(this.canvas.nodes) || { x: 0, y: 0, w: 0, h: 0 };
     const pts = p ? [p.cur] : [];
     const x1 = Math.min(b.x, ...pts.map((q) => q.x)) - 400;
@@ -1427,6 +1931,96 @@ export class NodeMapController {
     const y2 = Math.max(b.y + b.h, ...pts.map((q) => q.y)) + 400;
     Object.assign(this.wireSvg.style, { left: `${x1}px`, top: `${y1}px`, width: `${x2 - x1}px`, height: `${y2 - y1}px` });
     this.wireSvg.setAttribute("viewBox", `${x1} ${y1} ${x2 - x1} ${y2 - y1}`);
+
+    const canPatchDom = typeof this.wireSvg.appendChild === "function"
+      && typeof document !== "undefined"
+      && typeof document.createElementNS === "function";
+
+    if (canPatchDom) {
+      const liveIds = new Set();
+      for (const e of this.canvas.edges) {
+        const a = byId.get(e.from);
+        const target = byId.get(e.to);
+        if (!a || !target) continue;
+        liveIds.add(e.id);
+        let gEl = this.wireEls.get(e.id);
+        const needsGeom = !dirtyNodeIds || !gEl || dirtyNodeIds.has(e.from) || dirtyNodeIds.has(e.to);
+        if (!gEl) {
+          gEl = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          gEl.dataset.edgeId = e.id;
+          this.wireEls.set(e.id, gEl);
+          this.wireSvg.appendChild(gEl);
+        } else if (!gEl.isConnected) {
+          this.wireSvg.appendChild(gEl);
+        }
+        const sel = e.id === this.selectedEdge;
+        const layerHidden = !M.isLayerVisible(this.canvas.settings, e.layerId);
+        const focusDim = Boolean(this.focusHops != null && this._focusEdges && !this._focusEdges.has(e.id));
+        const cls = `nm-edge${sel ? " selected" : ""}${layerHidden ? " nm-layer-hidden" : ""}${focusDim ? " nm-focus-dim" : ""}`;
+        if (gEl.getAttribute("class") !== cls) gEl.setAttribute("class", cls);
+        const edgeColor = M.accentVar(e.color, "var(--accent-blue)");
+        if (gEl.style?.getPropertyValue?.("--nm-edge") !== edgeColor) gEl.style?.setProperty?.("--nm-edge", edgeColor);
+
+        if (needsGeom || sel !== Boolean(gEl._wasSel)) {
+          gEl._wasSel = sel;
+          const fromEnd = this.endOf(a, e.fromSide, e.fromField);
+          const toEnd = this.endOf(target, e.toSide, e.toField);
+          const g = computeEdgeGeometry(fromEnd, toEnd, { curve: e.curve, arrow: e.arrow, waypoints: e.waypoints });
+          this.edgeGeoms.set(e.id, g);
+          this.edgeEnds.set(e.id, [
+            [a.id, fromEnd.point ? e.fromField : null, g.fromSide],
+            [target.id, toEnd.point ? e.toField : null, g.toSide],
+          ]);
+          gEl.innerHTML = this._edgeInnerSvg(e, g);
+        }
+      }
+      for (const [id, gEl] of this.wireEls) {
+        if (!liveIds.has(id)) {
+          gEl.remove?.();
+          this.wireEls.delete(id);
+          this.edgeGeoms.delete(id);
+          this.edgeEnds.delete(id);
+        }
+      }
+      if (p) {
+        const from = byId.get(p.from);
+        if (from) {
+          if (!this.pendingWireEl) {
+            this.pendingWireEl = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            this.pendingWireEl.setAttribute("class", "nm-edge nm-edge-pending");
+            this.wireSvg.appendChild(this.pendingWireEl);
+          }
+          const end = { rect: { x: p.cur.x, y: p.cur.y, w: 0, h: 0 }, side: "auto", point: p.cur };
+          const g = computeEdgeGeometry(this.endOf(from, p.side, p.field), end, { curve: "bezier", arrow: "forward" });
+          this.pendingWireEl.innerHTML = `<path class="nm-edge-line" d="${g.d}" stroke-dasharray="5 4"/>`;
+        }
+      } else if (this.pendingWireEl) {
+        this.pendingWireEl.remove?.();
+        this.pendingWireEl = null;
+      }
+      const ends = [];
+      for (const pair of this.edgeEnds.values()) ends.push(...pair);
+      this.tagConnectedPorts(ends);
+      return;
+    }
+
+    // String fallback for minimal test DOM stubs lacking SVG element creation
+    let s = "";
+    this.edgeGeoms = new Map();
+    const ends = [];
+    for (const e of this.canvas.edges) {
+      const a = byId.get(e.from);
+      const target = byId.get(e.to);
+      if (!a || !target) continue;
+      const fromEnd = this.endOf(a, e.fromSide, e.fromField);
+      const toEnd = this.endOf(target, e.toSide, e.toField);
+      const g = computeEdgeGeometry(fromEnd, toEnd, { curve: e.curve, arrow: e.arrow, waypoints: e.waypoints });
+      this.edgeGeoms.set(e.id, g);
+      ends.push([a.id, fromEnd.point ? e.fromField : null, g.fromSide], [target.id, toEnd.point ? e.toField : null, g.toSide]);
+      const sel = e.id === this.selectedEdge ? " selected" : "";
+      const layerHidden = !M.isLayerVisible(this.canvas.settings, e.layerId) ? " nm-layer-hidden" : "";
+      s += `<g class="nm-edge${sel}${layerHidden}" data-edge-id="${escapeHtml(e.id)}" style="--nm-edge:${M.accentVar(e.color, "var(--accent-blue)")}">${this._edgeInnerSvg(e, g)}</g>`;
+    }
     if (p) {
       const from = byId.get(p.from);
       if (from) {
@@ -1468,7 +2062,23 @@ export class NodeMapController {
     wrap.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     wrap.addEventListener("contextmenu", (e) => this.onContextMenu(e));
     // Scrolled struct rows move their field ports
-    wrap.addEventListener("scroll", () => this.scheduleWires(), true);
+    wrap.addEventListener("scroll", (ev) => {
+      const nEl = ev.target?.closest?.(".nm-node");
+      const id = nEl?.dataset?.nodeId;
+      if (id) {
+        this.refreshPortOffsets(id);
+        this.scheduleWires(new Set([id]));
+      } else {
+        this.scheduleWires();
+      }
+    }, true);
+    if (this.breadcrumbsEl) {
+      this.breadcrumbsEl.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-bc-depth]");
+        if (!btn) return;
+        this.exitSubMapTo(parseInt(btn.dataset.bcDepth, 10));
+      });
+    }
     this.rootEl.addEventListener("keydown", (e) => this.onKeyDown(e));
     this.rootEl.addEventListener("keyup", (e) => {
       if (e.key === " ") this.spaceDown = false;
@@ -1497,11 +2107,19 @@ export class NodeMapController {
     }
   }
 
-  scheduleWires() {
+  scheduleWires(dirtyNodeIds = null) {
+    if (!dirtyNodeIds) this.dirtyWireNodes = null;
+    else if (this.dirtyWireNodes instanceof Set) {
+      for (const id of dirtyNodeIds) this.dirtyWireNodes.add(id);
+    } else if (this.dirtyWireNodes !== null || !this.wireFrame) {
+      this.dirtyWireNodes = new Set(dirtyNodeIds);
+    }
     if (this.wireFrame) return;
     this.wireFrame = requestAnimationFrame(() => {
       this.wireFrame = null;
-      this.renderWires();
+      const dirty = this.dirtyWireNodes;
+      this.dirtyWireNodes = null;
+      this.renderWires(dirty);
     });
   }
 
@@ -1515,6 +2133,17 @@ export class NodeMapController {
       return;
     }
     if (e.button !== 0 || t.closest(".nm-inline-edit, input, textarea, select")) return;
+    const wpEl = t.closest(".nm-edge-wp[data-edge-id]");
+    if (wpEl) {
+      const edge = this.canvas.edges.find((x) => x.id === wpEl.dataset.edgeId);
+      const wpIdx = parseInt(wpEl.dataset.wpIdx, 10);
+      if (edge && Number.isInteger(wpIdx) && edge.waypoints?.[wpIdx]) {
+        e.preventDefault();
+        this.selectEdge(edge.id);
+        this.gesture = { kind: "waypoint", start, edgeId: edge.id, wpIdx, moved: false };
+        return;
+      }
+    }
     const edgeEl = t.closest(".nm-edge[data-edge-id]");
     if (edgeEl) {
       this.selectEdge(edgeEl.dataset.edgeId);
@@ -1610,10 +2239,12 @@ export class NodeMapController {
     const snap = this.canvas.settings.snap ? this.canvas.settings.grid : 0;
     if (g.kind === "pan") {
       this.wrapEl.classList.add("nm-panning");
+      this.rootEl?.classList?.add?.("nm-dragging");
       this.canvas.viewport.x = g.vp.x + dxs;
       this.canvas.viewport.y = g.vp.y + dys;
       this.applyTransform();
     } else if (g.kind === "drag") {
+      this.rootEl?.classList?.add?.("nm-dragging");
       let dx = dxs / z;
       let dy = dys / z;
       const prim = g.nodes.find((m) => m.n.id === g.primary);
@@ -1621,28 +2252,39 @@ export class NodeMapController {
         dx = M.snapValue(prim.x + dx, snap) - prim.x;
         dy = M.snapValue(prim.y + dy, snap) - prim.y;
       }
+      const movedIds = new Set();
       for (const m of g.nodes) {
         m.n.x = Math.round(m.x + dx);
         m.n.y = Math.round(m.y + dy);
+        movedIds.add(m.n.id);
         const el = this.renderer.element(m.n.id);
-        if (el) {
-          el.style.left = `${m.n.x}px`;
-          el.style.top = `${m.n.y}px`;
-        }
+        if (el && this.renderer.place) this.renderer.place(el, m.n);
       }
-      this.scheduleWires();
+      this.scheduleWires(movedIds);
     } else if (g.kind === "resize") {
+      this.rootEl?.classList?.add?.("nm-dragging");
       const node = this.byId(g.id);
       if (!node) return;
       // Auto-fitted nodes keep their aspect ratio: the drag scales their content
       if (node.autoFit) Object.assign(node, M.scaleResize(g.rect, g.handle, dxs / z, dys / z, node));
       else Object.assign(node, M.resizeRect(g.rect, g.handle, dxs / z, dys / z, M.SIZE_LIMITS[node.type], snap));
+      this.portOffsets.delete(node.id);
       const el = this.renderer.element(node.id);
       if (el) this.renderer.place(el, node);
-      this.scheduleWires();
+      this.scheduleWires(new Set([node.id]));
+    } else if (g.kind === "waypoint") {
+      const edge = this.canvas.edges.find((x) => x.id === g.edgeId);
+      if (edge?.waypoints?.[g.wpIdx]) {
+        const p = this.toCanvas(e.clientX, e.clientY);
+        edge.waypoints[g.wpIdx] = {
+          x: Math.round(snap ? M.snapValue(p.x, snap) : p.x),
+          y: Math.round(snap ? M.snapValue(p.y, snap) : p.y),
+        };
+        this.scheduleWires(new Set([edge.from, edge.to]));
+      }
     } else if (g.kind === "wire") {
       g.cur = this.toCanvas(e.clientX, e.clientY);
-      this.scheduleWires();
+      this.scheduleWires(new Set([g.from]));
     } else if (g.kind === "marquee") {
       const p = this.toCanvas(e.clientX, e.clientY);
       const r = M.rectFromPoints(g.origin.x, g.origin.y, p.x, p.y);
@@ -1650,7 +2292,7 @@ export class NodeMapController {
       this.marqueeEl.hidden = false;
       this.selected = new Set([...g.base, ...M.nodesInMarquee(this.canvas.nodes, r)]);
       this.selectedEdge = null;
-      this.renderer.sync(this.canvas.nodes, this.selected, this.active);
+      this.renderer.sync(this.canvas.nodes, this.selected, this.active, this.canvas.settings);
     }
   }
 
@@ -1658,7 +2300,8 @@ export class NodeMapController {
     const g = this.gesture;
     if (!g) return;
     this.gesture = null;
-    this.wrapEl?.classList.remove("nm-panning");
+    this.wrapEl?.classList?.remove?.("nm-panning");
+    this.rootEl?.classList?.remove?.("nm-dragging");
     // A cancelled wire creates nothing; other gestures keep what they did so far
     if (e.type === "pointercancel" && g.kind === "wire") g.moved = false;
     if (g.kind === "pan") {
@@ -1675,6 +2318,8 @@ export class NodeMapController {
     } else if (g.kind === "resize" && g.moved) {
       const node = this.byId(g.id);
       if (node?.type === "group") M.reassignGroups(this.canvas.nodes, this.canvas.nodes.filter((n) => n.id !== node.id));
+      this.commit();
+    } else if (g.kind === "waypoint" && g.moved) {
       this.commit();
     } else if (g.kind === "wire") {
       // Target ports stay hit-testable (.nm-wiring) until the drop point is read
@@ -1749,7 +2394,61 @@ export class NodeMapController {
     else if (act === "mail-expand") this.expandThreadToNodes(node.id);
     else if (act === "kc-rel") this.expandKconfigRelations(node.id, btn.dataset.key);
     else if (act === "kc-expand") this.expandKconfigRelations(node.id);
-    else if (node.type === "struct") this.onStructAction(node, act, btn.dataset.key);
+    else if (act === "follow-type") this.followStructType(node.id, btn.dataset.key);
+    else if (act === "cve-spawn-diff") this._spawnFromCveDiff(node, btn.dataset.key);
+    else if (act === "cve-spawn-source") this._spawnLinkedNode(node, { type: "source", version: node.version, data: { path: btn.dataset.key, mode: "file" } }, "affects");
+    else if (act === "cve-spawn-cve") this._spawnLinkedNode(node, cveSpec({ cveId: btn.dataset.key, version: node.version, repo: node.repo }), "related");
+    else if (act === "kapi-catalog") this._spawnLinkedNode(node, kapiSpec({ catalog: btn.dataset.key, arch: node.data.arch, version: node.version, repo: node.repo }), "contains");
+    else if (act === "kapi-spawn-symbol") this._spawnLinkedNode(node, { type: "symbol", version: node.version, repo: node.repo, data: { name: btn.dataset.key, kind: "func" } }, "exposes");
+    else if (act === "kapi-spawn-man") {
+      const idx = String(btn.dataset.key || "").lastIndexOf(":");
+      const name = idx >= 0 ? btn.dataset.key.slice(0, idx) : btn.dataset.key;
+      const section = idx >= 0 ? btn.dataset.key.slice(idx + 1) : "2";
+      this._spawnLinkedNode(node, { type: "man", version: node.version, repo: node.repo, data: { name, section } }, "documented by");
+    } else if (act === "kapi-spawn-source" || act === "doc-spawn-source") {
+      const raw = String(btn.dataset.key || "");
+      const idx = raw.lastIndexOf(":");
+      const path = idx > 0 ? raw.slice(0, idx) : raw;
+      const line = idx > 0 ? Math.max(1, parseInt(raw.slice(idx + 1), 10) || 1) : 1;
+      this._spawnLinkedNode(node, { type: "source", version: node.version, repo: node.repo, data: { path, mode: "range", start: line, end: line + 30 } }, act === "doc-spawn-source" ? "documents" : "defined in");
+    } else if (act === "hist-spawn-commit") {
+      this._spawnLinkedNode(node, { type: "diff", version: node.version, repo: node.repo, data: { mode: "commit", commitHash: btn.dataset.key, path: "" } }, "blame commit");
+    } else if (act === "hist-spawn-diff") {
+      const raw = String(btn.dataset.key || "");
+      const sep = raw.indexOf(":");
+      const revRange = sep >= 0 ? raw.slice(0, sep) : raw;
+      const path = sep >= 0 ? raw.slice(sep + 1) : node.data.path;
+      const [versionA, versionB] = revRange.split("..");
+      this._spawnLinkedNode(node, { type: "diff", version: versionB || node.version, repo: node.repo, data: { mode: "file", versionA, versionB, path } }, "changed in");
+    } else if (node.type === "struct") this.onStructAction(node, act, btn.dataset.key);
+  }
+
+  _spawnLinkedNode(from, spec, label = "") {
+    if (!from || !spec) return null;
+    const siblingCount = this.canvas.edges.filter((e) => e.from === from.id).length;
+    const node = this.nodeFromSpec(spec, { x: from.x + from.w + 100, y: from.y + siblingCount * 110 });
+    if (!node) return null;
+    this.canvas.nodes.push(node);
+    M.reassignGroups(this.canvas.nodes, [node]);
+    const edge = M.createEdge({ from: from.id, to: node.id, label });
+    if (edge) this.canvas.edges.push(edge);
+    this.selected = new Set([node.id]);
+    this.selectedEdge = null;
+    this.commit();
+    return node;
+  }
+
+  _spawnFromCveDiff(node, key) {
+    const raw = String(key || "");
+    const idx = raw.lastIndexOf(":");
+    const sha = idx > 0 ? raw.slice(0, idx) : raw;
+    const kind = idx > 0 ? raw.slice(idx + 1) : "fixes";
+    if (!sha) return null;
+    return this._spawnLinkedNode(
+      node,
+      { type: "diff", version: node.version, repo: node.repo, data: { mode: "commit", commitHash: sha, path: "" } },
+      kind === "intro" ? "introduced" : "fixes",
+    );
   }
 
   // ------------------------------------------------------------------ mail and Kconfig nodes
@@ -1897,7 +2596,8 @@ export class NodeMapController {
     } else if (act === "show-hidden") {
       M.showAllHidden(d);
     } else if (act === "style") {
-      d.style = d.style === "table" ? "list" : "table";
+      const idx = M.STRUCT_STYLES.indexOf(d.style);
+      d.style = M.STRUCT_STYLES[(idx + 1) % M.STRUCT_STYLES.length];
     } else return;
     // Folding, showing or hiding rows changes an auto-fitted node's height: it measures again
     if (node.autoFit) this.fitQueue.add(node.id);
@@ -1923,6 +2623,11 @@ export class NodeMapController {
 
   onDblClick(e) {
     if (isTyping(e.target)) return;
+    const wpEl = e.target.closest?.(".nm-edge-wp[data-edge-id]");
+    if (wpEl) {
+      this.removeEdgeWaypoint(wpEl.dataset.edgeId, parseInt(wpEl.dataset.wpIdx, 10));
+      return;
+    }
     const titleEl = e.target.closest(".nm-title");
     const nodeEl = e.target.closest(".nm-node");
     const edgeEl = e.target.closest(".nm-edge[data-edge-id]");
@@ -1940,7 +2645,13 @@ export class NodeMapController {
       if (node?.type === "group" && e.target.closest(".nm-node-head")) return this.beginTitleEdit(node.id);
       return;
     }
-    if (edgeEl) return this.beginEdgeLabelEdit(edgeEl.dataset.edgeId);
+    if (edgeEl) {
+      const eid = edgeEl.dataset.edgeId;
+      if (e.shiftKey) return this.addEdgeWaypointAt(eid, this.toCanvas(e.clientX, e.clientY));
+      const edge = this.canvas.edges.find((x) => x.id === eid);
+      if (e.altKey && edge?.callSite?.path) return this.openCallSiteSource(edge);
+      return this.beginEdgeLabelEdit(eid);
+    }
     const p = this.toCanvas(e.clientX, e.clientY);
     this.addNoteAt(Math.round(p.x - 110), Math.round(p.y - 20));
   }
@@ -1957,9 +2668,13 @@ export class NodeMapController {
     if (isTyping(e.target)) return;
     // A focused button keeps Space/Enter, and Delete there is not meant for the selection
     if (e.target.closest?.("button") && [" ", "Enter", "Delete", "Backspace"].includes(e.key)) return;
+    if (this.tourPlayer?.active && this.tourPlayer.handleKeyDown?.(e)) return;
     const mod = e.ctrlKey || e.metaKey;
     const key = String(e.key || "").toLowerCase();
-    if (mod && !e.altKey && (key === "z" || key === "y")) {
+    if (mod && !e.altKey && key === "f") {
+      e.preventDefault();
+      this.searchBar?.open();
+    } else if (mod && !e.altKey && (key === "z" || key === "y")) {
       // Text fields keep their own undo (isTyping above returned already)
       e.preventDefault();
       if (key === "y" || e.shiftKey) this.redo();
@@ -1988,6 +2703,10 @@ export class NodeMapController {
       this.selectedEdge = null;
       this.commit({ save: false });
     } else if (e.key === "Escape") {
+      if (this.searchBar?.isOpen?.()) {
+        this.searchBar.close();
+        return;
+      }
       this.active = null;
       this.selected.clear();
       this.selectedEdge = null;
@@ -2014,6 +2733,7 @@ export class NodeMapController {
     e.stopPropagation();
     const nodeEl = e.target.closest(".nm-node");
     const edgeEl = e.target.closest(".nm-edge[data-edge-id]");
+    const at = this.toCanvas(e.clientX, e.clientY);
     if (nodeEl) {
       const node = this.byId(nodeEl.dataset.nodeId);
       if (!node) return;
@@ -2022,9 +2742,8 @@ export class NodeMapController {
       contextMenu.showNodeMapMenu(e.clientX, e.clientY, { node, fieldKey: row?.dataset.key || null, controller: this });
     } else if (edgeEl) {
       this.selectEdge(edgeEl.dataset.edgeId);
-      contextMenu.showNodeMapMenu(e.clientX, e.clientY, { edgeId: edgeEl.dataset.edgeId, controller: this });
+      contextMenu.showNodeMapMenu(e.clientX, e.clientY, { edgeId: edgeEl.dataset.edgeId, at, controller: this });
     } else {
-      const at = this.toCanvas(e.clientX, e.clientY);
       contextMenu.showNodeMapMenu(e.clientX, e.clientY, { isCanvas: true, at, controller: this });
     }
   }
@@ -2435,6 +3154,376 @@ export class NodeMapController {
     this.commit();
   }
 
+  /** Followable `struct`/`union` label for a struct member row, or null. */
+  followableTypeFor(nodeId, fieldKey) {
+    const node = this.byId(nodeId);
+    if (!node || node.type !== "struct" || !fieldKey) return null;
+    const layout = this.content.get(this.fetchKeyOf(node))?.value;
+    const item = layout ? findItem(layout.items, fieldKey) : null;
+    const ref = item ? extractReferencedStruct(item.type || item.type_name || "") : null;
+    return ref ? `${ref.kind} ${ref.name}` : null;
+  }
+
+  /** Spawn or link the referenced `struct`/`union` node from a struct member port. */
+  followStructType(nodeId, fieldKey) {
+    const node = this.byId(nodeId);
+    if (!node || node.type !== "struct" || !fieldKey) return null;
+    const layout = this.content.get(this.fetchKeyOf(node))?.value;
+    const item = layout ? findItem(layout.items, fieldKey) : null;
+    const ref = item ? extractReferencedStruct(item.type || item.type_name || "") : null;
+    if (!ref) return null;
+    let target = this.canvas.nodes.find((n) => n.type === "struct" && n.data.name === ref.name && n.data.kind === ref.kind && n.version === node.version);
+    if (!target) {
+      const siblingCount = this.canvas.edges.filter((e) => e.from === node.id).length;
+      target = M.createNode("struct", {
+        x: node.x + node.w + 110,
+        y: node.y + siblingCount * 120,
+        version: node.version,
+        repo: node.repo,
+        data: { name: ref.name, kind: ref.kind },
+      });
+      this.canvas.nodes.push(target);
+      M.reassignGroups(this.canvas.nodes, [target]);
+    }
+    const exists = this.canvas.edges.some((e) => e.from === node.id && e.to === target.id && e.fromField === fieldKey);
+    if (!exists) {
+      const edge = M.createEdge({
+        from: node.id,
+        to: target.id,
+        fromSide: "right",
+        fromField: fieldKey,
+        toSide: "left",
+        label: ref.edgeLabel,
+      });
+      if (edge) this.canvas.edges.push(edge);
+    }
+    this.selected = new Set([target.id]);
+    this.selectedEdge = null;
+    this.commit();
+    return target;
+  }
+
+  /** Expand callers and/or callees of a function symbol node from `getCallgraph`. */
+  async expandCallgraph(id, direction = "both") {
+    const node = this.byId(id);
+    if (!node || node.type !== "symbol" || !node.data?.name) return [];
+    const client = this.clientFor(node);
+    const ver = node.version || this.currentVersion;
+    let res;
+    try {
+      res = await client.getCallgraph(ver, node.data.name);
+    } catch (err) {
+      toast.error(`Callgraph failed: ${err.message}`);
+      return [];
+    }
+    const created = [];
+    const addSide = (entries, isCaller) => {
+      const list = Array.isArray(entries) ? entries.slice(0, 30) : [];
+      const lim = M.SIZE_LIMITS.symbol;
+      list.forEach((raw, idx) => {
+        const fnName = typeof raw === "string" ? raw : (raw?.name || raw?.function || raw?.caller || raw?.callee || "");
+        if (!fnName) return;
+        let other = this.canvas.nodes.find((n) => n.type === "symbol" && n.data.name === fnName && n.version === ver);
+        if (!other) {
+          other = M.createNode("symbol", {
+            x: isCaller ? node.x - lim.w - 110 : node.x + node.w + 110,
+            y: node.y + idx * (lim.h + 24),
+            version: ver,
+            repo: node.repo,
+            data: { name: fnName, kind: "func", astId: raw?.ast_id || null },
+          });
+          this.canvas.nodes.push(other);
+          created.push(other);
+        }
+        const [from, to] = isCaller ? [other.id, node.id] : [node.id, other.id];
+        if (!this.canvas.edges.some((e) => e.from === from && e.to === to && e.label === "calls")) {
+          const sitePath = typeof raw === "object" ? (raw?.call_site_path || raw?.file_path || raw?.path || "") : "";
+          const siteLine = typeof raw === "object" ? (raw?.call_site_line || raw?.line || null) : null;
+          const edge = M.createEdge({
+            from,
+            to,
+            label: "calls",
+            callSite: sitePath ? { path: sitePath, line: siteLine } : null,
+          });
+          if (edge) this.canvas.edges.push(edge);
+        }
+      });
+    };
+    if (direction === "callers" || direction === "both") addSide(res?.callers, true);
+    if (direction === "callees" || direction === "both") addSide(res?.callees, false);
+    if (created.length) M.reassignGroups(this.canvas.nodes, created);
+    if (created.length) this.selected = new Set(created.map((x) => x.id));
+    this.commit();
+    return created;
+  }
+
+  /** Prompt for target function and expand shortest call paths via `getCallpath`. */
+  promptCallPath(fromId) {
+    const from = this.byId(fromId);
+    if (!from) return;
+    const open = this.openModalFn || openModal;
+    const modal = open({
+      title: `Find Call Path from ${from.data.name || M.displayTitle(from)}()`,
+      width: "420px",
+      footerHtml: '<button type="button" class="code-btn primary" data-act="find">Expand Paths</button>',
+    });
+    modal.body.innerHTML = `<form class="nm-form">
+      <label class="nm-form-row"><span>Target function</span><input name="to" placeholder="schedule" required spellcheck="false"/></label>
+      <div class="nm-form-pair">
+        <label class="nm-form-row"><span>Max depth</span><input name="maxDepth" type="number" min="1" max="12" value="6"/></label>
+        <label class="nm-form-row"><span>Paths (k)</span><input name="k" type="number" min="1" max="10" value="3"/></label>
+      </div>
+    </form>`;
+    const form = modal.body.querySelector("form");
+    form.querySelector("input[name='to']")?.focus?.();
+    const submit = async () => {
+      const f = Object.fromEntries(new FormData(form).entries());
+      const target = String(f.to || "").trim();
+      if (!target) return;
+      modal.close();
+      await this.expandCallPath(fromId, target, {
+        maxDepth: parseInt(f.maxDepth, 10) || 6,
+        k: parseInt(f.k, 10) || 3,
+      });
+    };
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      submit();
+    });
+    const btn = modal.footer?.querySelector?.("[data-act='find']");
+    if (btn) btn.onclick = submit;
+  }
+
+  async expandCallPath(fromId, targetFn, { maxDepth = 6, k = 3 } = {}) {
+    const node = this.byId(fromId);
+    if (!node || !targetFn) return [];
+    const client = this.clientFor(node);
+    const ver = node.version || this.currentVersion;
+    let res;
+    try {
+      res = await client.getCallpath(ver, { from: node.data?.name || "", to: targetFn, maxDepth, k });
+    } catch (err) {
+      toast.error(`Call path failed: ${err.message}`);
+      return [];
+    }
+    const paths = Array.isArray(res?.paths) ? res.paths : [];
+    const created = [];
+    const lim = M.SIZE_LIMITS.symbol;
+    paths.forEach((chain, pIdx) => {
+      const steps = Array.isArray(chain) ? chain : (chain?.nodes || []);
+      let prev = node;
+      steps.forEach((step, sIdx) => {
+        const fnName = typeof step === "string" ? step : (step?.name || step?.function || "");
+        if (!fnName) return;
+        if (sIdx === 0 && fnName === node.data?.name) return;
+        let cur = this.canvas.nodes.find((n) => n.type === "symbol" && n.data.name === fnName && n.version === ver);
+        if (!cur) {
+          cur = M.createNode("symbol", {
+            x: node.x + (sIdx + 1) * (lim.w + 90),
+            y: node.y + pIdx * (lim.h + 40),
+            version: ver,
+            repo: node.repo,
+            data: { name: fnName, kind: "func", astId: step?.ast_id || null },
+          });
+          this.canvas.nodes.push(cur);
+          created.push(cur);
+        }
+        if (prev.id !== cur.id && !this.canvas.edges.some((e) => e.from === prev.id && e.to === cur.id && e.label === "calls")) {
+          const sitePath = typeof step === "object" ? (step?.call_site_path || step?.file_path || step?.path || "") : "";
+          const siteLine = typeof step === "object" ? (step?.call_site_line || step?.line || null) : null;
+          const edge = M.createEdge({
+            from: prev.id,
+            to: cur.id,
+            label: "calls",
+            callSite: sitePath ? { path: sitePath, line: siteLine } : null,
+          });
+          if (edge) this.canvas.edges.push(edge);
+        }
+        prev = cur;
+      });
+    });
+    if (created.length) {
+      M.reassignGroups(this.canvas.nodes, created);
+      this.selected = new Set(created.map((x) => x.id));
+    }
+    this.commit();
+    return created;
+  }
+
+  // ------------------------------------------------------------------ edge waypoints, focus, sub-maps & version travel
+
+  addEdgeWaypointAt(edgeId, pt) {
+    const edge = this.canvas.edges.find((e) => e.id === edgeId);
+    const g = this.edgeGeoms?.get(edgeId);
+    if (!edge || !pt) return false;
+    const p = { x: Math.round(pt.x), y: Math.round(pt.y) };
+    const wps = Array.isArray(edge.waypoints) ? [...edge.waypoints] : [];
+    const pts = g?.p1 && g?.p2 ? [g.p1, ...wps, g.p2] : (g?.points || []);
+    const idx = pts.length >= 2 ? nearestWaypointSegment(pts, p) : wps.length;
+    wps.splice(Math.min(idx, wps.length), 0, p);
+    edge.waypoints = wps;
+    this.selectedEdge = edge.id;
+    this.commit();
+    return true;
+  }
+
+  removeEdgeWaypoint(edgeId, idx) {
+    const edge = this.canvas.edges.find((e) => e.id === edgeId);
+    if (!edge || !Array.isArray(edge.waypoints) || idx < 0 || idx >= edge.waypoints.length) return false;
+    edge.waypoints.splice(idx, 1);
+    this.commit();
+    return true;
+  }
+
+  openCallSiteSource(edge) {
+    const cs = edge?.callSite;
+    if (!cs?.path) return false;
+    const src = this.byId(edge.from);
+    state.openTab({
+      type: "code",
+      title: cs.path.split("/").pop(),
+      path: cs.path,
+      cursorLine: cs.line || 1,
+      version: src?.version || this.currentVersion,
+      repo: src?.repo || this.repo,
+    });
+    return true;
+  }
+
+  setFocusHops(hops) {
+    this.focusHops = hops == null ? null : hops;
+    if (this.focusHops != null && this.selected.size) this.focusSeedIds = new Set(this.selected);
+    if (this.focusHops == null) this.focusSeedIds.clear();
+    const tb = this.rootEl?.querySelector?.("[data-tb='focus']");
+    tb?.setAttribute?.("aria-pressed", String(this.focusHops != null));
+    this.commit({ save: false });
+  }
+
+  cycleFocusHops() {
+    const order = [null, 1, 2, Infinity];
+    const idx = order.indexOf(this.focusHops);
+    const next = order[(idx + 1) % order.length];
+    this.setFocusHops(next);
+  }
+
+  applyFocusStyling() {
+    this._focusNodes = null;
+    this._focusEdges = null;
+    const seeds = this.selected.size ? [...this.selected] : [...this.focusSeedIds];
+    if (this.focusHops != null && seeds.length) {
+      const sub = M.connectedSubgraph(this.canvas, seeds, this.focusHops);
+      this._focusNodes = sub.nodeIds;
+      this._focusEdges = sub.edgeIds;
+    }
+    const toggleCls = (cl, name, on) => {
+      if (!cl) return;
+      if (typeof cl.toggle === "function") cl.toggle(name, on);
+      else if (on) cl.add?.(name);
+      else cl.remove?.(name);
+    };
+    for (const n of this.canvas?.nodes || []) {
+      const el = this.renderer?.element?.(n.id);
+      if (el?.classList) toggleCls(el.classList, "nm-focus-dim", Boolean(this._focusNodes && !this._focusNodes.has(n.id)));
+    }
+    for (const [eid, gEl] of this.wireEls || []) {
+      if (gEl?.classList) toggleCls(gEl.classList, "nm-focus-dim", Boolean(this._focusEdges && !this._focusEdges.has(eid)));
+    }
+  }
+
+  onTourStateChanged() {
+    this.renderInspector();
+  }
+
+  _resetViewForCanvasSwitch() {
+    this.selected.clear();
+    this.selectedEdge = null;
+    this.active = null;
+    this.focusHops = null;
+    this.focusSeedIds.clear();
+    this.tourPlayer?.stop?.();
+    this.rootEl?.querySelector?.("[data-tb='focus']")?.setAttribute?.("aria-pressed", "false");
+    this.wireEls.clear();
+    this.edgeEnds.clear();
+    this.edgeGeoms?.clear?.();
+    this.pendingWireEl = null;
+    this.portOffsets.clear();
+    if (this.wireSvg && "innerHTML" in this.wireSvg) this.wireSvg.innerHTML = "";
+  }
+
+  enterSubMap(groupId) {
+    const grp = this.byId(groupId);
+    if (!grp || grp.type !== "group") return false;
+    const had = Boolean(grp.data?.subCanvas);
+    M.convertGroupToSubMap(grp);
+    if (!this.rootCanvas) this.rootCanvas = this.canvas;
+    this.subMapPath.push(grp.id);
+    this.canvas = grp.data.subCanvas;
+    this._resetViewForCanvasSwitch();
+    this.history.reset(M.structuralSnapshot(this.canvas));
+    this.syncFollowChannel();
+    this.applyTransform();
+    this.commit({ save: !had, absorb: had });
+    return true;
+  }
+
+  exitSubMapTo(depth = 0) {
+    if (!this.rootCanvas) return false;
+    const d = Math.max(0, Math.min(this.subMapPath.length, Number(depth) || 0));
+    this.subMapPath = this.subMapPath.slice(0, d);
+    const resolved = M.resolveSubMapAtPath(this.rootCanvas, this.subMapPath);
+    this.canvas = resolved.canvas;
+    this._resetViewForCanvasSwitch();
+    this.history.reset(M.structuralSnapshot(this.canvas));
+    this.syncFollowChannel();
+    this.applyTransform();
+    this.commit({ save: false, absorb: true });
+    return true;
+  }
+
+  renderBreadcrumbs() {
+    if (!this.breadcrumbsEl || !this.rootCanvas) return;
+    if (!this.subMapPath.length) {
+      this.breadcrumbsEl.hidden = true;
+      this.breadcrumbsEl.innerHTML = "";
+      return;
+    }
+    const { trail } = M.resolveSubMapAtPath(this.rootCanvas, this.subMapPath);
+    const parts = ['<button type="button" class="nm-bc-btn" data-bc-depth="0">Root</button>'];
+    trail.forEach((t, i) => {
+      parts.push(`<span class="nm-bc-sep">/</span><button type="button" class="nm-bc-btn" data-bc-depth="${i + 1}">${escapeHtml(t.title)}</button>`);
+    });
+    this.breadcrumbsEl.innerHTML = parts.join("");
+    this.breadcrumbsEl.hidden = false;
+  }
+
+  compareVersion(targetVersion) {
+    this.versionDiffTarget = String(targetVersion || "").trim();
+    this.versionDiffCache.clear();
+    for (const n of this.canvas?.nodes || []) if (n.type === "struct") this.renderer?.invalidate(n.id);
+    this.commit({ save: false });
+  }
+
+  applyTargetVersion(targetVersion, groupId = null) {
+    const res = applyCanvasVersion(this.canvas.nodes, targetVersion, { groupId });
+    if (res.changedIds.length) {
+      this.versionRevertMap = res.previousVersions;
+      this.versionDiffCache.clear();
+      for (const id of res.changedIds) this.renderer?.invalidate(id);
+      this.commit();
+    }
+    return res.changedIds;
+  }
+
+  revertTargetVersion() {
+    if (!this.versionRevertMap) return [];
+    const reverted = revertCanvasVersion(this.canvas.nodes, this.versionRevertMap);
+    this.versionRevertMap = null;
+    this.versionDiffCache.clear();
+    for (const id of reverted) this.renderer?.invalidate(id);
+    if (reverted.length) this.commit();
+    return reverted;
+  }
+
   /** A node attached to `fromId` (optionally from a struct field), placed to its right. */
   promptAttachNode(fromId, fieldKey = null) {
     const from = this.byId(fromId);
@@ -2452,42 +3541,31 @@ export class NodeMapController {
     this.commit();
   }
 
-  autoLayoutDAG() {
-    const nodes = this.canvas.nodes.filter((n) => n.type !== "group");
-    if (!nodes.length) return;
-    const layer = new Map(nodes.map((n) => [n.id, 0]));
-    for (let iter = 0; iter < nodes.length; iter++) {
-      let changed = false;
-      for (const e of this.canvas.edges) {
-        if (!layer.has(e.from) || !layer.has(e.to)) continue;
-        if (layer.get(e.to) <= layer.get(e.from) && layer.get(e.from) < nodes.length) {
-          layer.set(e.to, layer.get(e.from) + 1);
-          changed = true;
+  autoLayoutDAG(mode = "dag") {
+    const active = this.canvas.nodes.filter((n) => n.type !== "group");
+    if (!active.length) return;
+    const applyPositions = (positions) => {
+      const byPos = new Map((positions || []).map((p) => [p.id, p]));
+      for (const n of active) {
+        const p = byPos.get(n.id);
+        if (p) {
+          n.x = p.x;
+          n.y = p.y;
         }
       }
-      if (!changed) break;
+      M.reassignGroups(this.canvas.nodes, active);
+      this.commit();
+      this.fitView();
+      toast.success(`Arranged ${active.length} nodes (${mode === "force" ? "force-directed" : "layered DAG"})`);
+    };
+    if (!this.workerPool?.workerSupported) {
+      const { positions } = layoutGraphJob({ nodes: this.canvas.nodes, edges: this.canvas.edges, mode });
+      applyPositions(positions);
+      return;
     }
-    const cols = new Map();
-    for (const n of nodes) {
-      const l = layer.get(n.id);
-      if (!cols.has(l)) cols.set(l, []);
-      cols.get(l).push(n);
-    }
-    let x = 80;
-    for (const l of [...cols.keys()].sort((a, b) => a - b)) {
-      let y = 80;
-      const col = cols.get(l);
-      for (const n of col) {
-        n.x = x;
-        n.y = y;
-        y += n.h + 40;
-      }
-      x += Math.max(...col.map((n) => n.w)) + 100;
-    }
-    M.reassignGroups(this.canvas.nodes, nodes);
-    this.commit();
-    this.fitView();
-    toast.success(`Arranged ${nodes.length} nodes by their connections`);
+    return this.workerPool.computeLayout({ nodes: this.canvas.nodes, edges: this.canvas.edges, mode }, { key: "layout" }).then((res) => {
+      if (this.containerEl?.isConnected && res?.positions) applyPositions(res.positions);
+    }).catch(() => { });
   }
 
   // ------------------------------------------------------------------ inspector
@@ -2549,10 +3627,20 @@ export class NodeMapController {
       const a = this.byId(edge.from);
       const b = this.byId(edge.to);
       html += `<div class="inspector-field"><span class="inspector-label">Connection</span><span class="inspector-val">${escapeHtml(a ? M.displayTitle(a) : "?")} → ${escapeHtml(b ? M.displayTitle(b) : "?")}</span></div>`;
+      html += row("Semantic preset", sel("edge-preset", "", M.EDGE_PRESETS.map((p) => p.id), M.EDGE_PRESETS.map((p) => p.label)));
       html += row("Label", input("edge-label", edge.label, 'placeholder="(none)"'));
       html += `<div class="nm-insp-pair">${row("From side", sel("edge-fromSide", edge.fromSide, M.SIDES))}${row("To side", sel("edge-toSide", edge.toSide, M.SIDES))}</div>`;
       html += `<div class="nm-insp-pair">${row("Arrows", sel("edge-arrow", edge.arrow, M.ARROWS))}${row("Line", sel("edge-style", edge.style, M.LINE_STYLES))}</div>`;
       html += row("Route", sel("edge-curve", edge.curve, M.CURVES));
+      if (st.layers?.length) {
+        html += row("Layer", sel("edge-layer", edge.layerId || "", ["", ...st.layers.map((l) => l.id)], ["(Always visible)", ...st.layers.map((l) => l.name)]));
+      }
+      if (edge.waypoints?.length) {
+        html += `<div class="inspector-field"><span class="inspector-label">Waypoints (${edge.waypoints.length})</span><button type="button" class="nodemap-btn" data-insp="edge-clear-wp">× Clear Waypoints</button></div>`;
+      }
+      if (edge.callSite?.path) {
+        html += `<div class="inspector-field"><span class="inspector-label">Call site</span><div class="nm-insp-inline"><span class="inspector-val">${escapeHtml(`${edge.callSite.path}:${edge.callSite.line || 1}`)}</span><button type="button" class="nodemap-btn" data-insp="edge-callsite">↗ Open</button></div></div>`;
+      }
       html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(edge.color)}</div>`;
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="edge-reverse">⇄ Reverse</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
     } else if (nodes.length > 1) {
@@ -2566,6 +3654,9 @@ export class NodeMapController {
         const styles = new Set(structs.map((n) => n.data.style));
         const cur = styles.size === 1 ? [...styles][0] : "";
         html += row(`Struct style (${structs.length})`, sel("multi-style", cur, cur ? M.STRUCT_STYLES : ["", ...M.STRUCT_STYLES], cur ? null : ["mixed", ...M.STRUCT_STYLES]));
+      }
+      if (st.layers?.length) {
+        html += row("Layer", sel("multi-layer", "", ["", ...st.layers.map((l) => l.id)], ["— assign layer —", ...st.layers.map((l) => l.name)]));
       }
       html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches("")}</div>`;
       const bgs = new Set(nodes.map((x) => x.bgColor));
@@ -2582,8 +3673,11 @@ export class NodeMapController {
       if (M.scalable(n.type)) html += scaleRow([n]);
       html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches(n.color, n.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)")}</div>`;
       html += bgRow("Background", n.bgColor, "var(--bg-secondary)", "bg");
+      if (st.layers?.length) {
+        html += row("Layer", sel("layerId", n.layerId || "", ["", ...st.layers.map((l) => l.id)], ["(Always visible)", ...st.layers.map((l) => l.name)]));
+      }
       html += check("hide-header", n.hideHeader, "Hide header in View Mode", "View Mode and exports leave this node's header out; Edit Mode shows it dimmed (drag, rename, restore)");
-      if (["struct", "source", "symbol", "kconfig", "maintainer"].includes(n.type) || (n.type === "diff" && n.data.mode === "commit")) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
+      if (["struct", "source", "symbol", "kconfig", "maintainer", "kapi", "doc", "history"].includes(n.type) || (n.type === "diff" && n.data.mode === "commit")) html += row("Revision", input("version", n.version, 'spellcheck="false"'));
       if (n.type === "struct") {
         html += row("Name", input("d-name", d.name, 'spellcheck="false"'));
         html += `<div class="nm-insp-pair">${row("Kind", sel("d-kind", d.kind, ["struct", "union"]))}${row("Style", sel("d-style", d.style, M.STRUCT_STYLES))}</div>`;
@@ -2593,12 +3687,25 @@ export class NodeMapController {
         const eng = this.kconfigEngineFor(n);
         const why = d.disableKconfigEngine ? "off for this node" : !st.kconfigCollapse ? "off for the canvas" : eng ? `${eng.title || eng.tabId} · ${eng.version || "?"}${eng.arch ? ` · ${eng.arch}` : ""}: compiled-out branches fold` : `no resolved engine for ${n.version || "this revision"}`;
         html += `<div class="inspector-field"><span class="inspector-label">Kconfig folding</span><span class="inspector-val">${escapeHtml(why)}</span></div>`;
+        if (d.style === "layout") {
+          const pm = paholeRows(this.paholeFor(n), d);
+          if (pm?.totalSize) html += `<div class="inspector-field"><span class="inspector-label">Memory layout</span><span class="inspector-val">${pm.totalSize} bytes · ${pm.cacheLines} cache line${pm.cacheLines === 1 ? "" : "s"} · ${pm.holesCount} hole${pm.holesCount === 1 ? "" : "s"}</span></div>`;
+        }
         const loaded = this.content.get(this.fetchKeyOf(n));
         // Items of this revision's layout only (keys of moved lines hide nothing)
         const hidden = loaded?.status === "ok" ? structRows(loaded.value, d, { editMode: true }).hidden : Object.keys(d.hiddenItems || {}).length;
         if (hidden) html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="show-hidden" title="Restore every hidden member, aggregate, #ifdef block and the outer conditions">Show all hidden (${hidden})</button></div>`;
         const layout = this.content.get(this.fetchKeyOf(n))?.value;
         if (layout) html += `<div class="inspector-field"><span class="inspector-label">Definition</span><span class="inspector-val">${escapeHtml(`${layout.file_path}:${layout.line_s}-${layout.line_e}`)} · span from ${layout.span_source === "db" ? "the index" : "the source text"}; guards read from the source</span></div>`;
+      } else if (n.type === "symbol") {
+        html += row("Symbol", input("d-name", d.name, 'spellcheck="false"'));
+        if (d.kind === "func") {
+          html += `<div class="nm-insp-actions">
+            <button type="button" class="nodemap-btn" data-insp="cg-callers">⤴ + Callers</button>
+            <button type="button" class="nodemap-btn" data-insp="cg-callees">⤵ + Callees</button>
+            <button type="button" class="nodemap-btn" data-insp="cg-path">🛣 Call Path…</button>
+          </div>`;
+        }
       } else if (n.type === "source") {
         html += row("File", input("d-path", d.path, 'spellcheck="false"'));
         html += row("Show", sel("d-mode", d.mode, M.SOURCE_MODES));
@@ -2630,11 +3737,24 @@ export class NodeMapController {
       } else if (n.type === "maintainer") {
         html += row("Section name", input("d-query", d.query || d.title, 'spellcheck="false"'));
         html += `<div class="nm-insp-pair">${row("Or a file", input("d-path", d.path, 'spellcheck="false"'))}${row("Section id", input("d-secId", d.secId || "", 'type="number" min="1"'))}</div>`;
+      } else if (n.type === "cve") {
+        html += row("CVE ID", input("d-cveId", d.cveId, 'placeholder="CVE-2024-..." spellcheck="false"'));
+        html += `<div class="nm-insp-pair">${row("Release", input("d-release", d.release, 'spellcheck="false"'))}${row("File CVEs", input("d-filePath", d.filePath, 'spellcheck="false"'))}</div>`;
+      } else if (n.type === "kapi") {
+        html += `<div class="nm-insp-pair">${row("Catalog", sel("d-catalog", d.catalog, M.KAPI_CATALOGS))}${row("ARCH", input("d-arch", d.arch, 'spellcheck="false"'))}</div>`;
+        html += `<div class="nm-insp-pair">${row("Symbol", input("d-symbol", d.symbol, 'spellcheck="false"'))}${row("Query", input("d-query", d.query, 'spellcheck="false"'))}</div>`;
+      } else if (n.type === "doc") {
+        html += row("Path", input("d-path", d.path, 'spellcheck="false"'));
+        html += `<div class="nm-insp-pair">${row("Mode", sel("d-mode", d.mode, M.DOC_MODES))}${row("Functions", input("d-functions", d.functions, 'spellcheck="false"'))}</div>`;
+      } else if (n.type === "history") {
+        html += `<div class="nm-insp-pair">${row("Mode", sel("d-mode", d.mode, M.HISTORY_MODES))}${row("Line", input("d-line", d.line || 1, 'type="number" min="1"'))}</div>`;
+        html += `<div class="nm-insp-pair">${row("File", input("d-path", d.path, 'spellcheck="false"'))}${row("Symbol", input("d-name", d.name, 'spellcheck="false"'))}</div>`;
       } else if (n.type === "note") {
         html += check("d-markdown", d.markdown, "Render Markdown");
       } else if (n.type === "group") {
         const members = M.groupDescendants(this.canvas.nodes, n.id).length;
         html += `<div class="inspector-field"><span class="inspector-label">Members</span><span class="inspector-val">${members} (drag nodes in or out of the frame)</span></div>`;
+        html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="enter-submap">${d.subCanvas ? "🌀 Enter Sub-Map Portal" : "🌀 Convert to Sub-Map Portal"}</button>${this.versionDiffTarget ? `<button type="button" class="nodemap-btn" data-insp="ver-apply-group">Apply ${escapeHtml(this.versionDiffTarget)}</button>` : ""}</div>`;
       }
       html += `<div class="nm-insp-actions">${M.TAB_OPENABLE_TYPES.includes(n.type) ? '<button type="button" class="nodemap-btn" data-insp="open-tab">↗ Open as tab</button>' : ""}<button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
       if (M.TAB_OPENABLE_TYPES.includes(n.type)) {
@@ -2648,6 +3768,21 @@ export class NodeMapController {
       html += `<div class="inspector-field"><span class="inspector-label">Canvas</span><span class="inspector-val">${this.canvas.nodes.length} nodes · ${this.canvas.edges.length} connections</span></div>`;
       html += `<div class="nm-insp-pair">${row("Grid", input("grid", st.grid, 'type="number" min="4" max="200"'))}${check("snap", st.snap, "Snap")}</div>`;
       html += bgRow("Canvas background", st.bgColor || "", "var(--bg-canvas)", "canvas-bg");
+      html += `<div class="inspector-field"><span class="inspector-label">Auto-Layout</span><div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="layout-dag">DAG (Sugiyama)</button><button type="button" class="nodemap-btn" data-insp="layout-force">Force-Directed</button></div></div>`;
+      const fHops = this.focusHops;
+      html += `<div class="inspector-field"><span class="inspector-label">Focus / Trace</span><div class="nm-insp-grid">
+        <button type="button" class="nodemap-btn" data-insp="focus-hops" data-value="off" aria-pressed="${fHops == null}">Off</button>
+        <button type="button" class="nodemap-btn" data-insp="focus-hops" data-value="1" aria-pressed="${fHops === 1}">1-hop</button>
+        <button type="button" class="nodemap-btn" data-insp="focus-hops" data-value="2" aria-pressed="${fHops === 2}">2-hop</button>
+        <button type="button" class="nodemap-btn" data-insp="focus-hops" data-value="all" aria-pressed="${fHops === Infinity}">All</button>
+      </div></div>`;
+      const layers = st.layers || [];
+      html += `<div class="inspector-field"><span class="inspector-label">Visibility layers</span><div class="nm-layer-list">${layers.map((l) =>
+        `<div class="nm-layer-row"><input type="checkbox" data-insp="layer-toggle" data-id="${escapeHtml(l.id)}" ${l.visible !== false ? "checked" : ""} aria-label="Layer visible"/><input data-insp="layer-name" data-id="${escapeHtml(l.id)}" value="${escapeHtml(l.name)}" aria-label="Layer name" spellcheck="false"/><button type="button" class="nodemap-btn nm-danger" data-insp="layer-delete" data-id="${escapeHtml(l.id)}" title="Delete layer">×</button></div>`).join("")}
+        <button type="button" class="nodemap-btn" data-insp="layer-add">+ New Layer</button></div></div>`;
+      html += `<div class="inspector-field"><span class="inspector-label">Version Time-Travel</span><div class="nm-insp-inline">${input("ver-target", this.versionDiffTarget, 'placeholder="v6.6" spellcheck="false" aria-label="Compare revision"')}<button type="button" class="nodemap-btn" data-insp="ver-compare">Compare</button>${this.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-clear">Clear</button>' : ""}</div>
+        <div class="nm-insp-actions">${this.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-apply">Apply Revision</button>' : ""}${this.versionRevertMap ? '<button type="button" class="nodemap-btn" data-insp="ver-revert">↶ Revert Versions</button>' : ""}</div></div>`;
+      html += NodeMapTourPlayer.inspectorHtml(this.canvas, this.activeTourId);
       const engines = this.followedEngines();
       // NodeMap embedded sessions: what the tab iframes run in, and the one the canvas follows
       html += `<div class="inspector-field"><span class="inspector-label">NodeMap sessions</span><div class="nm-es-list">${st.embedSessions.map((x) =>
@@ -2670,10 +3805,10 @@ export class NodeMapController {
         html += `<div class="inspector-field"><span class="inspector-label">Kconfig engine</span><span class="inspector-val">${escapeHtml(e ? `${e.title || e.tabId} · ${e.version || "?"}${e.arch ? ` · ${e.arch}` : ""} (nodes of ${e.version || "that revision"})` : none)}</span></div>`;
       }
       html += `<ul class="nm-help">
-        <li>Drag the background to pan; wheel to zoom (Ctrl+wheel over node content)</li>
+        <li>Drag the background to pan; wheel to zoom (Ctrl+wheel over node content); Ctrl+F searches</li>
         <li>Shift/Ctrl+drag or the Select tool draws a selection box; Shift/Ctrl+click adds to it</li>
         <li>Drag a header to move, a corner or edge to resize; Edit Mode: double-click a title to rename</li>
-        <li>Drag from a side dot (or a struct field dot) onto another node to connect</li>
+        <li>Drag from a side dot (or a struct field dot) onto another node to connect; Shift+dblclick adds a bend</li>
         <li>Ctrl+C / Ctrl+V copy and paste nodes (across NodeMap tabs), Ctrl+D duplicates</li>
         <li>Ctrl+Z undoes, Ctrl+Y or Ctrl+Shift+Z redoes</li>
         <li>Double-click the background for a note; Delete removes, arrows nudge</li>
@@ -2711,11 +3846,40 @@ export class NodeMapController {
       if (!Number.isFinite(pct) || pct <= 0) return;
       const list = this.selectedNodes().filter((x) => M.scalable(x.type));
       if (!list.length) return;
-      for (const x of list) M.setContentScale(x, pct / 100);
+      for (const x of list) {
+        M.setContentScale(x, pct / 100);
+        this.portOffsets.delete(x.id);
+      }
       // Live while dragging the slider: the inspector redraws (with the new value) once it is let go
       return this.commit({ inspector: final, coalesce: `insp:content-scale:${list.map((x) => x.id).join(",")}`, coalesceEnd: Boolean(final) });
     }
-    if (k === "es-name") {
+    if (k === "ver-target") {
+      this.versionDiffTarget = String(val || "").trim();
+      if (final && this.versionDiffTarget) this.compareVersion(this.versionDiffTarget);
+      return;
+    }
+    if (k === "tour-select") {
+      this.activeTourId = String(val || "");
+      return this.renderInspector();
+    }
+    if (k === "tour-title") {
+      const t = (this.canvas.tours || []).find((x) => x.id === el.dataset.id);
+      if (!t || !final) return;
+      t.title = String(val || "").trim().slice(0, 128) || "Walkthrough";
+    } else if (k === "tour-step-title" || k === "tour-step-caption") {
+      const t = (this.canvas.tours || []).find((x) => x.id === el.dataset.id);
+      const s = t?.steps?.find((x) => x.id === el.dataset.stepId);
+      if (!s) return;
+      if (k === "tour-step-title") s.title = String(val || "").trim().slice(0, 256) || "Step";
+      else s.caption = String(val || "").slice(0, 2000);
+    } else if (k === "layer-toggle") {
+      M.toggleLayerVisibility(this.canvas.settings, el.dataset.id);
+    } else if (k === "layer-name") {
+      if (!final) return;
+      const layer = (this.canvas.settings.layers || []).find((l) => l.id === el.dataset.id);
+      if (!layer) return;
+      layer.name = String(val || "").trim().slice(0, 128) || layer.id;
+    } else if (k === "es-name") {
       if (!final) return;
       if (!M.renameEmbedSession(this.canvas.settings, el.dataset.id, val)) return this.renderInspector();
     } else if (k === "follow-session") {
@@ -2728,7 +3892,14 @@ export class NodeMapController {
       this.canvas.settings.kconfigEngine = String(val || "");
     } else if (k === "multi-style") {
       if (!M.STRUCT_STYLES.includes(val)) return;
-      for (const n of this.selectedNodes()) if (n.type === "struct") n.data.style = val;
+      for (const n of this.selectedNodes()) if (n.type === "struct") {
+        n.data.style = val;
+        this.portOffsets.delete(n.id);
+      }
+    } else if (k === "multi-layer") {
+      for (const n of this.selectedNodes()) n.layerId = String(val || "");
+    } else if (node && k === "layerId") {
+      node.layerId = String(val || "");
     } else if (node && k === "hide-header") {
       node.hideHeader = Boolean(val);
       if (node.autoFit) this.fitQueue.add(node.id);
@@ -2742,6 +3913,11 @@ export class NodeMapController {
       this.canvas.settings.snap = Boolean(val);
       this.rootEl.querySelector("[data-tb='snap']")?.setAttribute("aria-pressed", String(this.canvas.settings.snap));
       this.applyTransform();
+    } else if (edge && k === "edge-preset") {
+      if (!val) return;
+      M.applyEdgePreset(edge, val);
+    } else if (edge && k === "edge-layer") {
+      edge.layerId = String(val || "");
     } else if (edge && k.startsWith("edge-")) {
       const f = k.slice(5);
       if (f === "label") edge.label = String(val).slice(0, 512);
@@ -2755,19 +3931,20 @@ export class NodeMapController {
       // An auto-fitted node keeps its aspect ratio: the size sets the content scale
       if (v && node.autoFit) M.setScaledSize(node, k, v);
       else if (v) node[k] = k === "w" ? Math.max(lim.minW, Math.min(lim.maxW, v)) : Math.max(lim.minH, Math.min(lim.maxH, v));
+      this.portOffsets.delete(node.id);
     } else if (node && k === "version" && final) {
       node.version = String(val).trim();
     } else if (node && k.startsWith("d-")) {
       if (!final && el.tagName !== "SELECT") return;
       const f = k.slice(2);
-      const raw = ["start", "end", "context", "tid", "secId"].includes(f) ? int(val) : val;
+      const raw = ["start", "end", "context", "tid", "secId", "line"].includes(f) ? int(val) : val;
       // A maintainer node looked up by name or file again forgets the section it resolved before
       const reset = node.type === "maintainer" && (f === "query" || f === "path") ? { secId: null, title: "" } : {};
       node.data = M.normalizeData(node.type, { ...node.data, ...reset, [f]: typeof raw === "string" ? raw.trim() : raw });
       if (!node.customTitle) node.title = M.defaultTitle(node.type, node.data);
     } else return;
     // Typing in a field keeps the inspector (and the caret) as it is
-    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h" || k === "es-name"), coalesce, coalesceEnd });
+    this.commit({ inspector: final && (el.tagName === "SELECT" || el.type === "checkbox" || k.startsWith("d-") || k === "w" || k === "h" || k === "es-name" || k === "layer-name" || k === "tour-title"), coalesce, coalesceEnd });
   }
 
   onInspectorClick(e) {
@@ -2783,7 +3960,10 @@ export class NodeMapController {
     else if (k === "show-hidden" && node) this.onStructAction(node, "show-hidden");
     else if (k === "scale-reset") {
       const list = this.selectedNodes().filter((x) => M.scalable(x.type));
-      for (const x of list) M.setContentScale(x, 1);
+      for (const x of list) {
+        M.setContentScale(x, 1);
+        this.portOffsets.delete(x.id);
+      }
       if (list.length) this.commit();
     } else if (k === "es-add") {
       if (M.addEmbedSession(this.canvas.settings)) this.commit();
@@ -2795,7 +3975,73 @@ export class NodeMapController {
     } else if (k === "copy-session" && node) this.copyNodeToSession(node.id, this.copyTarget);
     else if (k === "mail-expand" && node) this.expandThreadToNodes(node.id);
     else if (k === "kc-expand" && node) this.expandKconfigRelations(node.id);
-    else if (k === "align") this.align(btn.dataset.value);
+    else if (k === "cg-callers" && node) this.expandCallgraph(node.id, "callers");
+    else if (k === "cg-callees" && node) this.expandCallgraph(node.id, "callees");
+    else if (k === "cg-path" && node) this.promptCallPath(node.id);
+    else if (k === "enter-submap" && node) this.enterSubMap(node.id);
+    else if (k === "layout-dag") this.autoLayoutDAG("dag");
+    else if (k === "layout-force") this.autoLayoutDAG("force");
+    else if (k === "focus-hops") {
+      const v = btn.dataset.value;
+      this.setFocusHops(v === "off" ? null : v === "all" ? Infinity : Number(v));
+    } else if (k === "layer-add") {
+      const l = M.addLayer(this.canvas.settings, `Layer ${(this.canvas.settings.layers?.length || 0) + 1}`);
+      if (l) this.commit();
+    } else if (k === "layer-delete") {
+      if (M.removeLayer(this.canvas, btn.dataset.id)) this.commit();
+    } else if (k === "ver-compare") {
+      const inp = this.inspectorEl?.querySelector("[data-insp='ver-target']");
+      this.compareVersion(inp?.value || this.versionDiffTarget);
+    } else if (k === "ver-clear") {
+      this.compareVersion("");
+    } else if (k === "ver-apply") {
+      const inp = this.inspectorEl?.querySelector("[data-insp='ver-target']");
+      this.applyTargetVersion(inp?.value || this.versionDiffTarget);
+    } else if (k === "ver-apply-group" && node) {
+      this.applyTargetVersion(this.versionDiffTarget, node.id);
+    } else if (k === "ver-revert") {
+      this.revertTargetVersion();
+    } else if (k === "tour-add") {
+      this.canvas.tours = this.canvas.tours || [];
+      const t = createTour(`Tour ${this.canvas.tours.length + 1}`);
+      this.canvas.tours.push(t);
+      this.activeTourId = t.id;
+      this.commit();
+    } else if (k === "tour-delete") {
+      this.canvas.tours = (this.canvas.tours || []).filter((x) => x.id !== btn.dataset.id);
+      if (this.activeTourId === btn.dataset.id) this.activeTourId = this.canvas.tours[0]?.id || "";
+      this.commit();
+    } else if (k === "tour-capture") {
+      const t = (this.canvas.tours || []).find((x) => x.id === btn.dataset.id);
+      if (t) {
+        t.steps.push(captureTourStep({
+          title: this.tourPlayer.defaultStepTitle(t.steps.length),
+          viewport: this.canvas.viewport,
+          selectedNodes: [...this.selected],
+          selectedEdges: this.selectedEdge ? [this.selectedEdge] : [],
+        }));
+        this.commit();
+      }
+    } else if (k === "tour-play") {
+      this.tourPlayer.start(btn.dataset.id, 0);
+    } else if (k === "tour-step-go") {
+      this.tourPlayer.start(btn.dataset.id, parseInt(btn.dataset.index, 10) || 0);
+    } else if (k === "tour-step-up" || k === "tour-step-down") {
+      const t = (this.canvas.tours || []).find((x) => x.id === btn.dataset.id);
+      if (t && reorderTourStep(t, btn.dataset.stepId, k === "tour-step-up" ? -1 : 1)) this.commit();
+    } else if (k === "tour-step-delete") {
+      const t = (this.canvas.tours || []).find((x) => x.id === btn.dataset.id);
+      if (t && removeTourStep(t, btn.dataset.stepId)) this.commit();
+    } else if (k === "edge-clear-wp" && this.selectedEdge) {
+      const ed = this.canvas.edges.find((x) => x.id === this.selectedEdge);
+      if (ed) {
+        ed.waypoints = [];
+        this.commit();
+      }
+    } else if (k === "edge-callsite" && this.selectedEdge) {
+      const ed = this.canvas.edges.find((x) => x.id === this.selectedEdge);
+      if (ed) this.openCallSiteSource(ed);
+    } else if (k === "align") this.align(btn.dataset.value);
     else if (k === "distribute") this.distribute(btn.dataset.value);
     else if (k === "group") this.addGroup();
     else if (k === "fit") this.fitView();
@@ -2926,34 +4172,48 @@ export class NodeMapController {
     const size = pngSize(w, h, scale);
     const rasterize = (foreign) => {
       const svg = this.canvasSvg({ transparent, foreign, pixelScale: size.scale });
-      const img = new Image();
-      const fallback = (err) => {
-        if (foreign) {
-          toast.warning("This browser cannot rasterize the live man page / tab contents: the PNG shows placeholders for them");
-          rasterize(false);
-        } else toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
+      const drawMainThread = () => {
+        const img = new Image();
+        const fallback = (err) => {
+          if (foreign) {
+            toast.warning("This browser cannot rasterize the live man page / tab contents: the PNG shows placeholders for them");
+            rasterize(false);
+          } else toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
+        };
+        img.onload = () => {
+          try {
+            const c = document.createElement("canvas");
+            c.width = size.w;
+            c.height = size.h;
+            const ctx = c.getContext("2d");
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
+            ctx.drawImage(img, 0, 0, size.w, size.h);
+            c.toBlob((blob) => {
+              if (!blob) return toast.error("PNG export failed");
+              this.download("nodemap_canvas.png", blob);
+              toast.success(`Exported PNG image (${size.w} × ${size.h} px)`);
+            }, "image/png");
+          } catch (err) {
+            fallback(err);
+          }
+        };
+        img.onerror = () => fallback(null);
+        // A data URL (not a blob URL) keeps a foreignObject SVG from tainting the canvas where browsers allow it
+        img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
       };
-      img.onload = () => {
-        try {
-          const c = document.createElement("canvas");
-          c.width = size.w;
-          c.height = size.h;
-          const ctx = c.getContext("2d");
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = "high";
-          ctx.drawImage(img, 0, 0, size.w, size.h);
-          c.toBlob((blob) => {
-            if (!blob) return toast.error("PNG export failed");
-            this.download("nodemap_canvas.png", blob);
+      if (!foreign && this.workerPool?.workerSupported && typeof OffscreenCanvas !== "undefined") {
+        this.workerPool.rasterizePng({ svg, width: size.w, height: size.h }).then((res) => {
+          if (res?.blob) {
+            this.download("nodemap_canvas.png", res.blob);
             toast.success(`Exported PNG image (${size.w} × ${size.h} px)`);
-          }, "image/png");
-        } catch (err) {
-          fallback(err);
-        }
-      };
-      img.onerror = () => fallback(null);
-      // A data URL (not a blob URL) keeps a foreignObject SVG from tainting the canvas where browsers allow it
-      img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+          } else {
+            drawMainThread();
+          }
+        }).catch(drawMainThread);
+        return;
+      }
+      drawMainThread();
     };
     rasterize(true);
     return size;
@@ -2976,10 +4236,10 @@ export class NodeMapController {
         toast.error(`Import failed: not a NodeMap canvas (schema "${M.CANVAS_SCHEMA}" version ${M.CANVAS_VERSION})`);
         return;
       }
+      this.rootCanvas = canvas;
+      this.subMapPath = [];
       this.canvas = canvas;
-      this.selected.clear();
-      this.selectedEdge = null;
-      this.active = null;
+      this._resetViewForCanvasSwitch();
       this.syncFollowChannel();
       this.applyTransform();
       this.rootEl.querySelector("[data-tb='snap']")?.setAttribute("aria-pressed", String(canvas.settings.snap));

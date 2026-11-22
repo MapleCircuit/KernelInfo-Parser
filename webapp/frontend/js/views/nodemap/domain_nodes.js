@@ -1,13 +1,12 @@
 /**
- * domain_nodes.js - Content of the NodeMap's domain nodes (`webapp/API_FRONTEND.md` §5.3.2): diffs,
- * mailing-list threads, Kconfig symbols with their relations and MAINTAINERS sections.
+ * domain_nodes.js - Content of the NodeMap's domain nodes (`webapp/API_FRONTEND.md` §5.3.2):
+ * diffs, mailing-list threads, Kconfig symbols with relations, MAINTAINERS sections, CVE records,
+ * Kernel API catalogs, Kernel Docs (`.rst` / kernel-doc), and Symbol History / File Blame.
  *
- * DOM-free (unit tested). Each node type has a pure model built from the API payloads (`diffPayload()`,
- * `mailThreadModel()`, `kconfigModel()`, `maintainerModel()`), the live body HTML drawn from it
- * (`render*Body()`), and the layout helpers that spawn connected nodes (`mailThreadLayout()`,
- * `relationTargets()`). `nodemap_export.js` draws the same models as SVG vectors.
+ * DOM-free (unit tested).
  */
 import { esc } from "./struct_view.js";
+import { VIRTUAL_THRESHOLD, renderVirtualDiffWindow } from "./virtual_source.js";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const cleanMid = (m) => String(m || "").trim().replace(/^<|>$/g, "");
@@ -15,11 +14,6 @@ const bareSym = (s) => String(s || "").trim().replace(/^CONFIG_/, "");
 
 // ------------------------------------------------------------------ diff
 
-/**
- * Files of a unified diff text (`git diff` output): `[{path, oldPath, status, additions, deletions,
- * binary, hunks: [{header, lines: [[kind, oldNo, newNo, text]]}]}]`, `kind` one of `+`, `-`, ` `.
- * `fallbackPath` names the file of a diff without `diff --git` / `+++` headers.
- */
 export function parseUnifiedDiff(text, fallbackPath = "") {
   const files = [];
   let file = null;
@@ -75,18 +69,19 @@ export function parseUnifiedDiff(text, fallbackPath = "") {
   return files;
 }
 
-/** A commit-diff file (`git_service.parse_unified_diff`) in the node's file shape. */
 function commitFile(f) {
   const hunks = (Array.isArray(f?.hunks) ? f.hunks : []).map((h) => {
     const head = Number.isInteger(h.old_start)
       ? `@@ -${h.old_start},${h.old_count ?? 1} +${h.new_start},${h.new_count ?? 1} @@${h.heading ? ` ${h.heading}` : ""}`
       : `@@ ${h.heading || ""}`;
-    return { header: head, heading: h.heading || "", lines: (Array.isArray(h.lines) ? h.lines : []).filter(Array.isArray).map((l) => [
-      ["+", "-", " "].includes(l[0]) ? l[0] : " ",
-      Number.isInteger(l[1]) ? l[1] : null,
-      Number.isInteger(l[2]) ? l[2] : null,
-      String(l[3] ?? ""),
-    ]) };
+    return {
+      header: head, heading: h.heading || "", lines: (Array.isArray(h.lines) ? h.lines : []).filter(Array.isArray).map((l) => [
+        ["+", "-", " "].includes(l[0]) ? l[0] : " ",
+        Number.isInteger(l[1]) ? l[1] : null,
+        Number.isInteger(l[2]) ? l[2] : null,
+        String(l[3] ?? ""),
+      ])
+    };
   });
   return {
     path: String(f?.path || ""),
@@ -100,12 +95,6 @@ function commitFile(f) {
   };
 }
 
-/**
- * Loaded content of a diff node: `data` (the node payload) with the response of `getFileDiff()`
- * (`{diff, additions, deletions, is_binary, truncated}`) or `getCommitDiff()` (`{files: [...]}`), as
- * `{mode, versionA, versionB, commitHash, path, files, truncated}`; a commit diff keeps only `data.path`
- * when it names one of its files.
- */
 export function diffPayload(data, res) {
   const r = isObj(res) ? res : {};
   let files;
@@ -131,10 +120,6 @@ export function diffPayload(data, res) {
   };
 }
 
-/**
- * Display rows of a diff payload: `{kind, old, new, text}` with `kind` `file` (a file header, shown when
- * the payload has several files or is a commit), `hunk` (`@@` header), `+`, `-`, ` ` or `note`.
- */
 export function diffRows(payload) {
   const rows = [];
   const files = payload?.files || [];
@@ -157,10 +142,13 @@ export function diffRows(payload) {
 
 const DIFF_CLASS = { "+": "nm-diff-add", "-": "nm-diff-del", " ": "nm-diff-ctx", hunk: "nm-diff-hunk", file: "nm-diff-file", note: "nm-diff-note" };
 
-/** Live body of a diff node (old/new line numbers, sign, text). */
-export function renderDiffBody(payload) {
+/** Live body of a diff node (virtualizes large diffs above `VIRTUAL_THRESHOLD`). */
+export function renderDiffBody(payload, opts = {}) {
   const rows = diffRows(payload);
   if (!rows.length) return '<div class="nm-empty">No changes</div>';
+  if (rows.length > VIRTUAL_THRESHOLD && opts.virtual !== false) {
+    return `<div class="nm-diff nm-scroll nm-virtual">${renderVirtualDiffWindow(rows)}</div>`;
+  }
   let html = "";
   for (const r of rows) {
     const cls = DIFF_CLASS[r.kind] || "nm-diff-ctx";
@@ -175,14 +163,12 @@ export function renderDiffBody(payload) {
 
 // ------------------------------------------------------------------ mail
 
-/** Reference ids of a message (list or whitespace-separated `<id>` text), oldest first. */
 function refsOf(m) {
   const raw = m?.references;
   const list = Array.isArray(raw) ? raw : String(raw || "").split(/[\s,]+/);
   return list.map(cleanMid).filter(Boolean);
 }
 
-/** First lines of a message body without quoted text, for the expandable excerpt. */
 export function bodyExcerpt(body, max = 10) {
   const lines = String(body || "").replace(/\r\n/g, "\n").split("\n");
   const out = [];
@@ -197,16 +183,6 @@ export function bodyExcerpt(body, max = 10) {
   return out;
 }
 
-/**
- * Reply tree of a thread payload (`getMailThread()`: `{tid, total, messages}`, or one `getMailMessage()`
- * response): rows in reply order (depth-first, each level by date) as `{mid, parent, depth, guides,
- * subject, author, date, isPatch, isCover, patchVersion, patchIdx, patchTotal, focus, open, excerpt}`.
- * A message's parent is the last of its references inside the thread; a `data.single` node (one message
- * on its own) shows its message open. `guides` per depth level (1..depth)
- * says how the connector is drawn there: `pipe` (an ancestor's later sibling continues), `blank`, `tee`
- * (this row, siblings follow) or `end` (this row, the last child). `data.openMids` marks expanded
- * messages, `bodies` (mid -> body text) gives their excerpts.
- */
 export function mailThreadModel(payload, data = {}, bodies = null) {
   const p = isObj(payload) ? payload : {};
   const raw = Array.isArray(p.messages) ? p.messages : (p.message_id || p.subject ? [p] : []);
@@ -229,7 +205,6 @@ export function mailThreadModel(payload, data = {}, bodies = null) {
     }
     parentOf.set(x.mid, parent);
   }
-  // A reference cycle (bad headers) must not hide messages: a message whose chain loops is a root
   for (const x of msgs) {
     const seen = new Set([x.mid]);
     let cur = parentOf.get(x.mid);
@@ -276,7 +251,6 @@ export function mailThreadModel(payload, data = {}, bodies = null) {
         open: Boolean(open[x.mid]) || (Boolean(data.single) && x.mid === focus),
         excerpt: open[x.mid] || (data.single && x.mid === focus) ? bodyExcerpt(bodies?.get?.(x.mid) ?? (x.mid === cleanMid(p.message_id) ? p.body : "")) : [],
       });
-      // Deep threads stay readable: deeper replies hang at the last drawn level
       walk(x.mid, Math.min(depth + 1, 24), depth ? [...trail, !last] : []);
     });
   };
@@ -284,7 +258,6 @@ export function mailThreadModel(payload, data = {}, bodies = null) {
   return { tid: p.tid || null, total: p.total || rows.length, truncated: Boolean(p.truncated), rows };
 }
 
-/** Badges of a message row (`[v3]`, `3/7`, `PATCH`, `cover`). */
 export function mailBadges(r) {
   const out = [];
   if (r.patchVersion && r.patchVersion > 1) out.push(`v${r.patchVersion}`);
@@ -294,7 +267,6 @@ export function mailBadges(r) {
   return out;
 }
 
-/** Live body of a mail node: the reply tree with connector guides, badges and expandable excerpts. */
 export function renderMailBody(model) {
   if (!model.rows.length) return '<div class="nm-empty">No messages</div>';
   let html = "";
@@ -311,10 +283,6 @@ export function renderMailBody(model) {
   return `<div class="nm-mail nm-scroll">${html}</div>`;
 }
 
-/**
- * Canvas places of the message nodes "Expand Thread to Nodes" creates, as a tree right of `origin`
- * `{x, y}`: one column per reply depth, one row per message in reply order. `[{mid, parent, x, y}]`.
- */
 export function mailThreadLayout(model, origin, { w = 300, h = 120, gapX = 80, gapY = 24 } = {}) {
   return model.rows.map((r, i) => ({
     mid: r.mid,
@@ -326,7 +294,6 @@ export function mailThreadLayout(model, origin, { w = 300, h = 120, gapX = 80, g
 
 // ------------------------------------------------------------------ kconfig
 
-/** Relation groups of a Kconfig node: edge label, direction (out = this symbol is the edge's source). */
 export const KCONFIG_RELATIONS = [
   { rel: "depends_on", label: "Depends on", edge: "depends on", dir: "out" },
   { rel: "selects", label: "Selects", edge: "selects", dir: "out" },
@@ -337,11 +304,6 @@ export const KCONFIG_RELATIONS = [
 ];
 const IN_OF = { depends_on: "depended_by", selects: "selected_by", implies: "implied_by" };
 
-/**
- * Model of a Kconfig node from `getKconfigSymbol()` (`detail`) and `getKconfigGraph()` (`graph`,
- * `{edges: [{from, to, type}]}`): `{name, type, prompt, file, line, help, defined, groups: [{rel, label,
- * edge, dir, names}]}`; empty groups are left out. Names are bare (no `CONFIG_`).
- */
 export function kconfigModel(detail, graph, symbol) {
   const d = isObj(detail) ? detail : {};
   const name = bareSym(d.name || d.symbol_name || symbol);
@@ -369,10 +331,6 @@ export function kconfigModel(detail, graph, symbol) {
   };
 }
 
-/**
- * Value of a symbol in a Kconfig engine's assignments (`y`, `m`, `n`, a string / number value, or `""`
- * when unset). Assignments carry bare and `CONFIG_` keys.
- */
 export function kconfigValue(assignments, name) {
   if (!assignments) return "";
   const v = assignments[name] ?? assignments[`CONFIG_${name}`];
@@ -382,15 +340,10 @@ export function kconfigValue(assignments, name) {
   return String(v);
 }
 
-/** CSS modifier of a value badge. */
 export function valueClass(v) {
   return v === "y" ? "y" : v === "m" ? "m" : v === "n" ? "n" : v ? "val" : "unset";
 }
 
-/**
- * Live body of a Kconfig node. `value` is the followed engine's value (`null`: no engine), `onCanvas`
- * (Set of bare names) marks relations already on the canvas.
- */
 export function renderKconfigBody(model, value = null, onCanvas = null) {
   const badge = value === null ? '<span class="nm-kc-val nm-kc-none" title="No Kconfig engine followed">no engine</span>'
     : `<span class="nm-kc-val nm-kc-${valueClass(value)}" title="Value in the followed Kconfig engine">${esc(value || "unset")}</span>`;
@@ -405,10 +358,6 @@ export function renderKconfigBody(model, value = null, onCanvas = null) {
   return `<div class="nm-kc nm-scroll">${html}</div>`;
 }
 
-/**
- * Targets "Expand Relations" (or one chip, `only` = `rel:NAME`) links a Kconfig node to:
- * `[{name, rel, edge, dir}]` in group order, each name once.
- */
 export function relationTargets(model, only = "") {
   const out = [];
   const seen = new Set();
@@ -428,10 +377,6 @@ export function relationTargets(model, only = "") {
 
 const splitList = (s) => String(s || "").split(/\s*[\n;]\s*|,\s+/).map((x) => x.trim()).filter(Boolean);
 
-/**
- * Model of a MAINTAINERS section (`getMaintainerSection()` response or its `section`): `{secId, title,
- * status, maintainers, reviewers, lists, trees, files, excludes, web}` (people as `Name <email>`).
- */
 export function maintainerModel(res) {
   const r = isObj(res) ? res : {};
   const s = isObj(r.section) ? { ...r, ...r.section } : r;
@@ -458,7 +403,6 @@ export function maintainerModel(res) {
   };
 }
 
-/** Lines of a maintainer node: `[tag, text]` with the MAINTAINERS letters (`M`, `R`, `L`, `T`, `F`, `X`, `W`). */
 export function maintainerLines(model) {
   const out = [];
   for (const [tag, list] of [["M", model.maintainers], ["R", model.reviewers], ["L", model.lists], ["T", model.trees], ["W", model.web ? [model.web] : []], ["F", model.files], ["X", model.excludes]]) {
@@ -467,7 +411,6 @@ export function maintainerLines(model) {
   return out;
 }
 
-/** CSS modifier of a section status (`Maintained`, `Supported`, `Odd Fixes`, `Orphan`, `Obsolete`). */
 export function statusClass(status) {
   const s = String(status || "").toLowerCase();
   if (s.startsWith("supported")) return "supported";
@@ -477,11 +420,417 @@ export function statusClass(status) {
   return "other";
 }
 
-/** Live body of a maintainer node. */
 export function renderMaintainerBody(model) {
   let html = `<div class="nm-mt-head"><span class="nm-mt-title">${esc(model.title || "(section)")}</span>${model.status ? `<span class="nm-mt-status nm-mt-${statusClass(model.status)}" title="S: ${esc(model.status)}">${esc(model.status)}</span>` : ""}</div>`;
   const lines = maintainerLines(model);
   if (!lines.length) html += '<div class="nm-empty">No entries</div>';
   for (const [tag, v] of lines) html += `<div class="nm-mt-row"><span class="nm-mt-tag nm-mt-tag-${tag}">${tag}:</span><span class="nm-mt-val">${esc(v)}</span></div>`;
   return `<div class="nm-mt nm-scroll">${html}</div>`;
+}
+
+// ------------------------------------------------------------------ CVE & fix-chain
+
+/**
+ * Model of a `cve` node from `getCveDetail()` or `getFileCves()`.
+ */
+export function cveModel(res, data = {}) {
+  const r = isObj(res) ? res : {};
+  if (Array.isArray(r.cves)) {
+    return {
+      mode: "file",
+      filePath: String(r.file_path || data.filePath || ""),
+      version: String(r.version || data.release || ""),
+      total: Number(r.total) || r.cves.length,
+      affectedCount: Number(r.affected_count) || 0,
+      cves: r.cves.filter(isObj).slice(0, 60).map((c) => ({
+        cveId: String(c.cve_id || c.id || ""),
+        title: String(c.title || ""),
+        state: String(c.state || "unknown"),
+        severity: String(c.severity || ""),
+        score: c.score ?? null,
+      })),
+    };
+  }
+  const cvss = isObj(r.cvss) ? r.cvss : {};
+  const rs = isObj(r.release_state) ? r.release_state : {};
+  const ranges = (Array.isArray(r.ranges) ? r.ranges : []).filter(isObj).slice(0, 20).map((rg) => ({
+    introduced: String(rg.introduced || ""),
+    introducedSubject: String(rg.introduced_subject || ""),
+    fixed: String(rg.fixed || ""),
+    fixedSubject: String(rg.fixed_subject || ""),
+    inferred: (Array.isArray(rg.inferred_introduced) ? rg.inferred_introduced : []).filter(isObj).map((inf) => ({
+      sha: String(inf.sha || ""),
+      subject: String(inf.subject || ""),
+    })),
+  }));
+  return {
+    mode: "cve",
+    cveId: String(r.id || r.cve_id || data.cveId || ""),
+    title: String(r.title || ""),
+    description: String(r.description || ""),
+    severity: String(cvss.severity || r.severity || ""),
+    score: cvss.score ?? r.score ?? null,
+    kev: String(r.kev || ""),
+    state: String(rs.state || ""),
+    release: String(rs.release || data.release || ""),
+    cwes: (Array.isArray(r.cwes) ? r.cwes : []).map(String),
+    files: (Array.isArray(r.files) ? r.files : []).map(String).slice(0, 30),
+    ranges,
+    versionSummary: String(r.version_summary?.text || ""),
+  };
+}
+
+export function renderCveBody(model) {
+  if (!model) return '<div class="nm-empty">No CVE data</div>';
+  if (model.mode === "file") {
+    const head = `<div class="nm-cve-head"><span class="nm-cve-id">${esc(model.filePath || "File CVEs")}</span><span class="nm-cve-badge">${model.affectedCount} affected / ${model.total}</span></div>`;
+    const list = model.cves.length
+      ? model.cves.map((c) => `<div class="nm-cve-row"><span class="nm-cve-state nm-cve-${esc(c.state)}">${esc(c.state)}</span><button type="button" class="nm-cve-link" data-act="cve-spawn-cve" data-key="${esc(c.cveId)}" title="Spawn CVE node">${esc(c.cveId)}</button>${c.score != null ? `<span class="nm-cve-score">${esc(c.score)}</span>` : ""}<span class="nm-cve-subj" title="${esc(c.title)}">${esc(c.title)}</span></div>`).join("")
+      : '<div class="nm-empty">No CVEs recorded for this file</div>';
+    return `<div class="nm-cve nm-scroll">${head}${list}</div>`;
+  }
+  const sev = model.score != null ? `<span class="nm-cve-score ${model.score >= 7 ? "high" : model.score >= 4 ? "med" : "low"}">${esc(model.score)}${model.severity ? ` ${esc(model.severity)}` : ""}</span>` : "";
+  const stateBadge = model.state && model.state !== "unknown" ? `<span class="nm-cve-state nm-cve-${esc(model.state)}">${esc(model.state)}${model.release ? ` (${esc(model.release)})` : ""}</span>` : "";
+  const kevBadge = model.kev ? `<span class="nm-cve-state nm-cve-affected">KEV</span>` : "";
+  let html = `<div class="nm-cve-head"><span class="nm-cve-id">${esc(model.cveId)}</span>${sev}${stateBadge}${kevBadge}</div>`;
+  if (model.title) html += `<div class="nm-cve-title">${esc(model.title)}</div>`;
+  if (model.versionSummary) html += `<div class="nm-cve-summary">${esc(model.versionSummary)}</div>`;
+  if (model.ranges.length) {
+    html += '<div class="nm-cve-sec"><span class="nm-cve-label">Fix Chain</span>';
+    for (const rg of model.ranges) {
+      const intro = rg.introduced || rg.inferred[0]?.sha || "";
+      const introSubj = rg.introducedSubject || rg.inferred[0]?.subject || "";
+      if (intro) {
+        html += `<div class="nm-cve-commit"><span class="nm-cve-tag intro">intro</span><code class="nm-cve-sha">${esc(intro.slice(0, 10))}</code><span class="nm-cve-subj" title="${esc(introSubj)}">${esc(introSubj)}</span><button type="button" class="nm-cve-btn" data-act="cve-spawn-diff" data-key="${esc(intro)}:intro" title="Spawn commit diff node (introduced)">⊕ diff</button></div>`;
+      }
+      if (rg.fixed) {
+        html += `<div class="nm-cve-commit"><span class="nm-cve-tag fix">fix</span><code class="nm-cve-sha">${esc(rg.fixed.slice(0, 10))}</code><span class="nm-cve-subj" title="${esc(rg.fixedSubject)}">${esc(rg.fixedSubject)}</span><button type="button" class="nm-cve-btn" data-act="cve-spawn-diff" data-key="${esc(rg.fixed)}:fixes" title="Spawn commit diff node (fixes)">⊕ diff</button></div>`;
+      }
+    }
+    html += "</div>";
+  }
+  if (model.files.length) {
+    html += '<div class="nm-cve-sec"><span class="nm-cve-label">Affected Files</span>';
+    for (const f of model.files) {
+      html += `<div class="nm-cve-file"><span class="nm-cve-fpath" title="${esc(f)}">${esc(f)}</span><button type="button" class="nm-cve-btn" data-act="cve-spawn-source" data-key="${esc(f)}" title="Spawn source node (affects)">⊕ src</button></div>`;
+    }
+    html += "</div>";
+  }
+  if (model.description) html += `<div class="nm-cve-desc">${esc(model.description.slice(0, 600))}${model.description.length > 600 ? "…" : ""}</div>`;
+  return `<div class="nm-cve nm-scroll">${html}</div>`;
+}
+
+// ------------------------------------------------------------------ Kernel API / Boundary
+
+export function kapiModel(res, data = {}) {
+  const r = isObj(res) ? res : {};
+  const catalog = String(data.catalog || "summary");
+  const filter = String(data.symbol || data.query || "").trim().toLowerCase();
+  const match = (s) => !filter || String(s || "").toLowerCase().includes(filter);
+  const items = [];
+
+  if (catalog === "summary" || isObj(r.counts)) {
+    const counts = r.counts || {};
+    for (const [k, v] of Object.entries(counts)) {
+      items.push({ kind: "catalog", name: k, subtitle: `${v} entries`, cat: k });
+    }
+  }
+  if (Array.isArray(r.syscalls) || Array.isArray(r.unnumbered)) {
+    for (const s of [...(r.syscalls || []), ...(r.unnumbered || [])]) {
+      if (!isObj(s)) continue;
+      const entry = String(s.entry || (s.name ? `sys_${s.name}` : ""));
+      if (!match(`${s.name} ${entry} ${s.definition?.path || ""}`)) continue;
+      items.push({
+        kind: "syscall",
+        name: String(s.name || entry),
+        subtitle: `${s.nr != null ? `#${s.nr}` : "unnumbered"}${s.abi ? ` ${s.abi}` : ""} · ${s.status || "defined"}`,
+        path: String(s.definition?.path || ""),
+        line: s.definition?.line_s || 1,
+        symbol: entry,
+        manName: String(s.name || ""),
+        manSec: "2",
+      });
+    }
+  }
+  if (Array.isArray(r.exports)) {
+    for (const e of r.exports) {
+      if (!isObj(e) || !match(`${e.symbol} ${e.namespace || ""} ${e.path || ""}`)) continue;
+      items.push({
+        kind: "export",
+        name: String(e.symbol || ""),
+        subtitle: `${e.variant || "EXPORT_SYMBOL"}${e.namespace ? ` · ${e.namespace}` : ""}`,
+        path: String(e.path || ""),
+        line: e.line || 1,
+        symbol: String(e.symbol || ""),
+      });
+    }
+  }
+  if (Array.isArray(r.sites)) {
+    for (const e of r.sites) {
+      if (!isObj(e)) continue;
+      items.push({
+        kind: "export",
+        name: String(e.symbol || r.symbol || ""),
+        subtitle: `${e.variant || "EXPORT_SYMBOL"}${e.owner?.modname ? ` · ${e.owner.modname}` : ""}`,
+        path: String(e.path || ""),
+        line: e.line || 1,
+        symbol: String(e.symbol || r.symbol || ""),
+      });
+    }
+  }
+  if (Array.isArray(r.params)) {
+    for (const p of r.params) {
+      if (!isObj(p) || !match(`${p.full_name || p.name} ${p.handler || ""} ${p.path || ""}`)) continue;
+      items.push({
+        kind: "param",
+        name: String(p.full_name || p.name || ""),
+        subtitle: `${p.kind || "param"}${p.type ? ` · ${p.type}` : ""}`,
+        path: String(p.path || ""),
+        line: p.line || 1,
+        symbol: String(p.handler || ""),
+      });
+    }
+  }
+  if (Array.isArray(r.tracepoints)) {
+    for (const t of r.tracepoints) {
+      if (!isObj(t) || !match(`${t.system} ${t.name} ${t.path || ""}`)) continue;
+      items.push({
+        kind: "tracepoint",
+        name: t.system ? `${t.system}:${t.name}` : String(t.name || ""),
+        subtitle: String(t.macro || t.kind || "event"),
+        path: String(t.path || ""),
+        line: t.line || 1,
+        symbol: String(t.name || ""),
+      });
+    }
+  }
+  if (Array.isArray(r.modules)) {
+    for (const m of r.modules) {
+      if (!isObj(m) || !match(`${m.modname} ${m.license || ""} ${m.description || ""}`)) continue;
+      items.push({
+        kind: "module",
+        name: `${m.modname || "mod"}.ko`,
+        subtitle: String(m.license || m.description || ""),
+        path: String(m.members?.[0] || ""),
+        line: 1,
+        symbol: String(m.init || "").replace(/^.*\(|\)$/g, ""),
+      });
+    }
+  }
+  if (Array.isArray(r.entries)) {
+    for (const d of r.entries) {
+      if (!isObj(d) || !match(`${d.bus} ${d.id} ${d.table} ${d.path}`)) continue;
+      items.push({
+        kind: "device",
+        name: String(d.table || d.id || ""),
+        subtitle: `${d.bus || ""} · ${d.id || ""}`,
+        path: String(d.path || ""),
+        line: d.line || 1,
+        symbol: "",
+      });
+    }
+  }
+
+  return {
+    catalog,
+    version: String(r.version || ""),
+    arch: String(r.arch || data.arch || ""),
+    total: items.length,
+    items: items.slice(0, 100),
+  };
+}
+
+export function renderKapiBody(model) {
+  if (!model) return '<div class="nm-empty">No Kernel API data</div>';
+  const head = `<div class="nm-kapi-head"><span class="nm-kapi-cat">${esc(model.catalog)}</span>${model.arch ? `<span class="nm-kapi-arch">${esc(model.arch)}</span>` : ""}<span class="nm-kapi-cnt">${model.total} entries</span></div>`;
+  if (!model.items.length) return `<div class="nm-kapi nm-scroll">${head}<div class="nm-empty">No matching Kernel API entries</div></div>`;
+  const rows = model.items.map((it) => {
+    if (it.kind === "catalog") {
+      return `<div class="nm-kapi-row"><button type="button" class="nm-kapi-chip" data-act="kapi-catalog" data-key="${esc(it.cat)}">${esc(it.name)}</button><span class="nm-kapi-sub">${esc(it.subtitle)}</span></div>`;
+    }
+    const symBtn = it.symbol ? `<button type="button" class="nm-kapi-btn" data-act="kapi-spawn-symbol" data-key="${esc(it.symbol)}" title="Spawn symbol node">⊕ fn</button>` : "";
+    const manBtn = it.manName ? `<button type="button" class="nm-kapi-btn" data-act="kapi-spawn-man" data-key="${esc(`${it.manName}:${it.manSec || "2"}`)}" title="Spawn man page">⊕ man</button>` : "";
+    const srcBtn = it.path ? `<button type="button" class="nm-kapi-btn" data-act="kapi-spawn-source" data-key="${esc(`${it.path}:${it.line || 1}`)}" title="Spawn source slice">⊕ src</button>` : "";
+    return `<div class="nm-kapi-row"><span class="nm-kapi-tag">${esc(it.kind)}</span><span class="nm-kapi-name" title="${esc(it.name)}">${esc(it.name)}</span><span class="nm-kapi-sub" title="${esc(it.subtitle)}">${esc(it.subtitle)}</span><span class="nm-kapi-acts">${symBtn}${manBtn}${srcBtn}</span></div>`;
+  }).join("");
+  return `<div class="nm-kapi nm-scroll">${head}${rows}</div>`;
+}
+
+// ------------------------------------------------------------------ Kernel Docs (.rst / kernel-doc)
+
+function stripRstTags(html) {
+  return String(html || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseRstSections(content, toc = []) {
+  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  const sections = [];
+  let cur = { heading: "Document", level: 1, lines: [] };
+  const isAdorn = (l) => /^[=\-~^`*+#.:'"_]{3,}$/.test(String(l || "").trim());
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const next = lines[i + 1];
+    if (l.trim() && !/^\s/.test(l) && !/^\.\./.test(l) && next && isAdorn(next) && next.trim().length >= Math.max(3, l.trim().length - 2)) {
+      if (cur.lines.length || sections.length) sections.push(cur);
+      cur = { heading: l.trim(), level: 2, lines: [] };
+      i += 1;
+      continue;
+    }
+    const md = /^(#{1,4})\s+(.*)$/.exec(l);
+    if (md) {
+      if (cur.lines.length || sections.length) sections.push(cur);
+      cur = { heading: md[2].trim(), level: md[1].length, lines: [] };
+      continue;
+    }
+    cur.lines.push(l);
+  }
+  if (cur.lines.length || !sections.length) sections.push(cur);
+  return sections.slice(0, 60).map((s) => ({
+    heading: s.heading,
+    level: s.level,
+    text: s.lines.filter((x) => x.trim() && !/^\s*\.\.\s/.test(x)).slice(0, 12).join("\n"),
+    tocCount: toc.length,
+  }));
+}
+
+export function docModel(res, data = {}) {
+  const r = isObj(res) ? res : {};
+  const path = String(r.path || data.path || "");
+  if (Array.isArray(r.entries)) {
+    return {
+      mode: "kernel-doc",
+      path,
+      title: path ? path.split("/").pop() : "kernel-doc",
+      total: Number(r.total) || r.entries.length,
+      entries: r.entries.filter(isObj).slice(0, 60).map((e) => ({
+        kind: String(e.kind || "doc"),
+        name: String(e.name || ""),
+        brief: String(e.brief || ""),
+        signature: String(e.signature || ""),
+        line: Number(e.line) || null,
+        params: (Array.isArray(e.params) ? e.params : []).filter(isObj).map((p) => ({ name: String(p.name || ""), desc: String(p.desc || "") })),
+        sections: (Array.isArray(e.sections) ? e.sections : []).filter(isObj).map((s) => ({ title: String(s.title || ""), body: String(s.body || "") })),
+      })),
+    };
+  }
+  const content = String(r.content || "");
+  const title = String(r.title || (path ? path.split("/").pop() : "Kernel Docs"));
+  const sections = content ? parseRstSections(content, r.toc || []) : (r.html ? [{ heading: title, level: 1, text: stripRstTags(r.html).slice(0, 1500) }] : []);
+  return {
+    mode: "rst",
+    path,
+    title,
+    total: sections.length,
+    sections,
+    toc: Array.isArray(r.toc) ? r.toc.slice(0, 40) : [],
+  };
+}
+
+export function renderDocBody(model) {
+  if (!model) return '<div class="nm-empty">No documentation loaded</div>';
+  if (model.mode === "kernel-doc") {
+    if (!model.entries.length) return '<div class="nm-empty">No kernel-doc comments found</div>';
+    const html = model.entries.map((e) => {
+      const srcBtn = e.line && model.path ? `<button type="button" class="nm-doc-btn" data-act="doc-spawn-source" data-key="${esc(`${model.path}:${e.line}`)}" title="Open source at line ${esc(e.line)}">⊕ :${esc(e.line)}</button>` : "";
+      const params = e.params.slice(0, 8).map((p) => `<div class="nm-doc-param"><code>@${esc(p.name)}</code> <span>${esc(p.desc)}</span></div>`).join("");
+      const secs = e.sections.slice(0, 4).map((s) => `<div class="nm-doc-sec-txt"><b>${esc(s.title)}:</b> ${esc(s.body.slice(0, 240))}</div>`).join("");
+      return `<div class="nm-doc-entry">
+        <div class="nm-doc-entry-head"><span class="nm-doc-kind">${esc(e.kind)}</span><span class="nm-doc-name">${esc(e.name)}</span>${srcBtn}</div>
+        ${e.brief ? `<div class="nm-doc-brief">${esc(e.brief)}</div>` : ""}
+        ${e.signature ? `<pre class="nm-doc-sig">${esc(e.signature)}</pre>` : ""}
+        ${params}${secs}
+      </div>`;
+    }).join("");
+    return `<div class="nm-doc nm-scroll">${html}</div>`;
+  }
+  const html = model.sections.length
+    ? model.sections.map((s) => `<div class="nm-doc-section"><div class="nm-doc-h">${esc(s.heading)}</div>${s.text ? `<pre class="nm-doc-text">${esc(s.text)}</pre>` : ""}</div>`).join("")
+    : '<div class="nm-empty">Empty document</div>';
+  return `<div class="nm-doc nm-scroll"><div class="nm-doc-title">${esc(model.title)}</div>${html}</div>`;
+}
+
+// ------------------------------------------------------------------ Symbol History / File Blame
+
+export function historyModel(res, data = {}) {
+  const r = isObj(res) ? res : {};
+  if (Array.isArray(r.lines) || data.mode === "blame") {
+    const bySha = new Map();
+    for (const l of Array.isArray(r.lines) ? r.lines : []) {
+      if (!isObj(l) || !l.commit_hash) continue;
+      const sha = String(l.commit_hash);
+      let entry = bySha.get(sha);
+      if (!entry) {
+        entry = {
+          commitHash: sha,
+          author: String(l.author_name || l.author_email || "Unknown"),
+          date: l.date ? new Date(l.date * 1000).toISOString().slice(0, 10) : "",
+          subject: String(l.subject || ""),
+          lineStart: l.line || 1,
+          lineEnd: l.line || 1,
+          count: 0,
+        };
+        bySha.set(sha, entry);
+      }
+      entry.lineStart = Math.min(entry.lineStart, l.line || entry.lineStart);
+      entry.lineEnd = Math.max(entry.lineEnd, l.line || entry.lineEnd);
+      entry.count += 1;
+    }
+    return {
+      mode: "blame",
+      path: String(r.path || data.path || ""),
+      version: String(r.version || ""),
+      commits: [...bySha.values()].slice(0, 80),
+      totalLines: Array.isArray(r.lines) ? r.lines.length : 0,
+    };
+  }
+  const timeline = (Array.isArray(r.timeline) ? r.timeline : []).filter(isObj);
+  const changes = timeline.filter((t) => t.status !== "unchanged" && t.status !== "absent");
+  const rows = (changes.length ? changes : timeline).slice(0, 80).map((t) => ({
+    vname: String(t.vname || ""),
+    prevVname: String(t.prev_vname || ""),
+    status: String(t.status || ""),
+    path: String(t.path || r.path || data.path || ""),
+    lineS: t.line_s != null ? (Number(t.line_s) || null) : null,
+    lineE: t.line_e != null ? (Number(t.line_e) || null) : null,
+    added: Number(t.lines_added) || 0,
+    removed: Number(t.lines_removed) || 0,
+  }));
+  return {
+    mode: "symbol",
+    name: String(r.ast_name || data.name || ""),
+    path: String(r.path || data.path || ""),
+    branch: String(r.branch || ""),
+    totalVersions: Number(r.total_versions) || timeline.length,
+    changeCount: Number(r.change_count) || changes.length,
+    rows,
+  };
+}
+
+export function renderHistoryBody(model) {
+  if (!model) return '<div class="nm-empty">No history loaded</div>';
+  if (model.mode === "blame") {
+    const head = `<div class="nm-hist-head"><span>${esc(model.path || "Blame")}</span><span class="nm-hist-cnt">${model.commits.length} commits · ${model.totalLines} lines</span></div>`;
+    if (!model.commits.length) return `<div class="nm-hist nm-scroll">${head}<div class="nm-empty">No blame lines</div></div>`;
+    const rows = model.commits.map((c) => `<div class="nm-hist-row">
+      <code class="nm-hist-sha">${esc(c.commitHash.slice(0, 8))}</code>
+      <span class="nm-hist-author">${esc(c.author)}</span>
+      <span class="nm-hist-subj" title="${esc(c.subject)}">${esc(c.subject)}</span>
+      <span class="nm-hist-lines">L${c.lineStart}${c.lineEnd !== c.lineStart ? `–${c.lineEnd}` : ""} (${c.count})</span>
+      <button type="button" class="nm-hist-btn" data-act="hist-spawn-commit" data-key="${esc(c.commitHash)}" title="Spawn commit diff node">⊕ diff</button>
+    </div>`).join("");
+    return `<div class="nm-hist nm-scroll">${head}${rows}</div>`;
+  }
+  const head = `<div class="nm-hist-head"><span>${esc(model.name || model.path || "History")}</span><span class="nm-hist-cnt">${model.changeCount} changes / ${model.totalVersions} releases</span></div>`;
+  if (!model.rows.length) return `<div class="nm-hist nm-scroll">${head}<div class="nm-empty">No history stops found</div></div>`;
+  const rows = model.rows.map((r) => `<div class="nm-hist-row">
+    <span class="nm-hist-ver">${esc(r.vname)}</span>
+    <span class="nm-hist-st nm-hist-${esc(r.status)}">${esc(r.status)}</span>
+    <span class="nm-hist-delta">${r.added || r.removed ? `+${esc(r.added)} −${esc(r.removed)}` : (r.lineS ? `L${esc(r.lineS)}` : "")}</span>
+    ${r.prevVname && r.path ? `<button type="button" class="nm-hist-btn" data-act="hist-spawn-diff" data-key="${esc(`${r.prevVname}..${r.vname}:${r.path}`)}" title="Spawn diff ${esc(r.prevVname)}..${esc(r.vname)}">⊕ diff</button>` : ""}
+  </div>`).join("");
+  return `<div class="nm-hist nm-scroll">${head}${rows}</div>`;
 }

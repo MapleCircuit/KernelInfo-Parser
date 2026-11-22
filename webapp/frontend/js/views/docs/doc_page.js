@@ -10,6 +10,8 @@ import { toast } from "../../components/toast.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { openDefinition } from "../../utils/definition_picker.js";
 import { handleManLinkClick } from "../man/man_links.js";
+import { hasFeature } from "../../utils/projects.js";
+import { docSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { renderDocument, renderRstFragment, extractTitle, escapeHtml, highlightCode, slugify } from "./rst_renderer.js";
 
 const TITLE_FETCH_LIMIT = 80;
@@ -72,6 +74,7 @@ export class DocPage {
             <ul class="kdoc-this-page">
               <li><a href="#" class="kdoc-show-source">Show Source</a></li>
               <li><a href="#" class="kdoc-copy-link">Copy page path</a></li>
+              ${hasFeature(this.client?.repo || state.activeRepo(), "nodemap") ? '<li><a href="#" class="kdoc-send-nodemap">Send to NodeMap</a></li>' : ""}
             </ul>
           </div>
         </aside>
@@ -165,6 +168,10 @@ export class DocPage {
       } else if (a.classList.contains("kdoc-back")) {
         e.preventDefault();
         this.opts.onBack();
+      } else if (a.classList.contains("kdoc-send-nodemap")) {
+        e.preventDefault();
+        const repo = this.client?.repo || state.activeRepo();
+        sendToNodemap(docSpec({ path: this.opts.path, mode: "rst", version: this.opts.version, repo }), { repo, version: this.opts.version });
       } else if (a.dataset.doc) {
         e.preventDefault();
         this.navigate(a.dataset.doc, newTab);

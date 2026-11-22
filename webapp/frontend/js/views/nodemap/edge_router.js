@@ -1,7 +1,8 @@
 /**
  * edge_router.js - NodeMap edge geometry: side anchors, auto side choice, bezier / straight / orthogonal
- * paths, arrow heads and label placement. DOM-free; coordinates are canvas units (the wire layer sits
- * inside the zoomed canvas layer, so the same geometry serves the live view and the SVG/PNG export).
+ * paths (with optional manual bend waypoints), arrow heads and label placement. DOM-free; coordinates
+ * are canvas units (the wire layer sits inside the zoomed canvas layer, so the same geometry serves
+ * the live view and the SVG/PNG export).
  */
 
 const NORMALS = { top: [0, -1], right: [1, 0], bottom: [0, 1], left: [-1, 0] };
@@ -54,14 +55,144 @@ function cubicAt(p0, c1, c2, p3, t) {
 
 const r1 = (v) => Math.round(v * 10) / 10;
 
+function cleanWaypoints(waypoints) {
+  if (!Array.isArray(waypoints)) return [];
+  const out = [];
+  for (const w of waypoints) {
+    if (w && typeof w.x === "number" && typeof w.y === "number" && Number.isFinite(w.x) && Number.isFinite(w.y)) {
+      out.push({ x: w.x, y: w.y });
+    }
+  }
+  return out;
+}
+
+/** Midpoint along a polyline `pts` by segment count (places label on the center segment or middle vertex). */
+function polylineMid(pts) {
+  if (pts.length <= 1) return pts[0] || { x: 0, y: 0 };
+  if (pts.length % 2 === 1 && pts.length >= 3) {
+    return { x: pts[(pts.length - 1) / 2].x, y: pts[(pts.length - 1) / 2].y };
+  }
+  const m = Math.floor((pts.length - 1) / 2);
+  return { x: (pts[m].x + pts[m + 1].x) / 2, y: (pts[m].y + pts[m + 1].y) / 2 };
+}
+
 /**
- * Path of an edge between p1 (leaving `fromSide`) and p2 (entering `toSide`) in `curve` style.
- * Returns {d, mid, startAngle, endAngle}: `mid` is where the label goes, the angles (radians) are the
- * direction of travel at each end (for arrow heads).
+ * Find which segment `[i, i+1]` of `[p1, ...waypoints, p2]` is closest to `target`, returning the
+ * insertion index `i` inside `waypoints` so double-clicking an edge inserts a bend at the right place.
  */
-export function edgePath(p1, p2, fromSide = "right", toSide = "left", curve = "bezier") {
+export function nearestWaypointSegment(pts, target) {
+  if (!Array.isArray(pts) || pts.length < 2 || !target) return 0;
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    const t = lenSq > 0 ? Math.max(0, Math.min(1, ((target.x - a.x) * dx + (target.y - a.y) * dy) / lenSq)) : 0;
+    const px = a.x + dx * t, py = a.y + dy * t;
+    const d = Math.hypot(target.x - px, target.y - py);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+/**
+ * Path of an edge between p1 (leaving `fromSide`) and p2 (entering `toSide`) in `curve` style,
+ * optionally routed through manual bend `waypoints: [{x, y}]`.
+ * Returns {d, mid, startAngle, endAngle, controls?}: `mid` is where the label goes, the angles (radians)
+ * are the direction of travel at each end (for arrow heads).
+ */
+export function edgePath(p1, p2, fromSide = "right", toSide = "left", curve = "bezier", waypoints = []) {
   const n1 = NORMALS[fromSide] || NORMALS.right;
   const n2 = NORMALS[toSide] || NORMALS.left;
+  const wps = cleanWaypoints(waypoints);
+
+  if (wps.length) {
+    const pts = [p1, ...wps, p2];
+    if (curve === "straight") {
+      const d = pts.map((p, i) => `${i ? "L" : "M"} ${r1(p.x)} ${r1(p.y)}`).join(" ");
+      const mid = polylineMid(pts);
+      return {
+        d,
+        mid,
+        startAngle: Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x),
+        endAngle: Math.atan2(pts[pts.length - 1].y - pts[pts.length - 2].y, pts[pts.length - 1].x - pts[pts.length - 2].x),
+      };
+    }
+    if (curve === "orthogonal") {
+      const ortho = [p1];
+      let horiz = n1[0] !== 0;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        if (horiz) {
+          if (a.x !== b.x && a.y !== b.y) ortho.push({ x: b.x, y: a.y });
+        } else {
+          if (a.x !== b.x && a.y !== b.y) ortho.push({ x: a.x, y: b.y });
+        }
+        ortho.push(b);
+        horiz = !horiz;
+      }
+      const clean = ortho.filter((p, i) => i === 0 || p.x !== ortho[i - 1].x || p.y !== ortho[i - 1].y);
+      const d = clean.map((p, i) => `${i ? "L" : "M"} ${r1(p.x)} ${r1(p.y)}`).join(" ");
+      const m = Math.floor((clean.length - 1) / 2);
+      const mid = clean.length >= 2
+        ? { x: (clean[m].x + clean[m + 1].x) / 2, y: (clean[m].y + clean[m + 1].y) / 2 }
+        : { x: p1.x, y: p1.y };
+      const first = clean[1] || p2;
+      const last = clean[clean.length - 2] || p1;
+      return {
+        d,
+        mid,
+        startAngle: Math.atan2(first.y - p1.y, first.x - p1.x),
+        endAngle: Math.atan2(p2.y - last.y, p2.x - last.x),
+      };
+    }
+    // Smooth cubic spline through waypoints
+    const segs = [];
+    const controls = [];
+    const tangents = pts.map((p, i) => {
+      if (i === 0) {
+        const d0 = Math.hypot(pts[1].x - p1.x, pts[1].y - p1.y);
+        const k = Math.max(24, Math.min(180, d0 * 0.45));
+        return { x: n1[0] * k, y: n1[1] * k };
+      }
+      if (i === pts.length - 1) {
+        const d1 = Math.hypot(p2.x - pts[i - 1].x, p2.y - pts[i - 1].y);
+        const k = Math.max(24, Math.min(180, d1 * 0.45));
+        return { x: -n2[0] * k, y: -n2[1] * k };
+      }
+      return {
+        x: (pts[i + 1].x - pts[i - 1].x) * 0.25,
+        y: (pts[i + 1].y - pts[i - 1].y) * 0.25,
+      };
+    });
+    let d = `M ${r1(p1.x)} ${r1(p1.y)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      const c1 = { x: a.x + tangents[i].x, y: a.y + tangents[i].y };
+      const c2 = { x: b.x - tangents[i + 1].x, y: b.y - tangents[i + 1].y };
+      controls.push(c1, c2);
+      segs.push([a, c1, c2, b]);
+      d += ` C ${r1(c1.x)} ${r1(c1.y)}, ${r1(c2.x)} ${r1(c2.y)}, ${r1(b.x)} ${r1(b.y)}`;
+    }
+    const midSeg = segs[Math.floor(segs.length / 2)];
+    const mid = segs.length % 2 === 0
+      ? { x: wps[Math.floor(wps.length / 2) - 1]?.x ?? midSeg[0].x, y: wps[Math.floor(wps.length / 2) - 1]?.y ?? midSeg[0].y }
+      : cubicAt(midSeg[0], midSeg[1], midSeg[2], midSeg[3], 0.5);
+    const firstC = segs[0][1];
+    const lastC = segs[segs.length - 1][2];
+    return {
+      d,
+      mid,
+      startAngle: Math.atan2(firstC.y - p1.y, firstC.x - p1.x),
+      endAngle: Math.atan2(p2.y - lastC.y, p2.x - lastC.x),
+      controls,
+    };
+  }
+
   if (curve === "straight") {
     const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x);
     return { d: `M ${r1(p1.x)} ${r1(p1.y)} L ${r1(p2.x)} ${r1(p2.y)}`, mid: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }, startAngle: ang, endAngle: ang };
@@ -125,8 +256,9 @@ export function dashArray(style) {
 }
 
 /** Full geometry of one edge between two node rectangles. */
-export function computeEdgeGeometry(from, to, { curve = "bezier", arrow = "forward" } = {}) {
+export function computeEdgeGeometry(from, to, { curve = "bezier", arrow = "forward", waypoints = [] } = {}) {
   const ends = resolveEnds(from, to);
-  const geom = edgePath(ends.p1, ends.p2, ends.fromSide, ends.toSide, curve);
-  return { ...ends, ...geom, heads: arrowHeads(geom, ends.p1, ends.p2, arrow) };
+  const wps = cleanWaypoints(waypoints);
+  const geom = edgePath(ends.p1, ends.p2, ends.fromSide, ends.toSide, curve, wps);
+  return { ...ends, ...geom, waypoints: wps, heads: arrowHeads(geom, ends.p1, ends.p2, arrow) };
 }

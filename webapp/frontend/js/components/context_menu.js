@@ -22,7 +22,7 @@ import { referenceMenuItems } from "./file_references.js";
 import { hasFeature } from "../utils/projects.js";
 import { canBeVersionlessTab, isAlwaysVersionlessTab } from "../tab_routes.js";
 import { urlSync } from "../url_sync.js";
-import { diffSpec, nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
+import { diffSpec, historySpec, nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
 
 class ContextMenu {
   constructor() {
@@ -781,6 +781,13 @@ class ContextMenu {
           icon: "🕰",
           onClick: () => showSymbolHistoryModal(v, filePath, line, token.ast_id || null, token.name)
         });
+        if (filePath && hasFeature(state.activeRepo(), "nodemap")) {
+          items.push({
+            label: `Send Symbol History of ${token.name} to NodeMap`,
+            icon: "🗺️",
+            onClick: () => sendToNodemap(historySpec({ mode: "symbol", path: filePath, line, astId: token.ast_id || null, name: token.name, version: v }), { version: v })
+          });
+        }
       }
 
       items.push({ separator: true });
@@ -858,6 +865,11 @@ class ContextMenu {
         label: `Send ${fileName} to NodeMap`,
         icon: "🗺️",
         onClick: () => sendToNodemap(sourceSpec({ path: filePath, version: v }), { version: v })
+      });
+      items.push({
+        label: `Send ${fileName} Blame Timeline to NodeMap`,
+        icon: "🗺️",
+        onClick: () => sendToNodemap(historySpec({ mode: "blame", path: filePath, line, version: v }), { version: v })
       });
     }
 
@@ -1203,12 +1215,26 @@ class ContextMenu {
       const v = node.version || state.activeVersion();
       const title = node.customTitle || node.title;
       items.push({ label: "Rename…", icon: "✎", onClick: () => controller.beginTitleEdit(node.id) });
+      const followType = node.type === "struct" && fieldKey ? controller.followableTypeFor?.(node.id, fieldKey) : null;
+      if (followType) items.push({ label: `Follow Type (${followType})`, icon: "↣", onClick: () => controller.followStructType(node.id, fieldKey) });
       if (fieldKey) items.push({ label: "Attach Node to This Member…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id, fieldKey) });
       else if (node.type !== "group" && node.type !== "note") items.push({ label: "Attach Connected Node…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id) });
       if (node.type === "symbol") items.push({ label: d.expanded ? "Collapse Members" : "Expand Members", icon: d.expanded ? "🔼" : "🔽", onClick: () => controller.toggleExpandNode(node.id) });
+      if (node.type === "symbol" && d.kind === "func" && hasFeature(node.repo || state.activeRepo(), "callgraph")) {
+        items.push({ label: "+ Callers to NodeMap", icon: "⤴", onClick: () => controller.expandCallgraph?.(node.id, "callers") });
+        items.push({ label: "+ Callees to NodeMap", icon: "⤵", onClick: () => controller.expandCallgraph?.(node.id, "callees") });
+        items.push({ label: "Find Call Path to…", icon: "🛣", onClick: () => controller.promptCallPath?.(node.id) });
+      }
       if (node.type === "mail" && !d.single) items.push({ label: "Expand Thread to Nodes", icon: "⇶", onClick: () => controller.expandThreadToNodes(node.id) });
       if (node.type === "kconfig") items.push({ label: "Expand Relations", icon: "⇶", onClick: () => controller.expandKconfigRelations(node.id) });
-      if (["struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer"].includes(node.type)) items.push({ label: "Open as Tab", icon: "↗", onClick: () => controller.openNodeAsTab(node.id) });
+      if (node.type === "group") {
+        items.push({
+          label: d.subCanvas ? "Enter Sub-Map Portal" : "Convert Group to Sub-Map Portal",
+          icon: "🌀",
+          onClick: () => controller.enterSubMap?.(node.id),
+        });
+      }
+      if (["struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) items.push({ label: "Open as Tab", icon: "↗", onClick: () => controller.openNodeAsTab(node.id) });
       if ((node.type === "struct" || node.type === "symbol") && name) {
         items.push({ separator: true });
         items.push({
@@ -1238,7 +1264,16 @@ class ContextMenu {
       items.push({ label: controller.selected?.size > 1 ? `Remove ${controller.selected.size} Nodes` : "Remove Node", icon: "🗑️", danger: true, onClick: () => controller.deleteSelection() });
       this.renderMenu(x, y, { header: { title: title || "Node", sub: `NodeMap [${node.type}]` }, items });
     } else if (edgeId) {
+      const edge = controller.canvas?.edges?.find?.((x) => x.id === edgeId);
       items.push({ label: "Edit Label…", icon: "✎", onClick: () => controller.beginEdgeLabelEdit(edgeId) });
+      if (at) items.push({ label: "Add Bend Waypoint Here", icon: "◆", onClick: () => controller.addEdgeWaypointAt?.(edgeId, at) });
+      if (edge?.callSite?.path) {
+        items.push({
+          label: `Open Call Site (${edge.callSite.path.split("/").pop()}:${edge.callSite.line || 1})`,
+          icon: "↗",
+          onClick: () => controller.openCallSiteSource?.(edge),
+        });
+      }
       items.push({ label: "Remove Connection", icon: "🗑️", danger: true, onClick: () => controller.removeEdge(edgeId) });
       this.renderMenu(x, y, { header: { title: "Connection", sub: "NodeMap" }, items });
     } else if (isCanvas) {
