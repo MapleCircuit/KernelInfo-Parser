@@ -5,7 +5,7 @@
  * cache-line offsets/holes), and all 15 node types including `cve`, `kapi`, `doc`, and `history`.
  * `canvasToSvg()` and the size helpers are DOM-free (unit tested).
  */
-import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, isCustomColor, paintOrder, visibleCanvasSlice } from "./canvas_model.js";
+import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, formatLockBadge, isCustomColor, paintOrder, visibleCanvasSlice } from "./canvas_model.js";
 import { arrowHeads, dashArray, edgePath, resolveEnds } from "./edge_router.js";
 import { headMetaOf, sourceLineSegments } from "./node_content.js";
 import { diffRows, kconfigValue, mailBadges, maintainerLines, statusClass, valueClass } from "./domain_nodes.js";
@@ -209,7 +209,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
         const tx = 92;
         if (r.type) inner += txt(tx, base, esc(fit(r.type, m.typeCh)), { fill: C.type, family: "monospace" });
         const nx = tx + (r.type ? m.typeCh * MONO_CH + 6 : 0);
-        inner += txt(nx, base, esc(`${r.name}${r.bitfield || ""}`), { fill: C.text, family: "monospace" });
+        const lkSpan = r.lock?.kind ? `<tspan fill="${C.orange}"> [${esc(formatLockBadge(r.lock))}]</tspan>` : "";
+        inner += txt(nx, base, `${esc(`${r.name}${r.bitfield || ""}`)}${lkSpan}`, { fill: C.text, family: "monospace" });
       }
       ry += LAYOUT_ROW_H;
     }
@@ -315,7 +316,8 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
           if (typeText) row += txt(tx + 4 + r.depth * 2 * MONO_CH, base, esc(fit(typeText, model.typeCh - r.depth * 2)), { fill: r.kind === "agg" ? C.keyword : C.type, family: "monospace" });
           row += `<line x1="${r1(tx + typeW + 8)}" y1="${r1(ry)}" x2="${r1(tx + typeW + 8)}" y2="${r1(ry + rh)}" stroke="${C.rule}"/>`;
           const nx = tx + typeW + 12;
-          row += txt(nx, base, `<tspan fill="${C.text}">${esc(r.kind === "agg" ? label : r.name)}</tspan>${r.kind === "field" && r.suffix ? `<tspan fill="${C.number}">${esc(r.suffix)}</tspan>` : ""}`, { family: "monospace", weight: r.kind === "agg" ? "bold" : "" });
+          const lkSpan = r.lock?.kind ? `<tspan fill="${C.orange}"> [${esc(formatLockBadge(r.lock))}]</tspan>` : "";
+          row += txt(nx, base, `<tspan fill="${C.text}">${esc(r.kind === "agg" ? label : r.name)}</tspan>${r.kind === "field" && r.suffix ? `<tspan fill="${C.number}">${esc(r.suffix)}</tspan>` : ""}${lkSpan}`, { family: "monospace", weight: r.kind === "agg" ? "bold" : "" });
         } else {
           let spans = lead ? `<tspan fill="${C.faint}">${esc(lead)}</tspan>` : "";
           if (r.kind === "agg") {
@@ -327,6 +329,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
             spans += `<tspan fill="${C.text}">${esc(r.name)}</tspan>`;
             if (r.suffix) spans += `<tspan fill="${C.number}">${esc(r.suffix)}</tspan>`;
           }
+          if (r.lock?.kind) spans += `<tspan fill="${C.orange}"> [${esc(formatLockBadge(r.lock))}]</tspan>`;
           if (r.conds.length && !d.showGuards) spans += `<tspan fill="${C.preproc}" font-size="9"> #</tspan>`;
           row += txt(x0, base, spans, { family: "monospace" });
         }
@@ -676,12 +679,17 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const accent = resolve(accentVar(n.color, defaultAccent(n.type)));
     if (n.type === "group") {
       rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: n.h });
+      const grpLocks = Array.isArray(n.locks) && n.locks.length
+        ? ` · ${n.locks.map((l) => formatLockBadge(l)).join(" · ")}`
+        : "";
       return `<g><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="${accent}" fill-opacity="0.06" stroke="${accent}" stroke-dasharray="${n.data?.subCanvas ? "3 2" : "6 4"}"/>` +
-        `${txt(n.x + 10, n.y + 18, esc(displayTitle(n)), { weight: "bold", size: 12 })}</g>\n`;
+        `${txt(n.x + 10, n.y + 18, esc(`${displayTitle(n)}${grpLocks}`), { weight: "bold", size: 12 })}</g>\n`;
     }
     let box = layoutBox(n);
     const headShown = !n.hideHeader || editMode;
-    const top = headShown ? HEAD_H : 0;
+    const nodeLocks = Array.isArray(n.locks) ? n.locks : [];
+    const lockStripH = nodeLocks.length ? 18 : 0;
+    const top = (headShown ? HEAD_H : 0) + lockStripH;
     used = 0;
     let body = "";
     if (n.type === "struct") body = structBody(n, box, top, accent);
@@ -721,6 +729,20 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
       }
       h += txt(16 + bw, 18, esc(fit(displayTitle(n), Math.floor((box.w - bw - 28 - (metaCols ? metaCols * 6 + 8 : 0)) / 6.6))), { weight: "bold", size: 12 });
       s += n.hideHeader ? `<g opacity="0.45">${h}</g>` : h;
+    }
+    if (lockStripH) {
+      const ly = headShown ? HEAD_H : 0;
+      s += `<rect x="0" y="${ly}" width="${box.w}" height="${lockStripH}" fill="${C.head}"/>`;
+      s += `<line x1="0" y1="${ly + lockStripH}" x2="${box.w}" y2="${ly + lockStripH}" stroke="${C.rule}"/>`;
+      let lx = 8;
+      for (const lk of nodeLocks) {
+        const label = formatLockBadge(lk);
+        const lw = label.length * 5.8 + 10;
+        if (lx + lw > box.w - 4 && lx > 8) break;
+        s += `<rect x="${r1(lx)}" y="${ly + 2}" width="${r1(lw)}" height="14" rx="7" fill="${C.orange}" fill-opacity="0.16" stroke="${C.orange}"/>`;
+        s += txt(lx + lw / 2, ly + 12, esc(label), { fill: C.orange, size: 9, family: "monospace", anchor: "middle" });
+        lx += lw + 4;
+      }
     }
     const bid = clip(0, top, box.w, box.h - top);
     const fo = n.type === "tab" || n.type === "man" ? foreignOf(n) : null;
@@ -763,9 +785,13 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     const ends = resolveEnds({ rect: a, side: p1 ? fs : e.fromSide, point: p1 }, { rect: b, side: p2 ? ts : e.toSide, point: p2 });
     const g = edgePath(ends.p1, ends.p2, ends.fromSide, ends.toSide, e.curve, e.waypoints);
     const heads = arrowHeads(g, ends.p1, ends.p2, e.arrow);
+    const lockTag = e.lockKind ? `🔒 ${e.lockKind}` : "";
+    const edgeLabel = e.label && lockTag && !e.label.toLowerCase().includes(e.lockKind.toLowerCase())
+      ? `${e.label} (${lockTag})`
+      : (e.label || lockTag);
     extra.push(ends.p1, ends.p2, g.mid, ...(g.controls || []), ...(e.waypoints || []));
-    if (e.label) {
-      const half = (e.label.length * SANS_CH) / 2 + 4;
+    if (edgeLabel) {
+      const half = (edgeLabel.length * SANS_CH) / 2 + 4;
       extra.push({ x: g.mid.x - half, y: g.mid.y - 20 }, { x: g.mid.x + half, y: g.mid.y });
     }
     const c = resolve(accentVar(e.color, "var(--accent-blue)"));
@@ -773,7 +799,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     edgesSvg += `<path d="${g.d}" fill="none" stroke="${c}" stroke-width="2"${dash ? ` stroke-dasharray="${dash}"` : ""}/>\n`;
     for (const h of heads) edgesSvg += `<polygon points="${h}" fill="${c}"/>\n`;
     const halo = opts.transparent ? "" : ` stroke="${C.bg}" stroke-width="4" paint-order="stroke"`;
-    if (e.label) edgesSvg += `<text x="${r1(g.mid.x)}" y="${r1(g.mid.y - 6)}" text-anchor="middle" fill="${C.text}"${halo} font-family="sans-serif" font-size="11">${esc(e.label)}</text>\n`;
+    if (edgeLabel) edgesSvg += `<text x="${r1(g.mid.x)}" y="${r1(g.mid.y - 6)}" text-anchor="middle" fill="${C.text}"${halo} font-family="sans-serif" font-size="11">${esc(edgeLabel)}</text>\n`;
   }
   /* ui-scale-exempt-end */
 

@@ -374,72 +374,93 @@ function matchNodeContent(n, content, q) {
 }
 
 /**
- * Search canvas nodes and their loaded content for `query`.
- * Returns at most one match `{ nodeId, title, type, matchField, snippet }` per matching node.
+ * Search canvas nodes (and recursively nested `group.data.subCanvas` trees) for `query`.
+ * Returns at most one match `{ nodeId, title, type, matchField, snippet, subMapPath, trailTitles, breadcrumb }`
+ * per matching node.
  */
-export function searchCanvasNodes(nodes, query, contentOf = () => null) {
+export function searchCanvasNodes(nodes, query, contentOf = () => null, opts = {}) {
   const trimmed = String(query ?? "").trim();
   if (!trimmed) return [];
   const q = trimmed.toLowerCase();
+  const recursive = opts.recursive !== false;
+  const maxDepth = Number.isInteger(opts.maxDepth) ? opts.maxDepth : 8;
   const hits = [];
 
-  for (const n of Array.isArray(nodes) ? nodes : []) {
-    if (!n) continue;
-    const title = displayTitle(n);
-
+  const matchNode = (n, title) => {
     if (String(title).toLowerCase().includes(q)) {
-      hits.push({ nodeId: n.id, title, type: n.type, matchField: "title", snippet: title });
-      continue;
+      return { matchField: "title", snippet: title };
     }
-
-    let matched = null;
     for (const meta of [n.type, n.version, n.layerId]) {
       if (meta && String(meta).toLowerCase().includes(q)) {
-        matched = { matchField: "meta", snippet: String(meta) };
-        break;
+        return { matchField: "meta", snippet: String(meta) };
       }
     }
-    if (matched) {
-      hits.push({ nodeId: n.id, title, type: n.type, ...matched });
-      continue;
+    for (const lk of Array.isArray(n.locks) ? n.locks : []) {
+      for (const lv of [lk?.kind, lk?.lockName, lk?.note]) {
+        if (lv && String(lv).toLowerCase().includes(q)) {
+          return { matchField: "lock", snippet: makeSnippet([lk.kind, lk.lockName, lk.note].filter(Boolean).join(" "), q) };
+        }
+      }
     }
-
     const data = n.data && typeof n.data === "object" ? n.data : null;
     if (data) {
       for (const key of DATA_SEARCH_FIELDS) {
         const val = data[key];
         if (val != null && val !== "" && String(val).toLowerCase().includes(q)) {
-          matched = { matchField: "data", snippet: makeSnippet(String(val), q) };
-          break;
+          return { matchField: "data", snippet: makeSnippet(String(val), q) };
         }
       }
-      if (!matched && Array.isArray(data.constituents)) {
+      if (data.fieldLocks && typeof data.fieldLocks === "object") {
+        for (const [fk, fl] of Object.entries(data.fieldLocks)) {
+          const text = [fk, fl?.kind, fl?.lockName].filter(Boolean).join(" ");
+          if (text.toLowerCase().includes(q)) {
+            return { matchField: "lock", snippet: makeSnippet(text, q) };
+          }
+        }
+      }
+      if (Array.isArray(data.constituents)) {
         for (const c of data.constituents) {
           const name = typeof c === "string" ? c : c?.name || "";
           if (name && String(name).toLowerCase().includes(q)) {
-            matched = { matchField: "member", snippet: makeSnippet(name, q) };
-            break;
+            return { matchField: "member", snippet: makeSnippet(name, q) };
           }
         }
       }
     }
-    if (matched) {
-      hits.push({ nodeId: n.id, title, type: n.type, ...matched });
-      continue;
-    }
-
     let content = null;
     try {
       content = typeof contentOf === "function" ? contentOf(n) : null;
     } catch {
       content = null;
     }
-    const contentHit = matchNodeContent(n, content, q);
-    if (contentHit) {
-      hits.push({ nodeId: n.id, title, type: n.type, ...contentHit });
-    }
-  }
+    return matchNodeContent(n, content, q);
+  };
 
+  const walk = (list, subMapPath, trailTitles, depth) => {
+    for (const n of Array.isArray(list) ? list : []) {
+      if (!n) continue;
+      const title = displayTitle(n);
+      const hit = matchNode(n, title);
+      if (hit) {
+        const path = [...subMapPath];
+        const trail = [...trailTitles];
+        hits.push({
+          nodeId: n.id,
+          title,
+          type: n.type,
+          ...hit,
+          subMapPath: path,
+          trailTitles: trail,
+          breadcrumb: trail.length ? `${trail.join(" › ")} › ${title}` : title,
+        });
+      }
+      if (recursive && depth < maxDepth && n.type === "group" && Array.isArray(n.data?.subCanvas?.nodes)) {
+        walk(n.data.subCanvas.nodes, [...subMapPath, n.id], [...trailTitles, title], depth + 1);
+      }
+    }
+  };
+
+  walk(nodes, [], [], 0);
   return hits;
 }
 
@@ -683,6 +704,7 @@ export class NodeMapSearch {
     this.wrapEl = null;
     this.inputEl = null;
     this.countEl = null;
+    this.crumbEl = null;
     this.prevBtn = null;
     this.nextBtn = null;
     this.closeBtn = null;
@@ -716,6 +738,11 @@ export class NodeMapSearch {
     countEl.setAttribute?.("aria-live", "polite");
     countEl.textContent = "";
 
+    const crumbEl = document.createElement("span");
+    crumbEl.className = "nm-search-crumb";
+    crumbEl.hidden = true;
+    crumbEl.textContent = "";
+
     const prevBtn = document.createElement("button");
     prevBtn.type = "button";
     prevBtn.className = "nodemap-btn nm-search-prev";
@@ -742,6 +769,7 @@ export class NodeMapSearch {
 
     el.appendChild(inputEl);
     el.appendChild(countEl);
+    el.appendChild(crumbEl);
     el.appendChild(prevBtn);
     el.appendChild(nextBtn);
     el.appendChild(closeBtn);
@@ -750,6 +778,7 @@ export class NodeMapSearch {
     this.el = el;
     this.inputEl = inputEl;
     this.countEl = countEl;
+    this.crumbEl = crumbEl;
     this.prevBtn = prevBtn;
     this.nextBtn = nextBtn;
     this.closeBtn = closeBtn;
@@ -813,6 +842,10 @@ export class NodeMapSearch {
     this.index = -1;
     this._lastQuery = "";
     if (this.countEl) this.countEl.textContent = "";
+    if (this.crumbEl) {
+      this.crumbEl.textContent = "";
+      this.crumbEl.hidden = true;
+    }
     this.controller?.rootEl?.focus?.({ preventScroll: true });
   }
 
@@ -823,17 +856,39 @@ export class NodeMapSearch {
     this._highlightedEls.clear();
   }
 
+  _sameSubMapPath(hitPath) {
+    const a = Array.isArray(hitPath) ? hitPath : [];
+    const b = Array.isArray(this.controller?.subMapPath) ? this.controller.subMapPath : [];
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
   _applyHighlights() {
     this._clearHighlights();
     const renderer = this.controller?.renderer;
     if (!renderer?.element) return;
     for (let i = 0; i < this.matches.length; i++) {
       const hit = this.matches[i];
+      if (!this._sameSubMapPath(hit.subMapPath)) continue;
       const nodeEl = renderer.element(hit.nodeId);
       if (!nodeEl?.classList) continue;
       nodeEl.classList.add("nm-search-hit");
       if (i === this.index) nodeEl.classList.add("nm-search-current");
       this._highlightedEls.add(nodeEl);
+    }
+  }
+
+  _updateCrumb(hit) {
+    if (!this.crumbEl) return;
+    const trail = hit?.trailTitles;
+    if (Array.isArray(trail) && trail.length) {
+      this.crumbEl.textContent = trail.join(" › ");
+      this.crumbEl.title = hit.breadcrumb || trail.join(" › ");
+      this.crumbEl.hidden = false;
+    } else {
+      this.crumbEl.textContent = "";
+      this.crumbEl.hidden = true;
     }
   }
 
@@ -845,14 +900,16 @@ export class NodeMapSearch {
       this.matches = [];
       this.index = -1;
       if (this.countEl) this.countEl.textContent = "";
+      this._updateCrumb(null);
       this._clearHighlights();
       return this.matches;
     }
 
     const sameQuery = trimmed === this._lastQuery;
     this._lastQuery = trimmed;
+    const searchRoot = this.controller?.rootCanvas || this.controller?.canvas;
     this.matches = searchCanvasNodes(
-      this.controller?.canvas?.nodes || [],
+      searchRoot?.nodes || [],
       query,
       (n) => this.controller?.rawContentOf?.(n) || this.controller?.modelOf?.(n),
     );
@@ -860,6 +917,7 @@ export class NodeMapSearch {
     if (!this.matches.length) {
       this.index = -1;
       if (this.countEl) this.countEl.textContent = "0 matches";
+      this._updateCrumb(null);
       this._clearHighlights();
       return this.matches;
     }
@@ -869,6 +927,7 @@ export class NodeMapSearch {
     }
 
     if (this.countEl) this.countEl.textContent = `${this.index + 1} / ${this.matches.length}`;
+    this._updateCrumb(this.matches[this.index]);
     this._applyHighlights();
     return this.matches;
   }
@@ -883,8 +942,12 @@ export class NodeMapSearch {
       this.index = ((this.index + d) % len + len) % len;
     }
     if (this.countEl) this.countEl.textContent = `${this.index + 1} / ${len}`;
-    this._applyHighlights();
     const hit = this.matches[this.index];
+    this._updateCrumb(hit);
+    if (!this._sameSubMapPath(hit.subMapPath) && typeof this.controller?.navigateToSubMapPath === "function") {
+      this.controller.navigateToSubMapPath(hit.subMapPath || []);
+    }
+    this._applyHighlights();
     this.controller?.selectOnly?.(hit.nodeId);
     this.controller?.centerOnNode?.(hit.nodeId);
     return hit;
@@ -902,6 +965,7 @@ export class NodeMapSearch {
     this.el = null;
     this.inputEl = null;
     this.countEl = null;
+    this.crumbEl = null;
     this.prevBtn = null;
     this.nextBtn = null;
     this.closeBtn = null;

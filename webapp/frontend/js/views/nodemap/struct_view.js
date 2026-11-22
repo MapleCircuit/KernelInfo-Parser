@@ -5,7 +5,20 @@
  *
  * DOM-free (unit tested).
  */
-import { OUTER_KEY, structItemKey, typeVisible } from "./canvas_model.js";
+import { OUTER_KEY, formatLockBadge, structItemKey, typeVisible } from "./canvas_model.js";
+
+function findFieldLock(data, key, name) {
+  const map = data?.fieldLocks;
+  if (!map || typeof map !== "object") return null;
+  if (key && map[key]) return map[key];
+  if (name) {
+    const suffix = `:${name}`;
+    for (const [k, v] of Object.entries(map)) {
+      if (k === name || k.endsWith(suffix)) return v;
+    }
+  }
+  return null;
+}
 
 export function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -192,7 +205,8 @@ export function structRows(layout, data, opts = {}) {
     const dim = dimmed || own;
     const showType = typeVisible(data, key);
     const diff = it.name && diffStatus ? diffStatus.get(it.name) || "" : "";
-    const base = { key, depth, bars: barsAt(level), line: it.line || null, conds: it.conds || [], hidden: own, dim, dead: eff === F, showType, diff };
+    const lock = findFieldLock(data, key, it.name);
+    const base = { key, depth, bars: barsAt(level), line: it.line || null, conds: it.conds || [], hidden: own, dim, dead: eff === F, showType, diff, lock };
     if (it.kind === "aggregate") {
       const folded = Boolean(data.collapsed?.[key]);
       const typeText = showType && it.type_name ? it.type_name.replace(/^(struct|union)\s+/, "") : "";
@@ -282,6 +296,7 @@ export function paholeRows(pahole, data = {}) {
       name: String(m.name || "(anon)"),
       estimated: Boolean(m.estimated),
       refType: extractReferencedStruct(m.type),
+      lock: findFieldLock(data, key, m.name),
     });
   }
   return {
@@ -316,6 +331,19 @@ function followBtn(r) {
   return `<button type="button" class="nm-sf-follow" data-act="follow-type" data-key="${esc(r.key)}" title="Follow ${esc(r.refType.kind)} ${esc(r.refType.name)} (${esc(r.refType.edgeLabel)})">↗</button>`;
 }
 
+function lockBadgeHtml(lock) {
+  if (!lock?.kind) return "";
+  const label = formatLockBadge(lock);
+  const title = `Protected by ${lock.kind}${lock.lockName ? `: ${lock.lockName}` : ""}`;
+  return `<span class="nm-lock-badge nm-lock-${esc(lock.kind)}" title="${esc(title)}">${esc(label)}</span>`;
+}
+
+function lockBtn(r, editMode) {
+  if (!editMode) return "";
+  const has = Boolean(r.lock?.kind);
+  return `<button type="button" class="nm-sf-lock${has ? " on" : ""}" data-act="field-lock" data-key="${esc(r.key)}" title="${has ? `Edit lock (${esc(r.lock.kind)}${r.lock.lockName ? `: ${esc(r.lock.lockName)}` : ""})` : "Annotate locking / concurrency"}">🔒</button>`;
+}
+
 function rowClass(r, extra) {
   const diffCls = r.diff ? ` nm-sf-diff-${r.diff}` : "";
   return `nm-sf ${extra}${r.dim ? " nm-sf-dim" : ""}${r.hidden ? " nm-sf-hidden" : ""}${r.dead ? " nm-sf-dead" : ""}${diffCls}`;
@@ -345,13 +373,15 @@ function rowHtml(r, data, editMode, table, cell = false) {
   const tt = editMode ? `<button type="button" class="nm-sf-tt${r.showType ? " on" : ""}" data-act="toggle-type" data-key="${esc(r.key)}" title="${r.showType ? "Hide" : "Show"} the type${r.kind === "agg" ? "s inside" : " of"} ${esc(r.kind === "agg" ? r.label : r.name)}">T</button>` : "";
   const marker = guarded ? `<span class="nm-sf-guard" aria-label="${esc(condTitle(r.conds))}">#</span>` : "";
   const fl = followBtn(r);
+  const lk = lockBadgeHtml(r.lock);
+  const lkBtn = lockBtn(r, editMode);
   if (r.kind === "agg") {
     const fold = `<button type="button" class="nm-sf-fold" data-act="collapse" data-key="${esc(r.key)}" aria-expanded="${r.folded ? "false" : "true"}" title="${r.folded ? "Expand" : "Collapse"} ${esc(r.label)}">${r.folded ? "▸" : "▾"}</button>`;
     const typeCell = table
       ? `<span class="nm-sf-type nm-sf-cell"><span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? ` ${esc(r.typeText)}` : ""}</span>`
       : `<span class="nm-sf-tag">${esc(r.tag)}</span>${r.typeText ? `<span class="nm-sf-type">${esc(r.typeText)}</span>` : ""}`;
     return `<div class="${rowClass(r, `nm-sf-agg${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${fold}${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${r.folded ? `<span class="nm-sf-count"> {${r.count}}</span>` : ""}</span>${lk}${lkBtn}${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
   }
   const suffix = r.suffix ? `<span class="nm-sf-suffix">${esc(r.suffix)}</span>` : "";
@@ -359,7 +389,7 @@ function rowHtml(r, data, editMode, table, cell = false) {
     ? `<span class="nm-sf-type nm-sf-cell">${esc(r.type)}</span>`
     : (r.showType ? `<span class="nm-sf-type">${esc(r.type)}</span>` : "");
   return `<div class="${rowClass(r, `nm-sf-field${guarded ? " nm-guarded" : ""}`)}" data-key="${esc(r.key)}" ${style} title="${esc(condTitle(r.conds))}">
-    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
+    ${pl}${barsHtml(r.bars, cell)}<span class="nm-sf-ctl">${tt}</span>${typeCell}<span class="nm-sf-name${table ? " nm-sf-cell" : ""}">${esc(r.name)}${suffix}</span>${lk}${lkBtn}${fl}${marker}${line}${hideBtn(r, editMode, r.key)}${pr}
   </div>`;
 }
 
@@ -379,12 +409,14 @@ export function renderPaholeBody(pahole, data = {}, opts = {}) {
       return `<div class="nm-sf nm-sf-hole" data-pp-key="${esc(r.key)}"><span class="nm-sf-off">+${r.offset}</span><span class="nm-sf-sz">${r.size}B</span><span class="nm-sf-hole-label">/* ${r.size} byte padding hole */</span></div>`;
     }
     const fl = followBtn(r);
+    const lk = lockBadgeHtml(r.lock);
+    const lkBtn = lockBtn(r, Boolean(opts.editMode));
     return `<div class="nm-sf nm-sf-field nm-sf-layout${r.crosses ? " nm-sf-crosses" : ""}" data-key="${esc(r.key)}">
       <span class="nm-port nm-port-field nm-port-left" data-field="${esc(r.key)}" data-side="left"></span>
       <span class="nm-sf-off">+${r.offset}</span><span class="nm-sf-sz">${r.size}B</span>
       ${r.type ? `<span class="nm-sf-type nm-sf-cell">${esc(r.type)}</span>` : ""}
       <span class="nm-sf-name nm-sf-cell">${esc(r.name)}${r.bitfield ? `<span class="nm-sf-suffix">${esc(r.bitfield)}</span>` : ""}</span>
-      ${fl}${r.crosses ? '<span class="nm-sf-cross-tag" title="Crosses 64-byte cache-line boundary">⇄CL</span>' : ""}
+      ${lk}${lkBtn}${fl}${r.crosses ? '<span class="nm-sf-cross-tag" title="Crosses 64-byte cache-line boundary">⇄CL</span>' : ""}
       <span class="nm-port nm-port-field nm-port-right" data-field="${esc(r.key)}" data-side="right"></span>
     </div>`;
   }).join("");

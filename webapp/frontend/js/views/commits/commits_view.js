@@ -14,6 +14,7 @@ import { contextMenu } from "../../components/context_menu.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { hasFeature } from "../../utils/projects.js";
 import { buildDeepLink } from "../../tab_routes.js";
+import { generateImpactMap } from "../nodemap/impact_map.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -883,6 +884,9 @@ export class CommitsView {
               <button class="code-btn" id="btn-copy-commit-link" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Copy versionless deep link to this commit">
                 🔗 Copy link
               </button>
+              ${hasFeature(this.api?.repo || state.activeRepo(), "nodemap") ? `<button class="code-btn" id="btn-commit-impact-map" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Auto-generate a NodeMap Impact Map for this commit">
+                🕸 Impact Map
+              </button>` : ""}
             </div>
           </div>
         </div>
@@ -1017,6 +1021,36 @@ export class CommitsView {
           p.set("lc", "1");
           if (await copyToClipboard(buildDeepLink(p))) toast.success(`Copied link to commit ${c.commit_hash.slice(0, 12)}`);
           else toast.error("Failed to copy link to clipboard");
+        };
+      }
+
+      const impactMapBtn = detailEl.querySelector("#btn-commit-impact-map");
+      if (impactMapBtn && c.commit_hash) {
+        impactMapBtn.onclick = async () => {
+          impactMapBtn.disabled = true;
+          try {
+            const repo = this.api?.repo || state.repoOf(state.findTab(this.tabId)) || state.activeRepo();
+            const mapCanvas = await generateImpactMap({
+              api: this.api || api,
+              version: this.currentVersion || state.activeVersion(),
+              repo,
+              commitHash: c.commit_hash,
+              title: `Commit Impact: ${c.commit_hash.slice(0, 12)}`,
+            });
+            state.openTab({
+              type: "nodemap",
+              title: `Impact: ${c.commit_hash.slice(0, 8)}`,
+              repo,
+              version: this.currentVersion || state.activeVersion(),
+              initialCanvas: mapCanvas,
+              forceNew: true,
+            });
+            toast.success(`Generated Impact Map (${mapCanvas.nodes.length} nodes)`);
+          } catch (err) {
+            toast.error(`Impact Map failed: ${err.message}`);
+          } finally {
+            impactMapBtn.disabled = false;
+          }
         };
       }
 

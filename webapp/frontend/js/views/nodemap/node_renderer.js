@@ -5,7 +5,7 @@
  * (`content-visibility: hidden` off-screen and low-detail mode below 25% zoom), and visibility
  * layer filtering.
  */
-import { NODE_BADGES, accentVar, bgVar, contentBox, displayTitle, isLayerVisible, paintOrder } from "./canvas_model.js";
+import { NODE_BADGES, accentVar, bgVar, contentBox, displayTitle, formatLockBadge, isLayerVisible, paintOrder } from "./canvas_model.js";
 import { esc } from "./struct_view.js";
 import { isNodeInViewport, lodTierForViewport } from "./virtual_source.js";
 
@@ -103,6 +103,7 @@ export class NodeRenderer {
         <span class="nm-head-meta"></span>
         <span class="nm-head-tools"></span>
       </div>
+      <div class="nm-node-locks" hidden></div>
       <div class="nm-node-body"></div>
       ${node.type === "group" ? "" : SIDE_PORTS.map((s) => `<span class="nm-port nm-port-side nm-port-${s}" data-side="${s}" title="Drag to connect"></span>`).join("")}
       ${HANDLES.map((h) => `<span class="nm-rz nm-rz-${h}" data-rz="${h}"></span>`).join("")}`;
@@ -139,6 +140,18 @@ export class NodeRenderer {
     if (toolsEl && toolsEl.dataset.html !== tools) {
       toolsEl.innerHTML = tools;
       toolsEl.dataset.html = tools;
+    }
+    const locksEl = el.querySelector(".nm-node-locks");
+    if (locksEl) {
+      const locks = Array.isArray(node.locks) ? node.locks : [];
+      const lockHtml = locks.map((l) =>
+        `<span class="nm-lock-badge nm-lock-${esc(l.kind)}" title="${esc(l.note || `${l.kind}${l.lockName ? `: ${l.lockName}` : ""}`)}">${esc(formatLockBadge(l))}</span>`
+      ).join("");
+      if (locksEl.dataset.html !== lockHtml) {
+        locksEl.innerHTML = lockHtml;
+        locksEl.dataset.html = lockHtml;
+      }
+      locksEl.hidden = locks.length === 0;
     }
     const key = contentKey(node, this.hooks.bodyKey ? this.hooks.bodyKey(node) : "");
     if (this.keys.get(node.id) !== key) {

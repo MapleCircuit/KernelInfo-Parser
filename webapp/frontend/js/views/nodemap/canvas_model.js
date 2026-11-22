@@ -36,6 +36,7 @@ export const DOC_MODES = ["auto", "rst", "kernel-doc"];
 export const HISTORY_MODES = ["symbol", "blame"];
 export const ALIGN_MODES = ["left", "center", "right", "top", "middle", "bottom"];
 export const STRUCT_STYLES = ["list", "table", "layout"];
+export const LOCK_KINDS = ["spinlock", "mutex", "rwsem", "rcu", "atomic", "seqlock", "lock-order"];
 /** Node types whose content can be measured and scaled (`autoFit`); groups and live tab iframes cannot. */
 export const AUTOFIT_TYPES = [
   "struct", "symbol", "note", "source", "man", "diff", "mail", "kconfig", "maintainer",
@@ -198,6 +199,32 @@ const trueMap = (m) => {
   for (const [k, v] of Object.entries(boolMap(m))) if (v) out[k] = true;
   return out;
 };
+const normalizeFieldLocks = (m) => {
+  const out = {};
+  if (!isObj(m)) return out;
+  for (const [k, v] of Object.entries(m).slice(0, 512)) {
+    if (!k || k.length > 256) continue;
+    if (typeof v === "string" && LOCK_KINDS.includes(v)) {
+      out[k] = { kind: v, lockName: "" };
+    } else if (isObj(v) && LOCK_KINDS.includes(v.kind)) {
+      out[k] = { kind: v.kind, lockName: str(v.lockName, "", 128).trim() };
+    }
+  }
+  return out;
+};
+const normalizeNodeLocks = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const x of raw.slice(0, 32)) {
+    if (!isObj(x) || !LOCK_KINDS.includes(x.kind)) continue;
+    out.push({
+      kind: x.kind,
+      lockName: str(x.lockName, "", 128).trim(),
+      note: str(x.note, "", 256).trim(),
+    });
+  }
+  return out;
+};
 
 /** Type-specific payload, normalized. */
 export function normalizeData(type, raw, depth = 0) {
@@ -220,6 +247,7 @@ export function normalizeData(type, raw, depth = 0) {
         collapsedGuards: boolMap(d.collapsedGuards),
         // Members, aggregates (with their subtree) and #if blocks hidden in Edit Mode
         hiddenItems: trueMap(d.hiddenItems),
+        fieldLocks: normalizeFieldLocks(d.fieldLocks),
         disableKconfigEngine: Boolean(d.disableKconfigEngine),
       };
     case "symbol":
@@ -412,6 +440,7 @@ export function normalizeNode(raw, depth = 0) {
     layerId: typeof raw.layerId === "string" && ID_RE.test(raw.layerId) ? raw.layerId : "",
     version: str(raw.version, "", 256),
     repo: str(raw.repo, "", 128),
+    locks: normalizeNodeLocks(raw.locks),
     data,
     autoFit,
     baseW: autoFit ? baseW : w,
@@ -467,6 +496,7 @@ export function normalizeEdge(raw, nodeIds = null) {
     color: normalizeColor(raw.color),
     waypoints: normalizeWaypoints(raw.waypoints),
     layerId: typeof raw.layerId === "string" && ID_RE.test(raw.layerId) ? raw.layerId : "",
+    lockKind: pick(raw.lockKind, ["", ...LOCK_KINDS], ""),
     callSite: normalizeCallSite(raw.callSite),
   };
 }
@@ -483,7 +513,63 @@ export function applyEdgePreset(edge, presetId) {
   edge.arrow = p.arrow;
   edge.style = p.style;
   edge.color = p.color;
+  if (presetId === "locks" && !edge.lockKind) edge.lockKind = "rcu";
   return true;
+}
+
+// ------------------------------------------------------------------ locking & concurrency annotations
+
+/** Set or clear a locking annotation (`{ kind, lockName }`) on a struct field key. */
+export function setFieldLock(structData, fieldKey, lock) {
+  if (!structData || !fieldKey) return null;
+  if (!isObj(structData.fieldLocks)) structData.fieldLocks = {};
+  if (!lock || !LOCK_KINDS.includes(lock.kind)) {
+    delete structData.fieldLocks[fieldKey];
+    return null;
+  }
+  const next = { kind: lock.kind, lockName: str(lock.lockName, "", 128).trim() };
+  structData.fieldLocks[fieldKey] = next;
+  return next;
+}
+
+/** Append a locking annotation (`{ kind, lockName, note }`) to `node.locks`. */
+export function addNodeLock(node, lock = {}) {
+  if (!node) return null;
+  if (!Array.isArray(node.locks)) node.locks = [];
+  if (node.locks.length >= 32) return null;
+  const entry = {
+    kind: pick(lock.kind, LOCK_KINDS, "spinlock"),
+    lockName: str(lock.lockName, "", 128).trim(),
+    note: str(lock.note, "", 256).trim(),
+  };
+  node.locks.push(entry);
+  return entry;
+}
+
+/** Update an entry in `node.locks` by index. */
+export function updateNodeLock(node, idx, patch = {}) {
+  if (!node || !Array.isArray(node.locks) || idx < 0 || idx >= node.locks.length) return null;
+  const cur = node.locks[idx];
+  const next = {
+    kind: patch.kind !== undefined ? pick(patch.kind, LOCK_KINDS, cur.kind) : cur.kind,
+    lockName: patch.lockName !== undefined ? str(patch.lockName, "", 128).trim() : cur.lockName,
+    note: patch.note !== undefined ? str(patch.note, "", 256).trim() : cur.note,
+  };
+  node.locks[idx] = next;
+  return next;
+}
+
+/** Remove a locking annotation from `node.locks` by index. */
+export function removeNodeLock(node, idx) {
+  if (!node || !Array.isArray(node.locks) || idx < 0 || idx >= node.locks.length) return false;
+  node.locks.splice(idx, 1);
+  return true;
+}
+
+/** Format a lock annotation as a compact badge label. */
+export function formatLockBadge(lock) {
+  if (!lock || !lock.kind) return "";
+  return lock.lockName ? `🔒 ${lock.kind}: ${lock.lockName}` : `🔒 ${lock.kind}`;
 }
 
 // ------------------------------------------------------------------ visibility layers
@@ -775,7 +861,9 @@ export function loadCanvas(storage, key) {
 /** Persist a canvas; false when the storage refused it (quota, privacy mode). */
 export function saveCanvas(storage, key, canvas) {
   try {
-    storage.setItem(key, JSON.stringify(serializeCanvas(canvas)));
+    const payload = serializeCanvas(canvas);
+    payload.updated_at = Number(canvas?.updated_at) || Date.now();
+    storage.setItem(key, JSON.stringify(payload));
     return true;
   } catch {
     return false;

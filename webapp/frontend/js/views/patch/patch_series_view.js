@@ -11,7 +11,9 @@ import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
+import { hasFeature } from "../../utils/projects.js";
 import { runCheckpatch } from "../../components/checkpatch_panel.js";
+import { generateImpactMap } from "../nodemap/impact_map.js";
 import { addPatch, assignFile, draftProblems, emptyDraft, movePatch, parseAddresses, removeEdit, removePatch, seriesPayload, updatePatch } from "./series_model.js";
 
 const IDENTITY_KEY = "kernel_ide_patch_identity";
@@ -75,6 +77,7 @@ export class PatchSeriesView {
       <div class="pseries-head">
         <h2>Patch series</h2>
         <span class="kconfig-muted">base <code>${escapeHtml(d.base || state.currentVersion)}</code> · ${files.length} file${files.length === 1 ? "" : "s"} · ${d.series.length} patch${d.series.length === 1 ? "" : "es"}</span>
+        ${hasFeature(state.activeRepo(), "nodemap") ? `<button class="code-btn" type="button" data-act="impact-map" ${files.length ? "" : "disabled"} title="Auto-generate a NodeMap Impact Map for these staged changes">🕸 Build Impact Map</button>` : ""}
         <button class="code-btn" type="button" data-act="clear" ${files.length ? "" : "disabled"} title="Drop every staged file and patch">Discard draft</button>
       </div>
       ${files.length ? "" : `<div class="pseries-empty">No staged files. In a code tab, use <strong>✎ Create patch</strong> and <strong>Add to series</strong> for each file to change.</div>`}
@@ -181,8 +184,39 @@ export class PatchSeriesView {
       if (ok) this.save(null);
     } else if (btn.dataset.act === "suggest") {
       await this.suggestRecipients(btn);
+    } else if (btn.dataset.act === "impact-map") {
+      await this.buildImpactMap(btn);
     } else if (btn.dataset.act === "generate") {
       await this.generate(btn);
+    }
+  }
+
+  /** Build a layered Patch Impact Map in a new NodeMap tab for this draft's staged files. */
+  async buildImpactMap(btn) {
+    const d = this.draft;
+    const files = Object.keys(d.edits || {}).map((path) => ({ path }));
+    if (!files.length) return;
+    btn.disabled = true;
+    try {
+      const baseApi = this.api || api;
+      const version = d.base || state.currentVersion;
+      const repo = baseApi.repo || state.activeRepo();
+      const client = typeof baseApi.forRepo === "function" && repo ? baseApi.forRepo(repo) : baseApi;
+      const title = d.cover?.subject || d.series?.[0]?.subject || "Patch Series Impact Map";
+      const mapCanvas = await generateImpactMap({ api: client, version, repo, title, files });
+      state.openTab({
+        type: "nodemap",
+        title: `Impact: ${title.slice(0, 28)}`,
+        repo,
+        version,
+        initialCanvas: mapCanvas,
+        forceNew: true,
+      });
+      toast.success(`Generated Impact Map (${mapCanvas.nodes.length} nodes)`);
+    } catch (err) {
+      toast.error(`Could not build Impact Map: ${err.message}`);
+    } finally {
+      btn.disabled = false;
     }
   }
 

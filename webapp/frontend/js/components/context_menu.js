@@ -23,6 +23,7 @@ import { hasFeature } from "../utils/projects.js";
 import { canBeVersionlessTab, isAlwaysVersionlessTab } from "../tab_routes.js";
 import { urlSync } from "../url_sync.js";
 import { diffSpec, historySpec, nodeSpecsForTab, sendToNodemap, sourceSpec, tokenSpec } from "../views/nodemap/nodemap_bridge.js";
+import { generateImpactMap } from "../views/nodemap/impact_map.js";
 
 class ContextMenu {
   constructor() {
@@ -1081,6 +1082,34 @@ class ContextMenu {
           icon: "🕸",
           onClick: () => sendToNodemap(diffSpec({ commitHash: full, version: v, repo: state.activeRepo() }), { version: v }),
         },
+        ...(hasFeature(state.activeRepo(), "nodemap") ? [{
+          label: "Generate Commit Impact Map",
+          icon: "🗺",
+          onClick: async () => {
+            try {
+              const repo = state.activeRepo();
+              const client = typeof api.forRepo === "function" && repo ? api.forRepo(repo) : api;
+              const mapCanvas = await generateImpactMap({
+                api: client,
+                version: v,
+                repo,
+                commitHash: full,
+                title: `Commit Impact: ${full.slice(0, 12)}`,
+              });
+              state.openTab({
+                type: "nodemap",
+                title: `Impact: ${full.slice(0, 8)}`,
+                repo,
+                version: v,
+                initialCanvas: mapCanvas,
+                forceNew: true,
+              });
+              toast.success(`Generated Impact Map (${mapCanvas.nodes.length} nodes)`);
+            } catch (err) {
+              toast.error(`Impact Map failed: ${err.message}`);
+            }
+          },
+        }] : []),
         {
           // Only the header selection moves: no tab changes revision until Apply / New Tab (§5.13)
           label: isWorkCommit ? "Already the Work Commit" : "Set as Work Commit",
@@ -1217,6 +1246,9 @@ class ContextMenu {
       items.push({ label: "Rename…", icon: "✎", onClick: () => controller.beginTitleEdit(node.id) });
       const followType = node.type === "struct" && fieldKey ? controller.followableTypeFor?.(node.id, fieldKey) : null;
       if (followType) items.push({ label: `Follow Type (${followType})`, icon: "↣", onClick: () => controller.followStructType(node.id, fieldKey) });
+      if (fieldKey && node.type === "struct" && controller.canvas?.settings?.editMode) {
+        items.push({ label: "Set Field Lock Annotation…", icon: "🔒", onClick: () => controller.promptFieldLock?.(node, fieldKey) });
+      }
       if (fieldKey) items.push({ label: "Attach Node to This Member…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id, fieldKey) });
       else if (node.type !== "group" && node.type !== "note") items.push({ label: "Attach Connected Node…", icon: "🔗", onClick: () => controller.promptAttachNode(node.id) });
       if (node.type === "symbol") items.push({ label: d.expanded ? "Collapse Members" : "Expand Members", icon: d.expanded ? "🔼" : "🔽", onClick: () => controller.toggleExpandNode(node.id) });
@@ -1278,6 +1310,8 @@ class ContextMenu {
       this.renderMenu(x, y, { header: { title: "Connection", sub: "NodeMap" }, items });
     } else if (isCanvas) {
       items.push({ label: "Add Node…", icon: "➕", onClick: () => controller.showAddMenu(x, y) });
+      items.push({ label: "Build Patch / Commit Impact Map…", icon: "🗺", onClick: () => controller.openImpactMapDialog?.() });
+      items.push({ label: "Canvas Library & Templates…", icon: "📚", onClick: () => controller.openLibraryDialog?.("library") });
       if (at) items.push({ label: "Add Note Here", icon: "📝", onClick: () => controller.addNoteAt(Math.round(at.x), Math.round(at.y)) });
       items.push({ label: "Add Group", icon: "▭", onClick: () => controller.addGroup() });
       items.push({ label: "Paste Nodes", icon: "📋", shortcut: "Ctrl+V", disabled: !controller.readClipboard?.(), onClick: () => controller.pasteClipboard() });
