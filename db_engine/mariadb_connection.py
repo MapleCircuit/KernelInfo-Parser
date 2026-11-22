@@ -32,17 +32,35 @@ from db_engine.errors import (
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
-from db_engine.mariadb_support import _TUNING_FIRST, _TUNING_GROW_ONLY, logger, parse_server_setting
+from db_engine.mariadb_support import _DRIVER_TIMEOUT_ERRORS, _TUNING_FIRST, _TUNING_GROW_ONLY, logger, parse_server_setting
 
 # A connection used within this many seconds is trusted without a COM_PING round trip
 IDLE_PING_S = 30.0
 # Client errors meaning the connection itself is gone (server gone away, lost during query, lost connection)
 _LOST_ERRNOS = frozenset({2006, 2013, 2055})
+# Client socket timeouts (seconds) used when DB_CONNECT_TIMEOUT / DB_READ_TIMEOUT / DB_WRITE_TIMEOUT are unset
+# (`database.connect_timeout` / `read_timeout` / `write_timeout`); 0 disables one
+DEFAULT_CONNECT_TIMEOUT_S = 20
+DEFAULT_READ_TIMEOUT_S = 600
+DEFAULT_WRITE_TIMEOUT_S = 300
+# Read timeout (seconds) of long server-side statements (`_long_statement()`: DDL, `_raw_execute` set-based DML);
+# DB_LONG_READ_TIMEOUT / `database.long_read_timeout`, 0 waits without bound
+DEFAULT_LONG_READ_TIMEOUT_S = 7200
+
+
+def _env_timeout(name: str, default: int) -> int | None:
+    """Socket timeout in whole seconds from env `name` (`default` when unset or invalid, None when <= 0)."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(float(raw)) if raw else default
+    except ValueError:
+        value = default
+    return value if value > 0 else None
 
 
 def _is_connection_lost(exc: BaseException) -> bool:
     """True when `exc` means the connection is gone (a read may then reconnect and run again)."""
-    if isinstance(exc, (mysql.connector.InterfaceError, ConnectionError)):
+    if isinstance(exc, (mysql.connector.InterfaceError, ConnectionError, *_DRIVER_TIMEOUT_ERRORS)):
         return True
     if getattr(exc, "errno", None) in _LOST_ERRNOS:
         return True
@@ -133,6 +151,11 @@ class MariaDBConnection:
         self.host = os.getenv("DB_HOST")
         self.port = int(os.getenv("DB_PORT", "3306"))
         self.ssl_disabled = os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes")
+        # Client socket timeouts: a half-open socket (dead SSH tunnel, vanished server) fails instead of hanging
+        self.connect_timeout = _env_timeout("DB_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT_S)
+        self.read_timeout = _env_timeout("DB_READ_TIMEOUT", DEFAULT_READ_TIMEOUT_S)
+        self.write_timeout = _env_timeout("DB_WRITE_TIMEOUT", DEFAULT_WRITE_TIMEOUT_S)
+        self.long_read_timeout = _env_timeout("DB_LONG_READ_TIMEOUT", DEFAULT_LONG_READ_TIMEOUT_S)
         ssh_tunnel_active = os.getenv("SSH_TUNNEL_ENABLED", "").lower() in ("true", "1", "yes")
         env_socket = os.getenv("DB_SOCKET") or os.getenv("MYSQL_UNIX_PORT") or os.getenv("MYSQL_SOCKET")
         if not ssh_tunnel_active and env_socket not in ("off", "disabled", "none", "false"):
@@ -411,6 +434,7 @@ class MariaDBConnection:
             }
             if self.ssl_disabled:
                 conn_kwargs["ssl_disabled"] = True
+            conn_kwargs.update(self._timeout_kwargs())
             try:
                 return mysql.connector.connect(**conn_kwargs)
             except mysql.connector.Error as e:
@@ -447,8 +471,74 @@ class MariaDBConnection:
         }
         if self.ssl_disabled:
             conn_kwargs["ssl_disabled"] = True
+        conn_kwargs.update(self._timeout_kwargs())
 
         return mysql.connector.connect(**conn_kwargs)
+
+    def _timeout_kwargs(self) -> dict[str, int]:
+        """`mysql.connector.connect()` client socket timeouts of this instance (disabled ones left out)."""
+        timeouts = {
+            "connection_timeout": getattr(self, "connect_timeout", DEFAULT_CONNECT_TIMEOUT_S),
+            "read_timeout": getattr(self, "read_timeout", DEFAULT_READ_TIMEOUT_S),
+            "write_timeout": getattr(self, "write_timeout", DEFAULT_WRITE_TIMEOUT_S),
+        }
+        return {key: int(value) for key, value in timeouts.items() if value}
+
+    # The driver refused to change a connection's read timeout (C extension); warned about once per process
+    _long_statement_warned = False
+
+    @contextlib.contextmanager
+    def _long_statement(self) -> Iterator[None]:
+        """Raise the client read timeout to `long_read_timeout` for one long server-side statement.
+
+        `read_timeout` bounds each wait for a reply packet, so a statement that works for many minutes before its
+        first reply (CREATE INDEX, INSERT ... SELECT or DELETE ... JOIN over a large table) gets the long bound
+        (default `DEFAULT_LONG_READ_TIMEOUT_S`; None when DB_LONG_READ_TIMEOUT is 0); the write timeout stays.
+        """
+        cnx = getattr(self, "cnx", None)
+        previous = getattr(cnx, "read_timeout", None) if cnx is not None else None
+        long_timeout = getattr(self, "long_read_timeout", DEFAULT_LONG_READ_TIMEOUT_S)
+        # Only a connection with a finite (int) read timeout below the long bound is changed
+        if cnx is not None and isinstance(previous, int) and (long_timeout is None or long_timeout > previous):
+            try:
+                cnx.read_timeout = long_timeout
+            except Exception as exc:
+                cnx = None
+                if not MariaDBConnection._long_statement_warned:
+                    MariaDBConnection._long_statement_warned = True
+                    logger.warning(
+                        "[DB] The MariaDB driver cannot raise the read timeout of an open connection (%s); long "
+                        "statements keep the %ss read timeout (raise DB_READ_TIMEOUT if they time out)", exc, previous,
+                    )
+        else:
+            cnx = None
+        try:
+            yield
+        finally:
+            if cnx is not None and previous is not None and getattr(self, "cnx", None) is cnx:
+                try:
+                    cnx.read_timeout = previous
+                except Exception:
+                    pass
+
+    def _refresh_tunnel_route(self) -> None:
+        """Before a reconnect: restart a dead database SSH tunnel (owner process only) and follow its port.
+
+        `core.ssh_tunnel.ensure_ssh_tunnel()` keeps the forward's local port when it restarts the tunnel; when it
+        had to move to another port, this instance follows it. Without a tunnel nothing happens.
+        """
+        if os.getenv("SSH_TUNNEL_ENABLED", "").lower() not in ("true", "1", "yes"):
+            return
+        try:
+            from core.ssh_tunnel import ensure_ssh_tunnel
+
+            port = ensure_ssh_tunnel("database")
+        except Exception as exc:
+            logger.warning("[DB] SSH tunnel liveness check failed: %s", exc)
+            return
+        if port:
+            self.host = "127.0.0.1"
+            self.port = int(port)
 
     def ping(self) -> bool:
         """Run a lightweight COM_PING liveness check on the underlying connection (True when live)."""
@@ -502,10 +592,15 @@ class MariaDBConnection:
         self._reconnect()
 
     def _reconnect(self) -> None:
-        """Replace the connection with a new one (new cursor, `_init_session()`), up to 3 attempts."""
+        """Replace the connection with a new one (new cursor, `_init_session()`), up to 3 attempts.
+
+        Each attempt first runs `_refresh_tunnel_route()`, so a dead database SSH tunnel is restarted (in the
+        process that owns it) instead of every attempt failing with `Connection refused`.
+        """
         self._drop_connection()
         for attempt in range(3):
             logger.warning("No SQL connection. Reconnection attempt %d/3...", attempt + 1)
+            self._refresh_tunnel_route()
             try:
                 self.cnx = self.connect_sql()
                 self._cur = self.cnx.cursor()
@@ -691,10 +786,14 @@ class MariaDBConnection:
                 chunk = cursor.fetchmany(chunk_size)
 
     def _raw_execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
-        """Execute a DML or DDL SQL statement (committed by autocommit outside `transaction()`)."""
+        """Execute a DML or DDL SQL statement (committed by autocommit outside `transaction()`).
+
+        Runs under `_long_statement()`: set-based DML (copy, join deletes, include references) and DDL may work
+        server-side long before their reply.
+        """
         self._require_writable()
         self.check_if_connected()
-        with contextlib.closing(self.cnx.cursor()) as cursor:
+        with contextlib.closing(self.cnx.cursor()) as cursor, self._long_statement():
             cursor.execute(sql, tuple(params or ()))
             if getattr(cursor, "with_rows", False):
                 try:

@@ -85,6 +85,19 @@ from db_engine.spec import (
 if TYPE_CHECKING:
     pass
 
+# Client-side socket timeout errors of mysql-connector (`read_timeout` / `write_timeout` / `connection_timeout`):
+# the driver gave up on the socket, so the connection is unusable and is replaced like a lost one
+_DRIVER_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls for cls in (
+        getattr(mysql.connector.errors, name, None)
+        for name in ("ReadTimeoutError", "WriteTimeoutError", "ConnectionTimeoutError")
+    ) if isinstance(cls, type)
+)
+# Driver errors after which a statement outside a transaction drops the connection and runs again
+_DRIVER_CONN_ERRORS: tuple[type[BaseException], ...] = (
+    mysql.connector.OperationalError, mysql.connector.InterfaceError, *_DRIVER_TIMEOUT_ERRORS,
+)
+
 MAX_ALLOWED_PACKET = 1073741824
 MAX_JOIN_TABLES = 50
 CHUNK_JOIN_SIZE = 30

@@ -95,6 +95,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # SQLite engine only: database file (":memory:" for a private in-memory database); required for a file database (a bare "database" name is not a path)
         "path": "",
         "timeout": 10,
+        # MariaDB client socket timeouts (seconds; 0 disables one): opening a connection, waiting for any reply
+        # packet, sending one. Finite values make a half-open TCP / SSH-tunnel socket fail instead of blocking forever
+        "connect_timeout": 20,
+        "read_timeout": 600,
+        "write_timeout": 300,
+        # Read timeout of long statements (DDL, set-based INSERT ... SELECT / DELETE ... JOIN); 0 waits without bound
+        "long_read_timeout": 7200,
         "engine": "mariadb",
         "unix_socket": "auto",
         "ssl_disabled": False,
@@ -173,6 +180,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "checkpoint_delta_ratio": 0.3,
         # Processes extracting the functions/calls/ops tables of new C blobs (Step 6.9, m_blob_facts)
         "facts_workers": 4,
+        # Seconds a parsing worker may hold one batch without returning it before it is stack-dumped, killed and
+        # its batch re-parsed one file per batch (pipeline/worker_stage.py); 0 disables the watchdog
+        "worker_batch_timeout_s": 300,
         "single_version": False,
         "include_pre_releases": True,
     },
@@ -335,6 +345,10 @@ def _deep_merge(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any
     return target
 
 
+# `database` keys of the MariaDB client socket timeouts and their defaults (seconds), exported as DB_<KEY>
+DB_SOCKET_TIMEOUT_DEFAULTS = {"connect_timeout": 20, "read_timeout": 600, "write_timeout": 300, "long_read_timeout": 7200}
+
+
 def _coerce_int(val: Any, default: int) -> int:
     """Safely coerce value to integer."""
     if val is None:
@@ -389,6 +403,10 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
     password = str(db_cfg.get("password") or "")
     database = str(db_cfg.get("database") or "test")
     timeout = str(db_cfg.get("timeout") or 10)
+    socket_timeouts = {
+        f"DB_{key.upper()}": str(_coerce_int(db_cfg.get(key), default))
+        for key, default in DB_SOCKET_TIMEOUT_DEFAULTS.items()
+    }
 
     # Resolve Unix domain socket for local connections when SSH tunnel is disabled
     ssh_tunnel_active = (db_cfg.get("ssh_tunnel") or cfg.get("ssh_tunnel", {})).get("enabled", False)
@@ -421,6 +439,7 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
         "MYSQL_SSL_DISABLED": "true" if db_cfg.get("ssl_disabled") else "false",
         "TE_HUGEPAGES": str(cfg.get("parser", {}).get("hugepages", "auto")),
         "SSH_TUNNEL_ENABLED": "true" if ssh_tunnel_active else "false",
+        **socket_timeouts,
     }
     for k, v in vars_to_sync.items():
         os.environ[k] = v
@@ -509,6 +528,9 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         db_sec["timeout"] = _coerce_int(env_db_timeout, db_sec["timeout"])
     else:
         db_sec["timeout"] = _coerce_int(db_sec.get("timeout"), 10)
+    for key, default in DB_SOCKET_TIMEOUT_DEFAULTS.items():
+        env_val = _get_user_env(f"DB_{key.upper()}")
+        db_sec[key] = max(0, _coerce_int(env_val if env_val else db_sec.get(key), default))
 
     if env_db_engine := _get_user_env("DB_ENGINE"):
         db_sec["engine"] = env_db_engine
@@ -549,6 +571,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         parser_sec["preload_flush_mb"] = _coerce_int(env_p_flush, 512)
     else:
         parser_sec["preload_flush_mb"] = _coerce_int(parser_sec.get("preload_flush_mb"), 512)
+
+    env_batch_timeout = _get_user_env("WORKER_BATCH_TIMEOUT_S")
+    parser_sec["worker_batch_timeout_s"] = max(0, _coerce_int(
+        env_batch_timeout if env_batch_timeout else parser_sec.get("worker_batch_timeout_s"), 300
+    ))
 
     if env_p_cache_max := _get_user_env("CACHE_MAX_TABLE_MB"):
         parser_sec["cache_max_table_mb"] = _coerce_int(env_p_cache_max, 0)

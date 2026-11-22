@@ -36,7 +36,7 @@ from db_engine.sql_render import (
 if TYPE_CHECKING:
     from db_engine.DBHandling import MariaDB
     from core.TableHandling import Table
-from db_engine.mariadb_support import _binary_names_of, _normalize_row, _sort_rows, logger
+from db_engine.mariadb_support import _DRIVER_CONN_ERRORS, _binary_names_of, _normalize_row, _sort_rows, logger
 
 
 
@@ -256,7 +256,7 @@ class MariaDBSpec:
                             f"Bisecting into {mid} and {len(batch) - mid} rows..."
                         )
                         return _exec_batch(batch[:mid]) + _exec_batch(batch[mid:])
-                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                    if isinstance(err, _DRIVER_CONN_ERRORS):
                         if self._in_txn:
                             raise
                         self._drop_connection()

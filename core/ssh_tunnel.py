@@ -10,10 +10,15 @@ the manager object and can use the forward (it is a plain TCP listener on 127.0.
 but must neither probe nor signal the `ssh` process, which is not their child: see
 `SSHTunnelManager.is_active()` and `.stop()`. This keeps one tunnel alive for a whole
 multi-version parse instead of one per forked per-version worker.
+
+The owner keeps the tunnel alive with `SSHTunnelManager.ensure_active()` (module helper
+`ensure_ssh_tunnel()`): an `ssh` child that exited is restarted on the same local port, so
+every process and config entry pointing at `127.0.0.1:<local_port>` reconnects unchanged.
 """
 from __future__ import annotations
 
 import atexit
+from collections import deque
 import logging
 import os
 from pathlib import Path
@@ -23,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -101,6 +107,18 @@ class SSHTunnelManager:
         self._is_active = False
         # PID of the process that owns (spawned) the ssh child; set again in start().
         self._owner_pid = os.getpid()
+        # Set by start(), cleared by stop(): ensure_active() only restarts a tunnel that is meant to run
+        self._wanted = False
+        # Serializes ensure_active() restarts between the owner's threads (never taken in a forked worker)
+        self._restart_lock = threading.Lock()
+        # time.monotonic() before which ensure_active() does not retry after a failed restart
+        self._restart_blocked_until = 0.0
+        self.restarts = 0
+        # Bumped by every owner stop(): a restart that raced a stop() releases the tunnel it just started
+        self._stop_count = 0
+        # Last stderr lines of the ssh child, drained by a thread so a full pipe never blocks (freezes) ssh
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._stderr_thread: threading.Thread | None = None
 
     def is_owner(self) -> bool:
         """Return True if this process spawned the ssh child (False in a forked worker)."""
@@ -259,6 +277,7 @@ class SSHTunnelManager:
         except Exception as exc:
             self._cleanup_askpass()
             raise RuntimeError(f"Failed to spawn SSH process: {exc}") from exc
+        self._start_stderr_drain()
 
         # Wait for tunnel readiness: probe local port until listening or process dies
         start_time = time.time()
@@ -266,7 +285,7 @@ class SSHTunnelManager:
         while time.time() - start_time < self.connect_timeout:
             # Check if process died early
             if self.proc.poll() is not None:
-                stderr = self.proc.stderr.read() if self.proc.stderr else ""
+                stderr = self._stderr_text()
                 self._cleanup_askpass()
                 raise RuntimeError(
                     f"SSH tunnel process exited prematurely with code {self.proc.returncode}: {stderr.strip()}"
@@ -280,13 +299,14 @@ class SSHTunnelManager:
             time.sleep(0.1)
 
         if not ready:
-            self.stop()
+            self._release_process()
             raise RuntimeError(
                 f"SSH tunnel failed to establish forward on 127.0.0.1:{self.local_port} "
                 f"within {self.connect_timeout}s timeout."
             )
 
         self._is_active = True
+        self._wanted = True
 
         # Clean up temporary askpass script now that auth is complete
         self._cleanup_askpass()
@@ -314,6 +334,45 @@ class SSHTunnelManager:
             )
         return self.local_port
 
+    def _start_stderr_drain(self) -> None:
+        """Read the ssh child's stderr on a daemon thread, keeping its last lines in `_stderr_tail`.
+
+        Never reading the pipe lets it fill during a long run (warnings, failed channel opens), which blocks
+        ssh on its next write and freezes every forwarded connection.
+        """
+        proc = self.proc
+        stream = getattr(proc, "stderr", None) if proc is not None else None
+        tail: deque[str] = deque(maxlen=40)
+        self._stderr_tail = tail
+        self._stderr_thread = None
+        if stream is None:
+            return
+
+        def _drain() -> None:
+            try:
+                for line in stream:
+                    tail.append(str(line).rstrip())
+            except (OSError, ValueError, TypeError):
+                pass
+
+        thread = threading.Thread(target=_drain, name=f"ssh-tunnel-{self.feature}-stderr", daemon=True)
+        thread.start()
+        self._stderr_thread = thread
+
+    def _stderr_text(self, wait_s: float = 1.0) -> str:
+        """The ssh child's drained stderr (waiting up to `wait_s` for the drain to reach EOF after an exit)."""
+        thread = self._stderr_thread
+        if thread is not None:
+            thread.join(wait_s)
+        text = "\n".join(self._stderr_tail).strip()
+        # A drain still blocked on the pipe (a grandchild keeps it open) holds its lock: never read concurrently
+        if text or self.proc is None or self.proc.stderr is None or (thread is not None and thread.is_alive()):
+            return text
+        try:
+            return str(self.proc.stderr.read() or "").strip()
+        except (OSError, ValueError):
+            return ""
+
     def stop(self) -> None:
         """Safely terminate the SSH tunnel process and clean up resources.
 
@@ -327,6 +386,18 @@ class SSHTunnelManager:
             self._is_active = False
             return
 
+        self._wanted = False
+        self._stop_count += 1
+        # Wait for a restart in progress (bounded), so it cannot leave an ssh child running after this stop
+        locked = self._restart_lock.acquire(timeout=float(self.connect_timeout) * 3 + 10.0)
+        try:
+            self._release_process()
+        finally:
+            if locked:
+                self._restart_lock.release()
+
+    def _release_process(self) -> None:
+        """Owner only: end the ssh child (if still running) and drop it, keeping `_wanted` as is."""
         self._cleanup_askpass()
         if self.proc is not None:
             if self.proc.poll() is None:
@@ -341,6 +412,64 @@ class SSHTunnelManager:
                         pass
             self.proc = None
         self._is_active = False
+
+    def ensure_active(self, attempts: int = 3, backoff_s: float = 1.0, cooldown_s: float = 30.0) -> bool:
+        """Return True when the tunnel is usable, restarting a dead `ssh` child in the owner process.
+
+        In a forked worker (`is_owner()` False) nothing is restarted or signalled: the result is `is_active()`.
+        In the owner, a tunnel that was started and not stopped but whose `ssh` exited is started again on the
+        same local port (pinned as `configured_local_port`), up to `attempts` times with exponential backoff
+        from `backoff_s`. After all attempts fail, calls within `cooldown_s` return False without retrying, so a
+        reconnect loop does not stall on an unreachable SSH host. Thread-safe: concurrent callers wait for one
+        restart.
+        """
+        if not self.is_owner():
+            return self.is_active()
+        with self._restart_lock:
+            if self.is_active():
+                return True
+            if not self._wanted:
+                return False
+            if time.monotonic() < self._restart_blocked_until:
+                return False
+            code = self.proc.poll() if self.proc is not None else None
+            stderr = self._stderr_text(0.2)[-500:] if code is not None else ""
+            logger.warning(
+                "SSH tunnel for '%s' on 127.0.0.1:%d is down (ssh exit code %s%s); restarting it on the same port...",
+                self.feature, self.local_port, code, f": {stderr}" if stderr else "",
+            )
+            if self.local_port > 0:
+                self.configured_local_port = self.local_port
+            self._release_process()
+            stops = self._stop_count
+            for attempt in range(max(1, attempts)):
+                if stops != self._stop_count:
+                    return False
+                try:
+                    self.start()
+                except Exception as exc:
+                    logger.warning(
+                        "SSH tunnel restart attempt %d/%d for '%s' failed: %s", attempt + 1, max(1, attempts), self.feature, exc,
+                    )
+                    self._release_process()
+                    if attempt + 1 < max(1, attempts):
+                        time.sleep(backoff_s * (2 ** attempt))
+                    continue
+                if stops != self._stop_count:
+                    # stop() ran while this restart was starting ssh: honour it
+                    self._wanted = False
+                    self._release_process()
+                    return False
+                self.restarts += 1
+                self._restart_blocked_until = 0.0
+                logger.warning("SSH tunnel for '%s' restarted on 127.0.0.1:%d.", self.feature, self.local_port)
+                return True
+            self._restart_blocked_until = time.monotonic() + cooldown_s
+            logger.error(
+                "SSH tunnel for '%s' could not be restarted after %d attempts; retrying in %.0fs at the earliest.",
+                self.feature, max(1, attempts), cooldown_s,
+            )
+            return False
 
 
 _TUNNELS: dict[str, SSHTunnelManager] = {}
@@ -402,6 +531,18 @@ def stop_ssh_tunnel(feature: str | None = None) -> None:
             finally:
                 if feature == "database":
                     _GLOBAL_TUNNEL = None
+
+
+def ensure_ssh_tunnel(feature: str = "database") -> int | None:
+    """Keep the started tunnel of `feature` alive (`SSHTunnelManager.ensure_active()`).
+
+    Returns its local port when it is usable, None when no tunnel was started for `feature` or it is down and
+    could not be restarted (a forked worker never restarts the parent's tunnel).
+    """
+    mgr = _TUNNELS.get(feature)
+    if mgr is None:
+        return None
+    return mgr.local_port if mgr.ensure_active() else None
 
 
 def is_ssh_tunnel_active(feature: str = "database") -> bool:

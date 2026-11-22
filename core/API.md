@@ -12,37 +12,37 @@ agents.
   - 1.3. Global Constants & Enums [L158-L249]
 - 2. Filesystem & Git Subsystem (`core/FileHandler.py`) [L250-L322]
   - 2.1. `MasterFile` (`mf`) [L252-L322]
-- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L524]
-  - 3.1. `GreatProcessor` (`gp`) [L325-L524]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L525-L722]
-  - Relational Table Families (`core/DBLayout.py`) [L537-L606]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L607-L695]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L696-L722]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L723-L918]
-  - 5.1. Data Sanitization Helpers [L725-L731]
-  - 5.2. `Table` Class Interface [L732-L765]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L766-L871]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L872-L894]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L895-L918]
-- 6. End-to-End Inter-Module Execution Lifecycle [L919-L1066]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1067-L1459]
-  - 7.1. Unified Configuration Hierarchy [L1069-L1179]
-  - 7.1.1. Repository Auto-Detection & Selection [L1180-L1245]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1246-L1296]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1297-L1344]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1345-L1459]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1460-L1730]
-  - 8.1. High-Level Architecture [L1462-L1505]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1506-L1531]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1532-L1730]
-- 9. CVE List Ingestion (`parser/cve/`) [L1731-L1787]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1788-L1855]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1856-L1990]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1864-L1895]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1896-L1940]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1941-L1973]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L1974-L1990]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L1991-L2036]
+- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L538]
+  - 3.1. `GreatProcessor` (`gp`) [L325-L538]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L539-L736]
+  - Relational Table Families (`core/DBLayout.py`) [L551-L620]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L621-L709]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L710-L736]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L737-L932]
+  - 5.1. Data Sanitization Helpers [L739-L745]
+  - 5.2. `Table` Class Interface [L746-L779]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L780-L885]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L886-L908]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L909-L932]
+- 6. End-to-End Inter-Module Execution Lifecycle [L933-L1080]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1081-L1497]
+  - 7.1. Unified Configuration Hierarchy [L1083-L1198]
+  - 7.1.1. Repository Auto-Detection & Selection [L1199-L1264]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1265-L1334]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1335-L1382]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1383-L1497]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1498-L1768]
+  - 8.1. High-Level Architecture [L1500-L1543]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1544-L1569]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1570-L1768]
+- 9. CVE List Ingestion (`parser/cve/`) [L1769-L1825]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1826-L1893]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1894-L2028]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1902-L1933]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1934-L1978]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1979-L2011]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2012-L2028]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2029-L2074]
 <!-- toc:end -->
 
 ---
@@ -419,7 +419,21 @@ Central runtime container, schema registry, and worker IPC coordinator.
     parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the
     worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per
     batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they
-    make progress; files that kill a worker again are reported. If no worker can initialize (an init-failure
+    make progress; files that kill a worker again are reported. A **stall watchdog** in the reader thread
+    treats a worker that holds its oldest unreturned batch longer than `batch_timeout_s` (parameter, default
+    `parser.worker_batch_timeout_s` = 300 s, `<= 0` disables it) with no result frame waiting on its pipe as
+    hung. The batch timer restarts when a batch reaches an idle worker and on every result frame. Until its
+    first result frame a worker gets `_WORKER_INIT_GRACE_S` (120 s) more, which covers its start-up. The watchdog
+    logs an `ERROR` naming the worker, its PID, the stall time, the batch id and its files, sends `SIGUSR1`
+    (`file_processing_worker` registers a `faulthandler` dump of every thread's stack to stderr; a
+    `_STALL_DUMP_GRACE_S` (1.5 s) wait lets it finish), terminates and kills the worker and handles it like a
+    crashed one, so its batch is re-parsed one file per batch and a file that hangs again is reported as lost
+    (the error names the stall). A worker that sent its done frame but keeps its pipe open for
+    `_DONE_EXIT_GRACE_S` (60 s) is killed. After `_STALL_HEARTBEAT_S` (60 s) without a returned batch, and every
+    60 s after that, the reader logs a `WARNING` listing each open worker's in-flight batch and how long it has
+    been on it. The parent calls `core.ssh_tunnel.ensure_ssh_tunnel()` before forking and every
+    `_TUNNEL_CHECK_S` (30 s) while it waits for results, so a dead database tunnel is restarted on its port
+    (§7.2). If no worker can initialize (an init-failure
     frame from every worker, e.g. the database is unreachable), the stage raises. Ingest failures are recorded
     per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops
     on time. Stage 1 header batches are bounded by bytes and queued largest-first (`largest_first=True`); Stage 1 and each epoch log
@@ -1085,7 +1099,10 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   for the duration of a block and then restores the previous variables and `_EXPORTED_ENV_VARS`.
 - Sections:
   - `"database"`: database settings: `engine` (`"mariadb"` default, `"sqlite"`, `"mock"`; `db_engine.available_engines()`, CLI `--db`), `path` (SQLite file or `":memory:"`, exported as `DB_PATH`; a bare `database` name is not a file location and raises `ValueError` rather than creating a file in the working directory), and the MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`,
-    `timeout`, `unix_socket`; `user` and `password` default to empty: no account is assumed, and a
+    `timeout`, `unix_socket`, and the client socket timeouts `connect_timeout` / `read_timeout` / `write_timeout`
+    (defaults 20 / 600 / 300 s, env `DB_CONNECT_TIMEOUT` / `DB_READ_TIMEOUT` / `DB_WRITE_TIMEOUT`) and
+    `long_read_timeout` (default 7200 s, env `DB_LONG_READ_TIMEOUT`: the read bound of long DDL / set-based DML).
+    `sync_environ()` exports all four, and 0 disables one (`db_engine/DB_API.md` §2.1); `user` and `password` default to empty: no account is assumed, and a
     missing credential makes the first connection fail with `db_engine.ConfigurationError` naming the keys to set), `server_tuning` (`innodb_buffer_pool_size`, `innodb_log_file_size`,
     `innodb_flush_log_at_trx_commit`, `innodb_io_capacity`), and embedded feature `ssh_tunnel` (`enabled`,
     `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`,
@@ -1108,7 +1125,9 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     §2.18 and §7.1.
   - `"parser"`: TableEngine, memory mode, memory limits, `checkpoint_delta_ratio` (default
     0.3: largest share of a version's files that may differ from its base for its checkpoint to be kept as a
-    delta, §4.2; 0 keeps every checkpoint full), `facts_workers` (default 4: processes of Step 6.9)
+    delta, §4.2; 0 keeps every checkpoint full), `facts_workers` (default 4: processes of Step 6.9),
+    `worker_batch_timeout_s` (default 300, env `WORKER_BATCH_TIMEOUT_S`: seconds a parsing worker may hold one
+    batch before the stall watchdog of `_run_worker_stage` kills it, §3; 0 disables the watchdog)
     (`table_engine`, `memory_mode`, `mem_max`: memory guard ceiling in GB, `--mm` overrides it, 0 disables the guard, `hugepages`, `preload_flush_mb`: MB of preloaded
     rows held on the heap before they are packed into a shared-memory segment, env `PRELOAD_FLUSH_MB`;
     `cache_max_table_mb`: ceiling (MB) on the size of one TE-cached table, a bigger one is read straight from
@@ -1276,6 +1295,25 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     feature's active host and port settings.
   - Individual teardown via `stop_ssh_tunnel(feature)` or comprehensive teardown via `stop_ssh_tunnel()`
     (registered with `atexit` and `G.emergency_shutdown()`).
+  - A daemon thread drains the `ssh` child's stderr into a 40-line tail (`_stderr_tail`), so a pipe nobody
+    reads never fills and blocks `ssh` mid-run. The tail appears in the premature-exit and restart messages.
+- **Liveness & Auto-Restart (`ensure_active()`, `ensure_ssh_tunnel(feature)`)**:
+  - `SSHTunnelManager.ensure_active(attempts=3, backoff_s=1.0, cooldown_s=30.0) -> bool` returns whether
+    the tunnel is usable. In the owner process, a tunnel that was started and not stopped (`_wanted`) but
+    whose `ssh` exited is logged with its exit code and stderr tail. It is then started again on the same
+    local port: the previous `local_port` becomes `configured_local_port`, so an ephemeral port is kept too.
+    Up to `attempts` restarts run, with exponential backoff from `backoff_s`. After they all fail,
+    calls within `cooldown_s` return `False` at once. A `threading.Lock` serializes restarts between the
+    owner's threads. An owner `stop()` clears `_wanted` and counts itself in `_stop_count` before it waits
+    (bounded) for that lock. A restart that sees a stop while it starts `ssh` releases the new child and
+    returns `False`, so no `ssh` survives a stop.
+  - In a non-owner (forked) process `ensure_active()` only returns `is_active()`. It never spawns, signals or
+    reaps `ssh`, and never takes the restart lock.
+  - `ensure_ssh_tunnel(feature="database") -> int | None` runs `ensure_active()` on the feature's started
+    tunnel. It returns the usable local port, or `None` when no tunnel was started or it stays down. Callers
+    are `_run_worker_stage` (before forking and every 30 s while waiting, §3) and the MariaDB driver's
+    `_reconnect()` (`db_engine/DB_API.md` §2.1): when `SSH_TUNNEL_ENABLED` is set it runs before each
+    reconnect attempt and follows the port the tunnel reports.
 - **One Tunnel Per Run (Fork Ownership)**: Both tunnels are opened once before any version is parsed -
   `database.ssh_tunnel` in `arg_handling()`, and `mailing_list.ssh_tunnel` in `main()` (when both
   `mailing_list.enabled` and `mailing_list.ssh_tunnel.enabled` are set), so no tunnel is opened by the `-u` /

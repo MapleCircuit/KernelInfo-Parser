@@ -22,7 +22,7 @@ from db_engine.sql_render import (
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
-from db_engine.mariadb_support import _coerce_bytes, _is_binary_type, logger
+from db_engine.mariadb_support import _DRIVER_CONN_ERRORS, _coerce_bytes, _is_binary_type, logger
 
 
 
@@ -236,7 +236,7 @@ class MariaDBTables:
                         _exec_chunk(chunk_data[:mid])
                         _exec_chunk(chunk_data[mid:])
                         return
-                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                    if isinstance(err, _DRIVER_CONN_ERRORS):
                         if self._in_txn:
                             raise
                         self._drop_connection()
@@ -282,7 +282,7 @@ class MariaDBTables:
                 except mysql.connector.Error as err:
                     if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
                         raise DuplicateKeyError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
-                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                    if isinstance(err, _DRIVER_CONN_ERRORS):
                         if self._in_txn:
                             raise
                         self._drop_connection()
@@ -368,7 +368,7 @@ class MariaDBTables:
                         _exec_update_chunk(chunk_data[:mid])
                         _exec_update_chunk(chunk_data[mid:])
                         return
-                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                    if isinstance(err, _DRIVER_CONN_ERRORS):
                         if self._in_txn:
                             raise
                         self._drop_connection()
@@ -411,7 +411,7 @@ class MariaDBTables:
                     self._last_ok = time.monotonic()
                     break
                 except mysql.connector.Error as err:
-                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                    if isinstance(err, _DRIVER_CONN_ERRORS):
                         if self._in_txn:
                             raise
                         self._drop_connection()
@@ -464,7 +464,7 @@ class MariaDBTables:
         if not valid_items:
             return []
 
-        transient = (mysql.connector.OperationalError, mysql.connector.InterfaceError, ConnectionError, OSError)
+        transient = (*_DRIVER_CONN_ERRORS, ConnectionError, OSError)
 
         def _commit_table(
             item: tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]],

@@ -61,7 +61,8 @@ _PACKET_ERRNOS = frozenset({1153, 1154})
 # 1467 (failed to read auto-increment value): InnoDB reports a deadlock or timeout on the table AUTO-INC lock this way
 _DEADLOCK_ERRNOS = frozenset({1213, 1205, 1020, 1467})
 _CONN_ERRNOS = frozenset({2002, 2003, 2006, 2013, 2055, 1927})
-_CONN_CLASS_NAMES = frozenset({"InterfaceError", "PoolError"})
+# Driver client-side socket timeouts (read / write / connect) leave the connection unusable as well
+_CONN_CLASS_NAMES = frozenset({"InterfaceError", "PoolError", "ReadTimeoutError", "WriteTimeoutError", "ConnectionTimeoutError"})
 
 
 def translate_mysql_error(exc: BaseException) -> DBError | None:

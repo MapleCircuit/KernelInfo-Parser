@@ -6,6 +6,8 @@ from core.globalstuff import (
     CONTINUE_EXCEPTION,
     reclaim_system_memory,
 )
+import faulthandler
+import signal
 import sys
 
 import time
@@ -198,6 +200,25 @@ def _attach_blob_hash(CS: ChangeSet, blob_hashes: dict[str, bytes] | None) -> bo
     return CS.file_operation in ("D", "R100")
 
 
+def _register_stack_dump_signal() -> None:
+    """Let the parent request this worker's Python stacks: `SIGUSR1` dumps every thread to stderr.
+
+    `faulthandler` writes from its C-level handler, so the dump works while the worker is stuck in C code (a
+    libclang call, a blocking socket read) and never reaches the bytecode loop. The worker keeps running.
+    """
+    sig = getattr(signal, "SIGUSR1", None)
+    if sig is None:
+        return
+    for stream in (sys.stderr, sys.__stderr__):
+        if stream is None:
+            continue
+        try:
+            faulthandler.register(sig, file=stream, all_threads=True, chain=False)
+            return
+        except (AttributeError, ValueError, OSError, RuntimeError):
+            continue
+
+
 def file_processing_worker(
     conn: Any,
     vid: int,
@@ -211,8 +232,10 @@ def file_processing_worker(
     its per-file errors and sends it back on `conn` as one result frame, so parsing the next batch
     (already queued by the parent) overlaps sending the last one. `send_bytes` blocks while the parent is
     behind, which caps worker memory at the batches in flight. A done frame is sent last; closing the
-    pipe without it marks the worker as crashed.
+    pipe without it marks the worker as crashed. `SIGUSR1` dumps the worker's stacks to stderr
+    (`_register_stack_dump_signal()`); the parent sends it before killing a stalled worker.
     """
+    _register_stack_dump_signal()
     sys.setrecursionlimit(50000)
     # Detach worker gp from large parent-inherited caches to prevent Copy-on-Write page duplication
     if gp_ref is not None:

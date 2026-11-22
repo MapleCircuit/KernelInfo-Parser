@@ -7,6 +7,10 @@
     "database": "kernelinfo",
     "path": "",
     "timeout": 10,
+    "connect_timeout": 20,
+    "read_timeout": 600,
+    "write_timeout": 300,
+    "long_read_timeout": 7200,
     "engine": "mariadb",
     "unix_socket": "auto",
     "ssh_tunnel": {
@@ -39,6 +43,7 @@
     "hugepages": "auto",
     "preload_flush_mb": 512,
     "cache_max_table_mb": 6144,
+    "worker_batch_timeout_s": 300,
     "distributed": {
       "enabled": false,
       "role": "master",

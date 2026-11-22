@@ -52,7 +52,8 @@ class MariaDBIndexes:
                 return
             sql = f"CREATE INDEX {index_name} ON {table.table_name} "
             sql += f"({', '.join(table.init_columns[x[1]][0] for x in rows)})"
-            self._cur.execute(sql)
+            with self._long_statement():
+                self._cur.execute(sql)
             self.cnx.commit()
         except mysql.connector.Error as e:
             # 1061: Duplicate key name
@@ -84,7 +85,8 @@ class MariaDBIndexes:
             if not self.index_exists(index_name, table):
                 return
             sql = f"ALTER TABLE {table.table_name} DROP INDEX {index_name}"
-            self._cur.execute(sql)
+            with self._long_statement():
+                self._cur.execute(sql)
             self.cnx.commit()
         except mysql.connector.Error as e:
             # 1091: Can't DROP 'index'; check that column/key exists
@@ -200,8 +202,9 @@ class MariaDBIndexes:
                     f"WHERE child.`{local_col}` IS NOT NULL AND parent.`{foreign_col}` IS NULL;"
                 )
                 try:
-                    self._cur.execute(query)
-                    res = self._cur.fetchone()
+                    with self._long_statement():
+                        self._cur.execute(query)
+                        res = self._cur.fetchone()
                     count = res[0] if res else 0
                     if count > 0:
                         violations[f"{tbl.table_name}.{local_col} -> {foreign_tbl}.{foreign_col}"] = count

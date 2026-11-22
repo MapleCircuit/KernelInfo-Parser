@@ -6,6 +6,7 @@ from core.globalstuff import (
     freeze_system_memory,
 )
 
+import os
 import time
 from typing import Any
 from collections.abc import Callable
@@ -19,6 +20,8 @@ from collections import Counter, deque
 import pickle
 import traceback
 from table_engine.shared_buffer import SharedSymbolBuilder, SharedSymbolChain
+from core.config import get_parser_config
+from core.ssh_tunnel import ensure_ssh_tunnel
 from core.globalstuff import MEMORY_RECLAIM_STATS
 from core.SymbolRows import STATS as SYMBOL_STATS
 from core.DBLayout import (
@@ -44,6 +47,49 @@ class WorkerStageResult:
     lost_files: list[str] = field(default_factory=list)
     # Where the stage's time went (see _stage_time_split())
     split: dict[str, float] = field(default_factory=dict)
+
+
+# Seconds a worker may hold its oldest unreturned batch before the watchdog kills it (`parser.worker_batch_timeout_s`)
+DEFAULT_BATCH_TIMEOUT_S = 300.0
+# Without any returned batch for this long, the reader logs which workers hold which batches
+_STALL_HEARTBEAT_S = 60.0
+# Seconds a stalled worker gets to write its SIGUSR1 stack dump before it is terminated
+_STALL_DUMP_GRACE_S = 1.5
+# Extra seconds a worker gets on its first batch, which also covers its start-up (DB connection, cache detach)
+_WORKER_INIT_GRACE_S = 120.0
+# Seconds a worker that sent its done frame may take to exit (close its pipe) before it is killed
+_DONE_EXIT_GRACE_S = 60.0
+# Seconds between SSH tunnel liveness checks while the parent waits for worker results
+_TUNNEL_CHECK_S = 30.0
+
+
+def _configured_batch_timeout() -> float:
+    """`parser.worker_batch_timeout_s` (env WORKER_BATCH_TIMEOUT_S); <= 0 disables the stall watchdog."""
+    try:
+        return float(get_parser_config().get("worker_batch_timeout_s", DEFAULT_BATCH_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return DEFAULT_BATCH_TIMEOUT_S
+
+
+def _ensure_db_tunnel(label: str) -> None:
+    """Restart a dead database SSH tunnel (owner process only; no-op without a tunnel)."""
+    try:
+        ensure_ssh_tunnel("database")
+    except Exception as e:
+        logger.warning(COLOR.yellow(f"{label}: SSH tunnel liveness check failed: {e}"))
+
+
+def _stop_process(p: Any, label: str, grace_s: float = 2.0) -> None:
+    """Terminate `p` and kill it if it is still alive `grace_s` later."""
+    try:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=grace_s)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=grace_s)
+    except Exception as e:
+        logger.warning(f"{label}: stopping worker PID {getattr(p, 'pid', '?')} failed: {e}")
 
 
 # Small stages are split into about this many batches per worker: with one large batch per worker the
@@ -289,6 +335,7 @@ def _run_worker_stage(
     on_started: Callable[[], None] | None = None,
     retry_lost: bool = True,
     worker_target: Callable[..., None] | None = None,
+    batch_timeout_s: float | None = None,
 ) -> WorkerStageResult:
     """Parse `batches` on forked workers and stream every batch result into `ingest` on this thread.
 
@@ -302,6 +349,13 @@ def _run_worker_stage(
     workers' batches one file per batch to isolate the file that kills a worker. An `ingest` failure is
     recorded with its batch and does not stop the stage. If no worker can start (e.g. the database is
     unreachable), the stage raises.
+
+    Stall watchdog: a worker that holds its oldest unreturned batch for more than `batch_timeout_s` seconds
+    (default `parser.worker_batch_timeout_s`; <= 0 disables it) without a result frame pending on its pipe is
+    logged with the batch's files, sent `SIGUSR1` (stack dump to stderr), terminated and killed, then handled
+    like a worker that died: the batch is retried one file per batch. A worker that sent its done frame but
+    does not exit within `_DONE_EXIT_GRACE_S` is killed. Every `_STALL_HEARTBEAT_S` without a returned batch
+    the reader logs the batches still in flight; while waiting, the parent keeps the database SSH tunnel alive.
     """
     result = WorkerStageResult()
     if not batches:
@@ -310,6 +364,7 @@ def _run_worker_stage(
         return result
 
     target = worker_target or file_processing_worker
+    stall_timeout_s = float(_configured_batch_timeout() if batch_timeout_s is None else batch_timeout_s)
     batch_files = dict(batches)
     num_workers = max(1, min(num_workers, len(batches)))
     t_start = time.perf_counter()
@@ -317,6 +372,8 @@ def _run_worker_stage(
     procs: dict[int, Any] = {}
     conns: dict[Any, int] = {}
     _end_background_commits(label)
+    # Workers connect through the tunnel as soon as they start
+    _ensure_db_tunnel(label)
     _close_parent_db()
     try:
         freeze_system_memory()
@@ -344,6 +401,14 @@ def _run_worker_stage(
     worker_stats: list[dict[str, float]] = []
     # Per worker: (header symbol maps it loaded, blob ids it looked up), merged into gp.blob_symbol_cache
     blob_symbol_reports: list[tuple[Any, Any]] = []
+    # Watchdog state (reader thread only): when each worker started its oldest unreturned batch (reset when a
+    # batch reaches an idle worker and on every result frame), when it sent its done frame, which it killed
+    last_activity: dict[int, float] = {}
+    done_at: dict[int, float] = {}
+    stalled_workers: dict[int, tuple[int, float]] = {}
+    stalled_batches: set[int] = set()
+    # Workers that returned at least one result frame (past their start-up)
+    started_workers: set[int] = set()
 
     def _offer(item: Any) -> bool:
         while not stop.is_set():
@@ -361,6 +426,8 @@ def _run_worker_stage(
         try:
             if pending:
                 b_id, b_files = pending.popleft()
+                if not assigned[worker_id]:
+                    last_activity[worker_id] = time.monotonic()
                 assigned[worker_id].append(b_id)
                 conn.send_bytes(_FRAME_TASK + pickle.dumps((b_id, b_files), protocol=pickle.HIGHEST_PROTOCOL))
             else:
@@ -370,8 +437,84 @@ def _run_worker_stage(
             # The worker is gone; its EOF is handled by the read loop
             pass
 
+    def _worker_lost(open_conns: dict[Any, int], conn: Any, worker_id: int) -> None:
+        """A worker's pipe closed (or the watchdog killed it): re-queue the batches it had not returned."""
+        del open_conns[conn]
+        conn.close()
+        finish_times.append(time.perf_counter())
+        unreturned = assigned[worker_id]
+        if worker_id not in done_workers and unreturned:
+            if worker_id not in init_failed:
+                # The oldest unreturned batch was being parsed when the worker died
+                suspect_batches.append(unreturned.popleft())
+            # Queued but never started: back to the front for the surviving workers
+            pending.extendleft(reversed([(b_id, batch_files[b_id]) for b_id in unreturned]))
+            unreturned.clear()
+            # Only top up workers below their queue depth, so no pipe fills up with tasks
+            for other_conn, other_id in open_conns.items():
+                if len(assigned[other_id]) < _TASKS_AHEAD:
+                    _dispatch(other_conn, other_id)
+
+    def _has_pending_frame(conn: Any) -> bool:
+        try:
+            return bool(conn.poll(0))
+        except (EOFError, OSError):
+            return True  # closed: the next wait reports it
+
+    def _kill_stalled(open_conns: dict[Any, int], conn: Any, worker_id: int, elapsed: float) -> None:
+        p = procs[worker_id]
+        b_id = assigned[worker_id][0]
+        files = batch_files.get(b_id, [])
+        stalled_workers[worker_id] = (b_id, elapsed)
+        stalled_batches.add(b_id)
+        logger.error(COLOR.red(
+            f"{label}: worker {worker_id} (PID {p.pid}) stalled for {elapsed:.0f}s (limit {stall_timeout_s:.0f}s) "
+            f"on batch {b_id} ({len(files)} files: {', '.join(files)}); dumping its stacks to stderr and killing it."
+        ))
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None and p.pid:
+            try:
+                os.kill(p.pid, sigusr1)
+                p.join(timeout=_STALL_DUMP_GRACE_S)
+            except OSError:
+                pass
+        _stop_process(p, label)
+        _worker_lost(open_conns, conn, worker_id)
+
+    def _watchdog(open_conns: dict[Any, int], now: float) -> None:
+        for conn, worker_id in list(open_conns.items()):
+            if worker_id in done_workers:
+                if now - done_at.get(worker_id, now) > _DONE_EXIT_GRACE_S and not _has_pending_frame(conn):
+                    logger.warning(COLOR.yellow(
+                        f"{label}: worker {worker_id} (PID {procs[worker_id].pid}) finished but did not exit "
+                        f"within {_DONE_EXIT_GRACE_S:.0f}s; killing it."
+                    ))
+                    _stop_process(procs[worker_id], label)
+                    _worker_lost(open_conns, conn, worker_id)
+                continue
+            if stall_timeout_s <= 0 or not assigned[worker_id] or worker_id in init_failed:
+                continue
+            elapsed = now - last_activity.get(worker_id, now)
+            limit = stall_timeout_s if worker_id in started_workers else stall_timeout_s + _WORKER_INIT_GRACE_S
+            # A result waiting on the pipe means the worker is sending, not stuck
+            if elapsed > limit and not _has_pending_frame(conn):
+                _kill_stalled(open_conns, conn, worker_id, elapsed)
+
+    def _heartbeat(open_conns: dict[Any, int], now: float, idle_s: float) -> None:
+        in_flight = [
+            f"worker {worker_id} (PID {procs[worker_id].pid}) batch {assigned[worker_id][0]} "
+            f"({len(batch_files.get(assigned[worker_id][0], ()))} files) for {now - last_activity.get(worker_id, now):.0f}s"
+            for worker_id in sorted(open_conns.values())
+            if assigned[worker_id] and worker_id not in done_workers
+        ]
+        logger.warning(COLOR.yellow(
+            f"{label}: no batch returned for {idle_s:.0f}s; {len(open_conns)} worker(s) still open, "
+            f"{len(pending)} batch(es) pending; in flight: {'; '.join(in_flight) or 'none'}"
+        ))
+
     def _reader_loop() -> None:
         open_conns = dict(conns)
+        last_progress = last_heartbeat = time.monotonic()
         try:
             for _ in range(_TASKS_AHEAD):
                 for conn, worker_id in open_conns.items():
@@ -382,25 +525,12 @@ def _run_worker_stage(
                     try:
                         frame = conn.recv_bytes()
                     except (EOFError, OSError):
-                        del open_conns[conn]
-                        conn.close()
-                        finish_times.append(time.perf_counter())
-                        unreturned = assigned[worker_id]
-                        if worker_id not in done_workers and unreturned:
-                            if worker_id not in init_failed:
-                                # The oldest unreturned batch was being parsed when the worker died
-                                suspect_batches.append(unreturned.popleft())
-                            # Queued but never started: back to the front for the surviving workers
-                            pending.extendleft(reversed([(b_id, batch_files[b_id]) for b_id in unreturned]))
-                            unreturned.clear()
-                            # Only top up workers below their queue depth, so no pipe fills up with tasks
-                            for other_conn, other_id in open_conns.items():
-                                if len(assigned[other_id]) < _TASKS_AHEAD:
-                                    _dispatch(other_conn, other_id)
+                        _worker_lost(open_conns, conn, worker_id)
                         continue
                     tag = frame[:1]
                     if tag == _FRAME_DONE:
                         done_workers.add(worker_id)
+                        done_at[worker_id] = time.monotonic()
                         if len(frame) > 1:
                             try:
                                 stats = pickle.loads(frame[1:])
@@ -413,6 +543,9 @@ def _run_worker_stage(
                         init_failed.add(worker_id)
                         error_list.append(pickle.loads(frame[1:]))
                     elif tag == _FRAME_RESULT:
+                        last_progress = time.monotonic()
+                        last_activity[worker_id] = last_progress
+                        started_workers.add(worker_id)
                         try:
                             decoded = _decode_batch_result(frame)
                         except Exception as e:
@@ -426,6 +559,13 @@ def _run_worker_stage(
                         _dispatch(conn, worker_id)
                         if not _offer(decoded):
                             return
+                if not open_conns or stop.is_set():
+                    break
+                now = time.monotonic()
+                _watchdog(open_conns, now)
+                if open_conns and now - max(last_progress, last_heartbeat) >= _STALL_HEARTBEAT_S:
+                    last_heartbeat = now
+                    _heartbeat(open_conns, now, now - last_progress)
         except BaseException as e:
             reader_failures.append(e)
         finally:
@@ -444,6 +584,7 @@ def _run_worker_stage(
     files_returned = 0
     parent_split = {"wait_s": 0.0, "decode_s": 0.0, "ingest_s": 0.0}
     split_base = _parent_split_counters()
+    last_tunnel_check = time.monotonic()
     try:
         if on_started is not None:
             on_started()
@@ -455,6 +596,9 @@ def _run_worker_stage(
             except queue.Empty:
                 parent_split["wait_s"] += time.perf_counter() - t_wait
                 _maybe_idle_commit()
+                if time.monotonic() - last_tunnel_check >= _TUNNEL_CHECK_S:
+                    last_tunnel_check = time.monotonic()
+                    _ensure_db_tunnel(label)
                 if G.is_deadline_exceeded():
                     logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached during {label}. Halting early..."))
                     result.deadline_hit = True
@@ -557,6 +701,12 @@ def _run_worker_stage(
             logger.info(f"{label}: worker PID {p.pid} stopped on execution deadline.")
             continue
         result.failed_workers += 1
+        if worker_id in stalled_workers:
+            b_id, elapsed = stalled_workers[worker_id]
+            logger.error(COLOR.red(
+                f"{label}: worker {worker_id} (PID {p.pid}) was killed after stalling {elapsed:.0f}s on batch {b_id}"
+            ))
+            continue
         logger.error(COLOR.red(f"{label}: worker {worker_id} (PID {p.pid}) died before finishing (exit code {p.exitcode})"))
 
     for fetched, used in blob_symbol_reports:
@@ -597,9 +747,13 @@ def _run_worker_stage(
                 for f in b_items:
                     retry_batches.append((next_id + len(retry_batches), [f]))
             else:
+                reason = (
+                    f"A worker stalled for more than {stall_timeout_s:.0f}s while parsing this file and was killed"
+                    if b_id in stalled_batches else "A worker process died while parsing this file"
+                )
                 for f in b_items:
                     result.lost_files.append(f)
-                    error_list.append((f, "A worker process died while parsing this file; it was not ingested.", ""))
+                    error_list.append((f, f"{reason}; it was not ingested.", ""))
     next_id += len(retry_batches)
     retry_batches += [(next_id + i, batch_files[b_id]) for i, b_id in enumerate(unfinished)]
 
@@ -620,6 +774,7 @@ def _run_worker_stage(
         error_list,
         retry_lost=False,
         worker_target=target,
+        batch_timeout_s=stall_timeout_s,
     )
     result.files_ingested += retry.files_ingested
     result.failed_workers += retry.failed_workers

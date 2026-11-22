@@ -2,7 +2,7 @@
 
 Covers worker change selection after blob deduplication, memory-mode budgets, ChangeSet evacuation
 bookkeeping, the shared symbol segment lifecycle and file scoping, in-flight reference blocking,
-worker-side stub suppression, crash detection and retry in `_run_worker_stage`, the background git
+worker-side stub suppression, crash and stall detection and retry in `_run_worker_stage`, the background git
 commit worker handoff, and largest-first epoch batch ordering.
 """
 import gc
@@ -113,6 +113,50 @@ _NULL_CURSOR_TB = (
     '    raise Exception("Tried calling method on a null-cursor.")\n'
     "Exception: Tried calling method on a null-cursor.\n"
 )
+
+
+# File the stack-dump handler of `_hanging_worker` writes to (set by the test before the workers fork)
+_STACK_DUMP_PATH: list[str] = []
+
+
+def _hanging_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
+    """Fake parsing worker that never returns a batch naming a 'hang' file (like a parse stuck in libclang).
+
+    It registers a SIGUSR1 stack dump like `file_processing_worker`, into `_STACK_DUMP_PATH` when set; a file
+    named 'slow' takes 1.5s.
+    """
+    import faulthandler
+    import time
+
+    dump = open(_STACK_DUMP_PATH[0], "a") if _STACK_DUMP_PATH else None
+    if dump is not None:
+        faulthandler.register(signal.SIGUSR1, file=dump, all_threads=True, chain=False)
+    while True:
+        task = pipeline.worker_protocol._recv_task(conn)
+        if task is None:
+            break
+        batch_id, files = task
+        if any("hang" in f for f in files):
+            time.sleep(3600)
+        if any("slow" in f for f in files):
+            time.sleep(1.5)
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {f: len(files) for f in files}, [], compress=False))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
+    conn.close()
+
+
+def _lingering_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
+    """Fake worker that sends its done frame but never exits (its pipe stays open)."""
+    import time
+
+    while True:
+        task = pipeline.worker_protocol._recv_task(conn)
+        if task is None:
+            break
+        batch_id, files = task
+        conn.send_bytes(pipeline.worker_protocol._encode_batch_result(batch_id, {f: len(files) for f in files}, [], compress=False))
+    conn.send_bytes(pipeline.worker_protocol._FRAME_DONE)
+    time.sleep(3600)
 
 
 def _unstartable_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
@@ -419,6 +463,54 @@ class TestWorkerStage(unittest.TestCase):
         )
         self.assertEqual(len(seen), 1)
         self.assertIsNotNone(seen[0])
+
+    @mock.patch.object(pipeline.worker_stage, "_WORKER_INIT_GRACE_S", 0.0)
+    def test_stalled_worker_is_killed_and_its_hanging_file_isolated(self) -> None:
+        """A worker past `batch_timeout_s` is stack-dumped, killed and its batch retried file by file."""
+        ingested: dict[str, int] = {}
+        errors: list = []
+        batches = [(0, ["a.c", "b.c"]), (1, ["c.c", "hang.c", "d.c"]), (2, ["e.c"])]
+        with tempfile.NamedTemporaryFile(suffix=".dump") as dump:
+            _STACK_DUMP_PATH[:] = [dump.name]
+            self.addCleanup(_STACK_DUMP_PATH.clear)
+            with self.assertLogs(pipeline.worker_stage.logger, level="ERROR") as logs:
+                result = pipeline.worker_stage._run_worker_stage(
+                    "[test]", batches, ingested.update, 2, errors, worker_target=_hanging_worker, batch_timeout_s=1.0,
+                )
+            with open(dump.name) as fh:
+                stacks = fh.read()
+        self.assertEqual(set(ingested), {"a.c", "b.c", "c.c", "d.c", "e.c"})
+        self.assertEqual(ingested["c.c"], 1, "the stalled batch is re-parsed one file per batch")
+        self.assertEqual(result.lost_files, ["hang.c"])
+        self.assertTrue(any(e[0] == "hang.c" and "stalled" in e[1] for e in errors))
+        stall_logs = [line for line in logs.output if "stalled for" in line]
+        self.assertTrue(stall_logs)
+        self.assertIn("hang.c", stall_logs[0])
+        self.assertIn("batch 1 ", stall_logs[0])
+        self.assertIn("_hanging_worker", stacks, "SIGUSR1 dumped the stalled worker's stack")
+
+    def test_slow_stage_logs_in_flight_batches(self) -> None:
+        """Without a returned batch for `_STALL_HEARTBEAT_S`, the batches in flight are logged; nothing is killed."""
+        ingested: dict[str, int] = {}
+        with mock.patch.object(pipeline.worker_stage, "_STALL_HEARTBEAT_S", 0.3), \
+                self.assertLogs(pipeline.worker_stage.logger, level="WARNING") as logs:
+            result = pipeline.worker_stage._run_worker_stage(
+                "[test]", [(0, ["slow.c"])], ingested.update, 1, [], worker_target=_hanging_worker, batch_timeout_s=0,
+            )
+        self.assertEqual(ingested, {"slow.c": 1})
+        self.assertEqual(result.failed_workers, 0)
+        self.assertTrue(any("no batch returned" in line and "batch 0 (1 files)" in line for line in logs.output))
+
+    def test_worker_that_never_exits_after_done_is_killed(self) -> None:
+        ingested: dict[str, int] = {}
+        with mock.patch.object(pipeline.worker_stage, "_DONE_EXIT_GRACE_S", 0.5), \
+                self.assertLogs(pipeline.worker_stage.logger, level="WARNING") as logs:
+            result = pipeline.worker_stage._run_worker_stage(
+                "[test]", [(0, ["a.c"]), (1, ["b.c"])], ingested.update, 2, [], worker_target=_lingering_worker,
+            )
+        self.assertEqual(set(ingested), {"a.c", "b.c"})
+        self.assertEqual(result.lost_files, [])
+        self.assertTrue(any("did not exit" in line for line in logs.output))
 
     def test_same_error_on_most_files_stops_the_stage(self) -> None:
         """A stage stops as soon as one error message covers most files, without ingesting the rest."""

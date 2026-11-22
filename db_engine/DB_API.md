@@ -11,24 +11,24 @@ inserts/upserts, parallel table commits, declarative query specifications, and D
   - Neutral Errors (`db_engine/errors.py`) [L83-L108]
   - Capability Flags [L109-L124]
   - Core Drivers & Subsystem Components [L125-L147]
-- 2. Core Method Specifications [L148-L628]
-  - 2.1. Lifecycle, Session & Health [L150-L235]
-  - 2.2. Sequence Tracking & Single-Row CRUD [L236-L283]
-  - 2.3. Multi-Table Relational Views [L284-L293]
-  - 2.4. Batch Insert, Upsert & Parallel Commits [L294-L332]
-  - 2.5. DDL & Index Management [L333-L374]
-  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L375-L425]
-  - 2.7. Spec Read Primitives [L426-L453]
-  - 2.8. Spec Write Primitives [L454-L470]
-  - 2.9. Catalog & Server Introspection [L471-L486]
-  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L487-L503]
-  - 2.11. Pipeline Intent Methods [L504-L521]
-  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L522-L547]
-  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L548-L559]
-  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L560-L567]
-  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L568-L628]
-- 3. Factory Resolver (`get_db_engine`) [L629-L650]
-- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L651-L677]
+- 2. Core Method Specifications [L148-L651]
+  - 2.1. Lifecycle, Session & Health [L150-L258]
+  - 2.2. Sequence Tracking & Single-Row CRUD [L259-L306]
+  - 2.3. Multi-Table Relational Views [L307-L316]
+  - 2.4. Batch Insert, Upsert & Parallel Commits [L317-L355]
+  - 2.5. DDL & Index Management [L356-L397]
+  - 2.6. Declarative Query Specification Primitives (`db_engine/spec.py`) [L398-L448]
+  - 2.7. Spec Read Primitives [L449-L476]
+  - 2.8. Spec Write Primitives [L477-L493]
+  - 2.9. Catalog & Server Introspection [L494-L509]
+  - 2.10. Schema Maintenance & View Registry (`db_engine/views.py`) [L510-L526]
+  - 2.11. Pipeline Intent Methods [L527-L544]
+  - 2.12. Webapp Read Session & Query Primitives (`db_engine/pool.py`) [L545-L570]
+  - 2.13. Embedded SQLite Store (`db_engine/sqlite_store.py`) [L571-L582]
+  - 2.14. Foreign SQLite Reader (`db_engine/foreign.py`) [L583-L590]
+  - 2.15. SQLiteDB (`db_engine/sqlite_db.py`) [L591-L651]
+- 3. Factory Resolver (`get_db_engine`) [L652-L673]
+- 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`) [L674-L700]
 <!-- toc:end -->
 
 ---
@@ -155,6 +155,24 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
     `sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `foreign_key_checks = 0`, `unique_checks = 0`, `wait_timeout` /
     `interactive_timeout` 28800 s and `net_read_timeout` / `net_write_timeout` 3600 s in one combined
     `SET SESSION` statement (with a `sql_mode` fallback). Credentials come from `DB_USER` / `DB_PASSWORD` only; without them the connection raises `ConfigurationError` (no default account).
+  - **Client socket timeouts**: `mysql.connector.connect()` gets `connection_timeout`, `read_timeout` and
+    `write_timeout` on both the Unix-socket and the TCP path. They come from `DB_CONNECT_TIMEOUT` /
+    `DB_READ_TIMEOUT` / `DB_WRITE_TIMEOUT` (`database.connect_timeout` / `read_timeout` / `write_timeout`,
+    defaults `DEFAULT_CONNECT_TIMEOUT_S` 20, `DEFAULT_READ_TIMEOUT_S` 600 and `DEFAULT_WRITE_TIMEOUT_S` 300
+    seconds; 0 leaves one unset). `read_timeout` bounds each wait for a reply packet and `write_timeout` each
+    send. A half-open socket (a dead SSH tunnel or a vanished server) therefore raises the driver's
+    `ReadTimeoutError` / `WriteTimeoutError` instead of blocking `recv()` forever. These errors count as a lost
+    connection (`_is_connection_lost()`, `mariadb_support._DRIVER_CONN_ERRORS`, `translate_mysql_error()` ->
+    `ConnectionLostError`). Outside a transaction the connection is dropped (`_drop_connection()`) and the
+    statement retried as for errno 2013. Statements that work server-side for long before their first reply
+    packet run inside `_long_statement()`, which raises the read timeout to `long_read_timeout` for that
+    statement only. That bound comes from `DB_LONG_READ_TIMEOUT` / `database.long_read_timeout` (default
+    `DEFAULT_LONG_READ_TIMEOUT_S` 7200 s; 0 waits without bound). These statements are every `_raw_execute()`
+    (set-based DML such as `copy_rows`, `NewPairs.delete_rows_of`, `insert_include_references`, and backfill or
+    DDL statements), the `create_index()` / `remove_index()` DDL and the `verify_relational_integrity()`
+    scans. Spec reads (`_raw_query`, `_fetch_*`) keep `read_timeout`. A driver that cannot change an open
+    connection's timeout (the `mysql.connector` C extension) logs one `WARNING` and keeps `read_timeout` for
+    those statements as well.
 - **`__enter__() -> Self` & `__exit__(...) -> None`**
   - Context manager lifecycle; rolls back pending transaction on unhandled exception.
 - **`close() -> None`**
@@ -171,6 +189,11 @@ Other class attributes: `dialect` (`"mariadb"` / `"sqlite"`, the `sql_render` di
   - **Subprocess log demotion**: `subprocess_quiet()` (context manager, used by `TableEngine.start_new_db(..., is_worker=True)`) and `set_subprocess_quiet(True)` (automatically set in forked children by `EnginePool` fork hooks) demote `DB_engine <name> Started.` / `Closed.` in worker subprocesses from `INFO` to `DEBUG`.
   - **Parent-process `EnginePool`** (`db_engine/pool.py`, exported via `pooled_engine`, `close_engine_pools`, `EnginePool`, `PooledEngineFactory`, `PooledEngineLease`): wraps `G.DB` in `main.py` so parent-process `with G.DB() as db:`, `TableEngine` handles, and `MariaDB._lease_writer()` parallel commit/index workers reuse live `DB_engine` instances across stages and versions. Each checkout runs `ping()` (recreating/reconnecting dead handles automatically and logging reconnects at `INFO`, while routine reuse logs at `DEBUG`). `os.register_at_fork` protects pool locks across `fork()`; in a child the pool keeps the inherited handles referenced (`_inherited`) and never reuses, releases or closes them, since a finalized `mysql.connector` socket runs `shutdown(SHUT_RDWR)` on the connection the parent shares; `close_engine_pools()` closes every pooled handle at shutdown (`main._shutdown_runtime()`).
   - **Worker-process engines**: `BaseDBEngine.worker_factory()` returns a picklable zero-argument constructor of a new, independent connection to the same database (default: the engine class, configured from the environment like `MariaDB`; `SQLiteDB`: the same file). `worker_engine_factory(db)` accepts an engine, a `PooledEngineLease` (forwarded to its engine's `worker_factory()`), an engine class or a `PooledEngineFactory` (its `engine_class`). `ProcessPoolExecutor` initializers receive it instead of `type(db)`, since a lease wraps a parent-process pool and cannot be constructed in a child; they close the worker's engine through `multiprocessing.util.Finalize(..., exitpriority=...)`, which runs when a worker exits cleanly on every supported Python (plain `atexit` hooks of forked children run only from 3.14 on).
+  - **SSH tunnel recovery**: with `SSH_TUNNEL_ENABLED` set, every `_reconnect()` attempt first calls
+    `_refresh_tunnel_route()`. It runs `core.ssh_tunnel.ensure_ssh_tunnel("database")`, which restarts a
+    dead tunnel on its local port in the owner process and is a no-op in a forked worker
+    (`core/API.md` §7.2), and adopts the port it returns as `host` / `port`. A dead tunnel therefore no longer
+    fails every attempt with `2003 ... Connection refused`.
   - `close()` is the public shutdown. MariaDB's drop-and-retry paths (`check_if_connected`, `_reconnect`, connection-lost
     retries in writes and `reserve_id_block`) release the socket through the private `_drop_connection()`, which leaves
     the lifecycle count unchanged.

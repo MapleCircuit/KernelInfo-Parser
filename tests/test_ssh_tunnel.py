@@ -26,6 +26,7 @@ from core.ssh_tunnel import (
     SSHTunnelManager,
     _find_free_port,
     _is_port_in_use,
+    ensure_ssh_tunnel,
     get_active_ssh_tunnel,
     is_ssh_tunnel_active,
     start_ssh_tunnel,
@@ -430,6 +431,128 @@ class TestInheritedTunnelAcrossFork(unittest.TestCase):
             mock_popen.assert_not_called()
         self.assertIs(reused, manager)
         self.assertEqual(reused.local_port, 40011)
+
+
+class TestTunnelAutoRestart(unittest.TestCase):
+    """`ensure_active()` restarts a dead tunnel on the same port, only in the process that owns it."""
+
+    def setUp(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_tunnels = dict(core.ssh_tunnel._TUNNELS)
+        core.ssh_tunnel._TUNNELS.clear()
+        sleep = patch("core.ssh_tunnel.time.sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def tearDown(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
+        core.ssh_tunnel._TUNNELS.clear()
+        core.ssh_tunnel._TUNNELS.update(self._orig_tunnels)
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+
+    @staticmethod
+    def _proc(pid: int) -> MagicMock:
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.pid = pid
+        proc.stderr.read.return_value = "Connection to db.server.org closed by remote host."
+        return proc
+
+    @patch("core.ssh_tunnel._find_free_port", return_value=40021)
+    @patch("core.ssh_tunnel._is_port_in_use")
+    @patch("subprocess.Popen")
+    def _started(self, mock_popen: MagicMock, mock_port: MagicMock, mock_free: MagicMock) -> tuple[SSHTunnelManager, MagicMock]:
+        dead = self._proc(1001)
+        mock_popen.return_value = dead
+        mock_port.return_value = True
+        # local_port 0: the first start picks an ephemeral port, which a restart must keep
+        manager = SSHTunnelManager(host="mail.server.org", local_port=0, remote_port=8192, connect_timeout=2, feature="mailing_list")
+        manager.start()
+        self.assertEqual(manager.local_port, 40021)
+        return manager, dead
+
+    def test_owner_restarts_dead_tunnel_on_same_port(self) -> None:
+        import core.ssh_tunnel
+        manager, dead = self._started()
+        core.ssh_tunnel._TUNNELS["mailing_list"] = manager
+        dead.poll.return_value = 255                      # ssh exited
+        fresh = self._proc(1002)
+        # configured-port probe (free after the old forward died), then readiness
+        with patch("subprocess.Popen", return_value=fresh) as mock_popen, \
+                patch("core.ssh_tunnel._is_port_in_use", side_effect=[False, True]), \
+                patch("core.ssh_tunnel._find_free_port") as mock_free, \
+                self.assertLogs("core.ssh_tunnel", level="WARNING") as logs:
+            self.assertEqual(ensure_ssh_tunnel("mailing_list"), 40021)
+        mock_free.assert_not_called()
+        cmd = mock_popen.call_args.args[0]
+        self.assertIn("40021:127.0.0.1:8192", cmd)
+        self.assertIs(manager.proc, fresh)
+        self.assertEqual(manager.restarts, 1)
+        self.assertTrue(manager.is_active())
+        self.assertTrue(any("closed by remote host" in line for line in logs.output))
+
+    def test_live_tunnel_is_left_alone(self) -> None:
+        manager, live = self._started()
+        with patch("subprocess.Popen") as mock_popen:
+            self.assertTrue(manager.ensure_active())
+        mock_popen.assert_not_called()
+        self.assertIs(manager.proc, live)
+
+    def test_forked_worker_never_restarts_or_signals(self) -> None:
+        manager, dead = self._started()
+        manager._owner_pid = os.getpid() + 1              # inherited by a forked worker
+        dead.poll.return_value = 255
+        with patch("subprocess.Popen") as mock_popen, patch("core.ssh_tunnel._is_port_in_use", return_value=False):
+            self.assertFalse(manager.ensure_active())
+        mock_popen.assert_not_called()
+        dead.terminate.assert_not_called()
+        dead.kill.assert_not_called()
+        self.assertIs(manager.proc, dead)
+
+    def test_stopped_tunnel_is_not_restarted(self) -> None:
+        manager, _ = self._started()
+        manager.stop()
+        with patch("subprocess.Popen") as mock_popen:
+            self.assertFalse(manager.ensure_active())
+        mock_popen.assert_not_called()
+
+    def test_failed_restart_backs_off(self) -> None:
+        manager, dead = self._started()
+        dead.poll.return_value = 255
+        with patch("subprocess.Popen", side_effect=OSError("no ssh")) as mock_popen, \
+                patch("core.ssh_tunnel._is_port_in_use", return_value=False), \
+                self.assertLogs("core.ssh_tunnel", level="WARNING"):
+            self.assertFalse(manager.ensure_active(attempts=2, backoff_s=0.0))
+            self.assertEqual(mock_popen.call_count, 2)
+            # within the cooldown no new attempt is made
+            self.assertFalse(manager.ensure_active(attempts=2, backoff_s=0.0))
+            self.assertEqual(mock_popen.call_count, 2)
+
+    def test_restart_racing_a_stop_is_released(self) -> None:
+        """A stop() from another thread while a restart starts ssh wins: the new ssh child is ended."""
+        manager, dead = self._started()
+        dead.poll.return_value = 255
+        fresh = self._proc(1003)
+
+        def _start_with_concurrent_stop() -> int:
+            manager.proc = fresh
+            manager._stop_count += 1                      # what stop() on another thread records
+            return manager.local_port
+
+        with patch.object(manager, "start", side_effect=_start_with_concurrent_stop), \
+                self.assertLogs("core.ssh_tunnel", level="WARNING"):
+            self.assertFalse(manager.ensure_active())
+        fresh.terminate.assert_called_once()
+        self.assertIsNone(manager.proc)
+        self.assertFalse(manager._wanted)
+
+    def test_no_tunnel_started(self) -> None:
+        self.assertIsNone(ensure_ssh_tunnel("database"))
 
 
 if __name__ == "__main__":

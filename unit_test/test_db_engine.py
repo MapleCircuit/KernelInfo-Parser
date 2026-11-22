@@ -1906,6 +1906,139 @@ class TestEnginePoolAndLifecycleLogging(unittest.TestCase):
         self.assertEqual(pool.idle_count, 0)
 
 
+
+class TestMariaDBClientTimeouts(unittest.TestCase):
+    """Finite client socket timeouts reach `mysql.connector.connect()`; their errors count as a lost connection."""
+
+    _ENV = {
+        "DB_USER": "u", "DB_PASSWORD": "p", "DB_NAME": "d", "DB_HOST": "127.0.0.1", "DB_PORT": "3306",
+        "SSH_TUNNEL_ENABLED": "false", "DB_SOCKET": "off",
+        "DB_CONNECT_TIMEOUT": "", "DB_READ_TIMEOUT": "", "DB_WRITE_TIMEOUT": "",
+    }
+
+    def _connect_kwargs(self, **env: str) -> dict[str, Any]:
+        with unittest.mock.patch.dict(os.environ, {**self._ENV, **env}), \
+                unittest.mock.patch("db_engine.mariadb_connection.mysql.connector.connect") as connect:
+            db = MariaDB()
+            self.addCleanup(db._release_if_inherited)
+        self.assertEqual(connect.call_count, 1)
+        return connect.call_args.kwargs
+
+    def test_defaults_are_finite(self) -> None:
+        from db_engine import mariadb_connection as mc
+
+        kwargs = self._connect_kwargs()
+        self.assertEqual(kwargs["connection_timeout"], mc.DEFAULT_CONNECT_TIMEOUT_S)
+        self.assertEqual(kwargs["read_timeout"], mc.DEFAULT_READ_TIMEOUT_S)
+        self.assertEqual(kwargs["write_timeout"], mc.DEFAULT_WRITE_TIMEOUT_S)
+        self.assertTrue(all(isinstance(kwargs[k], int) and kwargs[k] > 0 for k in ("connection_timeout", "read_timeout", "write_timeout")))
+
+    def test_env_overrides_and_zero_disables(self) -> None:
+        kwargs = self._connect_kwargs(DB_CONNECT_TIMEOUT="7", DB_READ_TIMEOUT="42", DB_WRITE_TIMEOUT="0")
+        self.assertEqual(kwargs["connection_timeout"], 7)
+        self.assertEqual(kwargs["read_timeout"], 42)
+        self.assertNotIn("write_timeout", kwargs)
+
+    def test_unix_socket_path_gets_timeouts(self) -> None:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile() as sock:
+            kwargs = self._connect_kwargs(DB_SOCKET=sock.name, DB_HOST="localhost", DB_READ_TIMEOUT="11")
+        self.assertEqual(kwargs["unix_socket"], sock.name)
+        self.assertEqual(kwargs["read_timeout"], 11)
+
+    def test_config_exports_timeouts(self) -> None:
+        from core.config import sync_environ
+
+        import core.config
+
+        # sync_environ() records what it exported; keep that registry as it was
+        with unittest.mock.patch.dict(os.environ, {}), \
+                unittest.mock.patch.object(core.config, "_EXPORTED_ENV_VARS", dict(core.config._EXPORTED_ENV_VARS)):
+            sync_environ({"database": {"connect_timeout": 5, "read_timeout": 900, "write_timeout": 0}})
+            self.assertEqual(os.environ["DB_LONG_READ_TIMEOUT"], "7200")
+            self.assertEqual((os.environ["DB_CONNECT_TIMEOUT"], os.environ["DB_READ_TIMEOUT"], os.environ["DB_WRITE_TIMEOUT"]), ("5", "900", "0"))
+
+    def test_timeout_errors_are_connection_loss(self) -> None:
+        from db_engine.mariadb_connection import _is_connection_lost
+        from db_engine.mariadb_support import _DRIVER_CONN_ERRORS, _DRIVER_TIMEOUT_ERRORS
+        from db_engine.errors import translate_mysql_error
+
+        self.assertTrue(_DRIVER_TIMEOUT_ERRORS, "mysql-connector exposes Read/WriteTimeoutError")
+        for cls in _DRIVER_TIMEOUT_ERRORS:
+            exc = cls()
+            self.assertTrue(_is_connection_lost(exc), cls.__name__)
+            self.assertIsInstance(exc, _DRIVER_CONN_ERRORS)
+            self.assertIsInstance(translate_mysql_error(exc), ConnectionLostError)
+
+    def test_read_timeout_reconnects_and_reads_again(self) -> None:
+        from db_engine.mariadb_support import _DRIVER_TIMEOUT_ERRORS
+
+        timeout_cls = next(c for c in _DRIVER_TIMEOUT_ERRORS if c.__name__ == "ReadTimeoutError")
+        db = MariaDB.__new__(MariaDB)
+        db._pid = os.getpid()
+        db._in_txn = False
+        old_cnx = MagicMock()
+        db.cnx, db._cur = old_cnx, MagicMock()
+        db._last_ok = 1e18                                  # trusted: no ping before the read
+        new_cnx = MagicMock()
+        new_cnx.cursor.return_value.fetchone.return_value = (1,)
+        db.connect_sql = MagicMock(return_value=new_cnx)
+        db._init_session = MagicMock()
+        db._cur.execute.side_effect = timeout_cls()
+        with unittest.mock.patch.dict(os.environ, {"SSH_TUNNEL_ENABLED": "false"}), \
+                self.assertLogs("db_engine", level="WARNING"):
+            self.assertEqual(db._fetch_one("SELECT 1"), (1,))
+        old_cnx.close.assert_called_once()                  # the timed-out connection is dropped, not reused
+        self.assertIs(db.cnx, new_cnx)
+
+    def test_reconnect_restarts_dead_tunnel_and_follows_its_port(self) -> None:
+        db = MariaDB.__new__(MariaDB)
+        db._pid = os.getpid()
+        db._in_txn = False
+        db.cnx = db._cur = None
+        db.host, db.port = "127.0.0.1", 40000
+        db.connect_sql = MagicMock(return_value=MagicMock())
+        db._init_session = MagicMock()
+        with unittest.mock.patch.dict(os.environ, {"SSH_TUNNEL_ENABLED": "true"}), \
+                unittest.mock.patch("core.ssh_tunnel.ensure_ssh_tunnel", return_value=40100) as ensure, \
+                self.assertLogs("db_engine", level="WARNING"):
+            db._reconnect()
+        ensure.assert_called_with("database")
+        self.assertEqual(db.port, 40100)
+        self.addCleanup(db._release_if_inherited)
+
+    def test_long_statement_raises_and_restores_read_timeout(self) -> None:
+        db = MariaDB.__new__(MariaDB)
+        db.cnx = MagicMock()
+        db.cnx.read_timeout = 600
+        db.long_read_timeout = 7200
+        with db._long_statement():
+            self.assertEqual(db.cnx.read_timeout, 7200)
+        self.assertEqual(db.cnx.read_timeout, 600)
+        db.long_read_timeout = None                         # DB_LONG_READ_TIMEOUT=0: no bound
+        with db._long_statement():
+            self.assertIsNone(db.cnx.read_timeout)
+        self.assertEqual(db.cnx.read_timeout, 600)
+
+    def test_raw_execute_runs_as_long_statement(self) -> None:
+        db = MariaDB.__new__(MariaDB)
+        db._pid = os.getpid()
+        db._in_txn = False
+        db._last_ok = 1e18
+        db.read_only = False
+        db.cnx, db._cur = MagicMock(), MagicMock()
+        db.cnx.read_timeout = 600
+        db.long_read_timeout = 7200
+        seen: list = []
+        db.cnx.cursor.return_value.execute.side_effect = lambda *a: seen.append(db.cnx.read_timeout)
+        db.cnx.cursor.return_value.with_rows = False
+        db.cnx.cursor.return_value.rowcount = 3
+        self.assertEqual(db._raw_execute("DELETE FROM t"), 3)
+        self.assertEqual(seen, [7200])
+        self.assertEqual(db.cnx.read_timeout, 600)
+
+
 _generate_engine_test_classes()
 
 
