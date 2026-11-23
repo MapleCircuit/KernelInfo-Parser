@@ -46,6 +46,7 @@ Enforce the invariants loaded from `webapp/AGENTS.md` (read-only DB, git/path/SQ
 3. **Targeted Verification**:
    - Backend: `python3 -m unittest tests/test_webapp_<feature>.py`
    - Frontend: `node --test webapp/frontend/tests/<feature>.test.mjs`
+   - Real browser (UI behavior unit tests cannot see: iframes, exports, focus): headless Firefox scripts in `webapp/frontend/tests/e2e/` (`README.md` there; reuse `webdriver_bidi.mjs`).
 4. **Documentation Sync**:
    - Update `webapp/API.md` (architecture/services), `webapp/API_ENDPOINTS.md` (REST endpoints), or `webapp/API_FRONTEND.md` (frontend views) in declarative present-tense.
 5. **Final Gate**:

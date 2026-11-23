@@ -336,6 +336,10 @@
 }
 
 .nm-head-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+/* tab node mode (Keep changes / Frozen) and its Reset; a dot when the frozen tab was changed since */
+.nm-head-btn.nm-tab-mode.on { color: var(--accent-cyan); background: color-mix(in srgb, var(--accent-cyan) 14%, transparent); }
+.nm-head-btn.nm-tab-reset.nm-dirty { color: var(--accent-orange); }
+.nm-insp-seg .nodemap-btn[aria-pressed="true"] { border-color: var(--accent-cyan); }
 
 .nm-node-body {
   flex: 1;

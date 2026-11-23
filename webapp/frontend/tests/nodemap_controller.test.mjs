@@ -838,7 +838,7 @@ test("embedded sessions: tab iframes join one; the canvas follows its Kconfig en
   assert.equal(t.data.embedSessionId, "nms-1");
   const body = { innerHTML: "", querySelector: () => null };
   c.renderBody(t, body);
-  assert.match(body.innerHTML, /\?embed=1&amp;embedSession=tab-1%3Anms-1#tab=kconfig/, "the iframe joins the canvas-scoped session");
+  assert.match(body.innerHTML, /\?embed=1&amp;embedSession=tab-1%3Anms-1&amp;embedNode=[\w-]+#tab=kconfig/, "the iframe joins the canvas-scoped session and reports to its node");
   // Inspector: a second session, the tab moved to it, the canvas following it
   c.selected = new Set();
   c.onInspectorClick({ target: { closest: () => ({ dataset: { insp: "es-add" } }) } });

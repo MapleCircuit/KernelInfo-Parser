@@ -125,11 +125,10 @@ test("exportPNG: the SVG is rendered at the target pixels (never a 1× bitmap up
       canvasSvg: (o) => (calls.push(o), `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.floor(400 * (o.pixelScale || 1))}" height="${Math.floor(300 * (o.pixelScale || 1))}" viewBox="0 0 400 300"></svg>`),
       download: (name, blob) => downloads.push([name, blob]),
     };
-    const size = exportPNG(ctrl, { scale: 3 });
-    await settle();
-    assert.deepEqual(size, pngSize(400, 300, 3));
+    const size = await exportPNG(ctrl, { scale: 3 });
+    assert.deepEqual({ ...size, report: undefined }, { ...pngSize(400, 300, 3), report: undefined });
     assert.equal(calls[1].pixelScale, 3, "rasterized from an SVG sized 3× (same viewBox)");
-    assert.equal(calls[1].foreign, true, "the live snapshots are tried first");
+    assert.equal(calls[1].foreign, false, "live nodes come as per-node rasters, never one all-or-nothing foreignObject image");
     const cv = made.canvases.at(-1);
     assert.deepEqual([cv.width, cv.height], [1200, 900]);
     assert.deepEqual(cv.drawn.slice(1), [0, 0, 1200, 900], "drawn once at the output size");
@@ -150,8 +149,7 @@ test("exportPNG: a canvas the browser cannot allocate steps the factor down inst
       canvasSvg: (o) => (calls.push(o), `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.floor(400 * (o.pixelScale || 1))}" height="${Math.floor(300 * (o.pixelScale || 1))}" viewBox="0 0 400 300"></svg>`),
       download: (name) => downloads.push(name),
     };
-    exportPNG(ctrl, { scale: 4 });
-    await settle();
+    await exportPNG(ctrl, { scale: 4 });
     assert.deepEqual(calls.filter((o) => o.pixelScale).map((o) => o.pixelScale), [4, 2, 1], "halved until the canvas fits");
     assert.deepEqual(downloads, ["nodemap_canvas.png"]);
     assert.deepEqual([made.canvases.at(-1).width, made.canvases.at(-1).height], [400, 300]);
@@ -160,18 +158,21 @@ test("exportPNG: a canvas the browser cannot allocate steps the factor down inst
   }
 });
 
-test("exportPNG: an image that refuses the DOM snapshots is rendered again with placeholders", async () => {
-  const { restore } = pngHarness({ imageFails: (n) => n === 1 });
+test("exportPNG: a live node with nothing readable keeps its placeholder card (one render, no rasters)", async () => {
+  const { restore } = pngHarness();
   try {
     const calls = [];
     const downloads = [];
     const ctrl = {
-      canvasSvg: (o) => (calls.push(o), `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">${o.foreign ? "<foreignObject/>" : ""}</svg>`),
+      canvas: { ...M.emptyCanvas(), nodes: [M.createNode("tab", { id: "t1", data: { tabType: "code", hash: "tab=code" } })] },
+      renderer: { element: () => null },
+      canvasSvg: (o) => (calls.push(o), `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">${o.rasters?.({ id: "t1" }) ? '<image href="x"/>' : ""}</svg>`),
       download: (name) => downloads.push(name),
     };
-    exportPNG(ctrl, { scale: 1 });
-    await settle();
-    assert.deepEqual(calls.slice(1).map((o) => o.foreign), [true, false]);
+    const env = { createCanvas: () => null, loadImage: async () => ({}), toDataURL: () => "" };
+    const res = await exportPNG(ctrl, { scale: 1, env });
+    assert.deepEqual(res.report.placeholder, ["t1"], "nothing mounted: the node stays a placeholder");
+    assert.deepEqual(calls.slice(1).map((o) => Boolean(o.rasters)), [false], "no raster: the canvas renders once, without");
     assert.deepEqual(downloads, ["nodemap_canvas.png"]);
   } finally {
     restore();
@@ -189,8 +190,7 @@ test("exportPNG: a vector-only SVG goes to the worker's OffscreenCanvas at the o
       workerPool: { workerSupported: true, rasterizePng: async (j) => (jobs.push(j), { blob: { size: 1 } }) },
       download: (name) => downloads.push(name),
     };
-    exportPNG(ctrl, { scale: 2 });
-    await settle();
+    await exportPNG(ctrl, { scale: 2 });
     assert.deepEqual(jobs.map((j) => [j.width, j.height]), [[400, 200]]);
     assert.match(jobs[0].svg, /width="400" height="200"/);
     assert.deepEqual(downloads, ["nodemap_canvas.png"]);

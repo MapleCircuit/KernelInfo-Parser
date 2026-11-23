@@ -57,6 +57,24 @@ export function renderInspector(ctrl) {
     const state = n === 0 ? "off" : n === list.length ? "on" : "mixed";
     return `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" data-tri="${state}" ${state === "on" ? "checked" : ""} aria-checked="${state === "mixed" ? "mixed" : state === "on"}"/> <span>${escapeHtml(`${label} (${list.length})`)}</span></label>`;
   };
+  // Keep changes vs Frozen of tab nodes (`nodemap_tab_sync.js`): pressed buttons, both unpressed when mixed
+  const tabModeField = (list) => {
+    const frozenN = list.filter((x) => x.data.frozen).length;
+    const mode = frozenN === 0 ? "keep" : frozenN === list.length ? "frozen" : "mixed";
+    const many = list.length > 1;
+    const label = many ? `Tab changes (${list.length}${mode === "mixed" ? ", mixed" : ""})` : "Tab changes";
+    const dirty = list.some((x) => ctrl.tabLive?.get(x.id)?.dirty);
+    const note = mode === "keep"
+      ? "Navigation, scroll and view state inside the tab are saved with the canvas."
+      : mode === "frozen"
+        ? `Changes inside the tab are not saved: it comes back as frozen${dirty ? " (changed since: Reset to go back now)" : ""}.`
+        : "Some of the selected tabs are frozen.";
+    return `<div class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span><div class="nm-insp-inline nm-insp-seg" role="group" aria-label="Tab changes">` +
+      `<button type="button" class="nodemap-btn" data-insp="tab-keep" aria-pressed="${mode === "keep"}" title="Save what changes inside the tab (its navigation, scroll and view state) with the canvas">Keep changes</button>` +
+      `<button type="button" class="nodemap-btn" data-insp="tab-freeze" aria-pressed="${mode === "frozen"}" title="Freeze the tab as it is now: later changes inside it are not saved and are reset">❄ Frozen</button>` +
+      `${frozenN ? `<button type="button" class="nodemap-btn" data-insp="tab-reset" title="Reload the frozen tab${many ? "s" : ""} at the frozen state">↺ Reset</button>` : ""}` +
+      `</div><span class="inspector-val nm-hint">${escapeHtml(note)}</span></div>`;
+  };
   const layoutRow = (what) => `<div class="inspector-field"><span class="inspector-label">Auto-Layout${what ? ` · ${escapeHtml(what)}` : ""}</span><div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="layout-dag">DAG (Sugiyama)</button><button type="button" class="nodemap-btn" data-insp="layout-force">Force-Directed</button></div></div>`;
   const timeTravel = (scoped) => {
     const t = ctrl.versionDiffTarget;
@@ -116,6 +134,8 @@ export function renderInspector(ctrl) {
       const one = new Set(revs).size === 1 ? revs[0] : "";
       html += `<div class="inspector-field"><span class="inspector-label">${escapeHtml(`Revision (${revs.length} of ${nodes.length})`)}</span><div class="nm-insp-inline">${verInput("multi-version", one, `spellcheck="false" placeholder="${one ? "" : "mixed"}" title="Moves every selected node with a revision (one undo step)"`)}<button type="button" class="nodemap-btn" data-insp="multi-version-apply" title="Move every selected node with a revision to this one (one undo step)">Apply</button></div></div>`;
     }
+    const tabNodes = nodes.filter((n) => n.type === "tab");
+    if (tabNodes.length) html += tabModeField(tabNodes);
     const structs = nodes.filter((n) => n.type === "struct");
     if (structs.length) {
       const styles = new Set(structs.map((n) => n.data.style));
@@ -193,7 +213,8 @@ export function renderInspector(ctrl) {
       html += `<div class="inspector-field"><span class="inspector-label">Embedded ${escapeHtml(d.tabType)} tab</span><span class="inspector-val">#${escapeHtml(d.hash)}</span></div>`;
       const sess = M.embedSessionOf(ctrl.canvas, n);
       html += row("Embedded session", sel("d-embedSessionId", sess.id, st.embedSessions.map((x) => x.id), st.embedSessions.map((x) => x.name)));
-      html += `<div class="inspector-field"><span class="inspector-label">Runs isolated in this NodeMap's session "${escapeHtml(sess.name)}": tabs of one session share their Kconfig engines; nothing is saved and no workspace session sees it. Click it to interact; Esc or a click on the canvas gives the pointer back.</span></div>`;
+      html += tabModeField([n]);
+      html += `<div class="inspector-field"><span class="inspector-label">Runs isolated in this NodeMap's session "${escapeHtml(sess.name)}": tabs of one session share their Kconfig engines and no workspace session sees it. Click it to interact; Esc or a click on the canvas gives the pointer back.</span></div>`;
     } else if (n.type === "diff") {
       html += row("Show", sel("d-mode", d.mode, M.DIFF_MODES, ["one file between two revisions", "a commit"]));
       if (d.mode === "commit") html += row("Commit", input("d-commitHash", d.commitHash, 'spellcheck="false"'));
@@ -560,6 +581,11 @@ export function onInspectorClick(ctrl, e) {
   else if (k === "bg" || k === "bg-reset") ctrl.setBackground(k === "bg" ? btn.dataset.value || "" : "");
   else if (k === "canvas-bg" || k === "canvas-bg-reset") ctrl.setCanvasBackground(k === "canvas-bg" ? btn.dataset.value || "" : "");
   else if (k === "duplicate") ctrl.duplicateSelection();
+  else if (k === "tab-keep" || k === "tab-freeze") ctrl.setTabsFrozen([...ctrl.selected], k === "tab-freeze");
+  else if (k === "tab-reset") {
+    for (const x of ctrl.selectedNodes()) if (x.type === "tab" && x.data.frozen) ctrl.resetTabNode(x.id);
+    ctrl.renderInspector();
+  }
   else if (k === "show-hidden" && node) ctrl.onStructAction(node, "show-hidden");
   else if (k === "node-lock-add" && node) {
     if (M.addNodeLock(node, { kind: "spinlock" })) {

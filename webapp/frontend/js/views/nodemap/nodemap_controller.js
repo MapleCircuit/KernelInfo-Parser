@@ -40,6 +40,7 @@ import {
   showAddMenu, showExportMenu, specFromForm,
 } from "./nodemap_dialogs.js";
 import { canvasToSvg, captureNodeForeignObject } from "./nodemap_export.js";
+import { prepareTabFrames } from "./nodemap_png.js";
 import {
   attachCanvasEvents, beginEdgeLabelEdit, beginNoteEdit, beginTitleEdit, clearAlignmentGuides,
   clearTextSelection, expandBlameToNodes, expandCallPath, expandCallgraph, expandKconfigRelations, expandStructTypes, expandThreadToNodes, expandableTypesOf,
@@ -57,6 +58,10 @@ import {
 } from "./nodemap_persistence.js";
 import { layoutGraphJob } from "./nodemap_worker.js";
 import { renderStructBody } from "./struct_view.js";
+import {
+  flushPendingHellos, frameDisposed, frameMounted, keepLiveOnRestore, onTabFrameMessage, reconcileFrozenTabs, resetDirtyFrozenTabs, resetTabNode,
+  setTabsFrozen, tabKeyData,
+} from "./nodemap_tab_sync.js";
 import { NodeMapTourPlayer } from "./tour_mode.js";
 import { applyCanvasVersion, captureVersions, diffStructLayouts, renderStructDiffBadge, retargetNodeVersions, revertCanvasVersion } from "./version_diff.js";
 import { VIRTUAL_THRESHOLD, estimateNaturalSourceSize, mountVirtualDiff, mountVirtualSource, visibleCanvasRect } from "./virtual_source.js";
@@ -148,6 +153,12 @@ export class NodeMapController {
     this._seededAtMount = false;
     this._incomingAtMount = [];
     this._userEdited = false;
+    // TabsComponent keeps this view's DOM (and its tab iframes) mounted while another tab is shown
+    // (`components/tabs.js` keep-alive hosts): `render()` shows it again, `onHidden()` parks it
+    this.keepAlive = true;
+    this.hidden = false;
+    this.tabLive = new Map(); // tab node id -> live frame record (nodemap_tab_sync.js liveOf())
+    this._storeLoading = false;
     this.channelFactory = (name) => (typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(name) : null);
     this.kconfigSource = {
       list: () => (typeof state.kconfigEngineList === "function" ? state.kconfigEngineList() : []),
@@ -174,17 +185,26 @@ export class NodeMapController {
       this.history.reset(M.structuralSnapshot(this.canvas));
     }
     if (this.rootEl) {
-      containerEl.innerHTML = "";
-      containerEl.appendChild(this.rootEl);
+      // Shown again: the mounted DOM stays where it is (moving an iframe in the document reloads it)
+      if (this.rootEl.parentNode !== containerEl) {
+        containerEl.innerHTML = "";
+        containerEl.appendChild(this.rootEl);
+      }
+      const wasHidden = this.hidden;
+      this.hidden = false;
+      if (wasHidden) this.portOffsets.clear();
       this.subscribe();
       this.consumeIncoming(tabData);
       this.applyTransform();
       this.renderBreadcrumbs();
       this.minimap?.render();
       for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
+      // Frozen tab nodes changed while the tab was away come back at their frozen state
+      if (wasHidden) resetDirtyFrozenTabs(this);
       this.commit({ save: false, record: true });
       return;
     }
+    this.hidden = false;
     this.renderer?.clear();
     this.mounts.clear();
 
@@ -206,6 +226,7 @@ export class NodeMapController {
       headTools: (node, active) => this.headTools(node, active),
       headMeta: (node) => this.headMeta(node),
       bodyKey: (node) => this.bodyKey(node),
+      keyData: (node) => (node.type === "tab" ? tabKeyData(this, node) : undefined),
     });
 
     this.attachToolbar();
@@ -225,7 +246,15 @@ export class NodeMapController {
   }
 
   _hasIndexedDbBackend() { return hasIndexedDbBackend(this); }
-  loadFromIndexedDB() { return loadFromIndexedDB(this); }
+  loadFromIndexedDB() {
+    // Live tab state written meanwhile waits for the stored canvas (a save now would overwrite it)
+    this._storeLoading = true;
+    const done = () => {
+      this._storeLoading = false;
+      flushPendingHellos(this);
+    };
+    return Promise.resolve(loadFromIndexedDB(this)).finally(done);
+  }
   scheduleSave() { return scheduleSave(this); }
   flushSave() { return flushSave(this); }
   embedKey(sessionId) { return embedKey(this, sessionId); }
@@ -249,6 +278,23 @@ export class NodeMapController {
   exportDot(opts) { return exportDot(this, opts); }
   exportPNG(opts) { return exportPNG(this, opts); }
   importJSON(file) { return importJSON(this, file); }
+  onTabFrameMessage(e) { return onTabFrameMessage(this, e); }
+  setTabsFrozen(ids, frozen) { return setTabsFrozen(this, ids, frozen); }
+  resetTabNode(id) { return resetTabNode(this, id); }
+
+  /**
+   * TabsComponent parked this view (another tab of its pane is shown): its DOM stays mounted, hidden.
+   * Interaction with a tab node ends and the canvas is saved now.
+   */
+  onHidden() {
+    if (this.hidden) return;
+    this.hidden = true;
+    this.flushSave();
+    if (this.active && this.renderer) {
+      this.active = null;
+      this.commit({ save: false, inspector: false });
+    }
+  }
 
   dispose() {
     this._disposeGen += 1;
@@ -293,6 +339,8 @@ export class NodeMapController {
     this.mailBodies.clear();
     this.versionDiffCache.clear();
     this.fitQueue.clear();
+    this.tabLive.clear();
+    this.hidden = false;
     this._incomingAtMount = [];
     this.gesture = null;
     this.renderer = null;
@@ -313,7 +361,7 @@ export class NodeMapController {
     this.unsubs = [];
     const tabId = this.tab?.id;
     const offPending = state.subscribe("nodemap:pending", ({ tabId: id } = {}) => {
-      if (id === tabId && this.containerEl?.isConnected) {
+      if (id === tabId && this.containerEl?.isConnected && !this.hidden) {
         this.consumeIncoming(state.findTab(tabId) || this.tab);
         this.commit();
       }
@@ -926,7 +974,9 @@ export class NodeMapController {
         return;
       }
       const sess = M.embedSessionOf(this.canvas, node);
-      const src = M.embedSrc(node.data.hash, typeof location !== "undefined" ? location.pathname : "/", this.embedKey(sess.id));
+      // The shell reports its navigation and view state back to this node (nodemap_tab_sync.js)
+      const src = M.embedSrc(node.data.hash, typeof location !== "undefined" ? location.pathname : "/", this.embedKey(sess.id), node.id);
+      frameMounted(this, node);
       body.innerHTML = `<div class="nm-tabframe">
           <iframe class="nm-iframe" src="${escapeHtml(src)}" title="${escapeHtml(M.displayTitle(node))}" loading="lazy" referrerpolicy="same-origin"></iframe>
           <button type="button" class="nm-shield" data-act="interact" title="Click to interact with this tab (Esc or a click on the canvas leaves it)">Click to interact</button>
@@ -935,7 +985,10 @@ export class NodeMapController {
       if (frame) {
         applyFrameSupersample(frame, M.iframeSupersample(this.canvas.settings.renderQuality, this.zoom, node.scale));
         // Each load starts a new document: it takes the current factor again
-        frame.addEventListener?.("load", () => applyFrameSupersample(frame, Number(frame.dataset?.ss) || 1, { force: true }));
+        frame.addEventListener?.("load", () => {
+          // a PNG export reads it at 1× meanwhile (it puts the factor back when done)
+          if (!this._exportingFrames) applyFrameSupersample(frame, Number(frame.dataset?.ss) || 1, { force: true });
+        });
       }
     } else if (["diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit"].includes(node.type)) {
       const prevScroll = body.querySelector(".nm-scroll")?.scrollTop || 0;
@@ -990,6 +1043,7 @@ export class NodeMapController {
   }
 
   disposeBody(id) {
+    frameDisposed(this, id);
     const m = this.mounts.get(id);
     if (m?.dispose) m.dispose();
     this.mounts.delete(id);
@@ -1207,7 +1261,18 @@ export class NodeMapController {
         ? b("toggle-header", "◫", "Header hidden in View Mode: click to show it again")
         : b("toggle-header", "▔", "Hide this header in View Mode (Edit Mode keeps it, dimmed)");
     }
-    if (node.type === "tab") s += active ? b("interact", "✓", "Done interacting (Esc)") : b("interact", "⤢", "Interact with the embedded tab");
+    if (node.type === "tab") {
+      s += active ? b("interact", "✓", "Done interacting (Esc)") : b("interact", "⤢", "Interact with the embedded tab");
+      const frozen = Boolean(node.data.frozen);
+      const title = frozen
+        ? "Frozen: what you change inside this tab is not saved and is reset when you come back. Click to keep changes"
+        : "Keep changes: navigation, scroll and view state inside this tab are saved with the canvas. Click to freeze it as it is now";
+      s += `<button type="button" class="nm-head-btn nm-tab-mode${frozen ? " on" : ""}" data-act="tab-freeze" aria-pressed="${frozen}" aria-label="Frozen" title="${escapeHtml(title)}">${frozen ? "❄" : "✎"}</button>`;
+      if (frozen) {
+        const dirty = Boolean(this.tabLive.get(node.id)?.dirty);
+        s += `<button type="button" class="nm-head-btn nm-tab-reset${dirty ? " nm-dirty" : ""}" data-act="tab-reset" title="${escapeHtml(dirty ? "Reset to the frozen state (changed since)" : "Reset to the frozen state")}">↺</button>`;
+      }
+    }
     if (node.type === "symbol") s += b("expand", node.data.expanded ? "−" : "+", node.data.expanded ? "Collapse members" : "Expand members");
     if (node.type === "mail") s += b("mail-expand", "⇶", "Expand Thread to Nodes: one connected node per message");
     if (node.type === "kconfig") s += b("kc-expand", "⇶", "Expand Relations: add or connect every related symbol");
@@ -1303,6 +1368,8 @@ export class NodeMapController {
       return fresh.map((x) => {
         const cur = byId.get(x.id);
         if (!cur) return x;
+        // a Keep-changes tab node keeps what its frame shows now (its navigation is not an undo step)
+        keepLiveOnRestore(this, cur, x);
         for (const k of Object.keys(cur)) if (!(k in x)) delete cur[k];
         return Object.assign(cur, x);
       });
@@ -1311,6 +1378,7 @@ export class NodeMapController {
     this.canvas.edges = reuse(this.canvas.edges, doc.edges);
     if (Array.isArray(doc.tours)) this.canvas.tours = doc.tours;
     this.canvas.settings = { ...doc.settings, editMode: st.editMode, snap: st.snap };
+    reconcileFrozenTabs(this);
     for (const n of this.canvas.nodes) if (n.autoFit) this.fitQueue.add(n.id);
     this.syncFollowChannel();
     this.applyTransform();
@@ -1420,7 +1488,7 @@ export class NodeMapController {
    * keeps its layout and pointer mapping but rasterizes `k ×` the pixels. Applied in place (no reload).
    */
   applyRenderQuality() {
-    if (!this.renderer?.element || !this.canvas) return;
+    if (!this.renderer?.element || !this.canvas || this._exportingFrames) return;
     const quality = this.canvas.settings.renderQuality || "auto";
     for (const n of this.canvas.nodes) {
       if (n.type !== "tab") continue;
@@ -2244,11 +2312,26 @@ export class NodeMapController {
     };
   }
 
+  /**
+   * Get the visible canvas's tab iframes ready for a PNG export (`nodemap_png.js` prepareTabFrames()):
+   * lazy ones load now, each awaited within a bounded timeout, supersampling off until `restore()`.
+   */
+  prepareExportFrames({ timeoutMs } = {}) {
+    const frames = [];
+    for (const n of this.canvas ? M.visibleCanvasSlice(this.canvas).nodes : []) {
+      if (n.type !== "tab") continue;
+      const frame = this.renderer?.element?.(n.id)?.querySelector?.("iframe.nm-iframe");
+      if (frame) frames.push({ id: n.id, frame });
+    }
+    return prepareTabFrames(frames, { ...(timeoutMs !== undefined ? { timeoutMs } : {}), setSupersample: (f, k) => applyFrameSupersample(f, k, { force: true }) });
+  }
+
   /** Standalone SVG of the canvas (`canvasToSvg()`), measured and snapshotted at full detail (`withExportLayout()`). */
   canvasSvg(opts = {}) {
     const fonts = { sans: resolveFont("--font-sans", "sans-serif"), mono: resolveFont("--font-mono", "monospace") };
     return this.withExportLayout(() => canvasToSvg(this.canvas, (c) => resolveColor(c), {
       ...this.svgOptions({ foreign: opts.foreign !== false }),
+      rasters: typeof opts.rasters === "function" ? opts.rasters : null,
       transparent: Boolean(opts.transparent),
       pixelScale: opts.pixelScale || 1,
       fonts,

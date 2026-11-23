@@ -13,6 +13,7 @@ import { mayCarryTab, tabDragPayload } from "../../utils/tab_drag.js";
 import * as M from "./canvas_model.js";
 import { nodeSpecsForTab } from "./nodemap_bridge.js";
 import { PNG_DEFAULT_SCALE, pngSize, svgSize } from "./nodemap_export.js";
+import { LIVE_NODE_TYPES, browserPngEnv, liveNodeRasters } from "./nodemap_png.js";
 import { canvasToDot, canvasToInteractiveHtml, canvasToMermaid } from "./nodemap_export_formats.js";
 import { collectReferencedTabIds, pruneOrphanedTabCanvases } from "./nodemap_library.js";
 
@@ -394,26 +395,55 @@ export function exportDot(ctrl, { direction = "LR" } = {}) {
 }
 
 /**
- * PNG of the whole canvas: the SVG is rendered with its `width`/`height` at the output size (`pixelScale`),
- * so vectors (and the DOM snapshots) are rasterized directly at the target pixels, never a 1× bitmap
- * upscaled. A browser canvas smaller than `pngSize()`'s limits steps the factor down (halving, with a
- * warning naming the size); a browser that refuses the snapshots (tainted canvas, image load error) gets
- * the PNG again without them (placeholder cards) and a warning.
+ * PNG of the whole canvas (async; resolves `{ w, h, scale, clamped, report }` once downloaded, null on
+ * failure). The SVG is rendered with its `width`/`height` at the output size (`pixelScale`), so vectors are
+ * rasterized directly at the target pixels, never a 1× bitmap upscaled. Live DOM nodes (`tab`, `man`,
+ * `doc`) are prepared and rasterized one by one first (`nodemap_png.js`: tab iframes loaded and read at 1×,
+ * a taint-free DOM snapshot per node, else a 2D paint of its DOM, else a placeholder card) and embedded at
+ * the same density, so one node the browser refuses never degrades the others. A browser canvas smaller
+ * than `pngSize()`'s limits steps the factor down (halving, with a note naming the size); a canvas image
+ * the browser still refuses is rendered again with placeholder cards and a warning.
  */
-export function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE } = {}) {
+export async function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE, env = null } = {}) {
   const { w, h } = svgSize(ctrl.canvasSvg({ transparent, foreign: false }));
   const first = pngSize(w, h, scale);
+  let rasters = null;
+  let report = null;
+  const live = (ctrl.canvas?.nodes || []).filter((n) => LIVE_NODE_TYPES.includes(n.type));
+  if (live.length && ctrl.renderer) {
+    const tabs = live.filter((n) => n.type === "tab").length;
+    if (tabs) toast.info(`Preparing the PNG: loading ${tabs} live tab${tabs === 1 ? "" : "s"}…`);
+    // while frames are read at 1×, zoom changes and frame loads leave their supersampling alone
+    ctrl._exportingFrames = true;
+    let prep = null;
+    try {
+      prep = typeof ctrl.prepareExportFrames === "function" ? await ctrl.prepareExportFrames() : null;
+      ({ rasters, report } = await liveNodeRasters(ctrl, first.scale, env || browserPngEnv()));
+    } finally {
+      prep?.restore?.();
+      ctrl._exportingFrames = false;
+    }
+    report.timedOut = prep?.timedOut || [];
+  }
+  const notes = [];
+  if (report?.painted.length) notes.push(`${report.painted.length} live node${report.painted.length === 1 ? " was" : "s were"} drawn from ${report.painted.length === 1 ? "its" : "their"} page text (this browser refused the snapshot)`);
+  if (report?.placeholder.length) notes.push(`${report.placeholder.length} live node${report.placeholder.length === 1 ? "" : "s"} could not be read${report.timedOut.length ? " (still loading)" : ""}: placeholder${report.placeholder.length === 1 ? "" : "s"} instead`);
+  if (notes.length) toast.warning(`PNG export: ${notes.join("; ")}`);
+  const rastersOf = rasters && [...rasters.values()].some(Boolean) ? (n) => rasters.get(n.id) || null : null;
+
   const done = (blob, size) => {
     ctrl.download("nodemap_canvas.png", blob);
     const note = size.scale < Number(scale) - 1e-9 ? ` at ${Math.round(size.scale * 100) / 100}× (reduced to the browser's canvas limit)` : "";
     toast.success(`Exported PNG image (${size.w} × ${size.h} px${note})`);
+    return { ...size, report };
   };
-  const rasterize = (foreign, size) => {
-    const svg = ctrl.canvasSvg({ transparent, foreign, pixelScale: size.scale });
+  // `withLive`: the per-node rasters embedded; a refusal of the whole image retries without them
+  const rasterize = (withLive, size) => new Promise((resolve) => {
+    const svg = ctrl.canvasSvg({ transparent, foreign: false, pixelScale: size.scale, rasters: withLive ? rastersOf : null });
     const smaller = () => {
       const next = pngSize(w, h, size.scale / 2);
       if (size.scale <= 1 || next.w * next.h >= size.w * size.h) return false;
-      rasterize(foreign, next);
+      resolve(rasterize(withLive, next));
       return true;
     };
     const drawMainThread = () => {
@@ -422,10 +452,13 @@ export function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE
       const release = () => url && URL.revokeObjectURL(url);
       const fallback = (err) => {
         release();
-        if (foreign && svg.includes("<foreignObject")) {
+        if (withLive && svg.includes("<image ")) {
           toast.warning("This browser cannot rasterize the live man page / doc / tab contents: the PNG shows placeholders for them");
-          rasterize(false, size);
-        } else toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
+          resolve(rasterize(false, size));
+        } else {
+          toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
+          resolve(null);
+        }
       };
       img.onload = () => {
         release();
@@ -435,15 +468,21 @@ export function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE
           c.height = size.h;
           const ctx = c.getContext("2d");
           if (!ctx) {
-            if (!smaller()) toast.error("PNG export failed: no canvas of that size");
+            if (!smaller()) {
+              toast.error("PNG export failed: no canvas of that size");
+              resolve(null);
+            }
             return;
           }
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = "high";
           ctx.drawImage(img, 0, 0, size.w, size.h);
           c.toBlob((blob) => {
-            if (blob) done(blob, size);
-            else if (!smaller()) toast.error("PNG export failed");
+            if (blob) resolve(done(blob, size));
+            else if (!smaller()) {
+              toast.error("PNG export failed");
+              resolve(null);
+            }
           }, "image/png");
         } catch (err) {
           fallback(err);
@@ -455,17 +494,17 @@ export function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE
       img.height = size.h;
       img.src = url || `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
     };
-    if (!svg.includes("<foreignObject") && ctrl.workerPool?.workerSupported && typeof OffscreenCanvas !== "undefined") {
+    // a vector-only canvas (no embedded rasters) decodes in the worker's OffscreenCanvas
+    if (!svg.includes("<image ") && !svg.includes("<foreignObject") && ctrl.workerPool?.workerSupported && typeof OffscreenCanvas !== "undefined") {
       ctrl.workerPool.rasterizePng({ svg, width: size.w, height: size.h }).then((res) => {
-        if (res?.blob) done(res.blob, size);
+        if (res?.blob) resolve(done(res.blob, size));
         else drawMainThread();
       }).catch(drawMainThread);
       return;
     }
     drawMainThread();
-  };
-  rasterize(true, first);
-  return first;
+  });
+  return rasterize(Boolean(rastersOf), first);
 }
 
 export function importJSON(ctrl, file) {

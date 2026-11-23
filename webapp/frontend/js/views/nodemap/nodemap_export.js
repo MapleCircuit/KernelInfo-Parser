@@ -13,7 +13,7 @@ import { arrowHeads, dashArray, edgePath, resolveEnds } from "./edge_router.js";
 import { headMetaOf, sourceLineSegments } from "./node_content.js";
 import { commitRowKey, diffRows, kconfigValue, mailBadges, mailLineClass, mailRowKey, maintainerLines, releaseRowKey, statusClass, valueClass } from "./domain_nodes.js";
 import { collectExpandableTypes, countDirectives, esc as escHtml, paholeRows, structRows } from "./struct_view.js";
-import { mixCssColors, svgPaint } from "../../utils/css_color.js";
+import { evalCssColor, formatCssColor, mixCssColors, svgPaint } from "../../utils/css_color.js";
 
 export const EXPORT_METRICS = {
   PAD: 40,
@@ -352,6 +352,8 @@ function buildSvg(canvas, resolve, opts) {
   const visCanvas = visibleCanvasSlice(canvas);
   const content = typeof opts.content === "function" ? opts.content : () => null;
   const foreignOf = typeof opts.foreign === "function" ? opts.foreign : () => null;
+  // per-node rasters of live DOM bodies (PNG export, `nodemap_png.js`): `{ href: data:image/png…, w, h }`
+  const rasterOf = typeof opts.rasters === "function" ? opts.rasters : () => null;
   const editMode = Boolean(opts.editMode);
   const structOptsOf = typeof opts.structOpts === "function" ? opts.structOpts : () => ({ editMode });
   const rowHeightsOf = typeof opts.rowHeights === "function" ? opts.rowHeights : () => null;
@@ -1678,8 +1680,13 @@ function buildSvg(canvas, resolve, opts) {
     }
     s += strip.s;
     const bid = clip(0, top, box.w, box.h - top);
-    const fo = n.type === "tab" || n.type === "man" || n.type === "doc" ? foreignOf(n) : null;
-    if (fo?.html) {
+    const live = n.type === "tab" || n.type === "man" || n.type === "doc";
+    const raster = live ? rasterOf(n) : null;
+    const rasterOk = Boolean(raster?.href) && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(raster.href) && raster.w > 0 && raster.h > 0;
+    const fo = live && !rasterOk ? foreignOf(n) : null;
+    if (rasterOk) {
+      body = `<image x="0" y="${top}" width="${r1(raster.w)}" height="${r1(raster.h)}" preserveAspectRatio="none" href="${raster.href}"/>`;
+    } else if (fo?.html) {
       const bh = Math.max(0, box.h - top);
       body = `<foreignObject x="0" y="${top}" width="${box.w}" height="${bh}"><div xmlns="http://www.w3.org/1999/xhtml" style="width:${box.w}px;height:${bh}px;overflow:hidden">${String(fo.html).replace(XML_ILLEGAL, "")}</div></foreignObject>`;
     } else if (n.type === "tab") {
@@ -1788,7 +1795,7 @@ const FO_PROPS = [
   "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
   "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
   "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
-  "background-color", "background-image", "background-size", "background-position", "background-repeat",
+  "background-color", "background-image", "background-size", "background-position", "background-repeat", "background-clip",
   "box-shadow", "outline-width", "outline-style", "outline-color", "outline-offset",
   "color", "font-family", "font-size", "font-weight", "font-style", "font-variant", "font-stretch",
   "font-feature-settings", "font-variant-numeric", "font-variant-ligatures",
@@ -1800,14 +1807,100 @@ const FO_PROPS = [
   "align-items", "align-self", "align-content", "justify-items", "justify-self", "order", "row-gap", "column-gap",
   "grid-template-columns", "grid-template-rows", "grid-auto-flow", "grid-auto-columns", "grid-auto-rows",
   "grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end", "column-count", "list-style-type",
-  "list-style-position", "table-layout", "border-collapse", "border-spacing", "tab-size",
-  "fill", "stroke", "stroke-width", "overflow-x", "overflow-y",
+  "list-style-position", "list-style-image", "table-layout", "border-collapse", "border-spacing", "tab-size",
+  "clip-path", "mask-image", "-webkit-mask-image", "filter",
+  "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width", "stroke-opacity", "stroke-dasharray", "stroke-linecap",
+  "stroke-linejoin", "stop-color", "stop-opacity", "text-anchor", "dominant-baseline", "overflow-x", "overflow-y",
 ];
-const FO_DROP_TAGS = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "frame", "object", "embed", "audio", "video"]);
+const FO_DROP_TAGS = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "frame", "object", "embed", "audio", "video", "source", "track", "base"]);
 const FO_DROP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner";
 /** Elements cloned per snapshot; a larger subtree keeps its first ones in document order (the rest is cut). */
 const FO_MAX_ELEMENTS = 20000;
 const ATTR_NAME_RE = /^(?!xmlns)[A-Za-z_][\w.-]*$/i;
+const SVG_NS = "http://www.w3.org/2000/svg";
+// Attributes that would load something or name a resource of the live document
+const FO_DROP_ATTRS = new Set(["id", "style", "srcset", "sizes", "background", "ping", "integrity", "crossorigin", "loading"]);
+// Properties whose value is a list of layers (a `url()` layer is dropped, gradients stay)
+const LAYERED_PROPS = new Set(["background-image", "mask-image", "-webkit-mask-image"]);
+// SVG properties whose `url(#id)` may point at a gradient / clip / mask / filter of the same snapshot
+const SVG_REF_PROPS = new Set(["fill", "stroke", "clip-path", "mask-image", "-webkit-mask-image", "filter"]);
+const COLOR_PROPS = new Set([
+  "color", "background-color", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+  "outline-color", "text-decoration-color", "stop-color",
+]);
+let foSeq = 0;
+
+/** Split a CSS value at its top-level commas (not inside parentheses or quotes). */
+function splitTopLevel(value) {
+  const out = [];
+  let depth = 0;
+  let quote = "";
+  let cur = "";
+  for (const ch of String(value)) {
+    if (quote) {
+      if (ch === quote) quote = "";
+    } else if (ch === "\"" || ch === "'") quote = ch;
+    else if (ch === "(") depth += 1;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (ch === "," && depth === 0) {
+      out.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+const URL_RE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/gi;
+
+/**
+ * A computed value with nothing that could taint the snapshot or point outside it: `data:` URLs stay
+ * (inlined assets), a `url(#id)` of an SVG paint / clip / mask / filter is renamed to the snapshot's copy
+ * of `id` (`ids`), any other `url()` drops its layer (layered properties) or the whole value (`null`).
+ * `var()` / `color-mix()` left in a color are evaluated (`utils/css_color.js`).
+ */
+export function sanitizeCssValue(prop, value, { ids = null, read = null } = {}) {
+  let v = String(value ?? "");
+  if (!v) return null;
+  if (/url\(/i.test(v)) {
+    const fix = (part) => {
+      let ok = true;
+      const out = part.replace(URL_RE, (m, a, b, c) => {
+        const url = String(a ?? b ?? c ?? "").trim();
+        if (/^data:/i.test(url)) return `url("${url.replace(/"/g, "%22")}")`;
+        if (url.startsWith("#") && SVG_REF_PROPS.has(prop) && ids?.has(url.slice(1))) return `url("#${ids.get(url.slice(1))}")`;
+        ok = false;
+        return m;
+      });
+      return ok ? out : null;
+    };
+    if (LAYERED_PROPS.has(prop)) {
+      const layers = splitTopLevel(v).map(fix).filter(Boolean);
+      if (!layers.length) return null;
+      v = layers.join(", ");
+    } else {
+      const fixed = fix(v);
+      if (fixed === null) {
+        // an SVG paint keeps its fallback color (`url(#x) rgb(…)`), anything else is left out
+        if (prop === "fill" || prop === "stroke") {
+          const fallback = v.replace(URL_RE, "").trim();
+          return fallback && fallback !== "none" ? fallback : null;
+        }
+        return null;
+      }
+      v = fixed;
+    }
+  }
+  if (COLOR_PROPS.has(prop) || prop === "fill" || prop === "stroke") {
+    if (/var\(|color-mix\(/i.test(v)) {
+      const c = evalCssColor(v, read);
+      return c ? formatCssColor(c) : null;
+    }
+  }
+  return v;
+}
 
 function dataUrlOf(src, doc) {
   try {
@@ -1819,15 +1912,67 @@ function dataUrlOf(src, doc) {
     c.width = src.naturalWidth;
     c.height = src.naturalHeight;
     c.getContext("2d").drawImage(src, 0, 0);
+    // throws for an image of another origin: the snapshot leaves it out instead of tainting the export
     return c.toDataURL("image/png");
   } catch {
     return null;
   }
 }
 
-function cloneStyled(src, win, budget) {
+/** An empty box of `src`'s size (an image that cannot be inlined keeps its place in the layout). */
+function blankBox(src, doc) {
+  const box = doc.createElement("span");
+  const w = src.clientWidth || src.width || 0;
+  const h = src.clientHeight || src.height || 0;
+  box.setAttribute("style", `display:inline-block;width:${w}px;height:${h}px;`);
+  return box;
+}
+
+/** Copy of `<use href="#x">`'s target (a `<symbol>` as a nested `<svg>`), for a target outside the snapshot. */
+function inlineUse(src, win, ctx) {
+  const ref = String(src.getAttribute?.("href") || src.getAttribute?.("xlink:href") || "");
+  if (!ref.startsWith("#")) return null;
+  const doc = src.ownerDocument;
+  const target = doc.getElementById?.(ref.slice(1));
+  if (!target || ctx.root?.contains?.(target) || ctx.inlining > 4) return null;
+  const isSymbol = String(target.localName || "").toLowerCase() === "symbol";
+  const out = doc.createElementNS(SVG_NS, isSymbol ? "svg" : "g");
+  const num = (a) => Number(src.getAttribute?.(a)) || 0;
+  if (isSymbol) {
+    for (const a of ["x", "y", "width", "height"]) if (src.getAttribute?.(a)) out.setAttribute(a, String(num(a)));
+    if (!src.getAttribute?.("width")) {
+      const r = src.getBoundingClientRect?.();
+      if (r?.width) out.setAttribute("width", String(Math.round(r.width)));
+      if (r?.height) out.setAttribute("height", String(Math.round(r.height)));
+    }
+    const vb = target.getAttribute?.("viewBox");
+    if (vb) out.setAttribute("viewBox", vb);
+  } else if (num("x") || num("y")) out.setAttribute("transform", `translate(${num("x")} ${num("y")})`);
+  ctx.inlining += 1;
+  try {
+    for (const child of (isSymbol ? target.childNodes : [target])) {
+      const c = cloneStyled(child, win, ctx);
+      if (c) out.appendChild(c);
+    }
+  } finally {
+    ctx.inlining -= 1;
+  }
+  return out;
+}
+
+/** Ids of the SVG elements inside `root` renamed for one snapshot (`fo<n>-<id>`): id -> new id. */
+function svgIdsOf(root) {
+  const ids = new Map();
+  const prefix = `fo${(foSeq = (foSeq + 1) % 1e6)}-`;
+  for (const el of root.querySelectorAll?.("svg [id]") || []) {
+    if (el.namespaceURI === SVG_NS && !ids.has(el.id)) ids.set(el.id, `${prefix}${el.id}`.replace(/[^\w.-]/g, "_"));
+  }
+  return ids;
+}
+
+function cloneStyled(src, win, ctx) {
   if (src.nodeType === 3) return src.cloneNode(false);
-  if (src.nodeType !== 1 || budget.n-- <= 0) return null;
+  if (src.nodeType !== 1 || ctx.n-- <= 0) return null;
   const tag = String(src.localName || "").toLowerCase();
   if (FO_DROP_TAGS.has(tag)) return null;
   try {
@@ -1838,10 +1983,15 @@ function cloneStyled(src, win, budget) {
   const cs = win.getComputedStyle(src);
   if (cs.getPropertyValue("display") === "none") return null;
   const doc = src.ownerDocument;
+  const isSvg = src.namespaceURI === SVG_NS;
+  if (isSvg && tag === "use") {
+    const inlined = inlineUse(src, win, ctx);
+    if (inlined) return inlined;
+  }
   let el;
-  if (tag === "canvas" || tag === "img") {
+  if (tag === "canvas" || (tag === "img" && !isSvg)) {
     const url = dataUrlOf(src, doc);
-    if (!url) return null;
+    if (!url) return blankBox(src, doc);
     el = doc.createElement("img");
     el.setAttribute("src", url);
     el.setAttribute("alt", "");
@@ -1849,19 +1999,43 @@ function cloneStyled(src, win, budget) {
     el.setAttribute("height", String(src.height || src.clientHeight || 0));
   } else {
     el = src.cloneNode(false);
+    const xlink = el.getAttribute?.("xlink:href");
     for (const a of [...(el.attributes || [])]) {
       const name = a.name.toLowerCase();
-      if (name.startsWith("on") || name === "id" || name === "style" || name === "srcset" || !ATTR_NAME_RE.test(a.name)) el.removeAttribute(a.name);
-      else if ((name === "src" || name === "poster") && !String(a.value).startsWith("data:")) el.removeAttribute(a.name);
+      const value = String(a.value);
+      if (isSvg && name === "id" && ctx.ids.has(value)) {
+        el.setAttribute("id", ctx.ids.get(value));
+        continue;
+      }
+      if (name.startsWith("on") || FO_DROP_ATTRS.has(name) || !ATTR_NAME_RE.test(a.name) || /var\(/i.test(value)) {
+        el.removeAttribute(a.name);
+      } else if (name === "src" || name === "poster" || (name === "href" && isSvg)) {
+        // a resource reference: inlined data only, or (SVG) an element of this snapshot
+        if (/^data:/i.test(value)) continue;
+        if (name === "href" && value.startsWith("#") && ctx.ids.has(value.slice(1))) el.setAttribute("href", `#${ctx.ids.get(value.slice(1))}`);
+        else el.removeAttribute(a.name);
+      }
+    }
+    if (xlink && isSvg && !el.getAttribute("href")) {
+      if (xlink.startsWith("#") && ctx.ids.has(xlink.slice(1))) el.setAttribute("href", `#${ctx.ids.get(xlink.slice(1))}`);
+      else if (/^data:/i.test(xlink)) el.setAttribute("href", xlink);
     }
     if (tag === "input" || tag === "textarea") el.setAttribute("value", String(src.value ?? ""));
+    // an inline SVG keeps explicit dimensions (its CSS size may come from a stylesheet left behind)
+    if (tag === "svg" && isSvg) {
+      const r = src.getBoundingClientRect?.();
+      if (r?.width && !el.getAttribute("width")) el.setAttribute("width", String(Math.round(r.width * 100) / 100));
+      if (r?.height && !el.getAttribute("height")) el.setAttribute("height", String(Math.round(r.height * 100) / 100));
+    }
   }
+  const read = (name) => cs.getPropertyValue(name);
   let style = "";
   for (const p of FO_PROPS) {
     let v = cs.getPropertyValue(p);
     if (!v) continue;
-    if (p === "background-image" && /url\(/i.test(v)) continue;
     if ((p === "overflow-x" || p === "overflow-y") && (v === "auto" || v === "scroll")) v = "hidden";
+    v = sanitizeCssValue(p, v, { ids: ctx.ids, read });
+    if (v === null) continue;
     style += `${p}:${v};`;
   }
   if (style) el.setAttribute("style", style);
@@ -1875,15 +2049,15 @@ function cloneStyled(src, win, budget) {
   // a scrolled box shows its scroll position: a block box through a shifted wrapper, a flex / grid /
   // table box (a wrapper would break its layout) by shifting each item
   const itemShift = (st || sl) && /^(flex|inline-flex|grid|inline-grid|table)/.test(cs.getPropertyValue("display"));
-  if ((st || sl) && !itemShift) {
+  if ((st || sl) && !itemShift && !isSvg) {
     host = doc.createElement("div");
     host.setAttribute("style", `transform:translate(${-sl}px,${-st}px)`);
     el.appendChild(host);
   }
   for (const child of src.childNodes) {
-    let c = cloneStyled(child, win, budget);
+    let c = cloneStyled(child, win, ctx);
     if (!c) continue;
-    if (itemShift) {
+    if (itemShift && !isSvg) {
       if (c.nodeType === 3) {
         if (!String(c.nodeValue || "").trim()) continue;
         const span = doc.createElement("span");
@@ -1900,32 +2074,81 @@ function cloneStyled(src, win, budget) {
   return el;
 }
 
+/**
+ * Standalone markup of one element (an inline `<svg>` for the PNG paint fallback, `nodemap_png.js`): a
+ * styled, taint-free copy (`cloneStyled()`), or "" when it cannot be made.
+ */
+export function snapshotElementMarkup(src, win) {
+  try {
+    if (typeof XMLSerializer === "undefined" || !win?.getComputedStyle) return "";
+    const clone = cloneStyled(src, win, { n: FO_MAX_ELEMENTS, ids: svgIdsOf(src), root: src, inlining: 0 });
+    if (!clone) return "";
+    const markup = new XMLSerializer().serializeToString(clone).replace(XML_ILLEGAL, "");
+    return isWellFormedXml(markup) ? markup : "";
+  } catch {
+    return "";
+  }
+}
+
+/** True when `markup` (an XHTML fragment) parses as XML (no `DOMParser`: assumed so). */
+export function isWellFormedXml(markup) {
+  if (typeof DOMParser === "undefined") return true;
+  try {
+    const doc = new DOMParser().parseFromString(`<root xmlns="http://www.w3.org/1999/xhtml">${markup}</root>`, "application/xml");
+    return !doc.getElementsByTagName("parsererror").length;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The body element and window a live DOM node (`tab`, `man`, `doc`) is captured from: `{ body, root, win }`,
+ * or null when nothing is mounted or loaded (a tab iframe still loading or of another origin).
+ */
+export function liveNodeRoot(node, el) {
+  const body = el?.querySelector?.(".nm-node-body");
+  if (!body) return null;
+  if (node.type === "man" || node.type === "doc") {
+    // the live page (a beautified doc node keeps the Kernel Docs layout and styles)
+    const root = body.querySelector(node.type === "man" ? ".nm-man" : ".nm-doc");
+    return root ? { body, root, win: el.ownerDocument?.defaultView || globalThis, frame: null } : null;
+  }
+  if (node.type !== "tab") return null;
+  const frame = body.querySelector("iframe");
+  let doc = null;
+  let win = null;
+  try {
+    doc = frame?.contentDocument;
+    win = frame?.contentWindow;
+  } catch {
+    return null;
+  }
+  if (!doc || !win || doc.readyState === "loading") return null;
+  const root = doc.querySelector("#workspace") || doc.body;
+  return root ? { body, root, win, frame } : null;
+}
+
+/**
+ * Snapshot of a live DOM node's body (`tab` iframe document, `man` / `doc` page) as an XHTML fragment with
+ * every computed style inlined: `{ html, w, h }` in content units, or null (nothing laid out, nothing
+ * loaded, or markup that would not parse as XML). Nothing in it loads a resource: images and canvases are
+ * inlined as `data:` URLs (one of another origin is left out as an empty box), other `url()`s are dropped,
+ * SVG ids are renamed per snapshot (their `url(#id)` / `href` references follow) and `<use>` of a sprite
+ * outside the snapshot is inlined. A supersampled tab iframe is read at 1×.
+ */
 export function captureNodeForeignObject(node, el) {
   try {
-    const body = el?.querySelector?.(".nm-node-body");
-    if (!body || typeof XMLSerializer === "undefined") return null;
-    let root = null;
-    let win = null;
-    if (node.type === "man" || node.type === "doc") {
-      // the live page (a beautified doc node keeps the Kernel Docs layout and styles)
-      root = body.querySelector(node.type === "man" ? ".nm-man" : ".nm-doc");
-      win = el.ownerDocument?.defaultView || globalThis;
-    } else if (node.type === "tab") {
-      const frame = body.querySelector("iframe");
-      const doc = frame?.contentDocument;
-      win = frame?.contentWindow;
-      if (!doc || !win || doc.readyState === "loading") return null;
-      root = doc.querySelector("#workspace") || doc.body;
-    }
-    if (!root || !win?.getComputedStyle) return null;
-    // A supersampled tab iframe (its document zoomed, `applyFrameSupersample()`) is read at 1×
+    if (typeof XMLSerializer === "undefined") return null;
+    const live = liveNodeRoot(node, el);
+    if (!live?.win?.getComputedStyle) return null;
+    const { body, root, win } = live;
     const html0 = node.type === "tab" ? root.ownerDocument?.documentElement : null;
     const zoom0 = html0?.style?.zoom || "";
     if (zoom0) html0.style.zoom = "";
-    const budget = { n: FO_MAX_ELEMENTS };
+    const ctx = { n: FO_MAX_ELEMENTS, ids: svgIdsOf(root), root, inlining: 0 };
     let clone;
     try {
-      clone = cloneStyled(root, win, budget);
+      clone = cloneStyled(root, win, ctx);
     } finally {
       if (zoom0) html0.style.zoom = zoom0;
     }
@@ -1938,7 +2161,8 @@ export function captureNodeForeignObject(node, el) {
     const base = clone.getAttribute("style") || "";
     clone.setAttribute("style", `${base}margin:0;width:${w}px;height:${h}px;max-width:none;overflow:hidden;box-sizing:border-box;${bg ? `background-color:${bg};` : ""}`);
     const html = new XMLSerializer().serializeToString(clone).replace(XML_ILLEGAL, "");
-    return { html, w, h };
+    if (!isWellFormedXml(html)) return null;
+    return { html, w, h, bg: bg || "" };
   } catch {
     return null;
   }

@@ -59,7 +59,8 @@ import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
 import "./routes.js";
 import { exportDocument, importUserDataText } from "./utils/user_records.js";
 import { THEMES, applyTheme, savedTheme } from "./utils/theme.js";
-import { EMBED_FOLLOWED_KEYS, isEmbedMode } from "./utils/embed_mode.js";
+import { EMBED_FOLLOWED_KEYS, EMBED_MSG, isEmbedMode } from "./utils/embed_mode.js";
+import { EmbedBridge } from "./components/embed_bridge.js";
 import { computeUiScale, getUiFontScale, getUiLayoutScale, scaleUiPx } from "./utils/ui_scale.js";
 
 /** Settings → Export User Data (S06): every user record as a `kip-user` JSON document. */
@@ -291,10 +292,13 @@ class KernelIdeApp {
   /**
    * Embed shell (`?embed=1`, a NodeMap tab node, `webapp/API_FRONTEND.md` §5.3.4): the workspace only, no
    * chrome, no session, no service worker or sync check, nothing persisted. The address opens its tab;
-   * theme and UI scale follow the host window.
+   * theme and UI scale follow the host window. A tab node's shell gets the node's saved view state before
+   * its tab opens and reports its navigation back (`components/embed_bridge.js`).
    */
   async initEmbed() {
     document.documentElement.classList.add("kip-embed");
+    this.embedBridge = new EmbedBridge({ state, render: () => this.tabsComponent?.render() });
+    const restoring = this.embedBridge.handshake();
     applyTypographySettings();
     window.addEventListener("storage", (e) => {
       if (!EMBED_FOLLOWED_KEYS.includes(e.key)) return;
@@ -312,7 +316,10 @@ class KernelIdeApp {
       const project = (this.projects || []).find((p) => p.repo === repo);
       return project && project.available !== false ? { repo, version: project.default_branch || "" } : { repo: "", version: "" };
     });
+    const restored = await restoring;
     urlSync.init();
+    this.embedBridge.applyRestore(restored);
+    this.embedBridge.start();
     shortcuts.setContextProvider(() => {
       const tab = state.getActiveTab();
       return { tab, tabType: tab?.type || null, view: tab ? this.tabsComponent?.perTabViews?.get(tab.id) || null : null, modal: Boolean(document.querySelector(".ki-modal-backdrop")) };
@@ -322,7 +329,7 @@ class KernelIdeApp {
     // Esc outside any dialog hands the pointer back to the NodeMap canvas holding this shell
     document.addEventListener("keydown", (e) => {
       if (e.key !== "Escape" || window.parent === window || document.querySelector(".ki-modal-backdrop, .context-menu")) return;
-      window.parent.postMessage({ type: "kip-embed-escape" }, location.origin);
+      window.parent.postMessage({ type: EMBED_MSG.escape }, location.origin);
     });
   }
 

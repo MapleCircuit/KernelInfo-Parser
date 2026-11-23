@@ -17,10 +17,11 @@ const BADGES = NODE_BADGES;
 
 /**
  * What makes a node's body stale: its payload and revision (plus `extra`, view state from outside the
- * node such as Edit Mode or a Kconfig engine), not its geometry, title or color.
+ * node such as Edit Mode or a Kconfig engine), not its geometry, title or color. `data` replaces the
+ * payload when the node keys on a projection of it (a tab node: `nodemap_tab_sync.js` tabKeyData()).
  */
-export function contentKey(node, extra = "") {
-  return JSON.stringify([node.type, node.version, node.repo, node.data, extra]);
+export function contentKey(node, extra = "", data = undefined) {
+  return JSON.stringify([node.type, node.version, node.repo, data === undefined ? node.data : data, extra]);
 }
 
 /**
@@ -43,7 +44,7 @@ export class NodeRenderer {
   /**
    * @param {HTMLElement} layer  the zoomed canvas layer
    * @param {{renderBody(node, bodyEl), disposeBody?(nodeId), headTools?(node): string,
-   *          headMeta?(node): {text, title}, bodyKey?(node): string}} hooks
+   *          headMeta?(node): {text, title}, bodyKey?(node): string, keyData?(node): any}} hooks
    */
   constructor(layer, hooks) {
     this.layer = layer;
@@ -159,7 +160,7 @@ export class NodeRenderer {
       }
       locksEl.hidden = locks.length === 0;
     }
-    const key = contentKey(node, this.hooks.bodyKey ? this.hooks.bodyKey(node) : "");
+    const key = contentKey(node, this.hooks.bodyKey ? this.hooks.bodyKey(node) : "", this.hooks.keyData ? this.hooks.keyData(node) : undefined);
     if (this.keys.get(node.id) !== key) {
       this.keys.set(node.id, key);
       const body = el.querySelector(".nm-node-body");

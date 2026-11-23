@@ -26,3 +26,8 @@ Guidelines for running and writing unit tests across the repository:
 5. **Database Fixtures (`tests/db_fixtures.py`)**:
    - The one home of test database helpers: `make_db("mock"|"sqlite", tables=..., rows=...)` (private in-memory database, optionally filled), `patch_reader(db)` (serves the webapp `get_reader()` from `db`; nests, any stop order) and `DistDB` (distributed-parsing coordination tables). Do not hand-write read-session doubles for what a `MockDB` row set can answer: `MockDB` evaluates registry views (`m_symbol_def`, `m_checkpoint_tree`) and creates tables on first use (`db_engine/DB_API.md` §2.15 "MockDB").
    - Assert on stored rows through `MockDB.store` (`{primary key: row}` per table) or the public read API, never on engine internals.
+
+6. **Real-Browser Checks (`webapp/frontend/tests/e2e/`)**:
+   - Manual end-to-end scripts against a running webapp in headless Firefox (geckodriver + WebDriver BiDi, no npm dependencies); not run by `node --test webapp/frontend/tests/*.test.mjs` or `python3 main.py -u`. How to run them, and the pitfalls (page-realm evaluation, CSP-blocked `blob:` fetches), are in `webapp/frontend/tests/e2e/README.md`.
+   - Reuse `webdriver_bidi.mjs` (`openBrowser()`, `evaluate()`, `APP_PRELUDE`) for new UI checks; `nodemap_tab_e2e.mjs` is the NodeMap tab-node / PNG-export example.
+   - The server holds database connections: stop it (and geckodriver) before running the Python suite (§2).

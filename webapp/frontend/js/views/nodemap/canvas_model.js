@@ -9,6 +9,7 @@
  * `normalizeCanvas()` produces.
  */
 import { hexOfCssColor } from "../../utils/css_color.js";
+import { EMBED_NODE_RE, normalizeEmbedViewState } from "../../utils/embed_mode.js";
 
 export const CANVAS_SCHEMA = "kip-nodemap-canvas";
 export const CANVAS_VERSION = 1;
@@ -305,6 +306,12 @@ export function normalizeData(type, raw, depth = 0) {
         hash: str(d.hash, "", 4096).replace(/^#/, ""),
         // NodeMap embedded session the iframe runs in (`""`: the canvas's first one, `embedSessionOf()`)
         embedSessionId: typeof d.embedSessionId === "string" && ID_RE.test(d.embedSessionId) ? d.embedSessionId : "",
+        // Frozen: `hash` / `viewState` stay what they were when it was frozen and the iframe's own changes
+        // are ephemeral; else (Keep changes) the iframe's navigation and view state are written back
+        frozen: d.frozen === true,
+        // view state beyond the hash (`utils/embed_mode.js` normalizeEmbedViewState): scroll positions,
+        // view-local fields; sent to the embed shell when it starts
+        viewState: normalizeEmbedViewState(d.viewState),
       };
     case "diff": {
       const mode = pick(d.mode, DIFF_MODES, d.commitHash ? "commit" : "file");
@@ -1535,12 +1542,15 @@ export function tabTypeOfHash(hash) {
 
 /**
  * URL of the isolated embed shell for a tab hash: the app with `?embed=1` (no chrome, no workspace
- * session), joined to the NodeMap embedded session `embedSession` (`&embedSession=<id>`) when given.
+ * session), joined to the NodeMap embedded session `embedSession` (`&embedSession=<id>`) and reporting to
+ * node `nodeId` (`&embedNode=<id>`) when given.
  */
-export function embedSrc(hash, base = "/", embedSession = "") {
+export function embedSrc(hash, base = "/", embedSession = "", nodeId = "") {
   // Key of the session: `<nodemap tab id>:<session id>` (utils/embed_mode.js EMBED_SESSION_RE)
   const sess = embedSession && /^[\w.:-]{1,160}$/.test(embedSession) ? `&embedSession=${encodeURIComponent(embedSession)}` : "";
-  return `${base}?embed=1${sess}#${String(hash || "").replace(/^#/, "")}`;
+  // The node the shell reports its state to (`&embedNode=<id>`, utils/embed_mode.js EMBED_MSG)
+  const node = nodeId && EMBED_NODE_RE.test(nodeId) ? `&embedNode=${encodeURIComponent(nodeId)}` : "";
+  return `${base}?embed=1${sess}${node}#${String(hash || "").replace(/^#/, "")}`;
 }
 
 /** `hiddenItems` key of the struct-wide outer conditions banner (`layout.outer_conds`). */

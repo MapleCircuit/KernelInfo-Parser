@@ -358,7 +358,8 @@ export function openImageExport(ctrl, kind) {
   const submit = () => {
     const opts = { transparent: Boolean(transEl?.checked), scale: Number(scaleEl?.value) || PNG_DEFAULT_SCALE };
     modal.close();
-    if (png) ctrl.exportPNG(opts);
+    // async (live tab iframes are loaded and rasterized first): a failure is reported, never unhandled
+    if (png) Promise.resolve(ctrl.exportPNG(opts)).catch((err) => toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`));
     else ctrl.exportSVG(opts);
   };
   q("form")?.addEventListener?.("submit", (e) => {

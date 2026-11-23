@@ -5,6 +5,7 @@
 import { api } from "../../api.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { toast } from "../../components/toast.js";
+import { EMBED_MSG } from "../../utils/embed_mode.js";
 import * as M from "./canvas_model.js";
 import { commitRowKey, fullMailBody, mailRowKey, mailThreadLayout, relationTargets, releaseRowKey } from "./domain_nodes.js";
 import { cveSpec, kapiSpec } from "./nodemap_bridge.js";
@@ -639,7 +640,13 @@ export function attachCanvasEvents(ctrl) {
     window.addEventListener("pointerup", ctrl.onWinUp);
     window.addEventListener("pointercancel", ctrl.onWinUp);
     ctrl.onMessage = (e) => {
-      if (e.origin !== location.origin || e.data?.type !== "kip-embed-escape" || !ctrl.active) return;
+      if (e.origin !== location.origin) return;
+      // embed shells reporting their state (validated against the node's own iframe there)
+      if (e.data?.type === EMBED_MSG.hello || e.data?.type === EMBED_MSG.state) {
+        ctrl.onTabFrameMessage?.(e);
+        return;
+      }
+      if (e.data?.type !== EMBED_MSG.escape || !ctrl.active) return;
       const frame = ctrl.renderer?.element(ctrl.active)?.querySelector("iframe");
       if (frame && e.source === frame.contentWindow) {
         ctrl.active = null;
@@ -797,7 +804,9 @@ export function onClick(ctrl, e) {
         // a frame still loading
       }
     }
-  } else if (act === "toggle-header") ctrl.setHeaderHidden(node.id, !node.hideHeader);
+  } else if (act === "tab-freeze" && node.type === "tab") ctrl.setTabsFrozen([node.id], !node.data.frozen);
+  else if (act === "tab-reset" && node.type === "tab") ctrl.resetTabNode(node.id);
+  else if (act === "toggle-header") ctrl.setHeaderHidden(node.id, !node.hideHeader);
   else if (act === "open-tab") ctrl.openNodeAsTab(node.id);
   else if (act === "refresh") ctrl.refreshNode(node.id);
   else if (act === "expand") ctrl.toggleExpandNode(node.id);

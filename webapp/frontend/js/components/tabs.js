@@ -26,6 +26,33 @@ const TRANSFER_GRACE_MS = 250;
 // taken it this long after, it is written into that session's stored record instead (§5.24.5).
 const PUSH_ACK_GRACE_MS = 400;
 
+/** Take `el` out of the document (no-op for null). */
+function detachEl(el) {
+  if (!el) return;
+  if (el.parentNode?.removeChild) el.parentNode.removeChild(el);
+  else el.remove?.();
+}
+
+/**
+ * Insert `el` into `parent` before `ref` (null: at the end). An element already in the document moves
+ * with `moveBefore()` where the browser has it, which keeps its iframes loaded.
+ */
+function placeBefore(parent, el, ref) {
+  if (typeof parent.insertBefore !== "function") {
+    parent.appendChild(el);
+    return;
+  }
+  if (el.isConnected && parent.isConnected && typeof parent.moveBefore === "function") {
+    try {
+      parent.moveBefore(el, ref);
+      return;
+    } catch {
+      // not movable atomically here: insert it instead
+    }
+  }
+  parent.insertBefore(el, ref);
+}
+
 export class TabsComponent {
   constructor(containerEl, viewRenderers) {
     this.container = containerEl;
@@ -33,6 +60,13 @@ export class TabsComponent {
     // whose tabs each need their own instance (kconfig: one constraint engine per tab)
     this.viewRenderers = viewRenderers;
     this.perTabViews = new Map(); // tab id -> view instance of a factory type
+    // Pane elements persist across renders (pane id -> .pane), so the content of a keep-alive view
+    // (`view.keepAlive`, the NodeMap with its live tab iframes) never leaves the document: moving or
+    // detaching an iframe reloads it. Each such tab renders into its own host (tab id -> host element),
+    // shown while the tab is active and parked (hidden, inert, still laid out) while another one is.
+    this.paneEls = new Map();
+    this.keepAliveHosts = new Map();
+    this.layoutSig = "";
 
     this.draggedTabContext = null; // { tabId, sourcePaneId, tabData }
     this.dropIndicator = null;
@@ -92,28 +126,47 @@ export class TabsComponent {
       }
     });
 
-    this.container.innerHTML = "";
     this.container.className = `split-container split-${state.splitMode}`;
+    // A new split or pane set starts with equal panes; otherwise a dragged divider keeps its place
+    const layoutSig = `${state.splitMode}|${state.panes.map((p) => p.id).join(",")}`;
+    const relayout = layoutSig !== this.layoutSig;
+    this.layoutSig = layoutSig;
+    const livePanes = new Set(state.panes.map((p) => p.id));
+    // Everything but the persistent panes is rebuilt (dividers, the first render's placeholder)
+    for (const child of [...(this.container.children || [])]) {
+      const pid = child.dataset?.paneId;
+      if (pid && this.paneEls.get(pid) === child) continue;
+      detachEl(child);
+    }
+    const order = [];
+    const shownHosts = new Set();
 
     state.panes.forEach((pane, idx) => {
       if (idx > 0) {
         const divider = document.createElement("div");
         divider.className = "pane-divider";
         this.attachDividerResize(divider, state.splitMode, idx);
-        this.container.appendChild(divider);
+        order.push(divider);
       }
 
-      const paneEl = document.createElement("div");
-      paneEl.className = "pane";
-      paneEl.dataset.paneId = pane.id;
-      if (pane.id === state.activePaneId) {
-        paneEl.classList.add("active-pane");
+      let paneEl = this.paneEls.get(pane.id);
+      if (!paneEl) {
+        paneEl = document.createElement("div");
+        paneEl.dataset.paneId = pane.id;
+        // Activated before the clicked control reacts (capture), so what a click or a context menu opens
+        // follows this pane's tab: its revision and its project (the one the shared client addresses)
+        paneEl.addEventListener("click", () => state.setActivePane(pane.id), true);
+        paneEl.addEventListener("contextmenu", () => state.setActivePane(pane.id), true);
+        this.paneEls.set(pane.id, paneEl);
+        // In the document before anything renders into it, so a host moving in keeps its iframes
+        placeBefore(this.container, paneEl, null);
       }
-
-      // Activated before the clicked control reacts (capture), so what a click or a context menu opens
-      // follows this pane's tab: its revision and its project (the one the shared client addresses)
-      paneEl.addEventListener("click", () => state.setActivePane(pane.id), true);
-      paneEl.addEventListener("contextmenu", () => state.setActivePane(pane.id), true);
+      paneEl.className = pane.id === state.activePaneId ? "pane active-pane" : "pane";
+      if (relayout && paneEl.style) paneEl.style.flex = "";
+      // The tabstrip and the content container are built anew each render; keep-alive hosts stay
+      detachEl(paneEl._kipTabstrip);
+      detachEl(paneEl._kipContent);
+      order.push(paneEl);
 
       // 1. Tabstrip
       const tabstrip = document.createElement("div");
@@ -259,16 +312,27 @@ export class TabsComponent {
         this.paneScrolls.set(pane.id, cur);
       }, { passive: true });
 
-      paneEl.appendChild(tabstrip);
+      placeBefore(paneEl, tabstrip, paneEl.firstChild || null);
+      paneEl._kipTabstrip = tabstrip;
 
       // 2. Content Container
       const contentEl = document.createElement("div");
       contentEl.className = "tab-content-container";
       contentEl.dataset.paneId = pane.id;
       this.attachContentDropTarget(contentEl, pane.id, paneEl);
+      placeBefore(paneEl, contentEl, tabstrip.nextSibling || null);
+      paneEl._kipContent = contentEl;
 
       const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
-      if (activeTab) {
+      const keepView = activeTab ? this.keepAliveViewOf(activeTab) : null;
+      if (keepView) {
+        // The tab's own host, shown in place of the content container: its DOM survives tab switches
+        contentEl.style.display = "none";
+        const host = this.keepAliveHostFor(activeTab.id, pane.id, paneEl);
+        this.showHost(host);
+        shownHosts.add(activeTab.id);
+        keepView.render(host, activeTab);
+      } else if (activeTab) {
         this.renderTabContent(contentEl, activeTab);
         // Every scrollable part of the tab comes back where it was left (§5.28)
         attachScrollMemory(contentEl, activeTab);
@@ -280,10 +344,85 @@ export class TabsComponent {
           </div>
         `;
       }
-
-      paneEl.appendChild(contentEl);
-      this.container.appendChild(paneEl);
     });
+
+    // Hosts of inactive tabs are parked in the pane holding their tab (a tab moved to another pane
+    // takes its host along; without `moveBefore()` its frames reload), then the panes that are gone are
+    // dropped, before the panes are ordered: a stale pane left in place would make a surviving pane move
+    for (const [tabId, host] of this.keepAliveHosts) {
+      const pane = state.panes.find((p) => p.tabs.some((t) => t.id === tabId));
+      if (!pane) continue;
+      const paneEl = this.paneEls.get(pane.id);
+      if (paneEl && host.parentNode !== paneEl) {
+        placeBefore(paneEl, host, null);
+        host.dataset.paneId = pane.id;
+      }
+      if (!shownHosts.has(tabId)) this.parkHost(tabId, host);
+    }
+    for (const [pid, el] of [...this.paneEls]) {
+      if (livePanes.has(pid)) continue;
+      detachEl(el);
+      this.paneEls.delete(pid);
+    }
+
+    // Panes in state order (an existing pane only moves when the order itself changed)
+    order.forEach((el, i) => {
+      const at = this.container.children?.[i];
+      if (at !== el) placeBefore(this.container, el, at || null);
+    });
+  }
+
+  // ------------------------------------------------------------------ Keep-alive views
+  /** The per-tab view of `tab` when it keeps its DOM across tab switches (`view.keepAlive`), else null. */
+  keepAliveViewOf(tab) {
+    if (typeof this.viewRenderers[tab.type] !== "function") return null;
+    const view = this.rendererFor(tab);
+    return view && view.keepAlive && typeof view.render === "function" ? view : null;
+  }
+
+  /** Host element of keep-alive tab `tabId` in pane `paneEl` (created, or moved there with its tab). */
+  keepAliveHostFor(tabId, paneId, paneEl) {
+    let host = this.keepAliveHosts.get(tabId);
+    if (!host) {
+      host = document.createElement("div");
+      host.className = "tab-content-container tab-keepalive-host";
+      host.dataset.tabId = tabId;
+      // the drop target follows the pane the host is in (dataset.paneId, closest .pane)
+      this.attachContentDropTarget(host, paneId, paneEl);
+      this.keepAliveHosts.set(tabId, host);
+    }
+    if (host.parentNode !== paneEl) placeBefore(paneEl, host, null);
+    host.dataset.paneId = paneId;
+    return host;
+  }
+
+  showHost(host) {
+    host.classList.remove("is-parked");
+    host.inert = false;
+    host.removeAttribute?.("aria-hidden");
+  }
+
+  /** Hide keep-alive host `host` of tab `tabId` (still laid out at its size) and tell its view. */
+  parkHost(tabId, host) {
+    if (host.classList.contains("is-parked")) return;
+    host.classList.add("is-parked");
+    host.inert = true;
+    host.setAttribute?.("aria-hidden", "true");
+    const view = this.perTabViews.get(tabId);
+    if (view && typeof view.onHidden === "function") view.onHidden();
+  }
+
+  /** Dispose tab `tabId`'s own view and drop its keep-alive host (closed, or moved to another project). */
+  releaseView(tabId) {
+    const view = this.perTabViews.get(tabId);
+    if (view && typeof view.dispose === "function") view.dispose();
+    this.perTabViews.delete(tabId);
+    this.viewRepos?.delete(tabId);
+    const host = this.keepAliveHosts.get(tabId);
+    if (host) {
+      detachEl(host);
+      this.keepAliveHosts.delete(tabId);
+    }
   }
 
   // ------------------------------------------------------------------ Tab Drag & Drop
@@ -460,30 +599,33 @@ export class TabsComponent {
   }
 
   attachContentDropTarget(contentEl, targetPaneId, paneEl) {
+    // A keep-alive host moves between panes with its tab: it drops into the pane it is in now
+    const paneIdNow = () => contentEl.dataset?.paneId || targetPaneId;
+    const paneElNow = () => contentEl.closest?.(".pane") || paneEl;
     contentEl.addEventListener("dragover", (e) => {
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
-      paneEl.classList.add("pane-drop-target");
+      paneElNow().classList.add("pane-drop-target");
     });
 
     contentEl.addEventListener("dragleave", (e) => {
       if (!contentEl.contains(e.relatedTarget)) {
-        paneEl.classList.remove("pane-drop-target");
+        paneElNow().classList.remove("pane-drop-target");
       }
     });
 
     contentEl.addEventListener("drop", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      paneEl.classList.remove("pane-drop-target");
+      paneElNow().classList.remove("pane-drop-target");
       this.removeDropIndicator();
 
       if (!this.draggedTabContext) {
-        this.acceptForeignTabDrop(e, targetPaneId, null);
+        this.acceptForeignTabDrop(e, paneIdNow(), null);
         return;
       }
       const { tabId, sourcePaneId, tabData } = this.draggedTabContext;
-      this.moveTabToPane(tabId, sourcePaneId, targetPaneId, null, tabData);
+      this.moveTabToPane(tabId, sourcePaneId, paneIdNow(), null, tabData);
     });
   }
 
@@ -778,7 +920,7 @@ export class TabsComponent {
     let view = this.perTabViews.get(tab.id);
     const repo = tab.repo || "";
     if (view && this.viewRepos.get(tab.id) !== repo) {
-      if (typeof view.dispose === "function") view.dispose();
+      this.releaseView(tab.id);
       view = null;
     }
     if (!view) {
@@ -792,11 +934,9 @@ export class TabsComponent {
   /** Release the views of tabs that were closed. */
   pruneTabViews() {
     const open = new Set(state.panes.flatMap((p) => p.tabs.map((t) => t.id)));
-    for (const [tabId, view] of [...this.perTabViews]) {
+    for (const tabId of [...this.perTabViews.keys(), ...this.keepAliveHosts.keys()]) {
       if (open.has(tabId)) continue;
-      if (typeof view.dispose === "function") view.dispose();
-      this.perTabViews.delete(tabId);
-      this.viewRepos?.delete(tabId);
+      this.releaseView(tabId);
     }
   }
 
