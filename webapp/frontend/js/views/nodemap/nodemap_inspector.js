@@ -10,6 +10,9 @@ import { kconfigValue } from "./domain_nodes.js";
 import { attachAutocomplete, fetchSuggestions, openFileExplorer, openVersionPicker, structKindOf, withPickHtml } from "./nodemap_pickers.js";
 import { paholeRows, structRows } from "./struct_view.js";
 import { NodeMapTourPlayer, captureTourStep, createTour, removeTourStep, reorderTourStep } from "./tour_mode.js";
+import {
+  controllerViewportSize, createTourExportState, handleTourExportClick, handleTourExportInput, tourExportPanelHtml,
+} from "./tour_export.js";
 import { revisionOf } from "./version_diff.js";
 
 /** A bulk "Expand … to Nodes" that adds more nodes than this asks first (`nodemap_gestures.js`). */
@@ -299,7 +302,12 @@ export function renderInspector(ctrl) {
       `<div class="nm-layer-row"><input type="checkbox" data-insp="layer-toggle" data-id="${escapeHtml(l.id)}" ${l.visible !== false ? "checked" : ""} aria-label="Layer visible"/><input data-insp="layer-name" data-id="${escapeHtml(l.id)}" value="${escapeHtml(l.name)}" aria-label="Layer name" spellcheck="false"/><button type="button" class="nodemap-btn nm-danger" data-insp="layer-delete" data-id="${escapeHtml(l.id)}" title="Delete layer">×</button></div>`).join("")}
       <button type="button" class="nodemap-btn" data-insp="layer-add">+ New Layer</button></div></div>`;
     html += timeTravel(false);
-    html += NodeMapTourPlayer.inspectorHtml(ctrl.canvas, ctrl.activeTourId);
+    const tours = Array.isArray(ctrl.canvas.tours) ? ctrl.canvas.tours : [];
+    const activeTour = tours.find((t) => t?.id === ctrl.activeTourId) || tours[0] || null;
+    const exportHtml = activeTour
+      ? tourExportPanelHtml(activeTour, ctrl.tourExport || (ctrl.tourExport = createTourExportState()), controllerViewportSize(ctrl))
+      : "";
+    html += NodeMapTourPlayer.inspectorHtml(ctrl.canvas, ctrl.activeTourId, exportHtml);
     const engines = ctrl.followedEngines();
     html += `<div class="inspector-field"><span class="inspector-label">NodeMap sessions</span><div class="nm-es-list">${st.embedSessions.map((x) =>
       `<div class="nm-es-row"><input data-insp="es-name" data-id="${escapeHtml(x.id)}" value="${escapeHtml(x.name)}" aria-label="Session name" spellcheck="false"/><span class="nm-es-count" title="Tab nodes running in it">${ctrl.canvas.nodes.filter((n) => n.type === "tab" && M.embedSessionOf(ctrl.canvas, n).id === x.id).length}</span>` +
@@ -418,9 +426,11 @@ export function onInspectorInput(ctrl, e, final) {
   const el = e.target.closest("[data-insp]");
   if (!el || el.tagName === "BUTTON") return;
   const k = el.dataset.insp;
+  if (ctrl.tourExporting) return;
   // A checkbox click fires `input` and then `change`: only the `change` applies it (one commit, one undo
   // step, and a toggle never runs twice)
   if (el.type === "checkbox" && !final) return;
+  if (k.startsWith("tour-export-")) return handleTourExportInput(ctrl, k, el, final);
   const val = el.type === "checkbox" ? el.checked : el.value;
   const edge = ctrl.selectedEdge ? ctrl.canvas.edges.find((x) => x.id === ctrl.selectedEdge) : null;
   const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
@@ -574,6 +584,9 @@ export function onInspectorClick(ctrl, e) {
   const btn = e.target.closest("button[data-insp]");
   if (!btn) return;
   const k = btn.dataset.insp;
+  if (k === "tour-export-cancel") return handleTourExportClick(ctrl, k, btn);
+  if (ctrl.tourExporting) return;
+  if (k.startsWith("tour-export-")) return handleTourExportClick(ctrl, k, btn);
   const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
   if (k === "pick") openInspectorPicker(ctrl, btn);
   else if (k === "edit-mode") ctrl.setEditMode(!ctrl.canvas.settings.editMode);

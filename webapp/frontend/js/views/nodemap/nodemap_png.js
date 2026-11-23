@@ -30,7 +30,7 @@ const PAINT_MAX_WORDS = 40000;
 const MIN_NODE_SCALE = 0.5;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PAINT_SKIP_TAGS = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "frame", "object", "embed", "audio", "video", "source", "track", "head", "title"]);
-const PAINT_SKIP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner";
+const PAINT_SKIP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner, .nm-tour-export-ui, [data-tour-export-ui]";
 
 /** Browser primitives of the per-node rasterization (tests pass fakes). */
 export function browserPngEnv() {

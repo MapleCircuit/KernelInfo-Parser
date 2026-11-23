@@ -175,6 +175,7 @@ export function selectEdge(ctrl, id) {
 }
 
 export function onPointerDown(ctrl, e) {
+  if (ctrl.tourExporting) return;
   const t = e.target;
   if (!t.closest(".nm-inline-edit")) ctrl.rootEl.focus({ preventScroll: true });
   const start = { x: e.clientX, y: e.clientY };
@@ -465,6 +466,7 @@ export function finishWire(ctrl, g, e) {
 }
 
 export function onDblClick(ctrl, e) {
+  if (ctrl.tourExporting) return;
   if (isTyping(e.target)) return;
   const wpEl = e.target.closest?.(".nm-edge-wp[data-edge-id]");
   if (wpEl) {
@@ -500,6 +502,10 @@ export function onDblClick(ctrl, e) {
 }
 
 export function onWheel(ctrl, e) {
+  if (ctrl.tourExporting) {
+    e.preventDefault?.();
+    return;
+  }
   const inContent = e.target.closest(".nm-scroll");
   if (inContent && !e.ctrlKey && !e.metaKey) return;
   e.preventDefault();
@@ -508,6 +514,13 @@ export function onWheel(ctrl, e) {
 }
 
 export function onKeyDown(ctrl, e) {
+  if (ctrl.tourExporting) {
+    if (e.key === "Escape") {
+      e.preventDefault?.();
+      ctrl.cancelTourFrameExport?.();
+    }
+    return;
+  }
   if (isTyping(e.target)) return;
   if (e.target.closest?.("button") && [" ", "Enter", "Delete", "Backspace"].includes(e.key)) return;
   if (ctrl.tourPlayer?.active && ctrl.tourPlayer.handleKeyDown?.(e)) return;
@@ -582,6 +595,10 @@ export function onKeyDown(ctrl, e) {
 }
 
 export function onContextMenu(ctrl, e) {
+  if (ctrl.tourExporting) {
+    e.preventDefault?.();
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
   const nodeEl = e.target.closest(".nm-node");
@@ -782,6 +799,7 @@ export function spawnFromCveDiff(ctrl, node, key) {
 }
 
 export function onClick(ctrl, e) {
+  if (ctrl.tourExporting) return;
   const btn = e.target.closest("[data-act]");
   const nodeEl = e.target.closest(".nm-node");
   if (!btn && nodeEl && e.target.closest(".nm-doc-page")) return onDocLink(ctrl, e, nodeEl);

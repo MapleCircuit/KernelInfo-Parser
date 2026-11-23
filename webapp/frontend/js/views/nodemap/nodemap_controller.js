@@ -63,6 +63,7 @@ import {
   setTabsFrozen, tabKeyData,
 } from "./nodemap_tab_sync.js";
 import { NodeMapTourPlayer } from "./tour_mode.js";
+import { cancelTourFrameExport, createTourExportState } from "./tour_export.js";
 import { applyCanvasVersion, captureVersions, diffStructLayouts, renderStructDiffBadge, retargetNodeVersions, revertCanvasVersion } from "./version_diff.js";
 import { VIRTUAL_THRESHOLD, estimateNaturalSourceSize, mountVirtualDiff, mountVirtualSource, visibleCanvasRect } from "./virtual_source.js";
 import { NodeMapWorkerPool } from "./worker_pool.js";
@@ -147,6 +148,9 @@ export class NodeMapController {
     this.searchBar = new NodeMapSearch(this);
     this.tourPlayer = new NodeMapTourPlayer(this);
     this.activeTourId = "";
+    this.tourExport = createTourExportState();
+    this._tourExportRun = null;
+    this._tourExportSeq = 0;
     this.canvasMeta = {};
     this.userDb = localDB;
     this._disposeGen = 0;
@@ -296,7 +300,16 @@ export class NodeMapController {
     }
   }
 
+  get tourExporting() {
+    return Boolean(this._tourExportRun);
+  }
+
+  cancelTourFrameExport() {
+    return cancelTourFrameExport(this);
+  }
+
   dispose() {
+    this.cancelTourFrameExport();
     this._disposeGen += 1;
     this.unregisterApplier?.();
     this.unregisterApplier = null;
@@ -784,6 +797,7 @@ export class NodeMapController {
     const tb = this.rootEl.querySelector(".nodemap-toolbar");
     const fileInput = this.rootEl.querySelector(".nm-file-input");
     tb.addEventListener("click", (e) => {
+      if (this.tourExporting) return;
       const btn = e.target.closest("[data-tb]");
       if (!btn) return;
       const act = btn.dataset.tb;
@@ -2334,6 +2348,8 @@ export class NodeMapController {
       rasters: typeof opts.rasters === "function" ? opts.rasters : null,
       transparent: Boolean(opts.transparent),
       pixelScale: opts.pixelScale || 1,
+      ...(opts.viewportBox ? { viewportBox: opts.viewportBox } : {}),
+      ...(opts.tourHighlights ? { tourHighlights: opts.tourHighlights } : {}),
       fonts,
       measure: this.textMeasurer(fonts),
     }));

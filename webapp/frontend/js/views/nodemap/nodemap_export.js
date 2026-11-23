@@ -1597,10 +1597,16 @@ function buildSvg(canvas, resolve, opts) {
     return { s: rect(0, y, w, h, { fill: C.code }) + hline(0, w, y + h - 0.5, C.rule) + inner, h };
   };
 
+  const rawHl = opts.tourHighlights;
+  const hlNodeIds = rawHl?.nodeIds instanceof Set ? rawHl.nodeIds : new Set(Array.isArray(rawHl?.nodeIds) ? rawHl.nodeIds : []);
+  const hlEdgeIds = rawHl?.edgeIds instanceof Set ? rawHl.edgeIds : new Set(Array.isArray(rawHl?.edgeIds) ? rawHl.edgeIds : []);
+  const hlActive = Boolean(rawHl && (rawHl.active ?? (hlNodeIds.size > 0 || hlEdgeIds.size > 0)));
   const rects = new Map();
   const nodeSvg = (n) => {
     const accent = R(accentVar(n.color, defaultAccent(n.type)));
     const locks = Array.isArray(n.locks) ? n.locks.filter((l) => l?.kind) : [];
+    const focused = hlActive && hlNodeIds.has(n.id);
+    const dimmed = hlActive && !focused;
     if (n.type === "group") {
       rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: n.h });
       const fill = n.bgColor ? bgOf(n.bgColor, "var(--bg-secondary)") : accent;
@@ -1616,7 +1622,9 @@ function buildSvg(canvas, resolve, opts) {
         const cid = clip(0, 0, n.w, n.h, 6);
         g += `<g clip-path="url(#${cid})">${ls.s}</g>`;
       }
-      return `${g}</g>\n`;
+      if (focused) g += rect(-3, -3, n.w + 6, n.h + 6, { stroke: C.yellow, sw: 2, rx: 8 });
+      const out = `${g}</g>\n`;
+      return dimmed ? `<g opacity="0.2">${out}</g>\n` : out;
     }
     let box = layoutBox(n);
     const headShown = !n.hideHeader || editMode;
@@ -1699,12 +1707,21 @@ function buildSvg(canvas, resolve, opts) {
     s += `<g clip-path="url(#${bid})">${body}</g>`;
     s += "</g>";
     s += rect(0, 0, box.w, box.h, { stroke: n.color ? mix(accent, C.border, 55) : C.border, rx: 6 });
-    return `${s}</g>\n`;
+    if (focused) {
+      const inv = 1 / (box.s || 1);
+      s += rect(-3 * inv, -3 * inv, box.w + 6 * inv, box.h + 6 * inv, { stroke: C.yellow, sw: 2 * inv, rx: 8 });
+    }
+    const out = `${s}</g>\n`;
+    return dimmed ? `<g opacity="0.2">${out}</g>\n` : out;
   };
 
   const ordered = paintOrder(visCanvas.nodes);
-  const groupsSvg = ordered.filter((x) => x.type === "group").map(nodeSvg).join("");
-  const nodesSvg = ordered.filter((x) => x.type !== "group").map(nodeSvg).join("");
+  const groupNodes = ordered.filter((x) => x.type === "group");
+  const leafNodes = ordered.filter((x) => x.type !== "group");
+  const orderedGroups = hlActive ? [...groupNodes.filter((x) => !hlNodeIds.has(x.id)), ...groupNodes.filter((x) => hlNodeIds.has(x.id))] : groupNodes;
+  const orderedLeaves = hlActive ? [...leafNodes.filter((x) => !hlNodeIds.has(x.id)), ...leafNodes.filter((x) => hlNodeIds.has(x.id))] : leafNodes;
+  const groupsSvg = orderedGroups.map(nodeSvg).join("");
+  const nodesSvg = orderedLeaves.map(nodeSvg).join("");
   const byId = new Map(visCanvas.nodes.map((n) => [n.id, { ...n, ...(rects.get(n.id) || {}) }]));
   const pointOf = (n, field, side) => {
     const y = field ? anchors.get(n.id)?.get(field) : undefined;
@@ -1712,7 +1729,8 @@ function buildSvg(canvas, resolve, opts) {
     const s = layoutBox(n).s;
     return { x: side === "left" ? n.x : n.x + n.w, y: n.y + y * s };
   };
-  let edgesSvg = "";
+  let edgesNormalSvg = "";
+  let edgesFocusSvg = "";
   const extra = [];
   for (const e of visCanvas.edges) {
     const a = byId.get(e.from);
@@ -1735,11 +1753,17 @@ function buildSvg(canvas, resolve, opts) {
     }
     const c = R(accentVar(e.color, "var(--accent-blue)"));
     const dash = dashArray(e.style);
-    edgesSvg += `<path d="${g.d}" fill="none"${S(c, 0.9)} stroke-width="2"${dash ? ` stroke-dasharray="${dash}"` : ""}/>\n`;
-    for (const h of heads) edgesSvg += `<polygon points="${h}"${F(c)}/>\n`;
+    const eFocused = hlActive && hlEdgeIds.has(e.id);
+    const eDimmed = hlActive && !eFocused;
+    let eSvg = `<path d="${g.d}" fill="none"${S(c, eFocused ? 1 : 0.9)} stroke-width="${eFocused ? 3.5 : 2}"${dash ? ` stroke-dasharray="${dash}"` : ""}/>\n`;
+    for (const h of heads) eSvg += `<polygon points="${h}"${F(c)}/>\n`;
     const halo = opts.transparent ? "" : `${S(C.bg)} stroke-width="4" paint-order="stroke"`;
-    if (edgeLabel) edgesSvg += `<text x="${r1(g.mid.x)}" y="${r1(g.mid.y - 6)}" text-anchor="middle"${F(C.text)}${halo} font-family="${FONT.sans}" font-size="11">${esc(edgeLabel)}</text>\n`;
+    if (edgeLabel) eSvg += `<text x="${r1(g.mid.x)}" y="${r1(g.mid.y - 6)}" text-anchor="middle"${F(C.text)}${halo} font-family="${FONT.sans}" font-size="11">${esc(edgeLabel)}</text>\n`;
+    if (eDimmed) edgesNormalSvg += `<g opacity="0.2">${eSvg}</g>\n`;
+    else if (eFocused) edgesFocusSvg += eSvg;
+    else edgesNormalSvg += eSvg;
   }
+  const edgesSvg = edgesNormalSvg + edgesFocusSvg;
 
   const nb = boundsOf([...byId.values()]) || { x: 0, y: 0, w: 400, h: 300 };
   let x1 = nb.x, y1 = nb.y, x2 = nb.x + nb.w, y2 = nb.y + nb.h;
@@ -1749,15 +1773,21 @@ function buildSvg(canvas, resolve, opts) {
     x2 = Math.max(x2, p.x);
     y2 = Math.max(y2, p.y);
   }
-  const vx = Math.floor(x1 - PAD), vy = Math.floor(y1 - PAD);
-  const vw = Math.ceil(x2 - x1 + PAD * 2), vh = Math.ceil(y2 - y1 + PAD * 2);
+  const vb = opts.viewportBox;
+  const hasVb = Boolean(vb && Number.isFinite(Number(vb.x)) && Number.isFinite(Number(vb.y)) && Number(vb.w) > 0 && Number(vb.h) > 0 && Number(vb.width) > 0 && Number(vb.height) > 0);
+  const vx = hasVb ? Number(vb.x) : Math.floor(x1 - PAD);
+  const vy = hasVb ? Number(vb.y) : Math.floor(y1 - PAD);
+  const vw = hasVb ? Number(vb.w) : Math.ceil(x2 - x1 + PAD * 2);
+  const vh = hasVb ? Number(vb.h) : Math.ceil(y2 - y1 + PAD * 2);
   const ps = Number(opts.pixelScale) > 0 ? Number(opts.pixelScale) : 1;
-  const pw = ps === 1 ? vw : Math.max(1, Math.floor(vw * ps)), ph = ps === 1 ? vh : Math.max(1, Math.floor(vh * ps));
+  const pw = hasVb ? Math.max(1, Math.round(Number(vb.width))) : (ps === 1 ? vw : Math.max(1, Math.floor(vw * ps)));
+  const ph = hasVb ? Math.max(1, Math.round(Number(vb.height))) : (ps === 1 ? vh : Math.max(1, Math.floor(vh * ps)));
+  const vbAttr = hasVb ? `${+vx.toFixed(4)} ${+vy.toFixed(4)} ${+vw.toFixed(4)} ${+vh.toFixed(4)}` : `${vx} ${vy} ${vw} ${vh}`;
   // Snap grid (Inspector → Canvas → Snap): the live canvas draws border-color dots every `grid` units
   const grid = !opts.transparent && visCanvas.settings?.snap && Number(visCanvas.settings?.grid) >= 4 ? Number(visCanvas.settings.grid) : 0;
   if (grid) defs += `<pattern id="nmgrid" x="0" y="0" width="${grid}" height="${grid}" patternUnits="userSpaceOnUse"><circle cx="${grid / 2}" cy="${grid / 2}" r="1"${F(C.border)}/></pattern>`;
   if (shadowUsed) defs += shadowDef;
-  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pw}" height="${ph}" viewBox="${vx} ${vy} ${vw} ${vh}">\n`;
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pw}" height="${ph}" viewBox="${vbAttr}"${hasVb ? ' preserveAspectRatio="xMidYMid meet"' : ""}>\n`;
   if (defs) s += `<defs>${defs}</defs>\n`;
   if (!opts.transparent) s += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}"${F(C.bg)}/>\n`;
   if (grid) s += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" fill="url(#nmgrid)"/>\n`;
@@ -1813,7 +1843,7 @@ const FO_PROPS = [
   "stroke-linejoin", "stop-color", "stop-opacity", "text-anchor", "dominant-baseline", "overflow-x", "overflow-y",
 ];
 const FO_DROP_TAGS = new Set(["script", "noscript", "style", "link", "meta", "template", "iframe", "frame", "object", "embed", "audio", "video", "source", "track", "base"]);
-const FO_DROP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner";
+const FO_DROP_SEL = ".nm-shield, .context-menu, .tooltip, .toast, .toast-container, [role='tooltip'], .loading-overlay, .spinner, .nm-tour-export-ui, [data-tour-export-ui]";
 /** Elements cloned per snapshot; a larger subtree keeps its first ones in document order (the rest is cut). */
 const FO_MAX_ELEMENTS = 20000;
 const ATTR_NAME_RE = /^(?!xmlns)[A-Za-z_][\w.-]*$/i;
@@ -2126,6 +2156,32 @@ export function liveNodeRoot(node, el) {
   if (!doc || !win || doc.readyState === "loading") return null;
   const root = doc.querySelector("#workspace") || doc.body;
   return root ? { body, root, win, frame } : null;
+}
+
+/**
+ * Taint-free XHTML snapshot of a standalone DOM element (used for compositing visible HUD overlays
+ * when exporting tour frames with Hide HUD disabled): `{ html, w, h, bg }` or null.
+ */
+export function captureElementForeignObject(el) {
+  try {
+    if (!el || typeof XMLSerializer === "undefined") return null;
+    const win = el.ownerDocument?.defaultView || globalThis;
+    if (!win?.getComputedStyle) return null;
+    const rect = el.getBoundingClientRect?.();
+    const w = Math.ceil(el.offsetWidth || rect?.width || 0);
+    const h = Math.ceil(el.offsetHeight || rect?.height || 0);
+    if (!(w > 0 && h > 0)) return null;
+    const ctx = { n: FO_MAX_ELEMENTS, ids: svgIdsOf(el), root: el, inlining: 0 };
+    const clone = cloneStyled(el, win, ctx);
+    if (!clone) return null;
+    const base = clone.getAttribute("style") || "";
+    clone.setAttribute("style", `${base}position:static;margin:0;left:auto;top:auto;right:auto;bottom:auto;transform:none;width:${w}px;height:${h}px;box-sizing:border-box;`);
+    const html = new XMLSerializer().serializeToString(clone).replace(XML_ILLEGAL, "");
+    if (!isWellFormedXml(html)) return null;
+    return { html, w, h, bg: "" };
+  } catch {
+    return null;
+  }
 }
 
 /**

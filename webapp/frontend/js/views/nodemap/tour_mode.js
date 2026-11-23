@@ -216,6 +216,7 @@ export class NodeMapTourPlayer {
   }
 
   start(tourId, startIndex = 0) {
+    if (this.controller?.tourExporting) return false;
     const tour = (this.controller?.canvas?.tours || []).find((t) => t?.id === tourId) || null;
     if (!tour) return false;
     const steps = Array.isArray(tour.steps) ? tour.steps : [];
@@ -230,6 +231,7 @@ export class NodeMapTourPlayer {
   }
 
   stop() {
+    if (this.controller?.tourExporting) return false;
     if (this._animTimer) {
       clearTimeout(this._animTimer);
       this._animTimer = null;
@@ -243,6 +245,7 @@ export class NodeMapTourPlayer {
   }
 
   step(delta) {
+    if (this.controller?.tourExporting) return false;
     const tour = this.currentTour();
     if (!tour || !Array.isArray(tour.steps) || !tour.steps.length) return false;
     const d = Number(delta) || 0;
@@ -369,12 +372,12 @@ export class NodeMapTourPlayer {
     return `Step ${index + 1}`;
   }
 
-  inspectorHtml(canvas = this.controller?.canvas, activeTourId = this.tourId || "") {
-    return NodeMapTourPlayer.inspectorHtml(canvas, activeTourId);
+  inspectorHtml(canvas = this.controller?.canvas, activeTourId = this.tourId || "", exportHtml = "") {
+    return NodeMapTourPlayer.inspectorHtml(canvas, activeTourId, exportHtml);
   }
 
   /** Render the Inspector Tours section HTML using `data-insp="tour-*"` delegation attributes. */
-  static inspectorHtml(canvas, activeTourId = "") {
+  static inspectorHtml(canvas, activeTourId = "", exportHtml = "") {
     const tours = Array.isArray(canvas?.tours) ? canvas.tours : [];
     const activeTour = tours.find((t) => t?.id === activeTourId) || tours[0] || null;
     const header = `<div class="inspector-field nm-tour-insp-head"><span class="inspector-label">Tours</span><div class="nm-insp-inline"><button type="button" class="nodemap-btn" data-insp="tour-add">+ New Tour</button></div></div>`;
@@ -423,7 +426,8 @@ export class NodeMapTourPlayer {
         <button type="button" class="nodemap-btn" data-insp="tour-capture" data-id="${esc(activeTour.id)}">+ Capture Current Step</button>
         <button type="button" class="nodemap-btn" data-insp="tour-play" data-id="${esc(activeTour.id)}"${steps.length ? "" : " disabled"}>▶ Present Tour</button>
       </div>
-      <div class="nm-es-list nm-tour-step-list">${stepsHtml}</div>`;
+      <div class="nm-es-list nm-tour-step-list">${stepsHtml}</div>
+      ${exportHtml || ""}`;
   }
 
   dispose() {
