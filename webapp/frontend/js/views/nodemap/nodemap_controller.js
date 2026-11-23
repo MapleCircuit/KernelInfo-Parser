@@ -17,7 +17,7 @@ import { escapeHtml } from "../../components/modal.js";
 import { showChangePreview } from "../../components/change_preview.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { registerSelectionVersionApplier } from "../../components/version_switch.js";
-import { resolveColor } from "../../utils/theme.js";
+import { resolveColor, resolveFont } from "../../utils/theme.js";
 import { onUiScaleChanged } from "../../utils/ui_scale.js";
 import { isDocumentationPath } from "../docs/rst_renderer.js";
 import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.js";
@@ -454,6 +454,7 @@ export class NodeMapController {
       pahole,
       diffHtml: vdiff?.badgeHtml || "",
       versionDiff: vdiff?.diff || null,
+      versionDiffRange: vdiff ? [node.version, this.versionDiffTargetOf(node)] : null,
     };
   }
 
@@ -2162,23 +2163,96 @@ export class NodeMapController {
       structOpts: (n) => this.structOpts(n),
       rowHeights: (n) => this.structRowHeights(n),
       kconfigValues: (n) => this.kconfigValuesFor(n),
+      scroll: (n) => this.scrollOf(n),
+      onCanvas: (n) => (n.type === "kconfig" ? new Set(this.canvas.nodes.filter((x) => x.type === "kconfig" && x.id !== n.id).map((x) => x.data.symbol)) : null),
       foreign: foreign ? (n) => captureNodeForeignObject(n, this.renderer?.element?.(n.id)) : null,
     };
   }
 
+  /**
+   * Live scroll position of a node's body (`.nm-scroll`, content units) and, for a mail thread, of each
+   * boxed message body in order: `{ top, boxes }`; null when nothing is mounted.
+   */
+  scrollOf(node) {
+    const body = this.renderer?.element?.(node.id)?.querySelector?.(".nm-node-body");
+    if (!body?.querySelector) return null;
+    const top = Math.max(0, Number(body.querySelector(".nm-scroll")?.scrollTop) || 0);
+    const boxes = node.type === "mail" ? [...(body.querySelectorAll?.(".nm-mail-body:not(.nm-mail-body-single)") || [])].map((el) => Math.max(0, Number(el.scrollTop) || 0)) : [];
+    return { top, boxes };
+  }
+
+  /**
+   * Run `fn` with every node laid out at full detail: viewport-culled nodes (`nm-culled`,
+   * `content-visibility: hidden`), the low-LOD layer (`nm-lod-low`, bodies hidden below 25% zoom) and
+   * `content-visibility: auto` rows (`nm-exporting`) are materialized for the synchronous measurements and
+   * DOM snapshots of an export, then restored in `finally` before the browser paints again.
+   */
+  withExportLayout(fn) {
+    const layer = this.renderer?.layer;
+    const lod = Boolean(layer?.classList?.contains?.("nm-lod-low"));
+    const culled = [];
+    for (const n of this.canvas?.nodes || []) {
+      const el = this.renderer?.element?.(n.id);
+      if (el?.classList?.contains?.("nm-culled")) culled.push(el);
+    }
+    try {
+      layer?.classList?.add?.("nm-exporting");
+      if (lod) layer.classList.remove("nm-lod-low");
+      for (const el of culled) el.classList.remove("nm-culled");
+      void layer?.offsetHeight; // lay the materialized nodes out now
+      return fn();
+    } finally {
+      layer?.classList?.remove?.("nm-exporting");
+      if (lod) layer.classList.add("nm-lod-low");
+      for (const el of culled) el.classList.add("nm-culled");
+    }
+  }
+
+  /** Live heights of a struct's (or an expanded symbol's) `.nm-sf` rows, for the export; null when not measurable. */
   structRowHeights(node) {
-    if (node.type !== "struct") return null;
-    const rows = this.renderer?.element?.(node.id)?.querySelector?.(".nm-struct-rows");
+    if (node.type !== "struct" && node.type !== "symbol") return null;
+    const rows = this.renderer?.element?.(node.id)?.querySelector?.(node.type === "symbol" ? ".nm-sym-list" : ".nm-struct-rows");
     if (!rows?.children) return null;
     const hs = [...rows.children].filter((el) => el.classList?.contains("nm-sf")).map((el) => el.offsetHeight || 0);
     return hs.length && hs.every((h) => h > 0) ? hs : null;
   }
 
+  /**
+   * Text measurer of an export: the live font stacks through a canvas 2D context (`measureText`), so
+   * wrapped text, pills and chips take the widths the DOM gives them; null without a canvas (tests).
+   */
+  textMeasurer(fonts) {
+    let ctx = null;
+    try {
+      const cv = typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(1, 1) : globalThis.document?.createElement?.("canvas");
+      ctx = cv?.getContext?.("2d") || null;
+    } catch {
+      ctx = null;
+    }
+    if (typeof ctx?.measureText !== "function") return null;
+    const cache = new Map();
+    return (text, size, mono, weight) => {
+      const font = `${weight || 400} ${size}px ${mono ? fonts.mono : fonts.sans}`;
+      const key = `${font}\u0000${text}`;
+      let w = cache.get(key);
+      if (w === undefined) {
+        if (ctx.font !== font) ctx.font = font;
+        w = ctx.measureText(text).width;
+        cache.set(key, w);
+      }
+      return w;
+    };
+  }
+
+  /** Standalone SVG of the canvas (`canvasToSvg()`), measured and snapshotted at full detail (`withExportLayout()`). */
   canvasSvg(opts = {}) {
-    return canvasToSvg(this.canvas, (c) => resolveColor(c), {
+    const fonts = { sans: resolveFont("--font-sans", "sans-serif"), mono: resolveFont("--font-mono", "monospace") };
+    return this.withExportLayout(() => canvasToSvg(this.canvas, (c) => resolveColor(c), {
       ...this.svgOptions({ foreign: opts.foreign !== false }),
       transparent: Boolean(opts.transparent),
       pixelScale: opts.pixelScale || 1,
-    });
+      fonts,
+      measure: this.textMeasurer(fonts),
+    }));
   }
 }

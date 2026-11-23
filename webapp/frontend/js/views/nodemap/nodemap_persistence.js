@@ -393,55 +393,79 @@ export function exportDot(ctrl, { direction = "LR" } = {}) {
   return text;
 }
 
+/**
+ * PNG of the whole canvas: the SVG is rendered with its `width`/`height` at the output size (`pixelScale`),
+ * so vectors (and the DOM snapshots) are rasterized directly at the target pixels, never a 1× bitmap
+ * upscaled. A browser canvas smaller than `pngSize()`'s limits steps the factor down (halving, with a
+ * warning naming the size); a browser that refuses the snapshots (tainted canvas, image load error) gets
+ * the PNG again without them (placeholder cards) and a warning.
+ */
 export function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE } = {}) {
   const { w, h } = svgSize(ctrl.canvasSvg({ transparent, foreign: false }));
-  const size = pngSize(w, h, scale);
-  const rasterize = (foreign) => {
+  const first = pngSize(w, h, scale);
+  const done = (blob, size) => {
+    ctrl.download("nodemap_canvas.png", blob);
+    const note = size.scale < Number(scale) - 1e-9 ? ` at ${Math.round(size.scale * 100) / 100}× (reduced to the browser's canvas limit)` : "";
+    toast.success(`Exported PNG image (${size.w} × ${size.h} px${note})`);
+  };
+  const rasterize = (foreign, size) => {
     const svg = ctrl.canvasSvg({ transparent, foreign, pixelScale: size.scale });
+    const smaller = () => {
+      const next = pngSize(w, h, size.scale / 2);
+      if (size.scale <= 1 || next.w * next.h >= size.w * size.h) return false;
+      rasterize(foreign, next);
+      return true;
+    };
     const drawMainThread = () => {
       const img = new Image();
+      const url = typeof URL?.createObjectURL === "function" ? URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" })) : "";
+      const release = () => url && URL.revokeObjectURL(url);
       const fallback = (err) => {
-        if (foreign) {
-          toast.warning("This browser cannot rasterize the live man page / tab contents: the PNG shows placeholders for them");
-          rasterize(false);
+        release();
+        if (foreign && svg.includes("<foreignObject")) {
+          toast.warning("This browser cannot rasterize the live man page / doc / tab contents: the PNG shows placeholders for them");
+          rasterize(false, size);
         } else toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`);
       };
       img.onload = () => {
+        release();
         try {
           const c = document.createElement("canvas");
           c.width = size.w;
           c.height = size.h;
           const ctx = c.getContext("2d");
+          if (!ctx) {
+            if (!smaller()) toast.error("PNG export failed: no canvas of that size");
+            return;
+          }
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = "high";
           ctx.drawImage(img, 0, 0, size.w, size.h);
           c.toBlob((blob) => {
-            if (!blob) return toast.error("PNG export failed");
-            ctrl.download("nodemap_canvas.png", blob);
-            toast.success(`Exported PNG image (${size.w} × ${size.h} px)`);
+            if (blob) done(blob, size);
+            else if (!smaller()) toast.error("PNG export failed");
           }, "image/png");
         } catch (err) {
           fallback(err);
         }
       };
       img.onerror = () => fallback(null);
-      img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      img.decoding = "sync";
+      img.width = size.w;
+      img.height = size.h;
+      img.src = url || `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
     };
-    if (!foreign && ctrl.workerPool?.workerSupported && typeof OffscreenCanvas !== "undefined") {
+    if (!svg.includes("<foreignObject") && ctrl.workerPool?.workerSupported && typeof OffscreenCanvas !== "undefined") {
       ctrl.workerPool.rasterizePng({ svg, width: size.w, height: size.h }).then((res) => {
-        if (res?.blob) {
-          ctrl.download("nodemap_canvas.png", res.blob);
-          toast.success(`Exported PNG image (${size.w} × ${size.h} px)`);
-        } else {
-          drawMainThread();
-        }
+        if (res?.blob) done(res.blob, size);
+        else drawMainThread();
       }).catch(drawMainThread);
       return;
     }
     drawMainThread();
   };
-  rasterize(true);
-  return size;
+  rasterize(true, first);
+  return first;
 }
 
 export function importJSON(ctrl, file) {

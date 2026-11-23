@@ -370,7 +370,7 @@ test("row anchors in the SVG export: mail and history edges leave from their row
   const p1 = edgeY("mail:p1@x");
   const r1 = edgeY("mail:r1@x");
   assert.ok(root < p1 && p1 < r1, `rows top to bottom: ${root} ${p1} ${r1}`);
-  assert.equal(p1 - root, 18 + 14, "one header line and one meta line per closed message");
+  assert.equal(p1 - root, 18, "one header line per closed message (no author / date: an empty meta line has no height)");
   const blame = c.addNode({ type: "history", data: { mode: "blame", path: "f.c" } });
   Object.assign(blame, { x: 0, y: 0, w: 300, h: 300 });
   const lines = [{ commit_hash: "aaaa1111", line: 1 }, { commit_hash: "bbbb2222", line: 2 }];
@@ -379,7 +379,7 @@ test("row anchors in the SVG export: mail and history edges leave from their row
     const canvas = { ...M.emptyCanvas(), nodes: [blame, diff], edges: [M.createEdge({ from: blame.id, to: diff.id, fromSide: "right", toSide: "left", fromField: field })] };
     return Number(/<path d="M\s*300[ ,]([\d.]+)/.exec(canvasToSvg(canvas, (x) => x, { content: (n) => c.modelOf(n) }))?.[1]);
   };
-  assert.equal(hy("commit:bbbb2222") - hy("commit:aaaa1111"), 16);
+  assert.equal(hy("commit:bbbb2222") - hy("commit:aaaa1111"), 15 + 5, "a blame row and the 5-unit flex gap");
 });
 
 // ------------------------------------------------------------------ beautified doc nodes
@@ -423,7 +423,7 @@ test("doc nodes export as a foreignObject of the live page when mounted, as a ve
   assert.doesNotMatch(vector, /<foreignObject/);
   assert.match(vector, />Intro</);
   const live = canvasToSvg(canvas, (x) => x, { content: () => model, foreign: (n) => (n.type === "doc" ? { html: '<div class="nm-doc"><h1>Intro</h1></div>', w: 400, h: 274 } : null) });
-  assert.match(live, /<foreignObject x="0" y="26" width="400" height="274"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml"[^>]*><div class="nm-doc"><h1>Intro<\/h1>/);
+  assert.match(live, /<foreignObject x="0" y="33" width="400" height="267"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml"[^>]*><div class="nm-doc"><h1>Intro<\/h1>/);
 });
 
 test("doc links in a doc node spawn connected nodes instead of leaving the page", () => {

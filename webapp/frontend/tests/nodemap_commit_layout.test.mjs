@@ -451,7 +451,7 @@ test("commit node: normalization, registries, title, model, escaped body, bridge
   assert.match(c.headTools(node, false), /data-act="commit-spawn-diff"/);
   const svg = canvasToSvg(c.canvas, (x) => x, { content: (x) => c.modelOf(x) });
   assert.match(svg, /mm: fix &lt;b&gt;races/);
-  assert.match(svg, /Signed-off-by: A/);
+  assert.match(svg, /fill="var\(--accent-green\)"[^>]*>Signed-off-by:<\/text>(<rect[^>]*\/>|<text[^>]*>[^<]*<\/text>)*<text[^>]*fill="var\(--text-secondary\)"[^>]*>A/, "trailer key green, value secondary");
 });
 
 function blameController(count) {

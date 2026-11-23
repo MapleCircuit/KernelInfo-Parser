@@ -218,6 +218,17 @@
   --kdoc-sidebar-bg: #0a0c10;
   --kdoc-code-bg: #0a0c10;
   --kdoc-rule: #7a828e;
+  --kdoc-inline-code-bg: #151b23;
+  --bg-canvas: #010409;
+  --bg-glass: rgba(10, 12, 16, 0.92);
+  --border-muted: #4a5260;
+  --text-inverse: #010409;
+  --text-on-accent: #010409;
+  --accent-pink: #ff9bce;
+  --accent-rose: #ff9492;
+  --accent-blue-strong: #91cbff;
+  --accent-green-strong: #72f088;
+  --accent-orange-strong: #ffb757;
 }
 :root[data-theme="hc-light"] {
   --bg-primary: #ffffff;

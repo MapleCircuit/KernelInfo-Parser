@@ -8,6 +8,7 @@
  * persisted JSON (IndexedDB USER_STORE, localStorage fallback, and Export JSON) always has the shape
  * `normalizeCanvas()` produces.
  */
+import { hexOfCssColor } from "../../utils/css_color.js";
 
 export const CANVAS_SCHEMA = "kip-nodemap-canvas";
 export const CANVAS_VERSION = 1;
@@ -111,18 +112,12 @@ export function bgVar(id, base = "var(--bg-secondary)") {
 }
 
 /**
- * `#rrggbb` of a resolved CSS color (`#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()` / `rgba()`), for a native
- * color input; null when it cannot be read.
+ * `#rrggbb` of a resolved CSS color (`#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()` / `rgba()` in comma or space
+ * syntax, `color-mix(in srgb, …)` of literals; `utils/css_color.js`), alpha dropped, for a native color
+ * input; null when it cannot be read.
  */
 export function colorToHex(c) {
-  const s = String(c || "").trim().toLowerCase();
-  let m = /^#([0-9a-f]{3})$/.exec(s);
-  if (m) return `#${[...m[1]].map((x) => x + x).join("")}`;
-  m = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/.exec(s);
-  if (m) return `#${m[1]}`;
-  m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/.exec(s);
-  if (m) return `#${m.slice(1, 4).map((v) => Math.max(0, Math.min(255, Math.round(Number(v)))).toString(16).padStart(2, "0")).join("")}`;
-  return null;
+  return hexOfCssColor(c);
 }
 
 /**

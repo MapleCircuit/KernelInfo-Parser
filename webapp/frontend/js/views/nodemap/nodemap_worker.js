@@ -538,7 +538,8 @@ export async function rasterizePngJob(opts = {}) {
   }
   try {
     const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
-    const bmp = await createImageBitmap(blob);
+    // decoded straight at the output size (the SVG's own width/height already are), never a 1× upscale
+    const bmp = await createImageBitmap(blob, { resizeWidth: width, resizeHeight: height, resizeQuality: "high" });
     try {
       const c = new OffscreenCanvas(width, height);
       const ctx = c.getContext("2d");

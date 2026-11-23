@@ -124,7 +124,8 @@ export class NodeRenderer {
     el.classList.toggle("nm-scaled", node.type !== "group" && Boolean(node.scale) && node.scale !== 1);
     el.classList.toggle("nm-submap-portal", node.type === "group" && Boolean(node.data?.subCanvas));
     el.classList.toggle("nm-layer-hidden", settings ? !isLayerVisible(settings, node.layerId) : false);
-    el.style?.setProperty?.("--nm-accent", accentVar(node.color, "var(--accent-blue)"));
+    // the type default (notes yellow, every other node and group blue) unless the node has an accent
+    el.style?.setProperty?.("--nm-accent", accentVar(node.color, node.type === "note" ? "var(--accent-yellow)" : "var(--accent-blue)"));
     el.classList.toggle("nm-head-hidden", Boolean(node.hideHeader));
     el.classList.toggle("nm-has-bg", Boolean(node.bgColor));
     if (node.bgColor) el.style?.setProperty?.("--nm-node-bg", bgVar(node.bgColor, "var(--bg-secondary)"));

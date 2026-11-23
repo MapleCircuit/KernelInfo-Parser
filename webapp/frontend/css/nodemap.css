@@ -161,7 +161,7 @@
   font-size: var(--fs-11, 11px);
   font-family: var(--font-sans, sans-serif);
   fill: var(--text-primary);
-  stroke: var(--bg-canvas);
+  stroke: var(--nm-canvas-bg, var(--bg-canvas));
   stroke-width: 4px;
   paint-order: stroke;
   pointer-events: visiblePainted;
@@ -509,6 +509,10 @@
   content-visibility: auto;
   contain-intrinsic-size: auto 18px;
 }
+/* An image export measures and snapshots every row at its real size (`withExportLayout()`) */
+.nm-exporting .nm-struct-rows > .nm-sf,
+.nm-exporting .nm-sym-list > .nm-sf,
+.nm-exporting .nm-mail-row { content-visibility: visible; }
 
 /* Controls column (folds, type toggle): inline in list style, a fixed column in table style */
 .nm-sf-ctl { display: contents; }
@@ -1186,7 +1190,8 @@
 .nm-vd-rem { color: var(--accent-red); background: color-mix(in srgb, var(--accent-red) 14%, transparent); }
 .nm-vd-chg { color: var(--accent-orange); background: color-mix(in srgb, var(--accent-orange) 14%, transparent); }
 .nm-vd-grd { color: var(--syn-preproc); background: color-mix(in srgb, var(--syn-preproc) 14%, transparent); }
-.nm-sf-diff-add { background: color-mix(in srgb, var(--diff-add-fg) 12%, transparent); }
+.nm-sf-diff-add,
+.nm-sf-diff-added { background: color-mix(in srgb, var(--diff-add-fg) 12%, transparent); }
 .nm-sf-diff-type,
 .nm-sf-diff-guard { background: color-mix(in srgb, var(--accent-orange) 10%, transparent); }
 

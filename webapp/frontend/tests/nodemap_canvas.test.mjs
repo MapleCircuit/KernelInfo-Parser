@@ -594,10 +594,13 @@ test("SVG export: whole canvas, struct rows and bars, folds, hidden items, scale
   assert.doesNotMatch(svg, /var\(--|<foreignObject|<image/, "pure vector, literal colors");
   assert.match(svg, /<tspan fill="#123456">b<\/tspan>/, "table rows draw their members");
   assert.doesNotMatch(svg, />a<\/tspan>/, "a hidden member is left out in View Mode");
-  assert.match(svg, />▸ <\/text><text[^>]*>#if defined\(CONFIG_B\) · 1 member/, "a Kconfig-folded branch is a summary row (chevron in the controls column)");
+  assert.match(svg, />▸ <\/text><text[^>]*>#if defined\(CONFIG_B\)<\/text>/, "a Kconfig-folded branch is a summary row (chevron in the controls column)");
+  assert.match(svg, />1 member · compiled out<\/text>/, "its member count is the .nm-sf-ppsum-label pill");
+  assert.match(svg, /fill="#123456" fill-opacity="0\.07"/, "the folded summary row carries the 7% preprocessor tint");
   assert.match(svg, /stroke-width="2"\/>/);
   assert.ok((svg.match(/stroke-opacity="0\.9"/g) || []).length > 3, "scope bars of the outer block");
-  assert.match(svg, /stroke="#ff8800"/, "custom node color");
+  assert.match(svg, /height="3" fill="#ff8800"/, "custom node color: the accent strip");
+  assert.match(svg, /rx="6" fill="none" stroke="#946227"/, "the accented border is color-mix(accent 55%, --border-color) in sRGB");
   assert.match(svg, /stroke="#00aa11"/, "custom edge color");
   assert.match(svg, /<tspan fill="#123456">&lt;<\/tspan><tspan fill="#123456">y<\/tspan>/, "source lines, escaped, as lexical tokens");
   assert.match(svg, /Live commits tab/, "a tab iframe is a placeholder card");
@@ -609,7 +612,7 @@ test("SVG export: whole canvas, struct rows and bars, folds, hidden items, scale
   const paths = [...svg.matchAll(/<path d="M (-?[\d.]+) (-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
   assert.equal(paths.length, 2);
   assert.equal(paths[0][0], 360, "on the right side of the struct");
-  assert.ok(paths[0][1] > 26 + 22 && paths[0][1] < 250, `anchored at the row of d (y=${paths[0][1]})`);
+  assert.ok(paths[0][1] > 33 + 22 && paths[0][1] < 250, `anchored at the row of d (y=${paths[0][1]})`);
   assert.equal(paths[1][1], 250, "a hidden row falls back to the side anchor");
   const edit = canvasToSvg(canvas, resolve, { editMode: true, content: (n) => payloads[n.id] || null, structOpts: () => ({ editMode: true }) });
   assert.match(edit, />a<\/tspan>/, "Edit Mode draws hidden members (dimmed)");
@@ -755,9 +758,9 @@ test("struct toolbar only in Edit Mode; the source reference is in the header", 
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [node] }, (c) => c, { content: () => LAYOUT });
   assert.match(svg, /text-anchor="end"[^>]*>include\/foo\.h:10</, "the header shows the reference");
   assert.doesNotMatch(svg, />Types</, "no toolbar in View Mode");
-  // Rows start right under the header (26) + the outer banner (16) + 2
+  // Rows start right under the header (33: live border, padding and line height) + the outer banner (16) + 2
   const first = /<text x="[\d.]+" y="([\d.]+)"[^>]*><tspan fill="var\(--syn-type\)">int /.exec(svg);
-  assert.equal(Number(first[1]), 26 + 16 + 2 + 8 + 4, "first row baseline without the toolbar");
+  assert.equal(Number(first[1]), 33 + 16 + 2 + 8 + 4, "first row baseline without the toolbar");
 });
 
 test("SVG export: headerless nodes, backgrounds, transparency, pixel scale and foreignObject snapshots", () => {
@@ -785,7 +788,7 @@ test("SVG export: headerless nodes, backgrounds, transparency, pixel scale and f
   assert.deepEqual([big.w, big.h], [w * 3, h * 3]);
   assert.match(canvasToSvg(canvas, resolve, { pixelScale: 3 }), new RegExp(`viewBox="-?\\d+ -?\\d+ ${w} ${h}"`), "same viewBox: vectors rasterized larger");
   const fo = canvasToSvg(canvas, resolve, { foreign: (n) => (n.type === "tab" ? { html: '<div xmlns="http://www.w3.org/1999/xhtml">live \u0001commits</div>' } : n.type === "man" ? { html: "<p>man body</p>" } : null) });
-  assert.match(fo, /<foreignObject x="0" y="26" width="720" height="454"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml" style="width:720px;height:454px;overflow:hidden"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml">live commits<\/div>/);
+  assert.match(fo, /<foreignObject x="0" y="33" width="720" height="447"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml" style="width:720px;height:447px;overflow:hidden"><div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml">live commits<\/div>/);
   assert.match(fo, /man body/);
   assert.doesNotMatch(fo, /Live commits tab|\u0001/, "the snapshot replaces the card; XML-illegal characters go");
   assert.equal(captureNodeForeignObject(tab, null), null, "nothing mounted: no snapshot");
@@ -819,10 +822,10 @@ test("SVG export: the node interior is clipped to its rounded box; group default
     const body = svg.slice(svg.indexOf(`<g clip-path="url(#${clip[1]})">`));
     assert.ok(body.length < svg.length, "panel, header, accent strip and body inside it");
     const strip = body.indexOf('height="3" fill="[accent-red]"');
-    const border = body.indexOf('rx="6" fill="none" stroke="[accent-red]"');
+    const border = body.indexOf('rx="6" fill="none" stroke="color-mix(in srgb, [accent-red] 55%, [border-color])"');
     assert.ok(strip > 0 && border > strip, "the 3-unit accent strip is clipped; the border is drawn on top");
-    assert.doesNotMatch(svg, /<clipPath id="nmclip\d+"><rect x="0" y="0" width="200" height="26"\/>/, "no square header clip");
-    assert.match(svg, /stroke="\[accent-blue\]" stroke-dasharray="6 4"/, "an uncolored group frame is blue");
+    assert.doesNotMatch(svg, /<clipPath id="nmclip\d+"><rect x="0" y="0" width="200" height="33"\/>/, "no square header clip");
+    assert.match(svg, /fill="\[accent-blue\]" fill-opacity="0\.05" stroke="color-mix\(in srgb, \[accent-blue\] 60%, \[border-color\]\)" stroke-width="1\.5" rx="6"|rx="6" fill="\[accent-blue\]" fill-opacity="0\.05" stroke="color-mix\(in srgb, \[accent-blue\] 60%, \[border-color\]\)" stroke-width="1\.5" stroke-dasharray="6 4"/, "an uncolored group frame is blue: 5% fill, border mixed 60% into --border-color");
   }
 });
 
@@ -835,11 +838,11 @@ test("SVG export: auto-fitted structs end at their rows (folded #ifdefs leave no
   const rows = structRows(NESTED, s.data, { editMode: false, evaluator: kcfg() }).rows.length;
   const border = (svg) => Number(/<rect x="0" y="0" width="360" height="([\d.]+)" rx="6" fill="none"/.exec(svg)[1]);
   const h = border(canvasToSvg(canvas, named, opts));
-  assert.equal(h, 26 + 2 + rows * 18 + 2, "header + rows (18-unit table rows) + padding, not the stale 600");
+  assert.equal(h, 33 + 2 + rows * 18 + 2, "header + rows (18-unit table rows) + padding, not the stale 600");
   const vb = /viewBox="-?\d+ -?\d+ \d+ (\d+)"/.exec(canvasToSvg(canvas, named, opts))[1];
   assert.equal(Number(vb), Math.ceil(h + 80), "the image ends with the node, not the stale box");
   const measured = canvasToSvg(canvas, named, { ...opts, rowHeights: () => Array(rows).fill(21) });
-  assert.equal(border(measured), 26 + 2 + rows * 21 + 2, "measured DOM row heights lay the rows out");
+  assert.equal(border(measured), 33 + 2 + rows * 21 + 2, "measured DOM row heights lay the rows out");
   assert.equal(border(canvasToSvg(canvas, named, { ...opts, rowHeights: () => [21] })), h, "a row count that does not match is ignored");
   s.autoFit = false;
   s.h = 600;
@@ -850,10 +853,10 @@ test("SVG export: source lines keep the code view's lexical colors", () => {
   const src = M.createNode("source", { id: "src", x: 0, y: 0, data: { path: "a.c" } });
   const payload = { path: "a.c", start_line: 1, end_line: 2, total_lines: 2, lines: ["static int x = 1; /* c */", '#define S "s"'] };
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [src] }, named, { content: () => payload });
-  assert.match(svg, /<tspan fill="\[syn-keyword\]">static<\/tspan>/);
+  assert.match(svg, /<tspan fill="\[syn-keyword\]" font-weight="500">static<\/tspan>/, "keywords keep the code view's weight 500");
   assert.match(svg, /<tspan fill="\[syn-number\]">1<\/tspan>/);
   assert.match(svg, /<tspan fill="\[syn-comment\]" font-style="italic">\/\* c \*\/<\/tspan>/);
-  assert.match(svg, /<tspan fill="\[syn-preproc\]">#define <\/tspan><tspan fill="\[syn-preproc\]">S<\/tspan> <tspan fill="\[syn-string\]">&quot;s&quot;<\/tspan>/);
+  assert.match(svg, /<tspan fill="\[syn-preproc\]" font-weight="500">#define <\/tspan><tspan fill="\[syn-preproc\]" font-weight="500">S<\/tspan> <tspan fill="\[syn-string\]">&quot;s&quot;<\/tspan>/, "preprocessor and macro tokens are weight 500 too");
   assert.deepEqual(htmlSegments('<span class="tok-keyword x">if</span> (<span class="ast-dimmed"><span class="tok-number">1</span></span>&amp;&#039;'),
     [{ text: "if", cls: "tok-keyword" }, { text: " (", cls: "" }, { text: "1", cls: "tok-number" }, { text: "&'", cls: "" }]);
   assert.equal(sourceLineSegments(["/* a", "b */ int"], "x.c")[1][0].cls, "tok-comment", "multi-line comments span lines");
@@ -981,8 +984,8 @@ test("diff nodes: unified diff text and commit files become hunks with old / new
   assert.equal(D.diffPayload({ mode: "commit", commitHash: "abc", path: "b.c" }, commit).files.length, 1, "a commit diff keeps the node's file");
   assert.equal(headMetaOf("diff", p).text, "kernel/fork.c · v3.0..v3.1");
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [M.createNode("diff", { id: "d", data: { path: "kernel/fork.c", versionA: "v3.0", versionB: "v3.1" } })] }, named, { content: () => p });
-  assert.match(svg, /fill="\[diff-add-fg\]"[^>]*>\+ int &lt;c&gt;;/, "added lines in the diff color");
-  assert.match(svg, /fill="\[diff-del-fg\]"[^>]*>- int b;/);
+  assert.match(svg, /fill="\[diff-add-fg\]"[^>]*>\+<\/text><text[^>]*fill="\[diff-add-fg\]"[^>]*>int &lt;c&gt;;/, "added lines in the diff color (sign column, then the code)");
+  assert.match(svg, /fill="\[diff-del-fg\]"[^>]*>-<\/text><text[^>]*>int b;/);
   assert.match(svg, /@@ -10,3 \+10,4 @@/);
   assert.match(svg, />DIFF</);
 });

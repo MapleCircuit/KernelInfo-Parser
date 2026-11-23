@@ -5,6 +5,8 @@
  * `data-theme` on <html> is `dark` | `light` | `hc-dark` | `hc-light` | `auto` (boot.js sets it before the app
  * loads, from localStorage "kip-theme"); css/variables.css redefines the tokens per theme.
  */
+import { evalCssColor, formatCssColor, substituteVars } from "./css_color.js";
+
 export const THEMES = [["auto", "Auto (follow the system)"], ["dark", "Dark"], ["light", "Light"], ["hc-dark", "High-contrast dark"], ["hc-light", "High-contrast light"]];
 const KEY = "kip-theme";
 
@@ -53,8 +55,22 @@ export function token(name, fallback = "", read = (n) => getComputedStyle(docume
   }
 }
 
-/** A color usable outside CSS: `var(--x)` (or `var(--x, fallback)`) resolved to the token's value. */
+/**
+ * A color usable outside CSS: `var()` (nested, with fallbacks) substituted from the tokens and
+ * `color-mix(in srgb, …)` / `rgb()` / `rgba()` / hex evaluated (`utils/css_color.js`), as `#rrggbb` when
+ * opaque and `rgba(r, g, b, a)` otherwise; a value that is not a color comes back with its `var()`s
+ * substituted (`""` when a token is undefined).
+ */
 export function resolveColor(value, read = undefined) {
-  const m = /^var\((--[\w-]+)(?:,\s*([^)]+))?\)$/.exec(String(value || "").trim());
-  return m ? token(m[1], m[2] || "", read) : value;
+  const get = (n) => token(n, "", read);
+  const c = evalCssColor(value, get);
+  if (c) return formatCssColor(c);
+  const s = substituteVars(value, get);
+  return s === null ? "" : s;
+}
+
+/** A font family token (`--font-sans`) for an SVG `font-family` attribute (double quotes become single). */
+export function resolveFont(name, fallback, read = undefined) {
+  const v = substituteVars(token(name, fallback, read), (n) => token(n, "", read));
+  return String(v || fallback).replace(/"/g, "'").replace(/[<>&]/g, "").trim() || fallback;
 }
