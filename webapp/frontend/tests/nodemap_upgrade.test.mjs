@@ -63,7 +63,7 @@ function makeCtrl(tab = { id: "upg-1", type: "nodemap", version: "v6.6", repo: "
 
 // ------------------------------------------------------------------ Pillar 1: Virtualization, LOD, GPU, Incremental Wires, Undo
 
-test("virtual_source: 6,000-line source and diff stay under 200 DOM rows with translate3d window", () => {
+test("virtual_source: 6,000-line source and diff stay under 200 DOM rows with a 2D translate window", () => {
   const lines = Array.from({ length: 6000 }, (_, i) => `int fn_${i}(void) { return ${i}; }`);
   const range = computeVirtualRange(lines.length, 3300, 400);
   assert.ok(range.endIdx - range.startIdx <= 70, "overscanned slice stays bounded");
@@ -71,7 +71,8 @@ test("virtual_source: 6,000-line source and diff stay under 200 DOM rows with tr
 
   const html = renderVirtualSourceWindow(lines, 1, "kernel/big.c", new Set([range.startIdx + 5]), range);
   assert.match(html, /class="nm-virt-spacer"/);
-  assert.match(html, /class="nm-virt-window" style="transform:translate3d\(0,/);
+  assert.match(html, /class="nm-virt-window" style="transform:translate\(0,/);
+  assert.doesNotMatch(html, /translate3d/, "no forced 3D layer: rows rasterize at the final zoom");
   const rowCount = (html.match(/class="nm-src-row/g) || []).length;
   assert.equal(rowCount, range.endIdx - range.startIdx);
   assert.ok(rowCount < 100);
@@ -104,7 +105,7 @@ test("virtual_source: 6,000-line source and diff stay under 200 DOM rows with tr
   assert.ok(est.h > 90000, "large source node skips DOM layout measurement");
 });
 
-test("viewport LOD culling and GPU translate3d positioning", () => {
+test("viewport LOD culling and crisp 2D translate positioning", () => {
   const vis = visibleCanvasRect({ x: 0, y: 0, zoom: 1 }, 1000, 800, 100);
   const inside = M.createNode("note", { x: 100, y: 100, w: 200, h: 100 });
   const outside = M.createNode("note", { x: 5000, y: 5000, w: 200, h: 100 });
@@ -114,7 +115,7 @@ test("viewport LOD culling and GPU translate3d positioning", () => {
   assert.equal(lodTierForViewport(0.24), "low");
   assert.equal(lodTierForViewport(0.25), "full");
 
-  assert.equal(nodeBox(inside).transform, "translate3d(100px, 100px, 0)");
+  assert.equal(nodeBox(inside).transform, "translate(100px, 100px)");
 
   const toggleLog = () => {
     const set = new Set();

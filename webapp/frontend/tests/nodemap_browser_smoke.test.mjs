@@ -24,7 +24,7 @@ async function tryLaunchBrowser() {
   return null;
 }
 
-test("browser smoke: real-DOM interactive HTML viewer, virtual scroll rows & translate3d positioning", async (t) => {
+test("browser smoke: real-DOM interactive HTML viewer, virtual scroll rows & 2D translate positioning", async (t) => {
   const browser = await tryLaunchBrowser();
   if (!browser) {
     t.skip("Playwright / headless Chromium not installed");
@@ -64,12 +64,12 @@ test("browser smoke: real-DOM interactive HTML viewer, virtual scroll rows & tra
     const vb = await page.getAttribute("#nm-stage svg", "viewBox");
     assert.ok(vb && vb.split(/\s+/).length === 4);
 
-    // 2. Virtual Source 6,000 lines + translate3d positioning in real Chromium layout
+    // 2. Virtual Source 6,000 lines + 2D translate positioning in real Chromium layout
     const lines = Array.from({ length: 6000 }, (_, i) => `void fn_${i}(void) {}`);
     const range = computeVirtualRange(lines.length, 3000, 400);
     const vHtml = renderVirtualSourceWindow(lines, 1, "kernel/smoke.c", null, range);
     await page.setContent(`
-      <div class="nm-node" style="position:absolute;transform:translate3d(120px, 80px, 0);width:320px;height:400px;">
+      <div class="nm-node" style="position:absolute;transform:translate(120px, 80px);width:320px;height:400px;">
         <div class="nm-src" style="height:400px;overflow:auto;">${vHtml}</div>
       </div>
     `);

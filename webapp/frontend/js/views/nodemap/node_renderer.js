@@ -1,7 +1,9 @@
 /**
  * node_renderer.js - Incremental DOM of NodeMap nodes (`webapp/API_FRONTEND.md` §5.3.2).
  *
- * Uses GPU `translate3d(x, y, 0)` transforms for layout-free dragging, viewport LOD culling
+ * Positions nodes with integer 2D `translate(x, y)` transforms (layout-free dragging without promoting
+ * every node to its own compositor layer, so text rasterizes at the final zoom × content scale ×
+ * device pixel ratio instead of being stretched from a 1× bitmap), viewport LOD culling
  * (`content-visibility: hidden` off-screen and low-detail mode below 25% zoom), and visibility
  * layer filtering.
  */
@@ -21,7 +23,10 @@ export function contentKey(node, extra = "") {
   return JSON.stringify([node.type, node.version, node.repo, node.data, extra]);
 }
 
-/** CSS box and GPU transform of a node element: positioned with `translate3d(x, y, 0)` + content scale. */
+/**
+ * CSS box and transform of a node element: an integer 2D `translate(x, y)` plus the content scale. A 2D
+ * transform keeps the node in its layer's paint (no forced 3D layer whose bitmap the zoom would stretch).
+ */
 export function nodeBox(node) {
   const box = contentBox(node);
   const r = (v) => Math.round(v * 100) / 100;
@@ -30,7 +35,7 @@ export function nodeBox(node) {
   return {
     width: r(box.w),
     height: r(box.h),
-    transform: box.s !== 1 ? `translate3d(${tx}px, ${ty}px, 0) scale(${box.s})` : `translate3d(${tx}px, ${ty}px, 0)`,
+    transform: box.s !== 1 ? `translate(${tx}px, ${ty}px) scale(${box.s})` : `translate(${tx}px, ${ty}px)`,
   };
 }
 
@@ -163,7 +168,7 @@ export class NodeRenderer {
     }
   }
 
-  /** Position and size an element via GPU `translate3d` (zero layout thrashing during drags). */
+  /** Position and size an element via a 2D `translate` (zero layout thrashing during drags). */
   place(el, node) {
     const box = nodeBox(node);
     el.style.left = "0px";

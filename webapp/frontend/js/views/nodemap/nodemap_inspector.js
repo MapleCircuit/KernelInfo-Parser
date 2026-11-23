@@ -12,6 +12,9 @@ import { paholeRows, structRows } from "./struct_view.js";
 import { NodeMapTourPlayer, captureTourStep, createTour, removeTourStep, reorderTourStep } from "./tour_mode.js";
 import { revisionOf } from "./version_diff.js";
 
+/** A bulk "Expand … to Nodes" that adds more nodes than this asks first (`nodemap_gestures.js`). */
+export const BULK_CONFIRM_ABOVE = 20;
+
 /** `#rrggbb` a color input starts at: the custom color, else what the accent resolves to. */
 export function pickerValue(color, fallback = "var(--accent-blue)") {
   if (M.isCustomColor(color)) return color.toLowerCase();
@@ -48,6 +51,20 @@ export function renderInspector(ctrl) {
   const verInput = (name, value, extra = "") => withPickHtml(input(name, value, extra), "version", name, { insp: true });
   const fileInput = (name, value, extra = "") => withPickHtml(input(name, value, extra), "file", name, { insp: true });
   const check = (name, on, label, title = "") => `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" ${on ? "checked" : ""}/> <span>${escapeHtml(label)}</span></label>`;
+  // Checkbox over several nodes: checked when all are on, indeterminate (set after render) when mixed
+  const triCheck = (name, list, on, label, title = "") => {
+    const n = list.filter(on).length;
+    const state = n === 0 ? "off" : n === list.length ? "on" : "mixed";
+    return `<label class="inspector-field nm-insp-check"${title ? ` title="${escapeHtml(title)}"` : ""}><input type="checkbox" data-insp="${name}" data-tri="${state}" ${state === "on" ? "checked" : ""} aria-checked="${state === "mixed" ? "mixed" : state === "on"}"/> <span>${escapeHtml(`${label} (${list.length})`)}</span></label>`;
+  };
+  const layoutRow = (what) => `<div class="inspector-field"><span class="inspector-label">Auto-Layout${what ? ` · ${escapeHtml(what)}` : ""}</span><div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="layout-dag">DAG (Sugiyama)</button><button type="button" class="nodemap-btn" data-insp="layout-force">Force-Directed</button></div></div>`;
+  const timeTravel = (scoped) => {
+    const t = ctrl.versionDiffTarget;
+    const label = scoped ? `Version Time-Travel (${nodes.length} selected)` : "Version Time-Travel";
+    const note = t && ctrl.versionDiffScope ? `<span class="inspector-val nm-hint">${escapeHtml(`comparing ${ctrl.versionDiffScope.size} node${ctrl.versionDiffScope.size === 1 ? "" : "s"} with ${t}`)}</span>` : "";
+    return `<div class="inspector-field"><span class="inspector-label">${escapeHtml(label)}</span><div class="nm-insp-inline">${verInput("ver-target", t, 'placeholder="v6.6" spellcheck="false" aria-label="Compare revision"')}<button type="button" class="nodemap-btn" data-insp="ver-compare">Compare</button>${t ? '<button type="button" class="nodemap-btn" data-insp="ver-clear">Clear</button>' : ""}</div>${note}
+      <div class="nm-insp-actions">${t ? `<button type="button" class="nodemap-btn" data-insp="ver-apply" title="${scoped ? "Move the selected nodes with a revision to it (one undo step)" : "Move every node with a revision to it"}">Apply Revision</button>` : ""}${ctrl.versionRevertMap ? '<button type="button" class="nodemap-btn" data-insp="ver-revert" title="Back to the revisions the last Apply changed">↶ Revert Versions</button>' : ""}</div></div>`;
+  };
   const st = ctrl.canvas.settings;
   const em = Boolean(st.editMode);
   const scaleRow = (list) => {
@@ -91,10 +108,13 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Distribute</span><div class="nm-insp-grid"><button type="button" class="nodemap-btn" data-insp="distribute" data-value="horizontal" ${nodes.length < 3 ? "disabled" : ""}>horizontally</button><button type="button" class="nodemap-btn" data-insp="distribute" data-value="vertical" ${nodes.length < 3 ? "disabled" : ""}>vertically</button></div></div>`;
     const scalables = nodes.filter((n) => M.scalable(n.type));
     if (scalables.length) html += scaleRow(scalables);
+    const fits = nodes.filter((n) => M.AUTOFIT_TYPES.includes(n.type));
+    if (fits.length) html += triCheck("multi-autofit", fits, (n) => n.autoFit, "Auto-fit & Scale", "Size each node to all of its content; resizing then keeps the aspect ratio and scales the content (one undo step)");
+    html += triCheck("multi-hide-header", nodes, (n) => n.hideHeader, "Hide header in View Mode", "View Mode and exports leave these nodes' headers out; Edit Mode shows them dimmed (one undo step)");
     const revs = nodes.map(revisionOf).filter((r) => r !== null);
     if (revs.length) {
       const one = new Set(revs).size === 1 ? revs[0] : "";
-      html += row(`Revision (${revs.length})`, verInput("multi-version", one, `spellcheck="false" placeholder="${one ? "" : "mixed"}" title="Moves every selected node with a revision (one undo step)"`));
+      html += `<div class="inspector-field"><span class="inspector-label">${escapeHtml(`Revision (${revs.length} of ${nodes.length})`)}</span><div class="nm-insp-inline">${verInput("multi-version", one, `spellcheck="false" placeholder="${one ? "" : "mixed"}" title="Moves every selected node with a revision (one undo step)"`)}<button type="button" class="nodemap-btn" data-insp="multi-version-apply" title="Move every selected node with a revision to this one (one undo step)">Apply</button></div></div>`;
     }
     const structs = nodes.filter((n) => n.type === "struct");
     if (structs.length) {
@@ -108,6 +128,9 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Color</span>${swatches("")}</div>`;
     const bgs = new Set(nodes.map((x) => x.bgColor));
     html += bgRow("Background", bgs.size === 1 ? [...bgs][0] : "", "var(--bg-secondary)", "bg");
+    const arranged = nodes.filter((x) => x.type !== "group").length;
+    if (arranged) html += layoutRow(`${arranged} selected`);
+    if (revs.length) html += timeTravel(true);
     html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="duplicate" title="Duplicate the selection (Ctrl+D)">⧉ Duplicate</button><button type="button" class="nodemap-btn" data-insp="group">▭ Group</button><button type="button" class="nodemap-btn" data-insp="fit">Fit</button><button type="button" class="nodemap-btn nm-danger" data-insp="delete">Delete</button></div>`;
   } else if (nodes.length === 1) {
     const n = nodes[0];
@@ -210,11 +233,20 @@ export function renderInspector(ctrl) {
     } else if (n.type === "history") {
       html += `<div class="nm-insp-pair">${row("Mode", sel("d-mode", d.mode, M.HISTORY_MODES))}${row("Line", input("d-line", d.line || 1, 'type="number" min="1"'))}</div>`;
       html += `<div class="nm-insp-pair">${row("File", fileInput("d-path", d.path, 'spellcheck="false"'))}${row("Symbol", input("d-name", d.name, 'spellcheck="false" data-ac="symbol"'))}</div>`;
+      if (d.mode === "blame") {
+        const count = ctrl.modelOf(n)?.commits?.length || 0;
+        html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="blame-expand-commits" ${count ? "" : "disabled"} title="One commit details node per blamed commit, wired from its row (existing ones are reused; asks first above ${BULK_CONFIRM_ABOVE})">⇶ Expand Commits to Nodes${count ? ` (${count})` : ""}</button><button type="button" class="nodemap-btn" data-insp="blame-expand-diffs" ${count ? "" : "disabled"} title="One commit diff node per blamed commit, wired from its row (existing ones are reused; asks first above ${BULK_CONFIRM_ABOVE})">⇶ Expand Diffs to Nodes${count ? ` (${count})` : ""}</button></div>`;
+      }
+    } else if (n.type === "commit") {
+      html += row("Commit", input("d-commitHash", d.commitHash, 'spellcheck="false" placeholder="a1b2c3d4"'));
+      html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="commit-spawn-diff" ${d.commitHash ? "" : "disabled"} title="Add (or connect) this commit's diff node">± Open Diff Node</button></div>`;
     } else if (n.type === "note") {
       html += check("d-markdown", d.markdown, "Render Markdown");
     } else if (n.type === "group") {
       const members = M.groupDescendants(ctrl.canvas.nodes, n.id).length;
       html += `<div class="inspector-field"><span class="inspector-label">Members</span><span class="inspector-val">${members} (drag nodes in or out of the frame)</span></div>`;
+      const direct = ctrl.canvas.nodes.filter((x) => x.groupId === n.id && x.type !== "group").length;
+      if (direct) html += layoutRow(`${direct} member${direct === 1 ? "" : "s"}`);
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="enter-submap">${d.subCanvas ? "🌀 Enter Sub-Map Portal" : "🌀 Convert to Sub-Map Portal"}</button>${ctrl.versionDiffTarget ? `<button type="button" class="nodemap-btn" data-insp="ver-apply-group">Apply ${escapeHtml(ctrl.versionDiffTarget)}</button>` : ""}</div>`;
     }
     const locks = Array.isArray(n.locks) ? n.locks : [];
@@ -232,7 +264,8 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Canvas</span><span class="inspector-val">${ctrl.canvas.nodes.length} nodes · ${ctrl.canvas.edges.length} connections</span></div>`;
     html += `<div class="nm-insp-pair">${row("Grid", input("grid", st.grid, 'type="number" min="4" max="200"'))}${check("snap", st.snap, "Snap")}</div>`;
     html += bgRow("Canvas background", st.bgColor || "", "var(--bg-canvas)", "canvas-bg");
-    html += `<div class="inspector-field"><span class="inspector-label">Auto-Layout</span><div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="layout-dag">DAG (Sugiyama)</button><button type="button" class="nodemap-btn" data-insp="layout-force">Force-Directed</button></div></div>`;
+    html += layoutRow("");
+    html += row("Tab render quality", sel("render-quality", st.renderQuality || "auto", M.RENDER_QUALITIES, ["Auto (sharper when zoomed in)", "1× (fastest)", "1.5×", "2× (sharpest)"], 'title="Embedded tab iframes render at this multiple of their size and are drawn scaled down, so their text stays sharp when zoomed in or scaled up"'));
     const fHops = ctrl.focusHops;
     html += `<div class="inspector-field"><span class="inspector-label">Focus / Trace</span><div class="nm-insp-grid">
       <button type="button" class="nodemap-btn" data-insp="focus-hops" data-value="off" aria-pressed="${fHops == null}">Off</button>
@@ -244,8 +277,7 @@ export function renderInspector(ctrl) {
     html += `<div class="inspector-field"><span class="inspector-label">Visibility layers</span><div class="nm-layer-list">${layers.map((l) =>
       `<div class="nm-layer-row"><input type="checkbox" data-insp="layer-toggle" data-id="${escapeHtml(l.id)}" ${l.visible !== false ? "checked" : ""} aria-label="Layer visible"/><input data-insp="layer-name" data-id="${escapeHtml(l.id)}" value="${escapeHtml(l.name)}" aria-label="Layer name" spellcheck="false"/><button type="button" class="nodemap-btn nm-danger" data-insp="layer-delete" data-id="${escapeHtml(l.id)}" title="Delete layer">×</button></div>`).join("")}
       <button type="button" class="nodemap-btn" data-insp="layer-add">+ New Layer</button></div></div>`;
-    html += `<div class="inspector-field"><span class="inspector-label">Version Time-Travel</span><div class="nm-insp-inline">${verInput("ver-target", ctrl.versionDiffTarget, 'placeholder="v6.6" spellcheck="false" aria-label="Compare revision"')}<button type="button" class="nodemap-btn" data-insp="ver-compare">Compare</button>${ctrl.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-clear">Clear</button>' : ""}</div>
-      <div class="nm-insp-actions">${ctrl.versionDiffTarget ? '<button type="button" class="nodemap-btn" data-insp="ver-apply">Apply Revision</button>' : ""}${ctrl.versionRevertMap ? '<button type="button" class="nodemap-btn" data-insp="ver-revert">↶ Revert Versions</button>' : ""}</div></div>`;
+    html += timeTravel(false);
     html += NodeMapTourPlayer.inspectorHtml(ctrl.canvas, ctrl.activeTourId);
     const engines = ctrl.followedEngines();
     html += `<div class="inspector-field"><span class="inspector-label">NodeMap sessions</span><div class="nm-es-list">${st.embedSessions.map((x) =>
@@ -277,6 +309,7 @@ export function renderInspector(ctrl) {
     </ul>`;
   }
   ctrl.inspectorEl.innerHTML = html;
+  for (const el of ctrl.inspectorEl.querySelectorAll?.('input[data-tri="mixed"]') || []) el.indeterminate = true;
   wireInspectorAutocomplete(ctrl);
 }
 
@@ -290,6 +323,9 @@ export function inspectorPickContext(ctrl, k) {
   if (node?.type === "cve" && d.release) version = d.release;
   return { node, client, version };
 }
+
+/** Nodes a Version Time-Travel Compare covers: the multi-selection, else the whole canvas (null). */
+const compareScope = (ctrl) => (ctrl.selected.size > 1 ? [...ctrl.selected] : null);
 
 /** Selected node ids a picker opened for: a pick lands only if the selection is still the same. */
 const selectionKey = (ctrl) => [...ctrl.selected].sort().join(",");
@@ -361,6 +397,9 @@ export function onInspectorInput(ctrl, e, final) {
   const el = e.target.closest("[data-insp]");
   if (!el || el.tagName === "BUTTON") return;
   const k = el.dataset.insp;
+  // A checkbox click fires `input` and then `change`: only the `change` applies it (one commit, one undo
+  // step, and a toggle never runs twice)
+  if (el.type === "checkbox" && !final) return;
   const val = el.type === "checkbox" ? el.checked : el.value;
   const edge = ctrl.selectedEdge ? ctrl.canvas.edges.find((x) => x.id === ctrl.selectedEdge) : null;
   const node = ctrl.selected.size === 1 ? ctrl.byId([...ctrl.selected][0]) : null;
@@ -390,14 +429,14 @@ export function onInspectorInput(ctrl, e, final) {
     return ctrl.commit({ inspector: final, coalesce: `insp:content-scale:${list.map((x) => x.id).join(",")}`, coalesceEnd: Boolean(final) });
   }
   if (k === "multi-version") {
-    if (final && String(val || "").trim()) ctrl.applyVersionToSelection(val);
+    if (final && String(val || "").trim()) ctrl.applyVersionToSelection(val, { toastResult: true });
     return;
   }
   if (k === "ver-target") {
     const prev = ctrl.versionDiffShown || "";
     ctrl.versionDiffTarget = String(val || "").trim();
     // One comparison per revision: a pick and the input's own change event do not load it twice
-    if (final && ctrl.versionDiffTarget && ctrl.versionDiffTarget !== prev) ctrl.compareVersion(ctrl.versionDiffTarget);
+    if (final && ctrl.versionDiffTarget && ctrl.versionDiffTarget !== prev) ctrl.compareVersion(ctrl.versionDiffTarget, { ids: compareScope(ctrl) });
     return;
   }
   if (k === "tour-select") {
@@ -415,7 +454,23 @@ export function onInspectorInput(ctrl, e, final) {
     if (k === "tour-step-title") s.title = String(val || "").trim().slice(0, 256) || "Step";
     else s.caption = String(val || "").slice(0, 2000);
   } else if (k === "layer-toggle") {
-    M.toggleLayerVisibility(ctrl.canvas.settings, el.dataset.id);
+    if (M.setLayerVisibility(ctrl.canvas.settings, el.dataset.id, val) === null) return;
+  } else if (k === "render-quality") {
+    ctrl.canvas.settings.renderQuality = M.RENDER_QUALITIES.includes(val) ? val : "auto";
+    ctrl.applyRenderQuality?.();
+  } else if (k === "multi-autofit") {
+    for (const n of ctrl.selectedNodes()) {
+      if (!M.AUTOFIT_TYPES.includes(n.type)) continue;
+      M.setAutoFit(n, Boolean(val));
+      ctrl.portOffsets.delete(n.id);
+      if (n.autoFit) ctrl.fitQueue.add(n.id);
+    }
+  } else if (k === "multi-hide-header") {
+    for (const n of ctrl.selectedNodes()) {
+      n.hideHeader = Boolean(val);
+      ctrl.portOffsets.delete(n.id);
+      if (n.autoFit) ctrl.fitQueue.add(n.id);
+    }
   } else if (k === "layer-name") {
     if (!final) return;
     const layer = (ctrl.canvas.settings.layers || []).find((l) => l.id === el.dataset.id);
@@ -534,7 +589,14 @@ export function onInspectorClick(ctrl, e) {
       ctrl.syncFollowChannel();
       ctrl.commit();
     }
-  } else if (k === "copy-session" && node) ctrl.copyNodeToSession(node.id, ctrl.copyTarget);
+  } else if (k === "multi-version-apply") {
+    const inp = ctrl.inspectorEl?.querySelector?.("[data-insp='multi-version']");
+    const ref = String(inp?.value || "").trim();
+    if (ref) ctrl.applyVersionToSelection(ref, { toastResult: true });
+  } else if (k === "blame-expand-commits" && node) ctrl.expandBlameToNodes(node.id, "commit");
+  else if (k === "blame-expand-diffs" && node) ctrl.expandBlameToNodes(node.id, "diff");
+  else if (k === "commit-spawn-diff" && node?.type === "commit") ctrl.spawnCommitDiff(node.id);
+  else if (k === "copy-session" && node) ctrl.copyNodeToSession(node.id, ctrl.copyTarget);
   else if (k === "mail-expand" && node) ctrl.expandThreadToNodes(node.id);
   else if (k === "kc-expand" && node) ctrl.expandKconfigRelations(node.id);
   else if (k === "struct-expand-types" && node) ctrl.expandStructTypes(node.id);
@@ -565,12 +627,15 @@ export function onInspectorClick(ctrl, e) {
     if (M.removeLayer(ctrl.canvas, btn.dataset.id)) ctrl.commit();
   } else if (k === "ver-compare") {
     const inp = ctrl.inspectorEl?.querySelector("[data-insp='ver-target']");
-    ctrl.compareVersion(inp?.value || ctrl.versionDiffTarget);
+    ctrl.compareVersion(inp?.value || ctrl.versionDiffTarget, { ids: compareScope(ctrl) });
   } else if (k === "ver-clear") {
     ctrl.compareVersion("");
   } else if (k === "ver-apply") {
     const inp = ctrl.inspectorEl?.querySelector("[data-insp='ver-target']");
-    ctrl.applyTargetVersion(inp?.value || ctrl.versionDiffTarget);
+    const ref = inp?.value || ctrl.versionDiffTarget;
+    // With several nodes selected it moves just those (the selection stays)
+    if (ctrl.selected.size > 1) ctrl.applyVersionToSelection(ref, { toastResult: true });
+    else ctrl.applyTargetVersion(ref);
   } else if (k === "ver-apply-group" && node) {
     ctrl.applyTargetVersion(ctrl.versionDiffTarget, node.id);
   } else if (k === "ver-revert") {

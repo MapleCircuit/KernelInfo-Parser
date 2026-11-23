@@ -14,6 +14,7 @@ import { state } from "../../state.js";
 import { urlSync } from "../../url_sync.js";
 import { toast } from "../../components/toast.js";
 import { escapeHtml } from "../../components/modal.js";
+import { showChangePreview } from "../../components/change_preview.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { registerSelectionVersionApplier } from "../../components/version_switch.js";
 import { resolveColor } from "../../utils/theme.js";
@@ -23,9 +24,9 @@ import { DirectiveEvaluator, archMacros } from "../kconfig/directive_evaluator.j
 import { mountManDocument } from "../man/man_view.js";
 import * as M from "./canvas_model.js";
 import {
-  cveModel, diffPayload, diffRows, docModel, fullMailBody, historyModel, kapiModel, kconfigModel, kconfigValue,
+  commitModel, cveModel, diffPayload, diffRows, docModel, fullMailBody, historyModel, kapiModel, kconfigModel, kconfigValue,
   mailThreadModel, maintainerModel,
-  renderCveBody, renderDiffBody, renderDocBody, renderHistoryBody, renderKapiBody, renderKconfigBody,
+  renderCommitBody, renderCveBody, renderDiffBody, renderDocBody, renderHistoryBody, renderKapiBody, renderKconfigBody,
   renderMailBody, renderMaintainerBody,
 } from "./domain_nodes.js";
 import { computeEdgeGeometry, dashArray, nearestWaypointSegment } from "./edge_router.js";
@@ -41,10 +42,10 @@ import {
 import { canvasToSvg, captureNodeForeignObject } from "./nodemap_export.js";
 import {
   attachCanvasEvents, beginEdgeLabelEdit, beginNoteEdit, beginTitleEdit, clearAlignmentGuides,
-  clearTextSelection, expandCallPath, expandCallgraph, expandKconfigRelations, expandStructTypes, expandThreadToNodes, expandableTypesOf,
+  clearTextSelection, expandBlameToNodes, expandCallPath, expandCallgraph, expandKconfigRelations, expandStructTypes, expandThreadToNodes, expandableTypesOf,
   finishWire, followStructType, followableTypeFor, inlineInput, mailNodeOf, onClick, onContextMenu,
   onDblClick, onKeyDown, onPointerDown, onPointerMove, onPointerUp, onStructAction, onWheel,
-  selectEdge, selectOnly, setTitle, spawnFromCveDiff, spawnLinkedNode, spawnMailMessages,
+  selectEdge, selectOnly, setTitle, spawnCommitDiff, spawnFromCveDiff, spawnLinkedNode, spawnMailMessages,
   toggleExpandNode, toggleMailMessage,
 } from "./nodemap_gestures.js";
 import { onInspectorClick, onInspectorInput, pickerValue, renderInspector } from "./nodemap_inspector.js";
@@ -57,19 +58,42 @@ import {
 import { layoutGraphJob } from "./nodemap_worker.js";
 import { renderStructBody } from "./struct_view.js";
 import { NodeMapTourPlayer } from "./tour_mode.js";
-import { applyCanvasVersion, diffStructLayouts, renderStructDiffBadge, retargetNodeVersions, revertCanvasVersion } from "./version_diff.js";
+import { applyCanvasVersion, captureVersions, diffStructLayouts, renderStructDiffBadge, retargetNodeVersions, revertCanvasVersion } from "./version_diff.js";
 import { VIRTUAL_THRESHOLD, estimateNaturalSourceSize, mountVirtualDiff, mountVirtualSource, visibleCanvasRect } from "./virtual_source.js";
 import { NodeMapWorkerPool } from "./worker_pool.js";
 
 export { EMBED_TAB_TYPES };
 
 const PASTE_STEP = 24;
+/** Idle time after the last pan / zoom step before the canvas re-rasterizes crisply (ms). */
+const VIEW_SETTLE_MS = 160;
 const UNDO_LIMIT = 80;
 const cssEsc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
 /** Rows an edge end can anchor to (`fromField` / `toField`): struct members, mail messages, history rows. */
 const ANCHOR_ROWS = [".nm-sf", ".nm-mail-row", ".nm-hist-row"];
 export const ANCHOR_ROW_SEL = ANCHOR_ROWS.map((c) => `${c}[data-key]`).join(", ");
 const anchorRowSel = (key) => ANCHOR_ROWS.map((c) => `${c}[data-key="${cssEsc(key)}"]`).join(", ");
+/**
+ * Render iframe `frame` at `k ×` its box (`nm-ss`, `--nm-ss`; its same-origin document zoomed by `k`),
+ * drawn scaled by `1 / k`. `k = 1` restores the plain iframe. Nothing changes when the frame already
+ * has `k` unless `force` (a new document loaded in it). Returns the factor applied.
+ */
+export function applyFrameSupersample(frame, k, { force = false } = {}) {
+  const f = Number(k) > 1 ? Math.min(M.SUPERSAMPLE_MAX, Number(k)) : 1;
+  if (!frame || (!force && frame.dataset?.ss === String(f))) return f;
+  if (frame.dataset) frame.dataset.ss = String(f);
+  frame.classList?.toggle?.("nm-ss", f > 1);
+  if (f > 1) frame.style?.setProperty?.("--nm-ss", String(f));
+  else frame.style?.removeProperty?.("--nm-ss");
+  try {
+    const root = frame.contentDocument?.documentElement;
+    if (root) root.style.zoom = f > 1 ? String(f) : "";
+  } catch {
+    // a frame of another origin keeps its own resolution
+  }
+  return f;
+}
+
 /** The rectangle a row anchors at: its header line when it has one (an open mail message), else the row. */
 const anchorRectOf = (row) => (row.querySelector?.(".nm-anchor-line") || row).getBoundingClientRect?.();
 
@@ -102,6 +126,7 @@ export class NodeMapController {
     this.focusHops = null;
     this.focusSeedIds = new Set();
     this.versionDiffTarget = "";
+    this.versionDiffScope = null;
     this.versionDiffCache = new Map();
     this.versionRevertMap = null;
     this.wireEls = new Map();
@@ -232,6 +257,8 @@ export class NodeMapController {
     this.flushSave();
     clearTimeout(this.kconfigTimer);
     this.kconfigTimer = null;
+    clearTimeout(this._settleTimer);
+    this._settleTimer = null;
     if (this.wireFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.wireFrame);
     this.wireFrame = null;
     for (const u of this.unsubs) u();
@@ -459,8 +486,14 @@ export class NodeMapController {
     return entry.status === "ok" ? entry.value : null;
   }
 
+  /** The Version Time-Travel target `node` is compared against (`""`: none, or outside the compared selection). */
+  versionDiffTargetOf(node) {
+    if (!this.versionDiffTarget || (this.versionDiffScope && !this.versionDiffScope.has(node?.id))) return "";
+    return this.versionDiffTarget;
+  }
+
   versionDiffFor(node) {
-    const target = this.versionDiffTarget;
+    const target = this.versionDiffTargetOf(node);
     if (!target || node?.type !== "struct" || !node.data?.name || node.version === target) return null;
     const baseEntry = this.content.get(this.fetchKeyOf(node));
     if (baseEntry?.status !== "ok") return null;
@@ -493,7 +526,7 @@ export class NodeMapController {
         Boolean(this.canvas.settings.editMode),
         this.kconfigEngineFor(node)?.tabId || "",
         this.kconfigEpoch,
-        this.versionDiffTarget || "",
+        this.versionDiffTargetOf(node),
         node.data?.style === "layout" ? Boolean(this.content.get(this.paholeKeyOf(node))?.value) : false,
       ]);
     }
@@ -664,7 +697,7 @@ export class NodeMapController {
           <button type="button" class="nodemap-btn" data-tb="fit" title="Fit everything into view (Ctrl+1)">Fit</button>
           <button type="button" class="nodemap-btn" data-tb="reset" title="Reset pan and zoom (Ctrl+0)">1:1</button>
           <div class="nodemap-sep"></div>
-          <button type="button" class="nodemap-btn" data-tb="layout" title="Arrange nodes by their connections">Auto-Layout</button>
+          <button type="button" class="nodemap-btn" data-tb="layout" title="Arrange nodes by their connections: the selected nodes, a selected group's members, else the whole canvas">Auto-Layout</button>
           <button type="button" class="nodemap-btn" data-tb="focus" aria-pressed="${this.focusHops != null}" title="Focus / Trace Mode: highlight N-hop connected subgraph">Focus</button>
           <button type="button" class="nodemap-btn" data-tb="search" title="Find node (Ctrl+F)">Find</button>
           <button type="button" class="nodemap-btn" data-tb="minimap" aria-pressed="${Boolean(this.minimap?.visible)}" title="Toggle corner minimap">Map</button>
@@ -778,6 +811,8 @@ export class NodeMapController {
     if (node.type === "kapi") return JSON.stringify(["kapi", node.repo, node.version, d.catalog, d.query, d.symbol, d.arch]);
     if (node.type === "doc") return JSON.stringify(["doc", node.repo, node.version, d.path, d.mode, d.functions]);
     if (node.type === "history") return JSON.stringify(["history", node.repo, node.version, d.mode, d.path, d.line, d.name, d.astId]);
+    // A hash names one commit in every revision: the node's revision is only the lookup scope
+    if (node.type === "commit") return JSON.stringify(["commit", node.repo, d.commitHash]);
     return null;
   }
 
@@ -801,6 +836,7 @@ export class NodeMapController {
     if (node.type === "kapi") return kapiModel(v, node.data);
     if (node.type === "doc") return docModel(v, node.data);
     if (node.type === "history") return historyModel(v, node.data);
+    if (node.type === "commit") return commitModel(v, node.data);
     return v;
   }
 
@@ -894,12 +930,18 @@ export class NodeMapController {
           <iframe class="nm-iframe" src="${escapeHtml(src)}" title="${escapeHtml(M.displayTitle(node))}" loading="lazy" referrerpolicy="same-origin"></iframe>
           <button type="button" class="nm-shield" data-act="interact" title="Click to interact with this tab (Esc or a click on the canvas leaves it)">Click to interact</button>
         </div>`;
-    } else if (["diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) {
+      const frame = body.querySelector("iframe.nm-iframe");
+      if (frame) {
+        applyFrameSupersample(frame, M.iframeSupersample(this.canvas.settings.renderQuality, this.zoom, node.scale));
+        // Each load starts a new document: it takes the current factor again
+        frame.addEventListener?.("load", () => applyFrameSupersample(frame, Number(frame.dataset?.ss) || 1, { force: true }));
+      }
+    } else if (["diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit"].includes(node.type)) {
       const prevScroll = body.querySelector(".nm-scroll")?.scrollTop || 0;
       const loaders = {
         diff: () => this.loadDiff(node), mail: () => this.loadMail(node), kconfig: () => this.loadKconfig(node),
         maintainer: () => this.loadMaintainer(node), cve: () => this.loadCve(node), kapi: () => this.loadKapi(node),
-        doc: () => this.loadDoc(node), history: () => this.loadHistory(node),
+        doc: () => this.loadDoc(node), history: () => this.loadHistory(node), commit: () => this.loadCommit(node),
       };
       const entry = this.ensureContent(node, loaders[node.type]);
       if (entry.status === "loading") body.innerHTML = status(`Loading ${M.displayTitle(node)}…`);
@@ -923,6 +965,7 @@ export class NodeMapController {
         else if (node.type === "kapi") body.innerHTML = renderKapiBody(model);
         else if (node.type === "doc") body.innerHTML = renderDocBody(model);
         else if (node.type === "history") body.innerHTML = renderHistoryBody(model);
+        else if (node.type === "commit") body.innerHTML = renderCommitBody(model);
         else {
           const values = this.kconfigValuesFor(node);
           const onCanvas = new Set(this.canvas.nodes.filter((n) => n.type === "kconfig" && n.id !== node.id).map((n) => n.data.symbol));
@@ -1107,6 +1150,12 @@ export class NodeMapController {
     return client.getSymbolHistory(v, d.path, d.line || 1, d.astId || null, { name: d.name || "" });
   }
 
+  async loadCommit(node) {
+    const d = node.data;
+    if (!d.commitHash) throw new Error("Set a commit hash in the inspector");
+    return this.clientFor(node).getCommitDetail(node.version || this.currentVersion, d.commitHash);
+  }
+
   takeFresh(id) {
     const hit = Boolean(this.fresh?.has(id));
     this.fresh?.delete(id);
@@ -1162,13 +1211,18 @@ export class NodeMapController {
     if (node.type === "mail") s += b("mail-expand", "⇶", "Expand Thread to Nodes: one connected node per message");
     if (node.type === "kconfig") s += b("kc-expand", "⇶", "Expand Relations: add or connect every related symbol");
     if (node.type === "struct") s += b("expand-types", "⇶", "Expand Types: add or connect every non-standard type the members use");
-    if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) s += b("refresh", "⟳", "Load again");
+    if (node.type === "history" && node.data.mode === "blame") {
+      s += b("blame-expand-commits", "⇶", "Expand Commits to Nodes: one commit details node per blamed commit");
+      s += b("blame-expand-diffs", "⇶±", "Expand Diffs to Nodes: one commit diff node per blamed commit");
+    }
+    if (node.type === "commit") s += b("commit-spawn-diff", "±", "Open the diff of this commit as a node");
+    if (["struct", "source", "man", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit"].includes(node.type)) s += b("refresh", "⟳", "Load again");
     if (M.TAB_OPENABLE_TYPES.includes(node.type)) s += b("open-tab", "↗", "Open as a tab");
     return s;
   }
 
   headMeta(node) {
-    if (!["struct", "source", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history"].includes(node.type)) return null;
+    if (!["struct", "source", "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit"].includes(node.type)) return null;
     return headMetaOf(node.type, this.modelOf(node));
   }
 
@@ -1189,6 +1243,7 @@ export class NodeMapController {
     this.updateViewportCulling();
     const fitted = this.autoFitPass();
     this.applyBackground();
+    this.applyRenderQuality();
     this.renderWires(null);
     this.applyFocusStyling();
     this.tourPlayer?.applyHighlights?.();
@@ -1315,10 +1370,18 @@ export class NodeMapController {
 
   updateView() { this.commit({ save: false }); }
 
+  /**
+   * Pan / zoom the canvas layer. Its offset snaps to the device pixel grid and it is promoted to a
+   * compositor layer (`nm-moving`: `will-change: transform`) only while the view moves; once it rests
+   * the promotion ends, so the browser rasterizes text again at the final zoom × content scale × device
+   * pixel ratio instead of stretching the bitmap of the scale the move started at.
+   */
   applyTransform() {
     if (!this.layerEl) return;
     const { x, y, zoom } = this.canvas.viewport;
-    this.layerEl.style.transform = `translate(${x}px, ${y}px) scale(${zoom})`;
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    this.layerEl.style.transform = `translate(${M.snapToDevicePixel(x, dpr)}px, ${M.snapToDevicePixel(y, dpr)}px) scale(${zoom})`;
+    this.markViewMoving();
     if (this.zoomLabel) this.zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
     const g = this.canvas.settings.grid * zoom;
     this.wrapEl.classList.toggle("nm-grid-on", this.canvas.settings.snap);
@@ -1327,6 +1390,42 @@ export class NodeMapController {
     this.wrapEl.style.setProperty("--nm-grid-y", `${y}px`);
     this.updateViewportCulling();
     this.minimap?.render();
+  }
+
+  /** Keep `nm-moving` on the canvas while the view changes (cleared `VIEW_SETTLE_MS` after the last change). */
+  markViewMoving() {
+    if (!this.wrapEl?.classList) return;
+    const zoom = this.canvas?.viewport.zoom;
+    if (this._lastZoom !== zoom) {
+      this._lastZoom = zoom;
+      this._zoomPending = true;
+    }
+    this.wrapEl.classList.add("nm-moving");
+    clearTimeout(this._settleTimer);
+    this._settleTimer = setTimeout(() => {
+      this._settleTimer = null;
+      this.wrapEl?.classList?.remove?.("nm-moving");
+      // The tab iframes follow the settled zoom (re-laying them out on every wheel step would stutter)
+      if (this._zoomPending) {
+        this._zoomPending = false;
+        this.applyRenderQuality();
+      }
+    }, VIEW_SETTLE_MS);
+  }
+
+  /**
+   * Supersample the embedded tab iframes (`settings.renderQuality`, `M.iframeSupersample()`): each lays
+   * out at `k ×` its box with its document zoomed by `k` and is drawn scaled by `1 / k` (CSS), so it
+   * keeps its layout and pointer mapping but rasterizes `k ×` the pixels. Applied in place (no reload).
+   */
+  applyRenderQuality() {
+    if (!this.renderer?.element || !this.canvas) return;
+    const quality = this.canvas.settings.renderQuality || "auto";
+    for (const n of this.canvas.nodes) {
+      if (n.type !== "tab") continue;
+      const frame = this.renderer.element(n.id)?.querySelector?.("iframe.nm-iframe");
+      if (frame) applyFrameSupersample(frame, M.iframeSupersample(quality, this.zoom, n.scale));
+    }
   }
 
   updateViewportCulling() {
@@ -1501,7 +1600,7 @@ export class NodeMapController {
           this.wireSvg.appendChild(gEl);
         }
         const sel = e.id === this.selectedEdge;
-        const layerHidden = !M.isLayerVisible(this.canvas.settings, e.layerId);
+        const layerHidden = !M.isEdgeVisible(this.canvas.settings, e, a, target);
         const focusDim = Boolean(this.focusHops != null && this._focusEdges && !this._focusEdges.has(e.id));
         const cls = `nm-edge${sel ? " selected" : ""}${layerHidden ? " nm-layer-hidden" : ""}${focusDim ? " nm-focus-dim" : ""}`;
         if (gEl.getAttribute("class") !== cls) gEl.setAttribute("class", cls);
@@ -1562,7 +1661,7 @@ export class NodeMapController {
       this.edgeGeoms.set(e.id, g);
       ends.push([a.id, fromEnd.point ? e.fromField : null, g.fromSide], [target.id, toEnd.point ? e.toField : null, g.toSide]);
       const sel = e.id === this.selectedEdge ? " selected" : "";
-      const layerHidden = !M.isLayerVisible(this.canvas.settings, e.layerId) ? " nm-layer-hidden" : "";
+      const layerHidden = !M.isEdgeVisible(this.canvas.settings, e, a, target) ? " nm-layer-hidden" : "";
       s += `<g class="nm-edge${sel}${layerHidden}" data-edge-id="${escapeHtml(e.id)}" style="--nm-edge:${M.accentVar(e.color, "var(--accent-blue)")}">${this._edgeInnerSvg(e, g)}</g>`;
     }
     if (p) {
@@ -1641,6 +1740,10 @@ export class NodeMapController {
   followStructType(nodeId, fieldKey) { return followStructType(this, nodeId, fieldKey); }
   expandableTypesOf(id) { return expandableTypesOf(this, id); }
   expandStructTypes(id) { return expandStructTypes(this, id); }
+  expandBlameToNodes(id, kind = "commit") { return expandBlameToNodes(this, id, kind); }
+  spawnCommitDiff(id) { return spawnCommitDiff(this, id); }
+  /** The §5.0 confirmation of a bulk spawn (`showChangePreview()`; `confirmFn` replaces it in tests). */
+  confirmBulkSpawn(opts) { return (this.confirmFn || showChangePreview)(opts); }
   expandCallgraph(id, direction = "both") { return expandCallgraph(this, id, direction); }
   expandCallPath(fromId, targetFn, opts) { return expandCallPath(this, fromId, targetFn, opts); }
 
@@ -1901,9 +2004,14 @@ export class NodeMapController {
     this.breadcrumbsEl.hidden = false;
   }
 
-  compareVersion(targetVersion) {
+  /**
+   * Version Time-Travel comparison against `targetVersion` (`""` clears it): every struct node of the
+   * canvas, or only the nodes `ids` (the multi-selection Inspector's Compare).
+   */
+  compareVersion(targetVersion, { ids = null } = {}) {
     this.versionDiffTarget = String(targetVersion || "").trim();
     this.versionDiffShown = this.versionDiffTarget;
+    this.versionDiffScope = this.versionDiffTarget && ids?.length ? new Set(ids) : null;
     this.versionDiffCache.clear();
     for (const n of this.canvas?.nodes || []) if (n.type === "struct") this.renderer?.invalidate(n.id);
     this.commit({ save: false });
@@ -1930,12 +2038,15 @@ export class NodeMapController {
     const nodes = this.selectedNodes();
     if (!target || !nodes.length) return null;
     // The header names refs of the tab's repository (app.js moves a tab across projects otherwise)
+    const before = captureVersions(nodes);
     const res = retargetNodeVersions(nodes, target, { repo: this.repo || state.repoOf(this.tab) });
     const label = shortRef(target);
     const plural = (n) => `${n} selected node${n === 1 ? "" : "s"}`;
     let level = "success";
     let message;
     if (res.changedIds.length) {
+      // Revert Versions undoes the last apply, this one included
+      this.versionRevertMap = Object.fromEntries(res.changedIds.map((id) => [id, before[id]]));
       this.versionDiffCache.clear();
       for (const id of res.changedIds) {
         this.renderer?.invalidate(id);
@@ -1971,25 +2082,50 @@ export class NodeMapController {
     return reverted;
   }
 
-  autoLayoutDAG(mode = "dag") {
-    const active = this.canvas.nodes.filter((n) => n.type !== "group");
-    if (!active.length) return;
+  /**
+   * Auto-Layout (`dag` Sugiyama or `force`) as one undo step. `targetIds` (else the selection, see
+   * `M.layoutScope()`) picks what moves: a selected group's members (the group then fits around them),
+   * several selected nodes (kept at their bounding box's top-left corner), or the whole canvas (the view
+   * then fits it). Only the arranged nodes and the edges between them reach the layout.
+   */
+  autoLayoutDAG(mode = "dag", targetIds = null) {
+    const { scope, group, nodes: subset } = M.layoutScope(this.canvas.nodes, targetIds || [...this.selected]);
+    if (!subset.length) {
+      toast.info(scope === "group" ? "The group has no member nodes to arrange" : "No nodes to arrange");
+      return;
+    }
+    const ids = new Set(subset.map((n) => n.id));
+    const edges = this.canvas.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    const before = M.boundsOf(subset);
+    const origin = scope === "group"
+      ? { x: group.x + M.GROUP_LAYOUT_PAD.x, y: group.y + M.GROUP_LAYOUT_PAD.top }
+      : scope === "selection" ? { x: before.x, y: before.y } : null;
+    const kind = mode === "force" ? "force-directed" : "layered DAG";
     const applyPositions = (positions) => {
-      const byPos = new Map((positions || []).map((p) => [p.id, p]));
-      for (const n of active) {
+      // A result that arrives after the arranged nodes were deleted (or the canvas switched) is dropped
+      const live = new Set(this.canvas.nodes);
+      if (!subset.every((n) => live.has(n)) || (group && !live.has(group))) return;
+      const list = origin ? M.anchorPositions(positions, subset, origin) : (positions || []);
+      const byPos = new Map(list.map((p) => [p.id, p]));
+      for (const n of subset) {
         const p = byPos.get(n.id);
         if (p) { n.x = p.x; n.y = p.y; }
       }
-      M.reassignGroups(this.canvas.nodes, active);
+      if (group) M.fitGroupToMembers(group, subset);
+      M.reassignGroups(this.canvas.nodes, subset);
+      if (group) for (const n of subset) if (!n.groupId) n.groupId = group.id;
+      for (const n of subset) this.portOffsets.delete(n.id);
       this.commit();
-      this.fitView();
-      toast.success(`Arranged ${active.length} nodes (${mode === "force" ? "force-directed" : "layered DAG"})`);
+      if (scope === "canvas") this.fitView();
+      const where = scope === "group" ? ` in ${M.displayTitle(group)}` : scope === "selection" ? " (selection)" : "";
+      toast.success(`Arranged ${subset.length} node${subset.length === 1 ? "" : "s"}${where} (${kind})`);
     };
+    const job = { nodes: subset, edges, mode };
     if (!this.workerPool?.workerSupported) {
-      applyPositions(layoutGraphJob({ nodes: this.canvas.nodes, edges: this.canvas.edges, mode }).positions);
+      applyPositions(layoutGraphJob(job).positions);
       return;
     }
-    return this.workerPool.computeLayout({ nodes: this.canvas.nodes, edges: this.canvas.edges, mode }, { key: "layout" })
+    return this.workerPool.computeLayout(job, { key: "layout" })
       .then((res) => { if (this.containerEl?.isConnected && res?.positions) applyPositions(res.positions); })
       .catch(() => { });
   }

@@ -15,7 +15,10 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.DBLayout import m_commit, m_commit_file, m_git_ref, m_ingest_state, m_maintainer_person, m_repository
+from core.DBLayout import (
+    m_bridge_commit_person, m_commit, m_commit_file, m_commit_parent, m_file_name, m_git_ref, m_ingest_state,
+    m_maintainer_person, m_repository,
+)
 from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.routers import commits as commits_router
 from webapp.backend.services import commit_query as cq
@@ -43,6 +46,31 @@ class TestVersionlessCommitService(unittest.TestCase):
                 },
             ]
         return make_db("sqlite", tables=[m_repository, m_git_ref, m_ingest_state, m_commit, m_commit_file, m_maintainer_person], rows=rows)
+
+    def test_commit_detail_reports_parents_and_committer(self) -> None:
+        """The commit details node (NodeMap) shows the committer and spawns the parents by hash."""
+        rows = {
+            "m_maintainer_person": [
+                {"person_id": 1, "name": "Ada Author", "email": "ada@example.org"},
+                {"person_id": 2, "name": "Carl Committer", "email": "carl@example.org"},
+            ],
+            "m_commit": [
+                {"commit_id": 10, "network_id": 1, "commit_hash": b"\x11" * 20, "author_id": 1, "author_date": 1000,
+                 "committer_id": 1, "committer_date": 1000, "subject": "base", "message": "base"},
+                {"commit_id": 11, "network_id": 1, "commit_hash": b"\x22" * 20, "author_id": 1, "author_date": 2000,
+                 "committer_id": 2, "committer_date": 2100, "subject": "child", "message": "child\n\nSigned-off-by: Ada"},
+            ],
+            "m_commit_parent": [{"commit_id": 11, "parent_commit_id": 10, "parent_idx": 0}],
+        }
+        db = make_db("sqlite", tables=[m_commit, m_commit_parent, m_commit_file, m_file_name, m_bridge_commit_person, m_maintainer_person], rows=rows)
+        svc = GitService()
+        with patch_reader(db), patch.object(svc, "_fill_missing_commit_files"):
+            detail = svc.get_commit_detail("11")
+        self.assertEqual(detail["parents"], ["11" * 20])
+        self.assertEqual(detail["committer"]["name"], "Carl Committer")
+        self.assertEqual(detail["committer"]["email"], "carl@example.org")
+        self.assertEqual(detail["committer_date"], 2100)
+        self.assertFalse(detail["is_merge"])
 
     def test_get_commits_allows_empty_version_and_valid_git_rev(self) -> None:
         db = self._make_commit_db(with_commits=True)

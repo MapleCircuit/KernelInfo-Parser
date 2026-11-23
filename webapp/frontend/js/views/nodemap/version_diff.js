@@ -107,13 +107,13 @@ export function renderStructDiffBadge(diff, versionA, versionB) {
 
 const VERSIONED_TYPES = new Set(["struct", "symbol", "source", "kconfig", "maintainer", "kapi", "doc", "history"]);
 
-/** Switch `node.version` across the canvas (or within `groupId`) to `targetVersion`. */
-export function applyCanvasVersion(nodes, targetVersion, { groupId = null } = {}) {
+/** Switch `node.version` across the canvas (or within `groupId`, or of the nodes `ids`) to `targetVersion`. */
+export function applyCanvasVersion(nodes, targetVersion, { groupId = null, ids = null } = {}) {
   const ver = String(targetVersion || "").trim();
   if (!ver) return { changedIds: [], previousVersions: {} };
-  const scope = groupId
-    ? new Set(groupDescendants(nodes, groupId).map((n) => n.id))
-    : null;
+  const scope = ids
+    ? new Set(ids)
+    : groupId ? new Set(groupDescendants(nodes, groupId).map((n) => n.id)) : null;
   const changedIds = [];
   const previousVersions = {};
   for (const n of nodes || []) {
@@ -128,12 +128,19 @@ export function applyCanvasVersion(nodes, targetVersion, { groupId = null } = {}
   return { changedIds, previousVersions };
 }
 
-/** Restore node revisions from `previousVersions` map (`nodeId -> version`). */
+/**
+ * Restore node revisions from `previousVersions` (`nodeId -> version`, or `nodeId -> {version, data}`
+ * from `captureVersions()` when applying moved revision fields of the payload too).
+ */
 export function revertCanvasVersion(nodes, previousVersions = {}) {
   const revertedIds = [];
   for (const n of nodes || []) {
     if (Object.prototype.hasOwnProperty.call(previousVersions, n.id)) {
-      n.version = previousVersions[n.id];
+      const prev = previousVersions[n.id];
+      if (prev && typeof prev === "object") {
+        n.version = String(prev.version ?? "");
+        if (prev.data) n.data = prev.data;
+      } else n.version = prev;
       revertedIds.push(n.id);
     }
   }
@@ -141,11 +148,20 @@ export function revertCanvasVersion(nodes, previousVersions = {}) {
 }
 
 /**
+ * What `revertCanvasVersion()` needs to undo `retargetNodeVersions()` on `nodes`: their revision and
+ * payload (which it replaces, never mutates, so the captured objects stay as they were).
+ */
+export function captureVersions(nodes) {
+  return Object.fromEntries((nodes || []).map((n) => [n.id, { version: n.version, data: n.data }]));
+}
+
+/**
  * Node types whose content follows a revision when one is applied to selected nodes (the header's
  * Apply, the multi-selection Revision field): the canvas-wide set plus `cve` and `diff`. A `diff` in
  * file mode moves its "To" side (`versionB`), a `cve` node its release check (`release`, with the
  * revision of its file CVEs); a `tab` node moves the `v=` of its embedded address.
- * `note`, `group`, `man` and `mail` nodes have no revision.
+ * `note`, `group`, `man`, `mail` and `commit` nodes have no revision (a commit hash names one commit
+ * in every revision).
  */
 export const SELECTION_VERSIONED_TYPES = new Set([...VERSIONED_TYPES, "cve", "diff"]);
 

@@ -2,8 +2,8 @@
  * nodemap_bridge.js - "Send to NodeMap" from other views (`webapp/API_FRONTEND.md` §5.3.5).
  *
  * `nodeSpecsForTab()` (pure) turns a tab into the node that shows it natively (code tab → source or
- * Documentation `.rst` → doc node, man tab → man page node, pahole tab → struct node, Compare/Commits
- * → diff node, Mailing List → mail node, Kconfig → kconfig node, Maintainers → maintainer node,
+ * Documentation `.rst` → doc node, man tab → man page node, pahole tab → struct node, Compare → diff
+ * node, a commit of the Commits tab → commit details node, Mailing List → mail node, Kconfig → kconfig node, Maintainers → maintainer node,
  * CVE → cve node, Kernel API → kapi node) or, for every other tab, a live tab node embedding the
  * tab's address. `tabForNode()` (pure) is the reverse.
  */
@@ -37,8 +37,8 @@ export function nodeSpecsForTab(tab, hashOf, { live = false } = {}) {
     if (tab.type === "diff" && tab.path && (tab.versionA || tab.versionB)) {
       return [{ ...base, type: "diff", data: { mode: "file", versionA: tab.versionA || "", versionB: tab.versionB || tab.version || "", path: tab.path, oldPath: tab.oldPath || "" } }];
     }
-    if (tab.type === "commits" && tab.commitId) {
-      return [{ ...base, type: "diff", data: { mode: "commit", commitHash: tab.commitId, path: "" } }];
+    if (tab.type === "commits" && /^[0-9a-f]{4,64}$/i.test(String(tab.commitId || ""))) {
+      return [{ ...base, type: "commit", data: { commitHash: String(tab.commitId) } }];
     }
     if (tab.type === "mail" && (tab.threadId || tab.messageId)) {
       return [{ ...base, type: "mail", data: { tid: Number(tab.threadId) || null, mid: tab.messageId || "", subject: tab.mailSubject || "" } }];
@@ -107,6 +107,12 @@ export function diffSpec({ versionA = "", versionB = "", path = "", oldPath = ""
   if (commitHash) return { type: "diff", version: version || versionB, repo, data: { mode: "commit", commitHash, path } };
   if (!path) return null;
   return { type: "diff", version: version || versionB, repo, data: { mode: "file", versionA, versionB, path, oldPath } };
+}
+
+export function commitSpec({ commitHash = "", subject = "", version = "", repo = "" }) {
+  const hash = String(commitHash || "").trim();
+  if (!/^[0-9a-f]{4,64}$/i.test(hash)) return null;
+  return { type: "commit", version, repo, data: { commitHash: hash.toLowerCase(), subject: String(subject || "") } };
 }
 
 export function mailSpec({ tid = null, mid = "", subject = "", version = "", repo = "" }) {
@@ -201,6 +207,8 @@ export function tabForNode(node, loaded = null, fallback = {}) {
       return { type: "api", title: `Kernel API · ${d.catalog || "summary"}`, view: d.catalog || "summary", arch: d.arch || "x86_64", ...(d.query ? { query: d.query } : {}), ...(d.symbol ? { sel: d.symbol } : {}), ...base };
     case "doc":
       return d.path ? { type: "code", title: file(d.path), path: d.path, docMode: isDocumentationPath(d.path) ? "doc" : "source", ...base } : null;
+    case "commit":
+      return d.commitHash ? { type: "commits", title: `Commit ${d.commitHash.slice(0, 12)}`, commitId: d.commitHash, ...base } : null;
     case "history":
       if (d.path) return { type: "code", title: file(d.path), path: d.path, cursorLine: d.line || 1, showBlame: d.mode === "blame", ...base };
       return null;

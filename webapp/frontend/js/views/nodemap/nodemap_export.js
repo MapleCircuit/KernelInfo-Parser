@@ -2,7 +2,7 @@
  * nodemap_export.js - SVG (and, through it, PNG) of a whole NodeMap canvas (`webapp/API_FRONTEND.md` §5.3).
  *
  * Respects visibility layers (`visibleCanvasSlice`), edge waypoints, struct `layout` (pahole
- * cache-line offsets/holes), and all 15 node types including `cve`, `kapi`, `doc`, and `history`.
+ * cache-line offsets/holes), and all 16 node types including `cve`, `kapi`, `doc`, `history` and `commit`.
  * `canvasToSvg()` and the size helpers are DOM-free (unit tested).
  */
 import { BG_TINT, NODE_BADGES, accentVar, boundsOf, colorToHex, contentBox, displayTitle, formatLockBadge, isCustomColor, paintOrder, visibleCanvasSlice } from "./canvas_model.js";
@@ -693,6 +693,39 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     return rowsClip(box, top, inner);
   };
 
+  const commitBody = (n, box, top) => {
+    const model = content(n);
+    if (!model?.hash) return txt(10, top + 16, esc(n.data.commitHash ? `Commit ${n.data.commitHash.slice(0, 12)}` : "Commit"), { fill: C.faint });
+    let inner = "";
+    let y = top + 6;
+    const cols = Math.floor((box.w - 16) / SANS_CH);
+    const mcols = Math.floor((box.w - 16) / MONO_CH);
+    const line = (s, o = {}) => {
+      if (y <= box.h) inner += txt(8, y + 12, esc(s), o);
+      y += o.step || 15;
+    };
+    for (const l of wrap(model.subject || "(no subject)", cols).slice(0, 3)) line(l, { weight: "bold", step: 17 });
+    line(fit(`commit ${model.hash}`, mcols), { fill: C.blue, size: 10, family: "monospace" });
+    const who = (label, p) => p && (p.name || p.email) && line(fit(`${label} ${p.name}${p.email ? ` <${p.email}>` : ""}${p.date ? ` · ${p.date}` : ""}`, mcols), { fill: C.muted, size: 10, family: "monospace" });
+    who("Author:", model.author);
+    who("Commit:", model.committer);
+    if (model.parents.length) line(fit(`Parent${model.parents.length > 1 ? "s" : ""}: ${model.parents.map((p) => p.slice(0, 12)).join(" ")}`, mcols), { fill: C.muted, size: 10, family: "monospace" });
+    y += 4;
+    for (const l of String(model.body || "").split("\n").slice(0, 40)) {
+      if (y > box.h) break;
+      for (const w of wrap(l, mcols).slice(0, 4)) line(w || " ", { fill: C.text, size: 10, family: "monospace", step: 14 });
+    }
+    for (const t of model.trailers) line(fit(`${t.key}: ${t.value}`, mcols), { fill: C.green, size: 10, family: "monospace", step: 14 });
+    y += 4;
+    line(fit(`Files (${model.files.length}${model.filesTruncated ? "+" : ""})${model.fileSummary ? ` · ${model.fileSummary}` : ""}`, cols), { fill: C.muted, size: 10, weight: "bold" });
+    for (const f of model.files) {
+      if (y > box.h) break;
+      line(fit(`[${f.status}] ${f.path}`, mcols), { fill: f.status === "A" ? C.green : f.status === "D" ? C.red : C.text, size: 10, family: "monospace", step: 14 });
+    }
+    used = y + 4;
+    return rowsClip(box, top, inner);
+  };
+
   const symbolBody = (n, box, top) => {
     const d = n.data;
     if (!d.expanded) return txt(10, top + 18, esc(`${d.kind === "func" ? "Function" : "Symbol"} · ${n.version}`), { fill: C.faint });
@@ -744,6 +777,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
     else if (n.type === "kapi") body = kapiBody(n, box, top);
     else if (n.type === "doc") body = docBody(n, box, top);
     else if (n.type === "history") body = historyBody(n, box, top);
+    else if (n.type === "commit") body = commitBody(n, box, top);
     if (n.autoFit && used > top && used < box.h) box = { ...box, h: Math.ceil(used) };
     rects.set(n.id, { x: n.x, y: n.y, w: n.w, h: Math.round(box.h * box.s) });
     const tf = box.s !== 1 ? `translate(${n.x} ${n.y}) scale(${box.s})` : `translate(${n.x} ${n.y})`;
@@ -997,8 +1031,17 @@ export function captureNodeForeignObject(node, el) {
       root = doc.querySelector("#workspace") || doc.body;
     }
     if (!root || !win?.getComputedStyle) return null;
+    // A supersampled tab iframe (its document zoomed, `applyFrameSupersample()`) is read at 1×
+    const html0 = node.type === "tab" ? root.ownerDocument?.documentElement : null;
+    const zoom0 = html0?.style?.zoom || "";
+    if (zoom0) html0.style.zoom = "";
     const budget = { n: FO_MAX_ELEMENTS };
-    const clone = cloneStyled(root, win, budget);
+    let clone;
+    try {
+      clone = cloneStyled(root, win, budget);
+    } finally {
+      if (zoom0) html0.style.zoom = zoom0;
+    }
     if (!clone || budget.n < 0) return null;
     const w = body.offsetWidth || root.offsetWidth || 0;
     const h = body.offsetHeight || root.offsetHeight || 0;

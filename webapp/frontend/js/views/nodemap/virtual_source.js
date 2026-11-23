@@ -3,7 +3,8 @@
  * (`webapp/API_FRONTEND.md` §5.3).
  *
  * Keeps DOM node counts bounded (< 200 rows) even on 6,000+ line files by rendering only the visible
- * slice plus an overscan buffer inside a fixed-height spacer positioned via GPU `translate3d`.
+ * slice plus an overscan buffer inside a fixed-height spacer positioned via a 2D `translate` (no
+ * `will-change` compositor layer, so the rows stay crisp at any zoom).
  */
 import { AstOverlay } from "../code_view/ast_overlay.js";
 import { esc } from "./struct_view.js";
@@ -73,7 +74,7 @@ export function renderVirtualSourceWindow(lines, startLine, path, highlight = nu
     const codeHtml = htmlRows ? String(htmlRows[i] ?? "") : ov.renderLineHtml(i + 1, arr[i]);
     rowsHtml += `<div class="nm-src-row${mark}"><span class="nm-src-no">${no}</span><span class="nm-src-code">${codeHtml}</span></div>`;
   }
-  return `<div class="nm-virt-spacer" style="height:${r.totalHeight}px"><div class="nm-virt-window" style="transform:translate3d(0,${r.offsetY}px,0)">${rowsHtml}</div></div>`;
+  return `<div class="nm-virt-spacer" style="height:${r.totalHeight}px"><div class="nm-virt-window" style="transform:translate(0,${r.offsetY}px)">${rowsHtml}</div></div>`;
 }
 
 /** Render one diff row window `[range.startIdx, range.endIdx)` inside a fixed-height spacer. */
@@ -91,7 +92,7 @@ export function renderVirtualDiffWindow(rows, range = null) {
       rowsHtml += `<div class="nm-diff-row ${cls}"><span class="nm-diff-no">${esc(row.old ?? "")}</span><span class="nm-diff-no">${esc(row.new ?? "")}</span><span class="nm-diff-sign">${row.kind === " " ? "" : esc(row.kind)}</span><span class="nm-diff-code">${esc(row.text)}</span></div>`;
     }
   }
-  return `<div class="nm-virt-spacer" style="height:${r.totalHeight}px"><div class="nm-virt-window" style="transform:translate3d(0,${r.offsetY}px,0)">${rowsHtml}</div></div>`;
+  return `<div class="nm-virt-spacer" style="height:${r.totalHeight}px"><div class="nm-virt-window" style="transform:translate(0,${r.offsetY}px)">${rowsHtml}</div></div>`;
 }
 
 /**

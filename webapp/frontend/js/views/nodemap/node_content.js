@@ -193,6 +193,10 @@ export function headMetaOf(type, payload) {
     const text = payload.mode === "kernel-doc" ? `${payload.total || 0} entries` : `${payload.path}`;
     return { text, title: payload.path };
   }
+  if (type === "commit" && payload.hash) {
+    const text = `${payload.shortHash}${payload.author?.date ? ` · ${payload.author.date.slice(0, 10)}` : ""}`;
+    return { text, title: `${payload.hash}${payload.author?.name ? ` · ${payload.author.name}` : ""} · ${payload.files.length} file${payload.files.length === 1 ? "" : "s"}` };
+  }
   if (type === "history") {
     const text = payload.mode === "blame"
       ? `${payload.commits?.length || 0} commits`

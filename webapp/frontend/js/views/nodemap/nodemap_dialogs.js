@@ -13,7 +13,7 @@ import { copyToClipboard } from "../../utils/clipboard.js";
 import { isTabFeatureEnabled } from "../../utils/projects.js";
 import { isAlwaysVersionlessTab } from "../../tab_routes.js";
 import * as M from "./canvas_model.js";
-import { cveSpec, docSpec, historySpec, kapiSpec } from "./nodemap_bridge.js";
+import { commitSpec, cveSpec, docSpec, historySpec, kapiSpec } from "./nodemap_bridge.js";
 import { PNG_DEFAULT_SCALE, PNG_SCALES, pngSize, svgSize } from "./nodemap_export.js";
 import { canvasToDot, canvasToMermaid } from "./nodemap_export_formats.js";
 import {
@@ -34,7 +34,7 @@ export const EMBED_TAB_TYPES = [
 ];
 
 export const ADD_MENU = [
-  ["struct", "Struct / Union…", "🧱"], ["source", "Source File / Slice…", "📄"], ["diff", "Diff…", "±"],
+  ["struct", "Struct / Union…", "🧱"], ["source", "Source File / Slice…", "📄"], ["diff", "Diff…", "±"], ["commit", "Commit…", "⎇"],
   ["mail", "Mailing List Thread…", "✉"], ["kconfig", "Kconfig Symbol…", "⚙"], ["maintainer", "Maintainers…", "👥"],
   ["cve", "CVE / Fix-Chain…", "🛡"], ["kapi", "Kernel API…", "🔌"], ["doc", "Kernel Docs (.rst)…", "📖"],
   ["history", "Symbol History / Blame…", "🕰"], ["man", "Man Page…", "📘"], ["tab", "KernelInfo Tab…", "🗔"],
@@ -152,6 +152,9 @@ export function openNodeDialog(ctrl, type, existing = null) {
     body += field("path", "File (all files of a commit when empty)", "", 'placeholder="kernel/fork.c" spellcheck="false"', "file");
     body += field("oldPath", "Old path (renamed file)", "", 'spellcheck="false"', "file");
     body += field("commitHash", "Commit (commit diff)", "", 'placeholder="a1b2c3d4" spellcheck="false"');
+  } else if (type === "commit") {
+    title = "Add Commit";
+    body += field("commitHash", "Commit hash (full or abbreviated)", "", 'placeholder="a1b2c3d4" spellcheck="false" required');
   } else if (type === "mail") {
     title = "Add Mailing List Thread";
     body += field("tid", "Thread id", "", 'type="number" min="1"');
@@ -200,7 +203,7 @@ export function openNodeDialog(ctrl, type, existing = null) {
   modal.body.innerHTML = `<form class="nm-form">${body}</form>`;
   const form = modal.body.querySelector("form");
   wireFormPickers(form, dialogPickerContext(ctrl, form, type));
-  form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query'], input[name='cveId']")?.focus?.();
+  form.querySelector("input[name='name'], input[name='path'], input[name='symbol'], input[name='tid'], input[name='query'], input[name='cveId'], input[name='commitHash']")?.focus?.();
   const submit = async () => {
     const f = Object.fromEntries(new FormData(form).entries());
     const spec = await specFromForm(ctrl, type, f);
@@ -269,6 +272,11 @@ export async function specFromForm(ctrl, type, f) {
     const versionB = String(f.versionB || version).trim();
     if (!path || !versionA || !versionB) return toast.warning("Enter a file and both revisions"), null;
     return { type, version: versionB, data: { mode: "file", versionA, versionB, path, oldPath: String(f.oldPath || "").trim() } };
+  }
+  if (type === "commit") {
+    const spec = commitSpec({ commitHash: f.commitHash, version });
+    if (!spec) return toast.warning("Enter a commit hash (4-40 hex digits)"), null;
+    return spec;
   }
   if (type === "mail") {
     const tid = int(f.tid);

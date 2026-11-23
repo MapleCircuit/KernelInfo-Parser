@@ -16,6 +16,8 @@ const EDIT_ACTS = new Set(["toggle-type", "hide-item", "all-types", "guards", "t
 const MAIL_EXPAND_MAX = 60;
 const KC_EXPAND_MAX = 40;
 const TYPE_EXPAND_MAX = 40;
+/** A bulk Blame expand that would add more new nodes than this shows a confirmation first. */
+export const BLAME_CONFIRM_ABOVE = 20;
 
 const isTyping = (el) => Boolean(el && (el.closest?.("input, textarea, select, [contenteditable='true']")));
 
@@ -825,9 +827,24 @@ export function onClick(ctrl, e) {
     const path = idx > 0 ? raw.slice(0, idx) : raw;
     const line = idx > 0 ? Math.max(1, parseInt(raw.slice(idx + 1), 10) || 1) : 1;
     spawnLinkedNode(ctrl, node, { type: "source", version: node.version, repo: node.repo, data: { path, mode: "range", start: line, end: line + 30 } }, act === "doc-spawn-source" ? "documents" : "defined in");
-  } else if (act === "hist-spawn-commit") {
-    spawnLinkedNode(ctrl, node, { type: "diff", version: node.version, repo: node.repo, data: { mode: "commit", commitHash: btn.dataset.key, path: "" } }, "blame commit", { fromField: commitRowKey(btn.dataset.key) });
-  } else if (act === "hist-spawn-diff") {
+  } else if (act === "hist-spawn-commit" || act === "hist-spawn-commit-detail") {
+    const c = ctrl.modelOf(node)?.commits?.find((x) => x.commitHash === btn.dataset.key) || { commitHash: btn.dataset.key, subject: "" };
+    const target = linkBlameCommit(ctrl, node, c, act === "hist-spawn-commit" ? "diff" : "commit");
+    if (target) {
+      ctrl.selected = new Set([target.id]);
+      ctrl.selectedEdge = null;
+      ctrl.commit();
+    }
+  } else if (act === "blame-expand-commits") ctrl.expandBlameToNodes(node.id, "commit");
+  else if (act === "blame-expand-diffs") ctrl.expandBlameToNodes(node.id, "diff");
+  else if (act === "commit-spawn-diff") ctrl.spawnCommitDiff(node.id);
+  else if (act === "commit-spawn-parent") spawnCommitLink(ctrl, node, { type: "commit", hash: btn.dataset.key, label: "parent" });
+  else if (act === "commit-spawn-ref") {
+    const raw = String(btn.dataset.key || "");
+    const idx = raw.indexOf(":");
+    spawnCommitLink(ctrl, node, { type: "commit", hash: idx > 0 ? raw.slice(0, idx) : raw, label: idx > 0 ? raw.slice(idx + 1) : "refers to" });
+  } else if (act === "commit-spawn-file") spawnCommitLink(ctrl, node, { type: "diff", hash: node.data.commitHash, path: btn.dataset.key, label: "changes" });
+  else if (act === "hist-spawn-diff") {
     const raw = String(btn.dataset.key || "");
     const sep = raw.indexOf(":");
     const revRange = sep >= 0 ? raw.slice(0, sep) : raw;
@@ -1007,6 +1024,158 @@ export function expandThreadToNodes(ctrl, id) {
   const layout = mailThreadLayout({ rows }, { x: thread.x + thread.w + 80, y: thread.y }, { w: 320, h: 150 });
   const created = ctrl.spawnMailMessages(id, rows.map((r) => r.mid), { layout });
   if (model.rows.length > rows.length) toast.info(`Added the first ${rows.length} of ${model.rows.length} messages`);
+  return created;
+}
+
+// ------------------------------------------------------------------ commits (Blame rows, commit nodes)
+
+/** Whether two commit hashes name the same commit (one may be an abbreviation of the other). */
+export function sameCommit(a, b) {
+  const x = String(a || "").toLowerCase();
+  const y = String(b || "").toLowerCase();
+  if (!x || !y) return false;
+  return x.length <= y.length ? x.length >= 7 && y.startsWith(x) : y.length >= 7 && x.startsWith(y);
+}
+
+/**
+ * The node of `kind` already showing commit `hash` in `repo`: a `commit` details node, or a `diff`
+ * node of the whole commit (`path` empty) or of one of its files (`path`). Null when there is none.
+ */
+export function commitNodeOf(ctrl, kind, hash, repo = "", path = "") {
+  // A node without a repository is in the NodeMap's own (`nodeFromSpec()` fills it in)
+  const scope = (r) => r || ctrl.repo || "";
+  return ctrl.canvas.nodes.find((n) => scope(n.repo) === scope(repo) && (kind === "commit"
+    ? n.type === "commit" && sameCommit(n.data.commitHash, hash)
+    : n.type === "diff" && n.data.mode === "commit" && sameCommit(n.data.commitHash, hash) && (n.data.path || "") === (path || ""))) || null;
+}
+
+/** Spec of the node of `kind` (`commit` | `diff`) for commit `hash`, in the scope of node `from`. */
+function commitSpec(from, kind, hash, { subject = "", path = "" } = {}) {
+  return kind === "commit"
+    ? { type: "commit", version: from.version, repo: from.repo, data: { commitHash: hash, subject } }
+    : { type: "diff", version: from.version, repo: from.repo, data: { mode: "commit", commitHash: hash, path } };
+}
+
+/** Add an edge `from` → `to` unless one with the same anchor row already joins them. */
+function linkOnce(ctrl, from, to, label, fromField = null) {
+  if (ctrl.canvas.edges.some((e) => e.from === from.id && e.to === to.id && (e.fromField || null) === (fromField || null))) return null;
+  const edge = M.createEdge(fromField
+    ? { from: from.id, to: to.id, label, fromSide: "right", fromField, toSide: "left" }
+    : { from: from.id, to: to.id, label });
+  if (edge) ctrl.canvas.edges.push(edge);
+  return edge;
+}
+
+/**
+ * Connect Blame row `c` of history node `node` to the `commit` details or the commit `diff` node of its
+ * commit, adding that node (to the right of the Blame node) when the canvas has none. No commit here:
+ * the caller commits once. Returns the target node.
+ */
+export function linkBlameCommit(ctrl, node, c, kind, at = null) {
+  if (!node || !c?.commitHash) return null;
+  let target = commitNodeOf(ctrl, kind, c.commitHash, node.repo);
+  if (!target) {
+    const siblingCount = ctrl.canvas.edges.filter((e) => e.from === node.id).length;
+    target = ctrl.nodeFromSpec(commitSpec(node, kind, c.commitHash, { subject: c.subject }), at || { x: node.x + node.w + 100, y: node.y + siblingCount * 110 });
+    if (!target) return null;
+    ctrl.canvas.nodes.push(target);
+    M.reassignGroups(ctrl.canvas.nodes, [target]);
+  }
+  linkOnce(ctrl, node, target, kind === "commit" ? "blame commit" : "blame diff", commitRowKey(c.commitHash));
+  return target;
+}
+
+/**
+ * From commit node `node`: add (or reuse) the `commit` node of `hash` (a parent, a `Fixes:` target) or
+ * the commit `diff` node of `hash` (the whole commit, or one file `path`), connected with `label`.
+ */
+export function spawnCommitLink(ctrl, node, { type, hash, path = "", label = "" }) {
+  if (!node || !hash) return null;
+  let target = commitNodeOf(ctrl, type, hash, node.repo, path);
+  if (!target) return spawnLinkedNode(ctrl, node, commitSpec(node, type, hash, { path }), label);
+  linkOnce(ctrl, node, target, label);
+  ctrl.selected = new Set([target.id]);
+  ctrl.selectedEdge = null;
+  ctrl.commit();
+  return target;
+}
+
+/** The commit diff node of commit node `id` (added or reused), connected with a `diff` edge. */
+export function spawnCommitDiff(ctrl, id) {
+  const node = ctrl.byId(id);
+  if (!node || node.type !== "commit" || !node.data.commitHash) return null;
+  return spawnCommitLink(ctrl, node, { type: "diff", hash: node.data.commitHash, label: "diff" });
+}
+
+/** Geometry of the nodes a bulk Blame expand adds, in columns of `perColumn` beside the Blame node. */
+export function blameExpandLayout(node, count, kind, { perColumn = 12, gapX = 60, gapY = 24, offsetX = 120 } = {}) {
+  const lim = M.SIZE_LIMITS[kind];
+  const w = kind === "commit" ? 420 : 520;
+  const h = Math.max(lim.minH, kind === "commit" ? 260 : 300);
+  return Array.from({ length: count }, (_, i) => ({
+    x: node.x + node.w + offsetX + Math.floor(i / perColumn) * (w + gapX),
+    y: node.y + (i % perColumn) * (h + gapY),
+    w,
+    h,
+  }));
+}
+
+/**
+ * "Expand Commits to Nodes" (`kind` `commit`) / "Expand Diffs to Nodes" (`diff`) of Blame node `id`:
+ * one node per blamed commit (all of them, no cap), existing ones reused, each wired from its commit's
+ * row, the new ones in columns beside the Blame node; one undo step. Adding more than
+ * `BLAME_CONFIRM_ABOVE` new nodes asks first (`ctrl.confirmBulkSpawn()`); dismissing changes nothing.
+ * Resolves to the created nodes.
+ */
+export async function expandBlameToNodes(ctrl, id, kind = "commit") {
+  const what = kind === "diff" ? "diff" : "commit";
+  const node = ctrl.byId(id);
+  if (!node || node.type !== "history" || node.data.mode !== "blame") return [];
+  let model = ctrl.modelOf(node);
+  if (!model) return toast.info("The blame has not loaded yet"), [];
+  if (!model.commits?.length) return toast.info("No blamed commits to expand"), [];
+  let fresh = model.commits.filter((c) => !commitNodeOf(ctrl, what, c.commitHash, node.repo));
+  if (fresh.length > BLAME_CONFIRM_ABOVE) {
+    const ok = await ctrl.confirmBulkSpawn({
+      title: `Spawn ${fresh.length} ${what} nodes?`,
+      summary: `Spawn ${fresh.length} ${what} nodes from this Blame node?`,
+      intro: `${fresh.length} new ${what === "diff" ? "commit diff" : "commit details"} nodes will be added beside "${M.displayTitle(node)}" and wired from their rows${model.commits.length > fresh.length ? `; ${model.commits.length - fresh.length} commits already have one and are connected to it` : ""}. One undo step removes them all.`,
+      sections: [{
+        label: `New ${what} nodes`,
+        prefix: "",
+        fields: ["subject", "author"],
+        columns: ["Commit", "Subject", "Author"],
+        rows: fresh.map((c) => ({ name: c.commitHash.slice(0, 12), subject: c.subject, author: c.author })),
+      }],
+      confirmLabel: `Spawn ${fresh.length} nodes`,
+    });
+    // The canvas may have changed (or switched) while the dialog was open: plan again from what it holds now
+    if (!ok || ctrl.byId(id) !== node) return [];
+    model = ctrl.modelOf(node);
+    if (!model?.commits?.length) return [];
+    fresh = model.commits.filter((c) => !commitNodeOf(ctrl, what, c.commitHash, node.repo));
+  }
+  const freshSet = new Set(fresh.map((c) => c.commitHash));
+  const slots = blameExpandLayout(node, freshSet.size, what);
+  const created = [];
+  for (const c of model.commits) {
+    const existed = !freshSet.has(c.commitHash) || commitNodeOf(ctrl, what, c.commitHash, node.repo);
+    const slot = existed ? null : slots[created.length];
+    const target = linkBlameCommit(ctrl, node, c, what, slot ? { x: slot.x, y: slot.y } : null);
+    if (target && !existed) {
+      target.w = slot.w;
+      target.h = slot.h;
+      created.push(target);
+    }
+  }
+  if (created.length) {
+    M.reassignGroups(ctrl.canvas.nodes, created);
+    ctrl.selected = new Set(created.map((x) => x.id));
+    ctrl.selectedEdge = null;
+  }
+  ctrl.commit();
+  const reused = model.commits.length - created.length;
+  toast.success(`Added ${created.length} ${what} node${created.length === 1 ? "" : "s"}${reused ? ` (${reused} already on the canvas, connected)` : ""}`);
   return created;
 }
 

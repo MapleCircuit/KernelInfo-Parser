@@ -16,13 +16,13 @@ export const USER_CANVAS_KIND = "nodemap-canvas";
 
 export const NODE_TYPES = [
   "struct", "symbol", "source", "man", "tab", "note", "group",
-  "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history",
+  "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit",
 ];
 /** Header badge of each node type (live node and SVG export). */
 export const NODE_BADGES = {
   struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group",
   diff: "diff", mail: "mail", kconfig: "kconfig", maintainer: "maint",
-  cve: "cve", kapi: "kapi", doc: "doc", history: "hist",
+  cve: "cve", kapi: "kapi", doc: "doc", history: "hist", commit: "commit",
 };
 export const SIDES = ["auto", "top", "right", "bottom", "left"];
 export const ARROWS = ["none", "forward", "backward", "both"];
@@ -40,12 +40,12 @@ export const LOCK_KINDS = ["spinlock", "mutex", "rwsem", "rcu", "atomic", "seqlo
 /** Node types whose content can be measured and scaled (`autoFit`); groups and live tab iframes cannot. */
 export const AUTOFIT_TYPES = [
   "struct", "symbol", "note", "source", "man", "diff", "mail", "kconfig", "maintainer",
-  "cve", "kapi", "doc", "history",
+  "cve", "kapi", "doc", "history", "commit",
 ];
 /** Node types a tab of the workspace can open (Open as tab, Copy to Session). */
 export const TAB_OPENABLE_TYPES = [
   "struct", "source", "man", "tab", "symbol", "diff", "mail", "kconfig", "maintainer",
-  "cve", "kapi", "doc", "history",
+  "cve", "kapi", "doc", "history", "commit",
 ];
 /** Node types whose content scales (`scale`): every type but groups. */
 export const scalable = (type) => type !== "group";
@@ -167,6 +167,7 @@ export const SIZE_LIMITS = {
   kapi: { w: 400, h: 340, minW: 240, minH: 120, maxW: 1600, maxH: 2400 },
   doc: { w: 480, h: 380, minW: 260, minH: 140, maxW: 2000, maxH: 2400 },
   history: { w: 440, h: 340, minW: 240, minH: 140, maxW: 1800, maxH: 2400 },
+  commit: { w: 460, h: 420, minW: 260, minH: 140, maxW: 1800, maxH: 2400 },
 };
 
 export const GRID_DEFAULT = 20;
@@ -378,6 +379,12 @@ export function normalizeData(type, raw, depth = 0) {
         name: str(d.name, "", 256).trim(),
         astId: Number.isInteger(d.astId) ? d.astId : null,
       };
+    case "commit":
+      return {
+        commitHash: /^[0-9a-f]{4,64}$/i.test(String(d.commitHash || "")) ? String(d.commitHash).toLowerCase() : "",
+        // Subject known where the node was spawned from (a blame row): the title until the commit loads
+        subject: str(d.subject, "", 512).trim(),
+      };
     case "note":
       return { text: str(d.text, "", 20000), markdown: d.markdown !== false };
     case "group":
@@ -426,6 +433,9 @@ export function defaultTitle(type, data) {
     case "history":
       if (data.mode === "blame") return data.path ? `Blame · ${data.path.split("/").pop()}` : "File Blame";
       return data.name ? `History · ${data.name}` : (data.path ? `History · ${data.path.split("/").pop()}:${data.line || 1}` : "Symbol History");
+    case "commit":
+      if (!data.commitHash) return "Commit";
+      return data.subject ? `${data.commitHash.slice(0, 12)} ${data.subject}` : `Commit ${data.commitHash.slice(0, 12)}`;
     default:
       return "Node";
   }
@@ -641,6 +651,17 @@ export function toggleLayerVisibility(settings, id) {
   return layer.visible;
 }
 
+/**
+ * Set a layer's visibility explicitly (the Inspector checkbox: its `input` and `change` events both
+ * land here, so the state follows the checkbox instead of flipping twice). Null for an unknown layer.
+ */
+export function setLayerVisibility(settings, id, visible) {
+  const layer = (settings?.layers || []).find((l) => l.id === id);
+  if (!layer) return null;
+  layer.visible = Boolean(visible);
+  return layer.visible;
+}
+
 export function removeLayer(canvas, id) {
   if (!canvas?.settings?.layers) return false;
   const before = canvas.settings.layers.length;
@@ -655,6 +676,11 @@ export function isLayerVisible(settings, layerId) {
   if (!layerId) return true;
   const layer = (settings?.layers || []).find((l) => l.id === layerId);
   return layer ? layer.visible !== false : true;
+}
+
+/** Whether edge `e` is visible: its own layer and the layers of both nodes it joins are shown. */
+export function isEdgeVisible(settings, e, from = null, to = null) {
+  return isLayerVisible(settings, e?.layerId) && isLayerVisible(settings, from?.layerId) && isLayerVisible(settings, to?.layerId);
 }
 
 /** Filter canvas nodes & edges to only those visible in active visibility layers. */
@@ -715,7 +741,8 @@ export function emptyCanvas() {
  * branches a Kconfig engine compiles out) and `kconfigEngine` (engine tab id, `""` = the engine of each
  * node's revision); `bgColor` the canvas background (`bgVar()` over `--bg-canvas`); `embedSessions`
  * (1+ `{id, name}`) and `followSession` (`""` or one of their ids, default the first); `layers`
- * (visibility layers `[{id, name, visible, color}]`).
+ * (visibility layers `[{id, name, visible, color}]`); `renderQuality` the supersampling of embedded
+ * tab iframes (`RENDER_QUALITIES`, `iframeSupersample()`).
  */
 export function normalizeSettings(raw) {
   const st = isObj(raw) ? raw : {};
@@ -731,7 +758,37 @@ export function normalizeSettings(raw) {
     followSession: typeof st.followSession === "string" && (st.followSession === "" || embedSessions.some((x) => x.id === st.followSession))
       ? st.followSession : embedSessions[0].id,
     layers: normalizeLayers(st.layers),
+    renderQuality: pick(st.renderQuality, RENDER_QUALITIES, "auto"),
   };
+}
+
+// ------------------------------------------------------------------ render quality
+
+/** Tab iframe supersampling: `auto` follows the magnification, the others are fixed factors. */
+export const RENDER_QUALITIES = ["auto", "1", "1.5", "2"];
+export const SUPERSAMPLE_MAX = 2;
+
+/**
+ * Internal resolution factor of an embedded tab iframe: it lays out at `k ×` its box (its document
+ * zoomed by `k`) and is drawn scaled by `1 / k`, so the browser rasterizes `k ×` the pixels before the
+ * canvas zoom and the node's content scale magnify it. `auto` picks 1, 1.5 or 2 from the magnification
+ * `zoom × scale` (nothing to gain at or below 100%).
+ */
+export function iframeSupersample(quality, zoom = 1, scale = 1) {
+  if (quality && quality !== "auto") {
+    const k = Number(quality);
+    return Number.isFinite(k) ? clamp(k, 1, SUPERSAMPLE_MAX) : 1;
+  }
+  const m = num(zoom, 1) * num(scale, 1);
+  if (m <= 1.05) return 1;
+  if (m <= 1.6) return 1.5;
+  return SUPERSAMPLE_MAX;
+}
+
+/** `v` snapped to the device pixel grid (`dpr` device pixels per CSS pixel): crisp layer offsets. */
+export function snapToDevicePixel(v, dpr = 1) {
+  const d = num(dpr, 1) > 0 ? num(dpr, 1) : 1;
+  return Math.round(num(v, 0) * d) / d;
 }
 
 /** Default embedded session of a new canvas. */
@@ -1276,6 +1333,58 @@ export function containingGroup(nodes, node) {
     if (!best || g.w * g.h < best.w * best.h) best = g;
   }
   return best ? best.id : null;
+}
+
+/** Space between a group's frame and the members an Auto-Layout arranges in it (canvas units). */
+export const GROUP_LAYOUT_PAD = { x: 24, top: 44, bottom: 24 };
+
+/**
+ * What an Auto-Layout arranges for the selection `selectedIds`:
+ * - one group selected: its direct members other than nested groups (`scope: "group"`, `group`);
+ * - several nodes selected: the selected nodes other than groups (`scope: "selection"`);
+ * - nothing or one node other than a group: every node but groups (`scope: "canvas"`).
+ * `{ scope, nodes, group }`; `nodes` is empty when a group or a selection has nothing to arrange.
+ */
+export function layoutScope(nodes, selectedIds = []) {
+  const ids = new Set(selectedIds || []);
+  const sel = nodes.filter((n) => ids.has(n.id));
+  if (sel.length === 1 && sel[0].type === "group") {
+    const group = sel[0];
+    return { scope: "group", group, nodes: nodes.filter((n) => n.groupId === group.id && n.type !== "group") };
+  }
+  if (sel.length > 1) return { scope: "selection", group: null, nodes: sel.filter((n) => n.type !== "group") };
+  return { scope: "canvas", group: null, nodes: nodes.filter((n) => n.type !== "group") };
+}
+
+/**
+ * Move laid-out `positions` (`[{id, x, y}]`, any origin) so their bounding box starts at `origin`
+ * (`{x, y}`): a subset arranged in place keeps the top-left corner it had. Returns new objects.
+ */
+export function anchorPositions(positions, nodes, origin) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const list = (positions || []).filter((p) => p && byId.has(p.id));
+  if (!list.length || !origin) return list.map((p) => ({ ...p }));
+  let minX = Infinity, minY = Infinity;
+  for (const p of list) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+  }
+  const dx = Math.round(origin.x - minX);
+  const dy = Math.round(origin.y - minY);
+  return list.map((p) => ({ id: p.id, x: Math.round(p.x + dx), y: Math.round(p.y + dy) }));
+}
+
+/**
+ * Grow or shrink group `group` (mutated; its top-left corner stays) so `members` fit inside its frame
+ * with `GROUP_LAYOUT_PAD` around them, within the group size limits.
+ */
+export function fitGroupToMembers(group, members, pad = GROUP_LAYOUT_PAD) {
+  const b = boundsOf(members);
+  if (!group || !b) return group;
+  const lim = SIZE_LIMITS.group;
+  group.w = Math.round(clamp(b.x + b.w + pad.x - group.x, lim.minW, lim.maxW));
+  group.h = Math.round(clamp(b.y + b.h + pad.bottom - group.y, lim.minH, lim.maxH));
+  return group;
 }
 
 /** Re-derive membership of `moved` nodes from where they now are; returns the ids that changed group. */

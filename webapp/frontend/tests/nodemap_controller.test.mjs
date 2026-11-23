@@ -768,7 +768,10 @@ test("Send to NodeMap specs of the domain views; tabs convert to native diff / m
   const T = (tab) => nodeSpecsForTab({ version: "v3.0", ...tab }, hashOf);
   assert.equal(T({ type: "diff", versionA: "v3.0", versionB: "v3.1", path: "a.c" })[0].type, "diff");
   assert.equal(T({ type: "diff", versionA: "v3.0", versionB: "v3.1" })[0].type, "tab", "a whole-revision compare stays a live tab");
-  assert.deepEqual(T({ type: "commits", commitId: "abc123" })[0].data, { mode: "commit", commitHash: "abc123", path: "" });
+  const commit = T({ type: "commits", commitId: "abc123" })[0];
+  assert.equal(commit.type, "commit", "a commit of the Commits tab becomes a commit details node");
+  assert.deepEqual(commit.data, { commitHash: "abc123" });
+  assert.equal(T({ type: "commits", commitId: "not-a-hash" })[0].type, "tab", "anything but a hash stays a live tab");
   assert.deepEqual(T({ type: "mail", threadId: "9", messageId: "m@x" })[0].data, { tid: 9, mid: "m@x", subject: "" });
   assert.deepEqual(T({ type: "kconfig", symbol: "SMP", arch: "arm64" })[0].data, { symbol: "SMP", arch: "arm64" });
   assert.equal(T({ type: "kconfig", arch: "arm64" })[0].type, "tab", "a Kconfig tab without a symbol embeds live");

@@ -657,7 +657,8 @@ class GitService:
     def get_commit_detail(self, commit_id: int | str) -> dict[str, Any]:
         """Retrieve full commit metadata, modified files, and trailers."""
         with get_reader() as reader:
-            commit_cols = ["commit_id", "commit_hash", "author_id", "subject", "message", "author_date"]
+            commit_cols = ["commit_id", "commit_hash", "author_id", "subject", "message", "author_date",
+                           "committer_id", "committer_date"]
             if str(commit_id).isdigit():
                 c_row = reader.select_one(
                     "m_commit", commit_cols, [{"commit_id": int(commit_id)}, {"commit_id": gt(0)}], as_dict=True
@@ -703,6 +704,18 @@ class GitService:
                 "name": safe_decode(p_row["name"]) if p_row else "Unknown",
                 "email": safe_decode(p_row["email"]) if p_row else "",
             }
+            committer_id = c_row.get("committer_id")
+            if committer_id == c_row["author_id"]:
+                committer_dict = dict(author_dict)
+            else:
+                cp_row = reader.select_one(
+                    "m_maintainer_person", ["person_id", "name", "email"], {"person_id": committer_id}, as_dict=True
+                ) if committer_id else None
+                committer_dict = {
+                    "person_id": committer_id or 0,
+                    "name": safe_decode(cp_row["name"]) if cp_row else "",
+                    "email": safe_decode(cp_row["email"]) if cp_row else "",
+                }
 
             # Modified files
             files = [
@@ -787,6 +800,9 @@ class GitService:
                 "author_name": author_dict["name"],
                 "author_email": author_dict["email"],
                 "author_date": c_row["author_date"],
+                "committer": committer_dict,
+                "committer_date": c_row.get("committer_date") or 0,
+                "parents": parents,
                 "files": files,
                 "files_source": "db" if files else "none",
                 "files_truncated": False,
@@ -816,15 +832,18 @@ class GitService:
             out, _, _ = self.run_git(["rev-list", "--parents", "-n1", sha], timeout=10)
             parents = out.split()[1:]
 
-            # %an (author name) \x00 %ae (author email) \x00 %at (author timestamp) \x00 %s (subject) \x00 %B (body)
-            out, _, rc = self.run_git(["log", "-1", "--format=%an%x00%ae%x00%at%x00%s%x00%B", sha], timeout=10)
+            # author name, email, timestamp, committer name, email, timestamp, subject, body (\x00-separated)
+            out, _, rc = self.run_git(
+                ["log", "-1", "--format=%an%x00%ae%x00%at%x00%cn%x00%ce%x00%ct%x00%s%x00%B", sha], timeout=10
+            )
             if rc != 0:
                 raise HTTPException(status_code=404, detail=f"Commit '{commit_ref}' not found.")
-            parts = out.split("\x00", 4)
-            if len(parts) < 5:
+            parts = out.split("\x00", 7)
+            if len(parts) < 8:
                 raise HTTPException(status_code=500, detail="Failed to parse commit details from Git.")
-            author_name, author_email, author_date_str, subj, message = parts
+            author_name, author_email, author_date_str, c_name, c_email, c_date_str, subj, message = parts
             author_date = int(author_date_str) if author_date_str.strip().isdigit() else 0
+            committer_date = int(c_date_str) if c_date_str.strip().isdigit() else 0
         except HTTPException:
             raise
         except Exception as exc:
@@ -844,6 +863,9 @@ class GitService:
             "author_name": author_name,
             "author_email": author_email,
             "author_date": author_date,
+            "committer": {"person_id": 0, "name": c_name, "email": c_email},
+            "committer_date": committer_date,
+            "parents": parents,
             "files": [],
             "files_source": "none",
             "files_truncated": False,

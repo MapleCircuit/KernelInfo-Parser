@@ -1,7 +1,7 @@
 /**
  * domain_nodes.js - Content of the NodeMap's domain nodes (`webapp/API_FRONTEND.md` §5.3.2):
  * diffs, mailing-list threads, Kconfig symbols with relations, MAINTAINERS sections, CVE records,
- * Kernel API catalogs, Kernel Docs (`.rst` / kernel-doc), and Symbol History / File Blame.
+ * Kernel API catalogs, Kernel Docs (`.rst` / kernel-doc), Symbol History / File Blame, and commit details.
  *
  * DOM-free (unit tested).
  */
@@ -918,7 +918,8 @@ export function historyModel(res, data = {}) {
       mode: "blame",
       path: String(r.path || data.path || ""),
       version: String(r.version || ""),
-      commits: [...bySha.values()].slice(0, 80),
+      // Every blamed commit (no cap: the bulk expands and the row ports cover all of them)
+      commits: [...bySha.values()],
       totalLines: Array.isArray(r.lines) ? r.lines.length : 0,
     };
   }
@@ -951,14 +952,18 @@ const rowPorts = (key) => `<span class="nm-port nm-port-field nm-port-left" data
 export function renderHistoryBody(model) {
   if (!model) return '<div class="nm-empty">No history loaded</div>';
   if (model.mode === "blame") {
-    const head = `<div class="nm-hist-head"><span>${esc(model.path || "Blame")}</span><span class="nm-hist-cnt">${model.commits.length} commits · ${model.totalLines} lines</span></div>`;
+    const expand = model.commits.length
+      ? `<span class="nm-hist-tools"><button type="button" class="nm-hist-btn" data-act="blame-expand-commits" title="Expand Commits to Nodes: one commit details node per commit">⇶ commits</button><button type="button" class="nm-hist-btn" data-act="blame-expand-diffs" title="Expand Diffs to Nodes: one commit diff node per commit">⇶ diffs</button></span>`
+      : "";
+    const head = `<div class="nm-hist-head"><span>${esc(model.path || "Blame")}</span><span class="nm-hist-cnt">${model.commits.length} commits · ${model.totalLines} lines</span>${expand}</div>`;
     if (!model.commits.length) return `<div class="nm-hist nm-scroll">${head}<div class="nm-empty">No blame lines</div></div>`;
     const rows = model.commits.map((c) => `<div class="nm-hist-row" data-key="${esc(commitRowKey(c.commitHash))}">${rowPorts(commitRowKey(c.commitHash))}
       <code class="nm-hist-sha">${esc(c.commitHash.slice(0, 8))}</code>
       <span class="nm-hist-author">${esc(c.author)}</span>
       <span class="nm-hist-subj" title="${esc(c.subject)}">${esc(c.subject)}</span>
       <span class="nm-hist-lines">L${c.lineStart}${c.lineEnd !== c.lineStart ? `–${c.lineEnd}` : ""} (${c.count})</span>
-      <button type="button" class="nm-hist-btn" data-act="hist-spawn-commit" data-key="${esc(c.commitHash)}" title="Spawn commit diff node">⊕ diff</button>
+      <button type="button" class="nm-hist-btn" data-act="hist-spawn-commit-detail" data-key="${esc(c.commitHash)}" title="Spawn the commit details node">⊕ commit</button>
+      <button type="button" class="nm-hist-btn" data-act="hist-spawn-commit" data-key="${esc(c.commitHash)}" title="Spawn the commit diff node">⊕ diff</button>
     </div>`).join("");
     return `<div class="nm-hist nm-scroll">${head}${rows}</div>`;
   }
@@ -971,4 +976,110 @@ export function renderHistoryBody(model) {
     ${r.prevVname && r.path ? `<button type="button" class="nm-hist-btn" data-act="hist-spawn-diff" data-key="${esc(`${r.prevVname}..${r.vname}:${r.path}`)}" title="Spawn diff ${esc(r.prevVname)}..${esc(r.vname)}">⊕ diff</button>` : ""}
   </div>`).join("");
   return `<div class="nm-hist nm-scroll">${head}${rows}</div>`;
+}
+
+// ------------------------------------------------------------------ commit details
+
+/** A trailer line of a commit message (`Signed-off-by: …`, `Fixes: …`, `Link: …`). */
+const TRAILER_RE = /^([A-Za-z][A-Za-z0-9-]*):\s+(\S.*)$/;
+/** The commit a `Fixes:` / `Reverts:` style trailer names (`<hash> ("subject")`). */
+const TRAILER_SHA_RE = /^([0-9a-f]{7,40})\b/i;
+const FILE_STATUS = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied", T: "type changed" };
+
+/**
+ * A commit message split into the body (subject line dropped) and its trailing `Key: value` block.
+ * `{ body, trailers: [{ key, value, sha }] }` (`sha`: the commit a `Fixes:`-like trailer names).
+ */
+export function splitCommitMessage(message, subject = "") {
+  const lines = String(message || "").replace(/\r\n?/g, "\n").split("\n");
+  if (lines.length && (lines[0].trim() === String(subject || "").trim() || !subject)) lines.shift();
+  let end = lines.length;
+  while (end > 0 && !lines[end - 1].trim()) end -= 1;
+  let start = end;
+  while (start > 0 && TRAILER_RE.test(lines[start - 1].trim())) start -= 1;
+  // A trailer block follows a blank line (or is the whole message after the subject)
+  if (start < end && start > 0 && lines[start - 1].trim()) start = end;
+  const trailers = lines.slice(start, end).map((l) => {
+    const m = TRAILER_RE.exec(l.trim());
+    const sha = /^(fixes|reverts|revert|upstream|commit)$/i.test(m[1]) ? (TRAILER_SHA_RE.exec(m[2])?.[1] || "").toLowerCase() : "";
+    return { key: m[1], value: m[2], sha };
+  });
+  return { body: lines.slice(0, start).join("\n").trim(), trailers };
+}
+
+const personOf = (p, name, email) => {
+  const o = isObj(p) ? p : {};
+  return { name: String(o.name || name || ""), email: String(o.email || email || "") };
+};
+const isoDay = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toISOString().replace("T", " ").slice(0, 16) : "");
+
+/**
+ * Commit details node model from `GET /api/commits/{v}/detail/{hash}`: hash, subject, author and
+ * committer, the message body, its trailers (the contributors list when the message has none),
+ * parents and the changed files with a per-status summary.
+ */
+export function commitModel(res, data = {}) {
+  const r = isObj(res) ? res : {};
+  const raw = String(r.commit_hash || data.commitHash || "").toLowerCase();
+  const hash = /^[0-9a-f]{4,64}$/.test(raw) ? raw : "";
+  const subject = String(r.subject || data.subject || "");
+  const { body, trailers: parsed } = splitCommitMessage(r.message || "", subject);
+  let trailers = parsed;
+  if (!trailers.length && Array.isArray(r.trailers)) {
+    trailers = r.trailers.filter(isObj).map((t) => ({
+      key: String(t.role_name || t.key || "Trailer"),
+      value: t.value ? String(t.value) : `${t.name || ""}${t.email ? ` <${t.email}>` : ""}`.trim(),
+      sha: "",
+    }));
+  }
+  const files = (Array.isArray(r.files) ? r.files : []).filter(isObj).map((f) => ({
+    status: String(f.change_type || "M").slice(0, 1).toUpperCase(),
+    path: String(f.file || f.path || ""),
+  })).filter((f) => f.path);
+  const byStatus = {};
+  for (const f of files) byStatus[f.status] = (byStatus[f.status] || 0) + 1;
+  const author = { ...personOf(r.author, r.author_name, r.author_email), date: isoDay(r.author_date) };
+  const committer = isObj(r.committer) || r.committer_date
+    ? { ...personOf(r.committer, r.committer_name, r.committer_email), date: isoDay(r.committer_date) }
+    : null;
+  return {
+    hash,
+    shortHash: hash.slice(0, 12),
+    subject,
+    author,
+    committer,
+    body,
+    trailers,
+    parents: (Array.isArray(r.parents) ? r.parents : []).map((p) => String(p || "").toLowerCase()).filter((p) => /^[0-9a-f]{4,64}$/.test(p)),
+    isMerge: Boolean(r.is_merge),
+    files,
+    fileSummary: Object.entries(byStatus).map(([st, n]) => `${n} ${FILE_STATUS[st] || st}`).join(" · "),
+    filesTruncated: Boolean(r.files_truncated),
+  };
+}
+
+const personLine = (label, p) => (p && (p.name || p.email)
+  ? `<div class="nm-commit-row"><span class="nm-commit-k">${esc(label)}</span><span class="nm-commit-v">${esc(p.name)}${p.email ? ` &lt;${esc(p.email)}&gt;` : ""}${p.date ? ` <span class="nm-commit-date">${esc(p.date)}</span>` : ""}</span></div>`
+  : "");
+
+/** Live body of a commit details node; its buttons spawn the diff, parents, fixed commits and file diffs. */
+export function renderCommitBody(model) {
+  if (!model?.hash) return '<div class="nm-empty">No commit loaded</div>';
+  let html = `<div class="nm-commit-subj">${esc(model.subject || "(no subject)")}</div>`;
+  html += `<div class="nm-commit-row"><span class="nm-commit-k">commit</span><code class="nm-commit-sha" title="${esc(model.hash)}">${esc(model.hash)}</code></div>`;
+  html += personLine("Author", model.author);
+  if (model.committer) html += personLine("Committer", model.committer);
+  if (model.parents.length) {
+    html += `<div class="nm-commit-row"><span class="nm-commit-k">${model.parents.length > 1 ? "Parents" : "Parent"}</span><span class="nm-commit-v">${model.parents.map((p) =>
+      `<button type="button" class="nm-hist-btn" data-act="commit-spawn-parent" data-key="${esc(p)}" title="Spawn the details node of parent ${esc(p)}">⊕ ${esc(p.slice(0, 12))}</button>`).join(" ")}</span></div>`;
+  }
+  html += `<div class="nm-commit-actions"><button type="button" class="nm-hist-btn" data-act="commit-spawn-diff" data-key="${esc(model.hash)}" title="Spawn the diff node of this commit">± Open diff</button>${model.isMerge ? '<span class="nm-commit-date">merge (diff against the first parent)</span>' : ""}</div>`;
+  if (model.body) html += `<pre class="nm-commit-msg">${esc(model.body)}</pre>`;
+  if (model.trailers.length) {
+    html += `<div class="nm-commit-trailers">${model.trailers.map((t) => `<div class="nm-commit-row"><span class="nm-commit-tk">${esc(t.key)}:</span><span class="nm-commit-v">${esc(t.value)}</span>${t.sha
+      ? `<button type="button" class="nm-hist-btn" data-act="commit-spawn-ref" data-key="${esc(`${t.sha}:${t.key.toLowerCase()}`)}" title="Spawn the details node of ${esc(t.sha)}">⊕</button>` : ""}</div>`).join("")}</div>`;
+  }
+  html += `<div class="nm-commit-files"><div class="nm-hist-head"><span>Files (${model.files.length}${model.filesTruncated ? "+" : ""})</span><span class="nm-hist-cnt">${esc(model.fileSummary)}</span></div>${model.files.map((f) =>
+    `<div class="nm-commit-file"><span class="nm-commit-st nm-commit-st-${esc(f.status)}">${esc(f.status)}</span><span class="nm-commit-path" title="${esc(f.path)}">${esc(f.path)}</span><button type="button" class="nm-hist-btn" data-act="commit-spawn-file" data-key="${esc(f.path)}" title="Spawn the diff of ${esc(f.path)} in this commit">⊕ diff</button></div>`).join("")}${model.files.length ? "" : '<div class="nm-empty">No changed files recorded</div>'}</div>`;
+  return `<div class="nm-commit nm-scroll">${html}</div>`;
 }
