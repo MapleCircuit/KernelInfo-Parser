@@ -1,5 +1,5 @@
 /**
- * projects.js - The configured repositories of `GET /api/projects` and which project each one holds
+ * projects.js - The configured repositories of `GET /webapi/projects` and which project each one holds
  * (webapp/API_FRONTEND.md §5.13): the linux kernel, the Linux man-pages, or another one. app.js fills it
  * whenever the project list is read; views ask it which repository to address for man pages or for
  * the kernel. DOM-free.

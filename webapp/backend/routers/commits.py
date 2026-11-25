@@ -13,7 +13,7 @@ from webapp.backend.services.commit_facts import commit_ids, git_facts, release_
 from webapp.backend.services.git_service import GitService
 from webapp.backend.services.jobs import retry_after_ms
 
-router = APIRouter(prefix="/api", tags=["commits"])
+router = APIRouter(prefix="/webapi", tags=["commits"])
 git_service = GitService()
 
 

@@ -1022,7 +1022,7 @@ const personOf = (p, name, email) => {
 const isoDay = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toISOString().replace("T", " ").slice(0, 16) : "");
 
 /**
- * Commit details node model from `GET /api/commits/{v}/detail/{hash}`: hash, subject, author and
+ * Commit details node model from `GET /webapi/commits/{v}/detail/{hash}`: hash, subject, author and
  * committer, the message body, its trailers (the contributors list when the message has none),
  * parents and the changed files with a per-status summary.
  */

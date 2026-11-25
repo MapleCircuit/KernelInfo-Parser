@@ -8,7 +8,7 @@ from fastapi import APIRouter, Body, Depends, Query
 from webapp.backend.config import require_feature
 from webapp.backend.services.mailing_list_service import mailing_list_service
 
-router = APIRouter(prefix="/api/mail", tags=["mail"], dependencies=[Depends(require_feature("mail"))])
+router = APIRouter(prefix="/webapi/mail", tags=["mail"], dependencies=[Depends(require_feature("mail"))])
 
 
 @router.get("/status")

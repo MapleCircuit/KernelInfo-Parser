@@ -3,7 +3,7 @@
  * defined in other headers, with the include chain that reaches them. Pure and DOM-free
  * (webapp/frontend/tests/imports_model.test.mjs).
  *
- * Items come from GET /api/fs/imports/{version}?path=&arch= ({name, kind, type_name, header_path, line, chain,
+ * Items come from GET /webapi/fs/imports/{version}?path=&arch= ({name, kind, type_name, header_path, line, chain,
  * forced, via, context, ref_line, ref_lines, ref_count, alternatives}). When `forced` is true, `chain[0]` is the
  * compiler-forced `-include` header; for a context import (`via: "context"`) `chain[0]` is the file including the
  * current one (`context`); otherwise `chain[0]` is the current file. The last element is `header_path`.

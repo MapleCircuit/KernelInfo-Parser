@@ -77,7 +77,7 @@ class GlobalState {
     // reachable from it are offered, since v2.6.16.62 belongs to stable/linux-2.6.16.y and not to
     // master. It scopes what can be picked; it never moves a tab on its own.
     this.selectedBranch = "";
-    // The tags of that branch (`GET /api/branch/tags`), null while nothing scopes them. app.js fills
+    // The tags of that branch (`GET /webapi/branch/tags`), null while nothing scopes them. app.js fills
     // it; every control that offers tags goes through tagOnSelectedBranch(), so the Tag and RC lists
     // and the Commit picker's tag search all narrow to the same set.
     this.branchTags = null;

@@ -1,5 +1,5 @@
 /**
- * grep_format.js - Formatting of full-text search results (GET /api/fs/grep, webapp/API.md §4.2, §5.34).
+ * grep_format.js - Formatting of full-text search results (GET /webapi/fs/grep, webapp/API.md §4.2, §5.34).
  *
  * Pure and DOM-free (webapp/frontend/tests/grep_format.test.mjs).
  */

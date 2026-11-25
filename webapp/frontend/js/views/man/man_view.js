@@ -3,9 +3,9 @@
  * of a code tab of the man-pages repository (`mountManDocument`).
  *
  * The tab belongs to the man-pages repository (`tab.repo`) at one of its tags (`tab.version`), like every
- * tab, and asks `/api/man/*` with that repository named on every request. Without a page it shows the
- * tag's index (`/api/man/{v}/index`), grouped by section with a filter box. The toolbar holds the tag
- * dropdown (`/api/man/tags`), the Web/Terminal toggle (per tab, default `kip-man-mode` in localStorage)
+ * tab, and asks `/webapi/man/*` with that repository named on every request. Without a page it shows the
+ * tag's index (`/webapi/man/{v}/index`), grouped by section with a filter box. The toolbar holds the tag
+ * dropdown (`/webapi/man/tags`), the Web/Terminal toggle (per tab, default `kip-man-mode` in localStorage)
  * and the links back into the kernel: the syscall in the Kernel API tab and the SYNOPSIS symbols'
  * definitions, opened as tabs of the kernel's repository next to this one.
  */

@@ -113,7 +113,7 @@ export function draftProblems(draft) {
   return out;
 }
 
-/** The body of `POST /api/version/{base}/patch/series`. */
+/** The body of `POST /webapi/version/{base}/patch/series`. */
 export function seriesPayload(draft) {
   const n = draft.series.filter((p) => p.files.length).length;
   return {

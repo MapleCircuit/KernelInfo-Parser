@@ -1,6 +1,6 @@
 /**
  * ops_modal.js - Ops implementations (N1, webapp/API.md §5.6): who fills a struct's function-pointer field
- * (`GET /api/tools/{v}/implementations?struct=&field=`) and which ops tables use a function (`?function=`).
+ * (`GET /webapi/tools/{v}/implementations?struct=&field=`) and which ops tables use a function (`?function=`).
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
@@ -58,7 +58,7 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
     try {
       const params = new URLSearchParams({ struct });
       if (field) params.set("field", field);
-      const res = await api.requestJob(`/api/tools/${encodeURIComponent(version)}/implementations?${params}`, {
+      const res = await api.requestJob(`/webapi/tools/${encodeURIComponent(version)}/implementations?${params}`, {
         // 202 while the revision's source index is assembled (§2.19); then every struct answers at once
         signal: abort.signal, timeoutMs: 600000, onProgress: (p) => { if (!abort.signal.aborted && status.isConnected) status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
       });
@@ -82,7 +82,7 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
     status.textContent = `Looking for ops tables using ${fn}…`;
     results.innerHTML = "";
     try {
-      const res = await api.requestJob(`/api/tools/${encodeURIComponent(version)}/implementations?${new URLSearchParams({ function: fn })}`, {
+      const res = await api.requestJob(`/webapi/tools/${encodeURIComponent(version)}/implementations?${new URLSearchParams({ function: fn })}`, {
         signal: abort.signal, timeoutMs: 600000, onProgress: (p) => { if (!abort.signal.aborted && status.isConnected) status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
       });
       if (abort.signal.aborted || !modal.body.isConnected) return;

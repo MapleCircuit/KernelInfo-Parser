@@ -12,7 +12,7 @@ from webapp.backend.services.callgraph_service import CallgraphService
 from webapp.backend.services.diff_service import RENAME_SIMILARITY, DiffService
 from webapp.backend.services.pahole_service import PaholeService
 
-router = APIRouter(prefix="/api", tags=["tools"])
+router = APIRouter(prefix="/webapi", tags=["tools"])
 pahole_service = PaholeService()
 callgraph_service = CallgraphService()
 diff_service = DiffService()

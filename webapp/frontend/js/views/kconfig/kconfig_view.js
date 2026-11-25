@@ -1,7 +1,7 @@
 /**
  * kconfig_view.js - KConfig explorer: web menuconfig, symbol inspector and .config manager.
  *
- * The configuration model of the selected ARCH comes from GET /api/kconfig/{version}/tree and is
+ * The configuration model of the selected ARCH comes from GET /webapi/kconfig/{version}/tree and is
  * evaluated in the browser by KconfigEngine (scripts/kconfig semantics). While the engine is on,
  * every edit goes through kconfig's own setters, so only valid configurations can be produced and
  * exported. With the engine off, values are edited raw (no constraints) for exploration.

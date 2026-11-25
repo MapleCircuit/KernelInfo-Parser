@@ -6,11 +6,11 @@ Five tokens (short hex digests), each with its own client reaction (webapp/front
 - `parsed`: the active repository's ingested versions (m_git_ref + m_ingest_state); version lists
   are refetched and cached data of the versions that changed is dropped.
 - `git`: the active repository's refs (git for-each-ref); tag/branch lists are refetched.
-- `projects`: the repository list (GET /api/projects: configured repositories, which are parsed and
+- `projects`: the repository list (GET /webapi/projects: configured repositories, which are parsed and
   present); clients refetch it only when this changes, not with every parsed version.
 
-They are cached (frontend 5 s, db/projects 30 s, parsed/git 15 s) so `/api/sync` and the `X-KIP-Sync`
-header of every API response cost no database or Git work on most requests; `/api/sync?fresh=true`
+They are cached (frontend 5 s, db/projects 30 s, parsed/git 15 s) so `/webapi/sync` and the `X-KIP-Sync`
+header of every API response cost no database or Git work on most requests; `/webapi/sync?fresh=true`
 recomputes them all (the frontend never asks for it: its "Check for Updates" reads the cached tokens too).
 """
 from __future__ import annotations
@@ -346,7 +346,7 @@ class SyncHeaderMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/webapi/"):
             await self.app(scope, receive, send)
             return
         import contextvars

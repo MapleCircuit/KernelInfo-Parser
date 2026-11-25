@@ -61,7 +61,7 @@ registerInsightsSection({
       }
       const window = all.slice(start, start + 12).reverse();
       if (window.length) {
-        const series = await (ctx.api || api).request(`/api/insights/release-stats/series?${window.map((t) => `tag=${encodeURIComponent(t)}`).join("&")}`);
+        const series = await (ctx.api || api).request(`/webapi/insights/release-stats/series?${window.map((t) => `tag=${encodeURIComponent(t)}`).join("&")}`);
         const pts = (series.series || []).filter((x) => !x.pending);
         if (pts.length > 1) trend = `<div class="sv-trend">Commits, last ${pts.length} releases ${sparklineSvg(pts.map((x) => x.commits), { title: pts.map((x) => `${x.release}: ${x.commits}`).join(", ") })}</div>`;
       }

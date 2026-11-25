@@ -72,7 +72,7 @@ function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
   const ui = {
     includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null,
     branch: null, // branch the timeline follows ("" = chosen by the server for `version`), set on first load
-    branches: [], // the repository's branches (GET /api/branches)
+    branches: [], // the repository's branches (GET /webapi/branches)
     seq: 0,
     commitsSeq: 0,
   };

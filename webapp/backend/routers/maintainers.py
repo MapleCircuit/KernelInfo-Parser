@@ -9,7 +9,7 @@ from webapp.backend.config import require_feature
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.maintainer_service import MaintainerService
 
-router = APIRouter(prefix="/api", tags=["maintainers"], dependencies=[Depends(require_feature("maintainers"))])
+router = APIRouter(prefix="/webapi", tags=["maintainers"], dependencies=[Depends(require_feature("maintainers"))])
 maintainer_service = MaintainerService()
 
 

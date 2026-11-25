@@ -1034,10 +1034,10 @@ F:\t*/
 
             # HTTP endpoint test
             client = TestClient(create_app())
-            r_ok = client.get(f"/api/insights/resolve?rev={c_mid}")
+            r_ok = client.get(f"/webapi/insights/resolve?rev={c_mid}")
             self.assertEqual(r_ok.status_code, 200)
             self.assertEqual(r_ok.json()["tag"], "v1.1")
-            r_bad = client.get("/api/insights/resolve?rev=deadbeefcafe")
+            r_bad = client.get("/webapi/insights/resolve?rev=deadbeefcafe")
             self.assertEqual(r_bad.status_code, 404)
 
 
@@ -1108,7 +1108,7 @@ class TestSecurityInsights(unittest.TestCase):
         with mock.patch("webapp.backend.config.repo_feature_enabled", return_value=True), \
                 mock.patch("webapp.backend.services.cve_service.report", return_value=sample_report):
             # Unfiltered preserves all 5 CVEs including null CVSS and introduced_release
-            r_all = client.get("/api/insights/v6.6/cves")
+            r_all = client.get("/webapi/insights/v6.6/cves")
             self.assertEqual(r_all.status_code, 200)
             body_all = r_all.json()
             self.assertEqual(body_all["total"], 5)
@@ -1116,7 +1116,7 @@ class TestSecurityInsights(unittest.TestCase):
             self.assertIsNone(body_all["cves"][-1]["introduced_release"])
 
             # `< 7.5`: strictly excludes null CVSS (CVE-2024-0001) and 7.5/9.8
-            r_lt = client.get("/api/insights/v6.6/cves?cvss_op=lt&cvss_score=7.5")
+            r_lt = client.get("/webapi/insights/v6.6/cves?cvss_op=lt&cvss_score=7.5")
             self.assertEqual(r_lt.status_code, 200)
             b_lt = r_lt.json()
             self.assertEqual([c["id"] for c in b_lt["cves"]], ["CVE-2024-0002"])
@@ -1125,39 +1125,39 @@ class TestSecurityInsights(unittest.TestCase):
             self.assertEqual(b_lt["cvss_filter"], {"op": "lt", "score": 7.5})
 
             # `> 7.5`: only 9.8
-            r_gt = client.get("/api/insights/v6.6/cves?cvss_op=gt&cvss_score=7.5")
+            r_gt = client.get("/webapi/insights/v6.6/cves?cvss_op=gt&cvss_score=7.5")
             self.assertEqual([c["id"] for c in r_gt.json()["cves"]], ["CVE-2024-0004"])
             self.assertEqual(r_gt.json()["counts"], {"affected": 0, "possibly": 0, "fixed": 1, "fixed_here": 1})
 
             # `= 7.5`: matches 7.5 and float 7.499999999999999 reliably
-            r_eq = client.get("/api/insights/v6.6/cves?cvss_op=eq&cvss_score=7.5")
+            r_eq = client.get("/webapi/insights/v6.6/cves?cvss_op=eq&cvss_score=7.5")
             self.assertEqual([c["id"] for c in r_eq.json()["cves"]], ["CVE-2024-0005", "CVE-2024-0003"])
             self.assertEqual(r_eq.json()["counts"], {"affected": 1, "possibly": 0, "fixed": 1, "fixed_here": 0})
 
             # `>= 7.5` (also testing symbol alias `≥`)
-            r_ge = client.get("/api/insights/v6.6/cves", params={"cvss_op": "≥", "cvss_score": "7.5"})
+            r_ge = client.get("/webapi/insights/v6.6/cves", params={"cvss_op": "≥", "cvss_score": "7.5"})
             self.assertEqual([c["id"] for c in r_ge.json()["cves"]], ["CVE-2024-0005", "CVE-2024-0004", "CVE-2024-0003"])
 
             # Out-of-range clamping on backend (-3.2 -> 0.0; 15.8 -> 10.0)
-            r_low_clamp = client.get("/api/insights/v6.6/cves?cvss_op=ge&cvss_score=-3.2")
+            r_low_clamp = client.get("/webapi/insights/v6.6/cves?cvss_op=ge&cvss_score=-3.2")
             self.assertEqual(r_low_clamp.status_code, 200)
             self.assertEqual(r_low_clamp.json()["cvss_filter"], {"op": "ge", "score": 0.0})
             self.assertEqual(r_low_clamp.json()["total"], 4)  # excludes null CVSS
 
-            r_high_clamp = client.get("/api/insights/v6.6/cves?cvss_op=lt&cvss_score=15.8")
+            r_high_clamp = client.get("/webapi/insights/v6.6/cves?cvss_op=lt&cvss_score=15.8")
             self.assertEqual(r_high_clamp.status_code, 200)
             self.assertEqual(r_high_clamp.json()["cvss_filter"], {"op": "lt", "score": 10.0})
             self.assertEqual(r_high_clamp.json()["total"], 4)  # excludes null CVSS
 
             # Invalid operator / non-finite score rejected cleanly
-            self.assertEqual(client.get("/api/insights/v6.6/cves?cvss_op=invalid").status_code, 400)
-            self.assertIn(client.get("/api/insights/v6.6/cves?cvss_score=nan").status_code, (400, 422))
+            self.assertEqual(client.get("/webapi/insights/v6.6/cves?cvss_op=invalid").status_code, 400)
+            self.assertIn(client.get("/webapi/insights/v6.6/cves?cvss_score=nan").status_code, (400, 422))
 
         # Uningested response stays clean with CVSS params
         with mock.patch("webapp.backend.config.repo_feature_enabled", return_value=True), \
                 mock.patch("webapp.backend.services.cve_service.report",
                            return_value={"state": "done", "result": {"configured": False, "ingested": False, "cves": []}}):
-            r_un = client.get("/api/insights/v6.6/cves?cvss_op=ge&cvss_score=7")
+            r_un = client.get("/webapi/insights/v6.6/cves?cvss_op=ge&cvss_score=7")
             self.assertEqual(r_un.status_code, 200)
             self.assertEqual(r_un.json(), {"configured": False, "ingested": False, "total": 0, "cves": []})
 

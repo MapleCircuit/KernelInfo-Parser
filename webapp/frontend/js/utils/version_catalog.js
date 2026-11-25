@@ -1,5 +1,5 @@
 /**
- * version_catalog.js - Codec of the compact version catalog (GET /api/versions?compact=1, webapp/API.md §4.1).
+ * version_catalog.js - Codec of the compact version catalog (GET /webapi/versions?compact=1, webapp/API.md §4.1).
  *
  * A catalog is kept as {g, r}: `g` the server's generation, `r` positional rows
  * [vname, sha12, parsed, ref_type] (`parsed`: parse completion time, null for a tag only Git has).

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from webapp.backend.config import require_feature
 from webapp.backend.services.nodemap_service import nodemap_service
 
-router = APIRouter(prefix="/api/nodemap", tags=["nodemap"], dependencies=[Depends(require_feature("nodemap"))])
+router = APIRouter(prefix="/webapi/nodemap", tags=["nodemap"], dependencies=[Depends(require_feature("nodemap"))])
 
 
 @router.get("/{version_name}/struct/{name}")

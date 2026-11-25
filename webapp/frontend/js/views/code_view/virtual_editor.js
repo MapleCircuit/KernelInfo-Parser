@@ -1582,7 +1582,7 @@ export class VirtualEditor {
     docViewport.hidden = false;
     const history = this.tabData.docHistory || [];
     if (this.isMan) {
-      // Rendered from the page's document model (`/api/man/{v}/page?path=`), not from the roff text
+      // Rendered from the page's document model (`/webapi/man/{v}/page?path=`), not from the roff text
       mountManDocument(docViewport, {
         repo: this.api.repo,
         version: this.currentVersion,

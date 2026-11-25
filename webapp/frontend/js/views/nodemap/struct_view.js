@@ -1,6 +1,6 @@
 /**
- * struct_view.js - NodeMap struct node body from `GET /api/nodemap/{v}/struct/{name}` and
- * `GET /api/tools/{v}/pahole/{name}` (`webapp/API_ENDPOINTS.md` §4.14): fields, nested struct/union
+ * struct_view.js - NodeMap struct node body from `GET /webapi/nodemap/{v}/struct/{name}` and
+ * `GET /webapi/tools/{v}/pahole/{name}` (`webapp/API_ENDPOINTS.md` §4.14): fields, nested struct/union
  * members, `#if` / `#ifdef` lines, pointer/type follow links, and `layout` cache-line view.
  *
  * DOM-free (unit tested).
@@ -457,7 +457,7 @@ export function structRows(layout, data, opts = {}) {
 // ------------------------------------------------------------------ pahole layout rows (`style === "layout"`)
 
 /**
- * Display rows for `style === "layout"` from `GET /api/tools/{v}/pahole/{name}` (`pahole`):
+ * Display rows for `style === "layout"` from `GET /webapi/tools/{v}/pahole/{name}` (`pahole`):
  * interleaves 64-byte cache-line boundary markers (`kind: "cacheline"`), padding hole rows
  * (`kind: "hole"`), and member rows (`kind: "field"`) with `offset`, `size`, `cachelineIdx`, and `refType`.
  */

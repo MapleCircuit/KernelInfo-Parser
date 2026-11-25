@@ -18,7 +18,7 @@ from webapp.backend.database.helpers import (
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.sync_service import sync_service
 
-sync_router = APIRouter(prefix="/api", tags=["system"])
+sync_router = APIRouter(prefix="/webapi", tags=["system"])
 
 SERVER_STARTED = time.time()
 # A version still marked "parsing" after this long was most likely interrupted; the parser rolls such a

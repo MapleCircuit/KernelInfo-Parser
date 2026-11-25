@@ -1,7 +1,7 @@
 /**
  * kconfig_engine.js - Client-side Linux Kconfig engine (scripts/kconfig port).
  *
- * Evaluates the finalized model served by GET /api/kconfig/{version}/tree (built by
+ * Evaluates the finalized model served by GET /webapi/kconfig/{version}/tree (built by
  * parser/kconfig_ast/kconfig_model.py) with kconfig's own semantics:
  *  - sym_calc_value / sym_calc_visibility / sym_calc_choice, ranges, modules handling
  *  - sym_set_tristate_value / sym_set_string_value / sym_toggle_tristate_value (only legal changes)

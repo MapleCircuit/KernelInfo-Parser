@@ -112,8 +112,8 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(cacheFirst(request, SHELL_CACHE));
   } else if (url.pathname.startsWith("/b/")) {
     event.respondWith(cacheFirst(request, ASSET_CACHE));
-  } else if (url.pathname.startsWith("/api/")) {
-    if (url.pathname === "/api/sync") return; // always asks the server
+  } else if (url.pathname.startsWith("/webapi/")) {
+    if (url.pathname === "/webapi/sync") return; // always asks the server
     event.respondWith(networkFirst(request, API_CACHE));
   }
   // Anything else (legacy /static/ URLs, manifest, sw.js) goes to the network untouched

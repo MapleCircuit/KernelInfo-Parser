@@ -1,7 +1,7 @@
 /**
  * search_view.js - Full-text code search tab (tab type `search`, webapp/API.md §5.34).
  *
- * Searches the text of every file of the tab's revision (GET /api/fs/grep, git grep over its commit,
+ * Searches the text of every file of the tab's revision (GET /webapi/fs/grep, git grep over its commit,
  * §2.1.3): fixed text or POSIX ERE, match case, whole words, path filters (`drivers/net/`, `*.c`,
  * `!*.h`). Results are grouped by file with their matches highlighted; a click opens the file at the
  * line (middle-click or Ctrl/Cmd+click: a new tab, §5.9). The search is the tab's address

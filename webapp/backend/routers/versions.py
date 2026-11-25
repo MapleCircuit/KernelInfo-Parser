@@ -59,11 +59,11 @@ from webapp.backend.services.catalog_cache import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["versions"])
+router = APIRouter(prefix="/webapi", tags=["versions"])
 
 PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
 
-# Compact version catalog (GET /api/versions?compact=1, webapp/API.md section 4.1). The layout version
+# Compact version catalog (GET /webapi/versions?compact=1, webapp/API.md section 4.1). The layout version
 # is part of its ETag, so a client never applies a delta to a base of another layout.
 COMPACT_FORMAT = "c1"
 # Commit of a ref without a known commit in the fixed-width hash column (Git's null object id)
@@ -140,7 +140,7 @@ def get_projects() -> dict[str, Any]:
 
 def projects_catalog() -> list[dict[str, Any]]:
     """The configured repositories (config "repositories", auto-detected under workspace.repos_dir), the same for
-    every request (`active` False): what GET /api/projects lists and the `projects` sync token digests.
+    every request (`active` False): what GET /webapi/projects lists and the `projects` sync token digests.
 
     `indexed` tells whether the parser has ingested the repository into the database; unindexed
     repositories are still browsable through their Git object store.
@@ -571,7 +571,7 @@ def get_branch_tags(
     return {"branch": branch, "head": head, "total": len(tags), "tags": tags}
 
 
-# Progress of the startup warm-up, reported by GET /api/system/ingest (webapp/API.md section 4.1)
+# Progress of the startup warm-up, reported by GET /webapi/system/ingest (webapp/API.md section 4.1)
 PREWARM_STATE: dict[str, Any] = {"state": "idle", "started_at": None, "finished_at": None}
 _PREWARM_STOP = threading.Event()
 

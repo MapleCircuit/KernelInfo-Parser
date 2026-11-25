@@ -10,7 +10,7 @@ from webapp.backend.routers.insights import job_answer
 from webapp.backend.services import kapi_service as k
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH
 
-router = APIRouter(prefix="/api/kapi", tags=["kapi"], dependencies=[Depends(require_feature("api"))])
+router = APIRouter(prefix="/webapi/kapi", tags=["kapi"], dependencies=[Depends(require_feature("api"))])
 
 Arch = Annotated[str, Query(description="ARCH value (x86_64, i386, arm, ...)")]
 

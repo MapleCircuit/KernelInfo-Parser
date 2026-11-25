@@ -194,37 +194,37 @@ class TestVersionlessCommitGitAndRoutes(unittest.TestCase):
                 patch("webapp.backend.services.commit_facts.release_badges", return_value={}), \
                 patch("webapp.backend.services.cve_service.for_commit", return_value={"fixes": [], "introduced": [], "fixes_upstream": []}), \
                 patch("webapp.backend.services.commit_relations.relation_counts", return_value=({self.head_sha: {"fixes": 0}}, set())):
-            self.assertEqual(client.get("/api/commits/list?q=test").status_code, 200)
+            self.assertEqual(client.get("/webapi/commits/list?q=test").status_code, 200)
             m_list.assert_called_once_with("", 1, 50, "test")
 
-            self.assertEqual(client.get("/api/commits/search?q=te").status_code, 200)
+            self.assertEqual(client.get("/webapi/commits/search?q=te").status_code, 200)
 
-            self.assertEqual(client.get(f"/api/commits/detail/{self.head_sha}").status_code, 200)
+            self.assertEqual(client.get(f"/webapi/commits/detail/{self.head_sha}").status_code, 200)
             m_det.assert_called_once_with(self.head_sha)
 
-            self.assertEqual(client.get(f"/api/commits/diff/{self.head_sha}").status_code, 200)
+            self.assertEqual(client.get(f"/webapi/commits/diff/{self.head_sha}").status_code, 200)
             m_diff.assert_called_once_with(self.head_sha, 3)
 
-            self.assertEqual(client.get("/api/commits/timeline?limit=20").status_code, 200)
+            self.assertEqual(client.get("/webapi/commits/timeline?limit=20").status_code, 200)
             m_tl.assert_called_once_with("", limit=20, direction="past", cursor_id=None)
 
             for gran in ("year", "month", "week", "day", "MONTH"):
-                self.assertEqual(client.get(f"/api/commits/timeline?limit=10&granularity={gran}").status_code, 200)
-                self.assertEqual(client.get(f"/api/commits/v6.8/timeline?limit=10&granularity={gran}").status_code, 200)
-            self.assertEqual(client.get("/api/commits/timeline?granularity=hour").status_code, 400)
-            self.assertEqual(client.get("/api/commits/v6.8/timeline?granularity=invalid").status_code, 400)
+                self.assertEqual(client.get(f"/webapi/commits/timeline?limit=10&granularity={gran}").status_code, 200)
+                self.assertEqual(client.get(f"/webapi/commits/v6.8/timeline?limit=10&granularity={gran}").status_code, 200)
+            self.assertEqual(client.get("/webapi/commits/timeline?granularity=hour").status_code, 400)
+            self.assertEqual(client.get("/webapi/commits/v6.8/timeline?granularity=invalid").status_code, 400)
 
-            self.assertEqual(client.post(f"/api/commits/resolve_mail/{self.head_sha}").status_code, 200)
+            self.assertEqual(client.post(f"/webapi/commits/resolve_mail/{self.head_sha}").status_code, 200)
             m_mail.assert_called_once_with(self.head_sha)
 
-            self.assertEqual(client.get("/api/commits/query?author=ann").status_code, 200)
+            self.assertEqual(client.get("/webapi/commits/query?author=ann").status_code, 200)
             m_q.assert_called_once()
             self.assertEqual(m_q.call_args.args[0], "")
 
-            self.assertEqual(client.get(f"/api/commits/released/{self.head_sha}").status_code, 200)
-            self.assertEqual(client.post("/api/commits/released", json={"hashes": [self.head_sha]}).status_code, 200)
-            self.assertEqual(client.get(f"/api/commits/relations/{self.head_sha}").status_code, 200)
-            self.assertEqual(client.post("/api/commits/relations", json={"hashes": [self.head_sha]}).status_code, 200)
+            self.assertEqual(client.get(f"/webapi/commits/released/{self.head_sha}").status_code, 200)
+            self.assertEqual(client.post("/webapi/commits/released", json={"hashes": [self.head_sha]}).status_code, 200)
+            self.assertEqual(client.get(f"/webapi/commits/relations/{self.head_sha}").status_code, 200)
+            self.assertEqual(client.post("/webapi/commits/relations", json={"hashes": [self.head_sha]}).status_code, 200)
 
 
 class TestCommitAndTreeConcurrencyHardening(unittest.TestCase):

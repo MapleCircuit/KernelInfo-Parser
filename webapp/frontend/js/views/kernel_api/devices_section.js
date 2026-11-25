@@ -68,7 +68,7 @@ document.addEventListener("click", async (e) => {
   const arch = tab?.arch || state.kconfigArch();
   results.innerHTML = '<p class="sv-empty">Matching…</p>';
   try {
-    const res = await api.forTab(tab).request(`/api/kapi/${encodeURIComponent(version)}/devices/match`, {
+    const res = await api.forTab(tab).request(`/webapi/kapi/${encodeURIComponent(version)}/devices/match`, {
       method: "POST", body: JSON.stringify({ text, arch }), timeoutMs: 90000,
     });
     if (results.isConnected === false) return;

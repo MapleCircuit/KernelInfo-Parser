@@ -1320,7 +1320,7 @@ function typeNodeOf(ctrl, ref, version, repo = "") {
 }
 
 /**
- * A new node for type `ref`: a struct node for a `struct` / `union` (`GET /api/nodemap/{v}/struct/{name}`),
+ * A new node for type `ref`: a struct node for a `struct` / `union` (`GET /webapi/nodemap/{v}/struct/{name}`),
  * a symbol node for an `enum` or typedef (its definition resolves through `getSymbolDetail` and
  * its members expand like any symbol node).
  */

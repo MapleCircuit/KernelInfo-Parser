@@ -481,17 +481,17 @@ class TestCveCatalogAndEndpoints(unittest.TestCase):
         client = TestClient(app)
 
         with patch("webapp.backend.config.repo_feature_enabled", return_value=True):
-            r_list = client.get("/api/cve/list?kind=cna&limit=1")
+            r_list = client.get("/webapi/cve/list?kind=cna&limit=1")
             self.assertEqual(r_list.status_code, 200)
             body = r_list.json()
             self.assertEqual(body["total"], 2)
             self.assertEqual(len(body["cves"]), 1)
 
-            r_bad_id = client.get("/api/cve/not-a-cve")
+            r_bad_id = client.get("/webapi/cve/not-a-cve")
             self.assertEqual(r_bad_id.status_code, 400)
 
         with patch("webapp.backend.config.repo_feature_enabled", return_value=False):
-            r_disabled = client.get("/api/cve/list")
+            r_disabled = client.get("/webapi/cve/list")
             self.assertEqual(r_disabled.status_code, 403)
 
     def test_release_report_includes_cwes(self) -> None:

@@ -1205,7 +1205,7 @@ export class NodeMapController {
     if (cat === "syscalls") return client.getKapi(v, `syscalls?arch=${encodeURIComponent(d.arch || "x86_64")}`);
     if (cat === "exports") {
       return d.symbol
-        ? client.request(`/api/kapi/${encodeURIComponent(v)}/exports/${encodeURIComponent(d.symbol)}?arch=${encodeURIComponent(d.arch || "x86_64")}`)
+        ? client.request(`/webapi/kapi/${encodeURIComponent(v)}/exports/${encodeURIComponent(d.symbol)}?arch=${encodeURIComponent(d.arch || "x86_64")}`)
         : client.getKapi(v, "exports");
     }
     if (cat === "params") return client.getKapi(v, `params?arch=${encodeURIComponent(d.arch || "x86_64")}`);

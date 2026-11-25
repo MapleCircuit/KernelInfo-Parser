@@ -2,7 +2,7 @@
  * outline_model.js - Outline, sticky scroll and "go to symbol" logic of the code view (G03,
  * webapp/API.md §5.21). Pure and DOM-free (webapp/frontend/tests/outline_model.test.mjs).
  *
- * Items come from GET /api/fs/outline ({name, kind, type_name, line_s, line_e, linkage, children}),
+ * Items come from GET /webapi/fs/outline ({name, kind, type_name, line_s, line_e, linkage, children}),
  * or, for Kconfig files (whose entries are not symbol definitions), from `kconfigOutline()`.
  */
 

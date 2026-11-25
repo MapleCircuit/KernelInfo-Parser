@@ -154,7 +154,7 @@ def history_scope(version_name: str | None, branch: str | None = None) -> dict[s
     the first one reaching it; the default branch when none does. Branch tags are walked once per
     branch head and cached (routers/versions.py branch_tags()).
     """
-    # The branch-tag walk and its cache live with GET /api/branch/tags (imported lazily: routers import services)
+    # The branch-tag walk and its cache live with GET /webapi/branch/tags (imported lazily: routers import services)
     from webapp.backend.routers.versions import _branch_head, branch_tags, get_branches
 
     def walk(name: str) -> set[str] | None:

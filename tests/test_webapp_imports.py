@@ -195,10 +195,10 @@ class TestImportsService(unittest.TestCase):
         self._svc()
         with patch("webapp.backend.routers.filesystem.imports_service", ImportsService()):
             client = TestClient(create_app())
-            res = client.get("/api/fs/imports/v3.0", params={"path": "a.c", "arch": "x86_64"})
+            res = client.get("/webapi/fs/imports/v3.0", params={"path": "a.c", "arch": "x86_64"})
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.json()["path"], "a.c")
-            self.assertEqual(client.get("/api/fs/imports/v3.0", params={"path": "../x.c"}).status_code, 400)
+            self.assertEqual(client.get("/webapi/fs/imports/v3.0", params={"path": "../x.c"}).status_code, 400)
 
 
 # A header compiled in its includer's context (2.6.0 include/linux/lockd/bind.h): h.h includes nothing that

@@ -1,7 +1,7 @@
 /**
  * status_view.js - Parser status tab (tab type `status`, G11, webapp/API.md §5.37).
  *
- * What the parser has done for the active repository (GET /api/system/ingest): the catalog counters,
+ * What the parser has done for the active repository (GET /webapi/system/ingest): the catalog counters,
  * the versions being parsed (an entry not updated for 30 minutes is *stale*: an interrupted run, rolled
  * back by the parser's next start), recent completions, the database's table sizes (sortable), the
  * server's sync tokens, background jobs and caches. Refreshed every 15 s while the tab is visible.

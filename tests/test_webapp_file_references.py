@@ -1,4 +1,4 @@
-"""tests/test_webapp_file_references.py - "Referenced by" of a file (GET /api/fs/references, D10)."""
+"""tests/test_webapp_file_references.py - "Referenced by" of a file (GET /webapi/fs/references, D10)."""
 from __future__ import annotations
 
 import os

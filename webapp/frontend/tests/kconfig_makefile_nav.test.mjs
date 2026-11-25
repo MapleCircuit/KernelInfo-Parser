@@ -101,7 +101,7 @@ test("contextMenu identifies Makefile CONFIG_* tokens and provides declaration j
       cursorLine: 42,
       version: "v3.0"
     });
-    assert.ok(fetchCalls.some((c) => c.url.includes("/api/symbols/v3.0/detail/CONFIG_8139TOO")));
+    assert.ok(fetchCalls.some((c) => c.url.includes("/webapi/symbols/v3.0/detail/CONFIG_8139TOO")));
     assert.equal(toasts[toasts.length - 1][0], "success");
 
     // 2. Right-click editor menu showEditorMenu()

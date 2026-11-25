@@ -221,7 +221,7 @@ export class TreemapView {
       if (eng && state.kconfigConfigActive(this.engineTabId)) {
         // Unprefixed names only: the engine publishes both X and CONFIG_X
         const assignments = Object.fromEntries(Object.entries(eng.assignments || {}).filter(([k]) => !k.startsWith("CONFIG_")));
-        data = await (this.api || api).requestJob(`/api/version/${encodeURIComponent(this.version)}/treemap/build`, {
+        data = await (this.api || api).requestJob(`/webapi/version/${encodeURIComponent(this.version)}/treemap/build`, {
           method: "POST", body: { arch: eng.arch, assignments, path: this.path, max_depth: 2 }, timeoutMs: 60000,
           onProgress: (p) => {
             if (seq === this._loadSeq && this.containerEl?.isConnected) {

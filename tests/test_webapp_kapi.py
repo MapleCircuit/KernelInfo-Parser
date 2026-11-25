@@ -305,7 +305,7 @@ class TestKapiDbFirstReadPath(unittest.TestCase):
         app.include_router(kapi_router.router)
         client = TestClient(app)
         with mock.patch("webapp.backend.config.is_feature_enabled", return_value=True):
-            resp = client.get("/api/kapi/v6.1/summary?arch=x86_64")
+            resp = client.get("/webapi/kapi/v6.1/summary?arch=x86_64")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["source"], "db")

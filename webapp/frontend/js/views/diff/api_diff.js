@@ -1,6 +1,6 @@
 /**
  * api_diff.js - "API" mode of the Compare view (A6, webapp/API.md §5.11): the Kernel API changelog
- * between the base and target revisions (GET /api/kapi/diff). Pure rendering helpers plus a small
+ * between the base and target revisions (GET /webapi/kapi/diff). Pure rendering helpers plus a small
  * controller the Compare view mounts.
  */
 import { escapeHtml } from "../../components/modal.js";

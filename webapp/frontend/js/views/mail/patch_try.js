@@ -1,7 +1,7 @@
 /**
  * patch_try.js - "Try on revision…" for mailing-list patches (P1, webapp/API.md §5.22).
  *
- * The chosen messages are applied in memory to a revision (`POST /api/mail/apply`, nothing is written):
+ * The chosen messages are applied in memory to a revision (`POST /webapi/mail/apply`, nothing is written):
  * the results dialog lists each patch, file and hunk (applied, at an offset, failed with the nearest
  * region, created, deleted, unsupported), and **Open patched file** opens the file at that revision in
  * ⇄ Diff mode against the patched text (diff source kind `patch`, §5.21).

@@ -249,7 +249,7 @@ export class DocPage {
     await Promise.all(Array.from({ length: TITLE_FETCH_CONCURRENCY }, worker));
   }
 
-  /** Figures and images are served from the Git tree through /api/fs/raw. */
+  /** Figures and images are served from the Git tree through /webapi/fs/raw. */
   hydrateImages() {
     this.root.querySelectorAll("img.kdoc-img[data-raw]").forEach((img) => {
       img.addEventListener("error", () => {

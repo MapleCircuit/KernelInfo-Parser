@@ -134,7 +134,7 @@ def run_checkpatch(script_files: dict[str, str], patch: str, *, sandbox: str = "
 
 
 def check_patch(patch: str) -> dict[str, Any]:
-    """`POST /api/tools/{v}/checkpatch`: {enabled: false} when off (no process), else the parsed run."""
+    """`POST /webapi/tools/{v}/checkpatch`: {enabled: false} when off (no process), else the parsed run."""
     cfg = tools_config()
     if not cfg["enabled"]:
         return {"enabled": False, "config_key": "webapp.tools.checkpatch.enabled",

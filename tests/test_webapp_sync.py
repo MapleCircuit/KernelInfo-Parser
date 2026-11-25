@@ -118,7 +118,7 @@ class TestTokens(unittest.TestCase):
         mw = ss.SyncHeaderMiddleware(app)
         with patch.object(ss.sync_service, "cached_header_value", return_value=None), \
                 patch.object(ss.sync_service, "header_value", return_value="aa.bb.cc"):
-            asyncio.run(mw({"type": "http", "path": "/api/versions"}, None, send))
+            asyncio.run(mw({"type": "http", "path": "/webapi/versions"}, None, send))
             asyncio.run(mw({"type": "http", "path": "/b/x/js/app.js"}, None, send))
         self.assertIn((b"x-kip-sync", b"aa.bb.cc"), sent[0]["headers"])
         self.assertEqual(sent[2]["headers"], [])
@@ -260,7 +260,7 @@ class TestBranchTagsWarmup(unittest.TestCase):
 
 def _request(headers: dict[str, str] | None = None) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
-    return Request({"type": "http", "method": "GET", "path": "/api/versions", "query_string": b"", "headers": raw})
+    return Request({"type": "http", "method": "GET", "path": "/webapi/versions", "query_string": b"", "headers": raw})
 
 
 def _catalog_rows(n: int = 300) -> list[tuple]:
@@ -464,7 +464,7 @@ class TestVersionCatalog(unittest.TestCase):
 
 
 class TestBranchSourceTags(unittest.TestCase):
-    """Branch source scope aggregation (`GET /api/branch/tags?source=...`)."""
+    """Branch source scope aggregation (`GET /webapi/branch/tags?source=...`)."""
 
     def setUp(self) -> None:
         versions_router._BRANCH_TAGS_CACHE.clear()

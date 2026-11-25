@@ -13,7 +13,7 @@ from webapp.backend.services.history_service import history_service
 from webapp.backend.services.jobs import retry_after_ms
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
 
-router = APIRouter(prefix="/api", tags=["kconfig"], dependencies=[Depends(require_feature("kconfig"))])
+router = APIRouter(prefix="/webapi", tags=["kconfig"], dependencies=[Depends(require_feature("kconfig"))])
 kconfig_service = KconfigService()
 
 ToolchainParam = Annotated[str | None, Query(description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls")]

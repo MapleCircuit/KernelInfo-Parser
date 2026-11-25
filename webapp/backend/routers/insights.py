@@ -11,7 +11,7 @@ from webapp.backend.config import require_feature
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.jobs import retry_after_ms
 
-router = APIRouter(prefix="/api/insights", tags=["insights"], dependencies=[Depends(require_feature("insights"))])
+router = APIRouter(prefix="/webapi/insights", tags=["insights"], dependencies=[Depends(require_feature("insights"))])
 NO_STORE = {"Cache-Control": "no-store"}
 
 

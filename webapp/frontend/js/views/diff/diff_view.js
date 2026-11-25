@@ -325,7 +325,7 @@ export class DiffView {
       } else if (this.currentMode === "api") {
         this.apiAbort?.abort();
         this.apiAbort = new AbortController();
-        const res = await this.api.requestJob(`/api/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
+        const res = await this.api.requestJob(`/webapi/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
           signal: this.apiAbort.signal, timeoutMs: 60000,
           onProgress: (p) => {
             if (seq === this.loadSeq) resContainer.innerHTML = `<div class="compare-empty">Building the Kernel API catalogs… ${escapeHtml(progressLabel(p))}</div>`;

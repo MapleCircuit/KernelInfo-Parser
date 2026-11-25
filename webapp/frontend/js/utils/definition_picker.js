@@ -5,7 +5,7 @@
  * engine's ARCH while it is on with a resolved configuration, else x86_64), putting first those the
  * file the symbol is used in reaches through its #include chain (`fromFile`). Among the leading candidate
  * files, the picker then skips definitions the configuration does not compile: files whose Kbuild
- * condition is "n" (GET /api/kconfig/{v}/build) and lines inside #if/#ifdef branches compiled out
+ * condition is "n" (GET /webapi/kconfig/{v}/build) and lines inside #if/#ifdef branches compiled out
  * (the same evaluation as #ifdef dimming, with the ARCH's compiler macros such as __x86_64__).
  */
 import { api } from "../api.js";

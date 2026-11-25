@@ -165,7 +165,7 @@ registerApiSection({
   rowText: (r) => `${r.symbol} ${r.namespace} ${r.path}`,
   rowHtml: (r) => `<span class="sv-row-main">${escapeHtml(r.symbol)}</span>${r.variant !== "plain" ? `<span class="sv-tag ${r.variant.includes("gpl") ? "warn" : "info"}">${escapeHtml(VARIANT[r.variant] || r.variant)}</span>` : ""}${r.namespace ? `<span class="sv-tag info">${escapeHtml(r.namespace)}</span>` : ""}<span class="sv-row-sub">${escapeHtml(r.path.split("/").slice(-2).join("/"))}</span>`,
   chips: Object.entries(VARIANT).map(([id, label]) => ({ id, label, test: (r) => r.variant === id })),
-  fetchDetail: (ctx, key, row) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/exports/${encodeURIComponent(row?.symbol || key.split("@")[0])}?arch=${encodeURIComponent(state.kconfigArch())}`),
+  fetchDetail: (ctx, key, row) => (ctx.api || api).request(`/webapi/kapi/${encodeURIComponent(ctx.version)}/exports/${encodeURIComponent(row?.symbol || key.split("@")[0])}?arch=${encodeURIComponent(state.kconfigArch())}`),
   detailHtml: (d, ctx) => {
     const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
     return `<h2>${escapeHtml(d.symbol)}</h2>
@@ -204,7 +204,7 @@ registerApiSection({
   ],
   async fetchDetail(ctx, key, row) {
     if (!row) return null;
-    const doc = row.doc ? await (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/params/doc?line=${row.doc.line}`).catch(() => null) : null;
+    const doc = row.doc ? await (ctx.api || api).request(`/webapi/kapi/${encodeURIComponent(ctx.version)}/params/doc?line=${row.doc.line}`).catch(() => null) : null;
     return { ...row, docText: doc };
   },
   detailHtml: (r, ctx) => (!r ? '<div class="sv-empty">Not in this list.</div>' : `<h2>${escapeHtml(r.full_name)}</h2>
@@ -234,7 +234,7 @@ registerApiSection({
   rowHtml: (r) => `<span class="sv-row-sub" style="min-width:calc(90px * var(--ui-layout-scale, 1))">${escapeHtml(r.system)}</span><span class="sv-row-main">${escapeHtml(r.name)}</span>${r.kind !== "event" ? `<span class="sv-tag info">${escapeHtml(r.kind)}</span>` : ""}`,
   chips: [{ id: "event", label: "events", test: (r) => r.kind === "event" }, { id: "class", label: "classes", test: (r) => r.kind === "class" }, { id: "raw", label: "raw", test: (r) => r.kind === "raw" }],
   async fetchDetail(ctx, key, row) {
-    const sites = row?.kind === "class" ? null : await (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/tracepoints/${encodeURIComponent(key)}`).catch(() => null);
+    const sites = row?.kind === "class" ? null : await (ctx.api || api).request(`/webapi/kapi/${encodeURIComponent(ctx.version)}/tracepoints/${encodeURIComponent(key)}`).catch(() => null);
     return { ...(row || { name: key }), sites };
   },
   detailHtml: (t, ctx) => `<h2>${escapeHtml(t.name)}</h2>
@@ -268,7 +268,7 @@ registerApiSection({
     { id: "firmware", label: "firmware", test: (m) => m.firmware.length > 0 }, { id: "devtable", label: "device table", test: (m) => m.device_tables.length > 0 },
     { id: "asmodule", label: "built as module", test: (m) => m.built === "m" }, { id: "notbuilt", label: "not built", test: (m) => m.built === "n" },
   ],
-  fetchDetail: (ctx, key) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/modules/${encodeURIComponent(key)}?arch=${encodeURIComponent(ctx.arch)}`, { timeoutMs: 60000 }),
+  fetchDetail: (ctx, key) => (ctx.api || api).request(`/webapi/kapi/${encodeURIComponent(ctx.version)}/modules/${encodeURIComponent(key)}?arch=${encodeURIComponent(ctx.arch)}`, { timeoutMs: 60000 }),
   detailHtml: (m, ctx) => {
     const repo = ctx.view?.repo?.() || ctx.api?.repo || state.activeRepo();
     return `<h2>${escapeHtml(m.modname)}.ko</h2>

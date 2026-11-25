@@ -2028,7 +2028,7 @@ class KernelIdeApp {
   /**
    * Man activity button (§5.38): the man pages index. In the man-pages project, at the explored tag;
    * from the kernel, at the man-pages tag released on or before the explored kernel revision
-   * (`/api/man/resolve`), else the newest tag.
+   * (`/webapi/man/resolve`), else the newest tag.
    */
   updateActivityBar(repo = state.currentRepo || state.activeRepo()) {
     const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "cve", "man", "compare"];

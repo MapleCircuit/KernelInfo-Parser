@@ -1044,7 +1044,7 @@ export function kernelDocToRst(text) {
 }
 
 /**
- * HTML of one kernel-doc entry (`GET /api/docs/.../kernel-doc` `entries[]`): a `dl.c` definition card with a
+ * HTML of one kernel-doc entry (`GET /webapi/docs/.../kernel-doc` `entries[]`): a `dl.c` definition card with a
  * syntax-highlighted signature, parameters / members and sections, rendered as reStructuredText.
  * `opts.path` is the document the entry renders in, `opts.srcPath` the source file it was read from.
  */

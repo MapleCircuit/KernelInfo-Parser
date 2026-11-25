@@ -351,26 +351,26 @@ class TestManRouter(ManFixture):
 
     def test_endpoints_and_repo_selection(self) -> None:
         c = self.client
-        r = c.get("/api/man/man-pages-6.10/index", params={"repo": "man-pages"}, headers={"X-KI-Repo": "man-pages"})
+        r = c.get("/webapi/man/man-pages-6.10/index", params={"repo": "man-pages"}, headers={"X-KI-Repo": "man-pages"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["repo"], "man-pages")
         self.assertEqual(r.json()["version"], "man-pages-6.10")
-        r = c.get("/api/man/man-pages-6.10/page", params={"name": "read", "repo": "man-pages"})
+        r = c.get("/webapi/man/man-pages-6.10/page", params={"name": "read", "repo": "man-pages"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["linux"]["version"], "v6.9")
-        self.assertEqual(c.get("/api/man/man-pages-6.10/page", params={"name": "nope"}).status_code, 404)
-        self.assertEqual(c.get("/api/man/man-pages-6.10/page", params={"path": "../../x"}).status_code, 400)
-        self.assertEqual(next(t["name"] for t in c.get("/api/man/tags", headers={"X-KI-Repo": "man-pages"}).json()["tags"]),
+        self.assertEqual(c.get("/webapi/man/man-pages-6.10/page", params={"name": "nope"}).status_code, 404)
+        self.assertEqual(c.get("/webapi/man/man-pages-6.10/page", params={"path": "../../x"}).status_code, 400)
+        self.assertEqual(next(t["name"] for t in c.get("/webapi/man/tags", headers={"X-KI-Repo": "man-pages"}).json()["tags"]),
                          "man-pages-6.10")
         # resolve runs on the kernel repository (the default one here, or named by the header)
-        r = c.get("/api/man/resolve", params={"name": "read", "section": "2", "kernel": "v6.9"}, headers={"X-KI-Repo": "linux"})
+        r = c.get("/webapi/man/resolve", params={"name": "read", "section": "2", "kernel": "v6.9"}, headers={"X-KI-Repo": "linux"})
         self.assertEqual(r.json()["version"], "man-pages-6.9")
-        self.assertEqual(c.get("/api/man/resolve", params={"name": "read", "kernel": "-x"}).status_code, 400)
-        r = c.get("/api/man/diff", params={"a": "man-pages-6.9", "b": "man-pages-6.10", "repo": "man-pages"})
+        self.assertEqual(c.get("/webapi/man/resolve", params={"name": "read", "kernel": "-x"}).status_code, 400)
+        r = c.get("/webapi/man/diff", params={"a": "man-pages-6.9", "b": "man-pages-6.10", "repo": "man-pages"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["summary"], {"added": 2, "modified": 0, "deleted": 0, "unchanged": 6, "total_a": 6, "total_b": 8})
-        self.assertEqual(c.get("/api/man/diff", params={"a": "--x", "b": "man-pages-6.10"}).status_code, 400)
-        self.assertEqual(c.get("/api/man/diff", params={"a": "man-pages-9.99", "b": "man-pages-6.10"}).status_code, 404)
+        self.assertEqual(c.get("/webapi/man/diff", params={"a": "--x", "b": "man-pages-6.10"}).status_code, 400)
+        self.assertEqual(c.get("/webapi/man/diff", params={"a": "man-pages-9.99", "b": "man-pages-6.10"}).status_code, 404)
 
 
 class TestManDiff(ManFixture):

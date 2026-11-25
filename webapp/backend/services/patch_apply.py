@@ -338,7 +338,7 @@ def apply_series(sha: str, patches: list[tuple[str, list[FilePatch]]], read: Cal
 
 
 def diff_hunks(old: str | None, new: str | None) -> list[dict[str, Any]]:
-    """-U0 hunks between two texts in the shape of `GET /api/tools/diff/blobs` rows ([kind, old, new, text])."""
+    """-U0 hunks between two texts in the shape of `GET /webapi/tools/diff/blobs` rows ([kind, old, new, text])."""
     a = (old or "").splitlines()
     b = (new or "").splitlines()
     hunks = []

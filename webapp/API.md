@@ -49,7 +49,7 @@ ES-Module IDE frontend.
 
 ## 1. Architectural Overview & Component Structure
 
-The WebApp is structured into a zero-trust, decoupled layered architecture:
+The WebApp is structured into a zero-trust, decoupled layered architecture (internal browser endpoints live under `/webapi/*`, while the separate authenticated AI/programmatic service under `/api/*` is specified in `api/API.md`):
 
 ```
 webapp/
@@ -118,7 +118,7 @@ webapp/
 │       ├── commits.py              # Git commit log, detail, and blame annotations
 │       ├── mail.py                 # Mailing list threads, messages, patch diffs, and search
 │       ├── docs.py                 # Documentation labels & kernel-doc
-│       ├── system.py               # Change tokens (`/api/sync`), ingestion status (`/api/system/ingest`)
+│       ├── system.py               # Change tokens (`/webapi/sync`), ingestion status (`/webapi/system/ingest`)
 │       ├── insights.py             # Insights reports (§4.10)
 │       ├── cve.py                  # CVE catalog & records of the kernel CNA (§4.11)
 │       ├── kapi.py                 # Kernel API catalogs (§4.9)
@@ -257,7 +257,7 @@ early `429` rate-limit responses and `404`/`405` router errors—includes harden
   'self' data: blob:; connect-src 'self'; frame-ancestors 'self'`. Scripts and workers are restricted to
   `'self'`, with `'unsafe-inline'` only for style attributes. `script-src` carries **no** `'unsafe-eval'`: no
   frontend module evaluates code from a string (no `eval`, no `new Function`), so allowing it would only widen
-  what an injected string could do. A route may set a stricter policy of its own (`GET /api/fs/raw/...`
+  what an injected string could do. A route may set a stricter policy of its own (`GET /webapi/fs/raw/...`
   sandboxes raw SVG); the middleware only fills in the default.
 - `X-Frame-Options`: `SAMEORIGIN`. With `frame-ancestors 'self'` it refuses framing by any other origin
   (clickjacking) while NodeMap tab nodes frame the app's own `/?embed=1` shell (`webapp/API_FRONTEND.md` §5.3).
@@ -275,7 +275,7 @@ is served from the same origin, it still reads `X-KIP-Sync` and every other resp
 ### 2.4. Sliding-Window Rate Limiting
 - `SlidingWindowRateLimiter`: Enforces a thread-safe (`threading.Lock` guarding `hits` reads, mutations, and
   >2,000-IP expired-key eviction) in-memory sliding window cap (default 600 requests / 60 seconds per
-  client IP) on `/api/` requests; the shell, `/boot.js` and the build's assets are not limited, whatever their
+  client IP) on `/webapi/` requests; the shell, `/boot.js` and the build's assets are not limited, whatever their
   extension, while an API path ending in `.js` or `.json` is. Exceeding requests receive `HTTP 429 Too Many
   Requests` (`{"detail": "Too many requests. Please slow down."}`) with a `Retry-After` header and full
   security headers from the outer `SecurityHeadersMiddleware`. Behind a reverse proxy every client shares the
@@ -351,7 +351,7 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    highlight the exact symbol definition line.
 4. **Maintainer Query Sanitization & Parameter Preference**: Developer identity and maintainer endpoints
    (`webapp/backend/routers/maintainers.py`, `webapp/backend/services/maintainer_service.py`) support query
-   parameter lookups (`/api/maintainers/{version}/person?email=...`) alongside URL path parameters. Frontend
+   parameter lookups (`/webapi/maintainers/{version}/person?email=...`) alongside URL path parameters. Frontend
    API clients sanitize patch trailers and email strings (stripping `<>`, quotes, and whitespace) and prefer
    query parameters when identifiers contain special characters (`@`, `<`, `>`, `/`) to prevent URL decoding
    and route matching failures.
@@ -400,7 +400,7 @@ may any router, service, middleware, or background task in `webapp/` execute dat
    - `list_dir(rev, directory)` returns `(subdirectory names, {path: blob_sha} of the direct files)` from a
      per-commit directory index built in one pass over `list_tree` (`DERIVED_CACHE_SIZE` = 4 commits), so
      expanding a directory avoids scanning the whole tree. `search_index(rev)` is the per-commit list of
-     `(lowercased path, lowercased basename, path)` that the file palette scans (`GET /api/fs/search`).
+     `(lowercased path, lowercased basename, path)` that the file palette scans (`GET /webapi/fs/search`).
    - `resolve_commit_sha(rev)` answers are cached (4096 entries per repository): a full SHA that names a
      commit permanently, any other name for `REV_SHA_TTL` (15 s), and all names are dropped when the `git`
      sync token changes (`clear_revision_caches`). Caching avoids repeated `git rev-parse` subprocesses across
@@ -480,7 +480,7 @@ evaluated in three progressive tiers to optimize latency:
    limit, which the response reports as `renames.exhaustive: false` / `renames.limit_needed`, shown in the
    Compare view's rename note (v3.0→v3.1: every pair compared, 391 renames of which 161 identical, ~0.5 s;
    v3.0→v4.0: 2,967 renames without the exhaustive pass, `limit_needed` 19,771). The exhaustive pass for such
-   ranges is the separate rename search (`GET /api/tools/diff/renames`), run on request and scoped to a
+   ranges is the separate rename search (`GET /webapi/tools/diff/renames`), run on request and scoped to a
    directory.
 2. **Level 2 (AST & Symbol Structural Diff)**: For the first 50 modified source files (`.c`, `.h`, `.S`,
    `.rs`; paths sort documentation and dotfiles first) whose blobs are indexed on both sides, compares symbol
@@ -575,7 +575,7 @@ evaluated in three progressive tiers to optimize latency:
    `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
 6. **Projects**: an entry's project slug (`repository_project_slug()`: its `project`, else `man-pages` for a
    Linux man-pages clone recognised by `core.config.is_manpages_repository()`, else `linux`) is listed by
-   `GET /api/projects` as `project`; `is_manpages_entry()` tells the man-pages entry. A man-pages entry without
+   `GET /webapi/projects` as `project`; `is_manpages_entry()` tells the man-pages entry. A man-pages entry without
    configured `tag_views` gets `core.config.MANPAGES_TAG_VIEWS` (one view grouping `man-pages-X.*` by major).
    The Git-only tags of every project other than `linux` are listed in release order
    (`versions.release_tag_key()` over `parser/git_ast/release_order.py`, any `<prefix>X.Y[.Z][-rcN]` scheme:
@@ -590,7 +590,7 @@ evaluated in three progressive tiers to optimize latency:
 8. **Per-repository feature gating**: `webapp/backend/config.py` resolves effective feature flags for the active
    repository from `core.config.resolve_repo_features()` (`get_active_features()`, `is_feature_enabled(feature,
    repo=None)`). `require_feature(*features)` is a FastAPI dependency that rejects requests with `403 Forbidden`
-   when any required feature is disabled for the active repository. `GET /api/projects` exposes each repository's
+   when any required feature is disabled for the active repository. `GET /webapi/projects` exposes each repository's
    resolved `"features"` map. Cross-repository man-pages helpers in `webapp/backend/services/man_service.py` also
    enforce feature flags: `manpages_repository()` selects only a man-pages repository with `"man"` enabled,
    `resolve()` returns the `unavailable` payload when `"man"` is disabled on the active repository, and
@@ -605,15 +605,15 @@ Clients must follow server changes without the user knowing to reload. The serve
 | `frontend` | Webapp code changed | SHA-256 of the files under `webapp/frontend/` (path + content; the JS unit tests in `webapp/frontend/tests/` are left out and never served), recomputed only when a file's size, mtime, ctime or inode changed (checked every 5 s); identical files give the same build across restarts | The page reloads into the new build (see below) |
 | `parsed` | Versions of the active repository finished, re-parsed or rolled back | `m_git_ref` + `m_ingest_state` of the repository, unfinished versions excluded (15 s) | Version/branch lists are refetched; cached data of versions whose stamp changed is dropped. On the server, a change also clears every parse- and revision-dependent cache (`clear_parse_dependent_caches()`: `helpers.clear_version_caches()`, `filesystem_service` token/include/treemap/object caches, `maintainer_service`, `history_service`, `kconfig_service`, `kconfig_facts`, `imports_service`, `outline_service`, `hover_service`, `scope_service`, `kapi_diff_service`, `git_service` last-writer & file-history caches, `grep_service`, `nodemap_service`, `pahole_compare._CMP`, `arch_layout_service`, `tree_resolver`, `git_tree_resolver` revision caches, and registered `_REFS_CHANGED_HOOKS`) |
 | `git` | Tags fetched, branches moved | `git for-each-ref` of the repository (15 s) | Same as `parsed`, server side included: caches keyed by a revision name (a branch's file tokens, Kconfig model, maintainers, name → commit) are cleared, and the revision → SHA and blob-map caches of `GitTreeResolver` (`clear_revision_caches`; tree listings are content-addressed and kept) |
-| `projects` | Repository list changed: a repository added or removed, parsed for the first time, its clone gone, its configuration changed | `projects_catalog()` (configured repositories + `m_repository`/`m_project`, what `GET /api/projects` lists without the request's `active` flag) (30 s) | The repository list is refetched and the selectors re-rendered (`projects:updated`); it is not refetched with `parsed`/`git` changes |
-- **Delivery**: `GET /api/sync` returns all five. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so
-  tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/api/`
+| `projects` | Repository list changed: a repository added or removed, parsed for the first time, its clone gone, its configuration changed | `projects_catalog()` (configured repositories + `m_repository`/`m_project`, what `GET /webapi/projects` lists without the request's `active` flag) (30 s) | The repository list is refetched and the selectors re-rendered (`projects:updated`); it is not refetched with `parsed`/`git` changes |
+- **Delivery**: `GET /webapi/sync` returns all five. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so
+  tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/webapi/`
   response, so any request reveals a change without polling (`projects` is not in the header: the `GET
-  /api/sync` checks below reveal it). While the three tokens are cached the header is read in place
+  /webapi/sync` checks below reveal it). While the three tokens are cached the header is read in place
   (`cached_header_value`); only a refresh goes to the threadpool, and one refresh per token runs at a time
   (`_Ttl`: requests arriving meanwhile wait for its answer instead of each running `git for-each-ref` or the
   database query).
-- **When clients check**: clients synchronize with the server (`GET /api/sync`) when the page opens
+- **When clients check**: clients synchronize with the server (`GET /webapi/sync`) when the page opens
   (`syncManager.start()`), when opening a new tab (`tab:opened`), when restoring a workspace session
   (`session:adopted`/`session:restored`), and periodically every **60 s** via the reachability heartbeat
   (`pingServer()`), in addition to following `X-KIP-Sync` headers on all other API responses. Every sync check
@@ -624,7 +624,7 @@ Clients must follow server changes without the user knowing to reload. The serve
   and project catalogs are served cache-first from IndexedDB on refresh without hitting the network until a
   sync confirmation signals that those catalogs must be refetched.
 - **Manual check** (`syncManager.checkNow()`, Settings popover **🔄 Check for Updates**, §5.5): the same sync
-  as the 60 s heartbeat, run at once: `GET /api/sync` (the server's cached tokens, no `fresh`), applied by the
+  as the 60 s heartbeat, run at once: `GET /webapi/sync` (the server's cached tokens, no `fresh`), applied by the
   same `apply()`, so a changed `db` purges the caches, changed `parsed`/`git` tokens refetch the catalogs and
   stamps and a changed `projects` token the repository list, and nothing is refetched when no token changed.
   Two differences: nothing is re-rendered in place and a newer build is not announced (`apply(…, {notify:
@@ -636,7 +636,7 @@ Clients must follow server changes without the user knowing to reload. The serve
   updated}`. What was found is kept in `sessionStorage["kip-restart-note"]` and toasted by the restarted page
   (*Updates applied: …*, `syncManager.takeRestartNote()`); with no update the popover reports *Up to date*. It
   compares against the server's local Git repository; it does not `git fetch` from a remote.
-- **Version stamps**: `/api/versions` and `/api/branches` give each version a `stamp` (`<commit
+- **Version stamps**: `/webapi/versions` and `/webapi/branches` give each version a `stamp` (`<commit
   sha[:12]>.<parse completion time>`, `.0` for versions parsed before `m_ingest_state`, `.git` when not
   parsed; a branch uses its current Git head). `api._vk(version)` puts `"<name>@<stamp>~"` into every
   version-scoped cache key, so a re-parsed version or a moved branch never serves older cached data;
@@ -652,7 +652,7 @@ Clients must follow server changes without the user knowing to reload. The serve
   never mixes modules of two builds. The shell and `/boot.js` are sent with `Cache-Control: private,
   max-age=3600`, `sw.js` with `Cache-Control: public, max-age=31536000, immutable` (registered with
   `updateViaCache: "all"` so refreshes never poll `sw.js`, and updated via `fetch(..., {cache: "reload"})` +
-  `reg.update()` only when `GET /api/sync` reveals a build change). Legacy `/static/`, `/js/`, `/css/` mounts
+  `reg.update()` only when `GET /webapi/sync` reveals a build change). Legacy `/static/`, `/js/`, `/css/` mounts
   stay for direct access. `js/theme_boot.js` (G08) is a classic, render-blocking script in `<head>` (external,
   as the CSP requires) that sets `data-theme` from `localStorage` before the stylesheets paint, so a light
   theme never flashes dark.
@@ -665,7 +665,7 @@ Clients must follow server changes without the user knowing to reload. The serve
 - **Service worker** (`sw.js`): `kip-shell` holds `/` (every shell path and query share one entry) and
   `/boot.js`, cache-first; `kip-assets` holds `/b/<build>/…`, cache-first (the page posts `{type: "prune",
   build}` on start to drop other builds); `kip-api` holds API responses, network-first with cache fallback
-  (`/api/sync` is never cached, so it always reaches the server), bounded to `API_CACHE_LIMIT` (300) entries,
+  (`/webapi/sync` is never cached, so it always reaches the server), bounded to `API_CACHE_LIMIT` (300) entries,
   oldest dropped first; replies marked `Cache-Control: no-store` (version catalog deltas, §2.13) are passed
   through without being stored. Both `networkFirst()` (serving from `kip-api` on network error or synthesizing a JSON
   `503`) and `cacheFirst()` (catching offline cache/network errors and synthesizing a plain-text `503`) attach
@@ -681,7 +681,7 @@ Clients must follow server changes without the user knowing to reload. The serve
 ### 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`)
 A restarted server has empty in-memory caches, and a client after **Full Local Reset** (§5.5) has an empty
 IndexedDB, so the first page load would otherwise pay for every catalog itself — above all the branch-tags
-walk (`GET /api/branch/tags`, ~18 s for `master` of Linux).
+walk (`GET /webapi/branch/tags`, ~18 s for `master` of Linux).
 - **What runs**: after the database pool is pre-warmed, `lifespan` starts `start_prewarm()`, a daemon thread
   (`kip-prewarm`) that does not delay startup. For every configured repository whose work tree exists it
   selects that repository (`set_active_repository`), reads `get_versions(include_rc=True)` and
@@ -703,7 +703,7 @@ The version catalog is the largest response clients refetch: ~5,800 Linux tags (
 gzipped), and every client refetched it whenever the `parsed` token changed (§2.11), i.e. each time the parser
 finished a version (every ~2 minutes during a run). Building it took ~0.6 s of database, `git for-each-ref`
 and JSON/gzip work per request.
-- **Built once per repository state** (`TokenCache`): `/api/versions` and `/api/branches` only change with the
+- **Built once per repository state** (`TokenCache`): `/webapi/versions` and `/webapi/branches` only change with the
   active repository's `parsed` or `git` token, so each is built once per token pair (keyed by repository, and
   `include_rc` for versions) and served from memory until a token changes; requests arriving during a build
   wait for it (one build per key). A token that could not be computed (`""`) only vouches for a value for 15
@@ -715,9 +715,9 @@ and JSON/gzip work per request.
   Accept-Encoding, X-KI-Repo`.
 - **ETag / 304**: catalog responses carry a weak `ETag` (a content digest) and `Cache-Control: no-cache`, so
   the browser keeps them and revalidates; a request whose `If-None-Match` names the current ETag (or `*`) gets
-  `304` without a body. The browser does this by itself for `/api/branches` (and the legacy `/api/versions`
+  `304` without a body. The browser does this by itself for `/webapi/branches` (and the legacy `/webapi/versions`
   layout).
-- **Compact version catalog** (`GET /api/versions?compact=1`, §4.1, what the frontend reads): positional
+- **Compact version catalog** (`GET /webapi/versions?compact=1`, §4.1, what the frontend reads): positional
   columns without the fields the client can derive — `indexed` (a parse time is present), `is_prerelease` (the
   name), the `stamp` (`<sha12>.<parse time>` / `<sha12>.git`, identical to the legacy one, so no cached data
   is invalidated) — and with 12-hex commits instead of 40, `vid` left out (no view reads it): 183 KB raw / 67
@@ -904,7 +904,7 @@ Shared answers about releases, from Git:
 ### 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`)
 The only script the webapp runs from the tracked repository is `scripts/checkpatch.pl` (P4), and only under
 these rules — a branch or commit could carry a modified copy:
-- **Off by default**: `webapp.tools.checkpatch.enabled` (`false`); while off, `POST /api/tools/{v}/checkpatch`
+- **Off by default**: `webapp.tools.checkpatch.enabled` (`false`); while off, `POST /webapi/tools/{v}/checkpatch`
   answers `{enabled: false, config_key, reason}` and no process is spawned.
 - **Trusted source**: the script comes from `webapp.tools.checkpatch.ref` — `"latest-release"` (the newest
   final `vX.Y` tag) or an explicit release tag (`vX.Y` / `vX.Y.Z`); branches, SHAs, release candidates and the
@@ -979,7 +979,7 @@ facts instead (`m_blob_facts`, Step 6.9, `core/API.md` §6).
 The man-pages repository (the entry `is_manpages_entry()` recognises, §2.10) is read from Git at any revision
 with the pure parser `parser/man_ast/` (`man_paths`, `man_parser`, `man_facts`; `parser/man_ast/MAN_API.md`).
 Man endpoints (§4.13) answer from the request's repository when it is the man-pages, else from the first
-available configured man-pages repository; `/api/man/resolve` answers for a kernel revision of the request's
+available configured man-pages repository; `/webapi/man/resolve` answers for a kernel revision of the request's
 repository.
 - **Page files**: `page_map(commit)` lists the tree's page files (`man_paths.page_of_path()`: `man/manS/name.S`
   or `manS/name.S`) once per `(name, section)`, preferring the `man/` path. Root `manS -> man/manS` symlinks of
@@ -1027,7 +1027,7 @@ repository.
 A name clicked or hovered in a `.c` / `.h` file at a position resolves inside that file before any name-only
 lookup, so a local `dev`, `byte` or `word` of `SYSCALL_DEFINE5(pciconfig_write, ...)` opens its own declaration
 instead of a same-named global, and its cross-references are its uses in scope. Endpoints: `GET
-/api/symbols/{v}/scope` and the optional `line` / `col` of `hover`, `detail` and `xref` (§4.3); without `line`
+/webapi/symbols/{v}/scope` and the optional `line` / `col` of `hover`, `detail` and `xref` (§4.3); without `line`
 those behave as without local resolution.
 - **Scope model**: the file's blob (tree SHA of `list_tree()`, at most 4 MB) is decoded latin-1, so the columns
   of `parser/c_ast/c_scope.py` (`parser/c_ast/CAST_API.md` §14) equal the byte columns of `/fs/file` tokens, and
@@ -1214,8 +1214,8 @@ Open `http://localhost:8000` in any modern browser.
 | `202 Accepted` | A background job (§2.15) is still computing the answer; poll again after `retry_after_ms` (`Cache-Control: no-store`) | `{"state": "building", "key": "...", "progress": {"done": 3, "total": 10, "note": "..."}, "retry_after_ms": 1000}` |
 | `400 Bad Request` | Path traversal (`..`), control characters, whitespace/root path, unsafe Git revision, invalid identifier/hash, or batch/size cap violation | `{"detail": "Path traversal attempt detected."}` |
 | `403 Forbidden` | Path escapes repository jail (`LINUX_REPO_DIR`) or required repository feature disabled | `{"detail": "Access denied: path outside repository root."}` |
-| `404 Not Found` | Unknown `/api/*` route, unknown kernel version, or non-existent file/symbol/subsystem/commit | `{"detail": "Not Found"}` |
-| `405 Method Not Allowed` | Unsupported HTTP method on a valid `/api/*` route | `{"detail": "Method Not Allowed"}` |
+| `404 Not Found` | Unknown `/webapi/*` route, unknown kernel version, or non-existent file/symbol/subsystem/commit | `{"detail": "Not Found"}` |
+| `405 Method Not Allowed` | Unsupported HTTP method on a valid `/webapi/*` route | `{"detail": "Method Not Allowed"}` |
 | `409 Conflict` | Request for a stale frontend build asset (`/b/{build}/...`) | `{"detail": "stale frontend build", "build": "..."}` |
 | `413 Content Too Large` | Maintainer patch payload exceeds 5 MB limit | `{"detail": "patch_text exceeds 5 MB limit"}` |
 | `422 Unprocessable Entity` | FastAPI/Pydantic query, path, or body schema validation error (e.g. `max_length=256`, `ge`/`le` bounds) | `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}` |

@@ -96,7 +96,7 @@ export class CallgraphView {
     await this.loadCallgraph();
   }
 
-  /** Call path finder (N2): `GET /api/tools/{v}/callpath`, shortest chains with the call site of every hop. */
+  /** Call path finder (N2): `GET /webapi/tools/{v}/callpath`, shortest chains with the call site of every hop. */
   bindCallPath(initialTo) {
     const c = this.containerEl;
     const panel = c.querySelector("#callgraph-path");
@@ -145,7 +145,7 @@ export class CallgraphView {
       results.innerHTML = "";
       let res;
       try {
-        res = await this.api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
+        res = await this.api.requestJob(`/webapi/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
           // 202 while the revision's source index is assembled (the first search of a revision, §2.19)
           timeoutMs: 600000, onProgress: (p) => { if (seq === this._pathSeq && this.containerEl?.isConnected) status.textContent = `Indexing the sources of ${this.currentVersion}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
         });

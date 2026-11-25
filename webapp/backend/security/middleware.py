@@ -57,10 +57,10 @@ class SecurityHeadersMiddleware:
 
 
 class SlidingWindowRateLimiter:
-    """Sliding-window in-memory rate limiter per client IP address, on /api/ requests.
+    """Sliding-window in-memory rate limiter per client IP address, on /webapi/ requests.
 
     The shell, its loader and the build's assets are not limited (they are static and cached by the
-    browser); a path ending in ".js" or ".json" under /api/ is an API request like any other.
+    browser); a path ending in ".js" or ".json" under /webapi/ is an API request like any other.
     """
 
     def __init__(self, app, max_requests: int = 600, window_seconds: int = 60) -> None:
@@ -71,7 +71,7 @@ class SlidingWindowRateLimiter:
         self._lock = threading.Lock()
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/webapi/"):
             await self.app(scope, receive, send)
             return
 

@@ -684,7 +684,7 @@
   }
 }
 
-/* Inline figures (served from Git via /api/fs/raw) */
+/* Inline figures (served from Git via /webapi/fs/raw) */
 .kdoc-body img.kdoc-img {
   display: block;
   max-width: 100%;

@@ -1,7 +1,7 @@
 /**
  * file_diff.js - Full-file diff of a code tab against any file at any revision (toolbar "⇄ Diff").
  *
- * The server sends only the changed lines (`GET /api/tools/diff/blobs`, -U0 hunks); the unchanged
+ * The server sends only the changed lines (`GET /webapi/tools/diff/blobs`, -U0 hunks); the unchanged
  * lines are the same on both sides, so the full diff is rebuilt here from the file the tab already
  * shows (`buildDiffRows`). `pairDiffRows` aligns the same rows into side-by-side pairs.
  */

@@ -204,7 +204,7 @@ export function isStructured(text) {
   return parseCommitQuery(text).chips.length > 0;
 }
 
-/** Query string of GET /api/commits/{v}/query for a parsed query. */
+/** Query string of GET /webapi/commits/{v}/query for a parsed query. */
 export function queryParams(q, page = 1, limit = 50) {
   const p = new URLSearchParams();
   for (const path of q.paths) p.append("path", path);

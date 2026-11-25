@@ -1,6 +1,6 @@
 /**
  * watch_runtime.js - Watch list runtime (G10): stores watches in the `user` store (S06), checks them when
- * their branch moves (`versions:updated`, §2.11) or on demand (`POST /api/watch/changes`, §4.12), and keeps
+ * their branch moves (`versions:updated`, §2.11) or on demand (`POST /webapi/watch/changes`, §4.12), and keeps
  * the header bell's unread count. Imported once by app.js.
  */
 import { api } from "../../api.js";
@@ -73,7 +73,7 @@ export async function checkWatches(watches = null, { quiet = false } = {}) {
       const batch = g.watches.slice(offset, offset + MAX_WATCH_BATCH);
       let res;
       try {
-        res = await api.request("/api/watch/changes", {
+        res = await api.request("/webapi/watch/changes", {
           method: "POST", timeoutMs: 120000,
           body: JSON.stringify({ from: g.from, to: g.to, items: batch.map((w) => ({ key: w.key, ...w.data.target })) }),
         });

@@ -580,7 +580,7 @@ if __name__ == "__main__":
 
 
 class TestMergedCommits(unittest.TestCase):
-    """GET /api/mail/merged (P2): database path, trailer fallback, series aggregation, read-only SQL."""
+    """GET /webapi/mail/merged (P2): database path, trailer fallback, series aggregation, read-only SQL."""
 
     def _mail_db(self):
         from db_engine import MockDB

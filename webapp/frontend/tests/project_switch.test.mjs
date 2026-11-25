@@ -148,15 +148,15 @@ globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
   const repo = opts.headers?.["X-KI-Repo"] || "linux";
   let body = { ok: true };
-  if (u.includes("/api/projects")) {
+  if (u.includes("/webapi/projects")) {
     body = { projects: PROJECTS, active: "linux" };
-  } else if (u.includes("/api/branch/tags")) {
+  } else if (u.includes("/webapi/branch/tags")) {
     const q = new URL(u, "http://localhost").searchParams.get("branch") || "master";
     const tags = BRANCH_TAGS_BY_REPO[repo]?.[q] || [];
     body = { branch: q, head: "aaaaaaaaaaaaaaaaaaaa", total: tags.length, tags };
-  } else if (u.includes("/api/branches")) {
+  } else if (u.includes("/webapi/branches")) {
     body = { branches: BRANCHES_BY_REPO[repo] || BRANCHES_BY_REPO.linux, tag_views: [] };
-  } else if (u.includes("/api/versions")) {
+  } else if (u.includes("/webapi/versions")) {
     body = VERSIONS_BY_REPO[repo] || VERSIONS_BY_REPO.linux;
   }
   return {

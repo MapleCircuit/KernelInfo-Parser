@@ -120,7 +120,7 @@ export class PaholeView {
     panel.hidden = false;
     panel.innerHTML = `<div class="kconfig-muted">Comparing struct ${escapeHtml(this.structName)} at ${escapeHtml(this.currentVersion)} and ${escapeHtml(other)}…</div>`;
     try {
-      const res = await this.api.request(`/api/tools/pahole/compare?${new URLSearchParams({ a: this.currentVersion, b: other, struct: this.structName })}`, { timeoutMs: 60000 });
+      const res = await this.api.request(`/webapi/tools/pahole/compare?${new URLSearchParams({ a: this.currentVersion, b: other, struct: this.structName })}`, { timeoutMs: 60000 });
       if (panelSeq !== this._panelSeq || !this.containerEl?.isConnected || !panel.isConnected) return;
       panel.innerHTML = `<div class="pcmp-head"><strong>Layout ${escapeHtml(this.currentVersion)} → ${escapeHtml(other)}</strong><button class="code-btn" type="button" data-close aria-label="Close">✕</button></div>${compareHtml(res, this.currentVersion, other)}`;
     } catch (err) {
@@ -141,7 +141,7 @@ export class PaholeView {
     panel.hidden = false;
     panel.innerHTML = `<div class="kconfig-muted pcmp-progress">Computing the layout at each release where struct ${escapeHtml(this.structName)} changed…</div>`;
     try {
-      const res = await this.api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/pahole/${encodeURIComponent(this.structName)}/history`, {
+      const res = await this.api.requestJob(`/webapi/tools/${encodeURIComponent(this.currentVersion)}/pahole/${encodeURIComponent(this.structName)}/history`, {
         timeoutMs: 120000,
         onProgress: (p) => { if (panelSeq !== this._panelSeq || !this.containerEl?.isConnected || !panel.isConnected) return; const el = panel.querySelector(".pcmp-progress"); if (el) el.textContent = `Computing ${p?.note || "…"} (${p?.done ?? 0}/${p?.total ?? "?"})…`; },
       });

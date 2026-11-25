@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 from webapp.backend.security.git import safe_rev
 
-router = APIRouter(prefix="/api/watch", tags=["watch"])
+router = APIRouter(prefix="/webapi/watch", tags=["watch"])
 
 
 @router.post("/changes")

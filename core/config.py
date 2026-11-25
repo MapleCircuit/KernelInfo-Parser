@@ -153,6 +153,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # revisions are kept on disk (at most `revisions`), so a restart does not assemble them again.
         "source_index": {"workers": 2, "max_mb": 1024, "revisions": 8},
     },
+    # Standalone authenticated AI & programmatic API service (api/API.md)
+    "api": {
+        "host": "127.0.0.1",
+        "port": 8001,
+        "reload": False,
+        "default_version": "v3.0",
+        "keys": [],
+        "rate_limit": {
+            "max_requests": 120,
+            "window_seconds": 60,
+        },
+        "auth_lockout": {
+            "max_failures": 5,
+            "failure_window_seconds": 60,
+            "base_lockout_seconds": 30,
+            "max_lockout_seconds": 3600,
+        },
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        "client_ip_header": "X-Forwarded-For",
+    },
     # CVE records: a local clone of the CVE Program's list (cvelistV5) or of the kernel CNA's vulns.git, kept
     # current by the operator (git pull). The parser ingests it into m_cve / m_cve_commit when its HEAD changed
     # (at the start of every run, or alone with --cve; core/API.md section 9); the webapp reads those tables
@@ -562,6 +582,76 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     webapp_sec["pool_size"] = max(1, _coerce_int(webapp_sec.get("pool_size"), 10))
     webapp_sec["default_version"] = str(webapp_sec.get("default_version") or "v3.0").strip() or "v3.0"
 
+    if "api" not in merged or not isinstance(merged["api"], dict):
+        merged["api"] = copy.deepcopy(DEFAULT_CONFIG["api"])
+    api_sec = merged["api"]
+    if env_api_host := _get_user_env("API_HOST"):
+        api_sec["host"] = str(env_api_host).strip() or "127.0.0.1"
+    else:
+        api_sec["host"] = str(api_sec.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    if env_api_port := _get_user_env("API_PORT"):
+        api_sec["port"] = _coerce_int(env_api_port, api_sec.get("port", 8001))
+    else:
+        api_sec["port"] = _coerce_int(api_sec.get("port"), 8001)
+    if env_api_reload := _get_user_env("API_RELOAD"):
+        api_sec["reload"] = _coerce_bool(env_api_reload, api_sec.get("reload", False))
+    else:
+        api_sec["reload"] = _coerce_bool(api_sec.get("reload"), False)
+    if env_api_ver := _get_user_env("API_DEFAULT_VERSION"):
+        api_sec["default_version"] = str(env_api_ver).strip() or "v3.0"
+    else:
+        api_sec["default_version"] = str(api_sec.get("default_version") or webapp_sec["default_version"] or "v3.0").strip() or "v3.0"
+
+    if (env_api_keys := (_get_user_env("API_KEYS") or _get_user_env("KIP_API_KEYS"))) is not None:
+        raw_env_keys = env_api_keys.strip()
+        if raw_env_keys.startswith(("[", "{")):
+            try:
+                api_sec["keys"] = json.loads(raw_env_keys)
+            except json.JSONDecodeError:
+                api_sec["keys"] = [k.strip() for k in raw_env_keys.split(",") if k.strip()]
+        else:
+            api_sec["keys"] = [k.strip() for k in raw_env_keys.split(",") if k.strip()]
+    elif not isinstance(api_sec.get("keys"), (list, dict)):
+        api_sec["keys"] = []
+
+    default_rl = DEFAULT_CONFIG["api"]["rate_limit"]
+    rl_sec = api_sec.get("rate_limit")
+    if not isinstance(rl_sec, dict):
+        rl_sec = copy.deepcopy(default_rl)
+    api_sec["rate_limit"] = {
+        "max_requests": max(1, _coerce_int(rl_sec.get("max_requests"), default_rl["max_requests"])),
+        "window_seconds": max(1, _coerce_int(rl_sec.get("window_seconds"), default_rl["window_seconds"])),
+    }
+
+    default_lo = DEFAULT_CONFIG["api"]["auth_lockout"]
+    lo_sec = api_sec.get("auth_lockout")
+    if not isinstance(lo_sec, dict):
+        lo_sec = copy.deepcopy(default_lo)
+    base_lock = max(1, _coerce_int(lo_sec.get("base_lockout_seconds"), default_lo["base_lockout_seconds"]))
+    max_lock = max(base_lock, _coerce_int(lo_sec.get("max_lockout_seconds"), default_lo["max_lockout_seconds"]))
+    api_sec["auth_lockout"] = {
+        "max_failures": max(1, _coerce_int(lo_sec.get("max_failures"), default_lo["max_failures"])),
+        "failure_window_seconds": max(1, _coerce_int(lo_sec.get("failure_window_seconds"), default_lo["failure_window_seconds"])),
+        "base_lockout_seconds": base_lock,
+        "max_lockout_seconds": max_lock,
+    }
+
+    if (env_proxies := _get_user_env("API_TRUSTED_PROXIES")) is not None:
+        api_sec["trusted_proxies"] = [p.strip() for p in env_proxies.split(",") if p.strip()]
+    else:
+        raw_proxies = api_sec.get("trusted_proxies")
+        if isinstance(raw_proxies, str):
+            api_sec["trusted_proxies"] = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+        elif isinstance(raw_proxies, (list, tuple)):
+            api_sec["trusted_proxies"] = [str(p).strip() for p in raw_proxies if isinstance(p, str) and p.strip()]
+        else:
+            api_sec["trusted_proxies"] = list(DEFAULT_CONFIG["api"]["trusted_proxies"])
+
+    if env_ip_hdr := _get_user_env("API_CLIENT_IP_HEADER"):
+        api_sec["client_ip_header"] = str(env_ip_hdr).strip() or "X-Forwarded-For"
+    else:
+        api_sec["client_ip_header"] = str(api_sec.get("client_ip_header") or "X-Forwarded-For").strip() or "X-Forwarded-For"
+
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
         parser_sec["table_engine"] = env_p_te
@@ -747,6 +837,11 @@ def get_db_config() -> dict[str, Any]:
 def get_webapp_config() -> dict[str, Any]:
     """Retrieve active webapp configuration section."""
     return get_config().get("webapp", copy.deepcopy(DEFAULT_CONFIG["webapp"]))
+
+
+def get_api_config() -> dict[str, Any]:
+    """Retrieve active standalone AI API configuration section."""
+    return get_config().get("api", copy.deepcopy(DEFAULT_CONFIG["api"]))
 
 
 def get_parser_config() -> dict[str, Any]:

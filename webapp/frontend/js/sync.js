@@ -1,5 +1,5 @@
 /**
- * sync.js - Keeps the client in step with the server (tokens of GET /api/sync, see
+ * sync.js - Keeps the client in step with the server (tokens of GET /webapi/sync, see
  * webapp/backend/services/sync_service.py).
  *
  * - db: a rebuilt database clears every cached API response.
@@ -77,7 +77,7 @@ class SyncManager {
   }
 
   /**
-   * Sync with the server (`GET /api/sync`): checks db, parsed, git, and frontend tokens.
+   * Sync with the server (`GET /webapi/sync`): checks db, parsed, git, and frontend tokens.
    * In-flight calls share the promise; rapid calls within 1 s are coalesced.
    */
   async sync({ notify = true, fresh = false, force = false } = {}) {
@@ -143,7 +143,7 @@ class SyncManager {
    */
   async apply(sync, { notify, force = false, announce = true }) {
     if (!sync) return null;
-    // The repository these tokens belong to (`repo` of /api/sync, else the request's)
+    // The repository these tokens belong to (`repo` of /webapi/sync, else the request's)
     const repo = typeof sync.repo === "string" ? sync.repo : (api.repo || "");
     await this.loadStamps(repo);
     const prev = this.tokens;
@@ -199,7 +199,7 @@ class SyncManager {
   }
 
   /**
-   * Settings "Check for Updates": the sync of the 60 s heartbeat (`GET /api/sync` with the server's cached
+   * Settings "Check for Updates": the sync of the 60 s heartbeat (`GET /webapi/sync` with the server's cached
    * tokens, applied by apply(): a purged cache, refetched catalogs and repository list), run at once. Nothing is
    * re-rendered and a newer build is not announced: when `updated`, the caller restarts the page (restart()).
    * Resolves to {db, parsed, git, projects, frontend, newBuild, changed, removed, added, updated}: the first four
@@ -270,7 +270,7 @@ class SyncManager {
   }
 
   /**
-   * Refetch the repository list (GET /api/projects) after its `projects` token changed or on a manual check;
+   * Refetch the repository list (GET /webapi/projects) after its `projects` token changed or on a manual check;
    * app.js re-renders the selectors on `projects:updated`. A failure keeps the cached list.
    */
   async refreshProjects({ notify }) {

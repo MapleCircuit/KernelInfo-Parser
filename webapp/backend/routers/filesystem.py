@@ -16,7 +16,7 @@ from webapp.backend.services.imports_service import imports_service
 from webapp.backend.services.outline_service import outline_service
 from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
 
-router = APIRouter(prefix="/api", tags=["filesystem"])
+router = APIRouter(prefix="/webapi", tags=["filesystem"])
 fs_service = FilesystemService()
 
 

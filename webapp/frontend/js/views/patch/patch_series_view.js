@@ -3,7 +3,7 @@
  *
  * Staged files (from the patch modal's **Add to series**) are grouped into ordered patches, each with its
  * subject and description; a cover letter and the recipients (suggested from MAINTAINERS) complete the
- * series, and **Generate** formats it (`POST /api/version/{base}/patch/series`) with a check that it applies
+ * series, and **Generate** formats it (`POST /webapi/version/{base}/patch/series`) with a check that it applies
  * cleanly to its base, an mbox download and per-patch copies. The draft is session state (`patchDrafts`).
  */
 import { api } from "../../api.js";

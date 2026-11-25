@@ -1561,6 +1561,97 @@ class TestServiceConfigIsolation(unittest.TestCase):
         finally:
             gs._MEMORY_GUARD_INITIALIZED = orig_initialized
 
+    def test_api_config_defaults_file_env_and_cli(self) -> None:
+        """`api` section defaults, config.json overrides, env-var precedence, and api/main.py CLI flags."""
+        from api import main as api_main
+        from api.config import get_api_server_config, normalize_api_keys
+        from core.config import get_api_config
+
+        with patch("core.config.find_config_path", return_value=None):
+            cfg = load_config(config_path=None)
+        api_cfg = cfg["api"]
+        self.assertEqual(api_cfg["host"], "127.0.0.1")
+        self.assertEqual(api_cfg["port"], 8001)
+        self.assertFalse(api_cfg["reload"])
+        self.assertEqual(api_cfg["default_version"], "v3.0")
+        self.assertEqual(api_cfg["keys"], [])
+        self.assertEqual(api_cfg["rate_limit"], {"max_requests": 120, "window_seconds": 60})
+        self.assertEqual(
+            api_cfg["auth_lockout"],
+            {
+                "max_failures": 5,
+                "failure_window_seconds": 60,
+                "base_lockout_seconds": 30,
+                "max_lockout_seconds": 3600,
+            },
+        )
+        self.assertEqual(api_cfg["trusted_proxies"], ["127.0.0.1", "::1"])
+        self.assertEqual(api_cfg["client_ip_header"], "X-Forwarded-For")
+
+        # Key normalization supports list[str] and {name: key}, rejecting blanks/non-strings
+        self.assertEqual(normalize_api_keys([" k1 ", "", 123]), [("key_0", "k1")])
+        self.assertEqual(normalize_api_keys({"agent": " s1 ", "empty": "  "}), [("agent", "s1")])
+        self.assertEqual(normalize_api_keys(None), [])
+
+        custom_file = self.root / "api_cfg.json"
+        custom_file.write_text(
+            json.dumps(
+                {
+                    "api": {
+                        "host": "0.0.0.0",
+                        "port": 8111,
+                        "reload": True,
+                        "default_version": "v6.6",
+                        "keys": {"ci": "secret-ci"},
+                        "rate_limit": {"max_requests": 50, "window_seconds": 30},
+                        "auth_lockout": {
+                            "max_failures": 3,
+                            "failure_window_seconds": 120,
+                            "base_lockout_seconds": 10,
+                            "max_lockout_seconds": 600,
+                        },
+                        "trusted_proxies": ["10.0.0.0/8"],
+                        "client_ip_header": "X-Real-IP",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "API_PORT": "8222",
+                "API_KEYS": "env-key-1, env-key-2",
+                "API_CLIENT_IP_HEADER": "CF-Connecting-IP",
+            },
+            clear=False,
+        ):
+            init_config(custom_file)
+            loaded_api = get_api_config()
+            self.assertEqual(loaded_api["host"], "0.0.0.0")
+            self.assertEqual(loaded_api["port"], 8222)
+            self.assertTrue(loaded_api["reload"])
+            self.assertEqual(loaded_api["default_version"], "v6.6")
+            self.assertEqual(loaded_api["client_ip_header"], "CF-Connecting-IP")
+            self.assertEqual(loaded_api["trusted_proxies"], ["10.0.0.0/8"])
+            srv = get_api_server_config()
+            self.assertEqual(srv["normalized_keys"], [("key_0", "env-key-1"), ("key_1", "env-key-2")])
+
+        args = api_main.parse_args(["-c", str(custom_file), "--host", "127.0.0.1", "--port", "8333", "--no-reload"])
+        self.assertEqual(args.config, str(custom_file))
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 8333)
+        self.assertFalse(args.reload)
+        self.assertIsNone(api_main.parse_args([]).reload)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CONFIG_FILE", None)
+            os.environ.pop("KERNELINFO_CONFIG", None)
+            api_main.apply_config_path(args)
+            self.assertEqual(os.environ["CONFIG_FILE"], str(custom_file.resolve()))
+            self.assertEqual(os.environ["KERNELINFO_CONFIG"], str(custom_file.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

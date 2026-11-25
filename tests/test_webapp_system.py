@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
 
 class TestIngestStatus(unittest.TestCase):
-    """GET /api/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
+    """GET /webapi/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
 
     def _run(self, states, refs, now=1_000_000.0, network_id=7, repo_id=3):
         from webapp.backend.routers import system
@@ -254,8 +254,8 @@ class TestSecurityAndCoreHardening(unittest.TestCase):
         with patch.object(_sync_mod.sync_service, "cached_header_value", return_value=None), \
                 patch.object(_sync_mod.sync_service, "header_value", return_value="0.0.0"):
             client = TestClient(create_app())
-            resp = client.get("/api/nonexistent-endpoint-check")
-            resp_405 = client.delete("/api/versions")
+            resp = client.get("/webapi/nonexistent-endpoint-check")
+            resp_405 = client.delete("/webapi/versions")
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json(), {"detail": "Not Found"})
         self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
@@ -288,7 +288,7 @@ class TestSecurityAndCoreHardening(unittest.TestCase):
             async def recv() -> dict[str, object]:
                 return {"type": "http.request", "body": b"", "more_body": False}
 
-            await wrapped({"type": "http", "path": "/api/test", "client": ("127.0.0.1", 1234), "headers": []}, recv, send)
+            await wrapped({"type": "http", "path": "/webapi/test", "client": ("127.0.0.1", 1234), "headers": []}, recv, send)
             return code, captured
 
         hdr_429: list[dict[bytes, bytes]] = []

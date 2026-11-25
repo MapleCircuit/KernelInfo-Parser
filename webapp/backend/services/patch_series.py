@@ -232,7 +232,7 @@ def _git_read(sha: str, path: str) -> tuple[str | None, str | None, str]:
 
 
 def format_series(revision: str, req: dict[str, Any]) -> dict[str, Any]:
-    """`POST /api/version/{v}/patch/series`: the formatted series plus whether it applies to its base."""
+    """`POST /webapi/version/{v}/patch/series`: the formatted series plus whether it applies to its base."""
     from webapp.backend.services.tree_resolver import git_tree_resolver
     if not isinstance(req, dict):
         raise HTTPException(status_code=400, detail="Body must be a JSON object")

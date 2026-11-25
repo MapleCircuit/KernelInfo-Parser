@@ -928,7 +928,7 @@ class ContextMenu {
   }
 
   /**
-   * "Referenced by" of a file (GET /api/fs/references, §4.2): grouped entries, each opening the file at
+   * "Referenced by" of a file (GET /webapi/fs/references, §4.2): grouped entries, each opening the file at
    * its line (middle-click or Ctrl+click: a new tab). Resolves with the response (null on error).
    */
   async showFileReferencesMenu(x, y, version, path) {

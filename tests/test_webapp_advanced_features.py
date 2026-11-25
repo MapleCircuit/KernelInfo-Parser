@@ -276,7 +276,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn({"from": "EXT4_FS", "to": "JBD2", "type": "selects"}, graph["edges"])
 
     def test_kconfig_autosolve(self) -> None:
-        # Autosolve for EXT4_FS (the body of POST /api/kconfig/{v}/autosolve)
+        # Autosolve for EXT4_FS (the body of POST /webapi/kconfig/{v}/autosolve)
         res = autosolve_kconfig("v3.0", {"target_symbol": "EXT4_FS", "current_values": {}})
         self.assertTrue(res["solution_found"])
         self.assertIn("toggles_needed", res)
@@ -665,7 +665,7 @@ int get_foo(void) {
 
     @requires_live_db("reads the live database")
     def test_projects_and_branches_endpoints(self) -> None:
-        """Verify /api/projects, /api/branches, and /api/versions include_rc functionality."""
+        """Verify /webapi/projects, /webapi/branches, and /webapi/versions include_rc functionality."""
         from webapp.backend.routers.versions import (
             get_branches,
             get_projects,
@@ -806,7 +806,7 @@ class _LadderReader:
 
 
 class TestAstTreeBudget(unittest.TestCase):
-    """GET /api/symbols/{v}/ast/{id}: the answer never serializes more than MAX_AST_TREE_NODES nodes."""
+    """GET /webapi/symbols/{v}/ast/{id}: the answer never serializes more than MAX_AST_TREE_NODES nodes."""
 
     def _tree(self, depth: int, levels: int = 12) -> tuple[dict, _LadderReader]:
         from unittest.mock import patch

@@ -310,10 +310,10 @@ class TestScopedGitAndStableDeltas(unittest.TestCase):
 
             # HTTP endpoint
             client = TestClient(create_app())
-            resp = client.get("/api/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0&to_ref=v3.0.1")
+            resp = client.get("/webapi/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0&to_ref=v3.0.1")
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.json()["commits"], 5)
-            bad = client.get("/api/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0.2&to_ref=v3.0.1")
+            bad = client.get("/webapi/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0.2&to_ref=v3.0.1")
             self.assertEqual(bad.status_code, 400)
 
 

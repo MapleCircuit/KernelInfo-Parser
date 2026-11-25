@@ -118,6 +118,8 @@ DEFAULT_MODULES = [
     "tests.test_webapp_ui_scale",
     "tests.test_webapp_features",
     "tests.test_webapp_frontend_js",
+    "tests.test_ai_api_security",
+    "tests.test_ai_api",
     "tests.test_tui",
     "tests.test_tui_app",
     "tests.test_tui_testing",

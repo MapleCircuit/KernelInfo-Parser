@@ -1,5 +1,5 @@
 /**
- * file_references.js - "Referenced by" of a file (GET /api/fs/references, webapp/API.md §4.2): the menu
+ * file_references.js - "Referenced by" of a file (GET /webapi/fs/references, webapp/API.md §4.2): the menu
  * groups and labels, pure (webapp/frontend/tests/file_references.test.mjs). The context menu escapes every
  * label it renders (§5.6).
  */

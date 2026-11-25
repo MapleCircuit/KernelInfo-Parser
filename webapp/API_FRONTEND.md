@@ -105,7 +105,7 @@ webapp/frontend/js/
 │   ├── patch_modal.js     # In-browser patch staging (edit → git format-patch)
 │   ├── symbol_history_modal.js # Release slider over the history of a definition or Kconfig symbol
 │   ├── symbol_history_render.js # Its pure, escaped fragments (renamed-from note)
-│   ├── file_references.js       # "Referenced by" menu groups of a file (GET /api/fs/references)
+│   ├── file_references.js       # "Referenced by" menu groups of a file (GET /webapi/fs/references)
 │   ├── branch_picker.js   # Hierarchical branch & tag-view picker popover (grouped by branch source)
 │   ├── ref_picker.js      # Git reference picker popover (release tags + searchable commits)
 │   ├── version_switch.js  # Apply / New Tab: guarded revision switch of the active tab
@@ -187,7 +187,7 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   serverUp` (`isOnline` follows the browser's `online`/`offline` events); the settings panel's connection
   status reads `isConnected` and `isOnline`.
 - **Heartbeat (`startHeartbeat()`, `stopHeartbeat()`, `pingServer()`)**: `pingServer()` requests `GET
-  /api/sync` (cheap, server-cached, never intercepted by the worker) with a 5 s timeout, coalescing concurrent
+  /webapi/sync` (cheap, server-cached, never intercepted by the worker) with a 5 s timeout, coalescing concurrent
   probes via `_pingInFlight` so simultaneous heartbeat/visibility/`online` triggers share one request, records
   reachability without throwing or touching the loading spinner, and dispatches the sync payload to
   `syncManager.onSyncData` so that the periodic check updates everything (frontend build, database instance,
@@ -200,7 +200,7 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
 - `getVersions(includeRc, options)`: The version catalog (`{total, versions, g}`, entries `{vname,
   commit_hash` (12 hex)`, is_prerelease, ref_type, indexed, stamp}`), read from IndexedDB (`{g, r}` under
   `app_versions_c1_<rc|rel>`) without a network request until `sync` confirms a change; `{ networkFirst: true
-  }` when refreshed by sync. The network request asks for the compact form (`/api/versions?compact=1`) with
+  }` when refreshed by sync. The network request asks for the compact form (`/webapi/versions?compact=1`) with
   `If-None-Match: W/"c1-<g>"` of the catalog it holds and applies the `304`, delta or full answer
   (`utils/version_catalog.js`: `catalogFromBody`, `versionsFromCatalog`, §2.13); a delta of another base is
   answered by refetching the full catalog, a failure or an offline reply keeps the catalog held. Concurrent
@@ -226,16 +226,16 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   from `loc`, and `error`/`message` fallbacks, never emitting `"[object Object]"`).
 - `getVersionsCached(includeRc)`: That in-memory catalog — refreshed by every `getVersions()` call (startup,
   each sync refresh, §2.11) — fetched only when this page has none yet. Used where a lookup must not wait on
-  `/api/versions`: the **⇄ Diff** picker's default revision (`previousTag`), the ref picker's tag list (§5.13)
+  `/webapi/versions`: the **⇄ Diff** picker's default revision (`previousTag`), the ref picker's tag list (§5.13)
   and the Compare view's default base.
-- `getSync({fresh})`: Server change tokens (`GET /api/sync`, never cached; `fresh` adds `?fresh=true`);
+- `getSync({fresh})`: Server change tokens (`GET /webapi/sync`, never cached; `fresh` adds `?fresh=true`);
   `onSyncHeader` receives the `X-KIP-Sync` header of every response; `onSyncData` receives the full JSON
   snapshot; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
 - `getDirectoryTree(version, path)`: Direct children of a directory.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
 - `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
 - `getCompileCommandsDownloadUrl(version, arch)`: URL of the `compile_commands.json` download (`GET
-  /api/fs/compile_commands/{v}/export`).
+  /webapi/fs/compile_commands/{v}/export`).
 - `resolveInclude(version, header, astId, currentFile, arch)`: Resolves `#include` directive targets for
   `arch` (default `state.definitionContext().arch`, part of the cache key).
 - `resolveObject(version, objectPath, currentFile)`: Resolves Makefile/Kbuild `.o` object targets relative to
@@ -246,7 +246,7 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
 - `getSymbolDetail(version, name, arch, fromFile)` / `getSymbolXref(version, name, limit, arch)`: Symbol
   inspection; `arch` defaults to `state.definitionContext().arch` and is part of the cache key, as is
   `fromFile` (the file the symbol is used in, §2.7 item 4).
-- `getBuildConditions(version, paths, arch)`: Kbuild build conditions of files (`GET /api/kconfig/{v}/build`).
+- `getBuildConditions(version, paths, arch)`: Kbuild build conditions of files (`GET /webapi/kconfig/{v}/build`).
 - `searchSymbols(version, query, limit)`: Symbol definitions by prefix (Ctrl+K palette).
 - `getSymbolHistory(version, path, line, astId, { name, includeRc, branch })`: Release-by-release history of a
   definition on one branch (sends the definition ARCH; long timeout, since the first history of a branch walks
@@ -648,7 +648,7 @@ container (classes, no document ids), so several NodeMap tabs and split panes ne
   elevate the tab into a window of its own.
 
 #### 5.3.3. Struct Nodes
-- `GET /api/nodemap/{v}/struct/{name}` (`webapp/API_ENDPOINTS.md` §4.14) gives the definition's members, nested
+- `GET /webapi/nodemap/{v}/struct/{name}` (`webapp/API_ENDPOINTS.md` §4.14) gives the definition's members, nested
   `struct`/`union` members and the `#if` / `#ifdef` / `#ifndef` / `#elif` / `#else` / `#endif` lines inside it,
   each member with the conditions it is built under, plus the conditions around the whole definition
   (`outer_conds`). The span comes from the index for parsed revisions and from the source text otherwise; a
@@ -714,13 +714,13 @@ container (classes, no document ids), so several NodeMap tabs and split panes ne
   or the card. The inspector's **Show all hidden (N)** restores every one, the banner included.
 
 #### 5.3.4. Content Nodes
-- **Source** (`GET /api/nodemap/{v}/source`): a whole file, a line range or a symbol's definition (struct, union,
+- **Source** (`GET /webapi/nodemap/{v}/source`): a whole file, a line range or a symbol's definition (struct, union,
   function, macro, enum; optional context lines, the definition highlighted), highlighted by the code view's
   lexical highlighter (`AstOverlay`), for parsed and unparsed revisions alike. Slices are capped at 6000 lines.
   The body is the code alone; the path and line span are in the header.
 - **Man page**: `mountManDocument()` (§5.38) in the node with a node-local tab object, so mode and width toggles
   stay with the node; cross references navigate inside it. A node made from a name and section resolves the page
-  with `GET /api/man/resolve` for the node's kernel revision.
+  with `GET /webapi/man/resolve` for the node's kernel revision.
 - **KernelInfo tab**: any tab type, a new view or an open tab's address (`urlSync.paramsForTab(tab)`), shown live
   in an iframe of the **embed shell** `/?embed=1#<tab hash>` (`utils/embed_mode.js`). The shell boots the app
   without chrome (`html.kip-embed` hides header, activity bar and sidebar), joins no workspace session (no session
@@ -865,7 +865,7 @@ a header reference (`headMetaOf`) and inspector fields for its payload; all of t
   file CVE list (`getFileCves(version, filePath)`) via `cveModel()` and `renderCveBody()`, rendering CVSS score/KEV
   badges, release state, introduced/fixed commit chips (`⊕ diff` spawns commit `diff` nodes with `introduced` /
   `fixes` edges), and affected files (`⊕ src` spawns `source` nodes with `affects` edges).
-- **Kernel API / Boundary** (`data: {catalog, query, symbol, arch}`): queries `/api/kapi/{v}/...` (`getKapi()` for
+- **Kernel API / Boundary** (`data: {catalog, query, symbol, arch}`): queries `/webapi/kapi/{v}/...` (`getKapi()` for
   `summary`, `syscalls`, `exports`, `params`, `tracepoints`, `modules`, `devices`) via `kapiModel()` and
   `renderKapiBody()`, supporting click-to-spawn chips for function symbols (`⊕ fn`), man pages (`⊕ man`), source
   locations (`⊕ src`), and sub-catalogs.
@@ -1058,7 +1058,7 @@ a header reference (`headMetaOf`) and inspector fields for its payload; all of t
   bounds the offline cache. A change of `CACHE_LAYOUT` (`sync.js`, now 3: several response shapes changed)
   clears the data stores once.
 - **Settings popover entries** beyond storage: **⛏ Parser** — one line of ingestion status filled from `GET
-  /api/system/ingest` when the server answers (`312 parsed · 1 parsing (v3.2-rc4, 2 min ago) · DB 41.3 GB`,
+  /webapi/system/ingest` when the server answers (`312 parsed · 1 parsing (v3.2-rc4, 2 min ago) · DB 41.3 GB`,
   `statusLine()`), opening the status tab (§5.37); **⌨ Keyboard Shortcuts** (the overlay, §5.31.1); **🔄 Check
   for Updates** (§2.11); and, under Typography, *Sticky scroll* (§5.21).
 - **Upgrades with other windows open**: an open connection closes itself on `versionchange`, so a newer page's
@@ -1159,11 +1159,11 @@ a header reference (`headMetaOf`) and inspector fields for its payload; all of t
   The dialog takes a struct (guessed from the enclosing `struct S name = {` initializer, else
   `file_operations`; common ops structs suggested) and a field, or a function: a struct name lists its fields
   with counts, a `.field =` token its implementations, any other token the ops tables that use it (`GET
-  /api/tools/{v}/implementations`, §4.7). Results are grouped by file; each row opens the implementation's
+  /webapi/tools/{v}/implementations`, §4.7). Results are grouped by file; each row opens the implementation's
   definition, the entry line or the table; middle-click or Ctrl+click opens a new tab and keeps the dialog
   (§5.9). The Callgraph tab has **🧩 Indirect callers (ops tables)**, the same dialog on its function, and **⇢
   Find path to…** (N2): a target function (symbol suggestions), depth, functions to skip and *through ops
-  tables* (indirect edges); the shortest chains (`GET /api/tools/{v}/callpath`, §4.7) show as rows of hops,
+  tables* (indirect edges); the shortest chains (`GET /webapi/tools/{v}/callpath`, §4.7) show as rows of hops,
   each hop opening its call graph and its call site (`file:line`) opening the code; a static function or macro
   shows its file, and a hop through an ops table a dashed arrow with its `struct.field`. The first search of a
   revision shows the source index being assembled (§2.19); the target is kept in the URL (`to`), so a link
@@ -1277,7 +1277,7 @@ a header reference (`headMetaOf`) and inspector fields for its payload; all of t
   - Top-bar **"📄 Open Header"** action button quickly opens the included header file.
 
 ### 5.8. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
-- **Engine**: `KconfigEngine` decodes the model of `GET /api/kconfig/{v}/tree` (`decodeModel`) and evaluates
+- **Engine**: `KconfigEngine` decodes the model of `GET /webapi/kconfig/{v}/tree` (`decodeModel`) and evaluates
   it with kconfig's algorithms (twin of `parser/kconfig_ast/kconfig_eval.py`): `value`, `visibility`,
   `revDep`, `getType` (tristate degrades to bool without `MODULES`), `choiceSelection`, `isChangeable`,
   `menuVisible` (`menu_is_visible`); legal setters `setTristate` / `setValue` (refuse what kconfig refuses;
@@ -1583,7 +1583,7 @@ interactive UI surfaces:
 3. **Files Mode** (`api.getVersionsDiff`, 45 s timeout): Status chips (added / modified / deleted / renamed /
    unchanged) act as toggle filters alongside a path filter (which matches the path and, for renames, the old
    path). With no chip selected every change is listed; unchanged files are listed only while their chip is
-   selected. They are fetched the first time it is (`api.getUnchangedFiles`, `GET /api/tools/diff/unchanged`,
+   selected. They are fetched the first time it is (`api.getUnchangedFiles`, `GET /webapi/tools/diff/unchanged`,
    once per comparison; *Loading unchanged files…* meanwhile, and reselecting the chip retries a failed
    fetch), merged in path order with the other selected statuses, and shown with a `U` badge; clicking an
    unchanged row opens the file at the target revision instead of expanding a diff. Rows render in pages of
@@ -1606,7 +1606,7 @@ interactive UI surfaces:
      files because there were too many candidates, or identical content only without Git trees), and a form
      takes a similarity threshold (default 50%) and a directory (suggestions: the directories holding the most
      unpaired added/deleted files). **Search renames** calls `api.searchRenames` (`GET
-     /api/tools/diff/renames`, 120 s timeout, cached per revision pair, threshold and directory). A refused
+     /webapi/tools/diff/renames`, 120 s timeout, cached per revision pair, threshold and directory). A refused
      search (`too_many`) states the deleted × added counts and asks for a directory. A completed search
      replaces the pairing inside the directory (`applyRenameSearch`): renames with both ends there go back to
      added + deleted and the search result pairs them again (so a higher threshold drops pairs and a lower one
@@ -1641,7 +1641,7 @@ interactive UI surfaces:
      `compare-kconfig_<base>..<target>[_<statuses>][_<filter>]` (`_options.txt` / `_files.txt` / `.tsv` /
      `.json`).
 
-- **API mode** (A6, `views/diff/api_diff.js`): the Kernel API changelog of `GET /api/kapi/diff` (§4.9) — an
+- **API mode** (A6, `views/diff/api_diff.js`): the Kernel API changelog of `GET /webapi/kapi/diff` (§4.9) — an
   ARCH selector, kind chips with counts (Syscalls, Exports, Parameters, Tracepoints, Modules), status chips
   (*added*, *removed*, *changed*), a filter, and one row per change (`+` / `−` / `~`, kind, name, detail). A
   row opens the Kernel API section filtered on that name, at the target revision (the base for a removed
@@ -1649,7 +1649,7 @@ interactive UI surfaces:
   notes, *Table (.tsv)*, *JSON*. While the catalogs of either side build, the mode shows their progress. The
   palette command *Compare kernel APIs* opens it.
 
-- **Man pages mode** (`views/diff/man_diff.js`, `api.getManDiff` → `GET /api/man/diff`, §4.13): compares man
+- **Man pages mode** (`views/diff/man_diff.js`, `api.getManDiff` → `GET /webapi/man/diff`, §4.13): compares man
   entries between two `man-pages` revisions matched by canonical `(name, section)`. Displays status chips with
   counts (*added*, *modified*, *deleted*, plus the unchanged count), section selector pills (`ALL` and sections
   ordered by `manDiffSections`), and a text filter matching `name(section)`, summary, repository paths, function
@@ -1684,7 +1684,7 @@ interactive UI surfaces:
   (`#tab=commits&q=…&cid=<hash>`, §5.26, always the commit hash so the link survives a database rebuild);
   **Copy link** (`#btn-copy-commit-link`) copies a versionless `#repo=…&tab=commits&cid=<hash>&lc=1` link.
   Commit tabs can exist without a version tag (`tab.version === ""`, omitting the `.tab-version` badge and
-  `v=` hash parameter, calling `/api/commits/...` without a version segment and anchoring unfiltered timelines
+  `v=` hash parameter, calling `/webapi/commits/...` without a version segment and anchoring unfiltered timelines
   at the newest commit / `HEAD`); single-commit links from mail, CVEs, bookmarks, relations, file history,
   and commit popovers open tag-less, while timeline tabs opened with a version (`v=<rev>`) keep that anchor.
 - **One view per tab**: each commits tab has its own `CommitsView` (`app.viewRenderers.commits` is a factory),
@@ -1725,7 +1725,7 @@ interactive UI surfaces:
   tab of its own for it.
 
 - **Inline Commit Diff (`#btn-commit-diff`)**: The bottom of a selected commit's detail has a **± Show
-  changes** button. It loads `GET /api/commits/{v}/diff/{hash}` once per commit (IndexedDB `commits` store,
+  changes** button. It loads `GET /webapi/commits/{v}/diff/{hash}` once per commit (IndexedDB `commits` store,
   key `cdiff_<hash>_<context>`) and renders a compact per-file diff (status badge, `+/−` counts, old/new
   line-number gutters). Files with more than 120 rows, or after the 25th file, start collapsed; each file body
   scrolls at 420px.
@@ -1884,11 +1884,11 @@ interactive UI surfaces:
     4. Other projects can configure custom `tag_views` with arbitrary regex patterns.
   - **Branch Sources & Real Git Branches**: Selecting a **branch source** (`source:<name>`, rendered as
     `<name>/*` in `#branch-picker-label`, e.g. `history/*` or `stable/*`) scopes offered tags via `GET
-    /api/branch/tags?source=<name>` to all releases across that source's branches plus any tag-only chains
+    /webapi/branch/tags?source=<name>` to all releases across that source's branches plus any tag-only chains
     rooted exclusively in that source's DAG (such as pre-2.4 Linux historical tags `0.11`–`2.4.0-prerelease`,
     including `0.99`, under `history/*`), without changing `state.selectedVersion` (since a source is a scope,
     not a single Git revision). Selecting a **real Git branch** scopes offered tags to those reachable from it
-    (`GET /api/branch/tags`, e.g. `stable/linux-2.6.16.y` or `history/2.4-stable`) and sets its head as the
+    (`GET /webapi/branch/tags`, e.g. `stable/linux-2.6.16.y` or `history/2.4-stable`) and sets its head as the
     selected revision. Both fold sub-versions and pre-releases under their base release using the repository's
     primary `tag_views` rules (`getEffectiveTagView()`).
   - **Sub-version / Release Dropdown Sorting & Default**: Items in the Release dropdown are sorted descending
@@ -2001,7 +2001,7 @@ interactive UI surfaces:
   - **Links & Images**: Resolves relative document links (`.rst`, `.md`, `.tmpl`, `.html`, etc.) into
     `data-doc` attributes for in-app tab transitions, maps relative source links to `data-src`, directs
     external URLs to new tabs (`target="_blank" rel="noopener noreferrer"`), hydrates images via `data-raw`
-    from the Git tree (`/api/fs/raw`), and styles inline status badges (`.kdoc-badge`).
+    from the Git tree (`/webapi/fs/raw`), and styles inline status badges (`.kdoc-badge`).
   - **Kernel Automarkup**: Automatically scans prose text nodes outside code blocks and links, converting
     `CONFIG_*` macros to interactive Kconfig links and function calls `func()` to code symbols.
 - **DocBook XML Template Renderer (`webapp/frontend/js/views/docs/tmpl_renderer.js`)**:
@@ -2062,15 +2062,15 @@ interactive UI surfaces:
   URLs, `Documentation/…` paths, and kernel automarkup (`func()`, `struct foo`, `CONFIG_FOO`). Legacy
   plain-text docs keep aligned/indented text as preformatted blocks and promote tab-centered lines to
   headings. All source text is HTML-escaped.
-- **Figures**: `image`/`figure`/`kernel-figure` render inline from `/api/fs/raw` (on a light backing for
+- **Figures**: `image`/`figure`/`kernel-figure` render inline from `/webapi/fs/raw` (on a light backing for
   legibility); unrenderable formats (e.g. `.dot`) fall back to a source link.
 - **kernel-doc**: `.. kernel-doc::` blocks are replaced by the extracted API documentation
-  (`/api/docs/{v}/kernel-doc` with the directive's options): Sphinx C-domain entries with highlighted
+  (`/webapi/docs/{v}/kernel-doc` with the directive's options): Sphinx C-domain entries with highlighted
   signatures, Parameters/Members, Definition (types), Description/Return/Context sections rendered as
   reStructuredText after translating kernel-doc markup (`@param` → bold, `%CONST` → literal, `&struct foo` →
   type link), and a *[source]* link to the comment's line. The entry card and the markup translation are the
   DOM-free `renderKernelDocEntry()` / `kernelDocToRst()` of `rst_renderer.js`, shared with NodeMap doc nodes.
-- **Cross-document `:ref:`**: unresolved labels are looked up in `/api/docs/{v}/labels` and become links to
+- **Cross-document `:ref:`**: unresolved labels are looked up in `/webapi/docs/{v}/labels` and become links to
   `<doc>#<label>` showing the target section's title.
 - **Links**: `:doc:`/toctree/`Documentation/` links navigate in place (`tabData.docHistory` backs the sidebar
   **← Back**; Ctrl/middle-click opens a new tab), toctree labels are filled from each target's first title,
@@ -2082,10 +2082,10 @@ interactive UI surfaces:
 - **Opening**: `Ctrl/Cmd+K` or `Ctrl/Cmd+P` (search), `Ctrl/Cmd+Shift+P` (commands), or the header **🔍
   Search…** button. The keys are entries `palette.open` / `palette.commands` of the shortcut registry (§5.31)
   and can be rebound; the palette footer shows the current bindings.
-- **Modes by prefix** (`MODES` and `MODE_FEATURE` in `command_palette.js`): none — files (`/api/fs/search`),
+- **Modes by prefix** (`MODES` and `MODE_FEATURE` in `command_palette.js`): none — files (`/webapi/fs/search`),
   symbols (`api.searchSymbols`) and Kconfig options (`api.searchKconfig`, when `kconfig` is enabled) together;
   `/` commands; `$` symbols; `@` mailing-list discussions (§5.22, gated by `mail`); `%` text in every file of
-  the revision (`api.grepCode`, `GET /api/fs/grep`, 400 ms debounce, at least 2 characters: the first 30 matches
+  the revision (`api.grepCode`, `GET /webapi/fs/grep`, 400 ms debounce, at least 2 characters: the first 30 matches
   grouped by file with their exact match ranges highlighted, Enter opens the file at the line, plus *Open all
   results in the Search tab*, §5.34); `#` commits (`api.searchCommits`, gated by `commits`; selecting one
   selects it in the header and opens its tree in a repository explorer tab); `?` Kconfig options (gated by
@@ -2180,7 +2180,7 @@ interactive UI surfaces:
 
 ### 5.17. Treemap, Symbol History & Patch Staging
 - **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of
-  `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to
+  `/webapi/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to
   zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show
   Treemap of Folder*) or the palette.
 - **Symbol & Kconfig history** (`components/symbol_history_modal.js`): `showSymbolHistoryModal(version, path,
@@ -2188,11 +2188,11 @@ interactive UI surfaces:
   This Line*, palette *Symbol history at cursor line*) and `showKconfigHistoryModal(version, name)` (context
   menu *Kconfig History Across Releases* on a `CONFIG_*`/Kconfig token or selection, KConfig view **🕰
   History** card).
-  - **Branch**: the timeline follows one branch (*Branch scope* of `GET /api/symbols/{version_name}/history`).
+  - **Branch**: the timeline follows one branch (*Branch scope* of `GET /webapi/symbols/{version_name}/history`).
     The modal opens on the header's branch (`state.selectedBranch`, a real branch rather than a tag layout
     view) when the version is one of its tags (`state.tagOnSelectedBranch`) or is that branch; otherwise the
     server picks the branch holding the version (the default branch, or e.g. `stable/linux-2.6.32.y` for
-    `v2.6.32.71`). The **Branch** selector of the controls (`GET /api/branches`) refetches the timeline on
+    `v2.6.32.71`). The **Branch** selector of the controls (`GET /webapi/branches`) refetches the timeline on
     another branch, keeping the selected release when it is on it; it changes nothing outside the modal (the
     header's scope stays as it is).
   - **Slider**: one stop per release where the definition changed (introduced, modified, formatting-only,
@@ -2225,7 +2225,7 @@ interactive UI surfaces:
 
 - **Build overlay** (K4): **Build: off / `<engine>` ▾** in the treemap toolbar lists the running KConfig
   engines (like the code view's picker, §5.16; one without a resolved configuration is disabled). With one
-  picked, the treemap comes from `POST /api/version/{v}/treemap/build` (§4.2) with that engine's assignments:
+  picked, the treemap comes from `POST /webapi/version/{v}/treemap/build` (§4.2) with that engine's assignments:
   cells are colored by the bucket holding most of their bytes (built in, module, not built, unknown — design
   tokens), the legend gives *compiled: X of Y (Z %) · N of M .c/.S files*, and the tooltip the four buckets of
   a cell. **Compiled bytes** sizes cells by the bytes built in or as modules. The treemap refetches (500 ms
@@ -2240,7 +2240,7 @@ interactive UI surfaces:
   another project opened without a revision is left to its project's default (`""`: the man tab picks the
   newest tag), and tabs saved before tabs carried a repository take the session's project
   (`state.assignTabRepos`, `adoptSession`). No project change closes a tab or asks for confirmation.
-- The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones) and shows
+- The header **Project** selector lists `/webapi/projects` (parsed repositories plus *git only* ones) and shows
   the selected header repository: `state.currentRepo` follows the active tab whenever switching tabs or panes
   (`state.syncRepoFromActiveTab()` before `tabs:changed` / `pane:activated`, event `repo:synced`, which also
   takes the tab's revision). Picking another project (`switchProject`, also the palette's *Switch project*)
@@ -2257,7 +2257,7 @@ interactive UI surfaces:
   repository (`state.moveTabToRepository`) gets a fresh view (tabs.js).
 - **Tab strip badge**: a tab whose repository is not a linux kernel shows a small `.tab-project` label with
   the project's name before its title (`projectBadge()`).
-- **Project kinds & per-repository feature flags** (`utils/projects.js`, filled from every `/api/projects` read):
+- **Project kinds & per-repository feature flags** (`utils/projects.js`, filled from every `/webapi/projects` read):
   an entry's `project` (else its `slug`) names what the repository holds — `linux` for the kernel, `man-pages`
   for the Linux man-pages (§5.38). `repoFeatures(repo)` merges `DEFAULT_KERNEL_FEATURES` or
   `DEFAULT_MANPAGES_FEATURES` with the entry's `features` map, and `repoInsights(repo)` merges
@@ -2281,7 +2281,7 @@ interactive UI surfaces:
   release), plus release candidates/pre-releases (`rc#`, `pre#`, `test#`), newest first, with `(git only)`
   marking unparsed ones; `KernelIdeApp.buildVersionCatalog()` groups tags by `getEffectiveTagView()` regex
   rules (e.g. `releaseOf()` for `v3.0.1` → `v3.0`, `v2.6.16.62` → `v2.6.16`, `2.4.9.15` → `2.4`) from
-  `/api/versions?include_rc=true&compact=1` (§2.13). Catalog requests (`projects`, `branches`, `versions`)
+  `/webapi/versions?include_rc=true&compact=1` (§2.13). Catalog requests (`projects`, `branches`, `versions`)
   are read from IndexedDB and refetched when a sync token reports a change (§2.11), so newly parsed versions
   appear without clearing the cache.
 
@@ -2326,7 +2326,7 @@ interactive UI surfaces:
   (`clearScrollPositions`). Two explorer tabs of the same directory and revision are the same tab
   (`state.openTab` matching), and the tab title is the directory's name. The URL hash carries it as
   `tab=explorer&dir=<path>&v=<ref>`.
-- **Listing** (`GET /api/fs/tree/{v}?path=…`): directories first, then files (server-side order), each row
+- **Listing** (`GET /webapi/fs/tree/{v}?path=…`): directories first, then files (server-side order), each row
   with an extension icon, its name and either *directory* or the file's start-state label (`s_stat_label`). A
   filter box narrows the directory, **↑ Up** goes to the parent, **Reveal** reveals the directory in the
   sidebar explorer (`explorer:reveal`), **Treemap** opens its treemap (§5.17), and the status bar states how
@@ -2376,13 +2376,13 @@ interactive UI surfaces:
   `VirtualEditor.enterFileDiff`):
   - **Picker** (`showDiffPicker`): a **Revision** button opening the shared `refPicker` (§5.13, unscoped;
     default: the tag preceding the tab's revision, `previousTag`, the rule the Compare view uses for its base,
-    read from `api.getVersionsCached()` so opening the picker sends no `/api/versions` request), a **File**
+    read from `api.getVersionsCached()` so opening the picker sends no `/webapi/versions` request), a **File**
     box (default: the same path; suggestions from `api.searchFiles` *at the picked revision*), **Quick picks**
     (*This file @ previous tag*, and every other open code tab's file at its revision) and *Picked file is the
     target* (swap). **Show diff** / Enter applies; Cancel, Escape or a click outside changes nothing.
   - **Direction**: by default the picked file is the **base** and the tab's own file the **target**; swapped,
     the tab is the base.
-  - **Full diff in place**: `api.getBlobDiff` (`GET /api/tools/diff/blobs`, cached as `bdiff_*`) returns only
+  - **Full diff in place**: `api.getBlobDiff` (`GET /webapi/tools/diff/blobs`, cached as `bdiff_*`) returns only
     the changed lines; `buildDiffRows` rebuilds every line of both files from those hunks and the text the tab
     already shows (rows `{k, o, n, t, s}`, `s` = the tab's own line), so a 10k-line file costs only its
     changes on the wire. The viewport stays virtualized over the diff rows, and the minimap draws them with a
@@ -2407,7 +2407,7 @@ interactive UI surfaces:
     replace-only: the URL changes without a new history entry), so the diff survives tab switches, re-renders
     and reloads, and the hash carries it (`dv`, `dp` when the path differs, `ds=1`, `dm=split`; §5.26).
     **Patch source** (P1): `diffWith: {kind: "patch", mids, revision, applyId}` diffs the tab's file (the
-    base, left) against what those mailing-list patches make of it (`GET /api/mail/apply/{id}/file`,
+    base, left) against what those mailing-list patches make of it (`GET /webapi/mail/apply/{id}/file`,
     re-applied when the id is unknown or evicted); the chip reads *v7.3 → patched (3 messages)* and has no
     swap; the hash carries `dk=patch&dmid=<message ids>` instead of `dv`. A code deep link without `dv` (or
     `dk`) addresses the plain file, so a reused tab drops its diff (`state.openTab`); a link that changes the
@@ -2430,7 +2430,7 @@ interactive UI surfaces:
   editor body redraws it when the pane, the window or the sidebar changes its size.
 
 - **Outline, sticky scroll and the current definition** (`outline_panel.js`, `outline_model.js`, G03): after
-  the file loads, its definitions come from `GET /api/fs/outline` (§4.2; cached in the `files` store under the
+  the file loads, its definitions come from `GET /webapi/fs/outline` (§4.2; cached in the `files` store under the
   revision's stamp) — or, for a `Kconfig*` file, from its own text (`kconfigOutline`: `config` / `menuconfig`
   entries nested in `menu` … `endmenu`, `choice` … `endchoice` and `if` … `endif`).
   - **☰ Outline** (toolbar, part of the overflow order; disabled with *Outline needs an indexed file* when
@@ -2451,7 +2451,7 @@ interactive UI surfaces:
 - **Imports** (`imports_panel.js`, `imports_model.js`): **⇲ Imports** (toolbar, after Outline in the overflow
   order; disabled outside `.c`, `.h`, `.S` and `.s` files, `isImportsPath`) opens a side panel between the code
   and the minimap listing the symbols the file references that headers on its `#include` chain define
-  (`GET /api/fs/imports`, §4.2, `api.getFileImports(version, path, arch)`; cached in the `files` store per
+  (`GET /webapi/fs/imports`, §4.2, `api.getFileImports(version, path, arch)`; cached in the `files` store per
   revision, ARCH and path). The ARCH is that of the KConfig engine the tab follows (`x86_64` without one); the
   panel fetches only while open and refetches when a new file loads or the followed engine or its ARCH changes
   (`kconfig:engine:changed`, `setEngineSelection`).
@@ -2488,7 +2488,7 @@ interactive UI surfaces:
     a fenced block whose language comes from the grammar registry (`fenceLanguage`: `c`, `rust`, `asm`,
     `make`, `kconfig`, `dts`, …; the fence is longer than any backtick run of the code); *Copy External Link*
     — the same lines on the repository's own web viewer, built from the project's `git_url` (`GET
-    /api/projects`): kernel.org cgit (`…/tree/<path>?id=<sha>#n<a>`), GitHub (`…/blob/<sha>/<path>#L<a>-L<b>`)
+    /webapi/projects`): kernel.org cgit (`…/tree/<path>?id=<sha>#n<a>`), GitHub (`…/blob/<sha>/<path>#L<a>-L<b>`)
     or GitLab; hidden for other hosts.
 - **Blame** (`blame_view.js`, `blame_options.js`): **Blame** annotates every line with the commit that last
   changed it; the choice is kept on the tab (`tab.blame`, `bl=1` in its URL, §5.26), so a re-rendered or
@@ -2568,7 +2568,7 @@ interactive UI surfaces:
          standalone tab.
      - **Thread Tree mode** (`#mail-tree-pane`, replaces the former mini timeline outline):
        - **Revision picker** (`.mail-version-chips`): one chip per revision of the series (`v1`, `v2`, ...
-         each with its message count), from `GET /api/mail/versions` (§4.8). The chip of the revision on
+         each with its message count), from `GET /webapi/mail/versions` (§4.8). The chip of the revision on
          screen is active; choosing another loads that revision's thread (`inspectThread` on its `tid`,
          focused on its cover letter) and redraws the tree, so a multi-version patch series is navigated
          without going back to search. A single-revision series states so instead of showing one chip; nothing
@@ -2646,7 +2646,7 @@ interactive UI surfaces:
 
 - **Try a patch on a revision** (P1, `patch_try.js`): patch cards have **Try on revision…** and the thread
   header **Try the series…** (the newest version of the series in `[PATCH i/N]` order, cover letter included
-  for its `base-commit:`); both open the revision picker and apply in memory (`POST /api/mail/apply`). The
+  for its `base-commit:`); both open the revision picker and apply in memory (`POST /webapi/mail/apply`). The
   results dialog lists each patch with its status, then each file (applied, offset, created, deleted, renamed,
   failed with the reason, unsupported) and its hunks; a failed hunk shows its expected line, the pre-image and
   the nearest region (*k/n lines match*, a link opening the code there). **Open patched file** opens the file
@@ -2655,7 +2655,7 @@ interactive UI surfaces:
   it.
 - **Merged state of a thread** (P2, `merged_render.js`): the thread header shows *Merged k/N · v3.1* (*Merged
   · not released yet*, *Not merged*, or *Merged: unknown* when the lookup failed), from `api.getMergedCommits`
-  (`GET /api/mail/merged`; cached in the `tools` store under the `parsed` token, since the parser may link
+  (`GET /webapi/mail/merged`; cached in the `tools` store under the `parsed` token, since the parser may link
   more commits later). Clicking it lists the commits (`[i/N]` subject, first release); a click opens one in
   the Commits tab, middle-click or Ctrl/Cmd+click in a new one. Message cards of patches that landed get a
   *Merged as `<sha12>`* link.
@@ -3129,7 +3129,7 @@ Two list-and-detail tabs host the catalogs and reports — **Kernel API** (type 
 by each section's `visible(repo)` predicate; if none are enabled, it renders an empty-state notice (*No
 sections are enabled for this project.*).
 - **Layout**: section pills; an optional autodetected-tag badge (`.sv-detected`, shown when Insights autodetects a release tag or series from a commit, branch, or sub-release revision); an ARCH picker (ARCH-scoped sections: `GET
-  /api/kconfig/{v}/presets`, default `state.kconfigArch()`); a search box (every word must match, `rowText`);
+  /webapi/kconfig/{v}/presets`, default `state.kconfigArch()`); a search box (every word must match, `rowText`);
   filter chips with counts (static `chips` or dynamic `getChips(rows, ctx)` with optional `group` ORing, plus optional inline `mountExtraChips`/`updateExtraChips` controls); the status line (rows shown of total, the section's
   note, a progress bar while a background job builds the list, §2.15); an optional summary block (`result.summaryHtml`, or reactive `sec.summaryHtml(filtered, rows, ctx)` updated on filter changes); the list;
   the detail pane. **⬇** offers the section's downloads of the filtered rows (TSV, JSON…). The list folds into
@@ -3194,7 +3194,7 @@ detail subsystem and pull-request links are gated on `maintainers` and `mail`), 
 `maintainers`), **Stable** (H2, `stable`), **Security** (H4, `cve`). Charts are hand-built SVG with the design
 tokens (`webapp/frontend/js/utils/svg_charts.js`: bars with markers, sparklines, horizontal bars, KPI tiles).
 Insights follows the tab's top-header revision (`tab.version`) rather than a per-tab release picker: on render
-(`InsightsView.prepareRender`), `GET /api/insights/resolve?rev=…` (`api.resolveInsightsTag`, given a per-render
+(`InsightsView.prepareRender`), `GET /webapi/insights/resolve?rev=…` (`api.resolveInsightsTag`, given a per-render
 `AbortSignal`) resolves tags, branches, and commits to the release tag containing them (or the nearest ancestor
 release tag, flagging unreleased default-branch revisions as `latest`), showing the autodetected tag/series pill
 (`.sv-detected`) when it differs from the header revision and preserving `_resolveError` across `applyFilter()`.
@@ -3243,7 +3243,7 @@ cycle (bypassing the client report cache with `networkFirst: true` on `latest`, 
 - **Security** (`security_section.js`, H4): lists the Linux kernel CVEs affecting the resolved release tag,
   possibly affecting it, or fixed in it (§4.11), each row
   with its state (tooltip: what decided it), CVSS score, first final mainline release containing the introducing commit (`introduced_release`, omitted when `null` or `-rc`-only), and *KEV* when CISA lists it as exploited; chips
-  *affected*, *possibly*, *fixed*, *fixed here* (first fixed in this release), *Introduced by* (introduced by a commit whose `introduced_release` matches the selected version's final mainline release, excluding `null`/unversioned/`-rc`-only entries), *exploited*, and an inline CVSS filter control (`≥`, `>`, `<`, `=` operator selector defaulting to `≥`, and `[0.0, 10.0]` numeric input defaulting to `7`) that ignores incomplete intermediate keystrokes, clamps out-of-range values, excludes `null`/unscored CVEs across all operators, persists `&cvss_op=` / `&cvss=` in tab state, and queries `GET /api/insights/{release}/cves?cvss_op=…&cvss_score=…`. A dynamic `.sv-summary` strip (`buildSecuritySummaryHtml`) renders KPI tiles (filtered CVEs, affected, fixed/fixed here, exploited, average CVSS) and CVSS severity distribution bars (`hbarsHtml`) updated on every filter change. The detail gives the record's kind, the state at the tab's release, CVSS
+  *affected*, *possibly*, *fixed*, *fixed here* (first fixed in this release), *Introduced by* (introduced by a commit whose `introduced_release` matches the selected version's final mainline release, excluding `null`/unversioned/`-rc`-only entries), *exploited*, and an inline CVSS filter control (`≥`, `>`, `<`, `=` operator selector defaulting to `≥`, and `[0.0, 10.0]` numeric input defaulting to `7`) that ignores incomplete intermediate keystrokes, clamps out-of-range values, excludes `null`/unscored CVEs across all operators, persists `&cvss_op=` / `&cvss=` in tab state, and queries `GET /webapi/insights/{release}/cves?cvss_op=…&cvss_score=…`. A dynamic `.sv-summary` strip (`buildSecuritySummaryHtml`) renders KPI tiles (filtered CVEs, affected, fixed/fixed here, exploited, average CVSS) and CVSS severity distribution bars (`hbarsHtml`) updated on every filter change. The detail gives the record's kind, the state at the tab's release, CVSS
   (vector, source), KEV / SSVC exploitation, the description, the files (opening the code at the tab's
   release), the commits (introduced by / fixed by, each with its first release, links to the Commits tab; for
   other CNAs' records the introduction inferred from the fix's `Fixes:` tags, or *unknown*), the version
@@ -3345,9 +3345,9 @@ version}`, changed only through `series_model.js` (each file in exactly one patc
   patch; the last one stays), **+ Patch**.
 - **Author & recipients**: name, email, version (`vK`), the cover letter (two patches or more), To/Cc (one
   address per line or comma separated); **Suggest recipients** adds the maintainers (`suggested_to`) and
-  lists/reviewers (`suggested_cc`) of every touched file (`POST /api/maintainers/{v}/match`), keeping what is
+  lists/reviewers (`suggested_cc`) of every touched file (`POST /webapi/maintainers/{v}/match`), keeping what is
   there. Missing fields are listed and keep **Generate series** disabled.
-- **Generate series** (`POST /api/version/{base}/patch/series`, §4.6): a dialog with *Applies cleanly to
+- **Generate series** (`POST /webapi/version/{base}/patch/series`, §4.6): a dialog with *Applies cleanly to
   <base>* (or not, per patch), the diffstat, each message (copy, download) and **Download mbox**. Generating
   changes nothing; **Discard draft** asks first (Close keeps it).
 - **Tests**: `webapp/frontend/tests/patch_series.test.mjs` (blob SHA = `git hash-object`, staging, assignment,
@@ -3355,7 +3355,7 @@ version}`, changed only through `series_model.js` (each file in exactly one patc
   cover letter, base-commit, stale blob 409, path jail, duplicate files, `git am` on a scratch repository).
 
 ### 5.34. Search Tab: Full-Text Code Search (`webapp/frontend/js/views/search/search_view.js`, `webapp/frontend/css/search.css`)
-A tab (type `search`, badge `[F]`) searching the text of every file of its revision through `GET /api/fs/grep`
+A tab (type `search`, badge `[F]`) searching the text of every file of its revision through `GET /webapi/fs/grep`
 (§4.2, §2.1.3).
 - **Opening**: palette command *Search text in files…*, *Open all results in the Search tab* at the end of the
   palette's `%` results (§5.15), the code view's context menu *Search “…” in tree* (the selection, else the
@@ -3417,7 +3417,7 @@ last_checked, status, summary, changed_since, unread, result}`.
   (`master`/`main`; a tag never moves), starting from that branch's current commit.
 - **Checking** (`watch_runtime.js`): when `versions:updated` (§2.11) reports that a watched branch moved or
   appeared, the watches following it are checked from their last checked commit to the branch (`POST
-  /api/watch/changes`, §4.12, one request per (from, to) group); **Check now** in the Watch tab checks all. A
+  /webapi/watch/changes`, §4.12, one request per (from, to) group); **Check now** in the Watch tab checks all. A
   change marks the item unread until it is read, with what changed and since which commit; unchanged and
   cosmetic results stay silent. A toast names the changed count; an optional browser notification (enabled in
   the Watch tab, which asks the browser's permission) fires only while the page is hidden.
@@ -3432,7 +3432,7 @@ last_checked, status, summary, changed_since, unread, result}`.
 
 ### 5.37. Parser Status Tab (`webapp/frontend/js/views/status/status_view.js`, `status_model.js`, `webapp/frontend/css/status.css`)
 A tab (type `status`, badge `[I]`) showing what the parser has done for the active repository, from `GET
-/api/system/ingest` (§4.1); useful while the parser runs next to the webapp.
+/webapi/system/ingest` (§4.1); useful while the parser runs next to the webapp.
 - **Opening**: the palette command *Show parser status*, the **⛏ Parser** line of the settings popover (§5.5),
   or `#tab=status`.
 - **Content**: counters (tags in Git, parsed, parsing now, git only, database size); *Parsing now* — each
@@ -3449,7 +3449,7 @@ A tab (type `status`, badge `[I]`) showing what the parser has done for the acti
 
 ### 5.38. Man Pages Tab & Renderer (`webapp/frontend/js/views/man/`, `webapp/frontend/css/man.css`)
 The Linux man-pages repository (the configured repository whose project is `man-pages`, §5.18) is rendered
-from the page document model of `parser/man_ast/MAN_API.md` (format 1) served by `/api/man/*`
+from the page document model of `parser/man_ast/MAN_API.md` (format 1) served by `/webapi/man/*`
 (`webapp/API_ENDPOINTS.md`). The kernel links to it at the man-pages tag released on or before the kernel
 revision, and its pages link back into the kernel.
 - **Renderers** (`man_render.js`, pure, tested by `tests/man_render.test.mjs`): `renderManWeb(doc, opts)` is a
@@ -3468,9 +3468,9 @@ revision, and its pages link back into the kernel.
   `manPage`/`manSec` or `manPath`, `manMode`, `manWidth` (`"full"` or `"980"`), `kernelVersion`/`kernelRepo` (the kernel revision the reader came
   from) and `manQuery` (the index filter); hash keys in §5.26. Every request names the man-pages repository
   (`?repo=` and `X-KI-Repo`, `view.api.getManPage` / `getManIndex` / `getManTags`). A tab without a tag opens
-  on the newest one of `/api/man/tags`; a tab of another repository takes the configured man-pages one; tabs
+  on the newest one of `/webapi/man/tags`; a tab of another repository takes the configured man-pages one; tabs
   saved with `manRepo`/`manVersion` fields take them as their repository and tag.
-  - **Toolbar**: *☰ Index* (active while the index is shown); the page title and its other NAME aliases; the **Tag** dropdown (`/api/man/tags`;
+  - **Toolbar**: *☰ Index* (active while the index is shown); the page title and its other NAME aliases; the **Tag** dropdown (`/webapi/man/tags`;
     it moves the tab's revision, `state.setVersion`, the header following while the tab is active); the **Web / Terminal** toggle
     (per tab in `manMode`, the last choice kept as the default in `localStorage` `kip-man-mode`, read and
     written in try/catch; the active button stacks above the inactive one and hovered/focused above both); the **↔ 980px** width toggle
@@ -3484,22 +3484,22 @@ revision, and its pages link back into the kernel.
     (`linuxApiTab`, `linuxSymbolTab`).
   - **Cross references** fetch the page first and then navigate the same tab (a history entry), so a page
     missing at the tag is a toast and the tab stays where it is; Ctrl/Cmd+click opens a new man tab.
-  - **Index** (no page): `/api/man/{v}/index` grouped by section in man(1) search order (`groupIndex`,
+  - **Index** (no page): `/webapi/man/{v}/index` grouped by section in man(1) search order (`groupIndex`,
     `sectionTitle`: `2`, `3`, `1`, `8`, `5`, `4`, `7`, `6`, `9`, suffixed sections after their base) with a
     filter box (every word in the name or summary), a section jump bar labeled as `<category>(<section>)` (`indexSectionLabel`) and page counts; alias pages are marked.
   - **States**: loading lines, a missing page (with a link to the tag's index), request errors and "no
     man-pages repository configured".
 - **Opening**: the **Man** activity button and the palette command *Open man pages* (`app.openManIndex`): in
   the man-pages project, the index at the explored tag; from the kernel, the index at the tag
-  `/api/man/resolve?name=intro&section=1&kernel=<rev>` names (else the newest tag). Kernel links
+  `/webapi/man/resolve?name=intro&section=1&kernel=<rev>` names (else the newest tag). Kernel links
   (`man_links.js`): the Kernel API syscall detail's `man 2 <name>` and the rst `:manpage:` role render
-  `<a data-man-link data-man-sec href="<man7.org URL>">`; a click asks `/api/man/resolve` for the repository and
+  `<a data-man-link data-man-sec href="<man7.org URL>">`; a click asks `/webapi/man/resolve` for the repository and
   revision of the tab it is in (`openManReference(name, sec, {kernel, repo})`, opening `man7Url()` directly
   when `!hasFeature(repo, "man")`) and opens (or reuses) a man tab of the answer's repository at its tag and
   page, next to the kernel tab, when `available`, else opens the answer's man7.org `url` in a new browser
   tab; a middle-click follows the plain man7.org href.
 - **Code view** (man-pages project): a file matching `^(man/)?man\d[a-z]*/[^/]+\.\d[a-z]*$` is a document
-  (§5.21): it opens rendered (`mountManDocument`, from `/api/man/{v}/page?path=`) with the Web/Terminal
+  (§5.21): it opens rendered (`mountManDocument`, from `/webapi/man/{v}/page?path=`) with the Web/Terminal
   and width toggles, *Source* (the rendered/source toggle of documentation tabs), *Man tab* and the Linux back-links;
   cross references open the referenced page file in the same code tab (its back history), Ctrl/Cmd+click in a
   new one.
@@ -3514,11 +3514,11 @@ keys `id`, `ver`, `q`, `f`, `lc` in §5.26), gated by the `cve` feature (`TAB_FE
     `updateActivityBar()`), the *Open CVEs* palette command (`app.js`), and direct `CVE-YYYY-NNNN` quick-open
     entries in `command_palette.js` (when `mode === ""` and `hasFeature(repo, "cve")`).
   - **Code view** (`virtual_editor.js`): `#file-security-badge` opens `type: "cve"` with `query` set to
-    `currentFilePath` (and `sel` preselected when `GET /api/cve/file` returns a single CVE).
+    `currentFilePath` (and `sel` preselected when `GET /webapi/cve/file` returns a single CVE).
   - **Commit Relations card** (`commits_view.js`, `relations_render.js`): clicking `.rel-cve[data-cve]` opens
     `type: "cve"` with `sel: cveId` (middle-click or Ctrl/Cmd+click opens a new tab).
 - **Catalog list & filtering** (`CveView` in `cve_view.js`):
-  - Loads via `api.getCveList({ version: tab.cveVersion })` (`GET /api/cve/list`, §4.11) without requiring Git
+  - Loads via `api.getCveList({ version: tab.cveVersion })` (`GET /webapi/cve/list`, §4.11) without requiring Git
     or a release index, guarded by `AbortController` and `listSeq`.
   - **Controls**: text filter (`.sv-search`, 150 ms debounce, matching `id`, `title`, `severity`, `cwes`,
     `versions`, and `files`), kernel version filter (`.cve-version-input`, 250 ms debounce, persists
@@ -3528,11 +3528,11 @@ keys `id`, `ver`, `q`, `f`, `lc` in §5.26), gated by the `cve` feature (`TAB_FE
   - **Virtual list** (`VirtualList`, `rowHeight: 30`, `cveRowHtml`): displays severity tag, `KEV` / `unfixed`
     badges, CVE ID, title, and `versions` summary badge; middle-click or `forceNew` opens a new `cve` tab.
 - **Detail pane & shared renderer** (`cve_render.js` `renderCveDetailHtml`):
-  - Fetches `api.getCveDetail(cveId, release)` (`GET /api/cve/{cve_id}`) guarded by `detailAbort` and
+  - Fetches `api.getCveDetail(cveId, release)` (`GET /webapi/cve/{cve_id}`) guarded by `detailAbort` and
     `detailSeq`.
   - Renders the CVE header, cve.org link, **Copy link** button (`[data-copy-cve]`, copying `#repo=...&tab=cve&id=...`),
     **Applies to Versions** (`renderVersionSummaryHtml(c.version_summary)` showing `affected`, `fixed`, `text`,
     and `unfixed` badge), **Check release…** form (`[data-check-release-form]` / `.cve-check-release-input`,
-    querying `GET /api/cve/{cve_id}?release=<rel>` on demand), CVSS, CWEs, KEV/SSVC, description, clickable
+    querying `GET /webapi/cve/{cve_id}?release=<rel>` on demand), CVSS, CWEs, KEV/SSVC, description, clickable
     Files (`[data-open-file]` → `code` tab), Commits (`[data-commit]` → `commits` tab), Versions tables, and
     References. Uses `SETUP_HTML` and `NOT_INGESTED_HTML` when `configured === false` or `ingested === false`.

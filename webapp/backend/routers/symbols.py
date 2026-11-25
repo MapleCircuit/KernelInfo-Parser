@@ -17,7 +17,7 @@ from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
 ArchParam = Annotated[str, Query(description="ARCH value ranking arch-specific definitions (default x86_64)")]
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["symbols"])
+router = APIRouter(prefix="/webapi", tags=["symbols"])
 symbol_service = SymbolService()
 
 
