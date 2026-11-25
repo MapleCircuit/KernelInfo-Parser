@@ -16,8 +16,8 @@ import os
 import re
 import stat
 import subprocess
-from pathlib import Path
 from collections.abc import Iterable, Iterator, Mapping
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -135,6 +135,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "host": "0.0.0.0",
         "port": 8000,
         "reload": True,
+        "pool_size": 10,
+        "default_version": "v3.0",
         # Disk cache of derived data under KERNELINFO_CACHE_DIR (webapp/API.md section 2.14)
         "cache": {"max_mb": 1024},
         # Background jobs: worker threads per process (webapp/API.md section 2.15)
@@ -397,7 +399,6 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
     legacy webapp connection logic (which checks MYSQL_*), and spawned
     multiprocessing worker processes all observe the exact same configuration.
     """
-    global _EXPORTED_ENV_VARS
     db_cfg = cfg.get("database", {})
 
     host = str(db_cfg.get("host") or "127.0.0.1")
@@ -490,7 +491,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
             with open(resolved_path, "r", encoding="utf-8") as f:
                 file_data = json.load(f)
             if not isinstance(file_data, dict):
-                raise ValueError(f"Root JSON element must be an object, got {type(file_data).__name__}")
+                raise TypeError(f"Root JSON element must be an object, got {type(file_data).__name__}")
             # Backward compatibility: migrate legacy top-level ssh_tunnel to database.ssh_tunnel if needed
             if "ssh_tunnel" in file_data and isinstance(file_data["ssh_tunnel"], dict):
                 db_data = file_data.setdefault("database", {})
@@ -558,6 +559,8 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         webapp_sec["reload"] = _coerce_bool(env_wa_reload, webapp_sec["reload"])
     else:
         webapp_sec["reload"] = _coerce_bool(webapp_sec.get("reload"), True)
+    webapp_sec["pool_size"] = max(1, _coerce_int(webapp_sec.get("pool_size"), 10))
+    webapp_sec["default_version"] = str(webapp_sec.get("default_version") or "v3.0").strip() or "v3.0"
 
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
@@ -1207,10 +1210,7 @@ def default_project_insights(slug: str | None, entry: Mapping[str, Any] | None =
             names.append(name)
         git_url = str(entry.get("git_url") or "").strip().rstrip("/")
         if git_url:
-            base = Path(git_url).name
-            if base.endswith(".git"):
-                base = base[:-4]
-            base = base.strip().lower()
+            base = Path(git_url).name.removesuffix(".git").strip().lower()
             if base and base not in names:
                 names.append(base)
     cfg["generic_repo_names"] = names
@@ -1264,7 +1264,7 @@ def normalize_insights_overrides(raw: Any) -> dict[str, Any]:
         elif expected_type == "int":
             try:
                 if isinstance(val, bool):
-                    raise ValueError("bool is not int")
+                    raise TypeError("bool is not int")
                 iv = int(val)
                 if iv < 0:
                     raise ValueError("must be >= 0")
@@ -1274,7 +1274,7 @@ def normalize_insights_overrides(raw: Any) -> dict[str, Any]:
         elif expected_type == "float":
             try:
                 if isinstance(val, bool):
-                    raise ValueError("bool is not float")
+                    raise TypeError("bool is not float")
                 fv = float(val)
                 if not (0.0 <= fv <= 1.0):
                     raise ValueError("must be in 0.0..1.0")
@@ -1475,7 +1475,7 @@ def detect_repository_insights(
         tag_out = _git_out(repo, "tag", "-l")
         tags = [t.strip() for t in tag_out.splitlines() if t.strip()]
         if tags:
-            has_pre_rc = any(re.search(r"-(?:rc|pre)\d+$", t, re.I) for t in tags)
+            has_pre_rc = any(re.search(r"-(?:rc|pre)\d+$", t, re.IGNORECASE) for t in tags)
             base["milestone_rc"] = 1 if has_pre_rc else 0
         else:
             base["milestone_rc"] = 1 if effective_slug == LINUX_PROJECT else 0
@@ -1517,7 +1517,7 @@ def detect_repository_insights(
                     if count >= thresh
                 ]
                 if effective_slug == LINUX_PROJECT:
-                    has_linus = any("linus" in c.lower() for c in committer_counts.keys())
+                    has_linus = any("linus" in c.lower() for c in committer_counts)
                     if merge_commits < 3 or has_linus:
                         base["lead_mergers"] = ["Linus Torvalds"]
                     elif sorted_committers:
@@ -1541,10 +1541,7 @@ def detect_repository_insights(
         else:
             url_base = ""
             if url:
-                ub = Path(url.rstrip("/")).name
-                if ub.endswith(".git"):
-                    ub = ub[:-4]
-                url_base = ub.strip().lower()
+                url_base = Path(url.rstrip("/")).name.removesuffix(".git").strip().lower()
             names = []
             for candidate in (repo.name.lower(), effective_slug.lower(), url_base):
                 if candidate and candidate not in names:
@@ -1609,9 +1606,7 @@ def matches_branch_filter(branch: str, branch_filter: dict[str, Any] | None = No
 
     if not any(fnmatch.fnmatch(branch, pat) for pat in includes):
         return False
-    if any(fnmatch.fnmatch(branch, pat) for pat in excludes):
-        return False
-    return True
+    return not any(fnmatch.fnmatch(branch, pat) for pat in excludes)
 
 
 def find_repository_branches(
@@ -1695,7 +1690,7 @@ def find_repository_branches(
         # Tier 4: Linux-next integration branches (linux-next/master first)
         if b in ("linux-next/master", "linux-next/HEAD"):
             return (4, (0,), b)
-        if b.startswith("linux-next/") or b.startswith("next/"):
+        if b.startswith(("linux-next/", "next/")):
             return (4, (1,), b)
         # Tier 5: Remaining topic branches
         return (5, (), b)
@@ -2066,7 +2061,7 @@ def validate_service_config(
     prev_exported = dict(_EXPORTED_ENV_VARS)
     try:
         loaded = load_config(path)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return False, [str(exc)], None
     finally:
         for env_key in list(_EXPORTED_ENV_VARS.keys()):
@@ -2158,7 +2153,7 @@ def validate_service_config(
 
 def reset_config() -> None:
     """Reset the active configuration to uninitialized state (useful for tests)."""
-    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH, _EXPORTED_ENV_VARS
+    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH
     _ACTIVE_CONFIG = None
     _LOADED_CONFIG_PATH = None
     _DETECTED_REPO_CACHE.clear()

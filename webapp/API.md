@@ -38,11 +38,11 @@ ES-Module IDE frontend.
 - 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1088-L1093]
 - 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1094-L1099]
 - 6. Using the Services from Python [L1100-L1117]
-- 7. Configuration & Execution [L1118-L1206]
-  - 7.1. Configuration Precedence & Resolution [L1120-L1168]
-  - 7.2. Starting the Server [L1169-L1206]
-- 8. Error Handling, Status Codes & Resilience [L1207-L1243]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1225-L1243]
+- 7. Configuration & Execution [L1118-L1208]
+  - 7.1. Configuration Precedence & Resolution [L1120-L1170]
+  - 7.2. Starting the Server [L1171-L1208]
+- 8. Error Handling, Status Codes & Resilience [L1209-L1245]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1227-L1245]
 <!-- toc:end -->
 
 ---
@@ -1136,6 +1136,8 @@ Environment variables synchronized via `core.config.sync_environ()` include:
   `KERNELINFO_CACHE_ENGINE`) selects the cache engine (`cache_engine/CACHE_API.md`)
 
 Webapp keys of `config.json` beyond the bindings (`"webapp"` section):
+- `pool_size` (default `10`, clamped to `>= 1` by `get_backend_server_config()`): database connection pool size.
+- `default_version` (default `"v3.0"`): fallback target kernel version.
 - `cache.max_mb` (default `1024`): global cap of the disk cache (§2.14).
 - `jobs.workers` (default `2`): background job worker threads per process (§2.15).
 - `prewarm_indexes` (default `false`): build the commit relation and Kbuild object indexes at startup (§2.12).

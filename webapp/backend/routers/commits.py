@@ -97,6 +97,7 @@ _TIMELINE_GRANULARITIES = {"year", "month", "week", "day"}
 
 
 def _validate_timeline_params(direction: str, granularity: str) -> str:
+    """Validate `direction` and legacy `granularity` query parameters for commit-level timeline routes."""
     norm_dir = direction.lower().strip()
     if norm_dir not in _TIMELINE_DIRECTIONS:
         raise HTTPException(status_code=400, detail="direction must be 'past', 'future', or 'around'.")
@@ -110,9 +111,9 @@ def get_commit_timeline_unversioned(
     limit: int = Query(100, ge=1, le=250),
     direction: Annotated[str, Query()] = "past",
     cursor_id: int | None = Query(None),
-    granularity: Annotated[str, Query()] = "month",
+    granularity: Annotated[str, Query(description="Legacy query parameter validated against year/month/week/day; timeline responses remain commit-level.")] = "month",
 ) -> dict[str, Any]:
-    """Commit timeline from the latest commits in the repository (versionless)."""
+    """Commit-level timeline from the latest commits in the repository (versionless)."""
     norm_dir = _validate_timeline_params(direction, granularity)
     return git_service.get_commit_timeline("", limit=limit, direction=norm_dir, cursor_id=cursor_id)
 
@@ -123,9 +124,9 @@ def get_commit_timeline(
     limit: int = Query(100, ge=1, le=250),
     direction: Annotated[str, Query()] = "past",
     cursor_id: int | None = Query(None),
-    granularity: Annotated[str, Query()] = "month",
+    granularity: Annotated[str, Query(description="Legacy query parameter validated against year/month/week/day; timeline responses remain commit-level.")] = "month",
 ) -> dict[str, Any]:
-    """Commit timeline around the version's commit, with contributor summaries."""
+    """Commit-level timeline around the version's commit."""
     norm_dir = _validate_timeline_params(direction, granularity)
     return git_service.get_commit_timeline(version_name, limit=limit, direction=norm_dir, cursor_id=cursor_id)
 

@@ -105,6 +105,14 @@ class TestVersionlessCommitService(unittest.TestCase):
             self.assertEqual(res["timeline"][0]["commit_id"], 250)
             self.assertEqual(res["timeline"][0]["subject"], "latest: fix race")
 
+            for gran in ("year", "month", "week", "day"):
+                res_gran = svc.get_commit_timeline("", limit=10, direction="past", granularity=gran)
+                self.assertEqual(len(res_gran["timeline"]), 2)
+            from fastapi import HTTPException
+            with self.assertRaises(HTTPException) as ctx:
+                svc.get_commit_timeline("", limit=10, direction="past", granularity="decade")
+            self.assertEqual(ctx.exception.status_code, 400)
+
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class TestVersionlessCommitGitAndRoutes(unittest.TestCase):
@@ -199,6 +207,12 @@ class TestVersionlessCommitGitAndRoutes(unittest.TestCase):
 
             self.assertEqual(client.get("/api/commits/timeline?limit=20").status_code, 200)
             m_tl.assert_called_once_with("", limit=20, direction="past", cursor_id=None)
+
+            for gran in ("year", "month", "week", "day", "MONTH"):
+                self.assertEqual(client.get(f"/api/commits/timeline?limit=10&granularity={gran}").status_code, 200)
+                self.assertEqual(client.get(f"/api/commits/v6.8/timeline?limit=10&granularity={gran}").status_code, 200)
+            self.assertEqual(client.get("/api/commits/timeline?granularity=hour").status_code, 400)
+            self.assertEqual(client.get("/api/commits/v6.8/timeline?granularity=invalid").status_code, 400)
 
             self.assertEqual(client.post(f"/api/commits/resolve_mail/{self.head_sha}").status_code, 200)
             m_mail.assert_called_once_with(self.head_sha)

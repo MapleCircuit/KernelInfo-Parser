@@ -25,24 +25,24 @@ agents.
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L902-L924]
   - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L925-L948]
 - 6. End-to-End Inter-Module Execution Lifecycle [L949-L1096]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1097-L1515]
-  - 7.1. Unified Configuration Hierarchy [L1099-L1216]
-  - 7.1.1. Repository Auto-Detection & Selection [L1217-L1282]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1283-L1352]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1353-L1400]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1401-L1515]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1516-L1786]
-  - 8.1. High-Level Architecture [L1518-L1561]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1562-L1587]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1588-L1786]
-- 9. CVE List Ingestion (`parser/cve/`) [L1787-L1843]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1844-L1911]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1912-L2046]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1920-L1951]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1952-L1996]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L1997-L2029]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2030-L2046]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2047-L2094]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1097-L1516]
+  - 7.1. Unified Configuration Hierarchy [L1099-L1217]
+  - 7.1.1. Repository Auto-Detection & Selection [L1218-L1283]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1284-L1353]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1354-L1401]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1402-L1516]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1517-L1787]
+  - 8.1. High-Level Architecture [L1519-L1562]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1563-L1588]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1589-L1787]
+- 9. CVE List Ingestion (`parser/cve/`) [L1788-L1844]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1845-L1912]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1913-L2047]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1921-L1952]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1953-L1997]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L1998-L2030]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2031-L2047]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2048-L2095]
 <!-- toc:end -->
 
 ---
@@ -1130,7 +1130,8 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
       variables (`DB_SOCKET` / `MYSQL_UNIX_PORT`), or CLI flag `--db-socket`.
   - `"cache"`: local cache engine (`cache_engine/CACHE_API.md`): `engine` (default `"ram"`, also `"sqlite"`, env
     `KERNELINFO_CACHE_ENGINE`) and `dir` (base directory; empty: `KERNELINFO_CACHE_DIR`, else `~/.cache/kernelinfo`).
-  - `"webapp"`: FastAPI server settings (`host`, `port`, `reload`), plus `cache.max_mb` (default 1024: global
+  - `"webapp"`: FastAPI server settings (`host`, `port`, `reload`, `pool_size` default `10`, `default_version`
+    default `"v3.0"`), plus `cache.max_mb` (default 1024: global
     cap of the webapp's disk cache of derived data under `KERNELINFO_CACHE_DIR`), `jobs.workers` (default 2:
     background job threads per process) `prewarm_indexes` (default `false`: build the commit relation and
     Kbuild object indexes at startup), `source_index` (`workers` default `2`, `max_mb` default `1024`,
@@ -1382,7 +1383,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   - `ParserDistributedScreen` (`core/tui/screens/parser_dist.py`): Configures TableEngine, memory limits, hugepages, local cache (`cache.engine` via `available_cache_engines()` / `get_cache_engine()` alias normalisation, and `cache.dir`), and distributed worker identification (`worker_id`, `role` across `standalone`/`master`/`worker`/`daemon`, `delegate_stable`). The distributed fields are stored under `parser.distributed`; a key present there (an empty `worker_id` included) is shown as saved, and the flat `parser.<key>` value seeds the form only when the key is absent; with neither, the form shows the parser defaults (empty `worker_id`, i.e. `<role>:<hostname>:<pid>`, and `delegate_stable` on). `Memory Mode` offers `normal`, `low` and `very_low` (`normalize_memory_mode()` in `core/config.py` maps the aliases `compact` and `very-low` to `very_low` and any other value to `normal`, at config load and in `main.py`). When the terminal has room right of the form (≥ 87 columns), a side panel shows help for the focused field from `HELP_TOPICS` (Table Engine, Memory Mode, Max TE Table, Cache Engine, Cache Directory, Distributed; an overview for other fields); `F1`, or `?` outside a text field, shows the same topic in a dialog.
   - `CVEMailingListScreen` (`core/tui/screens/cve_ml.py`): Configures local CVE catalog clone paths and public-inbox mailing list storage and daemon tunnels.
   - `LoggingScreen` (`core/tui/screens/logging_cfg.py`): Configures `logging.parser` (`enabled`, `dir`, `file`, `error_dir`, `error_file`, `level` via `VALID_LOG_LEVELS`) and `logging.webapp` (`enabled`, `request_mode` via `VALID_WEBAPP_REQUEST_MODES`, `dir`, `file`, `error_dir`, `error_file`, `level`). Respects `app.config_scope`: `"daemon"` hides the Webapp Backend Logging box/widgets and edits only `logging.parser`; `"webapp"` hides the Parser Logging box/widgets and edits only `logging.webapp`; `"full"` shows both. Normalizes levels and request modes on save via `normalize_log_level()` and `normalize_webapp_request_mode()`. Displays contextual `HELP_TOPICS` in a side panel when terminal width >= 87 columns, or in a modal dialog on `F1` / `?` (outside text inputs). `Esc` / `Cancel` confirms before discarding unsaved edits.
-  - `WebappSettingsScreen` (`core/tui/screens/webapp_cfg.py`): Configures `webapp.host`, `webapp.port` (`1..65535`), `webapp.reload`, `cache.engine` (`available_cache_engines()`), `cache.dir`, `webapp.cache.max_mb`, `webapp.jobs.workers`, `webapp.prewarm_indexes`, `webapp.tools.checkpatch.enabled`, `webapp.tools.checkpatch.ref`, `webapp.tools.sandbox`, and `webapp.source_index.{workers,max_mb,revisions}` with contextual `HELP_TOPICS` and input validation.
+  - `WebappSettingsScreen` (`core/tui/screens/webapp_cfg.py`): Configures `webapp.host`, `webapp.port` (`1..65535`), `webapp.reload`, `cache.engine` (`available_cache_engines()`), `cache.dir`, `webapp.cache.max_mb`, `webapp.jobs.workers`, `webapp.prewarm_indexes`, `webapp.tools.checkpatch.enabled`, `webapp.tools.checkpatch.ref`, `webapp.tools.sandbox`, and `webapp.source_index.{workers,max_mb,revisions}` with contextual `HELP_TOPICS` and input validation, and calls `sync_webapp_repositories()` on save to ensure `webapp.default_version`, `webapp.pool_size`, and any scalar `repo_dir`/`lore_archive_db`/`cve_dir` entries remain synchronized with `webapp.repositories` and top-level `repositories`, `cve.repo_dir`, and `mailing_list.storage_dir`.
   - `ScopedConfigMenuScreen` (`core/tui/screens/scoped_config.py`): Scoped configuration menu for `"daemon"` (`config_daemon.json`) or `"webapp"` (`config_webapp.json`). Pushes the standalone config context once on first `on_enter()` via `TUIApp.push_config_context(target_path, scope=service, seed_service=service)` (so returning from sub-screens preserves unsaved edits), displays `Editing: <target_path>` and dirty state, hides parser-only screens (`ParserDistributedScreen`, `VersionParseScreen`, `TableReset`, `logging.parser`) under `"webapp"` scope, saves strictly to the standalone file, and restores the parent context on `B`/`Q`/`Esc` (confirming discard if dirty).
   - `SystemdServicesScreen` (`core/tui/screens/systemd_services.py`): Manages `kernelinfo-daemon.service` and `kernelinfo-webapp.service` via `core/systemd_manager.py`. Displays live `Installed`/`Enabled`/`Active`/`Mode`/`User:Group`, standalone config status, and interactive `Attach:` commands when `tmux` mode is active or selected. Edits per-service `User=`, `Group=`, and `tmux Multiplexer Mode` (verifying `find_tmux_binary()`), opens `ScopedConfigMenuScreen`, previews rendered unit files and `journalctl` logs in `ScrollableTextViewer`, runs `preflight_service_install()` (auto-seeding missing standalone configs via `ensure_standalone_config()` and confirming warnings), and executes `install_service()`, `control_service()` (`start`/`stop`/`restart`/`enable`/`disable`), and `uninstall_service()` inside `TUIApp.suspend()`.
   - Both screens read checkbox values with `core.config._coerce_bool` (string booleans such as `"false"` read as `False`). Saving validates the numeric inputs first (`mem_max` and `cache_max_table_mb`: whole numbers >= 0; the daemon and SSH ports: 1-65535); an invalid input leaves the configuration untouched, names the field in an "Invalid Value" dialog, and keeps the screen open. `Esc` (or `Cancel`) leaves without saving; with unsaved edits it first asks for confirmation (`BaseScreen.confirm_discard()`, which compares the widget values against the baseline recorded by `mark_form_clean()` at construction and after a save).

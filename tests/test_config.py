@@ -4,9 +4,9 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
-from pathlib import Path
 
 from core.config import (
     DEFAULT_BRANCH_FILTER,
@@ -14,9 +14,6 @@ from core.config import (
     DEFAULT_TAG_VIEWS,
     find_config_path,
     find_repository_branches,
-    get_config,
-    get_db_config,
-    get_parser_config,
     get_repository,
     get_webapp_config,
     init_config,
@@ -33,6 +30,7 @@ from webapp.backend.config import get_backend_db_config
 class TestConfigManagement(unittest.TestCase):
     def setUp(self) -> None:
         import copy
+
         import core.config
         self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
         self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
@@ -41,6 +39,7 @@ class TestConfigManagement(unittest.TestCase):
 
     def tearDown(self) -> None:
         import copy
+
         import core.config
         reset_config()
         os.environ.clear()
@@ -60,7 +59,65 @@ class TestConfigManagement(unittest.TestCase):
             # No default account: credentials come from the configuration or the connect fails with a clear error
             self.assertEqual((cfg["database"]["user"], cfg["database"]["password"]), ("", ""))
             self.assertEqual(cfg["webapp"]["port"], 8000)
+            self.assertEqual(cfg["webapp"]["pool_size"], 10)
+            self.assertEqual(cfg["webapp"]["default_version"], "v3.0")
             self.assertEqual(cfg["parser"]["table_engine"], "cached")
+
+    def test_default_config_webapp_keys_and_no_duplicate_dict_literals(self) -> None:
+        """DEFAULT_CONFIG['webapp'] has all expected keys (including default_version and pool_size) and zero duplicate literal keys."""
+        import ast
+
+        import core.config
+        from webapp.backend.config import get_backend_server_config
+
+        wa = DEFAULT_CONFIG["webapp"]
+        for expected_key in (
+            "host",
+            "port",
+            "reload",
+            "pool_size",
+            "default_version",
+            "cache",
+            "jobs",
+            "prewarm_indexes",
+            "tools",
+            "source_index",
+        ):
+            self.assertIn(expected_key, wa)
+        self.assertEqual(wa["default_version"], "v3.0")
+        self.assertEqual(wa["pool_size"], 10)
+        self.assertIn("repositories", DEFAULT_CONFIG)
+
+        source_path = Path(core.config.__file__)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        default_cfg_dicts: list[ast.Dict] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "DEFAULT_CONFIG":
+                if isinstance(node.value, ast.Dict):
+                    default_cfg_dicts.append(node.value)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "DEFAULT_CONFIG" and isinstance(node.value, ast.Dict):
+                        default_cfg_dicts.append(node.value)
+        self.assertEqual(len(default_cfg_dicts), 1)
+
+        for dict_node in ast.walk(default_cfg_dicts[0]):
+            if isinstance(dict_node, ast.Dict):
+                literal_keys = [
+                    k.value for k in dict_node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                ]
+                self.assertEqual(
+                    len(literal_keys),
+                    len(set(literal_keys)),
+                    f"Duplicate literal key in DEFAULT_CONFIG at line {dict_node.lineno}: {literal_keys}",
+                )
+
+        with patch("core.config.find_config_path", return_value=None):
+            init_config(None)
+            srv_cfg = get_backend_server_config()
+            self.assertEqual(srv_cfg["default_version"], "v3.0")
+            self.assertEqual(srv_cfg["pool_size"], 10)
+            self.assertEqual(srv_cfg["port"], 8000)
 
     def test_load_custom_config_file(self) -> None:
         """Config file values override defaults."""
@@ -190,7 +247,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_main_cli_config_integration(self) -> None:
         """main.py arg_handling correctly parses -c and loads parser configuration."""
-        import main
         import pipeline.cli
         custom_data = {
             "parser": {
@@ -245,7 +301,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_default_continuous_parsing_arguments(self) -> None:
         """Verify pipeline.cli.arg_handling defaults single_version to False for continuous parsing."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
             args = pipeline.cli.arg_handling()
@@ -253,7 +308,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_single_version_argument(self) -> None:
         """Verify pipeline.cli.arg_handling recognizes --single-version and --single flags."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--single-version"]):
             args = pipeline.cli.arg_handling()
@@ -265,7 +319,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_no_rc_argument(self) -> None:
         """--no-rc / --releases-only disables pre-release discovery; the default includes them."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
             self.assertTrue(pipeline.cli.arg_handling().include_pre_releases)
@@ -276,7 +329,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_rc_arguments(self) -> None:
         """Verify pipeline.cli.arg_handling recognizes --rc, --include-rc, and --include-pre-releases flags."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--rc"]):
             args = pipeline.cli.arg_handling()
@@ -466,7 +518,11 @@ class TestRepositoryDetection(unittest.TestCase):
         """Verify DEFAULT_TAG_VIEWS regex rules partition Linux 2.6.x, 3.x+, historical, and next tags."""
         import copy
         import re
-        from core.config import _LEGACY_DEFAULT_TAG_VIEWS, _normalize_repo_entry_features
+
+        from core.config import (
+            _LEGACY_DEFAULT_TAG_VIEWS,
+            _normalize_repo_entry_features,
+        )
 
         self.assertGreaterEqual(len(DEFAULT_TAG_VIEWS), 1)
         linux_view = DEFAULT_TAG_VIEWS[0]
@@ -1093,6 +1149,7 @@ class TestServiceConfigIsolation(unittest.TestCase):
 
     def setUp(self) -> None:
         import copy
+
         import core.config
 
         self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
@@ -1104,6 +1161,7 @@ class TestServiceConfigIsolation(unittest.TestCase):
 
     def tearDown(self) -> None:
         import copy
+
         import core.config
 
         reset_config()
@@ -1391,17 +1449,21 @@ class TestServiceConfigIsolation(unittest.TestCase):
         import pipeline.cli
 
         new_cfg = self.root / "new_daemon.json"
-        with mock.patch("sys.argv", ["main.py", "--configure", "--config", str(new_cfg)]):
-            with mock.patch("core.tui.app.run_config_tui_launch", return_value=None) as mock_tui:
-                with self.assertRaises(SystemExit) as cm:
-                    pipeline.cli.arg_handling()
-                self.assertEqual(cm.exception.code, 0)
-                mock_tui.assert_called_once_with(str(new_cfg))
+        with (
+            mock.patch("sys.argv", ["main.py", "--configure", "--config", str(new_cfg)]),
+            mock.patch("core.tui.app.run_config_tui_launch", return_value=None) as mock_tui,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            pipeline.cli.arg_handling()
+        self.assertEqual(cm.exception.code, 0)
+        mock_tui.assert_called_once_with(str(new_cfg))
 
         # Non-TUI run with missing --config raises FileNotFoundError (no fallback to config.json)
-        with mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(new_cfg)]):
-            with self.assertRaises(FileNotFoundError):
-                pipeline.cli.arg_handling()
+        with (
+            mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(new_cfg)]),
+            self.assertRaises(FileNotFoundError),
+        ):
+            pipeline.cli.arg_handling()
 
         # sync_repositories(write=True) writes to the --config file, not REPO_ROOT/config.json
         repos_dir = self.root / "repos"

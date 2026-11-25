@@ -1189,8 +1189,15 @@ class GitService:
         limit: int = 100,
         direction: str = "past",
         cursor_id: int | None = None,
+        granularity: str = "month",
     ) -> dict[str, Any]:
-        """Retrieve structured commit timeline starting from the version tag anchor (or HEAD/latest when empty), supporting past and future exploration."""
+        """Retrieve commit-level chronological timeline starting from the version tag anchor (or HEAD/latest when empty), supporting past, future, and around exploration.
+
+        `granularity` (`"year"`, `"month"`, `"week"`, `"day"`) is accepted and validated for backward compatibility;
+        responses are always commit-level (`timeline: [...]`).
+        """
+        if str(granularity or "month").lower().strip() not in {"year", "month", "week", "day"}:
+            raise HTTPException(status_code=400, detail="granularity must be one of: year, month, week, day.")
         limit = max(1, min(int(limit or 100), 250))
 
         def _format_date(ts: int) -> str:
