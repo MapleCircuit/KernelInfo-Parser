@@ -16,10 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.DBLayout import m_commit
 from db_engine import MockDB
 from tests.db_fixtures import patch_reader
-from webapp.backend.services.history_service import KCONFIG_TYPES
 from webapp.backend.services import git_service as gs
+from webapp.backend.services.history_service import KCONFIG_TYPES
 from webapp.backend.services.kconfig_service import KconfigService
-
 
 COMMIT = {"commit_hash": bytes.fromhex("ab" * 20), "author_date": 1300000000, "subject": "fix it",
           "author_name": "Ann", "author_email": "ann@x.org"}
@@ -184,6 +183,7 @@ class TestRepairHeadCommitFiles(unittest.TestCase):
 
     def test_reuse_step_writes_no_head_commit_rows(self) -> None:
         from contextlib import contextmanager
+
         import main
         import pipeline.blob_reuse
         from core.DBLayout import m_commit_file

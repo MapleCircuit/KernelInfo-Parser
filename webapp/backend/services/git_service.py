@@ -1,22 +1,26 @@
 """webapp/backend/services/git_service.py - Git Blame, Commits, Timelines & Format-Patch."""
 from __future__ import annotations
+
 import logging
 import re
 import subprocess
 import time
 import urllib.parse
-from webapp.backend.config import RepoScopedCache, get_repo_dir
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
+
 from fastapi import HTTPException
-from db_engine.spec import Join, NotExists, ge, gt, le, lt, hash_prefix
-from webapp.backend.database.pool import get_reader
+
+from db_engine.spec import Join, NotExists, ge, gt, hash_prefix, le, lt
+from webapp.backend.config import RepoScopedCache, get_repo_dir
 from webapp.backend.database.helpers import (
     get_active_network_id,
+    get_version_info,
     hash_hex,
     safe_decode,
-    get_version_info,
 )
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import is_safe_rev, safe_rev
 from webapp.backend.security.jail import resolve_and_verify_repo_path
 from webapp.backend.services.mailing_list_service import LORE_BASE_URL
@@ -44,7 +48,7 @@ MAX_COMMIT_FILE_ROWS = 5000
 def _strip_diff_prefix(path: str, prefix: str) -> str:
     if path.startswith('"') and path.endswith('"'):
         path = path[1:-1]
-    return path[len(prefix):] if path.startswith(prefix) else path
+    return path.removeprefix(prefix)
 
 
 def parse_unified_diff(text: str, max_lines: int = MAX_COMMIT_DIFF_LINES,
@@ -150,6 +154,8 @@ def _cached_git_file_history(
         cwd=repo_dir or str(get_repo_dir()),
         capture_output=True,
         text=True,
+        errors="replace",
+        check=False,
         timeout=8.0,
     )
     if proc.returncode != 0:
@@ -165,10 +171,9 @@ def _cached_git_file_history(
             chash, aname, aemail, adate_str, subj = parts[0], parts[1], parts[2], parts[3], parts[4]
             try:
                 adate = int(adate_str)
-                from datetime import datetime, timezone
-                dt = datetime.fromtimestamp(adate, tz=timezone.utc)
+                dt = datetime.fromtimestamp(adate, tz=UTC)
                 adate_iso = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
+            except (ValueError, OverflowError, OSError):
                 adate = 0
                 adate_iso = ""
 
@@ -281,6 +286,8 @@ class GitService:
             cwd=str(get_repo_dir()),
             capture_output=True,
             text=True,
+            errors="replace",
+            check=False,
             timeout=timeout,
         )
         return proc.stdout, proc.stderr, proc.returncode
@@ -363,10 +370,9 @@ class GitService:
                   ignore_ws: bool = False) -> dict[str, Any]:
         """Line-by-line `git blame` of a file at a revision: the commit, author, date and subject of each
         line, where the line was in that commit and the commit before it (\"blame before this change\")."""
-        import urllib.parse
         clean_file_path = urllib.parse.unquote(str(file_path).strip()).strip("/")
         target_path = resolve_and_verify_repo_path(clean_file_path)
-        rel_path = str(target_path.relative_to(get_repo_dir()))
+        rel_path = str(target_path.relative_to(get_repo_dir().resolve()))
 
         with get_reader() as reader:
             vid, vname = get_version_info(reader, version_name)
@@ -412,7 +418,8 @@ class GitService:
         try:
             history = self.get_file_history(version_name, file_path, limit=1)
             return history.get("last_changed")
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - optional metadata
+            logger.debug("get_file_last_changed fallback failed for %s: %s", file_path, exc)
             return None
 
     @staticmethod
@@ -452,7 +459,6 @@ class GitService:
                     if c:
                         chash = format_commit_hash(c["commit_hash"])
                         adate = int(c["author_date"] or 0)
-                        from datetime import datetime, timezone
                         writer = {
                             "commit_id": int(rows[0]["commit_id"]),
                             "commit_hash": chash,
@@ -460,7 +466,7 @@ class GitService:
                             "author_name": safe_decode(c["author_name"]) or "",
                             "author_email": safe_decode(c["author_email"]) or "",
                             "author_date": adate,
-                            "author_date_iso": datetime.fromtimestamp(adate, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if adate else "",
+                            "author_date_iso": datetime.fromtimestamp(adate, tz=UTC).strftime("%Y-%m-%d %H:%M:%S") if adate else "",
                             "subject": safe_decode(c["subject"]) or "",
                             "source": "db",
                         }
@@ -481,13 +487,12 @@ class GitService:
         self, version_name: str, file_path: str, limit: int = 50
     ) -> dict[str, Any]:
         """Retrieve chronological git commit history and last changed metadata for a specific file."""
-        import urllib.parse
         clean_file_path = urllib.parse.unquote(str(file_path).strip()).strip("/")
         target_path = resolve_and_verify_repo_path(clean_file_path)
-        rel_path = str(target_path.relative_to(get_repo_dir()))
+        rel_path = str(target_path.relative_to(get_repo_dir().resolve()))
 
         with get_reader() as reader:
-            vid, vname = get_version_info(reader, version_name)
+            _vid, vname = get_version_info(reader, version_name)
         rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
@@ -510,7 +515,7 @@ class GitService:
     def format_patch(self, version_name: str, req: Any) -> dict[str, Any]:
         """Generate an RFC-2822 compliant patch string."""
         import difflib
-        from datetime import datetime, timezone
+
         from webapp.backend.models import FormatPatchRequest
 
         if isinstance(req, dict):
@@ -535,7 +540,7 @@ class GitService:
         if not subj.startswith("[PATCH]"):
             subj = f"[PATCH] {subj}"
 
-        timestamp = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+        timestamp = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S +0000")
         author_name = getattr(req, "author_name", "Kernel Developer")
         author_email = getattr(req, "author_email", "dev@kernel.org")
         body = (getattr(req, "commit_body", "") or "").strip() or f"Update {file_path}."
@@ -629,7 +634,7 @@ class GitService:
                                             "author_email": parts[2],
                                             "files_count": 0,
                                         })
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - best-effort git fallback
                         logger.debug("Git search fallback for hash %s failed: %s", q_clean, exc)
 
             elif q_clean:
@@ -659,24 +664,32 @@ class GitService:
         with get_reader() as reader:
             commit_cols = ["commit_id", "commit_hash", "author_id", "subject", "message", "author_date",
                            "committer_id", "committer_date"]
-            if str(commit_id).isdigit():
+            _cid_str = str(commit_id).strip()
+            is_digits = bool(_cid_str) and _cid_str.isascii() and _cid_str.isdigit()
+            network_id = get_active_network_id(reader)
+            if is_digits:
+                conds: list[dict[str, Any]] = [{"commit_id": int(_cid_str)}, {"commit_id": gt(0)}]
+                if network_id is not None:
+                    conds.append({"network_id": network_id})
                 c_row = reader.select_one(
-                    "m_commit", commit_cols, [{"commit_id": int(commit_id)}, {"commit_id": gt(0)}], as_dict=True
+                    "m_commit", commit_cols, conds, as_dict=True
                 )
             else:
                 # commit_hash is BINARY(20); anything that is not hex cannot name a commit, and
                 # encoding it to latin-1 would raise on a non-latin-1 character
-                cid_str = str(commit_id).strip()
-                if not _HEX_REF.fullmatch(cid_str.lower()):
+                if not _HEX_REF.fullmatch(_cid_str.lower()):
                     raise HTTPException(status_code=400, detail="A commit id or hash (4-40 hex digits) must be specified.")
                 # Prefix (full hash included): a range over the binary hash; two matches are ambiguous
-                rows = reader.select_rows("m_commit", commit_cols, {"commit_hash": hash_prefix(cid_str)}, limit=2, as_dict=True)
+                hash_cond: dict[str, Any] = {"commit_hash": hash_prefix(_cid_str)}
+                if network_id is not None:
+                    hash_cond["network_id"] = network_id
+                rows = reader.select_rows("m_commit", commit_cols, hash_cond, limit=2, as_dict=True)
                 if len(rows) > 1:
-                    raise HTTPException(status_code=400, detail=f"Commit prefix '{cid_str}' is ambiguous; give more digits.")
+                    raise HTTPException(status_code=400, detail=f"Commit prefix '{_cid_str}' is ambiguous; give more digits.")
                 c_row = rows[0] if rows else None
             if not c_row:
-                if not str(commit_id).isdigit():
-                    return self._get_git_commit_detail(str(commit_id).strip())
+                if not is_digits:
+                    return self._get_git_commit_detail(_cid_str)
                 raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found.")
 
             cid = c_row["commit_id"]
@@ -784,7 +797,7 @@ class GitService:
                         "patch_total": erow["patch_total"],
                         "lore_url": f"{LORE_BASE_URL}{mid}/",
                     })
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - optional mailing-list metadata
                 logger.debug("Failed to query m_commit_email for commit %d: %s", cid, exc)
 
             # LKML thread URL on the self-hosted public-inbox mirror
@@ -926,7 +939,11 @@ class GitService:
             return {"resolved": True, "linked_emails": detail["linked_emails"], "cached": True}
 
         from parser.mailing_list.ml_client import MailingListClient
-        from parser.mailing_list.ml_types import CommitFeatures, MLRelationType, MLMatchTier
+        from parser.mailing_list.ml_types import (
+            CommitFeatures,
+            MLMatchTier,
+            MLRelationType,
+        )
 
         repo_dir = str(get_repo_dir())
         c_hash = detail["commit_hash"]
@@ -942,11 +959,20 @@ class GitService:
             # patch would give another patch id, so none is computed for it.
             with subprocess.Popen(["git", "-C", repo_dir, "show", "--format=", c_hash],
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as show:
-                patch = show.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
-                if len(patch) > MAX_COMMIT_DIFF_BYTES:
+                try:
+                    assert show.stdout is not None
+                    patch = show.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
+                    if len(patch) > MAX_COMMIT_DIFF_BYTES:
+                        show.kill()
+                        patch = b""
+                    show_rc = show.wait(timeout=30)
+                except subprocess.TimeoutExpired:
                     show.kill()
-                    patch = b""
-                show_rc = show.wait(timeout=30)
+                    show.wait()
+                    raise
+                finally:
+                    if show.poll() is None:
+                        show.kill()
             if show_rc == 0 and patch:
                 p_patchid = subprocess.run(["git", "patch-id", "--stable"], input=patch, capture_output=True, check=False, timeout=30)
                 if p_patchid.returncode == 0 and p_patchid.stdout:
@@ -959,7 +985,7 @@ class GitService:
         blob_hashes: list[str] = []
         try:
             diff_res = subprocess.run(["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash],
-                                      capture_output=True, text=True, check=False, timeout=30)
+                                      capture_output=True, text=True, errors="replace", check=False, timeout=30)
             if diff_res.returncode == 0:
                 for line in diff_res.stdout.splitlines():
                     parts = line.split()
@@ -967,8 +993,8 @@ class GitService:
                         post_sha = parts[3]
                         if len(post_sha) == 40 and post_sha != "0" * 40:
                             blob_hashes.append(post_sha)
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("diff-tree of %s not computed: %s", c_hash, exc)
 
         features = CommitFeatures(
             commit_id=cid,
@@ -1030,7 +1056,7 @@ class GitService:
                     "lore_url": f"{LORE_BASE_URL}{pr_mid}/",
                 })
             return {"resolved": bool(linked), "linked_emails": linked, "cached": False}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - live resolve returns error dict
             logger.warning("Live resolve error for commit %s: %s", c_hash, exc)
             return {"resolved": False, "linked_emails": [], "error": str(exc)}
 
@@ -1055,12 +1081,21 @@ class GitService:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             ) as proc:
-                raw = proc.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
-                truncated = len(raw) > MAX_COMMIT_DIFF_BYTES
-                if truncated:
+                try:
+                    assert proc.stdout is not None
+                    raw = proc.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
+                    truncated = len(raw) > MAX_COMMIT_DIFF_BYTES
+                    if truncated:
+                        proc.kill()
+                        raw = raw[: raw.rfind(b"\n", 0, MAX_COMMIT_DIFF_BYTES) + 1]
+                    rc = proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
                     proc.kill()
-                    raw = raw[: raw.rfind(b"\n", 0, MAX_COMMIT_DIFF_BYTES) + 1]
-                rc = proc.wait(timeout=30)
+                    proc.wait()
+                    raise
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
         except subprocess.TimeoutExpired as e:
             raise HTTPException(status_code=504, detail="git diff timed out.") from e
         except OSError as e:
@@ -1130,7 +1165,7 @@ class GitService:
                 "next_future_cursor": None,
                 "timeline": git_commits,
             }
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
             logger.debug("Failed to resolve unparsed git timeline for %s: %s", rev, e)
             return None
 
@@ -1142,14 +1177,12 @@ class GitService:
         cursor_id: int | None = None,
     ) -> dict[str, Any]:
         """Retrieve structured commit timeline starting from the version tag anchor (or HEAD/latest when empty), supporting past and future exploration."""
-        import datetime
-
         limit = max(1, min(int(limit or 100), 250))
 
         def _format_date(ts: int) -> str:
             try:
-                return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-            except Exception:
+                return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OverflowError, OSError):
                 return ""
 
         now_ts = int(time.time())
@@ -1159,6 +1192,9 @@ class GitService:
             if v_clean:
                 vid, vname = get_version_info(reader, v_clean)
                 if vid is None:
+                    git_res = self._git_timeline_fallback(v_clean, v_clean, limit, direction, now_ts, _format_date)
+                    if git_res is not None:
+                        return git_res
                     vid, vname = get_version_info(reader, "v3.0")
             else:
                 vid, vname = None, ""

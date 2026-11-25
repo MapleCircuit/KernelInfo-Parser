@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -72,10 +71,10 @@ class TestThemes(unittest.TestCase):
             if not f.endswith(".css") or f == "variables.css":
                 continue
             text = read(os.path.join(CSS, f))
-            text = re.sub(r"/\* theme-fixed-start.*?theme-fixed-end \*/", "", text, flags=re.S)  # mconf TUI colors
+            text = re.sub(r"/\* theme-fixed-start.*?theme-fixed-end \*/", "", text, flags=re.DOTALL)  # mconf TUI colors
             text = re.sub(r":where\(:root\)\s*\{[^}]*\}", "", text)  # token definitions (docs.css)
             text = re.sub(r"var\(--[\w-]+,\s*[^)]*\)", "", text)  # fallbacks
-            text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+            text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
             stray += [f"{f}: {m.group(0)}" for m in HEX.finditer(text)]
         for root, _, files in os.walk(JS):
             for f in files:

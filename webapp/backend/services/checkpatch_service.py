@@ -108,11 +108,22 @@ def run_checkpatch(script_files: dict[str, str], patch: str, *, sandbox: str = "
         started = time.monotonic()
         timed_out = False
         try:
-            proc = subprocess.run(cmd, cwd=work, env=env, capture_output=True, text=True, timeout=timeout, preexec_fn=_limits)
+            proc = subprocess.run(
+                cmd,
+                cwd=work,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=timeout,
+                preexec_fn=_limits,
+            )
             out, err, code = proc.stdout, proc.stderr, proc.returncode
         except subprocess.TimeoutExpired as exc:
             timed_out = True
-            out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            out = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             err, code = "checkpatch timed out", -1
         results, raw = parse_terse(out.replace(work + "/", ""))
         counts = {lvl: sum(1 for r in results if r["level"] == lvl) for lvl in ("ERROR", "WARNING", "CHECK")}
@@ -136,7 +147,15 @@ def check_patch(patch: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="perl is not installed on the server")
     from webapp.backend.config import get_repo_dir
     from webapp.backend.services.git_reader import git_reader
-    tags = subprocess.run(["git", "-C", str(get_repo_dir()), "tag", "-l", "v*"], capture_output=True, text=True, timeout=30).stdout.split()
+    tags = subprocess.run(
+        ["git", "-C", str(get_repo_dir()), "tag", "-l", "v*"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    ).stdout.split()
     ref = resolve_script_ref(cfg["ref"], tags)
     files = {}
     for rel in ("scripts/checkpatch.pl", *DATA_FILES):

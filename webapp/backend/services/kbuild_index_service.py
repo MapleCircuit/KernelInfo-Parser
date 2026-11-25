@@ -16,11 +16,12 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
-from parser.kbuild_conditions import M, N, UNKNOWN, Y, evaluate, is_other_arch_path
+from parser.kbuild_conditions import UNKNOWN, M, N, Y, evaluate, is_other_arch_path
 from webapp.backend.config import get_active_repo_name
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
@@ -197,8 +198,19 @@ def compact(idx: dict[str, Any]) -> dict[str, Any]:
                          "m": [[m["path"], m["expr"]] for m in o["members"]]} for o in idx["objects"]]}
 
 
-__all__ = ["index_state", "index_now", "required_symbols", "module_capable", "objects_for_module", "objects_for_file",
-           "compact", "Y", "M", "N", "UNKNOWN"]
+__all__ = [
+    "UNKNOWN",
+    "M",
+    "N",
+    "Y",
+    "compact",
+    "index_now",
+    "index_state",
+    "module_capable",
+    "objects_for_file",
+    "objects_for_module",
+    "required_symbols",
+]
 
 
 # ------------------------------------------------------------------ config-aware treemap (K4)
@@ -213,7 +225,7 @@ def validate_assignments(raw: Any) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=f"assignments must be an object of at most {MAX_ASSIGNMENTS} entries")
     out = {}
     for k, v in raw.items():
-        key = str(k)[7:] if str(k).startswith("CONFIG_") else str(k)
+        key = str(k).removeprefix("CONFIG_")
         if not _ASSIGN_KEY.match(key) or not isinstance(v, (str, int, float, bool)) or len(str(v)) > 1000:
             raise HTTPException(status_code=400, detail=f"Invalid assignment: {str(k)[:40]}")
         out[key] = str(v)
@@ -226,7 +238,7 @@ def classify_files(idx: dict[str, Any], assignments: dict[str, str]) -> dict[str
     A resolved configuration (an engine's, at least 50 symbols) lists what is set: a symbol it leaves out
     is unset ("n"); a smaller, partial one leaves the others unknown."""
     full = len(assignments) >= 50
-    lookup = (lambda s: assignments.get(s, "n")) if full else (lambda s: assignments.get(s))  # noqa: E731
+    lookup = (lambda s: assignments.get(s, "n")) if full else (lambda s: assignments.get(s))
     values = [evaluate(e, lookup) for e in idx["exprs"]]
     out: dict[str, str] = {}
     for o in idx["objects"]:
@@ -247,6 +259,7 @@ def build_treemap(version: str, arch: str, assignments: dict[str, str], path: st
     """The treemap of a subtree (filesystem_service shape) with per node built_y / built_m / not_built /
     unknown bytes and files_y / files_m / files_n / files_unknown under the configuration."""
     import hashlib
+
     from webapp.backend.config import RepoScopedCache
     from webapp.backend.services.tree_resolver import git_tree_resolver
     global _TREEMAP

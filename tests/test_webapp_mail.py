@@ -22,28 +22,27 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from webapp.backend.services.mailing_list_service import (
-    MailingListService,
-    LORE_BASE_URL,
-    normalize_series_subject,
+from db_engine import MockDB
+from parser.mailing_list.ml_patch_parser import parse_patch_from_body
+from parser.mailing_list.ml_types import (
+    MLMatchTier,
+    MLRelationType,
+    ResolvedCommitContext,
+    SmsgRecord,
 )
+from tests.db_fixtures import patch_reader
 from webapp.backend.routers.mail import (
-    get_mail_status,
     get_mail_message,
+    get_mail_status,
     get_mail_thread,
     get_mail_thread_versions,
     search_mailing_list,
 )
-from webapp.backend.routers.commits import resolve_commit_mail as router_resolve_commit_mail
-from db_engine import MockDB
-from tests.db_fixtures import patch_reader
 from webapp.backend.services.git_service import GitService
-from parser.mailing_list.ml_patch_parser import parse_patch_from_body
-from parser.mailing_list.ml_types import (
-    ResolvedCommitContext,
-    SmsgRecord,
-    MLMatchTier,
-    MLRelationType,
+from webapp.backend.services.mailing_list_service import (
+    LORE_BASE_URL,
+    MailingListService,
+    normalize_series_subject,
 )
 
 
@@ -602,6 +601,7 @@ class TestMergedCommits(unittest.TestCase):
 
     def test_db_path_and_series(self) -> None:
         from unittest.mock import patch
+
         from tests.db_fixtures import patch_reader
         from webapp.backend.services import merged_service as ms
         db = self._mail_db()
@@ -618,6 +618,7 @@ class TestMergedCommits(unittest.TestCase):
 
     def test_trailer_fallback_without_indexes(self) -> None:
         from unittest.mock import patch
+
         from db_engine import MockDB
         from tests.db_fixtures import patch_reader
         from webapp.backend.services import merged_service as ms
@@ -631,7 +632,8 @@ class TestMergedCommits(unittest.TestCase):
         fb.assert_called_once_with("m@x", 0)
         self.assertEqual(out["source"], "trailers")
         self.assertEqual(out["series"]["merged"], 1)
-        with self.assertRaises(Exception):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
             ms.merged_commits()
 
     def test_indexes_present_needs_both_declared_indexes(self) -> None:
@@ -649,8 +651,9 @@ class TestMergedCommits(unittest.TestCase):
 
     def test_parser_creates_missing_declared_indexes(self) -> None:
         from unittest.mock import MagicMock
-        from pipeline.db_setup import ensure_declared_indexes
+
         from core.DBLayout import m_commit_email
+        from pipeline.db_setup import ensure_declared_indexes
         db = MagicMock()
         db.index_exists.side_effect = lambda name, table: name == "commit_email_tid_idx"
         self.assertEqual(ensure_declared_indexes(db, (m_commit_email,)), ["commit_email_mid_idx"])

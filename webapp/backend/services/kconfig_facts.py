@@ -16,7 +16,8 @@ import logging
 import subprocess
 import threading
 from collections import OrderedDict
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from parser.kconfig_ast.kconfig_definitions import kconfig_definitions
 from webapp.backend.config import get_repo_dir
@@ -108,10 +109,14 @@ def read_blobs(shas: Iterable[str], skip_cached: bool = True) -> dict[str, str]:
         if nl < 0:
             break
         header = out[pos:nl].split()
-        if len(header) < 3 or header[1] != b"blob":
+        if len(header) >= 3 and header[2].isdigit():
+            size = int(header[2])
+            if header[1] != b"blob":
+                pos = nl + 1 + size + 1
+                continue
+        else:
             pos = nl + 1
             continue
-        size = int(header[2])
         texts[sha] = out[nl + 1:nl + 1 + size].decode("utf-8", errors="replace")
         pos = nl + 1 + size + 1
     return texts
@@ -124,13 +129,14 @@ def clear() -> None:
 
 def reverse_dependencies(symbol: str, shas: Iterable[str] | None = None) -> tuple[list[str], list[str]]:
     """Return ([selected_by], [implied_by]) for `symbol` across cached or provided Kconfig blobs."""
-    clean = symbol.strip()
-    if clean.startswith("CONFIG_"):
-        clean = clean[7:]
+    clean = symbol.strip().removeprefix("CONFIG_")
     selected_by: set[str] = set()
     implied_by: set[str] = set()
     with _LOCK:
-        blob_defs = list(_DEFS_CACHE.values())
+        if shas is not None:
+            blob_defs = [d for s in shas if (d := _DEFS_CACHE.get(s)) is not None]
+        else:
+            blob_defs = list(_DEFS_CACHE.values())
     for d in blob_defs:
         for sym_name, facts_list in d.items():
             for f in facts_list:

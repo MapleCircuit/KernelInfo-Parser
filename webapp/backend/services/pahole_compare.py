@@ -5,7 +5,8 @@ across the releases where its definition changed (the symbol history's stops), o
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -22,7 +23,7 @@ def compare_layouts(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     (a removed and an added member of the same type at the same offset) and the size / holes / cacheline deltas."""
     am = {m["name"]: m for m in a.get("members") or []}
     bm = {m["name"]: m for m in b.get("members") or []}
-    side = lambda m: {"offset": m["offset"], "size": m["size"], "type": m["type"]} if m else None  # noqa: E731
+    side = lambda m: {"offset": m["offset"], "size": m["size"], "type": m["type"]} if m else None
     rows = []
     for name in list(am) + [n for n in bm if n not in am]:
         x, y = am.get(name), bm.get(name)
@@ -76,7 +77,7 @@ def layout_history(stops: list[str], layout_of: Callable[[str], dict[str, Any]],
 _PAHOLE = None
 
 
-def _pahole():
+def _pahole() -> Any:
     global _PAHOLE
     if _PAHOLE is None:
         from webapp.backend.services.pahole_service import PaholeService
@@ -113,7 +114,7 @@ def history_state(version: str, struct: str, include_rc: bool = False, wait: flo
     sha = resolve(version)
     ck = f"{get_active_repo_name()}|pahole-hist|1|{sha}|{struct}|{int(include_rc)}"
 
-    def build(progress):
+    def build(progress: Callable[..., None] | None) -> dict[str, Any]:
         from webapp.backend.services.history_service import history_service
         here = _pahole().get_struct_layout(version, struct)
         progress(0, 1, "release history of the definition")

@@ -13,14 +13,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from starlette.requests import Request
+
 from db_engine import MockDB
-from webapp.backend import app as app_module
 from tests.db_fixtures import patch_reader
+from webapp.backend import app as app_module
 from webapp.backend.routers import versions as versions_router
 from webapp.backend.routers.versions import _stamp
 from webapp.backend.services import catalog_cache as cc
 from webapp.backend.services import sync_service as ss
-from starlette.requests import Request
 
 
 def _route(app, path: str):
@@ -115,7 +116,8 @@ class TestTokens(unittest.TestCase):
             sent.append(message)
 
         mw = ss.SyncHeaderMiddleware(app)
-        with patch.object(ss.sync_service, "header_value", return_value="aa.bb.cc"):
+        with patch.object(ss.sync_service, "cached_header_value", return_value=None), \
+                patch.object(ss.sync_service, "header_value", return_value="aa.bb.cc"):
             asyncio.run(mw({"type": "http", "path": "/api/versions"}, None, send))
             asyncio.run(mw({"type": "http", "path": "/b/x/js/app.js"}, None, send))
         self.assertIn((b"x-kip-sync", b"aa.bb.cc"), sent[0]["headers"])
@@ -250,9 +252,9 @@ class TestBranchTagsWarmup(unittest.TestCase):
                 patch.object(versions_router, "resolve_repo_path", return_value=MagicMock(exists=lambda: True)), \
                 patch.object(versions_router, "set_active_repository", return_value=object()), \
                 patch.object(versions_router, "reset_active_repository") as reset, \
-                patch.object(versions_router, "get_versions", side_effect=RuntimeError("db down")):
-            with self.assertLogs(versions_router.logger, "WARNING"):
-                versions_router.prewarm_catalog()
+                patch.object(versions_router, "get_versions", side_effect=RuntimeError("db down")), \
+                self.assertLogs(versions_router.logger, "WARNING"):
+            versions_router.prewarm_catalog()
         reset.assert_called_once()
 
 
@@ -501,7 +503,7 @@ class TestBranchSourceTags(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             run_git(tmp, "init", "-b", "master")
-            c_root = commit(tmp, "README", "m0", "mainline root", "v2.6.12")
+            commit(tmp, "README", "m0", "mainline root", "v2.6.12")
             c_master = commit(tmp, "README", "m1", "mainline 3.0", "v3.0")
 
             # Two stable branches anchored on mainline

@@ -18,7 +18,12 @@ from typing import Any
 from fastapi import HTTPException
 
 from webapp.backend.config import get_repo_dir
-from webapp.backend.security.git import git_pathspecs, is_safe_rev, safe_rev, validate_pathspecs
+from webapp.backend.security.git import (
+    git_pathspecs,
+    is_safe_rev,
+    safe_rev,
+    validate_pathspecs,
+)
 
 MAX_TEXT = 100
 MAX_OFFSET = 1_000_000
@@ -64,7 +69,7 @@ def _resolve(rev: str, what: str) -> str:
     safe_rev(rev, what)
     try:
         out = subprocess.run(["git", "-C", str(get_repo_dir()), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+                             check=False, capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         out = ""
     if not _FULL_SHA.match(out):
@@ -177,7 +182,11 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
         start = [_resolve(b.lstrip("."), "range end"), f"^{_resolve(a, 'range start')}"]
         range_desc = f"{a}..{b.lstrip('.')}"
     elif release:
-        from webapp.backend.services.release_service import LATEST_RELEASE, latest_info, range_of
+        from webapp.backend.services.release_service import (
+            LATEST_RELEASE,
+            latest_info,
+            range_of,
+        )
         safe_rev(release, "release")
         prev, sha = range_of(release)
         start = [sha] + ([f"^{prev}"] if prev else [])
@@ -199,7 +208,7 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
                           since=since, until=until, merges="" if merges == "all" else merges, text=text,
                           skip=(page - 1) * limit, limit=limit)
     try:
-        proc = subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, text=True,
+        proc = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, text=True,
                               timeout=QUERY_TIMEOUT, errors="replace")
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="The commit query took too long: narrow it with a path or a release.") from None

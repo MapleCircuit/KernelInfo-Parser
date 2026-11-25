@@ -22,12 +22,13 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from db_engine.spec import Coalesce, Join, gt
 from webapp.backend.config import get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_repo_id, safe_decode
-from db_engine.spec import Coalesce, Join, gt
 from webapp.backend.database.pool import get_reader
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,8 @@ class _Ttl:
 
     def peek(self, key: Any) -> str | None:
         """The cached value while it is fresh, else None (never computes)."""
-        hit = self._values.get(key)
+        with self._lock:
+            hit = self._values.get(key)
         return hit[1] if hit and time.monotonic() - hit[0] < self.ttl else None
 
     def get(self, key: Any, value_fn: Callable[[], str], fresh: bool = False) -> str:
@@ -103,6 +105,7 @@ class SyncService:
         self._projects = _Ttl(_PROJECTS_TTL)
         self._last_parsed: dict[str, str] = {}
         self._last_git: dict[str, str] = {}
+        self._state_lock = threading.Lock()
 
     # ------------------------------------------------------------------ frontend
     def _frontend_files(self) -> list[tuple[str, int, int, int, int]]:
@@ -156,7 +159,7 @@ class SyncService:
                 with get_reader() as reader:
                     row = reader.select_one("m_db_instance", ["instance_hash"])
                     return safe_decode(row["instance_hash"])[:12] if row else ""
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - DB unavailability leaves token empty
                 logger.debug("db token unavailable: %s", exc)
                 return ""
         return self._db.get("db", compute, fresh)
@@ -182,14 +185,16 @@ class SyncService:
                         f"{safe_decode(r['ref_name'])}:{r['commit_id']}:{r['updated_at']}"
                         for r in rows if int(r["status"]) != INGEST_PARSING
                     ]
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - DB unavailability leaves token empty
                 logger.debug("parsed token unavailable: %s", exc)
                 return ""
             token = _digest(parts)
-            if self._last_parsed.get(repo) not in (None, token):
+            with self._state_lock:
+                prev = self._last_parsed.get(repo)
+                self._last_parsed[repo] = token
+            if prev not in (None, token):
                 clear_parse_dependent_caches()
                 logger.info("Parsed versions of '%s' changed; version caches cleared.", repo)
-            self._last_parsed[repo] = token
             return token
         return self._parsed.get(repo, compute, fresh)
 
@@ -201,18 +206,20 @@ class SyncService:
             try:
                 out = subprocess.run(
                     ["git", "for-each-ref", "--format=%(objectname) %(refname)"],
-                    cwd=repo_dir, capture_output=True, text=True, timeout=10, check=False,
+                    cwd=repo_dir, capture_output=True, text=True, errors="replace", timeout=10, check=False,
                 ).stdout
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - Git unavailability leaves token empty
                 logger.debug("git token unavailable: %s", exc)
                 return ""
             token = _digest(out.splitlines())
             # Tags fetched or a branch moved: caches keyed by a revision name (a branch's files, Kconfig
             # model, maintainers, name -> commit) would keep answering for the old commit
-            if self._last_git.get(repo_dir) not in (None, token):
+            with self._state_lock:
+                prev = self._last_git.get(repo_dir)
+                self._last_git[repo_dir] = token
+            if prev not in (None, token):
                 clear_parse_dependent_caches()
                 logger.info("Git refs of %s changed; revision caches cleared.", repo_dir)
-            self._last_git[repo_dir] = token
             return token
         return self._git.get(repo_dir, compute, fresh)
 
@@ -223,7 +230,7 @@ class SyncService:
                 # Imported here: the versions router imports this module (through catalog_cache)
                 from webapp.backend.routers.versions import projects_catalog
                 return _digest([json.dumps(projects_catalog(), sort_keys=True, default=str)])
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - fallback when projects catalog unavailable
                 logger.debug("projects token unavailable: %s", exc)
                 return ""
         return self._projects.get("projects", compute, fresh)
@@ -271,58 +278,59 @@ def clear_parse_dependent_caches() -> None:
     from webapp.backend.database import helpers
     from webapp.backend.services import (
         filesystem_service,
+        git_service,
+        grep_service,
         history_service,
+        hover_service,
+        kapi_diff_service,
         kconfig_facts,
-        maintainer_service,
         kconfig_service,
+        maintainer_service,
+        nodemap_service,
+        outline_service,
+        pahole_compare,
+        scope_service,
     )
     from webapp.backend.services.arch_layout_service import arch_layout_service
     from webapp.backend.services.imports_service import imports_service
-    from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
+    from webapp.backend.services.tree_resolver import git_tree_resolver, tree_resolver
 
-    for cache in (
+    caches = (
         helpers._NAME_TO_VID_CACHE, helpers._VID_TO_NAME_CACHE, helpers._REPO_ID_CACHE, helpers._PRELOADED,
         filesystem_service._FILE_TOKENS_CACHE, filesystem_service._INCLUDE_CACHE,
-        filesystem_service._TREEMAP_CACHE,
+        filesystem_service._TREEMAP_CACHE, filesystem_service._OBJECT_CACHE,
         maintainer_service._MAINTAINER_CACHE, maintainer_service._FILE_SUBSYSTEMS_CACHE,
         maintainer_service._BLOB_SECTIONS_CACHE, maintainer_service._BLOB_CREDITS_CACHE,
         maintainer_service._CREDITS_KEYS_CACHE,
-        history_service._FACTS_CACHE, history_service._TAG_CODE_CACHE,
+        history_service._FACTS_CACHE,
         kconfig_service._MODELS, kconfig_service._BUILD_RESOLVERS,
         kconfig_service._LISTING_CACHE, kconfig_service._PATHS_CACHE, kconfig_service._USAGE_CACHE,
         kconfig_service._ARCH_INFO_CACHE, kconfig_service._KBUILD_COVERAGE,
         imports_service._cache,
-    ):
+        outline_service.outline_service._cache,
+        kapi_diff_service._CACHE,
+        git_service._LAST_WRITER_CACHE,
+        nodemap_service._LAYOUT_CACHE,
+    )
+    clearers: list[Callable[[], Any]] = [cache.clear for cache in caches]
+    clearers.extend([
+        history_service.clear_cache,
+        kconfig_facts.clear,
+        arch_layout_service.clear_cache,
+        tree_resolver.clear_cache,
+        git_tree_resolver.clear_revision_caches,
+        hover_service.hover_service.clear_cache,
+        scope_service.scope_service.clear_cache,
+        git_service._cached_git_file_history.cache_clear,
+        grep_service.grep_service.clear,
+        lambda: pahole_compare._CMP.clear() if pahole_compare._CMP is not None else None,
+        *_REFS_CHANGED_HOOKS,
+    ])
+    for fn in clearers:
         try:
-            cache.clear()
-        except Exception:
-            pass
-
-    try:
-        kconfig_facts.clear()
-    except Exception:
-        pass
-
-    try:
-        arch_layout_service.clear_cache()
-    except Exception:
-        pass
-
-    try:
-        tree_resolver.clear_cache()
-    except Exception:
-        pass
-
-    try:
-        git_tree_resolver.clear_revision_caches()
-    except Exception:
-        pass
-
-    for hook in list(_REFS_CHANGED_HOOKS):
-        try:
-            hook()
-        except Exception:
-            pass
+            fn()
+        except Exception as exc:  # noqa: BLE001 - best-effort cache invalidation
+            logger.debug("cache clear skipped: %s", exc)
 
 
 sync_service = SyncService()
@@ -343,6 +351,7 @@ class SyncHeaderMiddleware:
             await self.app(scope, receive, send)
             return
         import contextvars
+
         from starlette.concurrency import run_in_threadpool
 
         ctx = contextvars.copy_context()
@@ -354,7 +363,7 @@ class SyncHeaderMiddleware:
                     value = ctx.run(sync_service.cached_header_value) or await run_in_threadpool(ctx.run, sync_service.header_value)
                     message.setdefault("headers", [])
                     message["headers"] = [*message["headers"], (SYNC_HEADER.lower().encode(), value.encode())]
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - header is optional
                     logger.debug("sync header skipped: %s", exc)
             await send(message)
 

@@ -23,7 +23,7 @@ MIN_NODE = 18
 
 def node_version(node: str) -> int:
     try:
-        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([node, "--version"], capture_output=True, text=True, check=False, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return 0
     m = re.match(r"v(\d+)", out.strip())
@@ -35,7 +35,7 @@ def run_js_tests(test_dir: Path = JS_TESTS, node: str | None = None, timeout: fl
     take no globs, and Node 22 reads a directory argument as a file."""
     files = sorted(str(p) for p in test_dir.rglob("*.test.mjs"))
     return subprocess.run([node or "node", "--test", "--test-timeout=60000", *files], capture_output=True,
-                          text=True, timeout=timeout, cwd=str(ROOT))
+                          text=True, check=False, timeout=timeout, cwd=str(ROOT))
 
 
 class TestFrontendJs(unittest.TestCase):
@@ -58,7 +58,7 @@ class TestFrontendJs(unittest.TestCase):
         suite = JS_TESTS / "security_insights.test.mjs"
         self.assertTrue(suite.is_file(), f"Missing {suite}")
         res = subprocess.run([self.node, "--test", "--test-timeout=60000", str(suite)], capture_output=True,
-                             text=True, timeout=120, cwd=str(ROOT))
+                             text=True, check=False, timeout=120, cwd=str(ROOT))
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertRegex(res.stdout, r"# fail 0")
 

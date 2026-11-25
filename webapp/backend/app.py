@@ -1,39 +1,41 @@
 """webapp/backend/app.py - FastAPI Application Factory."""
 from __future__ import annotations
-from contextlib import asynccontextmanager
+
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from core.logging_setup import setup_webapp_logging
 from webapp.backend.config import get_backend_logging_config, refresh_default_repo_dir
+from webapp.backend.routers import (
+    commits_router,
+    cve_router,
+    docs_router,
+    filesystem_router,
+    insights_router,
+    kapi_router,
+    kconfig_router,
+    mail_router,
+    maintainers_router,
+    man_router,
+    nodemap_router,
+    symbols_router,
+    sync_router,
+    tools_router,
+    versions_router,
+    watch_router,
+)
 from webapp.backend.security.middleware import (
     RepoContextMiddleware,
     RequestLoggingMiddleware,
     SecurityHeadersMiddleware,
     SlidingWindowRateLimiter,
-)
-from webapp.backend.routers import (
-    versions_router,
-    filesystem_router,
-    symbols_router,
-    kconfig_router,
-    maintainers_router,
-    commits_router,
-    tools_router,
-    sync_router,
-    docs_router,
-    mail_router,
-    insights_router,
-    cve_router,
-    kapi_router,
-    watch_router,
-    man_router,
-    nodemap_router,
 )
 from webapp.backend.services.sync_service import SyncHeaderMiddleware, sync_service
 
@@ -83,36 +85,37 @@ async def lifespan(app: FastAPI):
     # Pre-warm DB pool and establish SSH tunnel if configured
     try:
         _db_engine().warm_up()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - best-effort startup pre-warm
         logger.debug("Database pool startup pre-warm deferred: %s", exc)
     # Version/branch catalogs and the default branch's tag walk, in the background (API.md section 2.12)
     try:
         from webapp.backend.routers.versions import start_prewarm
         start_prewarm()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - best-effort startup pre-warm
         logger.warning("Catalog pre-warm not started: %s", exc)
     yield
     try:
-        from webapp.backend.routers.versions import cancel_branch_walks
+        from webapp.backend.routers.versions import cancel_branch_walks, cancel_prewarm
+        cancel_prewarm()
         cancel_branch_walks()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - shutdown best-effort cleanup
+        logger.debug("Shutdown branch walk cancellation skipped: %s", exc)
     # Background jobs (API.md section 2.15): cancel queued and running ones, stop the workers
     try:
         from webapp.backend.services.jobs import jobs
         jobs.cancel_all()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - shutdown best-effort cleanup
+        logger.debug("Shutdown job cancellation skipped: %s", exc)
     # Graceful shutdown: close connection pool and stop SSH tunnel
     try:
         _db_engine().shutdown()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - shutdown best-effort cleanup
+        logger.debug("Shutdown DB engine skipped: %s", exc)
     try:
         from core.ssh_tunnel import stop_ssh_tunnel
         stop_ssh_tunnel("database")
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - shutdown best-effort cleanup
+        logger.debug("Shutdown SSH tunnel skipped: %s", exc)
 
 
 def create_app() -> FastAPI:
@@ -128,7 +131,6 @@ def create_app() -> FastAPI:
 
     # 1. Performance & Security Middleware
     app.add_middleware(GZipMiddleware, minimum_size=1000)
-    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(SlidingWindowRateLimiter, max_requests=600, window_seconds=60)
     # Read-only API with no cookie or header authentication: any origin may read it, but never with
     # credentials. "*" together with allow_credentials makes Starlette reflect the caller's Origin
@@ -143,8 +145,10 @@ def create_app() -> FastAPI:
     # Inside RepoContextMiddleware: the change tokens are those of the request's repository
     app.add_middleware(SyncHeaderMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
-    # Outermost: the selected repository must be visible to every inner middleware and endpoint
+    # Selection of the request's repository visible to inner middleware and endpoints
     app.add_middleware(RepoContextMiddleware)
+    # Outermost: attach defensive security headers to every response (including early 429s)
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # 2. Register API Routers
     app.include_router(versions_router)
@@ -191,11 +195,20 @@ def create_app() -> FastAPI:
         if build != current:
             return JSONResponse({"detail": "stale frontend build", "build": current}, status_code=409,
                                 headers={"Cache-Control": "no-store"})
-        target = (FRONTEND_DIR / asset_path).resolve()
+        try:
+            target = (FRONTEND_DIR / asset_path).resolve()
+            is_inside = target.is_relative_to(FRONTEND_DIR)
+        except (OSError, ValueError):
+            return Response(status_code=404)
         # The JS unit tests (webapp/frontend/tests) are not part of a build
-        if asset_path.startswith("tests/") or not target.is_relative_to(FRONTEND_DIR) or not target.is_file():
+        if asset_path.startswith("tests/") or not is_inside or not target.is_file():
             return Response(status_code=404)
         return FileResponse(str(target), headers={"Cache-Control": BUILD_CACHE_CONTROL})
+
+    @app.api_route("/api/{unmatched_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    def api_not_found(unmatched_path: str):
+        """Consistent JSON 404 for unknown /api/ paths."""
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     @app.get("/manifest.json")
     def serve_manifest():

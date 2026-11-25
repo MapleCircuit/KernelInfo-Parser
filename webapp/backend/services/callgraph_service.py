@@ -1,12 +1,18 @@
 """webapp/backend/services/callgraph_service.py - Bidirectional Caller / Callee Flow Graph."""
 from __future__ import annotations
+
 from typing import Any
+
 from core.globalstuff import ASTT, SymbolLinkage
 from db_engine.spec import Join, between
-from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import safe_decode
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.symbol_service import SymbolService, binding_ref_asts
-from webapp.backend.services.tree_resolver import best_path, definition_arch, definition_rank
+from webapp.backend.services.tree_resolver import (
+    best_path,
+    definition_arch,
+    definition_rank,
+)
 
 # m_type_descriptor C_functionproto / C_functionprotodecl / Rust_Fn / ASM_Label: function definitions and prototypes
 FUNCTION_TYPES = (int(ASTT.C_functionproto), int(ASTT.C_functionprotodecl), int(ASTT.Rust_Fn), int(ASTT.ASM_Label))
@@ -98,25 +104,28 @@ class CallgraphService:
                 line_no = r["line"]
 
                 # For Rust method callers inside impl Trait for Type, resolve the actual method name
-                if caller_name.startswith("impl ") or " for " in caller_name or path.endswith(".rs"):
-                    if caller_name.startswith("impl ") or " for " in caller_name or not caller_name:
-                        from webapp.backend.services.git_reader import git_reader
-                        from parser.rust_ast.rust_pure_extractor import extract_rust_outline
-                        from webapp.backend.services.outline_service import flatten
-                        raw, is_dir, _ = git_reader.read_file(vname, path)
-                        if raw and not is_dir:
-                            items = flatten(extract_rust_outline(raw))
-                            methods = [
-                                it["name"] for it in items
-                                if it.get("kind") == "function" and it.get("line_s", 0) <= line_no <= it.get("line_e", line_no)
-                            ]
-                            if methods:
-                                caller_name = methods[0]
+                if (caller_name.startswith("impl ") or " for " in caller_name or path.endswith(".rs")) and (
+                    caller_name.startswith("impl ") or " for " in caller_name or not caller_name
+                ):
+                    from parser.rust_ast.rust_pure_extractor import (
+                        extract_rust_outline,
+                    )
+                    from webapp.backend.services.git_reader import git_reader
+                    from webapp.backend.services.outline_service import flatten
+                    raw, is_dir, _ = git_reader.read_file(vname, path)
+                    if raw and not is_dir:
+                        items = flatten(extract_rust_outline(raw))
+                        methods = [
+                            it["name"] for it in items
+                            if it.get("kind") == "function" and it.get("line_s", 0) <= line_no <= it.get("line_e", line_no)
+                        ]
+                        if methods:
+                            caller_name = methods[0]
 
                 # Handle loose callers where tag_id = 0 in assembly files
                 if (not caller_name or caller_name == "<unknown>") and path.endswith((".S", ".s")):
-                    from webapp.backend.services.git_reader import git_reader
                     from parser.asm_ast.asm_pure_extractor import extract_asm_outline
+                    from webapp.backend.services.git_reader import git_reader
                     from webapp.backend.services.outline_service import flatten
                     raw, is_dir, _ = git_reader.read_file(vname, path)
                     if raw and not is_dir:

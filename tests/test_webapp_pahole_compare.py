@@ -9,7 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import HTTPException
 
-from webapp.backend.services.pahole_compare import compare_layouts, history_stops, layout_history
+from webapp.backend.services.pahole_compare import (
+    compare_layouts,
+    history_stops,
+    layout_history,
+)
 
 
 def layout(members, size, holes=0, est=False):

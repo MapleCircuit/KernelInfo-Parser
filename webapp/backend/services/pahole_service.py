@@ -1,14 +1,24 @@
 """webapp/backend/services/pahole_service.py - Struct Memory Layout & 64-Byte Cacheline Visualizer."""
 from __future__ import annotations
+
+import logging
 import re
 from typing import Any
+
 from fastapi import HTTPException
+
 from db_engine.spec import Agg, Join, Value
-from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import safe_decode
+from webapp.backend.database.pool import get_reader
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.symbol_service import SymbolService
-from webapp.backend.services.tree_resolver import best_path, definition_arch, definition_rank
+from webapp.backend.services.tree_resolver import (
+    best_path,
+    definition_arch,
+    definition_rank,
+)
+
+logger = logging.getLogger(__name__)
 
 # m_type_descriptor names of struct and union definitions (a variable or macro of the same name is no layout)
 STRUCT_DECL_TYPES = ("C_structdecl", "C_uniondecl")
@@ -31,7 +41,16 @@ _DISPLAY_TYPES = {
 
 def _category(raw_type: str | None) -> str:
     t = (raw_type or "").strip()
-    return t[2:] if t.startswith("C_") else t
+    return t.removeprefix("C_")
+
+
+def _opt_int(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _member_size(category: str) -> tuple[int, int, bool]:
@@ -58,7 +77,7 @@ class PaholeService:
             lines = text.splitlines()[max(0, line_s - 1):line_e]
             for line in lines[1:-1]:
                 line = re.sub(r"/\*.*?\*/", "", line).strip()
-                if not line or line.startswith("//") or line.startswith("#"):
+                if not line or line.startswith(("//", "#")):
                     continue
                 # Function pointer: void (*done)(struct foo *);
                 fn_m = re.match(r"^(.*?)\(\s*\*\s*([a-zA-Z_]\w*)\s*\)\s*(\(.*?\))\s*;", line)
@@ -89,8 +108,8 @@ class PaholeService:
                         if arr:
                             type_str = f"{type_str} {arr}".strip()
                         field_types[name] = type_str
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - best-effort source field type extraction
+            logger.debug("source field type extraction failed for %s:%s: %s", version_name, file_path, exc)
         return field_types
 
     @staticmethod
@@ -183,13 +202,13 @@ class PaholeService:
         for r in fields_raw:
             field_name = safe_decode(r["field_name"]) or f"field_{r['priority']}"
             category = _category(safe_decode(r["type_name"]) or safe_decode(r["ref_type_name"]) or "int")
-            attr_size = r.get("attr_size")
-            attr_offset = r.get("attr_offset")
-            attr_bitfield = r.get("attr_bitfield")
+            attr_size = _opt_int(r.get("attr_size"))
+            attr_offset = _opt_int(r.get("attr_offset"))
+            attr_bitfield = _opt_int(r.get("attr_bitfield"))
 
             # Compiler-extracted size from Clang (size_bytes attribute)
-            if attr_size is not None and int(attr_size) >= 0:
-                sz = int(attr_size)
+            if attr_size is not None and attr_size >= 0:
+                sz = attr_size
                 estimated = False
             else:
                 sz, _, estimated = _member_size(category)
@@ -207,8 +226,8 @@ class PaholeService:
 
             # Offset & padding hole derivation (offset_bits attribute)
             bit_offset = None
-            if attr_offset is not None and int(attr_offset) >= 0:
-                exact_offset_bits = int(attr_offset)
+            if attr_offset is not None and attr_offset >= 0:
+                exact_offset_bits = attr_offset
                 exact_byte_offset = exact_offset_bits // 8
                 rem_bits = exact_offset_bits % 8
                 if rem_bits > 0:
@@ -240,12 +259,12 @@ class PaholeService:
                 "cacheline_idx": curr_offset // 64,
                 "cacheline_offset": curr_offset % 64,
                 "crosses_cacheline": (curr_offset // 64) != ((curr_offset + sz - 1) // 64) if sz > 0 else False,
-                "bitfield_width": int(attr_bitfield) if attr_bitfield else None,
+                "bitfield_width": attr_bitfield if attr_bitfield else None,
                 "bit_offset": bit_offset,
             })
 
-            if attr_bitfield and int(attr_bitfield) > 0 and attr_offset is not None:
-                next_bit = int(attr_offset) + int(attr_bitfield)
+            if attr_bitfield and attr_bitfield > 0 and attr_offset is not None:
+                next_bit = attr_offset + attr_bitfield
                 curr_offset = (next_bit + 7) // 8
             else:
                 curr_offset += sz

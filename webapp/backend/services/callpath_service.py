@@ -13,7 +13,8 @@ ops tables assign to that field, matched by field name (approximate: every struc
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
+from typing import Any
 
 Edge = tuple  # (other node, path, line[, via])
 
@@ -135,7 +136,13 @@ NOT_KERNEL = ("tools/", "scripts/", "samples/", "Documentation/", "usr/")
 def arch_filter(version: str, arch: str | None) -> tuple[str, Callable[[str], bool]]:
     """(ARCH, path test): calls made in a path count unless it belongs to another architecture's tree, to the other
     word size's files of the ARCH's own tree, or to a user-space tree (`tools/`, `scripts/`, ...)."""
-    from webapp.backend.services.tree_resolver import ARCH_OTHER, ARCH_OWN, _bits_penalty, definition_arch, path_arch_group
+    from webapp.backend.services.tree_resolver import (
+        ARCH_OTHER,
+        ARCH_OWN,
+        _bits_penalty,
+        definition_arch,
+        path_arch_group,
+    )
     name, scope, bits = definition_arch(version, arch or None)
 
     def test(path: str) -> bool:
@@ -187,6 +194,7 @@ def callpath_state(version: str, src: str, dst: str, *, max_depth: int = 6, k: i
     """The search, once the revision's source index is in memory ({state: "done", result}); the index job's state
     (202 with progress) while it is assembled. The search itself takes milliseconds to a few seconds."""
     from fastapi import HTTPException
+
     from webapp.backend.security.sql import is_valid_identifier
     from webapp.backend.services.kapi_service import resolve
     from webapp.backend.services.source_index import revision_state

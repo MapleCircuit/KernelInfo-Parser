@@ -1,8 +1,6 @@
 """tests/test_webapp_source_index.py - Source index: per-blob facts, revision assembly and its saved form (webapp/API.md section 2.19)."""
 from __future__ import annotations
 
-from cache_engine import get_cache_engine
-
 import os
 import shutil
 import subprocess
@@ -10,7 +8,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
+
+from cache_engine import get_cache_engine
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -307,7 +308,7 @@ class TestRevisionIndex(unittest.TestCase):
         self.assertEqual(sorted(idx.file_of(n) for n in helpers), ["drivers/b.c", "kernel/a.c"])
         entry = idx.nodes_named("entry")[0]
         self.assertEqual(self.names(idx.callees(entry)), [("asm_only", "kernel/a.c", ""), ("helper", "kernel/a.c", "")])
-        a_helper = [n for n in helpers if idx.file_of(n) == "kernel/a.c"][0]
+        a_helper = next(n for n in helpers if idx.file_of(n) == "kernel/a.c")
         self.assertEqual(self.names(idx.callers(a_helper)), [("entry", "kernel/a.c", "")], "b.c's call binds to b.c's helper")
         self.assertEqual(idx.definitions(idx.nodes_named("asm_only")[0]), [], "a callee without a C definition")
 
@@ -410,8 +411,8 @@ class TestDatabaseFacts(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class TestBuildFromGit(unittest.TestCase):
-    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
-           "GIT_COMMITTER_EMAIL": "t@x", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    env: ClassVar[dict[str, str]] = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                                     "GIT_COMMITTER_EMAIL": "t@x", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
     def commit(self, repo: str) -> str:
         subprocess.run(["git", "-C", repo, "add", "-A"], check=True, env=self.env)
@@ -483,6 +484,30 @@ class TestBuildFromGit(unittest.TestCase):
             self.assertEqual(len(extracted), 1, "only the blob the database lacks is extracted")
             self.assertEqual(idx.struct_report("file_operations")["tables"], 3)
             self.assertEqual(len(idx.nodes_named("helper")), 2)
+
+    def test_read_blobs_drains_non_blob_entries(self) -> None:
+        import io
+
+        t_sha = "1" * 40
+        b_sha = "2" * 40
+        stream = io.BytesIO(
+            f"{t_sha} tree 4\nTREE\n{b_sha} blob 7\nint x;\n\n".encode("ascii")
+        )
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdin = io.BytesIO()
+                self.stdout = stream
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                pass
+
+        with patch.object(si.subprocess, "Popen", return_value=FakeProc()):
+            got = list(si.read_blobs([t_sha, b_sha]))
+        self.assertEqual(got, [(t_sha, None), (b_sha, "int x;\n")])
 
 
 if __name__ == "__main__":

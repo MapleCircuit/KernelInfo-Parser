@@ -1,8 +1,12 @@
 """webapp/backend/routers/maintainers.py - Subsystems Roster, Maintainers & CREDITS."""
 from __future__ import annotations
-from typing import Any
+
+from typing import Annotated, Any
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+
 from webapp.backend.config import require_feature
+from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.maintainer_service import MaintainerService
 
 router = APIRouter(prefix="/api", tags=["maintainers"], dependencies=[Depends(require_feature("maintainers"))])
@@ -33,12 +37,30 @@ def get_person(version_name: str, person_id_or_email: str | None = None, email: 
 
 
 @router.post("/maintainers/{version_name}/match")
-def match_maintainers(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def match_maintainers(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """get_maintainer.pl emulation on patch content and/or file paths."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    patch_text = payload.get("patch") or payload.get("patch_text") or ""
+    if not isinstance(patch_text, str):
+        raise HTTPException(status_code=400, detail="patch_text must be a string")
+    if len(patch_text) > 5_000_000 or len(patch_text.encode("utf-8")) > 5_000_000:
+        raise HTTPException(status_code=413, detail="patch_text exceeds 5,000,000 bytes")
+    paths = payload.get("touched_files") or payload.get("paths") or []
+    if not isinstance(paths, list):
+        raise HTTPException(status_code=400, detail="paths must be a list")
+    if len(paths) > 500:
+        raise HTTPException(status_code=400, detail="At most 500 paths")
+    for p in paths:
+        if not isinstance(p, str):
+            raise HTTPException(status_code=400, detail="Each path must be a string")
+        clean = p.strip().lstrip("/")
+        if clean and not is_safe_rel_path(clean):
+            raise HTTPException(status_code=400, detail="Invalid path")
     return maintainer_service.match_maintainers(
         version_name,
-        patch_text=payload.get("patch") or payload.get("patch_text") or "",
-        paths=payload.get("touched_files") or payload.get("paths") or [],
+        patch_text=patch_text,
+        paths=paths,
     )
 
 

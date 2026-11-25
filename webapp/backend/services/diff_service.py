@@ -7,26 +7,33 @@ Level 3: Scoped Kconfig file and symbol deltas.
 Every side of a comparison may be a release tag, a branch, or an arbitrary commit SHA.
 """
 from __future__ import annotations
+
 import json
 import logging
 import posixpath
 import re
 import subprocess
-from webapp.backend.config import get_repo_dir
 from typing import Any
+
 from fastapi import HTTPException
+
+from core.globalstuff import ASTT, is_safe_git_rev
 from db_engine.spec import Join
-from webapp.backend.database.pool import get_reader
-from webapp.backend.database.helpers import (
-    safe_decode,
-    get_version_info,
+from parser.kconfig_ast.kconfig_definitions import (
+    KCONFIG_TYPE_NAMES,
+    RAW_FIELDS,
+    kconfig_field_changes,
 )
+from webapp.backend.config import get_repo_dir
+from webapp.backend.database.helpers import (
+    get_version_info,
+    safe_decode,
+)
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.jail import is_safe_rel_path
-from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
-from parser.kconfig_ast.kconfig_definitions import KCONFIG_TYPE_NAMES, RAW_FIELDS, kconfig_field_changes
 from webapp.backend.services import kconfig_facts
 from webapp.backend.services.git_service import parse_unified_diff
-from core.globalstuff import ASTT, is_safe_git_rev
+from webapp.backend.services.tree_resolver import git_tree_resolver, tree_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +59,6 @@ _RENAME_LIMIT_RE = re.compile(rb"at least (\d+)")
 
 
 KCONFIG_TYPE_CODES = {name: code for code, name in KCONFIG_TYPE_NAMES.items()}
-# Kconfig definitions are parsed once per blob SHA and shared with Kconfig history (kconfig_facts.py)
-_DEFS_CACHE = kconfig_facts._DEFS_CACHE
 
 
 def _read_kconfig_blobs(shas: set[str]) -> dict[str, str]:
@@ -478,8 +483,7 @@ class DiffService:
         found: set[str] = set()
         prefix = f"{rev}:"
         for line in out.stdout.decode("utf-8", errors="replace").splitlines():
-            if line.startswith(prefix):
-                line = line[len(prefix):]
+            line = line.removeprefix(prefix)
             path, _, match = line.partition(":")
             if path not in paths:
                 continue
@@ -617,12 +621,21 @@ class DiffService:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             ) as proc:
-                raw = proc.stdout.read(MAX_BLOB_DIFF_BYTES + 1)
-                truncated = len(raw) > MAX_BLOB_DIFF_BYTES
-                if truncated:
+                try:
+                    assert proc.stdout is not None
+                    raw = proc.stdout.read(MAX_BLOB_DIFF_BYTES + 1)
+                    truncated = len(raw) > MAX_BLOB_DIFF_BYTES
+                    if truncated:
+                        proc.kill()
+                        raw = raw[: raw.rfind(b"\n", 0, MAX_BLOB_DIFF_BYTES) + 1]
+                    rc = proc.wait(timeout=BLOB_DIFF_TIMEOUT)
+                except subprocess.TimeoutExpired:
                     proc.kill()
-                    raw = raw[: raw.rfind(b"\n", 0, MAX_BLOB_DIFF_BYTES) + 1]
-                rc = proc.wait(timeout=BLOB_DIFF_TIMEOUT)
+                    proc.wait()
+                    raise
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
         except subprocess.TimeoutExpired as e:
             raise HTTPException(status_code=504, detail="git diff timed out.") from e
         except OSError as e:
@@ -698,6 +711,8 @@ class DiffService:
                 )
         out: dict[str, set[bytes]] = {}
         for r in rows:
+            if not r.get("hash"):
+                continue
             out.setdefault(safe_decode(r["name"]), set()).add(bytes(r["hash"]))
         return {k: frozenset(v) for k, v in out.items()}
 

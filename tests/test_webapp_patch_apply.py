@@ -139,11 +139,36 @@ class TestPatchApply(unittest.TestCase):
             for i, patch in enumerate(cases):
                 with open(os.path.join(tmp, "p.diff"), "w") as fh:
                     fh.write(patch)
-                ok_git = subprocess.run([git, "apply", "--check", "p.diff"], cwd=tmp, capture_output=True).returncode == 0
+                ok_git = subprocess.run([git, "apply", "--check", "p.diff"], check=False, cwd=tmp, capture_output=True).returncode == 0
                 ok_ours = run([patch])["patches"][0]["status"] == "applied"
                 self.assertEqual(ok_ours, ok_git, f"case {i}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPatchApplyEncodingSafety(unittest.TestCase):
+    """BE-004 regression: surrogate-free decoding on Latin-1 blobs and malformed quoted paths."""
+
+    def test_strip_prefix_malformed_escape_and_latin1_blob_safety(self) -> None:
+        from unittest.mock import patch
+
+        from webapp.backend.services import patch_series
+        from webapp.backend.services.patch_apply import PatchApplyService, _strip_prefix
+
+        # Malformed escape does not crash unicode_escape decoding
+        cleaned = _strip_prefix('"a/drivers/\\xzz_name.c"')
+        self.assertIsNotNone(cleaned)
+        cleaned.encode("utf-8")  # strictly valid UTF-8, no surrogates
+
+        latin1_raw = b"/* comment \xff\xfe */\nint ok = 1;\n"
+        with patch("webapp.backend.services.git_reader.git_reader.read_file", return_value=(latin1_raw, False, "1" * 40)):
+            txt = PatchApplyService._reader("abc")("drivers/foo.c")
+            series_txt, _blob, _mode = patch_series._git_read("abc", "drivers/foo.c")
+        self.assertIsNotNone(txt)
+        self.assertIn("\ufffd", txt)
+        txt.encode("utf-8")  # raises UnicodeEncodeError if surrogates were emitted
+        self.assertIsNotNone(series_txt)
+        series_txt.encode("utf-8")
 
 
 if __name__ == "__main__":

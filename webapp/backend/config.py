@@ -162,8 +162,10 @@ class RepoScopedCache(dict):
             return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
+        scoped = self._k(key)
         with self._lock:
-            super().__setitem__(self._k(key), value)
+            super().__setitem__(scoped, value)
+            self._touch(scoped)
             self._evict()
 
     def __contains__(self, key: object) -> bool:
@@ -173,6 +175,14 @@ class RepoScopedCache(dict):
     def __delitem__(self, key: Any) -> None:
         with self._lock:
             super().__delitem__(self._k(key))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return super().__len__()
+
+    def clear(self) -> None:
+        with self._lock:
+            super().clear()
 
     def get(self, key: Any, default: Any = None) -> Any:
         scoped = self._k(key)
@@ -188,8 +198,10 @@ class RepoScopedCache(dict):
             return super().pop(self._k(key), *default)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
+        scoped = self._k(key)
         with self._lock:
-            value = super().setdefault(self._k(key), default)
+            value = super().setdefault(scoped, default)
+            self._touch(scoped)
             self._evict()
             return value
 
@@ -201,7 +213,21 @@ def get_backend_db_config() -> dict[str, Any]:
 
 def get_backend_server_config() -> dict[str, Any]:
     """Retrieve verified web application server bindings."""
-    return get_webapp_config()
+    cfg = dict(get_webapp_config() or {})
+    try:
+        pool_size = max(1, int(cfg.get("pool_size") or 10))
+    except (TypeError, ValueError):
+        pool_size = 10
+    try:
+        port = int(cfg.get("port") or 8000)
+    except (TypeError, ValueError):
+        port = 8000
+    if not 1 <= port <= 65535:
+        port = 8000
+    cfg["pool_size"] = pool_size
+    cfg["port"] = port
+    cfg["default_version"] = str(cfg.get("default_version") or "v3.0")
+    return cfg
 
 
 def get_backend_logging_config() -> dict[str, Any]:

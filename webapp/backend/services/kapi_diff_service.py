@@ -7,10 +7,13 @@ export is removed + added). While a catalog is still building the answer is its 
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.services import kapi_service as k
+
+logger = logging.getLogger(__name__)
 
 KINDS = ("syscalls", "exports", "params", "tracepoints", "modules")
 _CACHE: RepoScopedCache = RepoScopedCache(maxsize=16)
@@ -75,8 +78,8 @@ def _rev_key(version: str) -> str:
             cid = reader.kapi_resolve_commit_id(version, repo_id=get_active_repo_id(reader))
             if cid is not None:
                 return f"cid:{cid}"
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("kapi_resolve_commit_id failed for %s: %s", version, exc)
     return k.resolve(version)
 
 

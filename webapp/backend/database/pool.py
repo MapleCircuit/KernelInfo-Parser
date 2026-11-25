@@ -1,10 +1,10 @@
 """webapp/backend/database/pool.py - Encapsulated Pool Bridge to db_engine."""
 from __future__ import annotations
 
-from typing import Any, ContextManager
+from contextlib import AbstractContextManager
+from typing import Any
 
 from db_engine import configure_pool
-
 from webapp.backend.config import get_backend_db_config
 
 # The pool receives its connection configuration from the webapp, never the reverse.
@@ -20,7 +20,7 @@ def _reader_engine() -> Any:
     return get_db_engine(get_backend_db_config().get("engine"))
 
 
-def get_reader() -> ContextManager[Any]:
+def get_reader() -> AbstractContextManager[Any]:
     """Read-only session of the configured database engine: the one entry point of every webapp service.
 
     `with get_reader() as reader:` yields an object with the `db_engine` read API (`select_rows`, `select_one`,

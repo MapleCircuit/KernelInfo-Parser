@@ -23,10 +23,22 @@ import re
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any
 
 from fastapi import HTTPException
 
+from cache_engine import (
+    BYTES,
+    INT,
+    TEXT,
+    CacheSpace,
+    Eq,
+    In,
+    StoreSpec,
+    get_cache_engine,
+)
+from db_engine.spec import Agg, Join, Value
 from parser.git_ast.commit_relations import (  # noqa: F401 - re-exported
     BACKFILL_DONE,
     FIXES_RE,
@@ -44,10 +56,8 @@ from parser.git_ast.commit_relations import (  # noqa: F401 - re-exported
     normalize_mid,
     parse_relations,
 )
-from cache_engine import BYTES, INT, TEXT, CacheSpace, Eq, In, StoreSpec, get_cache_engine
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
-from db_engine.spec import Agg, Join, Value
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.jobs import jobs
 from webapp.backend.services.sync_service import register_refs_changed
@@ -126,6 +136,7 @@ class RelationIndex:
 
     def __init__(self) -> None:
         self._resolved: RepoScopedCache = RepoScopedCache(maxsize=20_000)
+        self._write_lock = threading.Lock()
 
     @staticmethod
     def space_name() -> str:
@@ -169,7 +180,7 @@ class RelationIndex:
 
     # ------------------------------------------------------------------ build
     def _write(self, space: CacheSpace, commits: list, rels: list, links: list) -> None:
-        with space.batch():
+        with self._write_lock, space.batch():
             space.store("commits").put_many(commits, replace=False)
             space.store("rel").put_many(rels, replace=False)
             space.store("links").put_many(links, replace=False)
@@ -183,6 +194,7 @@ class RelationIndex:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if revs is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
                                 bufsize=1 << 20)
+        feeder: threading.Thread | None = None
         if revs is not None:
             def feed() -> None:
                 try:
@@ -190,7 +202,8 @@ class RelationIndex:
                     proc.stdin.close()
                 except (OSError, ValueError):
                     pass
-            threading.Thread(target=feed, daemon=True).start()
+            feeder = threading.Thread(target=feed, daemon=True)
+            feeder.start()
         commits: list = []
         rels: list = []
         links: list = []
@@ -229,6 +242,8 @@ class RelationIndex:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+            if feeder is not None:
+                feeder.join(timeout=5.0)
             if proc.stdout:
                 proc.stdout.close()
 
@@ -320,7 +335,7 @@ class RelationIndex:
                     related.append(bytes.fromhex(full))
             elif kind == KIND_STABLE_CC:
                 out["stable_cc"].append(note or "")
-        prefixes = set(sha[:k] for k in range(8, 41))
+        prefixes = {sha[:k] for k in range(8, 41)}
         by_prefix = [(src, kind) for src, kind, prefix in rel.scan(
             Eq("p8", sha[:8]), columns=("src", "kind", "prefix")) if prefix in prefixes]
         fixed_by = [src for src, kind in by_prefix if kind == KIND_FIXES]
@@ -371,7 +386,7 @@ class RelationIndex:
         """Commits saying they are a backport of `sha` (`commit <sha> upstream.`, cherry picks)."""
         rel = self.space().store("rel")
         rows = list(rel.scan([Eq("dst", bytes.fromhex(sha)), Eq("kind", KIND_UPSTREAM)], columns=("src",)))
-        prefixes = set(sha[:k] for k in range(8, 40))
+        prefixes = {sha[:k] for k in range(8, 40)}
         rows += [(src,) for src, prefix in rel.scan([Eq("p8", sha[:8]), Eq("kind", KIND_UPSTREAM)], columns=("src", "prefix"))
                  if prefix in prefixes]
         return list(dict.fromkeys(src.hex() for (src,) in rows))
@@ -388,7 +403,7 @@ class RelationIndex:
 
 def _git(args: list[str], timeout: float = 60.0) -> str | None:
     try:
-        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, text=True,
+        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, text=True,
                              timeout=timeout, errors="replace")
     except (OSError, subprocess.SubprocessError):
         return None
@@ -397,6 +412,7 @@ def _git(args: list[str], timeout: float = 60.0) -> str | None:
 
 relation_index = RelationIndex()
 _STALE: dict[str, bool] = {}
+_STALE_LOCK = threading.Lock()
 
 
 def _job_key() -> str:
@@ -407,10 +423,13 @@ def ensure_index(wait: float = 0.0) -> dict[str, Any]:
     """Submit the (incremental) build when ref heads moved since the last one; returns the job state."""
     repo = get_active_repo_name()
     covered = relation_index.covered_heads()
-    if covered and not _STALE.get(repo, True):
+    with _STALE_LOCK:
+        is_stale = _STALE.get(repo, True)
+    if covered and not is_stale:
         return {"state": "done", "progress": {"done": 1, "total": 1, "note": "current"}}
     if covered and relation_index.is_current():
-        _STALE[repo] = False
+        with _STALE_LOCK:
+            _STALE[repo] = False
         return {"state": "done", "progress": {"done": 1, "total": 1, "note": "current"}}
     key = _job_key()
     state = jobs.get(key)
@@ -420,7 +439,8 @@ def ensure_index(wait: float = 0.0) -> dict[str, Any]:
     if state["state"] == "building" and wait > 0:
         state = jobs.wait(key, wait) or state
     if state.get("state") == "done":
-        _STALE[repo] = False
+        with _STALE_LOCK:
+            _STALE[repo] = False
     # A store from an earlier build still answers while the incremental pass runs
     if state.get("state") == "building" and covered:
         return {**state, "state": "done", "refreshing": True}
@@ -429,7 +449,8 @@ def ensure_index(wait: float = 0.0) -> dict[str, Any]:
 
 def mark_stale() -> None:
     """The `git` token changed: the next request checks the heads and refreshes incrementally."""
-    _STALE.clear()
+    with _STALE_LOCK:
+        _STALE.clear()
     _DB_READY.clear()
 
 
@@ -473,8 +494,8 @@ def relations_token() -> str:
             with get_reader() as cur:
                 row = cur.select_one("m_commit_relation", {"m": Agg("MAX", "commit_id")}) or {}
                 return f"db:{row.get('m')}"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("relations_token database check failed: %s", exc)
     return f"index:{relation_index.meta('built_at') if relation_index.built() else ''}"
 
 
@@ -613,10 +634,10 @@ def db_counts(hashes: list[str]) -> dict[str, dict[str, Any]]:
                 rows = fwd.get(cid, [])
                 out[sha] = {"fixes": sum(int(r["kind"]) == KIND_FIXES for r in rows), "fixed_by": 0, "reverted_by": 0,
                             "backports": 0, "stable_cc": any(int(r["kind"]) == KIND_STABLE_CC for r in rows)}
-            for sha in out:
+            for sha, counts in out.items():
                 for r in _reverse(cur, network_id, sha, (KIND_FIXES, KIND_REVERTS, KIND_UPSTREAM)):
                     field = {KIND_FIXES: "fixed_by", KIND_REVERTS: "reverted_by", KIND_UPSTREAM: "backports"}[r["kind"]]
-                    out[sha][field] += 1
+                    counts[field] += 1
     except Exception as exc:  # noqa: BLE001
         logger.debug("database relation counts failed: %s", exc)
         return {}

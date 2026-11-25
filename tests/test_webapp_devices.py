@@ -53,7 +53,7 @@ class TestDeviceIndex(unittest.TestCase):
 
     def test_matching(self) -> None:
         pci = entries("e1000_pci_tbl", "pci")
-        kinds = lambda ident: [k for k, _ in d.match(pci, ident)]  # noqa: E731
+        kinds = lambda ident: [k for k, _ in d.match(pci, ident)]
         self.assertEqual(kinds({"bus": "pci", "vendor": 0x8086, "device": 0x10D3}), ["exact"])
         self.assertEqual(kinds({"bus": "pci", "vendor": 0x10EC, "device": 0x8139, "cls": 0x020000}), ["exact"])
         self.assertEqual(kinds({"bus": "pci", "vendor": 0x10EC, "device": 0x8139, "cls": 0x030000}), [])  # class mask refuses

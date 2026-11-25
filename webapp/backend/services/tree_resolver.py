@@ -28,12 +28,12 @@ from pathlib import Path
 from typing import Any
 
 from core.globalstuff import SymbolLinkage, is_safe_git_rev
+from db_engine.spec import Join, finished_ref
 from parser.arch_layout import ArchLayout, path_arch
 from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
-from db_engine.spec import Join, finished_ref
-from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import hash_hex, safe_decode
+from webapp.backend.database.pool import get_reader
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class TreeResolverService:
         self._checkpoint_cache: dict[int, int] = {}
         self._parent_cache: dict[int, int] = {}
         self._max_cache_size = max_cache_size
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def clear_cache(self) -> None:
         """Clear all in-memory tree and checkpoint caches."""
@@ -57,13 +57,15 @@ class TreeResolverService:
 
     def _get_first_parent(self, commit_id: int, reader: Any) -> int | None:
         """Resolve the primary (first-parent, parent_idx=0) commit_id."""
-        if commit_id in self._parent_cache:
-            return self._parent_cache[commit_id]
+        with self._lock:
+            if commit_id in self._parent_cache:
+                return self._parent_cache[commit_id]
 
         row = reader.select_one("m_commit_parent", ["parent_commit_id"], {"commit_id": commit_id, "parent_idx": 0})
         if row:
             parent_id = row["parent_commit_id"]
-            self._parent_cache[commit_id] = parent_id
+            with self._lock:
+                self._parent_cache[commit_id] = parent_id
             return parent_id
         return None
 
@@ -76,16 +78,17 @@ class TreeResolverService:
             (checkpoint_commit_id, forward_delta_commits)
             where forward_delta_commits is ordered chronologically forward [C_chk+1, ..., commit_id].
         """
-        if commit_id in self._checkpoint_cache:
-            chk_id = self._checkpoint_cache[commit_id]
+        with self._lock:
+            cached_chk = self._checkpoint_cache.get(commit_id)
+        if cached_chk is not None:
             # Build forward path from chk_id to commit_id if cached
             curr = commit_id
             path_rev: list[int] = []
-            while curr != chk_id and curr is not None and len(path_rev) <= max_depth:
+            while curr != cached_chk and curr is not None and len(path_rev) <= max_depth:
                 path_rev.append(curr)
                 curr = self._get_first_parent(curr, reader)
-            if curr == chk_id:
-                return chk_id, list(reversed(path_rev))
+            if curr == cached_chk:
+                return cached_chk, list(reversed(path_rev))
 
         curr = commit_id
         path_rev = []
@@ -100,7 +103,8 @@ class TreeResolverService:
             curr = self._get_first_parent(curr, reader)
 
         if chk_id is not None:
-            self._checkpoint_cache[commit_id] = chk_id
+            with self._lock:
+                self._checkpoint_cache[commit_id] = chk_id
         return chk_id, list(reversed(path_rev))
 
     def resolve_tree(self, commit_id: int, reader: Any = None) -> dict[int, int]:
@@ -108,9 +112,10 @@ class TreeResolverService:
         if commit_id <= 0:
             return {}
 
-        if commit_id in self._tree_cache:
-            self._tree_cache.move_to_end(commit_id)
-            return dict(self._tree_cache[commit_id])
+        with self._lock:
+            if commit_id in self._tree_cache:
+                self._tree_cache.move_to_end(commit_id)
+                return dict(self._tree_cache[commit_id])
 
         if reader is not None:
             return self._resolve_tree_with_reader(commit_id, reader)
@@ -122,13 +127,16 @@ class TreeResolverService:
         chk_id, forward_path = self._find_nearest_checkpoint_and_path(commit_id, reader)
 
         # 1. Load baseline tree from checkpoint
-        if chk_id is not None and chk_id in self._tree_cache:
-            tree_map = dict(self._tree_cache[chk_id])
-        elif chk_id is not None:
+        tree_map: dict[int, int] | None = None
+        if chk_id is not None:
+            with self._lock:
+                if chk_id in self._tree_cache:
+                    tree_map = dict(self._tree_cache[chk_id])
+        if tree_map is None and chk_id is not None:
             rows = reader.select_rows(reader.checkpoint_tree_source(), ["fnid", "blob_id"], {"commit_id": chk_id})
             tree_map = {r["fnid"]: r["blob_id"] for r in rows if r["blob_id"] != 0}
             self._cache_tree(chk_id, dict(tree_map))
-        else:
+        elif tree_map is None:
             tree_map = {}
 
         # 2. Apply forward deltas along first-parent path
@@ -152,9 +160,10 @@ class TreeResolverService:
         return dict(tree_map)
 
     def _cache_tree(self, commit_id: int, tree_map: dict[int, int]) -> None:
-        self._tree_cache[commit_id] = tree_map
-        if len(self._tree_cache) > self._max_cache_size:
-            self._tree_cache.popitem(last=False)
+        with self._lock:
+            self._tree_cache[commit_id] = tree_map
+            if len(self._tree_cache) > self._max_cache_size:
+                self._tree_cache.popitem(last=False)
 
 
 BLOB_PATHS_TTL = 120.0
@@ -263,14 +272,14 @@ class GitTreeResolver:
 
         tree: dict[str, str] = {}
         for entry in out.split(b"\0"):
-            if not entry:
+            if not entry or b"\t" not in entry:
                 continue
             meta, _, raw_path = entry.partition(b"\t")
             parts = meta.split()
             # Submodules (type 'commit') carry no blob content
             if len(parts) != 3 or parts[1] != b"blob":
                 continue
-            tree[raw_path.decode("utf-8", errors="surrogateescape")] = parts[2].decode("ascii")
+            tree[raw_path.decode("utf-8", errors="replace")] = parts[2].decode("ascii")
 
         with self._lock:
             self._tree_cache[sha] = tree
@@ -355,12 +364,14 @@ class GitTreeResolver:
             return None
         sizes: dict[str, int] = {}
         for entry in out.split(b"\0"):
+            if not entry or b"\t" not in entry:
+                continue
             meta, _, raw_path = entry.partition(b"\t")
             parts = meta.split()
             if len(parts) != 4 or parts[1] != b"blob":
                 continue
             try:
-                sizes[raw_path.decode("utf-8", errors="surrogateescape")] = int(parts[3])
+                sizes[raw_path.decode("utf-8", errors="replace")] = int(parts[3])
             except ValueError:
                 continue
 
@@ -543,7 +554,7 @@ def definition_arch(version_name: str, arch: str | None) -> tuple[str, ArchScope
     for candidate in dict.fromkeys((arch or DEFAULT_DEFINITION_ARCH, DEFAULT_DEFINITION_ARCH, FALLBACK_DEFINITION_ARCH)):
         try:
             info = KconfigService().resolve_arch(version_name, candidate)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - fallback to next ARCH candidate
             logger.debug("ARCH %s not resolvable at %s: %s", candidate, version_name, exc)
             continue
         layout = arch_layout_service.layout(info["rev"], info["arch"])

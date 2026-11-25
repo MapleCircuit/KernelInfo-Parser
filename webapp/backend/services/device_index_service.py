@@ -13,19 +13,31 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
 from parser import kapi_catalog as kc
-from parser.kapi_catalog import parse_entry, to_int  # noqa: F401 - re-exported for tests
+from parser.kapi_catalog import parse_entry  # noqa: F401 - re-exported for tests
 
 # entries_of, parse_defines, table_initializer are re-exported: the device index readers (tests)
-from parser.kapi_facts import entries_of, parse_defines, quoted_includes, split_args, string_value, table_initializer  # noqa: F401
+from parser.kapi_facts import (  # noqa: F401
+    entries_of,
+    parse_defines,
+    split_args,
+    string_value,
+    table_initializer,
+)
 from webapp.backend.config import get_active_repo_name
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import jobs
-from webapp.backend.services.kapi_service import FileCache, _db_catalog, resolve, revision_records
+from webapp.backend.services.kapi_service import (
+    FileCache,
+    _db_catalog,
+    resolve,
+    revision_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +137,8 @@ def _pci_match(e: dict[str, Any], ident: dict[str, Any]) -> str | None:
         if e.get(key) not in (None, PCI_ANY) and _field_ok(e[key], ident.get(key)) is not True:
             return None
     mask = e.get("mask") or 0
-    if mask:
-        if ident.get("cls") is None or ((e.get("cls") or 0) ^ ident["cls"]) & mask:
-            return None
+    if mask and (ident.get("cls") is None or ((e.get("cls") or 0) ^ ident["cls"]) & mask):
+        return None
     if v in (None, PCI_ANY) and d in (None, PCI_ANY):
         return "class" if mask else None
     if d in (None, PCI_ANY):
@@ -150,9 +161,8 @@ def match(entries: list[dict[str, Any]], ident: dict[str, Any]) -> list[tuple[st
         elif bus == "of":
             if e.get("compatible") and e["compatible"] == ident.get("compatible"):
                 kind = "exact"
-        elif bus == "acpi":
-            if e.get("acpi_id") and e["acpi_id"].upper() == str(ident.get("acpi_id", "")).upper():
-                kind = "exact"
+        elif bus == "acpi" and e.get("acpi_id") and e["acpi_id"].upper() == str(ident.get("acpi_id", "")).upper():
+            kind = "exact"
         if kind:
             out.append((kind, e))
     rank = {"exact": 0, "subsystem": 1, "vendor": 2, "class": 3}
@@ -161,7 +171,10 @@ def match(entries: list[dict[str, Any]], ident: dict[str, Any]) -> list[tuple[st
 
 
 def _module_of(kidx: dict[str, Any] | None, path: str) -> dict[str, Any]:
-    from webapp.backend.services.kbuild_index_service import objects_for_file, required_symbols
+    from webapp.backend.services.kbuild_index_service import (
+        objects_for_file,
+        required_symbols,
+    )
     if not kidx:
         return {"module": os.path.splitext(os.path.basename(path))[0], "options": [], "expr": None}
     objs = objects_for_file(kidx, path)

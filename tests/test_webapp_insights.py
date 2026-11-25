@@ -68,8 +68,9 @@ class TestReleaseStatsSources(unittest.TestCase):
 
     def setUp(self) -> None:
         from unittest import mock
-        from tests.db_fixtures import patch_reader
+
         from parser.git_ast import release_stats as rst
+        from tests.db_fixtures import patch_reader
         from webapp.backend.services import maintainer_service
         self._Repo.setUp(self)
         rst.ingest(self.db, self.dir, repo_id=1)
@@ -172,11 +173,10 @@ class TestReleaseStatsSources(unittest.TestCase):
         self.assertEqual(first_names, ["Cy D", "Neo N"])
 
     def test_db_merge_window(self) -> None:
+        import contextlib
         import json
-        try:
+        with contextlib.suppress(Exception):
             self.db.create_table([D.m_release_pull])
-        except Exception:
-            pass
         self.db.delete_rows("m_release_pull", None, all_rows=True)
         git_mw = ins.compute_merge_window("v3.1")
         self.assertEqual(git_mw["source"], "git")
@@ -217,14 +217,14 @@ class TestReleaseStatsSources(unittest.TestCase):
         self.assertEqual(mw_state["result"]["source"], "database")
 
     def test_health_from_db_and_m_release_section_health(self) -> None:
+        import contextlib
         import json
-        from parser.maintainer_ast.maintainer_parser import MaintainerParser
-        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 
-        try:
+        from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+        from parser.maintainer_ast.maintainer_parser import MaintainerParser
+
+        with contextlib.suppress(Exception):
             self.db.create_table([D.m_release_section_health])
-        except Exception:
-            pass
         self.db.delete_rows("m_release_section_health", None, all_rows=True)
         raw_maint = (
             "FOO SUBSYSTEM\n"
@@ -310,10 +310,10 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
         from pathlib import Path
         if not shutil.which("git"):
             raise unittest.SkipTest("git is not installed")
-        from tests.test_commit_relations import ENV, Store, git
+        from tests.test_commit_relations import Store, git
         cls.dir = Path(tempfile.mkdtemp(prefix="health-"))
         cls.cache = tempfile.TemporaryDirectory()
-        g = lambda *a: git(cls.dir, *a)  # noqa: E731
+        g = lambda *a: git(cls.dir, *a)
         cls.g = staticmethod(g)
 
         def commit(author: str, email: str, msg: str, files: dict[str, str | None] | None = None) -> None:
@@ -368,7 +368,6 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
         """What the parser stores for v1.0 -> v1.1-rc1 -> v1.1 -> v1.2: persons, authors, parents, the commits'
         files (renames as new + old name, merges none), trailers, ingest states, and the v1.2 tree's
         m_maintainer_file rows."""
-        import main
         import pipeline.blob_reuse
         from parser.git_ast import GitCommitParser
         db = cls.store.db
@@ -405,11 +404,11 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
                 else:
                     f = fnid(parts[1])
                     db.insert_rows("m_commit_file", CF_COLUMNS, [(cid, f, 1, 0 if parts[0] == "A" else f, 1, parts[0])])
-        tag = lambda t: ids[cls.g("rev-parse", f"{t}^{{commit}}").strip()]  # noqa: E731
+        tag = lambda t: ids[cls.g("rev-parse", f"{t}^{{commit}}").strip()]
         chain = [("v1.0", None), ("v1.1-rc1", "v1.0"), ("v1.1", "v1.1-rc1"), ("v1.2", "v1.1")]
         db.insert_rows("m_ingest_state", ["network_id", "commit_id", "status", "updated_at", "base_commit_id"],
                        [(1, tag(t), 2, 0, tag(b) if b else 0) for t, b in chain])
-        secs, matcher = cls.sections()
+        _secs, matcher = cls.sections()
         for path in cls.g("ls-tree", "-r", "--name-only", "v1.2").split():
             for s in matcher.match_file(path):
                 if s.name != "THE REST":
@@ -417,6 +416,7 @@ class TestSubsystemHealthFromDatabase(unittest.TestCase):
 
     def setUp(self) -> None:
         from unittest import mock
+
         from webapp.backend.services.jobs import JobManager
         self.patches = [
             mock.patch.dict(os.environ, {"KERNELINFO_CACHE_DIR": self.cache.name}),
@@ -695,7 +695,7 @@ F:\t*/
 
         tmp = Path(tempfile.mkdtemp(prefix="mw-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        g = lambda *a: git(tmp, *a)  # noqa: E731
+        g = lambda *a: git(tmp, *a)
         maint = (
             "Maintainers List\n----------------\n\n"
             "EDAC\nM:\tBorislav Petkov <bp@alien8.de>\nS:\tMaintained\nF:\tdrivers/edac/\n\n"
@@ -818,6 +818,7 @@ F:\t*/
         import tempfile
         from pathlib import Path
         from unittest import mock
+
         from webapp.backend.services import commit_query as cq
         if not shutil.which("git"):
             raise unittest.SkipTest("git is not installed")
@@ -919,7 +920,9 @@ F:\t*/
         import tempfile
         from pathlib import Path
         from unittest import mock
+
         from fastapi.testclient import TestClient
+
         from webapp.backend.app import create_app
 
         if not shutil.which("git"):
@@ -1062,12 +1065,12 @@ class TestSecurityInsights(unittest.TestCase):
         self.assertIsNone(earliest_final_release([{"mainline": "v6.2-rc1", "stable": None}, None], tags_with_final))
 
     def test_security_endpoint_introduced_release_and_cvss_filtering(self) -> None:
-        import json
         from unittest import mock
+
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from webapp.backend.routers import insights as insights_router
-        from webapp.backend.services import cve_service as cs
 
         app = FastAPI()
         app.include_router(insights_router.router)
@@ -1160,6 +1163,7 @@ class TestSecurityInsights(unittest.TestCase):
 
     def test_release_report_introduced_release_rc_only_and_final(self) -> None:
         from unittest import mock
+
         from webapp.backend.services import cve_service as cs
 
         c_rc = "1" * 40
@@ -1227,6 +1231,7 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest import mock
+
         from parser.git_ast.release_order import series_ord_for, series_track_for
         from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
         from parser.maintainer_ast.maintainer_parser import MaintainerParser
@@ -1239,7 +1244,7 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
 
         tmp = Path(tempfile.mkdtemp(prefix="subsys-delta-"))
         self.addCleanup(shutil.rmtree, tmp, True)
-        g = lambda *a: git(tmp, *a)  # noqa: E731
+        g = lambda *a: git(tmp, *a)
 
         maint_v1 = (
             "FOO DRIVER\nM:\tAnn Dev <ann@x.org>\nS:\tMaintained\nF:\tdrivers/foo/\n\n"
@@ -1353,6 +1358,7 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
     def test_precomputed_health_keeps_earlier_releases_across_maintainers_evolution(self) -> None:
         import json
         from unittest import mock
+
         from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
         from parser.maintainer_ast.maintainer_parser import MaintainerParser
         from tests.db_fixtures import make_db, patch_reader
@@ -1393,9 +1399,9 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
         tc = {"v1.0": "0" * 40, "v1.1": h1, "v1.2": h2}
         with patch_reader(db), \
                 mock.patch.object(rs, "tag_commits", return_value=tc), \
-                mock.patch.object(rs, "previous", side_effect=lambda t: {"v1.1": "v1.0", "v1.2": "v1.1"}.get(t)):
-            with get_reader() as cur:
-                pre, unans = ins._read_precomputed_health(cur, 1, ["v1.1", "v1.2"], secs_v2, tc, target_tag="v1.2")
+                mock.patch.object(rs, "previous", side_effect=lambda t: {"v1.1": "v1.0", "v1.2": "v1.1"}.get(t)), \
+                get_reader() as cur:
+            pre, unans = ins._read_precomputed_health(cur, 1, ["v1.1", "v1.2"], secs_v2, tc, target_tag="v1.2")
         # v1.1 must NOT be invalidated just because NEW SUBSYSTEM was added in v1.2!
         self.assertEqual(unans, [])
         self.assertIn("v1.1", pre)
@@ -1407,6 +1413,7 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
 
     def test_load_maintainers_skips_db_for_unparsed_and_latest(self) -> None:
         from unittest import mock
+
         from tests.db_fixtures import make_db, patch_reader
 
         db = make_db("sqlite", tables=[D.m_git_ref, D.m_commit, D.m_ingest_state])
@@ -1422,13 +1429,14 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
 
     def test_compute_subsystem_health_reraises_job_cancelled(self) -> None:
         from unittest import mock
+
         from webapp.backend.services.jobs import JobCancelled
 
         with mock.patch.object(ins, "_health_window", return_value=["v1.1"]), \
                 mock.patch.object(ins, "_maintainer_data", return_value=([], None)), \
-                mock.patch.object(ins, "health_from_db", side_effect=JobCancelled()):
-            with self.assertRaises(JobCancelled):
-                ins.compute_subsystem_health("v1.1", 1)
+                mock.patch.object(ins, "health_from_db", side_effect=JobCancelled()), \
+                self.assertRaises(JobCancelled):
+            ins.compute_subsystem_health("v1.1", 1)
 
     def test_subsystem_health_cache_key_changes_with_window_tags(self) -> None:
         from unittest import mock

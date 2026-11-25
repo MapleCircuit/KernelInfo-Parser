@@ -54,15 +54,15 @@ def strip_fences(text: str, rel_path: str, bad_fences: list[str]) -> str:
         bad_fences.append(f"{rel_path}: mismatched {FENCE_START}/{FENCE_END} ({starts} vs {ends})")
     if (starts or ends) and rel_path not in ALLOWED_FENCE_PATHS:
         bad_fences.append(f"{rel_path}: {FENCE_START} is not permitted here")
-    text = re.sub(r"/\*\s*ui-scale-exempt-start.*?\*/.*?/\*\s*ui-scale-exempt-end.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"<!--\s*ui-scale-exempt-start.*?-->.*?<!--\s*ui-scale-exempt-end.*?-->", "", text, flags=re.S)
+    text = re.sub(r"/\*\s*ui-scale-exempt-start.*?\*/.*?/\*\s*ui-scale-exempt-end.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"<!--\s*ui-scale-exempt-start.*?-->.*?<!--\s*ui-scale-exempt-end.*?-->", "", text, flags=re.DOTALL)
     return text
 
 
 def scan_css_text(text: str, rel_path: str, bad_fences: list[str]) -> list[str]:
     cleaned = strip_fences(text, rel_path, bad_fences)
     cleaned = VAR_TOKEN_FALLBACK.sub("", cleaned)
-    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.S)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
     return [f"{rel_path}: {m.group(0).strip()}" for m in CSS_LITERAL_FONT_SIZE.finditer(cleaned)]
 
 
@@ -106,7 +106,7 @@ class TestUiScale(unittest.TestCase):
 
         html = strip_fences(read(INDEX_HTML), "index.html", bad_fences)
         html = VAR_TOKEN_FALLBACK.sub("", html)
-        html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+        html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
         for m in JS_INLINE_FONT_SIZE.finditer(html):
             stray.append(f"index.html: {m.group(0).strip()}")
 
@@ -118,7 +118,7 @@ class TestUiScale(unittest.TestCase):
         for f in sorted(os.listdir(CSS)):
             if not f.endswith(".css") or f in ("variables.css", "codeview.css"):
                 continue
-            text = re.sub(r"/\*.*?\*/", "", read(os.path.join(CSS, f)), flags=re.S)
+            text = re.sub(r"/\*.*?\*/", "", read(os.path.join(CSS, f)), flags=re.DOTALL)
             for tok in ("--code-font-size", "--code-row-height"):
                 if tok in text:
                     stray.append(f"css/{f}: uses {tok}")

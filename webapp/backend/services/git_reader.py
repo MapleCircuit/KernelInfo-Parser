@@ -7,12 +7,13 @@ and directory checks in the Linux Git repository, using a small pool of persiste
 from __future__ import annotations
 
 import atexit
-from collections.abc import Iterator
-from contextlib import contextmanager
 import logging
-from pathlib import Path
 import subprocess
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 from core.globalstuff import is_safe_git_spec
 from webapp.backend.config import LINUX_REPO_DIR, get_repo_dir
@@ -67,11 +68,11 @@ class GitReader:
                     self._proc.stderr.close()
                 self._proc.terminate()
                 self._proc.wait(timeout=1.0)
-            except Exception:
+            except (OSError, subprocess.SubprocessError, ValueError):
                 try:
                     self._proc.kill()
-                except Exception:
-                    pass
+                except OSError as exc:
+                    logger.debug("Failed to kill git cat-file process: %s", exc)
             finally:
                 self._proc = None
 
@@ -114,7 +115,7 @@ class GitReader:
                 assert proc.stdin is not None
                 assert proc.stdout is not None
 
-                proc.stdin.write(f"{target_spec}\n".encode("utf-8"))
+                proc.stdin.write(f"{target_spec}\n".encode())
                 proc.stdin.flush()
 
                 header_bytes = proc.stdout.readline()
@@ -133,6 +134,8 @@ class GitReader:
                 sha1 = parts[0]
                 obj_type = parts[1]
                 size = int(parts[2])
+                if size < 0:
+                    raise ValueError(f"Negative git object size: {size}")
 
                 # Read exact byte payload
                 data = bytearray()
@@ -143,7 +146,9 @@ class GitReader:
                     data.extend(chunk)
 
                 # Consume the trailing newline emitted by git cat-file --batch
-                _ = proc.stdout.read(1)
+                trailing = proc.stdout.read(1)
+                if len(trailing) < 1:
+                    raise BrokenPipeError("Unexpected EOF reading trailing newline")
 
                 return (obj_type, bytes(data), sha1)
 
@@ -195,9 +200,13 @@ class _RepoReaders:
 
     @contextmanager
     def checkout(self) -> Iterator[GitReader]:
+        deadline = time.monotonic() + 30.0
         with self._cond:
             while not self._idle and len(self.readers) >= self.size:
-                self._cond.wait()
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise RuntimeError("Timed out waiting for git reader")
+                self._cond.wait(timeout=rem)
             if self._idle:
                 reader = self._idle.pop()
             else:

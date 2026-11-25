@@ -17,10 +17,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.DBLayout import m_file_reference
-from db_engine import MockDB
 from core import ingest_state as I
-from core.DBLayout import TABLES
+from core.DBLayout import TABLES, m_file_reference
+from db_engine import MockDB
 from parser import kbuild_symbols as ks
 from parser.kbuild_parser import KbuildParser
 from tests.db_fixtures import patch_reader

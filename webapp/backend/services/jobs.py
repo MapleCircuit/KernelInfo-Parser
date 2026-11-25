@@ -26,7 +26,8 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
@@ -44,25 +45,39 @@ class JobCancelled(Exception):
 class _Progress:
     """Callable handed to a job function: ``progress(done, total, note)``."""
 
-    def __init__(self, job: "_Job") -> None:
+    def __init__(self, job: _Job) -> None:
         self._job = job
         self.cancelled = job.cancel_event
 
     def __call__(self, done: int | None = None, total: int | None = None, note: str | None = None) -> None:
         if self.cancelled.is_set():
             raise JobCancelled()
-        p = self._job.progress
+        p = dict(self._job.progress)
         if done is not None:
             p["done"] = int(done)
         if total is not None:
             p["total"] = int(total)
         if note is not None:
             p["note"] = str(note)[:200]
+        self._job.progress = p
 
 
 class _Job:
-    __slots__ = ("key", "fn", "cache", "cache_key", "ctx", "state", "progress", "started_at",
-                 "finished_at", "result", "error", "cancel_event", "done_event")
+    __slots__ = (
+        "cache",
+        "cache_key",
+        "cancel_event",
+        "ctx",
+        "done_event",
+        "error",
+        "finished_at",
+        "fn",
+        "key",
+        "progress",
+        "result",
+        "started_at",
+        "state",
+    )
 
     def __init__(self, key: str, fn: Callable[[_Progress], Any], cache: Any, cache_key: str | None,
                  ctx: contextvars.Context) -> None:
@@ -103,7 +118,7 @@ class JobManager:
         self._lock = threading.Lock()
         self._jobs: dict[str, _Job] = {}          # building (queued or running)
         self._done: OrderedDict[str, _Job] = OrderedDict()  # finished: results (LRU) and failures (TTL)
-        self._queue: "queue.Queue[_Job | None]" = queue.Queue()
+        self._queue: queue.Queue[_Job | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._shutdown = False
 
@@ -114,7 +129,8 @@ class JobManager:
         try:
             from core.config import get_webapp_config
             return max(1, int((get_webapp_config().get("jobs") or {}).get("workers", 2)))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - config fallback
+            logger.debug("Using default worker count: %s", exc)
             return 2
 
     def _ensure_workers(self) -> None:
@@ -143,7 +159,7 @@ class JobManager:
             except HTTPException as exc:
                 self._finish(job, error=str(exc.detail))
                 continue
-            except Exception as exc:  # noqa: BLE001 - a job failure is reported, never raised
+            except Exception as exc:
                 logger.warning("Background job %s failed: %s", job.key, exc, exc_info=True)
                 self._finish(job, error=f"{type(exc).__name__}: {exc}")
                 continue
@@ -158,14 +174,14 @@ class JobManager:
             self._finish(job, result=result)
 
     def _finish(self, job: _Job, result: Any = None, error: str | None = None) -> None:
-        job.finished_at = time.time()
-        if error is None:
-            job.state = "done"
-            job.result = result
-        else:
-            job.state = "failed"
-            job.error = error
         with self._lock:
+            job.finished_at = time.time()
+            if error is None:
+                job.result = result
+                job.state = "done"
+            else:
+                job.error = error
+                job.state = "failed"
             self._jobs.pop(job.key, None)
             self._done.pop(job.key, None)
             self._done[job.key] = job
@@ -229,14 +245,6 @@ class JobManager:
         job.done_event.wait(timeout)
         return job.snapshot(with_result=True)
 
-    def run_sync(self, key: str, fn: Callable[[_Progress], Any], *, cache: Any = None,
-                 cache_key: str | None = None, timeout: float = 30.0) -> Any | None:
-        """Submit (or join) a job and wait for it: the result, or None when it failed or is still building."""
-        state = self.submit(key, fn, cache=cache, cache_key=cache_key)
-        if state["state"] == "building":
-            state = self.wait(key, timeout) or state
-        return state.get("result") if state.get("state") == "done" else None
-
     def cancel(self, key: str) -> bool:
         with self._lock:
             job = self._jobs.get(key)
@@ -255,9 +263,10 @@ class JobManager:
         with self._lock:
             self._shutdown = True
             pending = list(self._jobs.values())
+            threads = list(self._threads)
         for job in pending:
             job.cancel_event.set()
-        for _ in self._threads:
+        for _ in threads:
             self._queue.put(None)
 
     def reset(self) -> None:

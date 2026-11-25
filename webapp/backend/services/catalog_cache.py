@@ -10,14 +10,17 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import threading
 import time
-from typing import Any, Callable, Generic, TypeVar
+from collections.abc import Callable
+from typing import Any, Generic, TypeVar
 
 from fastapi import Request, Response
 
 from webapp.backend.services.sync_service import sync_service
 
+logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Bodies below this size are sent as they are (GZipMiddleware's threshold)
@@ -35,14 +38,18 @@ def digest(data: bytes) -> str:
 
 def dumps(obj: Any) -> bytes:
     """JSON exactly as FastAPI's JSONResponse renders it."""
-    return json.dumps(obj, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")).encode("utf-8")
+    try:
+        return json.dumps(obj, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        logger.exception("Failed to serialize catalog JSON body")
+        raise
 
 
 class JsonBody:
     """A JSON response body encoded once: raw bytes, gzip (level 9, once) and its ETag (content digest
     unless given)."""
 
-    __slots__ = ("raw", "gz", "etag")
+    __slots__ = ("etag", "gz", "raw")
 
     def __init__(self, obj: Any, etag: str | None = None) -> None:
         self.raw = dumps(obj)
@@ -55,8 +62,7 @@ def client_etags(request: Request) -> list[str]:
     tags = []
     for part in request.headers.get("if-none-match", "").split(","):
         part = part.strip()
-        if part.startswith("W/"):
-            part = part[2:]
+        part = part.removeprefix("W/")
         part = part.strip('"')
         if part:
             tags.append(part)
@@ -111,7 +117,11 @@ class TokenCache(Generic[T]):
                 entry = self._entries.get(key)
             if self._current(entry, tokens):
                 return entry[2]  # built by the request this one waited for
-            value = build(entry[2] if entry else None)
+            try:
+                value = build(entry[2] if entry else None)
+            except Exception:
+                logger.exception("TokenCache build failed for key %r", key)
+                raise
             with self._lock:
                 self._entries[key] = (tokens, time.monotonic(), value)
             return value

@@ -6,6 +6,7 @@ memory stream, which every API call paid twice.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 
@@ -67,6 +68,7 @@ class SlidingWindowRateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.hits: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
@@ -77,12 +79,23 @@ class SlidingWindowRateLimiter:
         client_ip = client[0] if client else "unknown"
         now = time.monotonic()
         cutoff = now - self.window_seconds
+        retry_after: int | None = None
 
-        timestamps = self.hits.setdefault(client_ip, deque())
-        while timestamps and timestamps[0] <= cutoff:
-            timestamps.popleft()
-        if len(timestamps) >= self.max_requests:
-            retry_after = int(timestamps[0] + self.window_seconds - now) + 1
+        with self._lock:
+            timestamps = self.hits.setdefault(client_ip, deque())
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+            if len(timestamps) >= self.max_requests:
+                retry_after = int(timestamps[0] + self.window_seconds - now) + 1
+            else:
+                timestamps.append(now)
+
+            # Periodic cleanup of expired IP keys to prevent unbounded memory growth
+            if len(self.hits) > 2000:
+                for ip in [ip for ip, tss in self.hits.items() if not tss or tss[-1] <= cutoff]:
+                    self.hits.pop(ip, None)
+
+        if retry_after is not None:
             response = JSONResponse(
                 status_code=429,
                 content={"detail": "Too many requests. Please slow down."},
@@ -90,12 +103,6 @@ class SlidingWindowRateLimiter:
             )
             await response(scope, receive, send)
             return
-        timestamps.append(now)
-
-        # Periodic cleanup of expired IP keys to prevent unbounded memory growth
-        if len(self.hits) > 2000:
-            for ip in [ip for ip, tss in self.hits.items() if not tss or tss[-1] <= cutoff]:
-                self.hits.pop(ip, None)
         await self.app(scope, receive, send)
 
 

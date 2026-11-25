@@ -25,7 +25,13 @@ from core.config import (
     resolve_repo_features,
     resolve_repo_insights,
 )
-from parser.git_ast.release_order import PREFIXED_SERIES, PREFIXED_TAG_RE, parse_tag, release_key
+from db_engine.spec import Join, finished_ref, gt
+from parser.git_ast.release_order import (
+    PREFIXED_SERIES,
+    PREFIXED_TAG_RE,
+    parse_tag,
+    release_key,
+)
 from webapp.backend.config import (
     get_active_repo_name,
     get_active_repository,
@@ -42,7 +48,6 @@ from webapp.backend.database.helpers import (
     safe_decode,
 )
 from webapp.backend.database.pool import get_reader
-from db_engine.spec import Join, finished_ref, gt
 from webapp.backend.security.git import safe_rev
 from webapp.backend.services.catalog_cache import (
     JsonBody,
@@ -114,6 +119,7 @@ def _git_lines(args: list[str], timeout: float = 10.0) -> list[str]:
             cwd=str(get_repo_dir()),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -315,6 +321,7 @@ def _run_git_walk(args: list[str], stdin_text: str | None = None) -> list[str] |
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            errors="replace",
         )
     except OSError:
         return None
@@ -566,6 +573,7 @@ def get_branch_tags(
 
 # Progress of the startup warm-up, reported by GET /api/system/ingest (webapp/API.md section 4.1)
 PREWARM_STATE: dict[str, Any] = {"state": "idle", "started_at": None, "finished_at": None}
+_PREWARM_STOP = threading.Event()
 
 
 def prewarm_catalog() -> None:
@@ -581,6 +589,8 @@ def prewarm_catalog() -> None:
 
 def _prewarm_repositories() -> None:
     for repo in list_repositories():
+        if _PREWARM_STOP.is_set():
+            break
         name = repo.get("name")
         if not name or not resolve_repo_path(repo).exists():
             continue
@@ -604,8 +614,14 @@ def _prewarm_repositories() -> None:
             reset_active_repository(token)
 
 
+def cancel_prewarm() -> None:
+    """Signal the startup warm-up loop to stop before the next repository (server shutdown)."""
+    _PREWARM_STOP.set()
+
+
 def start_prewarm() -> threading.Thread:
     """Run prewarm_catalog() in a daemon thread (does not delay startup)."""
+    _PREWARM_STOP.clear()
     thread = threading.Thread(target=prewarm_catalog, name="kip-prewarm", daemon=True)
     thread.start()
     return thread

@@ -16,9 +16,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from db_engine.spec import AnyOf, Join
 from webapp.backend.database.helpers import get_active_network_id, safe_decode
 from webapp.backend.database.pool import get_reader
-from db_engine.spec import AnyOf, Join
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,9 @@ def _from_trailers(mid: str, tid: int) -> list[dict[str, Any]]:
     mids = [mid] if mid else []
     if tid:
         try:
-            from webapp.backend.services.mailing_list_service import mailing_list_service
+            from webapp.backend.services.mailing_list_service import (
+                mailing_list_service,
+            )
             thread = mailing_list_service.get_thread(tid, mid_hint=mid)
             for m in (thread.get("messages") or [])[:MAX_THREAD_MIDS]:
                 if m.get("message_id"):

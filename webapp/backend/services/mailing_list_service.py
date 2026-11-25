@@ -6,12 +6,12 @@ hierarchies, email beautification, search querying, and graceful offline fallbac
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 import logging
 import re
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import Any
 
 from core.config import get_mailing_list_config
@@ -125,7 +125,7 @@ class MailingListService:
                 self._client = MailingListClient()
                 self._client_init_error = ""
                 return self._client
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self._client_init_error = str(exc)
                 logger.warning("Could not initialize MailingListClient: %s", exc)
                 return None
@@ -157,7 +157,8 @@ class MailingListService:
                 is_healthy = True
             else:
                 is_healthy = client._check_health(timeout=1.5)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MailingListClient health check failed: %s", exc)
             is_healthy = False
 
         return {
@@ -222,7 +223,7 @@ class MailingListService:
                     self._email_cache.popitem(last=False)
 
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Error retrieving email %s: %s", key, exc)
             return {
                 "available": False,
@@ -302,7 +303,7 @@ class MailingListService:
 
                 with self._lock:
                     self._live_put(self._thread_cache, tid, cached_res, self._max_thread_cache)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("Error retrieving thread %d: %s", tid, exc)
                 return {
                     "available": False,
@@ -521,7 +522,7 @@ class MailingListService:
                 self._live_put(self._search_cache, cache_key, result, self._max_search_cache)
 
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Error executing mailing list search '%s': %s", clean_q, exc)
             return {
                 "available": False,

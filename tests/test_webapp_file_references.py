@@ -109,7 +109,8 @@ class TestResolveInclude(unittest.TestCase):
     def resolve(self, db, header: str = "<linux/lockd/nlm.h>") -> dict:
         fss._INCLUDE_CACHE.clear()
         self.addCleanup(fss._INCLUDE_CACHE.clear)
-        from webapp.backend.services import arch_layout_service as als, tree_resolver as tr
+        from webapp.backend.services import arch_layout_service as als
+        from webapp.backend.services import tree_resolver as tr
         with patch_reader(db), \
                 mock.patch.object(fss, "get_version_info", return_value=(1, "2.3.35pre2")), \
                 mock.patch.object(tr, "definition_arch", return_value=("i386", None, 32)), \

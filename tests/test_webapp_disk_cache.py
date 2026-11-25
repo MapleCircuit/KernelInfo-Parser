@@ -98,5 +98,59 @@ class TestDiskCache(unittest.TestCase):
         self.assertEqual(kconfig_service._disk_load("cd" * 20), {"model": {"version": "x"}})
 
 
+class TestDiskCacheFaultInjectionAndSyncInvalidation(unittest.TestCase):
+    """Verify BE-016 corrupt-gzip/NaN handling and BE-017 parse-dependent cache clearing."""
+
+    def test_corrupt_gzip_unlinked_and_nan_rejected(self) -> None:
+        import gzip
+        from unittest.mock import patch
+
+        from webapp.backend.services.disk_cache import DiskCache
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "webapp.backend.services.disk_cache.cache_root", return_value=Path(tmp)
+        ):
+            cache = DiskCache("fault")
+            self.assertTrue(cache.put("ok", {"v": 1}))
+            self.assertFalse(cache.put("nan", {"bad": float("nan")}))
+
+            corrupt_path = cache.path_for("broken")
+            corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+            # Valid gzip header followed by garbage triggers zlib.error on read
+            with gzip.open(corrupt_path, "wb") as fh:
+                fh.write(b'{"a": 1}')
+            raw = corrupt_path.read_bytes()
+            corrupt_path.write_bytes(raw[:12] + b"\xff\xff\x00\x00")
+            self.assertTrue(corrupt_path.exists())
+            self.assertIsNone(cache.get("broken"))
+            self.assertFalse(corrupt_path.exists())
+
+    def test_clear_parse_dependent_caches_clears_secondary_caches(self) -> None:
+        from webapp.backend.services import (
+            filesystem_service,
+            hover_service,
+            kapi_diff_service,
+            outline_service,
+            scope_service,
+            sync_service,
+        )
+
+        filesystem_service._OBJECT_CACHE["__test__"] = {"x": 1}
+        hover_service.hover_service._cache[("sha", "sym", "x86", "")] = {"found": True}
+        scope_service.scope_service._models[("v3.0", "x86")] = object()  # type: ignore[assignment]
+        scope_service.scope_service._answers[("v3.0", "x86", "CONFIG_X")] = {}
+        outline_service.outline_service._cache[("sha", "a.c")] = {}
+        kapi_diff_service._CACHE[("a", "b")] = {}
+
+        sync_service.clear_parse_dependent_caches()
+
+        self.assertNotIn("__test__", filesystem_service._OBJECT_CACHE)
+        self.assertEqual(len(hover_service.hover_service._cache), 0)
+        self.assertEqual(len(scope_service.scope_service._models), 0)
+        self.assertEqual(len(scope_service.scope_service._answers), 0)
+        self.assertEqual(len(outline_service.outline_service._cache), 0)
+        self.assertEqual(len(kapi_diff_service._CACHE), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

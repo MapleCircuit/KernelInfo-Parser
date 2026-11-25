@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -146,7 +143,7 @@ class TestCveVersions(unittest.TestCase):
         self.entries = cs.parse_record(cna_record("CVE-2024-00001"))["entries"]
 
     def test_entries_answer_on_their_own(self) -> None:
-        st = lambda v: cs.version_status(self.entries, v)  # noqa: E731
+        st = lambda v: cs.version_status(self.entries, v)
         self.assertEqual(st("3.0"), "unaffected")        # before the bug
         self.assertEqual(st("5.4.100"), "unaffected")    # the stable series before the backported bug
         self.assertEqual(st("5.4.265"), "affected")      # backported bug, not fixed yet
@@ -268,7 +265,7 @@ class TestCveFromDatabase(unittest.TestCase):
         ctx.tags.side_effect = lambda f: {"mainline": "v6.5"} if f == FIX else {"stable": "v6.1.50"}
         ctx.applies.return_value = True
         ctx.contains.side_effect = lambda f: f in (INTRO, STABLE_FIX)  # STABLE_FIX is in v6.1.55, but FIX is not
-        state, basis = cs.affects(rec, "v6.1.55", ctx)
+        state, _basis = cs.affects(rec, "v6.1.55", ctx)
         self.assertEqual(state, "fixed")
 
     def test_not_ingested(self) -> None:
@@ -476,6 +473,7 @@ class TestCveCatalogAndEndpoints(unittest.TestCase):
     def test_router_list_before_detail_and_feature_gate(self) -> None:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from webapp.backend.routers import cve as cve_router
 
         app = FastAPI()
@@ -550,6 +548,25 @@ class TestCveCatalogAndEndpoints(unittest.TestCase):
             # Stale cve_head falls back to release_report / ensure_release_index
             self.db.update_rows("m_cve_release_state", {"cve_head": bytes.fromhex("a" * 40)}, {"segment_id": 10})
             self.assertIsNone(cs.db_release_report("v6.6"))
+
+    def test_source_cache_locking_under_concurrency(self) -> None:
+        import threading
+
+        cs._SOURCE.update(checked=0.0, row=None)
+        results: list[dict | None] = []
+        barrier = threading.Barrier(4)
+
+        def call() -> None:
+            barrier.wait()
+            results.append(cs.source(fresh=True))
+
+        with patch("webapp.backend.services.cve_service.get_reader", side_effect=RuntimeError("no db")):
+            threads = [threading.Thread(target=call) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(results, [None, None, None, None])
 
 
 if __name__ == "__main__":

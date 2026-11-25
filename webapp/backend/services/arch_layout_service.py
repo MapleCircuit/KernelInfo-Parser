@@ -20,9 +20,13 @@ import logging
 import threading
 from collections import OrderedDict
 
-from parser.arch_layout import ArchLayout, compute_layouts
-from parser.include_graph import ConditionEvaluator, IncludeResolver, include_directives_with_conditions
 from db_engine.spec import Join
+from parser.arch_layout import ArchLayout, compute_layouts
+from parser.include_graph import (
+    ConditionEvaluator,
+    IncludeResolver,
+    include_directives_with_conditions,
+)
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import git_tree_resolver
@@ -178,7 +182,7 @@ class ArchLayoutService:
                 return hit
         try:
             raw, is_dir, _ = git_reader.read_file(sha, path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("git read %s:%s failed: %s", sha, path, exc)
             raw, is_dir = None, False
         directives = include_directives_with_conditions(raw.decode("latin-1")) if raw and not is_dir else []
@@ -199,7 +203,7 @@ class ArchLayoutService:
                         Join(("m_arch_layout_entry", "e"), {"e.layout_id": "r.layout_id"}),
                     ],
                 )
-        except Exception as exc:  # table missing (older database) or no database
+        except Exception as exc:  # noqa: BLE001 - table missing (older database) or no database
             logger.debug("m_arch_root unavailable: %s", exc)
             return None
         if not rows:
@@ -215,7 +219,7 @@ class ArchLayoutService:
         def read(path: str) -> str | None:
             try:
                 raw, is_dir, _ = git_reader.read_file(sha, path)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("git read %s:%s failed: %s", sha, path, exc)
                 return None
             return None if raw is None or is_dir else raw.decode("utf-8", errors="replace")

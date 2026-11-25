@@ -16,8 +16,15 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.DBLayout import (
-    m_bridge_commit_person, m_commit, m_commit_file, m_commit_parent, m_file_name, m_git_ref, m_ingest_state,
-    m_maintainer_person, m_repository,
+    m_bridge_commit_person,
+    m_commit,
+    m_commit_file,
+    m_commit_parent,
+    m_file_name,
+    m_git_ref,
+    m_ingest_state,
+    m_maintainer_person,
+    m_repository,
 )
 from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.routers import commits as commits_router
@@ -204,6 +211,75 @@ class TestVersionlessCommitGitAndRoutes(unittest.TestCase):
             self.assertEqual(client.post("/api/commits/released", json={"hashes": [self.head_sha]}).status_code, 200)
             self.assertEqual(client.get(f"/api/commits/relations/{self.head_sha}").status_code, 200)
             self.assertEqual(client.post("/api/commits/relations", json={"hashes": [self.head_sha]}).status_code, 200)
+
+
+class TestCommitAndTreeConcurrencyHardening(unittest.TestCase):
+    """BE-001, BE-002, BE-011 regression: commit digit validation, TreeResolver locking, RelationIndex write lock."""
+
+    def test_get_commit_detail_rejects_non_ascii_digits_and_tree_latin1_paths(self) -> None:
+        import threading
+
+        from fastapi import HTTPException
+
+        from tests.db_fixtures import make_db
+        from webapp.backend.services.git_service import GitService
+        from webapp.backend.services.tree_resolver import (
+            GitTreeResolver,
+            TreeResolverService,
+        )
+
+        svc = GitService()
+        with patch_reader(make_db("mock")), \
+                patch("webapp.backend.services.git_service.get_active_network_id", return_value=1):
+            with self.assertRaises(HTTPException) as ctx:
+                svc.get_commit_detail("²")
+            self.assertEqual(ctx.exception.status_code, 400)
+
+        # GitTreeResolver replaces invalid UTF-8 bytes in paths without surrogates
+        resolver = GitTreeResolver()
+        bad_ls_tree = b"100644 blob " + b"a" * 40 + b"\tdrivers/\xffbad.c\0"
+        with patch.object(resolver, "resolve_commit_sha", return_value="1" * 40), \
+                patch.object(resolver, "_run_git", return_value=bad_ls_tree):
+            tree = resolver.list_tree("v3.0")
+        self.assertEqual(tree, {"drivers/\ufffdbad.c": "a" * 40})
+
+        # Concurrent TreeResolverService lookups share _lock cleanly
+        db = make_db("mock")
+        ts = TreeResolverService()
+        barrier = threading.Barrier(4)
+        results: list[dict[int, int]] = []
+
+        def worker() -> None:
+            barrier.wait()
+            results.append(ts.resolve_tree(0, reader=db))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, [{}, {}, {}, {}])
+
+    def test_relation_index_write_acquires_lock(self) -> None:
+        import threading
+        from contextlib import nullcontext
+        from unittest.mock import MagicMock
+
+        from webapp.backend.services.commit_relations import RelationIndex
+
+        idx = RelationIndex()
+        fake_store = MagicMock()
+        fake_space = MagicMock()
+        fake_space.batch.return_value = nullcontext()
+        fake_space.store.return_value = fake_store
+        # Acquire _write_lock on main thread briefly, verify background write blocks until release
+        entered = threading.Event()
+        with idx._write_lock:
+            t = threading.Thread(target=lambda: (idx._write(fake_space, [], [], []), entered.set()))
+            t.start()
+            self.assertFalse(entered.wait(timeout=0.05))
+        self.assertTrue(entered.wait(timeout=2.0))
+        t.join()
 
 
 if __name__ == "__main__":

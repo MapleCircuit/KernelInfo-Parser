@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -137,8 +137,8 @@ def revision_records(sha: str, progress: Callable | None = None) -> list[tuple[s
 
 
 def resolve(version: str) -> str:
-    from webapp.backend.services.release_service import resolve_sha
     from webapp.backend.security.git import safe_rev
+    from webapp.backend.services.release_service import resolve_sha
     safe_rev(version)
     sha = resolve_sha(version)
     if not sha:
@@ -435,8 +435,8 @@ def tracepoint_callsites(version: str, name: str) -> dict[str, Any]:
                                 sites.append({"path": fpath, "line": r["line_no"], "text": f"trace_{name}(...)"})
                     if sites:
                         return {"name": name, "call_sites": sites, "truncated": len(ref_rows) >= 500}
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tracepoint DB call_sites lookup failed for %s: %s", name, exc)
     sha = resolve(version)
     res = grep_service.grep(sha, rf"\btrace_{name}(_rcuidle)?[[:space:]]*\(", mode="regex", paths=["*.c", "*.h", "*.rs"],
                             max_matches=500, max_per_file=50)

@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from webapp.backend.services import git_service as gs_mod
 from db_engine import MockDB
 from tests.db_fixtures import patch_reader
+from webapp.backend.services import git_service as gs_mod
 from webapp.backend.services.git_service import GitService
 
 PORCELAIN = """\

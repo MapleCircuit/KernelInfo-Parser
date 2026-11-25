@@ -1,11 +1,16 @@
 """webapp/backend/routers/tools.py - Pahole Layout, Function Callgraph & Revision Compare."""
 from __future__ import annotations
-from typing import Any
-from fastapi import APIRouter, Body, Depends, Query
+
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+
 from webapp.backend.config import require_feature
-from webapp.backend.services.pahole_service import PaholeService
+from webapp.backend.security.git import safe_rev
+from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.callgraph_service import CallgraphService
-from webapp.backend.services.diff_service import DiffService, RENAME_SIMILARITY
+from webapp.backend.services.diff_service import RENAME_SIMILARITY, DiffService
+from webapp.backend.services.pahole_service import PaholeService
 
 router = APIRouter(prefix="/api", tags=["tools"])
 pahole_service = PaholeService()
@@ -13,15 +18,28 @@ callgraph_service = CallgraphService()
 diff_service = DiffService()
 
 
+def _check_len(value: str, name: str, limit: int = 256) -> None:
+    if len(value) > limit:
+        raise HTTPException(status_code=400, detail=f"{name} must be at most {limit} characters")
+
+
+def _check_rel_path(path: str) -> None:
+    clean = path.strip().strip("/")
+    if clean and not is_safe_rel_path(clean):
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+
 @router.get("/tools/{version_name}/pahole/{struct_name}", dependencies=[Depends(require_feature("pahole"))])
 def get_struct_layout(version_name: str, struct_name: str) -> dict[str, Any]:
     """Pahole-style memory layout of a C struct (estimated from its AST)."""
+    _check_len(struct_name, "struct_name")
     return pahole_service.get_struct_layout(version_name, struct_name)
 
 
 @router.get("/tools/{version_name}/callgraph/{function_name}", dependencies=[Depends(require_feature("callgraph"))])
 def get_callgraph(version_name: str, function_name: str) -> dict[str, Any]:
     """Bidirectional caller and callee callgraph."""
+    _check_len(function_name, "function_name")
     return callgraph_service.get_function_callgraph(version_name, function_name)
 
 
@@ -31,6 +49,8 @@ def get_version_diff(
     version_b: str = Query(...),
 ) -> dict[str, Any]:
     """Files added, deleted, modified and renamed between two revisions."""
+    safe_rev(version_a, "version_a")
+    safe_rev(version_b, "version_b")
     return diff_service.get_versions_diff(version_a, version_b)
 
 
@@ -40,6 +60,8 @@ def get_unchanged_files(
     version_b: str = Query(...),
 ) -> dict[str, Any]:
     """Files identical at both revisions (same path, same content)."""
+    safe_rev(version_a, "version_a")
+    safe_rev(version_b, "version_b")
     return diff_service.get_unchanged_files(version_a, version_b)
 
 
@@ -52,6 +74,10 @@ def get_file_diff(
     similarity: int = Query(RENAME_SIMILARITY, ge=1, le=100),
 ) -> dict[str, Any]:
     """Unified diff of a single file between two releases or commits."""
+    safe_rev(version_a, "version_a")
+    safe_rev(version_b, "version_b")
+    _check_rel_path(path)
+    _check_rel_path(old_path)
     return diff_service.get_file_diff(version_a, version_b, path, old_path, similarity)
 
 
@@ -63,6 +89,10 @@ def get_blob_diff(
     path_b: str = Query(...),
 ) -> dict[str, Any]:
     """Changed lines between any two files at any two revisions (code view "Diff with…")."""
+    safe_rev(version_a, "version_a")
+    safe_rev(version_b, "version_b")
+    _check_rel_path(path_a)
+    _check_rel_path(path_b)
     return diff_service.get_blob_diff(version_a, path_a, version_b, path_b)
 
 
@@ -74,17 +104,22 @@ def search_renames(
     similarity: int = Query(RENAME_SIMILARITY, ge=1, le=100),
 ) -> dict[str, Any]:
     """Exhaustive rename search between two revisions, optionally under one directory."""
+    safe_rev(version_a, "version_a")
+    safe_rev(version_b, "version_b")
+    _check_rel_path(path)
     return diff_service.search_renames(version_a, version_b, path, similarity)
 
 
 @router.get("/diff/kconfig/{v1}/{v2}", dependencies=[Depends(require_feature("compare", "kconfig"))])
 def get_kconfig_diff(v1: str, v2: str) -> dict[str, Any]:
     """Kconfig symbol definitions added, removed and changed between two revisions."""
+    safe_rev(v1, "v1")
+    safe_rev(v2, "v2")
     return diff_service.get_kconfig_diff(v1, v2)
 
 
 @router.post("/tools/{version_name}/checkpatch", dependencies=[Depends(require_feature("patch"))])
-def post_checkpatch(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def post_checkpatch(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """Run scripts/checkpatch.pl of the configured release tag on a patch (P4; off by default: {enabled: false})."""
     from webapp.backend.services.checkpatch_service import check_patch
     patch = payload.get("patch") if isinstance(payload, dict) else None
@@ -101,13 +136,15 @@ def get_implementations(
     """Ops implementations (N1): `struct` (+ `field`) lists the functions designated initializers assign to its
     fields; `function` lists the ops tables that use a function. From the revision's source index (202 with progress
     while it is assembled)."""
-    from fastapi import HTTPException
     from webapp.backend.routers.insights import job_answer
     from webapp.backend.services.ops_service import index_state, uses_state
+
     if function:
+        _check_len(function, "function")
         return job_answer(uses_state(version_name, function, wait=3.0), lambda r: r)
     if not struct:
         raise HTTPException(status_code=400, detail="Give struct (and field) or function")
+    _check_len(struct, "struct")
 
     def shape(r: dict[str, Any]) -> dict[str, Any]:
         out = {"version": version_name, "struct": r["struct"], "tables": r["tables"], "files": r["files"],
@@ -144,6 +181,9 @@ def get_callpath(
 def get_pahole_compare(a: str = Query(...), b: str = Query(...), struct: str = Query(...)) -> dict[str, Any]:
     """A struct's layout at two revisions, member by member (N3)."""
     from webapp.backend.services.pahole_compare import compare
+    safe_rev(a, "a")
+    safe_rev(b, "b")
+    _check_len(struct, "struct")
     return compare(a, b, struct)
 
 
@@ -152,4 +192,5 @@ def get_pahole_history(version_name: str, struct_name: str, include_rc: bool = Q
     """Size, holes and cachelines of a struct at each release where its definition changed (N3); 202 while it runs."""
     from webapp.backend.routers.insights import job_answer
     from webapp.backend.services.pahole_compare import history_state
+    _check_len(struct_name, "struct_name")
     return job_answer(history_state(version_name, struct_name, include_rc))

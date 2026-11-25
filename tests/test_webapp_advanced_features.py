@@ -27,11 +27,27 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from typing import Self
+
+from fastapi import HTTPException
+
 from tests import require_indexed_ref
 from tests.db_fixtures import requires_live_db
-from fastapi import HTTPException
 from webapp.backend.database.pool import get_reader
 from webapp.backend.models import FormatPatchRequest
+from webapp.backend.services import (
+    callgraph_service as callgraph_mod,
+)
+from webapp.backend.services import (
+    filesystem_service as filesystem_mod,
+)
+from webapp.backend.services import (
+    pahole_service as pahole_mod,
+)
+from webapp.backend.services import (
+    symbol_service as symbol_mod,
+)
+from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.callgraph_service import CallgraphService
 from webapp.backend.services.diff_service import DiffService
 from webapp.backend.services.filesystem_service import FilesystemService
@@ -39,13 +55,6 @@ from webapp.backend.services.git_service import GitService, _compute_structured_
 from webapp.backend.services.kconfig_service import KconfigService
 from webapp.backend.services.maintainer_service import MaintainerService
 from webapp.backend.services.pahole_service import PaholeService
-from webapp.backend.services import (
-    callgraph_service as callgraph_mod,
-    filesystem_service as filesystem_mod,
-    pahole_service as pahole_mod,
-    symbol_service as symbol_mod,
-)
-from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.symbol_service import SymbolService
 from webapp.backend.services.tree_resolver import ArchScope
 
@@ -104,7 +113,7 @@ class _FixtureReader:
     """Read session double answering the symbol reads of the webapp services from the fixture lists above (the
     symbol read intents they exercise are stubbed: seeding the AST / tag graph behind them is not what is tested)."""
 
-    def __enter__(self) -> "_FixtureReader":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -181,6 +190,7 @@ def _fixture_kconfig_model():
         model={"symbols": symbols},
         own_depends={"EXT4_FS": ["BLOCK"], "BTRFS_FS": ["BLOCK"]},
         selected_by={},
+        implied_by={},
         arch={"arch": "x86_64"},
     )
 
@@ -544,7 +554,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
     def test_pure_asm_detection_and_classification(self) -> None:
         """Verify is_pure_asm_content and type_check identify pure ASM .h/.c files as T_ASM."""
-        from core.globalstuff import is_pure_asm_content, type_check, T_C, T_ASM
+        from core.globalstuff import T_ASM, T_C, is_pure_asm_content, type_check
 
         # 1. Typical ASM header file like arch/m68k/fpsp040/fpsp.h
         asm_header = """|
@@ -656,7 +666,11 @@ int get_foo(void) {
     @requires_live_db("reads the live database")
     def test_projects_and_branches_endpoints(self) -> None:
         """Verify /api/projects, /api/branches, and /api/versions include_rc functionality."""
-        from webapp.backend.routers.versions import get_projects, get_branches, get_versions
+        from webapp.backend.routers.versions import (
+            get_branches,
+            get_projects,
+            get_versions,
+        )
 
         # 1. Projects
         projs = get_projects()
@@ -735,8 +749,8 @@ int get_foo(void) {
     @requires_live_db("reads the live database")
     def test_file_history_and_last_changed(self) -> None:
         """Verify file history and last changed metadata retrieval via git_service and filesystem_service."""
-        from webapp.backend.services.git_service import GitService
         from webapp.backend.services.filesystem_service import FilesystemService
+        from webapp.backend.services.git_service import GitService
 
         git_svc = GitService()
         fs_svc = FilesystemService()
@@ -774,7 +788,7 @@ class _LadderReader:
         self.levels = levels
         self.queries = 0
 
-    def __enter__(self) -> "_LadderReader":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> None:
