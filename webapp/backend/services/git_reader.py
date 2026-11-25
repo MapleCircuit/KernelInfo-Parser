@@ -71,7 +71,8 @@ class GitReader:
             except (OSError, subprocess.SubprocessError, ValueError):
                 try:
                     self._proc.kill()
-                except OSError as exc:
+                    self._proc.wait(timeout=1.0)
+                except (OSError, subprocess.SubprocessError) as exc:
                     logger.debug("Failed to kill git cat-file process: %s", exc)
             finally:
                 self._proc = None

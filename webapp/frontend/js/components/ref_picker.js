@@ -97,12 +97,20 @@ class RefPicker {
         this.close();
       }
     };
-    setTimeout(() => document.addEventListener("mousedown", this._outsideHandler), 0);
+    const outsideHandler = this._outsideHandler;
+    this._outsideTimer = setTimeout(() => {
+      this._outsideTimer = null;
+      if (this._outsideHandler === outsideHandler) document.addEventListener("mousedown", outsideHandler);
+    }, 0);
 
     await this.search("");
   }
 
   close() {
+    if (this._outsideTimer) {
+      clearTimeout(this._outsideTimer);
+      this._outsideTimer = null;
+    }
     if (this._outsideHandler) {
       document.removeEventListener("mousedown", this._outsideHandler);
       this._outsideHandler = null;

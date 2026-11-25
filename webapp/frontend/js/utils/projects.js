@@ -29,7 +29,6 @@ export function projectOf(repo) {
 }
 
 export const isManPagesRepo = (repo) => projectSlug(projectOf(repo)) === "man-pages";
-export const isLinuxRepo = (repo) => projectSlug(projectOf(repo)) === "linux";
 
 export const DEFAULT_KERNEL_FEATURES = Object.freeze({
   kconfig: true,
@@ -192,7 +191,6 @@ export function manPagesRepo(preferred = "") {
   if (preferred && ok(projectOf(preferred))) return preferred;
   return PROJECTS.find(ok)?.repo || "";
 }
-export const linuxRepo = (preferred = "") => repoOfProject("linux", preferred);
 
 /**
  * Tab types whose address holds in any repository (§5.18): the header's Project moves such an active tab to

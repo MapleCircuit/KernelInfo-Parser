@@ -212,8 +212,11 @@ export class ManView {
 
   dispose() {
     this.seq++;
+    clearTimeout(this._filterTimer);
+    this._filterTimer = null;
     this.ro?.disconnect();
     this.ro = null;
+    this.containerEl = null;
   }
 
   mode() {
@@ -421,10 +424,11 @@ export class ManView {
       <div class="man-index-groups"></div>
     </div>`;
     const input = this.body().querySelector(".man-filter");
-    let timer = null;
+    clearTimeout(this._filterTimer);
+    this._filterTimer = null;
     input.addEventListener("input", () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
+      clearTimeout(this._filterTimer);
+      this._filterTimer = setTimeout(() => {
         if (!this.live(seq)) return;
         this.persist({ manQuery: input.value.trim() });
         this.renderIndexGroups();

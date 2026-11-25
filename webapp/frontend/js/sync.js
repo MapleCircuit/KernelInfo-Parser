@@ -208,6 +208,14 @@ class SyncManager {
    * any of them did. Rejects when the server is unreachable or the update could not be applied.
    */
   async checkNow() {
+    if (this._checkNowInFlight) return this._checkNowInFlight;
+    this._checkNowInFlight = this._runCheckNow().finally(() => {
+      this._checkNowInFlight = null;
+    });
+    return this._checkNowInFlight;
+  }
+
+  async _runCheckNow() {
     const prev = { ...this.tokens, ...this.repoTokens(api.repo) };
     const sync = await api.getSync();
     const run = this.queue.then(() => this.apply(sync, { notify: false, announce: false }));

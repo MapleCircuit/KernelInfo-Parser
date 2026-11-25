@@ -25,6 +25,7 @@ export class BookmarksView {
     this.openNotes = new Set();
     this.editTour = null;
     this.unsub = null;
+    this._seq = 0;
   }
 
   async render(containerEl, tabData) {
@@ -50,21 +51,29 @@ export class BookmarksView {
       if (this.containerEl?.isConnected) this.refresh();
     });
     if (tabData.importTour) await this.importLink(tabData.importTour);
+    if (!this.containerEl?.isConnected) return;
     await this.refresh();
   }
 
   dispose() {
+    this._seq++;
     this.unsub?.();
     this.unsub = null;
+    this.containerEl = null;
   }
 
   async refresh() {
-    this.marks = sortBookmarks(await listBookmarks());
-    this.tours = await listTours();
+    const seq = ++this._seq;
+    const [marks, tours] = await Promise.all([listBookmarks(), listTours()]);
+    if (seq !== this._seq || !this.containerEl?.isConnected) return;
+    const sortedMarks = sortBookmarks(marks);
+    const notePairs = await Promise.all(sortedMarks.map(async (m) => [m.key, await getNote(m.key)]));
+    if (seq !== this._seq || !this.containerEl?.isConnected) return;
+    this.marks = sortedMarks;
+    this.tours = tours;
     this.notes = new Map();
-    for (const m of this.marks) {
-      const n = await getNote(m.key);
-      if (n) this.notes.set(m.key, n);
+    for (const [k, n] of notePairs) {
+      if (n) this.notes.set(k, n);
     }
     this.renderMarks();
     this.renderTours();
@@ -95,10 +104,10 @@ export class BookmarksView {
             <div class="bm-actions">
               <input class="bm-label" value="${escapeHtml(m.data.label)}" aria-label="Label" />
               <input class="bm-groupin" value="${escapeHtml(m.data.group || "")}" placeholder="group" aria-label="Group" />
-              <button type="button" data-act="up" title="Move up">↑</button><button type="button" data-act="down" title="Move down">↓</button>
+              <button type="button" data-act="up" title="Move up" aria-label="Move up">↑</button><button type="button" data-act="down" title="Move down" aria-label="Move down">↓</button>
               <button type="button" data-act="note">${open ? "Hide note" : note ? "Note" : "+ Note"}</button>
               ${tourOpts ? `<select data-act="to-tour" aria-label="Add to tour"><option value="">+ to tour…</option>${tourOpts}</select>` : ""}
-              <button type="button" data-act="delete" title="Delete this bookmark and its note">🗑</button>
+              <button type="button" data-act="delete" title="Delete this bookmark and its note" aria-label="Delete bookmark">🗑</button>
             </div>
             ${open ? `<div class="bm-note"><textarea rows="5" placeholder="Markdown note">${escapeHtml(note?.data.markdown || "")}</textarea>
               <div class="bm-note-actions"><button type="button" data-act="save-note">Save note</button></div>
@@ -118,7 +127,7 @@ export class BookmarksView {
         <div class="bm-line"><strong>${escapeHtml(t.data.title)}</strong> <span class="kconfig-muted">${t.data.steps.length} step${t.data.steps.length === 1 ? "" : "s"}</span></div>
         ${t.data.description ? `<div class="kconfig-muted">${escapeHtml(t.data.description.slice(0, 200))}</div>` : ""}
         <div class="bm-actions"><button type="button" data-act="play" ${t.data.steps.length ? "" : "disabled"}>▶ Play</button><button type="button" data-act="edit">${ed?.key === t.key ? "Close editor" : "Edit"}</button>
-          <button type="button" data-act="export">Export</button><button type="button" data-act="link" title="Copy a link that carries the whole tour">Copy link</button><button type="button" data-act="delete-tour">🗑</button></div>
+          <button type="button" data-act="export">Export</button><button type="button" data-act="link" title="Copy a link that carries the whole tour">Copy link</button><button type="button" data-act="delete-tour" title="Delete this tour" aria-label="Delete tour">🗑</button></div>
         ${ed?.key === t.key ? this.tourEditorHtml(ed) : ""}
       </div>`).join("")}`;
   }
@@ -128,7 +137,7 @@ export class BookmarksView {
       <label>Title <input data-tf="title" value="${escapeHtml(ed.tour.title)}" /></label>
       <label>Description <textarea data-tf="description" rows="2">${escapeHtml(ed.tour.description || "")}</textarea></label>
       ${ed.tour.steps.map((s, i) => `<div class="bm-step" data-step="${i}"><div class="bm-line"><strong>${i + 1}.</strong> <a href="#" data-step-open="${i}">${escapeHtml(targetLabel(s.target))}</a>
-        <button type="button" data-step-act="up">↑</button><button type="button" data-step-act="down">↓</button><button type="button" data-step-act="remove">✕</button></div>
+        <button type="button" data-step-act="up" title="Move step up" aria-label="Move step up">↑</button><button type="button" data-step-act="down" title="Move step down" aria-label="Move step down">↓</button><button type="button" data-step-act="remove" title="Remove step" aria-label="Remove step">✕</button></div>
         <input data-sf="title" value="${escapeHtml(s.title || "")}" placeholder="Step title" />
         <textarea data-sf="markdown" rows="3" placeholder="What to look at here (Markdown)">${escapeHtml(s.markdown || "")}</textarea></div>`).join("") || `<div class="kconfig-muted">Add steps with “+ to tour…” on a bookmark, or “Add this line to a tour” in a code tab's menu.</div>`}
       <div class="bm-actions"><button type="button" data-act="save-tour" class="active">Save tour</button></div></div>`;

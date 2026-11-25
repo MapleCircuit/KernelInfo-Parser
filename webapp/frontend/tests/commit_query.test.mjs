@@ -110,6 +110,8 @@ function makeViewHarness() {
       setAttribute: (k, v) => attrs.set(k, String(v)),
       getAttribute: (k) => attrs.get(k) ?? null,
       addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
       focus() { this.focused = true; },
       setSelectionRange(a, b) { this.selection = [a, b]; },
     };
@@ -126,6 +128,7 @@ function makeViewHarness() {
   view.containerEl = {
     isConnected: true,
     querySelector: (sel) => elements[sel] || (sel.startsWith("#commit-query-keys-") ? elements.datalist : null),
+    querySelectorAll: () => [],
   };
   return { view, elements };
 }
@@ -280,4 +283,67 @@ test("commit query help participates in browser Back/Forward history round-trips
     globalThis.history.pushState = origPush;
     globalThis.history.replaceState = origReplace;
   }
+});
+
+test("tokenize caps input length at 4096 characters", () => {
+  const longText = "a ".repeat(3000) + "author:tail";
+  const tokens = tokenize(longText);
+  assert.ok(tokens.length <= 2048);
+  assert.ok(!tokens.some((t) => t.key === "author" && t.value === "tail"));
+});
+
+test("CommitsView dispose increments tokens, cancels search, and guards stale inspectCommit / CSS.escape / lore_url", async () => {
+  const { view, elements } = makeViewHarness();
+  let aborted = false;
+  let cancelled = false;
+  view.factsAbort = { abort() { aborted = true; } };
+  view._debouncedSearch = { cancel() { cancelled = true; } };
+  view._listToken = 1;
+  view._detailToken = 2;
+  view._relToken = 3;
+
+  // selectLoadedCommit uses CSS.escape safely for arbitrary characters in hash
+  view.api = { getCommitDetail: async () => null, getCommitRelease: async () => ({}), getCommitRelations: async () => ({}) };
+  view.commits = [{ commit_id: 1, commit_hash: 'abc"def\\123' }];
+  const found = view.selectLoadedCommit('abc"def\\123');
+  assert.equal(found, true);
+
+  // Stale inspectCommit resolves after dispose -> must not write DOM
+  let resolveCommit;
+  view.api = {
+    getCommitDetail: () => new Promise((r) => { resolveCommit = r; }),
+  };
+  const pending = view.inspectCommit("deadbeef");
+  view.dispose();
+  // selectLoadedCommit calls inspectCommit (+1 _detailToken), then line 313 (+1 _detailToken), then dispose (+1 _detailToken)
+  assert.equal(aborted, true);
+  assert.equal(cancelled, true);
+  assert.equal(view._listToken, 2);
+  assert.equal(view._detailToken, 5);
+  assert.equal(view._relToken, 4);
+  assert.equal(view.containerEl, null);
+
+  elements["#commit-detail-container"].innerHTML = "UNTOUCHED";
+  resolveCommit({ commit_hash: "deadbeef", subject: "x", author_name: "a", author_email: "a@b", lore_url: "javascript:alert(1)" });
+  await pending;
+  assert.equal(elements["#commit-detail-container"].innerHTML, "UNTOUCHED");
+
+  // Live inspectCommit sanitizes lore_url and guards missing commit_hash
+  const { view: view2, elements: els2 } = makeViewHarness();
+  view2.api = {
+    getCommitDetail: async () => ({ subject: "No hash", author_name: "Ada", author_email: "ada@kernel.org", lore_url: "javascript:alert(1)" }),
+    getCommitRelease: async () => ({}),
+    getCommitRelations: async () => ({}),
+  };
+  await view2.inspectCommit("12345678");
+  assert.ok(!els2["#commit-detail-container"].innerHTML.includes("javascript:"));
+
+  const { view: view3, elements: els3 } = makeViewHarness();
+  view3.api = {
+    getCommitDetail: async () => ({ commit_hash: "0123456789abcdef", subject: "Good lore", author_name: "Ada", author_email: "ada@kernel.org", lore_url: "https://lore.kernel.org/all/123/" }),
+    getCommitRelease: async () => ({}),
+    getCommitRelations: async () => ({}),
+  };
+  await view3.inspectCommit("0123456789abcdef");
+  assert.match(els3["#commit-detail-container"].innerHTML, /href="https:\/\/lore\.kernel\.org\/all\/123\/"[^>]*rel="noopener noreferrer"/);
 });

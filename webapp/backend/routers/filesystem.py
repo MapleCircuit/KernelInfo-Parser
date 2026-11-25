@@ -186,8 +186,7 @@ def post_build_treemap(version_name: str, payload: Annotated[dict[str, Any], Bod
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Body must be an object")
     path = str(payload.get("path") or "")
-    if path and not is_safe_rel_path(path):
-        raise HTTPException(status_code=400, detail="Invalid path")
+    _validate_rel_path(path)
     assignments = validate_assignments(payload.get("assignments") or {})
     return job_answer(build_treemap(version_name, str(payload.get("arch") or "x86_64"), assignments, path,
                                     int(payload.get("max_depth") or 2)))

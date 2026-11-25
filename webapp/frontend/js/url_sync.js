@@ -384,8 +384,8 @@ class UrlSynchronizer {
       const file = params.get("file");
       // line=<a> or line=<a>-<b> (a selected range, G06); a reversed range is normalized
       const lineSpec = /^(\d+)(?:-(\d+))?$/.exec(params.get("line") || "");
-      let line = lineSpec ? parseInt(lineSpec[1], 10) : 1;
-      let lineEnd = lineSpec && lineSpec[2] ? parseInt(lineSpec[2], 10) : 0;
+      let line = lineSpec ? Math.max(1, parseInt(lineSpec[1], 10) || 1) : 1;
+      let lineEnd = lineSpec && lineSpec[2] ? Math.max(1, parseInt(lineSpec[2], 10) || 0) : 0;
       if (lineEnd && lineEnd < line) [line, lineEnd] = [lineEnd, line];
       if (lineEnd === line) lineEnd = 0;
       const arch = params.get("arch") || "x86_64";

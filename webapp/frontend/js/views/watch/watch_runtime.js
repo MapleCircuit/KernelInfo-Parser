@@ -60,6 +60,8 @@ export async function markRead(keys = null) {
   for (const [k, s] of states) if (s.unread && (!keys || keys.includes(k))) await saveState(k, { ...s, unread: false });
 }
 
+const MAX_WATCH_BATCH = 200;
+
 /** Check watches (all, or those an update concerns). Returns the number of items that changed. */
 export async function checkWatches(watches = null, { quiet = false } = {}) {
   const all = watches || (await listWatches());
@@ -67,20 +69,23 @@ export async function checkWatches(watches = null, { quiet = false } = {}) {
   const states = await watchStates();
   let changed = 0;
   for (const g of checkGroups(all, states)) {
-    let res;
-    try {
-      res = await api.request("/api/watch/changes", {
-        method: "POST", timeoutMs: 120000,
-        body: JSON.stringify({ from: g.from, to: g.to, items: g.watches.map((w) => ({ key: w.key, ...w.data.target })) }),
-      });
-    } catch (err) {
-      if (!quiet) toast.error(`Watch check ${g.to} failed: ${err.message}`);
-      continue;
-    }
-    for (const item of res.items) {
-      const next = nextState(states.get(item.key), item, res.to_sha);
-      if (item.changed) changed++;
-      await saveState(item.key, next);
+    for (let offset = 0; offset < g.watches.length; offset += MAX_WATCH_BATCH) {
+      const batch = g.watches.slice(offset, offset + MAX_WATCH_BATCH);
+      let res;
+      try {
+        res = await api.request("/api/watch/changes", {
+          method: "POST", timeoutMs: 120000,
+          body: JSON.stringify({ from: g.from, to: g.to, items: batch.map((w) => ({ key: w.key, ...w.data.target })) }),
+        });
+      } catch (err) {
+        if (!quiet) toast.error(`Watch check ${g.to} failed: ${err.message}`);
+        continue;
+      }
+      for (const item of Array.isArray(res?.items) ? res.items : []) {
+        const next = nextState(states.get(item.key), item, res.to_sha);
+        if (item.changed) changed++;
+        await saveState(item.key, next);
+      }
     }
   }
   return changed;

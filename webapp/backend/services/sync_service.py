@@ -296,7 +296,6 @@ def clear_parse_dependent_caches() -> None:
     from webapp.backend.services.tree_resolver import git_tree_resolver, tree_resolver
 
     caches = (
-        helpers._NAME_TO_VID_CACHE, helpers._VID_TO_NAME_CACHE, helpers._REPO_ID_CACHE, helpers._PRELOADED,
         filesystem_service._FILE_TOKENS_CACHE, filesystem_service._INCLUDE_CACHE,
         filesystem_service._TREEMAP_CACHE, filesystem_service._OBJECT_CACHE,
         maintainer_service._MAINTAINER_CACHE, maintainer_service._FILE_SUBSYSTEMS_CACHE,
@@ -312,7 +311,7 @@ def clear_parse_dependent_caches() -> None:
         git_service._LAST_WRITER_CACHE,
         nodemap_service._LAYOUT_CACHE,
     )
-    clearers: list[Callable[[], Any]] = [cache.clear for cache in caches]
+    clearers: list[Callable[[], Any]] = [helpers.clear_version_caches, *(cache.clear for cache in caches)]
     clearers.extend([
         history_service.clear_cache,
         kconfig_facts.clear,

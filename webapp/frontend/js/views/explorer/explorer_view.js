@@ -59,9 +59,9 @@ export class ExplorerView {
           <div class="explorer-breadcrumbs" id="explorer-breadcrumbs"></div>
           <div class="explorer-actions">
             <input type="text" class="explorer-filter" id="explorer-filter" placeholder="Filter this directory…" spellcheck="false" />
-            <button class="code-btn" id="explorer-up" title="Go to the parent directory">↑ Up</button>
-            <button class="code-btn" id="explorer-reveal" title="Reveal this directory in the sidebar explorer">Reveal</button>
-            <button class="code-btn" id="explorer-treemap" title="Open the treemap of this directory">Treemap</button>
+            <button type="button" class="code-btn" id="explorer-up" title="Go to the parent directory">↑ Up</button>
+            <button type="button" class="code-btn" id="explorer-reveal" title="Reveal this directory in the sidebar explorer">Reveal</button>
+            <button type="button" class="code-btn" id="explorer-treemap" title="Open the treemap of this directory">Treemap</button>
           </div>
         </div>
         <div class="explorer-listing" id="explorer-listing">
@@ -133,6 +133,11 @@ export class ExplorerView {
     });
   }
 
+  dispose() {
+    this.loadToken++;
+    this.containerEl = null;
+  }
+
   async load() {
     const listing = this.containerEl?.querySelector("#explorer-listing");
     if (!listing) return;
@@ -140,11 +145,11 @@ export class ExplorerView {
     listing.innerHTML = `<div class="explorer-empty">Loading ${escapeHtml(this.path || "repository root")}…</div>`;
     try {
       const res = await this.api.getDirectoryTree(this.version, this.path);
-      if (token !== this.loadToken) return;
+      if (token !== this.loadToken || !this.containerEl?.isConnected) return;
       this.entries = res.entries || res.tree || [];
       this.renderListing();
     } catch (err) {
-      if (token !== this.loadToken) return;
+      if (token !== this.loadToken || !this.containerEl?.isConnected) return;
       listing.innerHTML = `<div class="explorer-error">Failed to list ${escapeHtml(this.path || "the repository root")} at ${escapeHtml(this.version)}: ${escapeHtml(err.message)}</div>`;
     }
   }

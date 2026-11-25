@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ago, formatDuration, formatMb, sortTables, statusLine } from "../js/views/status/status_model.js";
+import { ago, fmtTime, formatDuration, formatMb, sortTables, statusLine } from "../js/views/status/status_model.js";
 
 test("relative times, sizes, durations", () => {
   const now = 1_000_000_000_000;
@@ -8,6 +8,13 @@ test("relative times, sizes, durations", () => {
   assert.equal(ago(now / 1000 - 125, now), "2 min ago");
   assert.equal(ago(now / 1000 - 7200, now), "2 h ago");
   assert.equal(ago(0, now), "");
+  assert.equal(ago(-10, now), "");
+  assert.equal(ago(Infinity, now), "");
+  assert.equal(ago(NaN, now), "");
+  assert.equal(fmtTime(1700000000), "2023-11-14T22:13:20.000Z");
+  for (const bad of [0, -1, -100, NaN, Infinity, -Infinity, null, undefined, "", false, true, "abc", 1e20]) {
+    assert.equal(fmtTime(bad), "", `expected empty string for ${String(bad)}`);
+  }
   assert.equal(formatMb(42291), "41.3 GB");
   assert.equal(formatMb(512), "512 MB");
   assert.equal(formatMb(2.5), "2.5 MB");

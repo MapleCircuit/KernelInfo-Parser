@@ -786,5 +786,5 @@
   padding: 12px 16px;
   border: 1px solid var(--border-color, #30363d);
   border-radius: 6px;
-  background: var(--bg-surface, #161b22);
+  background: var(--bg-secondary);
 }

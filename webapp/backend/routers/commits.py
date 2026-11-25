@@ -92,14 +92,14 @@ def get_file_history(version_name: str, path: str, limit: int = Query(50, ge=1, 
     return git_service.get_file_history(version_name, path, limit)
 
 
-_TIMELINE_DIRECTIONS = {"past", "future"}
+_TIMELINE_DIRECTIONS = {"past", "future", "around"}
 _TIMELINE_GRANULARITIES = {"year", "month", "week", "day"}
 
 
 def _validate_timeline_params(direction: str, granularity: str) -> str:
     norm_dir = direction.lower().strip()
     if norm_dir not in _TIMELINE_DIRECTIONS:
-        raise HTTPException(status_code=400, detail="direction must be 'past' or 'future'.")
+        raise HTTPException(status_code=400, detail="direction must be 'past', 'future', or 'around'.")
     if granularity.lower().strip() not in _TIMELINE_GRANULARITIES:
         raise HTTPException(status_code=400, detail="granularity must be one of: year, month, week, day.")
     return norm_dir

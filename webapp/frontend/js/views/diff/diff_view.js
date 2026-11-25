@@ -19,6 +19,17 @@ import { previousTag } from "../code_view/file_diff.js";
 import { diffSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 
 const PAGE_SIZE = 500;
+const MAX_INITIAL_DIFF_LINES = 800;
+
+function renderDiffLinesHtml(lines) {
+  return lines.map((line) => {
+    let cls = "";
+    if (line.startsWith("@@")) cls = "diff-hunk";
+    else if (line.startsWith("+") && !line.startsWith("+++")) cls = "diff-add";
+    else if (line.startsWith("-") && !line.startsWith("---")) cls = "diff-del";
+    return `<div class="${cls}">${escapeHtml(line) || " "}</div>`;
+  }).join("");
+}
 const KCONFIG_TYPES = { 1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int" };
 const STATUS_LABELS = { added: "A", modified: "M", deleted: "D", renamed: "R", unchanged: "U", removed: "D", changed: "M" };
 const FILE_STATUSES = ["added", "modified", "deleted", "renamed", "unchanged"];
@@ -78,6 +89,31 @@ export class DiffView {
     this.unchangedFiles = null;
     this.unchangedLoading = null;
     this.unchangedError = "";
+    this.apiAbort = null;
+    this._debouncedFilter = null;
+    this._debouncedGrep = null;
+    this._debouncedManFilter = null;
+    this._debouncedApiFilter = null;
+    this._closeDownloadMenu = null;
+  }
+
+  dispose() {
+    this.loadSeq++;
+    this.apiAbort?.abort();
+    this.apiAbort = null;
+    this._debouncedFilter?.cancel?.();
+    this._debouncedFilter = null;
+    this._debouncedGrep?.cancel?.();
+    this._debouncedGrep = null;
+    this._debouncedManFilter?.cancel?.();
+    this._debouncedManFilter = null;
+    this._debouncedApiFilter?.cancel?.();
+    this._debouncedApiFilter = null;
+    if (this._closeDownloadMenu) {
+      document.removeEventListener("mousedown", this._closeDownloadMenu, true);
+      this._closeDownloadMenu = null;
+    }
+    this.containerEl = null;
   }
 
   repo() {
@@ -95,7 +131,9 @@ export class DiffView {
     const modes = compareModesForRepo(this.repo());
 
     this.versionB = tabData.versionB || tabData.version || await this.defaultTarget();
+    if (this.containerEl !== containerEl) return;
     this.versionA = tabData.versionA || await this.defaultBaseFor(this.versionB);
+    if (this.containerEl !== containerEl) return;
     this.currentMode = resolveCompareMode(tabData.mode, modes, isMan);
     // API mode (A6): kinds, statuses, filter and ARCH, recorded on the tab
     this.apiKinds = new Set(String(tabData.apiKinds || "").split(",").filter((k) => API_KINDS.includes(k)));
@@ -141,7 +179,7 @@ export class DiffView {
             <button class="compare-ref-btn" id="cmp-ref-a" type="button" title="Base revision">
               <span class="compare-ref-role">Base</span><span class="compare-ref-value"></span>
             </button>
-            <button class="code-btn" id="cmp-swap" type="button" title="Swap base and target">⇄</button>
+            <button class="code-btn" id="cmp-swap" type="button" title="Swap base and target" aria-label="Swap base and target">⇄</button>
             <button class="compare-ref-btn" id="cmp-ref-b" type="button" title="Target revision">
               <span class="compare-ref-role">Target</span><span class="compare-ref-value"></span>
             </button>
@@ -362,25 +400,26 @@ export class DiffView {
       };
     });
     const filter = container.querySelector(".api-diff-filter");
-    let t = null;
+    this._debouncedApiFilter?.cancel?.();
+    this._debouncedApiFilter = debounce(() => {
+      if (!this.containerEl) return;
+      this.apiQuery = filter.value.trim();
+      this.persist();
+      const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
+      const dlBtn = container.querySelector(".api-diff-download");
+      if (dlBtn) dlBtn.textContent = `⬇ Download (${shown.length})`;
+      const listEl = container.querySelector(".api-diff-list");
+      if (listEl) {
+        listEl.innerHTML = shown.slice(0, 3000).map((r) => `<div class="api-diff-row status-${r.status}" data-kind="${r.kind}" data-key="${escapeHtml(r.key)}" data-status="${r.status}">
+          <span class="api-diff-status">${r.status === "added" ? "+" : r.status === "removed" ? "−" : "~"}</span>
+          <span class="api-diff-kind">${escapeHtml(KIND_LABEL[r.kind] || r.kind)}</span>
+          <span class="api-diff-key">${escapeHtml(r.key)}</span>
+          <span class="api-diff-detail">${escapeHtml(r.detail)}</span></div>`).join("") || '<div class="compare-empty">No API change matches.</div>'
+          + (shown.length > 3000 ? `<div class="compare-empty">… ${shown.length - 3000} more (download the table)</div>` : "");
+      }
+    }, 200);
     filter.oninput = () => {
-      clearTimeout(t);
-      t = setTimeout(() => {
-        this.apiQuery = filter.value.trim();
-        this.persist();
-        const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
-        const dlBtn = container.querySelector(".api-diff-download");
-        if (dlBtn) dlBtn.textContent = `⬇ Download (${shown.length})`;
-        const listEl = container.querySelector(".api-diff-list");
-        if (listEl) {
-          listEl.innerHTML = shown.slice(0, 3000).map((r) => `<div class="api-diff-row status-${r.status}" data-kind="${r.kind}" data-key="${escapeHtml(r.key)}" data-status="${r.status}">
-            <span class="api-diff-status">${r.status === "added" ? "+" : r.status === "removed" ? "−" : "~"}</span>
-            <span class="api-diff-kind">${escapeHtml(KIND_LABEL[r.kind] || r.kind)}</span>
-            <span class="api-diff-key">${escapeHtml(r.key)}</span>
-            <span class="api-diff-detail">${escapeHtml(r.detail)}</span></div>`).join("") || '<div class="compare-empty">No API change matches.</div>'
-            + (shown.length > 3000 ? `<div class="compare-empty">… ${shown.length - 3000} more (download the table)</div>` : "");
-        }
-      }, 200);
+      this._debouncedApiFilter();
     };
     container.querySelector(".api-diff-download").onclick = (e) => {
       e.stopPropagation();
@@ -462,11 +501,14 @@ export class DiffView {
     });
 
     const filterInput = resContainer.querySelector("#cmp-file-filter");
+    this._debouncedFilter?.cancel?.();
     const applyFileFilter = debounce(() => {
+      if (!this.containerEl) return;
       this.visibleCount = PAGE_SIZE;
       this.renderFileRows();
       this.persist();
     }, 120);
+    this._debouncedFilter = applyFileFilter;
     filterInput.oninput = () => {
       this.fileFilter = filterInput.value;
       applyFileFilter();
@@ -490,12 +532,18 @@ export class DiffView {
   }
 
   wireDownloadMenu(resContainer, onPick) {
+    if (this._closeDownloadMenu) {
+      document.removeEventListener("mousedown", this._closeDownloadMenu, true);
+      this._closeDownloadMenu = null;
+    }
     const menu = resContainer.querySelector("#cmp-download-menu");
+    if (menu) menu.hidden = true;
     const closeMenu = (e) => {
-      if (e && menu.parentElement.contains(e.target)) return;
+      if (e && menu.parentElement?.contains(e.target)) return;
       menu.hidden = true;
       document.removeEventListener("mousedown", closeMenu, true);
     };
+    this._closeDownloadMenu = closeMenu;
     resContainer.querySelector("#cmp-download").onclick = () => {
       if (!menu.hidden) return closeMenu();
       menu.hidden = false;
@@ -811,7 +859,7 @@ export class DiffView {
           <span class="compare-row-actions">
             ${canOpenBase ? `<button class="code-btn" data-open="a" type="button" title="Open at ${escapeHtml(this.versionA)}">${escapeHtml(shortRef(this.versionA))}</button>` : ""}
             ${canOpenTarget ? `<button class="code-btn" data-open="b" type="button" title="Open at ${escapeHtml(this.versionB)}">${escapeHtml(shortRef(this.versionB))}</button>` : ""}
-            ${type !== "unchanged" ? `<button class="code-btn" data-nodemap type="button" title="Send this file's diff to the NodeMap canvas">🕸</button>` : ""}
+            ${type !== "unchanged" ? `<button class="code-btn" data-nodemap type="button" title="Send this file's diff to the NodeMap canvas" aria-label="Send this file's diff to the NodeMap canvas">🕸</button>` : ""}
           </span>
         </div>
       </div>`;
@@ -882,27 +930,33 @@ export class DiffView {
 
     try {
       const res = await this.api.getFileDiff(this.versionA, this.versionB, path, oldPath || "", similarity ?? 50);
-      if (!rowEl.contains(box)) return;
+      if (!this.containerEl || !rowEl.contains(box)) return;
       if (res.is_binary) {
         box.innerHTML = `<div class="diff-content">Binary file changed.</div>`;
         return;
       }
       const lines = (res.diff || "").split("\n");
-      const body = lines.map((line) => {
-        let cls = "";
-        if (line.startsWith("@@")) cls = "diff-hunk";
-        else if (line.startsWith("+") && !line.startsWith("+++")) cls = "diff-add";
-        else if (line.startsWith("-") && !line.startsWith("---")) cls = "diff-del";
-        return `<div class="${cls}">${escapeHtml(line) || " "}</div>`;
-      }).join("");
+      const truncatedInitial = lines.length > MAX_INITIAL_DIFF_LINES;
+      const shownLines = truncatedInitial ? lines.slice(0, MAX_INITIAL_DIFF_LINES) : lines;
+      const body = renderDiffLinesHtml(shownLines);
       box.innerHTML = `
         <div class="diff-header">
           <span class="diff-add">+${res.additions}</span> <span class="diff-del">−${res.deletions}</span>
           ${res.truncated ? `<span class="compare-diff-note">(diff truncated)</span>` : ""}
         </div>
-        <div class="diff-content">${body || "No textual changes."}</div>`;
+        <div class="diff-content">${body || "No textual changes."}</div>
+        ${truncatedInitial ? `<button type="button" class="code-btn compare-diff-show-all">Show all ${lines.length.toLocaleString()} lines</button>` : ""}`;
+      const showAllBtn = box.querySelector(".compare-diff-show-all");
+      if (showAllBtn) {
+        showAllBtn.onclick = (e) => {
+          e.stopPropagation();
+          const contentEl = box.querySelector(".diff-content");
+          if (contentEl) contentEl.innerHTML = renderDiffLinesHtml(lines);
+          showAllBtn.remove();
+        };
+      }
     } catch (e) {
-      if (rowEl.contains(box)) {
+      if (this.containerEl && rowEl.contains(box)) {
         box.innerHTML = `<div class="diff-content compare-diff-error">Failed to load diff: ${escapeHtml(e.message)}</div>`;
       }
     }
@@ -986,11 +1040,14 @@ export class DiffView {
     };
 
     const filterInput = resContainer.querySelector("#cmp-man-filter");
+    this._debouncedManFilter?.cancel?.();
     const applyManFilter = debounce(() => {
+      if (!this.containerEl) return;
       this.manVisibleCount = PAGE_SIZE;
       this.renderManRows();
       this.persist();
     }, 120);
+    this._debouncedManFilter = applyManFilter;
     filterInput.oninput = () => {
       this.manQuery = filterInput.value;
       applyManFilter();

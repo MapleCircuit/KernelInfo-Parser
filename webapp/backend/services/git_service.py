@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import threading
 import time
 import urllib.parse
 from datetime import UTC, datetime
@@ -957,11 +958,16 @@ class GitService:
         try:
             # Bounded like get_commit_diff(): a tree-import commit diffs to hundreds of MB. A truncated
             # patch would give another patch id, so none is computed for it.
-            with subprocess.Popen(["git", "-C", repo_dir, "show", "--format=", c_hash],
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as show:
+            show_cmd = ["git", "-C", repo_dir, "show", "--format=", c_hash]
+            with subprocess.Popen(show_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as show:
+                timed_out = threading.Event()
+                timer = threading.Timer(30.0, lambda: (timed_out.set(), show.kill()))
+                timer.start()
                 try:
                     assert show.stdout is not None
                     patch = show.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
+                    if timed_out.is_set():
+                        raise subprocess.TimeoutExpired(show_cmd, 30.0)
                     if len(patch) > MAX_COMMIT_DIFF_BYTES:
                         show.kill()
                         patch = b""
@@ -971,6 +977,7 @@ class GitService:
                     show.wait()
                     raise
                 finally:
+                    timer.cancel()
                     if show.poll() is None:
                         show.kill()
             if show_rc == 0 and patch:
@@ -1075,15 +1082,21 @@ class GitService:
             parents = out.split()[1:]
             base = parents[0] if parents else _EMPTY_TREE
             # Stream stdout and stop reading at the byte cap: a tree-import commit can diff to hundreds of MB.
+            diff_cmd = ["git", "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", base, sha]
             with subprocess.Popen(
-                ["git", "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", base, sha],
+                diff_cmd,
                 cwd=str(get_repo_dir()),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             ) as proc:
+                timed_out = threading.Event()
+                timer = threading.Timer(30.0, lambda: (timed_out.set(), proc.kill()))
+                timer.start()
                 try:
                     assert proc.stdout is not None
                     raw = proc.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
+                    if timed_out.is_set():
+                        raise subprocess.TimeoutExpired(diff_cmd, 30.0)
                     truncated = len(raw) > MAX_COMMIT_DIFF_BYTES
                     if truncated:
                         proc.kill()
@@ -1094,6 +1107,7 @@ class GitService:
                     proc.wait()
                     raise
                 finally:
+                    timer.cancel()
                     if proc.poll() is None:
                         proc.kill()
         except subprocess.TimeoutExpired as e:

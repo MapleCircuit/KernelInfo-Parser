@@ -75,7 +75,7 @@ export class InsightsView extends SectionedView {
     } else if (ver) {
       this.resolved = fallbackResolved(ver);
     }
-    if (signal.aborted) return;
+    if (signal.aborted || !this.containerEl?.isConnected) return;
     this.updateDetectedBadge();
   }
 

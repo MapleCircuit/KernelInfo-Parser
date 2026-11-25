@@ -162,7 +162,8 @@ class TreeResolverService:
     def _cache_tree(self, commit_id: int, tree_map: dict[int, int]) -> None:
         with self._lock:
             self._tree_cache[commit_id] = tree_map
-            if len(self._tree_cache) > self._max_cache_size:
+            self._tree_cache.move_to_end(commit_id)
+            while len(self._tree_cache) > self._max_cache_size:
                 self._tree_cache.popitem(last=False)
 
 

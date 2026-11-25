@@ -3,6 +3,7 @@
  * hardware. Paste `lspci -nn`, `lsusb`, modalias, compatible or ACPI ids; browse the device tables.
  */
 import { api } from "../../api.js";
+import { state } from "../../state.js";
 import { escapeHtml } from "../../components/modal.js";
 import { toast } from "../../components/toast.js";
 import { registerApiSection } from "./kernel_api_view.js";
@@ -60,20 +61,20 @@ document.addEventListener("click", async (e) => {
   const btn = e.target.closest?.(".dev-find");
   if (!btn) return;
   const box = btn.closest(".dev-paste");
-  const view = box.closest(".sv-container");
   const text = box.querySelector(".dev-input").value;
   const results = box.querySelector(".dev-results");
-  const version = view?.closest("[data-tab-version]")?.dataset.tabVersion;
-  const state = (await import("../../state.js")).state;
   const tab = state.getActiveTab();
+  const version = tab?.version || state.activeVersion?.() || state.currentVersion;
   const arch = tab?.arch || state.kconfigArch();
   results.innerHTML = '<p class="sv-empty">Matching…</p>';
   try {
-    const res = await api.forTab(tab).request(`/api/kapi/${encodeURIComponent(version || tab?.version || state.currentVersion)}/devices/match`, {
+    const res = await api.forTab(tab).request(`/api/kapi/${encodeURIComponent(version)}/devices/match`, {
       method: "POST", body: JSON.stringify({ text, arch }), timeoutMs: 90000,
     });
-    results.innerHTML = resultsHtml(res, { version: tab?.version || state.currentVersion, arch, repo: state.repoOf(tab) });
+    if (results.isConnected === false) return;
+    results.innerHTML = resultsHtml(res, { version, arch, repo: state.repoOf(tab) });
   } catch (err) {
+    if (results.isConnected === false) return;
     results.innerHTML = "";
     toast.error(`Matching failed: ${err.message}`);
   }
@@ -82,11 +83,10 @@ document.addEventListener("click", (e) => {
   const a = e.target.closest?.(".dev-results [data-open-file], .dev-results [data-kconfig]");
   if (!a) return;
   e.preventDefault();
-  import("../../state.js").then(({ state }) => {
-    const tab = state.getActiveTab();
-    if (a.dataset.openFile) state.openTab({ type: "code", title: a.dataset.openFile.split("/").pop(), path: a.dataset.openFile, cursorLine: parseInt(a.dataset.line, 10) || 1, version: tab?.version || state.currentVersion });
-    else if (hasFeature(state.repoOf(tab), "kconfig")) state.openTab({ type: "kconfig", title: `KConfig (${tab?.arch || state.kconfigArch()})`, arch: tab?.arch || state.kconfigArch(), symbol: a.dataset.kconfig, version: tab?.version || state.currentVersion });
-  });
+  const tab = state.getActiveTab();
+  const version = tab?.version || state.activeVersion?.() || state.currentVersion;
+  if (a.dataset.openFile) state.openTab({ type: "code", title: a.dataset.openFile.split("/").pop(), path: a.dataset.openFile, cursorLine: parseInt(a.dataset.line, 10) || 1, version });
+  else if (hasFeature(state.repoOf(tab), "kconfig")) state.openTab({ type: "kconfig", title: `KConfig (${tab?.arch || state.kconfigArch()})`, arch: tab?.arch || state.kconfigArch(), symbol: a.dataset.kconfig, version });
 });
 
 export { resultsHtml };

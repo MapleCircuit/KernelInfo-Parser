@@ -3,6 +3,7 @@
  */
 import { api } from "../api.js";
 import { state } from "../state.js";
+import { safeHttpUrl } from "../utils/url_safety.js";
 
 export async function showPersonModal(version, personIdentifier) {
   if (!personIdentifier) return;
@@ -50,7 +51,7 @@ export async function showPersonModal(version, personIdentifier) {
       <div style="font-weight: 600; font-size: var(--fs-14, 14px); color: var(--text-primary, #ccc); display: flex; align-items: center; gap: 8px;">
         <span>👤 Developer Profile</span>
       </div>
-      <button class="person-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
+      <button type="button" aria-label="Close" class="person-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </div>
     <div class="person-modal-body" style="padding: 24px 20px; overflow-y: auto; flex: 1;">
       <div style="text-align: center; color: var(--text-muted, #888); padding: 30px;">
@@ -81,11 +82,13 @@ export async function showPersonModal(version, personIdentifier) {
 
   try {
     const data = await api.getPersonProfile(currentVersion, personIdentifier);
+    if (!backdrop.isConnected) return;
     const p = data.person || data;
     const name = p.name || data.name || String(personIdentifier);
     const email = p.email || data.email || "";
     const inCredits = Boolean(data.in_credits || (data.credits && (data.credits.description || data.credits.web_page)));
     const credits = data.credits || {};
+    const webUrl = safeHttpUrl(credits.web_page);
     const stats = data.contribution_stats || {};
     const sections = data.sections || data.subsystems || [];
     const authoredCount = stats.authored_commits ?? (data.recent_commits ? data.recent_commits.length : 0);
@@ -97,7 +100,7 @@ export async function showPersonModal(version, personIdentifier) {
       <!-- Profile Header -->
       <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 20px;">
         <div style="width: calc(52px * var(--ui-layout-scale, 1)); height: calc(52px * var(--ui-layout-scale, 1)); border-radius: 50%; background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)); color: var(--text-on-accent); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: var(--fs-20, 20px); flex-shrink: 0; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
-          ${initials}
+          ${escapeHtml(initials)}
         </div>
         <div style="flex: 1; min-width: 0;">
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
@@ -126,7 +129,7 @@ export async function showPersonModal(version, personIdentifier) {
           <div style="font-size: var(--fs-11, 11px); font-weight: 600; text-transform: uppercase; color: var(--text-muted, #888); margin-bottom: 8px;">biographical credits record</div>
           <div style="font-size: var(--fs-12, 12px); color: var(--text-secondary, #ccc); display: flex; flex-direction: column; gap: 6px;">
             ${credits.description ? `<div><strong>Description:</strong> ${escapeHtml(credits.description)}</div>` : ""}
-            ${credits.web_page ? `<div><strong>Web Page:</strong> <a href="${escapeHtml(credits.web_page)}" target="_blank" style="color:var(--accent-blue, #58a6ff);">${escapeHtml(credits.web_page)} ↗</a></div>` : ""}
+            ${credits.web_page ? `<div><strong>Web Page:</strong> ${webUrl ? `<a href="${escapeHtml(webUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-blue, #58a6ff);">${escapeHtml(credits.web_page)} ↗</a>` : `<span>${escapeHtml(credits.web_page)}</span>`}</div>` : ""}
             ${credits.pgp_key ? `<div><strong>PGP Key:</strong> <code style="font-family:var(--font-mono, monospace); font-size: var(--fs-11, 11px); color: var(--accent-orange, #f0883e);">${escapeHtml(credits.pgp_key)}</code></div>` : ""}
             ${credits.snail_mail ? `<div><strong>Postal / Snail Mail:</strong><pre style="margin-top:4px; font-family:inherit; white-space:pre-wrap; color:var(--text-muted, #888); font-size:var(--fs-11, 11px);">${escapeHtml(credits.snail_mail)}</pre></div>` : ""}
           </div>

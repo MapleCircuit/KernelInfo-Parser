@@ -51,6 +51,7 @@ function makeCtrl(tab = { id: "upg-1", type: "nodemap", version: "v6.6", repo: "
   c.currentVersion = tab.version;
   c.repo = tab.repo;
   c.storageKey = `${M.STORAGE_PREFIX}${tab.id}`;
+  c.containerEl = { isConnected: true };
   c.canvas = M.emptyCanvas();
   c.rootCanvas = c.canvas;
   c.renderer = { sync() {}, invalidate() {}, element: () => null, clear() {}, place() {}, updateViewportCulling() {} };
@@ -390,10 +391,17 @@ test("cve, kapi, doc, and history domain nodes render, bridge, spawn and export 
   assert.equal(kapiSpec({ catalog: "exports", symbol: "kmalloc" }).data.symbol, "kmalloc");
   assert.equal(docSpec({ path: "Documentation/foo.rst" }).type, "doc");
   assert.equal(historySpec({ mode: "blame", path: "a.c" }).data.mode, "blame");
+  const blameSpec = historySpec({ mode: "blame", path: "a.c", version: "v6.6" });
+  const blameN = M.createNode(blameSpec.type, { version: blameSpec.version, data: blameSpec.data });
   assert.equal(tabForNode(cveN).type, "cve");
   assert.equal(tabForNode(kapiN).type, "api");
-  assert.equal(tabForNode(docN).docMode, "doc");
+  assert.equal(tabForNode(docN).docMode, "rendered");
   assert.equal(tabForNode(histN).type, "code");
+  assert.equal(tabForNode(histN).blame, false);
+  assert.equal(tabForNode(histN).showBlame, false);
+  assert.equal(tabForNode(blameN).type, "code");
+  assert.equal(tabForNode(blameN).blame, true);
+  assert.equal(tabForNode(blameN).showBlame, true);
 
   const svg = canvasToSvg({ ...M.emptyCanvas(), nodes: [cveN, kapiN, docN, histN] }, named, {
     content: (n) => ({ [cveN.id]: cveM, [kapiN.id]: kapiM, [docN.id]: docM, [histN.id]: histM }[n.id]),
@@ -559,5 +567,86 @@ test("regression: worker pool exec after dispose returns null, and empty IDB mer
   } finally {
     document.createElement = origCreate;
     c.dispose();
+  }
+});
+
+test("FE-013: expandCallgraph and expandCallPath abort cleanly if disposed, detached, switched canvas, or source removed mid-await", async () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+
+  // 1. Disposed mid-await in expandCallgraph
+  {
+    const d = deferred();
+    const c = makeCtrl();
+    c.api = { async getCallgraph() { return d.promise; } };
+    const fn = c.addNode({ type: "symbol", data: { name: "copy_process", kind: "func" } });
+    let commits = 0;
+    c.commit = () => { commits += 1; };
+    const pending = c.expandCallgraph(fn.id, "both");
+    c.dispose();
+    d.resolve({ callers: [{ name: "sys_fork", file_path: "kernel/fork.c", line: 100 }], callees: [] });
+    const added = await pending;
+    assert.deepEqual(added, []);
+    assert.equal(c.canvas.nodes.length, 1);
+    assert.equal(c.canvas.edges.length, 0);
+    assert.equal(commits, 0);
+  }
+
+  // 2. Detached containerEl mid-await in expandCallgraph
+  {
+    const d = deferred();
+    const c = makeCtrl();
+    c.api = { async getCallgraph() { return d.promise; } };
+    const fn = c.addNode({ type: "symbol", data: { name: "copy_process", kind: "func" } });
+    let commits = 0;
+    c.commit = () => { commits += 1; };
+    const pending = c.expandCallgraph(fn.id, "callees");
+    c.containerEl.isConnected = false;
+    d.resolve({ callers: [], callees: [{ name: "copy_mm", file_path: "kernel/fork.c", line: 220 }] });
+    const added = await pending;
+    assert.deepEqual(added, []);
+    assert.equal(c.canvas.nodes.length, 1);
+    assert.equal(commits, 0);
+  }
+
+  // 3. Switched canvas mid-await in expandCallPath (even when both canvases lack .id)
+  {
+    const d = deferred();
+    const c = makeCtrl();
+    c.api = { async getCallpath() { return d.promise; } };
+    const fn = c.addNode({ type: "symbol", data: { name: "copy_process", kind: "func" } });
+    let commits = 0;
+    c.commit = () => { commits += 1; };
+    const origCanvas = c.canvas;
+    const pending = c.expandCallPath(fn.id, "dup_mm", { maxDepth: 4, k: 2 });
+    const switchedCanvas = M.emptyCanvas();
+    c.canvas = switchedCanvas;
+    d.resolve({ paths: [["copy_process", "copy_mm", "dup_mm"]] });
+    const added = await pending;
+    assert.deepEqual(added, []);
+    assert.equal(origCanvas.nodes.length, 1);
+    assert.equal(switchedCanvas.nodes.length, 0);
+    assert.equal(commits, 0);
+  }
+
+  // 4. Source node removed mid-await in expandCallPath
+  {
+    const d = deferred();
+    const c = makeCtrl();
+    c.api = { async getCallpath() { return d.promise; } };
+    const fn = c.addNode({ type: "symbol", data: { name: "copy_process", kind: "func" } });
+    let commits = 0;
+    c.commit = () => { commits += 1; };
+    const pending = c.expandCallPath(fn.id, "dup_mm", { maxDepth: 4, k: 2 });
+    c.canvas.nodes = c.canvas.nodes.filter((n) => n.id !== fn.id);
+    d.resolve({ paths: [["copy_process", "copy_mm", "dup_mm"]] });
+    const added = await pending;
+    assert.deepEqual(added, []);
+    assert.equal(c.canvas.nodes.length, 0);
+    assert.equal(c.canvas.edges.length, 0);
+    assert.equal(commits, 0);
   }
 });

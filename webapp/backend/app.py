@@ -205,11 +205,6 @@ def create_app() -> FastAPI:
             return Response(status_code=404)
         return FileResponse(str(target), headers={"Cache-Control": BUILD_CACHE_CONTROL})
 
-    @app.api_route("/api/{unmatched_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-    def api_not_found(unmatched_path: str):
-        """Consistent JSON 404 for unknown /api/ paths."""
-        return JSONResponse(status_code=404, content={"detail": "Not Found"})
-
     @app.get("/manifest.json")
     def serve_manifest():
         manifest_path = FRONTEND_DIR / "manifest.json"

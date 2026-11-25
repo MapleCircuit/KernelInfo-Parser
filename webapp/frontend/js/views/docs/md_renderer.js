@@ -512,13 +512,18 @@ export class MarkdownRenderer {
    * Format image tags, adding badge class if image URL corresponds to a shield/badge.
    */
   formatImage(alt, rawUrl, rawTitle) {
+    const trimmed = String(rawUrl || "").trim();
+    const schemeCheck = trimmed.replace(/[\u0000-\u0020\u007f]+/g, "");
     const titleAttr = rawTitle ? ` title="${escapeHtml(rawTitle)}"` : "";
-    const isBadge = /(badge|shields\.io|crates\.io\/crates\/[^\/]+\.svg|deps\.rs)/i.test(rawUrl);
+    const isBadge = /(badge|shields\.io|crates\.io\/crates\/[^\/]+\.svg|deps\.rs)/i.test(trimmed);
     const badgeClass = isBadge ? " kdoc-badge" : "";
-    if (/^[a-z]+:\/\//i.test(rawUrl)) {
-      return `<img class="kdoc-img${badgeClass}" src="${escapeHtml(rawUrl)}" alt="${escapeHtml(alt)}"${titleAttr} />`;
+    if (/^(?:https?|ftp):\/\//i.test(schemeCheck)) {
+      return `<img class="kdoc-img${badgeClass}" src="${escapeHtml(trimmed)}" alt="${escapeHtml(alt)}"${titleAttr} />`;
     }
-    const resolved = resolveRelativePath(rawUrl, this.path);
+    if (/^[a-z][a-z0-9+.-]*:/i.test(schemeCheck)) {
+      return `<img class="kdoc-img${badgeClass}" src="" alt="${escapeHtml(alt)}"${titleAttr} />`;
+    }
+    const resolved = resolveRelativePath(trimmed, this.path);
     return `<img class="kdoc-img${badgeClass}" data-raw="${escapeHtml(resolved)}" alt="${escapeHtml(alt)}"${titleAttr} />`;
   }
 
@@ -526,14 +531,19 @@ export class MarkdownRenderer {
    * Format links to relative documents, sources, external URLs, or internal section anchors.
    */
   formatLink(innerHtml, rawUrl, rawTitle) {
+    const trimmed = String(rawUrl || "").trim();
+    const schemeCheck = trimmed.replace(/[\u0000-\u0020\u007f]+/g, "");
     const titleAttr = rawTitle ? ` title="${escapeHtml(rawTitle)}"` : "";
-    if (rawUrl.startsWith("#")) {
-      return `<a class="reference internal" href="${escapeHtml(rawUrl)}"${titleAttr}>${innerHtml}</a>`;
+    if (trimmed.startsWith("#")) {
+      return `<a class="reference internal" href="${escapeHtml(trimmed)}"${titleAttr}>${innerHtml}</a>`;
     }
-    if (/^[a-z]+:\/\//i.test(rawUrl)) {
-      return `<a class="reference external" href="${escapeHtml(rawUrl)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${innerHtml}</a>`;
+    if (/^(?:https?|ftp):\/\//i.test(schemeCheck) || /^mailto:/i.test(schemeCheck)) {
+      return `<a class="reference external" href="${escapeHtml(trimmed)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${innerHtml}</a>`;
     }
-    const resolved = resolveRelativePath(rawUrl, this.path);
+    if (/^[a-z][a-z0-9+.-]*:/i.test(schemeCheck)) {
+      return `<a class="reference internal" href="#"${titleAttr}>${innerHtml}</a>`;
+    }
+    const resolved = resolveRelativePath(trimmed, this.path);
     if (/\.(md|markdown|rst|txt)$/i.test(resolved.split("#")[0])) {
       return `<a class="reference internal" data-doc="${escapeHtml(resolved)}" href="#"${titleAttr}>${innerHtml}</a>`;
     }

@@ -222,9 +222,11 @@ export class TabsComponent {
 
         // Close button
         const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
         closeBtn.className = "tab-close";
         closeBtn.innerHTML = "&times;";
         closeBtn.title = "Close tab";
+        closeBtn.setAttribute("aria-label", "Close tab");
         closeBtn.addEventListener("click", (e) => {
           e.stopPropagation();
           state.closeTab(tab.id, pane.id);
@@ -269,8 +271,10 @@ export class TabsComponent {
       actions.className = "tabstrip-actions";
 
       const splitHBtn = document.createElement("button");
+      splitHBtn.type = "button";
       splitHBtn.className = "tabstrip-btn";
       splitHBtn.title = state.splitMode === "horizontal" ? "Close Split View" : "Split Editor Right (Side by Side)";
+      splitHBtn.setAttribute("aria-label", splitHBtn.title);
       splitHBtn.innerHTML = `<svg viewBox="0 0 16 16"><path d="M0 2a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2zm7.5 1v10h6.5a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1h-6.5zm-1 0H2a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h4.5V3z"/></svg>`;
       splitHBtn.onclick = (e) => {
         e.stopPropagation();
@@ -278,8 +282,10 @@ export class TabsComponent {
       };
 
       const splitVBtn = document.createElement("button");
+      splitVBtn.type = "button";
       splitVBtn.className = "tabstrip-btn";
       splitVBtn.title = state.splitMode === "vertical" ? "Close Split View" : "Split Editor Down (Stacked)";
+      splitVBtn.setAttribute("aria-label", splitVBtn.title);
       splitVBtn.innerHTML = `<svg viewBox="0 0 16 16"><path d="M0 2a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2zm1 6.5h14V14a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V8.5zm0-1V3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v4.5H1z"/></svg>`;
       splitVBtn.onclick = (e) => {
         e.stopPropagation();
@@ -738,7 +744,7 @@ export class TabsComponent {
     state.closeTab(tab.id, sourcePaneId);
 
     // Open new browser window with the new session pinned
-    window.open(`/?session=${encodeURIComponent(newSession.id)}`, "_blank");
+    window.open(`/?session=${encodeURIComponent(newSession.id)}`, "_blank", "noopener,noreferrer");
   }
 
   // ------------------------------------------------------------------ Tab Context Menu
@@ -891,10 +897,16 @@ export class TabsComponent {
         document.body.style.userSelect = "";
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        window.removeEventListener("blur", onPointerUp);
       };
 
+      this._activeDividerCleanup?.();
+      this._activeDividerCleanup = onPointerUp;
       window.addEventListener("pointermove", onPointerMove);
       window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
+      window.addEventListener("blur", onPointerUp);
     });
   }
 

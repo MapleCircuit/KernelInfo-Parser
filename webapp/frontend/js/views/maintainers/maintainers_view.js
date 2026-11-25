@@ -6,7 +6,15 @@ import { state } from "../../state.js";
 import { maintainerSpec, sendToNodemap } from "../nodemap/nodemap_bridge.js";
 import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
+import { safeHttpUrl } from "../../utils/url_safety.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
+
+function externalLinkHtml(rawUrl) {
+  const safe = safeHttpUrl(rawUrl);
+  return safe
+    ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-blue);">${escapeHtml(safe)}</a>`
+    : escapeHtml(rawUrl);
+}
 
 /** Sections of the view's sidebar; the first is the default, left out of the URL (§5.26). */
 const SECTIONS = ["subsystems", "developers", "credits", "patch"];
@@ -61,6 +69,17 @@ export class MaintainersView {
     this.listCollapsed = false;
     this.listLoaded = false;
     this.containerEl = null;
+    this._listToken = 0;
+    this._detailToken = 0;
+    this.debouncedSearch = null;
+  }
+
+  dispose() {
+    this.debouncedSearch?.cancel?.();
+    this.debouncedSearch = null;
+    this._listToken = (this._listToken || 0) + 1;
+    this._detailToken = (this._detailToken || 0) + 1;
+    this.containerEl = null;
   }
 
   async render(containerEl, tabData) {
@@ -105,7 +124,7 @@ export class MaintainersView {
               <span class="m-role-pill ${this.currentDevRole === "reviewer" ? "active" : ""}" data-role="reviewer">Reviewers</span>
               <span class="m-role-pill ${this.currentDevRole === "credits" ? "active" : ""}" data-role="credits">CREDITS</span>
             </div>
-            <button id="btn-dev-sort" class="btn-dev-sort" title="Toggle Sort (Activity / A-Z)">
+            <button type="button" id="btn-dev-sort" class="btn-dev-sort" title="Toggle Sort (Activity / A-Z)">
               ${this.currentDevSort === "alpha" ? "🔤 A-Z" : "⚡ Activity"}
             </button>
           </div>
@@ -161,10 +180,12 @@ export class MaintainersView {
 
     // Search filter
     const searchInput = containerEl.querySelector("#m-search-input");
+    this.debouncedSearch?.cancel?.();
     const debouncedSearch = debounce((q) => {
       this.persistTabState({ query: q });
       this.loadList(q);
     }, 250);
+    this.debouncedSearch = debouncedSearch;
     searchInput.oninput = () => {
       debouncedSearch(searchInput.value.trim());
     };
@@ -190,6 +211,7 @@ export class MaintainersView {
     this.containerEl.querySelector("#m-search-input")?.focus();
     if (this.listLoaded) return;
     await this.loadList(this.containerEl.querySelector("#m-search-input")?.value?.trim() || "");
+    if (!this.containerEl?.isConnected) return;
     this.containerEl.querySelector(".subsystem-card.active")?.scrollIntoView({ block: "nearest" });
   }
 
@@ -221,6 +243,7 @@ export class MaintainersView {
   }
 
   async loadList(query = "") {
+    const token = ++this._listToken;
     this.listLoaded = true;
     const listContainer = this.containerEl.querySelector("#m-list-container");
     listContainer.innerHTML = `<div style="padding:16px;color:var(--text-muted);">Searching...</div>`;
@@ -228,6 +251,7 @@ export class MaintainersView {
     if (this.activeTab === "subsystems") {
       try {
         const res = await this.api.getMaintainersOverview(this.currentVersion, query);
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.subsystems = res.sections || [];
         this.renderSubsystemsList();
         if (!this.subsystems.length) {
@@ -236,6 +260,7 @@ export class MaintainersView {
           }</div>`;
         }
       } catch (e) {
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "developers") {
@@ -245,16 +270,20 @@ export class MaintainersView {
           role: this.currentDevRole,
           sort: this.currentDevSort,
         });
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.developers = res.developers || [];
         this.renderDevelopersList(this.developers);
       } catch (e) {
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "credits") {
       try {
         const res = await this.api.getCredits(this.currentVersion, query);
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.renderCreditsList(res.credits || res.entries || []);
       } catch (e) {
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "patch") {
@@ -369,12 +398,14 @@ export class MaintainersView {
   }
 
   async inspectSection(secId) {
+    const token = ++this._detailToken;
     this.setSelection(secId, null);
     const detailEl = this.containerEl.querySelector("#m-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading subsystem details...</div>`;
 
     try {
       const res = await this.api.getMaintainerSection(this.currentVersion, secId);
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       const sec = res.section || res;
 
       detailEl.innerHTML = `
@@ -413,10 +444,10 @@ export class MaintainersView {
             <div class="m-card-title">Subsystem Metadata</div>
             <div style="display:flex;flex-direction:column;gap:8px;font-size:var(--fs-12, 12px);">
               <div><strong style="color:var(--text-muted);">Mailing List:</strong> ${escapeHtml(sec.mailing_list || "None")}</div>
-              <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? `<a href="${escapeHtml(sec.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.web_page)}</a>` : "None"}</div>
+              <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? externalLinkHtml(sec.web_page) : "None"}</div>
               <div><strong style="color:var(--text-muted);">SCM Tree:</strong> ${escapeHtml(sec.scm_tree || "None")}</div>
-              ${sec.patchwork ? `<div><strong style="color:var(--text-muted);">Patchwork:</strong> <a href="${escapeHtml(sec.patchwork)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.patchwork)}</a></div>` : ""}
-              ${sec.bug_url ? `<div><strong style="color:var(--text-muted);">Bug Tracker:</strong> <a href="${escapeHtml(sec.bug_url)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.bug_url)}</a></div>` : ""}
+              ${sec.patchwork ? `<div><strong style="color:var(--text-muted);">Patchwork:</strong> ${externalLinkHtml(sec.patchwork)}</div>` : ""}
+              ${sec.bug_url ? `<div><strong style="color:var(--text-muted);">Bug Tracker:</strong> ${externalLinkHtml(sec.bug_url)}</div>` : ""}
               ${sec.chat_channel ? `<div><strong style="color:var(--text-muted);">Chat Channel:</strong> ${escapeHtml(sec.chat_channel)}</div>` : ""}
               ${sec.profile_doc ? `<div><strong style="color:var(--text-muted);">Profile Doc:</strong> <span class="m-profile-doc-link" data-path="${escapeHtml(sec.profile_doc)}" style="color:var(--accent-blue);cursor:pointer;">${escapeHtml(sec.profile_doc)}</span></div>` : ""}
             </div>
@@ -446,11 +477,14 @@ export class MaintainersView {
           <div style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:var(--fs-11, 11px);">
             ${
               Array.isArray(sec.files) && sec.files.length > 0
-                ? sec.files.map((f) => `
-                    <div class="m-file-link" data-path="${escapeHtml(f.fname || f)}" style="color:var(--accent-blue);cursor:pointer;padding:2px 0;">
-                      📄 ${escapeHtml(f.fname || f)}
+                ? sec.files.map((f) => {
+                    const fp = f.fname || f.path || f;
+                    return `
+                    <div class="m-file-link" data-path="${escapeHtml(fp)}" style="color:var(--accent-blue);cursor:pointer;padding:2px 0;">
+                      📄 ${escapeHtml(fp)}
                     </div>
-                  `).join("")
+                  `;
+                  }).join("")
                 : `<span style="color:var(--text-muted);">No directly matched indexed files recorded</span>`
             }
           </div>
@@ -518,6 +552,7 @@ export class MaintainersView {
       });
 
     } catch (e) {
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
@@ -547,12 +582,14 @@ export class MaintainersView {
   }
 
   async inspectPerson(emailOrName) {
+    const token = ++this._detailToken;
     this.setSelection(null, emailOrName);
     const detailEl = this.containerEl.querySelector("#m-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading developer profile...</div>`;
 
     try {
       const p = await this.api.getPersonProfile(this.currentVersion, emailOrName);
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       const stats = p.contribution_stats || {};
       const sections = p.sections || p.subsystems || [];
 
@@ -568,7 +605,7 @@ export class MaintainersView {
             <div class="m-card-title">CREDITS Record</div>
             <div style="display:flex;flex-direction:column;gap:8px;font-size:var(--fs-12, 12px);">
               <div><strong style="color:var(--text-muted);">Description:</strong> ${escapeHtml(p.credits?.description || "Not in CREDITS")}</div>
-              ${p.credits?.web_page ? `<div><strong style="color:var(--text-muted);">Web Page:</strong> <a href="${escapeHtml(p.credits.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(p.credits.web_page)}</a></div>` : ""}
+              ${p.credits?.web_page ? `<div><strong style="color:var(--text-muted);">Web Page:</strong> ${externalLinkHtml(p.credits.web_page)}</div>` : ""}
               ${p.credits?.pgp_key ? `<div><strong style="color:var(--text-muted);">PGP Key:</strong> <code style="font-size:var(--fs-11, 11px);color:var(--accent-orange);">${escapeHtml(p.credits.pgp_key)}</code></div>` : ""}
               <div><strong style="color:var(--text-muted);">Snail Mail:</strong> ${p.credits?.snail_mail ? `<pre style="font-family:inherit;margin-top:2px;white-space:pre-wrap;">${escapeHtml(p.credits.snail_mail)}</pre>` : "None"}</div>
             </div>
@@ -603,7 +640,7 @@ export class MaintainersView {
         </div>
 
         <div style="margin-top:16px;display:flex;gap:8px;">
-          <button id="btn-view-person-commits" class="code-btn active" style="font-size:var(--fs-12, 12px);padding:6px 12px;cursor:pointer;">
+          <button type="button" id="btn-view-person-commits" class="code-btn active" style="font-size:var(--fs-12, 12px);padding:6px 12px;cursor:pointer;">
             View Commits by ${escapeHtml(p.name || p.email)}
           </button>
         </div>
@@ -648,6 +685,7 @@ export class MaintainersView {
         };
       }
     } catch (e) {
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to load person profile: ${escapeHtml(e.message)}</div>`;
     }
   }
@@ -661,7 +699,7 @@ export class MaintainersView {
       <div class="patch-analyzer-box">
         <div style="font-weight:600;font-size:var(--fs-14, 14px);color:var(--accent-orange);">Patch Reviewer (get_maintainer.pl Simulator)</div>
         <textarea class="patch-input-textarea" id="patch-text-input" placeholder="Paste git format-patch or unified diff here..."></textarea>
-        <button class="code-btn active" id="btn-run-match" style="align-self:flex-start;">Analyze Recipients</button>
+        <button type="button" class="code-btn active" id="btn-run-match" style="align-self:flex-start;">Analyze Recipients</button>
         <div id="patch-match-results" style="margin-top:12px;"></div>
       </div>
     `;
@@ -673,6 +711,7 @@ export class MaintainersView {
 
       try {
         const matchRes = await this.api.matchMaintainers(this.currentVersion, text);
+        if (!this.containerEl?.isConnected || !resContainer.isConnected) return;
         const toList = (matchRes.suggested_to || []).map((p) => {
           const str = typeof p === "string" ? p : `${p.name || p.email} <${p.email || ""}> (${p.role || "Maintainer"})`;
           return `<div>• ${escapeHtml(str)}</div>`;
@@ -692,6 +731,7 @@ export class MaintainersView {
           </div>
         `;
       } catch (e) {
+        if (!this.containerEl?.isConnected || !resContainer.isConnected) return;
         resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     };

@@ -67,7 +67,10 @@ export class VirtualList {
     });
     this.viewport.addEventListener("keydown", (e) => this.onKey(e));
     if (typeof ResizeObserver === "function") {
-      this.ro = new ResizeObserver(() => this.paint());
+      this.ro = new ResizeObserver(() => {
+        if (this.host?.isConnected === false) return;
+        this.paint();
+      });
       this.ro.observe(this.viewport);
     }
     this._offScale = onUiScaleChanged(({ layoutScale } = {}) => {
@@ -99,6 +102,7 @@ export class VirtualList {
   }
 
   paint() {
+    if (!this.host || this.host.isConnected === false || !this.viewport || !this.rowsEl) return;
     const [start, end] = visibleRange(this.viewport.scrollTop, this.viewport.clientHeight || 400, this.rowHeight, this.rows.length);
     this.rowsEl.style.transform = `translateY(${start * this.rowHeight}px)`;
     let html = "";

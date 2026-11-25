@@ -14,19 +14,6 @@ import { kconfigGrammar } from "./languages/kconfig.js";
 import { dtsGrammar } from "./languages/dts.js";
 import { yamlGrammar } from "./languages/yaml.js";
 
-export const ALL_GRAMMARS = [
-  cGrammar,
-  rustGrammar,
-  pythonGrammar,
-  shellGrammar,
-  perlGrammar,
-  assemblyGrammar,
-  makefileGrammar,
-  kconfigGrammar,
-  dtsGrammar,
-  yamlGrammar
-];
-
 export const DEFAULT_FALLBACK_GRAMMAR = {
   id: "raw",
   name: "Raw",

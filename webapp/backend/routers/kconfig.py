@@ -39,8 +39,6 @@ def get_kconfig_symbol(
     toolchain: ToolchainParam = None,
 ) -> dict[str, Any]:
     """Arch-scoped definitions (file:line), dependencies, reverse dependencies, help and compiled files."""
-    if len(symbol_name) > 256:
-        raise HTTPException(status_code=400, detail="symbol_name must be at most 256 characters")
     return kconfig_service.get_symbol_detail(version_name, symbol_name, arch, toolchain)
 
 
@@ -53,8 +51,6 @@ def get_kconfig_symbol_usage(
     toolchain: ToolchainParam = None,
 ) -> dict[str, Any]:
     """Where CONFIG_<symbol> is used: Kbuild rules, C/ASM/linker sources and Kconfig references."""
-    if len(symbol_name) > 256:
-        raise HTTPException(status_code=400, detail="symbol_name must be at most 256 characters")
     return kconfig_service.get_symbol_usage(version_name, symbol_name, arch, limit, toolchain)
 
 
@@ -76,8 +72,6 @@ def get_kconfig_symbol_history(
     branch: str | None = Query(None, description="Branch the timeline follows (default: chosen for version_name)"),
 ) -> dict[str, Any]:
     """Release-by-release history of every definition of CONFIG_<symbol>, with property-level changes."""
-    if len(symbol_name) > 256:
-        raise HTTPException(status_code=400, detail="symbol_name must be at most 256 characters")
     return history_service.get_kconfig_history(symbol_name, version_name, include_rc, branch=branch or None)
 
 

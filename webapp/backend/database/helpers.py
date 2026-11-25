@@ -73,8 +73,9 @@ _REPO_ID_CACHE: dict[str, int] = RepoScopedCache()
 
 def get_active_repo_id(reader: Any) -> int:
     """m_repository.repo_id of the request's repository (-1 when that repository was never parsed)."""
-    if "repo_id" in _REPO_ID_CACHE:
-        return _REPO_ID_CACHE["repo_id"]
+    cached = _REPO_ID_CACHE.get("repo_id")
+    if cached is not None:
+        return cached
     repo = get_active_repository()
     repo_id = -1
     try:
@@ -108,6 +109,15 @@ def get_active_network_id(reader: Any) -> int | None:
             return None
     _REPO_ID_CACHE["network_id"] = network_id
     return network_id if network_id >= 0 else None
+
+
+def clear_version_caches() -> None:
+    """Atomically clear all version and repository ID lookup caches under _VERSION_LOCK."""
+    with _VERSION_LOCK:
+        _NAME_TO_VID_CACHE.clear()
+        _VID_TO_NAME_CACHE.clear()
+        _REPO_ID_CACHE.clear()
+        _PRELOADED.clear()
 
 
 def preload_version_cache(reader: Any) -> None:

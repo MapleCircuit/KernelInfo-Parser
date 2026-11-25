@@ -18,6 +18,7 @@ import { toast } from "../../components/toast.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { buildDeepLink } from "../../tab_routes.js";
+import { safeHttpUrl } from "../../utils/url_safety.js";
 
 const STATUS_COLORS = {
   A: "var(--accent-green)",
@@ -89,11 +90,22 @@ export class MailView {
 
     this.isLoadingSearch = false;
     this.isLoadingThread = false;
+    this._searchToken = 0;
     this._threadToken = 0;
     this.daemonStatus = null;
     this._checkingDaemon = false;
     this.listCollapsed = false;
     this.listLoaded = false;
+    this.debouncedSearch = null;
+  }
+
+  dispose() {
+    this.debouncedSearch?.cancel?.();
+    this.debouncedSearch = null;
+    this._searchToken = (this._searchToken || 0) + 1;
+    this._threadToken = (this._threadToken || 0) + 1;
+    this._versionsToken = (this._versionsToken || 0) + 1;
+    this.containerEl = null;
   }
 
   async render(containerEl, tabData = {}) {
@@ -120,8 +132,8 @@ export class MailView {
         <!-- Left Column: Search / Thread Tree -->
         <div class="mail-list-col">
           <div class="mail-list-switcher">
-            <button class="mail-list-mode-btn ${treeActive ? '' : 'active'}" data-list-mode="search" title="Search the mailing list archive">🔍 Search</button>
-            <button class="mail-list-mode-btn ${treeActive ? 'active' : ''}" data-list-mode="tree" title="Browse the reply tree of the open thread">🌲 Thread Tree</button>
+            <button type="button" class="mail-list-mode-btn ${treeActive ? '' : 'active'}" data-list-mode="search" title="Search the mailing list archive">🔍 Search</button>
+            <button type="button" class="mail-list-mode-btn ${treeActive ? 'active' : ''}" data-list-mode="tree" title="Browse the reply tree of the open thread">🌲 Thread Tree</button>
             <button type="button" class="collapse-btn" id="btn-mail-collapse" title="Collapse mailing list" aria-label="Collapse mailing list">${COLLAPSE_ICON}</button>
           </div>
 
@@ -132,14 +144,14 @@ export class MailView {
               <div style="display:flex;gap:6px;align-items:center;">
                 <span style="font-size:var(--fs-14, 14px);">✉</span>
                 <input type="text" id="mail-search-input" class="mail-search-input" placeholder="Search LKML subject, author, s:, f:, m:..." />
-                <button id="mail-search-clear-btn" class="mail-clear-btn" title="Clear search" style="display:none;">&times;</button>
+                <button type="button" id="mail-search-clear-btn" class="mail-clear-btn" title="Clear search" aria-label="Clear search" style="display:none;">&times;</button>
               </div>
               <!-- Quick Filter Chips -->
               <div class="mail-filter-chips">
-                <button class="mail-chip ${this.currentFilter === 'all' ? 'active' : ''}" data-filter="all">All</button>
-                <button class="mail-chip ${this.currentFilter === 'patch' ? 'active' : ''}" data-filter="patch">Patches</button>
-                <button class="mail-chip ${this.currentFilter === 'cover' ? 'active' : ''}" data-filter="cover">Cover Letters</button>
-                <button class="mail-chip ${this.currentFilter === 'pull' ? 'active' : ''}" data-filter="pull">Pull Requests</button>
+                <button type="button" class="mail-chip ${this.currentFilter === 'all' ? 'active' : ''}" data-filter="all">All</button>
+                <button type="button" class="mail-chip ${this.currentFilter === 'patch' ? 'active' : ''}" data-filter="patch">Patches</button>
+                <button type="button" class="mail-chip ${this.currentFilter === 'cover' ? 'active' : ''}" data-filter="cover">Cover Letters</button>
+                <button type="button" class="mail-chip ${this.currentFilter === 'pull' ? 'active' : ''}" data-filter="pull">Pull Requests</button>
               </div>
             </div>
 
@@ -174,12 +186,14 @@ export class MailView {
       if (clearBtn) clearBtn.style.display = "block";
     }
 
+    this.debouncedSearch?.cancel?.();
     const debouncedSearch = debounce((q) => {
       this.currentQuery = q;
       if (clearBtn) clearBtn.style.display = q ? "block" : "none";
       this.persistTabState({ query: q });
       this.loadSearch(true);
     }, 250);
+    this.debouncedSearch = debouncedSearch;
 
     searchInput.oninput = () => {
       debouncedSearch(searchInput.value.trim());
@@ -235,7 +249,10 @@ export class MailView {
     if (collapsed) return;
     if (this.listMode === "search") {
       this.containerEl.querySelector("#mail-search-input")?.focus();
-      if (!this.listLoaded) await this.loadSearch(true);
+      if (!this.listLoaded) {
+        await this.loadSearch(true);
+        if (!this.containerEl?.isConnected) return;
+      }
     } else if (this.listMode === "tree") {
       this.renderTree();
       this.loadThreadVersions();
@@ -288,16 +305,16 @@ export class MailView {
     this.renderVersionSelector();
     try {
       const data = await this.api.getMailThreadVersions(this.activeThreadId, this.activeMessageId);
-      if (token !== this._versionsToken) return;
+      if (token !== this._versionsToken || !this.containerEl?.isConnected) return;
       this.versionsData = data;
       if (data?.available && data.current_version) {
         this.selectedVersion = data.current_version;
       }
     } catch (e) {
-      if (token !== this._versionsToken) return;
+      if (token !== this._versionsToken || !this.containerEl?.isConnected) return;
       this.versionsData = { available: false, error: e.message, versions: [] };
     } finally {
-      if (token === this._versionsToken) {
+      if (token === this._versionsToken && this.containerEl?.isConnected) {
         this.isLoadingVersions = false;
         this.renderVersionSelector();
         this.renderTree();
@@ -329,7 +346,7 @@ export class MailView {
         const isActive = v.version === this.selectedVersion;
         const count = v.patches || v.total || 0;
         return `
-          <button class="mail-version-chip ${isActive ? 'active' : ''}" data-version="${v.version}"
+          <button type="button" class="mail-version-chip ${isActive ? 'active' : ''}" data-version="${v.version}"
                   title="${escapeHtml(v.subject || '')}\n${escapeHtml(v.author || '')}${v.date_iso ? ' · ' + escapeHtml(v.date_iso) : ''}">
             v${v.version}
             <span class="mail-version-count">${count}</span>
@@ -450,7 +467,7 @@ export class MailView {
       host.innerHTML = `
         <div class="mail-tree-empty">
           <p>No thread open.</p>
-          <button class="code-btn" id="mail-tree-goto-search">Find a thread in Search</button>
+          <button type="button" class="code-btn" id="mail-tree-goto-search">Find a thread in Search</button>
         </div>
       `;
       const gotoBtn = host.querySelector("#mail-tree-goto-search");
@@ -515,7 +532,8 @@ export class MailView {
     else if (isReply) badge = `<span class="mail-badge reply">RE</span>`;
 
     row.innerHTML = `
-      <button class="mail-tree-twisty ${node.children.length ? '' : 'leaf'}"
+      <button type="button" class="mail-tree-twisty ${node.children.length ? '' : 'leaf'}"
+              aria-label="${node.children.length ? (isOpen ? 'Collapse replies' : `Show ${replyCount} replies`) : 'No replies'}"
               title="${node.children.length ? (isOpen ? 'Collapse replies' : `Show ${replyCount} repl${replyCount === 1 ? 'y' : 'ies'}`) : 'No replies'}">
         ${node.children.length ? (isOpen ? '▾' : '▸') : '·'}
       </button>
@@ -618,8 +636,10 @@ export class MailView {
   async checkDaemonStatus() {
     if (this._checkingDaemon || this.daemonStatus !== null) return;
     this._checkingDaemon = true;
+    const container = this.containerEl;
     try {
       const st = await this.api.getMailStatus();
+      if (!this.containerEl?.isConnected || this.containerEl !== container) return;
       this.daemonStatus = st;
       const banner = this.containerEl?.querySelector("#mail-status-banner");
       if (!banner) return;
@@ -631,7 +651,7 @@ export class MailView {
             <span>⚠️</span>
             <span>Mailing list backend is offline (${escapeHtml(st.reason || 'Not reachable')}). Showing cached threads.</span>
           </div>
-          <button class="code-btn" id="mail-retry-status-btn" style="font-size:var(--fs-10, 10px);padding:2px 8px;">Retry</button>
+          <button type="button" class="code-btn" id="mail-retry-status-btn" style="font-size:var(--fs-10, 10px);padding:2px 8px;">Retry</button>
         `;
         const retryBtn = banner.querySelector("#mail-retry-status-btn");
         if (retryBtn) {
@@ -653,9 +673,10 @@ export class MailView {
   }
 
   async loadSearch(reset = true) {
-    const listContainer = this.containerEl.querySelector("#mail-results-container");
+    const listContainer = this.containerEl?.querySelector("#mail-results-container");
     if (!listContainer) return;
 
+    const token = ++this._searchToken;
     this.listLoaded = true;
     if (reset) {
       this.currentPage = 1;
@@ -670,6 +691,7 @@ export class MailView {
         limit: 50,
         filterType: this.currentFilter,
       });
+      if (token !== this._searchToken || !this.containerEl?.isConnected) return;
 
       this.totalResults = data.total || 0;
       const newItems = data.results || [];
@@ -697,6 +719,7 @@ export class MailView {
       this.isLoadingSearch = false;
       this.renderResultsList();
     } catch (e) {
+      if (token !== this._searchToken || !this.containerEl?.isConnected) return;
       if (reset) {
         listContainer.innerHTML = `
           <div style="padding:16px;color:var(--accent-red);font-size:var(--fs-12, 12px);">
@@ -705,7 +728,7 @@ export class MailView {
         `;
       }
     } finally {
-      this.isLoadingSearch = false;
+      if (token === this._searchToken) this.isLoadingSearch = false;
     }
   }
 
@@ -749,7 +772,7 @@ export class MailView {
           <span class="mail-result-author" title="${escapeHtml(item.author)}">${escapeHtml(authorShort)}</span>
           <div style="display:flex;gap:6px;align-items:center;">
             ${badgesHtml}
-            <span class="mail-result-date">${dateStr}</span>
+            <span class="mail-result-date">${escapeHtml(dateStr)}</span>
           </div>
         </div>
       `;
@@ -780,6 +803,7 @@ export class MailView {
     // Pagination button
     if (this.results.length < this.totalResults) {
       const moreBtn = document.createElement("button");
+      moreBtn.type = "button";
       moreBtn.className = "code-btn";
       moreBtn.style.width = "100%";
       moreBtn.style.margin = "12px 0 24px 0";
@@ -811,7 +835,7 @@ export class MailView {
 
     try {
       const threadData = await this.api.getMailThread(tid, targetMid);
-      if (token !== this._threadToken) return;
+      if (token !== this._threadToken || !this.containerEl?.isConnected) return;
       this.activeThreadData = threadData;
       this.activeThreadId = threadData.tid || tid;
 
@@ -835,7 +859,7 @@ export class MailView {
         this.loadThreadVersions();
       }
     } catch (e) {
-      if (token !== this._threadToken) return;
+      if (token !== this._threadToken || !this.containerEl?.isConnected) return;
       detailEl.innerHTML = `
         <div style="padding:32px;color:var(--accent-red);text-align:center;">
           Failed to load thread: ${escapeHtml(e.message)}
@@ -867,6 +891,8 @@ export class MailView {
       targetIdx = 0;
     }
 
+    const safeThreadLoreUrl = safeHttpUrl(threadData.lore_url || (LORE_BASE_URL + "t/" + encodeURIComponent(threadData.tid || 0)));
+
     container.innerHTML = `
       <div class="mail-thread-wrapper">
         <!-- Thread Header Bar -->
@@ -876,8 +902,8 @@ export class MailView {
             <span><strong>${messages.length}</strong> message${messages.length === 1 ? '' : 's'}</span>
             <span>·</span>
             <span><strong>${participants.length}</strong> contributor${participants.length === 1 ? '' : 's'}</span>
-            <span>·</span>
-            <a href="${escapeHtml(threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0)))}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org ↗</a>
+            ${safeThreadLoreUrl ? `<span>·</span>
+            <a href="${escapeHtml(safeThreadLoreUrl)}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org ↗</a>` : ""}
             <span>·</span>
             <button class="code-btn mail-copy-link-btn" type="button" data-act="copy-thread-link" title="Copy versionless deep link to this thread">🔗 Copy link</button>
             <span>·</span>
@@ -1015,10 +1041,12 @@ export class MailView {
       badgeHtml = `<span class="mail-badge patch">PATCH${vStr}${idxStr}</span>`;
     }
 
+    const msgLoreUrl = safeHttpUrl(`${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id || "")}/`);
+
     card.innerHTML = `
       <div class="mail-card-header">
         <div class="mail-card-header-line mail-card-header-top">
-          <button class="mail-card-toggle" title="Toggle message body">
+          <button type="button" class="mail-card-toggle" title="Toggle message body" aria-label="Toggle message body">
             ${startExpanded ? '▼' : '▶'}
           </button>
           <div class="mail-card-author-group">
@@ -1034,15 +1062,15 @@ export class MailView {
           <div class="mail-card-actions">
             <!-- View Mode Toggle -->
             <div class="mail-view-mode-toggle" title="Toggle Beautified / Raw RFC-822 view">
-              <button class="mail-mode-btn active" data-mode="beautified">Beautified</button>
-              <button class="mail-mode-btn" data-mode="raw">Raw</button>
+              <button type="button" class="mail-mode-btn active" data-mode="beautified">Beautified</button>
+              <button type="button" class="mail-mode-btn" data-mode="raw">Raw</button>
             </div>
-            <button class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
-            <button class="code-btn mail-action-btn" data-act="copy-link" title="Copy versionless deep link to this message">🔗 Link</button>
-            <button class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
-            <button class="code-btn mail-action-btn" data-act="nodemap" title="Send this thread, focused on this message, to the NodeMap canvas">🕸 NodeMap</button>
-            ${msgSummary.is_patch && !/^\s*re\s*:/i.test(msgSummary.subject || "") ? `<button class="code-btn mail-action-btn" data-act="try" title="Apply this patch to a revision, in memory">Try on revision…</button>` : ""}
-            <a href="${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>
+            <button type="button" class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
+            <button type="button" class="code-btn mail-action-btn" data-act="copy-link" title="Copy versionless deep link to this message">🔗 Link</button>
+            <button type="button" class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
+            <button type="button" class="code-btn mail-action-btn" data-act="nodemap" title="Send this thread, focused on this message, to the NodeMap canvas">🕸 NodeMap</button>
+            ${msgSummary.is_patch && !/^\s*re\s*:/i.test(msgSummary.subject || "") ? `<button type="button" class="code-btn mail-action-btn" data-act="try" title="Apply this patch to a revision, in memory">Try on revision…</button>` : ""}
+            ${msgLoreUrl ? `<a href="${escapeHtml(msgLoreUrl)}" target="_blank" rel="noopener noreferrer" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>` : ""}
           </div>
         </div>
       </div>
@@ -1118,10 +1146,12 @@ export class MailView {
     if (copyBtn) {
       copyBtn.onclick = async (e) => {
         e.stopPropagation();
+        const token = this._threadToken;
         const mid = msgSummary.message_id || msgSummary.num;
         let detail = this.loadedMessageDetails.get(mid);
         if (!detail) {
           detail = await this.api.getMailMessage(mid);
+          if (token !== this._threadToken || !this.containerEl?.isConnected || !detail) return;
         }
         const textToCopy = detail?.raw || detail?.body || "";
         if (textToCopy) {
@@ -1163,10 +1193,12 @@ export class MailView {
     if (downloadBtn) {
       downloadBtn.onclick = async (e) => {
         e.stopPropagation();
+        const token = this._threadToken;
         const mid = msgSummary.message_id || msgSummary.num;
         let detail = this.loadedMessageDetails.get(mid);
         if (!detail) {
           detail = await this.api.getMailMessage(mid);
+          if (token !== this._threadToken || !this.containerEl?.isConnected || !detail) return;
         }
         const content = detail?.raw || detail?.body || "";
         const filename = `${(detail?.subject || mid).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 40)}.eml`;
@@ -1191,15 +1223,18 @@ export class MailView {
   }
 
   async fetchAndRenderMessageDetail(mid, cardEl) {
+    const token = this._threadToken;
     const bodyEl = cardEl.querySelector(".mail-card-body");
     if (!bodyEl) return;
 
     try {
       const detail = await this.api.getMailMessage(mid);
+      if (token !== this._threadToken || !this.containerEl?.isConnected || !cardEl.isConnected || !bodyEl.isConnected) return;
       this.loadedMessageDetails.set(mid, detail);
       const isRaw = this.rawModeMap.get(mid) || false;
       this.renderCardContent(bodyEl, detail, isRaw);
     } catch (e) {
+      if (token !== this._threadToken || !this.containerEl?.isConnected || !cardEl.isConnected || !bodyEl.isConnected) return;
       bodyEl.innerHTML = `
         <div style="padding:16px;color:var(--accent-red);font-size:var(--fs-12, 12px);">
           Failed to load message: ${escapeHtml(e.message)}
@@ -1211,6 +1246,7 @@ export class MailView {
   renderCardContent(bodyEl, detail, isRaw) {
     bodyEl.innerHTML = "";
     if (!detail || detail.available === false || detail.error) {
+      const detailLoreUrl = safeHttpUrl(detail?.lore_url);
       bodyEl.innerHTML = `
         <div class="mail-empty-message-error" style="padding:14px;background:rgba(255,200,0,0.08);border:1px solid rgba(255,200,0,0.25);border-radius:6px;margin:8px 0;">
           <div style="font-weight:600;color:var(--accent-yellow);margin-bottom:6px;display:flex;align-items:center;gap:6px;">
@@ -1221,8 +1257,8 @@ export class MailView {
             ${escapeHtml(detail?.error || "The message content could not be located in the local public-inbox mirror.")}
           </div>
           <div style="display:flex;gap:10px;align-items:center;">
-            ${detail?.lore_url ? `<a href="${escapeHtml(detail.lore_url)}" target="_blank" rel="noopener noreferrer" class="lore-link" style="font-size:var(--fs-12, 12px);">View on lore.kernelinfo.org ↗</a>` : ""}
-            <button class="code-btn mail-retry-msg-btn" style="font-size:var(--fs-11, 11px);padding:3px 10px;">Retry</button>
+            ${detailLoreUrl ? `<a href="${escapeHtml(detailLoreUrl)}" target="_blank" rel="noopener noreferrer" class="lore-link" style="font-size:var(--fs-12, 12px);">View on lore.kernelinfo.org ↗</a>` : ""}
+            <button type="button" class="code-btn mail-retry-msg-btn" style="font-size:var(--fs-11, 11px);padding:3px 10px;">Retry</button>
           </div>
         </div>
       `;
@@ -1364,7 +1400,7 @@ export class MailView {
             <span class="cdiff-path">${pathLabel}</span>
             <span class="cdiff-add">+${f.additions || 0}</span>
             <span class="cdiff-del">−${f.deletions || 0}</span>
-            <button class="code-btn cdiff-open" data-fi="${fi}" title="Open this file in Code Editor">Open ↗</button>
+            <button type="button" class="code-btn cdiff-open" data-fi="${fi}" title="Open this file in Code Editor">Open ↗</button>
           </summary>
           <div class="cdiff-body">
       `;

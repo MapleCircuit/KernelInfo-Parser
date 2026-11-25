@@ -62,6 +62,16 @@ class TestFrontendJs(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertRegex(res.stdout, r"# fail 0")
 
+    def test_core_security_and_session_transfer_js_suites(self) -> None:
+        """Core security/URL/error/state/session-transfer JS tests pass."""
+        suites = [JS_TESTS / "core_security_state.test.mjs", JS_TESTS / "session_transfer.test.mjs"]
+        for suite in suites:
+            self.assertTrue(suite.is_file(), f"Missing {suite}")
+        res = subprocess.run([self.node, "--test", "--test-timeout=60000", *(str(s) for s in suites)],
+                             capture_output=True, text=True, check=False, timeout=120, cwd=str(ROOT))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertRegex(res.stdout, r"# fail 0")
+
     def test_bridge_reports_failures(self) -> None:
         """A failing assertion makes the bridge fail (the suite cannot pass vacuously)."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -26,6 +26,7 @@ import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
 import { MenuconfigTui } from "./menuconfig_tui.js";
 import { KconfigHistory } from "./kconfig_history.js";
+import { kconfigDryRun, applyDryRun } from "./kconfig_dry_run.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
 import { showChangePreview, previewOrApply } from "../../components/change_preview.js";
 import { showKconfigHistoryModal } from "../../components/symbol_history_modal.js";
@@ -58,6 +59,14 @@ export class KconfigView {
     this.containerEl = null;
     this.archPresets = [];
     this.detailToken = 0;
+    this._archSeq = 0;
+    this._usageSeq = 0;
+    this._graphSeq = 0;
+    this._compareSeq = 0;
+    this._compareRunSeq = 0;
+    this._searchTimer = null;
+    this._disposed = false;
+    this.tui = null;
     // Raw assignments (bare names) while the engine is off; resolved values while it is on
     this.rawValues = {};
     // Tab currently rendered by this view, and whether the engine change in flight is its own
@@ -97,12 +106,24 @@ export class KconfigView {
 
   /** Called when this tab is closed (TabsComponent.pruneTabViews). */
   dispose() {
+    this._disposed = true;
+    this._archSeq++;
+    this.detailToken++;
+    this._usageSeq++;
+    this._graphSeq++;
+    this._compareSeq++;
+    this._compareRunSeq++;
+    clearTimeout(this._searchTimer);
+    this._searchTimer = null;
+    const tui = this.tui;
+    this.tui = null;
+    this.containerEl = null;
+    tui?.hide();
     if (this.unsubscribeEngine) this.unsubscribeEngine();
     if (this.unsubscribeEngineRequest) this.unsubscribeEngineRequest();
     this.history.clear("");
     this.unsubscribeEngine = null;
     this.unsubscribeEngineRequest = null;
-    this.containerEl = null;
   }
 
   /** This tab's engine was switched on or off by something other than this view. */
@@ -140,6 +161,9 @@ export class KconfigView {
   }
 
   async render(containerEl, tabData) {
+    this._disposed = false;
+    clearTimeout(this._searchTimer);
+    this._searchTimer = null;
     this.containerEl = containerEl;
     this.tabId = tabData.id || null;
     this.currentVersion = tabData.version || state.currentVersion;
@@ -219,20 +243,25 @@ export class KconfigView {
     `;
     this.bindToolbar();
 
+    let targetArch = this.currentArch;
     try {
-      const presetsRes = await this.api.getKconfigPresets(this.currentVersion);
+      const presetsRes = await (this.api || api).getKconfigPresets(this.currentVersion);
+      if (!this.containerEl?.isConnected) return;
       this.archPresets = (presetsRes && presetsRes.targets) || [];
       if (!this.archPresets.some((p) => p.id === this.currentArch)) {
         const fallback = presetsRes?.default_arch || this.archPresets[0]?.id || DEFAULT_ARCH;
         if (this.archPresets.length) toast.info(`ARCH=${this.currentArch} does not exist in ${this.currentVersion}; using ${fallback}`);
-        this.currentArch = fallback;
+        targetArch = fallback;
       }
       this.fillArchSelect();
     } catch (err) {
+      if (!this.containerEl?.isConnected) return;
       console.warn("Could not fetch arch presets:", err);
     }
 
-    await this.activateArch(this.currentArch);
+    await this.activateArch(targetArch);
+    if (!this.containerEl?.isConnected) return;
+    this.fillArchSelect();
     if (tabData && tabData.symbol) this.selectAndInspectSymbol(tabData.symbol, { keepFilter: Boolean(this.searchQuery) });
     // The command palette may have asked this tab to take the engine while it was in the background
     if (state.takeKconfigEngineRequest(this.tabId)) this.setEngineActive(true);
@@ -254,7 +283,9 @@ export class KconfigView {
     c.querySelector("#btn-toolchain").onclick = () => this.showToolchainModal();
     c.querySelector("#btn-open-tui").onclick = () => {
       if (!this.engine.loaded) return;
-      new MenuconfigTui(this).show();
+      this.tui?.hide();
+      this.tui = new MenuconfigTui(this);
+      this.tui.show();
     };
     c.querySelector("#btn-export-config").onclick = () => this.exportConfig();
     c.querySelector("#btn-load-defconfig").onclick = () => this.showDefconfigModal();
@@ -274,9 +305,13 @@ export class KconfigView {
 
     const searchInput = c.querySelector("#kconfig-search-input");
     searchInput.oninput = () => {
-      this.searchQuery = searchInput.value.trim();
-      this.filterTree(this.searchQuery);
-      this.persistTabState({ query: this.searchQuery });
+      clearTimeout(this._searchTimer);
+      this._searchTimer = setTimeout(() => {
+        if (!this.containerEl?.isConnected) return;
+        this.searchQuery = searchInput.value.trim();
+        this.filterTree(this.searchQuery);
+        this.persistTabState({ query: this.searchQuery });
+      }, 150);
     };
 
     c.querySelector("#btn-kconfig-expand").onclick = () => this.setListCollapsed(false);
@@ -310,6 +345,7 @@ export class KconfigView {
   // ------------------------------------------------------------------ configuration lifecycle
   /** Load the ARCH's model and restore its saved configuration (or its default defconfig). */
   async activateArch(arch) {
+    const seq = ++this._archSeq;
     const archChanged = this.currentArch !== arch;
     if (archChanged) {
       this.expandedNodeIds.clear();
@@ -334,9 +370,11 @@ export class KconfigView {
     if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-empty">Loading KConfig model for ARCH=${escapeHtml(arch)}...</div>`;
 
     try {
-      const raw = await this.api.getKconfigTree(this.currentVersion, arch, this.toolchain);
+      const raw = await (this.api || api).getKconfigTree(this.currentVersion, arch, this.toolchain);
+      if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
       this.engine.setModel(raw);
     } catch (err) {
+      if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
       if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-error">Failed to load the Kconfig model: ${escapeHtml(err.message)}</div>`;
       return;
     }
@@ -355,6 +393,7 @@ export class KconfigView {
     } finally {
       this.historyPaused--;
     }
+    if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
     if (resume) this.history.base = this.snapshot();
     else this.history.clear(historyKey, this.snapshot());
 
@@ -695,10 +734,12 @@ export class KconfigView {
 
   /** Load a defconfig of this ARCH ("" = the default `make defconfig` one). */
   async loadDefconfig(path, { quiet = false } = {}) {
+    const seq = this._archSeq;
     let res;
     try {
-      res = await this.api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
+      res = await (this.api || api).getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
     } catch (err) {
+      if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
       if (!quiet) toast.error(`Failed to load defconfig: ${err.message}`);
       this.engine.loadConfig("");
       this.engine.setAllNewSymbols("default");
@@ -706,6 +747,7 @@ export class KconfigView {
       this.commit();
       return;
     }
+    if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
     const report = this.engine.loadConfig(res.content || "");
     this.engine.setAllNewSymbols("default");
     if (this.engineActive) {
@@ -864,6 +906,11 @@ export class KconfigView {
     }
     this.changed();
     return true;
+  }
+
+  /** Show change preview unless empty, then apply; forwards to components/change_preview.js. */
+  previewOrApply(opts) {
+    return previewOrApply(opts);
   }
 
   /** Ask before a change that lowers other options; resolves true to go ahead. */
@@ -1148,7 +1195,7 @@ export class KconfigView {
     if (isTri && !(s.choice && this.engineActive && e.symTri(s.choice) === 2)) {
       for (const v of s.type === "tristate" ? ["n", "m", "y"] : ["n", "y"]) {
         const allowed = !this.engineActive || v === val || e.tristateWithinRange(sym, { n: 0, m: 1, y: 2 }[v]);
-        controls.push(`<button class="code-btn kconfig-set-btn ${v === val ? "active" : ""}" data-value="${v}" ${allowed ? "" : "disabled"} title="${allowed ? `Set CONFIG_${sym}=${v}` : escapeHtml(e.refusalReason(sym, { n: 0, m: 1, y: 2 }[v]))}">${v}</button>`);
+        controls.push(`<button class="code-btn kconfig-set-btn ${v === val ? "active" : ""}" data-value="${v}" ${allowed ? "" : "disabled"} title="${allowed ? `Set CONFIG_${escapeHtml(sym)}=${v}` : escapeHtml(e.refusalReason(sym, { n: 0, m: 1, y: 2 }[v]))}">${v}</button>`);
       }
     } else if (isTri) {
       controls.push(`<button class="code-btn kconfig-set-btn ${val === "y" ? "active" : ""}" data-value="y">${val === "y" ? "(X) selected" : "Select"}</button>`);
@@ -1348,15 +1395,15 @@ export class KconfigView {
   async fillRemoteDetail(sym, token, detailCol) {
     let detail;
     try {
-      detail = await this.api.getKconfigSymbol(this.currentVersion, sym, this.currentArch, this.toolchain);
+      detail = await (this.api || api).getKconfigSymbol(this.currentVersion, sym, this.currentArch, this.toolchain);
     } catch (err) {
-      if (token === this.detailToken) {
+      if (token === this.detailToken && this.containerEl?.isConnected) {
         const box = detailCol.querySelector("#kconfig-detail-remote");
         if (box) box.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       }
       return;
     }
-    if (token !== this.detailToken) return;
+    if (token !== this.detailToken || !this.containerEl?.isConnected) return;
     const box = detailCol.querySelector("#kconfig-detail-remote");
     if (!box) return;
     if (detail.defined_for_arch === false) {
@@ -1371,6 +1418,24 @@ export class KconfigView {
     const rules = (detail.kbuild || []).filter((r) => r.kind === "directory" && !r.other_arch);
     const own = compiled.filter((f) => !f.other_arch);
     const other = compiled.filter((f) => f.other_arch);
+    const impliedBy = Array.isArray(detail.implied_by) ? detail.implied_by : [];
+    const impliedByRemoteHtml = impliedBy.length
+      ? `<div class="kconfig-prop-title" style="margin-top:8px;">Implied by (${impliedBy.length})</div>`
+        + impliedBy.map((item) => {
+          if (typeof item === "string") {
+            return `<div class="kconfig-rel-row">${/^[A-Za-z0-9_]+$/.test(item) ? this.symLink(item) : `<code>${escapeHtml(item)}</code>`}</div>`;
+          }
+          if (item && typeof item === "object") {
+            const name = item.symbol || item.by || item.name || "";
+            const cond = item.cond || item.condition || item.expr || "";
+            const loc = item.file ? ` ${this.fileLink(item.file, item.line)}` : "";
+            const left = name ? this.symLink(String(name)) : "";
+            const mid = cond ? `${left ? ' <span class="kconfig-muted">when</span> ' : ""}<code>${escapeHtml(String(cond))}</code>` : "";
+            return `<div class="kconfig-rel-row">${left || mid ? `${left}${mid}` : `<code>${escapeHtml(JSON.stringify(item))}</code>`}${loc}</div>`;
+          }
+          return `<div class="kconfig-rel-row"><code>${escapeHtml(String(item))}</code></div>`;
+        }).join("")
+      : "";
     const fileRow = (f) => `<div class="kconfig-file-row ${f.other_arch ? "kconfig-other-arch" : ""}">
         ${this.fileLink(f.file_path, 1, f.file_path)}
         <span class="kconfig-muted">${escapeHtml(f.target_obj || "")} · ${escapeHtml(f.compile_mode || "")}</span>
@@ -1379,6 +1444,7 @@ export class KconfigView {
     box.innerHTML = `
       <div class="kconfig-prop-title">Help</div>
       <pre class="kconfig-help">${escapeHtml(detail.help || "There is no help available for this option.")}</pre>
+      ${impliedByRemoteHtml}
       <div class="kconfig-prop-title" style="margin-top:8px;">Files built when enabled (${own.length})</div>
       ${own.map(fileRow).join("") || '<span class="kconfig-muted">No Makefile rule names this option directly.</span>'}
       ${rules.length ? `<div class="kconfig-prop-title" style="margin-top:8px;">Directories descended into</div>
@@ -1389,14 +1455,18 @@ export class KconfigView {
   }
 
   async renderUsage(sym, container) {
+    const token = this.detailToken;
+    const seq = ++this._usageSeq;
     container.innerHTML = `<div class="kconfig-muted">Searching ${escapeHtml(this.currentVersion)}…</div>`;
     let usage;
     try {
-      usage = await this.api.getKconfigUsage(this.currentVersion, sym, this.currentArch, this.toolchain);
+      usage = await (this.api || api).getKconfigUsage(this.currentVersion, sym, this.currentArch, this.toolchain);
     } catch (err) {
+      if (seq !== this._usageSeq || token !== this.detailToken || !this.containerEl?.isConnected) return;
       container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
     }
+    if (seq !== this._usageSeq || token !== this.detailToken || !this.containerEl?.isConnected) return;
     const byFile = new Map();
     for (const r of usage.source_refs || []) {
       if (!byFile.has(r.file_path)) byFile.set(r.file_path, []);
@@ -1419,34 +1489,68 @@ export class KconfigView {
   }
 
   async autosolve(sym) {
+    const seq = this._archSeq;
     toast.info(`Searching prerequisites for CONFIG_${sym}…`);
     let res;
     try {
-      res = await this.api.autosolveKconfig(this.currentVersion, { target_symbol: sym, arch: this.currentArch, toolchain: this.toolchain, current_values: this.engine.configValues() });
+      res = await (this.api || api).autosolveKconfig(this.currentVersion, { target_symbol: sym, arch: this.currentArch, toolchain: this.toolchain, current_values: this.engine.configValues() });
     } catch (err) {
+      if (this._disposed || seq !== this._archSeq || (this.containerEl && !this.containerEl.isConnected)) return;
       toast.error(`Auto-solve failed: ${err.message}`);
       return;
     }
+    if (this._disposed || seq !== this._archSeq || (this.containerEl && !this.containerEl.isConnected) || !this.engine.loaded) return;
     const toggles = res.toggles_needed || [];
-    let applied = 0;
-    for (const t of toggles) {
-      if (this.engine.setValue(t.symbol, t.set_to || t.to || "y")) applied++;
+    if (!toggles.length) {
+      toast.error(`CONFIG_${sym} cannot be enabled: ${(res.blocked_by || []).join("; ") || "no legal path"}`);
+      return;
     }
-    if (applied) this.changed();
-    if (this.engine.value(sym) !== "n") toast.success(`CONFIG_${sym}=${this.engine.value(sym)} after ${applied} change(s): ${toggles.map((t) => `${t.symbol}=${t.set_to}`).join(", ")}`);
-    else toast.error(`CONFIG_${sym} cannot be enabled: ${(res.blocked_by || []).join("; ") || "no legal path"}`);
+    const run = kconfigDryRun(this.engine.model, this.engine.captureState(), (probe, ctx) => {
+      for (const t of toggles) ctx.want(t.symbol, t.set_to || t.to || "y");
+    });
+    if (!run.changes.length || run.engine.value(sym) === "n") {
+      toast.error(`CONFIG_${sym} cannot be enabled: ${(res.blocked_by || []).join("; ") || "no legal path"}`);
+      return;
+    }
+    const prereqs = run.changes.filter((c) => c.name !== sym);
+    const targetChange = run.changes.find((c) => c.name === sym);
+    const sections = prereqs.length
+      ? [
+          ...(targetChange ? [{ label: "Requested option", rows: [targetChange] }] : []),
+          { label: "Prerequisites & side effects", rows: prereqs },
+        ]
+      : [];
+    const { applied } = await this.previewOrApply({
+      title: `Enable CONFIG_${sym}?`,
+      summary: `${run.changes.length} option${run.changes.length === 1 ? "" : "s"} will change (${prereqs.length} prerequisite${prereqs.length === 1 ? "" : "s"} / side effect${prereqs.length === 1 ? "" : "s"})`,
+      intro: `Auto-solve found a configuration path to enable CONFIG_${sym}. Close leaves the configuration unchanged.`,
+      sections,
+      confirmLabel: `Apply ${run.changes.length} change${run.changes.length === 1 ? "" : "s"}`,
+      onInspect: (name) => this.selectAndInspectSymbol(name),
+      apply: () => {
+        if (this._disposed || seq !== this._archSeq || (this.containerEl && !this.containerEl.isConnected)) return;
+        applyDryRun(this.engine, run);
+        this.changed();
+      },
+    });
+    if (!applied || this._disposed || seq !== this._archSeq || (this.containerEl && !this.containerEl.isConnected)) return;
+    toast.success(`CONFIG_${sym}=${this.engine.value(sym)} after ${run.changes.length} change(s): ${toggles.map((t) => `${t.symbol}=${t.set_to || t.to || "y"}`).join(", ")}`);
   }
 
   /** Depends-on (left) and selects/implies (right) relations of a symbol as a clickable SVG graph. */
   async renderDependencyGraph(symbolName, container) {
+    const token = this.detailToken;
+    const seq = ++this._graphSeq;
     container.innerHTML = `<div class="kconfig-muted">Loading graph…</div>`;
     let graph;
     try {
-      graph = await this.api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, this.toolchain);
+      graph = await (this.api || api).getKconfigGraph(this.currentVersion, this.currentArch, symbolName, this.toolchain);
     } catch (err) {
+      if (seq !== this._graphSeq || token !== this.detailToken || !this.containerEl?.isConnected) return;
       container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
     }
+    if (seq !== this._graphSeq || token !== this.detailToken || !this.containerEl?.isConnected) return;
     const edges = graph.edges || [];
     const left = [...new Set(edges.filter((e) => e.type === "depends_on" && e.from === symbolName).map((e) => e.to))];
     const right = [...new Set(edges.filter((e) => e.type !== "depends_on" && e.from === symbolName).map((e) => e.to))];
@@ -1535,15 +1639,20 @@ export class KconfigView {
 
   /** Compare this tab's configuration with a defconfig of its ARCH, or with another KConfig tab. */
   async showCompareModal() {
+    const seq = ++this._compareSeq;
     const modal = openModal({ title: "Compare configurations", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "760px" });
     modal.body.innerHTML = `<div class="ki-modal-empty">Loading defconfigs…</div>`;
     let list = [];
     let listError = "";
     try {
-      const defs = await this.api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
+      const defs = await (this.api || api).getKconfigDefconfigs(this.currentVersion, this.currentArch);
       list = (defs && defs.defconfigs) || [];
     } catch (err) {
       listError = err.message;
+    }
+    if (seq !== this._compareSeq || !this.containerEl?.isConnected) {
+      modal.close();
+      return;
     }
     const otherTabs = state.kconfigTabs().filter((t) => t.id !== this.tabId);
     if (!list.length && !otherTabs.length) {
@@ -1569,6 +1678,7 @@ export class KconfigView {
     const defRow = modal.body.querySelector("#cmp-defconfig-row");
     const defSelect = modal.body.querySelector("#cmp-defconfig");
     const run = async () => {
+      const runSeq = ++this._compareRunSeq;
       const out = modal.body.querySelector("#cmp-defconfig-result");
       const useDefconfig = source.value === "defconfig";
       defRow.style.display = useDefconfig ? "" : "none";
@@ -1577,8 +1687,10 @@ export class KconfigView {
         const side = useDefconfig
           ? await this.defconfigSide(defSelect.value)
           : this.tabSide(source.value.slice(4));
+        if (runSeq !== this._compareRunSeq || seq !== this._compareSeq || !this.containerEl?.isConnected) return;
         this.renderComparison(out, modal, side);
       } catch (err) {
+        if (runSeq !== this._compareRunSeq || seq !== this._compareSeq || !this.containerEl?.isConnected) return;
         out.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
       }
     };
@@ -1664,14 +1776,17 @@ export class KconfigView {
   }
 
   async showDefconfigModal() {
+    const seq = this._archSeq;
     let list = [];
     try {
-      const defs = await this.api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
+      const defs = await (this.api || api).getKconfigDefconfigs(this.currentVersion, this.currentArch);
       list = (defs && defs.defconfigs) || [];
     } catch (err) {
+      if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
       toast.error(`Failed to fetch defconfigs: ${err.message}`);
       return;
     }
+    if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
     if (!list.length) {
       toast.info(`No defconfig found for ARCH=${this.currentArch}.`);
       return;
@@ -1713,8 +1828,10 @@ export class KconfigView {
    * or null when the user declined (model and values left as they were).
    */
   async reloadModel() {
+    const seq = this._archSeq;
     const before = { ...(this.rawValues || {}) };
-    const raw = await this.api.getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
+    const raw = await (this.api || api).getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
+    if (seq !== this._archSeq || !this.containerEl?.isConnected) return null;
     // Resolve on a throwaway engine: the live one keeps the current model until this is accepted
     let changes = [];
     if (this.engineActive) {
@@ -1770,16 +1887,18 @@ export class KconfigView {
    */
   async showToolchainModal() {
     if (!this.engine.loaded) return;
+    const seq = this._archSeq;
     const report = this.engine.model.toolchain || { macros: false, profile: {}, env_used: [], probes: [], messages: [] };
     const spec = JSON.parse(JSON.stringify(this.toolchain || {}));
     spec.env = spec.env || {};
     spec.probes = spec.probes || {};
     let defaults = null;
     try {
-      defaults = await this.api.getKconfigToolchainDefaults(this.currentVersion, this.currentArch);
+      defaults = await (this.api || api).getKconfigToolchainDefaults(this.currentVersion, this.currentArch);
     } catch (err) {
       console.warn("Toolchain defaults unavailable:", err);
     }
+    if (seq !== this._archSeq || !this.containerEl?.isConnected) return;
     const eff = report.profile || {};
     const modal = openModal({ title: "Toolchain & Kconfig environment", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "980px" });
     const BOOL_KINDS = new Set(["cc-option", "ld-option", "as-instr", "cc-compile", "script", "file", "command"]);

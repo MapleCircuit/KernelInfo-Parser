@@ -55,6 +55,10 @@ function cacheFirst(request, cacheName, cacheKey = request) {
       if (response && response.status === 200) cache.put(cacheKey, response.clone());
       return response;
     });
+  })).catch(() => new Response("Offline", {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "Content-Type": "text/plain", "X-KIP-Offline": "1" },
   }));
 }
 

@@ -10,8 +10,6 @@ export function formatChips(set) {
   return [...(set || [])].sort().join(",");
 }
 
-export const CVSS_OPS = ["ge", "gt", "lt", "eq"];
-export const CVSS_OP_LABEL = { ge: "≥", gt: ">", lt: "<", eq: "=" };
 const _CVSS_OP_ALIASES = {
   "<": "lt", lt: "lt",
   ">": "gt", gt: "gt",
@@ -97,8 +95,18 @@ export function filterRows(section, rows, query, chips, ctx = null) {
 /** Counts per chip over `rows` (what each chip would leave). */
 export function chipCounts(section, rows, ctx = null) {
   const out = {};
+  const testable = [];
   for (const c of resolveChips(section, rows, ctx)) {
-    if (typeof c.test === "function") out[c.id] = rows.reduce((n, r) => n + (c.test(r, ctx) ? 1 : 0), 0);
+    if (typeof c.test === "function") {
+      out[c.id] = 0;
+      testable.push(c);
+    }
+  }
+  if (!testable.length || !rows?.length) return out;
+  for (const r of rows) {
+    for (let i = 0; i < testable.length; i++) {
+      if (testable[i].test(r, ctx)) out[testable[i].id]++;
+    }
   }
   return out;
 }

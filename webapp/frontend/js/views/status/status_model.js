@@ -5,12 +5,23 @@
 
 /** "2 min ago", "3 h ago", "just now" for a unix time (seconds), relative to `now` (ms). */
 export function ago(unixSeconds, now = Date.now()) {
-  if (!unixSeconds) return "";
-  const s = Math.max(0, Math.round(now / 1000 - unixSeconds));
+  if (unixSeconds === null || unixSeconds === undefined || unixSeconds === "" || typeof unixSeconds === "boolean") return "";
+  const ts = Number(unixSeconds);
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const s = Math.max(0, Math.round(now / 1000 - ts));
   if (s < 45) return "just now";
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   if (s < 86400) return `${Math.round(s / 3600)} h ago`;
   return `${Math.round(s / 86400)} d ago`;
+}
+
+/** ISO-8601 timestamp for a unix time (seconds), or "" when missing/non-finite/non-positive. */
+export function fmtTime(unixSeconds) {
+  if (unixSeconds === null || unixSeconds === undefined || unixSeconds === "" || typeof unixSeconds === "boolean") return "";
+  const ts = Number(unixSeconds);
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts * 1000);
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString();
 }
 
 /** "41.3 GB" / "512 MB" from megabytes. */

@@ -87,6 +87,11 @@ class TestWatch(unittest.TestCase):
             post_watch_changes({"from": "v3.0", "to": "v3.1", "items": [{"key": str(i)} for i in range(201)]})
         self.assertEqual(too_many.exception.status_code, 400)
 
+        # Non-dict items are isolated per-item instead of raising AttributeError
+        res = CHECK.check("A", "B", ["bad-item", {"key": "f", "type": "file", "path": "kernel/fork.c"}])
+        self.assertEqual(res[0]["error"], "invalid watch item")
+        self.assertTrue(res[1]["changed"])
+
 
 if __name__ == "__main__":
     unittest.main()

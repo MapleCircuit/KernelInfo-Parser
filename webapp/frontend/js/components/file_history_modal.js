@@ -50,7 +50,7 @@ export async function showFileHistoryModal(version, filePath) {
         <span>📜 File Commit History:</span>
         <code style="color: var(--accent-blue, #61afef); font-size: var(--fs-13, 13px);">${escapeHtml(cleanPath)}</code>
       </h3>
-      <button class="file-history-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
+      <button type="button" aria-label="Close" class="file-history-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: var(--fs-20, 20px); cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </div>
     <div class="file-history-modal-body" style="padding: 16px 20px; overflow-y: auto; flex: 1;">
       <div style="padding: 30px; text-align: center; color: var(--text-muted);">⏳ Loading Git commit history for ${escapeHtml(cleanPath)}...</div>
@@ -83,6 +83,7 @@ export async function showFileHistoryModal(version, filePath) {
 
   try {
     const data = await api.getFileHistory(version, cleanPath, 100);
+    if (!backdrop.isConnected) return;
     const commits = (data && data.commits) ? data.commits : [];
     const lastChanged = (data && data.last_changed) || (commits.length > 0 ? commits[0] : null);
 
@@ -112,11 +113,14 @@ export async function showFileHistoryModal(version, filePath) {
     } else {
       commitsListHtml = `
         <div style="display: flex; flex-direction: column; gap: 10px;">
-          ${commits.map((c) => `
-            <div class="commit-history-item" style="background: var(--bg-tertiary, #252526); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 12px 14px;" data-hash="${c.commit_hash}">
+          ${commits.map((c) => {
+            const hash = c.commit_hash || "";
+            const escapedHash = escapeHtml(hash);
+            return `
+            <div class="commit-history-item" style="background: var(--bg-tertiary, #252526); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 12px 14px;" data-hash="${escapedHash}">
               <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
                 <div style="display: flex; align-items: center; gap: 8px;">
-                  <span class="badge" style="font-family: monospace; font-size: var(--fs-11, 11px); padding: 2px 6px; background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);"># ${escapeHtml(c.commit_hash_short || c.commit_hash.substring(0, 10))}</span>
+                  <span class="badge" style="font-family: monospace; font-size: var(--fs-11, 11px); padding: 2px 6px; background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);"># ${escapeHtml(c.commit_hash_short || hash.substring(0, 10))}</span>
                   <span style="font-weight: 600; font-size: var(--fs-12, 12px); color: var(--text-primary, #fff);">${escapeHtml(c.author_name || 'Unknown')}</span>
                   <span style="font-size: var(--fs-11, 11px); color: var(--text-muted, #888);">&lt;${escapeHtml(c.author_email || '')}&gt;</span>
                 </div>
@@ -126,12 +130,13 @@ export async function showFileHistoryModal(version, filePath) {
                 ${escapeHtml(c.subject || '')}
               </div>
               <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px;">
-                <button class="code-btn btn-copy-sha" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">📋 Copy SHA</button>
-                <button class="code-btn active btn-explore-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">Explore at Commit ➔</button>
-                <button class="code-btn btn-view-commit" data-hash="${c.commit_hash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px); background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);">View Commit ➔</button>
+                <button type="button" class="code-btn btn-copy-sha" data-hash="${escapedHash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">📋 Copy SHA</button>
+                <button type="button" class="code-btn active btn-explore-commit" data-hash="${escapedHash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px);">Explore at Commit ➔</button>
+                <button type="button" class="code-btn btn-view-commit" data-hash="${escapedHash}" style="padding: 2px 8px; font-size: var(--fs-11, 11px); background: rgba(97, 175, 239, 0.15); color: var(--accent-blue, #61afef); border: 1px solid rgba(97, 175, 239, 0.3);">View Commit ➔</button>
               </div>
             </div>
-          `).join("")}
+          `;
+          }).join("")}
         </div>
       `;
     }

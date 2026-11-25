@@ -26,6 +26,48 @@ const RENAME_SEARCH_TIMEOUT_MS = 120000;
 // Callgraph: the callers of a widely used function are looked up across every indexed blob (~25 s for schedule)
 const CALLGRAPH_TIMEOUT_MS = 60000;
 
+/** Format JSON/text error payload from FastAPI/REST endpoints into a human-readable string. */
+export function formatApiErrorDetail(errObj, fallback = "Request failed") {
+  if (!errObj || typeof errObj !== "object") return fallback;
+  const detail = errObj.detail;
+  if (Array.isArray(detail)) {
+    const joined = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          const msg = item.msg ? String(item.msg) : "";
+          const locParts = Array.isArray(item.loc)
+            ? (item.loc.length > 1 && ["body", "query", "path", "header", "cookie"].includes(item.loc[0]) ? item.loc.slice(1) : item.loc)
+            : [];
+          const loc = locParts.join(".");
+          if (msg) return loc ? `${loc}: ${msg}` : msg;
+          try {
+            return JSON.stringify(item);
+          } catch {
+            return String(item);
+          }
+        }
+        return item == null ? "" : String(item);
+      })
+      .filter(Boolean)
+      .join("; ");
+    return joined || fallback;
+  }
+  if (typeof detail === "string" && detail) return detail;
+  if (detail && typeof detail === "object") {
+    if (typeof detail.message === "string" && detail.message) return detail.message;
+    if (typeof detail.error === "string" && detail.error) return detail.error;
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return fallback;
+    }
+  }
+  if (typeof errObj.error === "string" && errObj.error) return errObj.error;
+  if (typeof errObj.message === "string" && errObj.message) return errObj.message;
+  return fallback;
+}
+
 class ApiClient {
   constructor() {
     this.baseUrl = "";
@@ -49,6 +91,7 @@ class ApiClient {
     this.onSyncData = null;
     this._showTimer = null;
     this._heartbeatTimer = null;
+    this._pingInFlight = null;
 
     window.addEventListener("online", () => {
       this.isOnline = true;
@@ -83,6 +126,14 @@ class ApiClient {
 
   /** One heartbeat request; resolves to the reachability it observed. Never throws, never cached. */
   async pingServer() {
+    if (this._pingInFlight) return this._pingInFlight;
+    this._pingInFlight = this._doPingServer().finally(() => {
+      this._pingInFlight = null;
+    });
+    return this._pingInFlight;
+  }
+
+  async _doPingServer() {
     if (!navigator.onLine) {
       this._setServerUp(false);
       return false;
@@ -260,7 +311,7 @@ class ApiClient {
         let errMsg = `Request failed: ${response.status}`;
         try {
           const errObj = JSON.parse(errText);
-          if (errObj.detail) errMsg = errObj.detail;
+          errMsg = formatApiErrorDetail(errObj, errMsg);
         } catch {
           if (errText) errMsg = errText;
         }

@@ -149,8 +149,9 @@ class JobManager:
             if job.cancel_event.is_set():
                 self._finish(job, error="cancelled")
                 continue
-            job.progress["note"] = ""
-            job.started_at = time.time()
+            with self._lock:
+                job.progress = {**job.progress, "note": ""}
+                job.started_at = time.time()
             try:
                 result = job.ctx.run(job.fn, _Progress(job))
             except JobCancelled:
@@ -228,8 +229,9 @@ class JobManager:
             job = _Job(key, fn, cache, cache_key, contextvars.copy_context())
             self._jobs[key] = job
             self._ensure_workers()
+            snap = job.snapshot()
         self._queue.put(job)
-        return job.snapshot()
+        return snap
 
     def get(self, key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -243,7 +245,8 @@ class JobManager:
         if job is None:
             return None
         job.done_event.wait(timeout)
-        return job.snapshot(with_result=True)
+        with self._lock:
+            return job.snapshot(with_result=True)
 
     def cancel(self, key: str) -> bool:
         with self._lock:

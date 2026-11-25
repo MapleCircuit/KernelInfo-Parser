@@ -157,12 +157,15 @@ export function queryHelpHtml({ hasSelectedCommit = false, selectedCommitLabel =
   `;
 }
 
+const MAX_QUERY_LEN = 4096;
+
 /** Tokens of a query: words, key:value and key:"quoted value" (quotes keep spaces). */
 export function tokenize(text) {
   const out = [];
+  const s = String(text || "").slice(0, MAX_QUERY_LEN);
   const re = /(\S+?):"([^"]*)"?|"([^"]*)"?|(\S+)/g;
   let m;
-  while ((m = re.exec(String(text || ""))) !== null) {
+  while ((m = re.exec(s)) !== null) {
     if (m[1] !== undefined) out.push({ raw: m[0], key: m[1].toLowerCase(), value: m[2] });
     else if (m[3] !== undefined) out.push({ raw: m[0], key: "", value: m[3] });
     else {

@@ -13,6 +13,7 @@ import logging
 import posixpath
 import re
 import subprocess
+import threading
 from typing import Any
 
 from fastapi import HTTPException
@@ -616,14 +617,20 @@ class DiffService:
         try:
             # Two object SHAs: nothing user-supplied reaches the command line. Stdout is streamed and
             # cut at the byte cap (two unrelated large files can differ on every line).
+            cmd = ["git", "-C", str(get_repo_dir()), "diff", "--no-color", "--no-ext-diff", "-U0", blobs[0], blobs[1]]
             with subprocess.Popen(
-                ["git", "-C", str(get_repo_dir()), "diff", "--no-color", "--no-ext-diff", "-U0", blobs[0], blobs[1]],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             ) as proc:
+                timed_out = threading.Event()
+                timer = threading.Timer(BLOB_DIFF_TIMEOUT, lambda: (timed_out.set(), proc.kill()))
+                timer.start()
                 try:
                     assert proc.stdout is not None
                     raw = proc.stdout.read(MAX_BLOB_DIFF_BYTES + 1)
+                    if timed_out.is_set():
+                        raise subprocess.TimeoutExpired(cmd, BLOB_DIFF_TIMEOUT)
                     truncated = len(raw) > MAX_BLOB_DIFF_BYTES
                     if truncated:
                         proc.kill()
@@ -634,6 +641,7 @@ class DiffService:
                     proc.wait()
                     raise
                 finally:
+                    timer.cancel()
                     if proc.poll() is None:
                         proc.kill()
         except subprocess.TimeoutExpired as e:

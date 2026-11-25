@@ -210,6 +210,10 @@ class TestSecurityAndCoreHardening(unittest.TestCase):
 
         helpers.preload_version_cache(FailingReader())
         self.assertFalse(helpers._PRELOADED["loaded"])
+        helpers._REPO_ID_CACHE["repo_id"] = 42
+        helpers.clear_version_caches()
+        self.assertEqual(len(helpers._REPO_ID_CACHE), 0)
+        self.assertFalse(helpers._PRELOADED.get("loaded", False))
 
     def test_repo_scoped_cache_lru_and_config_clamping(self) -> None:
         from webapp.backend import config as cfg
@@ -251,11 +255,14 @@ class TestSecurityAndCoreHardening(unittest.TestCase):
                 patch.object(_sync_mod.sync_service, "header_value", return_value="0.0.0"):
             client = TestClient(create_app())
             resp = client.get("/api/nonexistent-endpoint-check")
+            resp_405 = client.delete("/api/versions")
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json(), {"detail": "Not Found"})
         self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
         self.assertEqual(resp.headers.get("X-Frame-Options"), "SAMEORIGIN")
         self.assertEqual(resp.headers.get("Referrer-Policy"), "strict-origin-when-cross-origin")
+        self.assertEqual(resp_405.status_code, 405)
+        self.assertEqual(resp_405.headers.get("X-Content-Type-Options"), "nosniff")
 
         statuses: list[int] = []
 

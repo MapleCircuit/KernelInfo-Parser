@@ -42,7 +42,12 @@ class ContextMenu {
   }
 
   hide() {
+    this._openSeq++;
     this._justOpened = false;
+    if (this._guardTimer) {
+      clearTimeout(this._guardTimer);
+      this._guardTimer = null;
+    }
     if (this.menuEl) {
       this.menuEl.remove();
       this.menuEl = null;
@@ -61,10 +66,11 @@ class ContextMenu {
     // Ignore the bubbling click event that opened this menu if a caller did not stopPropagation()
     const seq = ++this._openSeq;
     this._justOpened = true;
-    const clearGuard = setTimeout(() => {
+    this._guardTimer = setTimeout(() => {
+      this._guardTimer = null;
       if (this._openSeq === seq) this._justOpened = false;
     }, 0);
-    clearGuard?.unref?.();
+    this._guardTimer?.unref?.();
 
     this.menuEl = document.createElement("div");
     this.menuEl.className = "context-menu";

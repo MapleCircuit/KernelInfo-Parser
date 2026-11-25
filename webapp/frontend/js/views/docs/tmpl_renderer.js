@@ -23,6 +23,7 @@
 
 import { escapeHtml, slugify } from "./rst_renderer.js";
 import { highlightCode } from "./md_renderer.js";
+import { safeHttpUrl } from "../../utils/url_safety.js";
 
 /**
  * Check if the given repository path is a DocBook XML template.
@@ -509,14 +510,15 @@ export class TmplRenderer {
         return `&ldquo;${this.renderChildren(node, { inline: true })}&rdquo;`;
 
       case "ulink": {
-        const url = node.attrs.url || "#";
-        const text = this.renderChildren(node, { inline: true }) || url;
-        return `<a class="reference external" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+        const rawUrl = (node.attrs.url || "").trim();
+        const safeUrl = safeHttpUrl(rawUrl) || (/^(?:mailto:[^\s\u0000-\u001f\u007f]+|#)/i.test(rawUrl) ? rawUrl : "#");
+        const text = this.renderChildren(node, { inline: true }) || escapeHtml(rawUrl || "#");
+        return `<a class="reference external" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${text}</a>`;
       }
 
       case "link": {
         const linkend = node.attrs.linkend || "";
-        const text = this.renderChildren(node, { inline: true }) || linkend;
+        const text = this.renderChildren(node, { inline: true }) || escapeHtml(linkend);
         return `<a class="reference internal" href="#${escapeHtml(linkend)}">${text}</a>`;
       }
 
@@ -551,16 +553,5 @@ export class TmplRenderer {
  */
 export function renderTmplDocument(source, path) {
   return new TmplRenderer(source, { path }).render();
-}
-
-/**
- * Render a DocBook XML fragment to HTML.
- *
- * @param {string} source - DocBook XML fragment
- * @param {string} path - Context path
- * @returns {string}
- */
-export function renderTmplFragment(source, path = "") {
-  return new TmplRenderer(source, { path }).render().html;
 }
 

@@ -132,6 +132,8 @@ export async function showDiffPicker(anchorEl, { tabId, version, path, current, 
     if (same) return;
   }
   const prev = await previousTag(version, client);
+  if (!anchorEl?.isConnected) return;
+  if (openPicker) openPicker.close();
   let selVersion = current?.version || prev;
   let selPath = current?.path || path;
   let swap = Boolean(current?.swap);

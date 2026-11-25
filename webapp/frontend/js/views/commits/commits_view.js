@@ -15,6 +15,9 @@ import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { hasFeature } from "../../utils/projects.js";
 import { buildDeepLink } from "../../tab_routes.js";
 import { generateImpactMap } from "../nodemap/impact_map.js";
+import { safeHttpUrl } from "../../utils/url_safety.js";
+
+const cssEsc = (s) => (globalThis.CSS?.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -36,8 +39,8 @@ function escapeHtml(str) {
 /** Collapse the line numbers of one diff side ("+" -> new, "-" -> old) into [[start, end], ...] blocks. */
 function changedRanges(file, kind) {
   const nums = [];
-  for (const h of file.hunks) {
-    for (const [k, oldNo, newNo] of h.lines) {
+  for (const h of file?.hunks || []) {
+    for (const [k, oldNo, newNo] of h?.lines || []) {
       if (k === kind) nums.push(kind === "+" ? newNo : oldNo);
     }
   }
@@ -124,6 +127,9 @@ export class CommitsView {
     this.listCollapsed = false;
     this.listLoaded = false;
     this.showingQueryHelp = false;
+    this._listToken = 0;
+    this._detailToken = 0;
+    this._relToken = 0;
     this._debouncedSearch = null;
     this._datalistId = `commit-query-keys-${++nextDatalistId}`;
   }
@@ -244,6 +250,7 @@ export class CommitsView {
     this.containerEl.querySelector("#commit-search-input")?.focus();
     if (this.listLoaded) return;
     await this.loadCommits(this.currentQuery, true);
+    if (!this.containerEl?.isConnected) return;
     this.containerEl.querySelector(".commit-card.active")?.scrollIntoView({ block: "nearest" });
   }
 
@@ -279,18 +286,18 @@ export class CommitsView {
       if (this.currentQuery && isStructured(this.currentQuery)) {
         // Structured query (H8): git log, downward pagination only
         const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.commits = res.commits || [];
         this.hasMore = Boolean(res.has_more);
       } else if (this.currentQuery) {
         const res = await this.api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         const newCommits = res.commits || [];
         this.commits = newCommits;
         this.hasMore = newCommits.length === 50;
       } else {
         const res = await this.api.getCommitTimeline(this.currentVersion, 50, "past", null);
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.commits = res.timeline || [];
         this.hasPast = Boolean(res.has_past);
         this.hasFuture = Boolean(res.has_future);
@@ -299,7 +306,7 @@ export class CommitsView {
       }
       this.renderCommitList();
     } catch (e) {
-      if (reset && token === this._listToken) {
+      if (reset && token === this._listToken && this.containerEl?.isConnected) {
         listContainer.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
       }
     }
@@ -321,7 +328,7 @@ export class CommitsView {
 
     try {
       const res = await this.api.getCommitTimeline(this.currentVersion, 50, "future", this.nextFutureCursor);
-      if (token !== this._listToken) return;
+      if (token !== this._listToken || !this.containerEl?.isConnected) return;
       const newCommits = [...(res.timeline || [])].reverse();
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       const fresh = newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash));
@@ -334,7 +341,7 @@ export class CommitsView {
       this.renderCommitList();
       listContainer.scrollTop = prevScrollTop + (listContainer.scrollHeight - prevScrollHeight);
     } catch (e) {
-      if (token !== this._listToken) return;
+      if (token !== this._listToken || !this.containerEl?.isConnected) return;
       console.error("Failed to load more commits (top):", e);
       this.isLoadingTop = false;
       if (topBtn) {
@@ -361,21 +368,21 @@ export class CommitsView {
       if (this.currentQuery && isStructured(this.currentQuery)) {
         const nextPage = this.currentPage + 1;
         const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), nextPage, 50));
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.currentPage = nextPage;
         this.commits.push(...(res.commits || []).filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = Boolean(res.has_more);
       } else if (this.currentQuery) {
         const nextPage = this.currentPage + 1;
         const res = await this.api.getCommits(this.currentVersion, nextPage, 50, this.currentQuery);
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         this.currentPage = nextPage;
         const newCommits = res.commits || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = newCommits.length === 50;
       } else {
         const res = await this.api.getCommitTimeline(this.currentVersion, 50, "past", this.nextPastCursor);
-        if (token !== this._listToken) return;
+        if (token !== this._listToken || !this.containerEl?.isConnected) return;
         const newCommits = res.timeline || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasPast = Boolean(res.has_past);
@@ -385,7 +392,7 @@ export class CommitsView {
       this.isLoadingBottom = false;
       this.renderCommitList();
     } catch (e) {
-      if (token !== this._listToken) return;
+      if (token !== this._listToken || !this.containerEl?.isConnected) return;
       console.error("Failed to load more commits (bottom):", e);
       this.isLoadingBottom = false;
       if (bottomBtn) {
@@ -404,6 +411,7 @@ export class CommitsView {
     // Top pagination button (timeline mode when there are commits above)
     if (!this.currentQuery && this.hasFuture) {
       const topBtn = document.createElement("button");
+      topBtn.type = "button";
       topBtn.className = "code-btn";
       topBtn.id = "btn-load-more-top";
       topBtn.style.width = "100%";
@@ -482,6 +490,7 @@ export class CommitsView {
     const showBottomBtn = (!this.currentQuery && this.hasPast) || (this.currentQuery && this.hasMore);
     if (showBottomBtn) {
       const bottomBtn = document.createElement("button");
+      bottomBtn.type = "button";
       bottomBtn.className = "code-btn";
       bottomBtn.id = "btn-load-more-bottom";
       bottomBtn.style.width = "100%";
@@ -531,7 +540,8 @@ export class CommitsView {
     </div>`;
 
     files.forEach((f, fi) => {
-      const rows = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+      const hunks = f.hunks || [];
+      const rows = hunks.reduce((n, h) => n + (h.lines || []).length, 0);
       const pathLabel = f.status === "R" && f.old_path !== f.path
         ? `${escapeHtml(f.old_path)} → ${escapeHtml(f.path)}`
         : escapeHtml(f.path);
@@ -540,22 +550,22 @@ export class CommitsView {
           <span class="cdiff-status-badge" style="color:${STATUS_COLORS[f.status] || "var(--text-secondary)"};">${escapeHtml(f.status)}</span>
           <span class="cdiff-path">${pathLabel}</span>
           <span class="cdiff-add">+${f.additions}</span><span class="cdiff-del">−${f.deletions}</span>
-          <button class="code-btn cdiff-open" data-fi="${fi}" title="Open the file at the first change">Open ↗</button>
+          <button type="button" class="code-btn cdiff-open" data-fi="${fi}" title="Open the file at the first change">Open ↗</button>
         </summary>
         <div class="cdiff-body">`;
       if (f.binary) {
         html += `<div class="cdiff-status">Binary file</div>`;
-      } else if (!f.hunks.length) {
+      } else if (!hunks.length) {
         html += `<div class="cdiff-status">${f.truncated ? "Diff omitted (commit too large)" : "No content changes (mode or rename only)"}</div>`;
       }
-      f.hunks.forEach((h, hi) => {
+      hunks.forEach((h, hi) => {
         html += `<div class="cdiff-hunk" data-fi="${fi}" data-hi="${hi}" title="Open at this change">@@ -${h.old_start},${h.old_count} +${h.new_start},${h.new_count} @@ <span>${escapeHtml(h.heading)}</span></div>`;
-        h.lines.forEach(([k, oldNo, newNo, text], li) => {
+        (h.lines || []).forEach(([k, oldNo, newNo, text], li) => {
           const cls = k === "+" ? "add" : k === "-" ? "del" : "ctx";
           html += `<div class="cdiff-row ${cls}" data-fi="${fi}" data-hi="${hi}" data-li="${li}"><span class="cdiff-ln">${oldNo ?? ""}</span><span class="cdiff-ln">${newNo ?? ""}</span><span class="cdiff-sign">${k === " " ? "" : k}</span><span class="cdiff-text">${escapeHtml(text)}</span></div>`;
         });
       });
-      if (f.truncated && f.hunks.length) html += `<div class="cdiff-status">… diff truncated</div>`;
+      if (f.truncated && hunks.length) html += `<div class="cdiff-status">… diff truncated</div>`;
       html += `</div></details>`;
     });
     if (!files.length) html += `<div class="cdiff-status">This commit has no file changes against its parent.</div>`;
@@ -573,11 +583,13 @@ export class CommitsView {
       if (!f) return;
       const forceNew = e.type === "auxclick" || e.ctrlKey || e.metaKey;
       if (el.classList.contains("cdiff-row")) {
-        const [k, oldNo, newNo] = f.hunks[parseInt(el.dataset.hi, 10)].lines[parseInt(el.dataset.li, 10)];
+        const lineEntry = f.hunks?.[parseInt(el.dataset.hi, 10)]?.lines?.[parseInt(el.dataset.li, 10)];
+        if (!lineEntry) return;
+        const [k, oldNo, newNo] = lineEntry;
         if (k === "-") this.openChange(diff, f, "-", oldNo, forceNew);
         else this.openChange(diff, f, "+", newNo, forceNew);
       } else {
-        const h = el.classList.contains("cdiff-hunk") ? f.hunks[parseInt(el.dataset.hi, 10)] : f.hunks[0];
+        const h = el.classList.contains("cdiff-hunk") ? f.hunks?.[parseInt(el.dataset.hi, 10)] : f.hunks?.[0];
         this.openHunk(diff, f, h, forceNew);
       }
     };
@@ -591,8 +603,9 @@ export class CommitsView {
       this.openChange(diff, file, file.status === "D" ? "-" : "+", 1, forceNew);
       return;
     }
-    const added = hunk.lines.find(([k]) => k === "+");
-    const removed = hunk.lines.find(([k]) => k === "-");
+    const lines = hunk.lines || [];
+    const added = lines.find(([k]) => k === "+");
+    const removed = lines.find(([k]) => k === "-");
     if (added || !removed) this.openChange(diff, file, "+", added ? added[2] : hunk.new_start, forceNew);
     else this.openChange(diff, file, "-", removed[1], forceNew);
   }
@@ -629,7 +642,7 @@ export class CommitsView {
     const cards = this.containerEl.querySelectorAll(".commit-card");
     cards.forEach((x) => x.classList.remove("active"));
     // renderCommitList() may prepend a "Load 50 More Commits" button, so cards are matched by hash
-    const card = Array.from(cards).find((x) => x.querySelector(`.copy-hash[data-hash="${hash}"]`));
+    const card = Array.from(cards).find((x) => x.querySelector(`.copy-hash[data-hash="${cssEsc(hash)}"]`));
     if (card) {
       card.classList.add("active");
       card.scrollIntoView({ block: "nearest" });
@@ -821,6 +834,8 @@ export class CommitsView {
 
   /** Relation chips on the cards of the loaded timeline (H1), fetched in one batch per render. */
   async decorateCardsWithRelations() {
+    const relToken = ++this._relToken;
+    const listToken = this._listToken;
     const cards = [...(this.containerEl?.querySelectorAll(".commit-card") || [])];
     this.relationCounts = this.relationCounts || new Map();
     const missing = [];
@@ -831,11 +846,13 @@ export class CommitsView {
     if (missing.length) {
       try {
         const res = await this.api.getRelationCounts(this.currentVersion, missing.slice(0, 200));
+        if (relToken !== this._relToken || listToken !== this._listToken || !this.containerEl?.isConnected) return;
         for (const h of missing) this.relationCounts.set(h, res?.results?.[h] || null);
       } catch {
         return;
       }
     }
+    if (relToken !== this._relToken || listToken !== this._listToken || !this.containerEl?.isConnected) return;
     for (const card of this.containerEl?.querySelectorAll(".commit-card") || []) {
       const hash = card.querySelector(".copy-hash")?.dataset.hash;
       const html = relationChipsHtml(this.relationCounts.get(hash));
@@ -862,11 +879,12 @@ export class CommitsView {
 
     try {
       const c = await this.api.getCommitDetail(this.currentVersion, commitIdOrHash);
-      if (token !== this._detailToken) return;
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       // The commit on screen is recorded on the tab by its hash, never by the integer
       // commit_id: a shared link has to survive a database rebuild (§5.26)
       this.persistTabState({ commitId: c.commit_hash || String(commitIdOrHash), queryHelp: undefined });
       const dateStr = c.author_date ? new Date(c.author_date * 1000).toUTCString() : "";
+      const safeLoreUrl = safeHttpUrl(c.lore_url);
 
       detailEl.innerHTML = `
         <div class="commit-header">
@@ -876,15 +894,15 @@ export class CommitsView {
             <div><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
             <div><strong>Hash:</strong> ${hashHtml(c.commit_hash)}</div>
             <div class="commit-release" id="commit-release-badge"><span class="release-badge pending">First released in …</span></div>
-            ${c.lore_url ? `<div><a href="${escapeHtml(c.lore_url)}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
+            ${safeLoreUrl ? `<div><a href="${escapeHtml(safeLoreUrl)}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-              <button class="code-btn active" id="btn-explore-commit" style="font-size:var(--fs-11, 11px);padding:4px 10px;">
-                🔍 Explore Files at this Commit (${escapeHtml(c.commit_hash.slice(0, 8))})
+              <button type="button" class="code-btn active" id="btn-explore-commit" style="font-size:var(--fs-11, 11px);padding:4px 10px;">
+                🔍 Explore Files at this Commit (${escapeHtml((c.commit_hash || "").slice(0, 8))})
               </button>
-              <button class="code-btn" id="btn-copy-commit-link" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Copy versionless deep link to this commit">
+              <button type="button" class="code-btn" id="btn-copy-commit-link" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Copy versionless deep link to this commit">
                 🔗 Copy link
               </button>
-              ${hasFeature(this.api?.repo || state.activeRepo(), "nodemap") ? `<button class="code-btn" id="btn-commit-impact-map" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Auto-generate a NodeMap Impact Map for this commit">
+              ${hasFeature(this.api?.repo || state.activeRepo(), "nodemap") ? `<button type="button" class="code-btn" id="btn-commit-impact-map" style="font-size:var(--fs-11, 11px);padding:4px 10px;" title="Auto-generate a NodeMap Impact Map for this commit">
                 🕸 Impact Map
               </button>` : ""}
             </div>
@@ -895,7 +913,7 @@ export class CommitsView {
         ${hasFeature(this.api?.repo, "mail") ? `<div class="m-card" style="margin-bottom:16px;" id="commit-mail-card">
           <div class="m-card-title" style="display:flex;justify-content:space-between;align-items:center;">
             <span>✉ Mailing List Discussions &amp; Patches (${(c.linked_emails || []).length})</span>
-            <button class="code-btn" id="btn-open-ml-search" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Search LKML for this commit subject">
+            <button type="button" class="code-btn" id="btn-open-ml-search" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Search LKML for this commit subject">
               Search LKML ↗
             </button>
           </div>
@@ -970,7 +988,7 @@ export class CommitsView {
 
         <!-- Inline diff of the commit (loaded on demand) -->
         <div class="commit-diff-section">
-          <button class="code-btn" id="btn-commit-diff" title="Show the lines this commit changed; click a line to open the file there">± Show changes</button>
+          <button type="button" class="code-btn" id="btn-commit-diff" title="Show the lines this commit changed; click a line to open the file there">± Show changes</button>
           <div class="commit-diff-panel" id="commit-diff-panel" hidden></div>
         </div>
       `;
@@ -1095,7 +1113,7 @@ export class CommitsView {
         });
       });
     } catch (e) {
-      if (token !== this._detailToken) return;
+      if (token !== this._detailToken || !this.containerEl?.isConnected) return;
       this.persistTabState({ queryHelp: undefined });
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
@@ -1107,7 +1125,7 @@ export class CommitsView {
       return `
         <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;color:var(--text-muted);">
           <span>No pre-indexed patch emails found for this commit.</span>
-          <button class="code-btn" id="btn-resolve-mail" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Query LKML archive live for this commit">
+          <button type="button" class="code-btn" id="btn-resolve-mail" style="font-size:var(--fs-10, 10px);padding:2px 8px;" title="Query LKML archive live for this commit">
             🔍 Auto-resolve from LKML
           </button>
         </div>
@@ -1151,7 +1169,7 @@ export class CommitsView {
         state.openTab({
           type: "mail",
           title: `LKML: ${(c.subject || '').slice(0, 24)}`,
-          query: c.subject || c.commit_hash.slice(0, 10),
+          query: c.subject || (c.commit_hash || "").slice(0, 10),
           forceNew: false,
         });
       };
@@ -1164,6 +1182,7 @@ export class CommitsView {
         resolveBtn.textContent = "Resolving...";
         try {
           const res = await this.api.resolveCommitMail(this.currentVersion, c.commit_hash || c.commit_id);
+          if (!detailEl.isConnected || !this.containerEl?.isConnected) return;
           if (res.resolved && res.linked_emails?.length) {
             c.linked_emails = res.linked_emails;
             const bodyEl = detailEl.querySelector("#commit-linked-emails-body");
@@ -1203,8 +1222,12 @@ export class CommitsView {
   }
 
   dispose() {
+    this._listToken = (this._listToken || 0) + 1;
+    this._detailToken = (this._detailToken || 0) + 1;
+    this._relToken = (this._relToken || 0) + 1;
     this.factsAbort?.abort();
     this._debouncedSearch?.cancel?.();
+    this.debouncedApplySearch?.cancel?.();
     clearTimeout(this.chipTimer);
     this.containerEl = null;
   }

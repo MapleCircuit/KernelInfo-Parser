@@ -76,19 +76,24 @@ export class NodeRenderer {
         this.keys.delete(id);
       }
     }
-    let prev = null;
-    for (const node of paintOrder(nodes)) {
-      let el = this.els.get(node.id);
-      if (!el) {
-        el = this.create(node);
-        this.els.set(node.id, el);
+    this.hooks.beginSync?.();
+    try {
+      let prev = null;
+      for (const node of paintOrder(nodes)) {
+        let el = this.els.get(node.id);
+        if (!el) {
+          el = this.create(node);
+          this.els.set(node.id, el);
+        }
+        this.patch(el, node, selected.has(node.id), active === node.id, settings);
+        if (!el.isConnected || (prev && el.previousElementSibling !== prev && !this.orderedAfter(prev, el))) {
+          if (prev) prev.after(el);
+          else this.layer.appendChild(el);
+        }
+        prev = el;
       }
-      this.patch(el, node, selected.has(node.id), active === node.id, settings);
-      if (!el.isConnected || (prev && el.previousElementSibling !== prev && !this.orderedAfter(prev, el))) {
-        if (prev) prev.after(el);
-        else this.layer.appendChild(el);
-      }
-      prev = el;
+    } finally {
+      this.hooks.endSync?.();
     }
   }
 

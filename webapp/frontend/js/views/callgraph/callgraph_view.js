@@ -11,6 +11,17 @@ export class CallgraphView {
     this.functionName = "schedule";
     this.containerEl = null;
     this.tabId = null;
+    this._seq = 0;
+    this._pathSeq = 0;
+    this._suggestTimer = null;
+  }
+
+  dispose() {
+    this._seq++;
+    this._pathSeq++;
+    clearTimeout(this._suggestTimer);
+    this._suggestTimer = null;
+    this.containerEl = null;
   }
 
   async render(containerEl, tabData) {
@@ -34,10 +45,10 @@ export class CallgraphView {
           </div>
           <div style="display:flex;gap:8px;">
             <input type="text" id="callgraph-input" value="${escapeHtml(this.functionName)}" placeholder="Function name..." />
-            <button class="code-btn active" id="callgraph-btn">Explore</button>
-            <button class="code-btn" id="callgraph-btn-nodemap" title="Open interactive DAG in NodeMap">🗺️ Open in NodeMap</button>
-            <button class="code-btn" id="callgraph-btn-path" title="Shortest call chains from this function to another (N2)">⇢ Find path to…</button>
-            <button class="code-btn" id="callgraph-btn-ops" title="Indirect callers: the ops tables (struct initializers) that hold this function in a function-pointer field (N1)">🧩 Indirect callers (ops tables)</button>
+            <button type="button" class="code-btn active" id="callgraph-btn">Explore</button>
+            <button type="button" class="code-btn" id="callgraph-btn-nodemap" title="Open interactive DAG in NodeMap">🗺️ Open in NodeMap</button>
+            <button type="button" class="code-btn" id="callgraph-btn-path" title="Shortest call chains from this function to another (N2)">⇢ Find path to…</button>
+            <button type="button" class="code-btn" id="callgraph-btn-ops" title="Indirect callers: the ops tables (struct initializers) that hold this function in a function-pointer field (N1)">🧩 Indirect callers (ops tables)</button>
           </div>
         </div>
 
@@ -50,7 +61,7 @@ export class CallgraphView {
             <input type="text" id="callpath-exclude" placeholder="skip: printk, kmalloc" spellcheck="false" title="Functions not to go through (hubs)" />
             <label class="kconfig-muted" title="Also follow calls through struct members (x->ops->read(...)) to the functions ops tables assign to that field. Matched by field name: approximate, and it widens the search"><input type="checkbox" id="callpath-indirect" /> through ops tables</label>
             <button class="code-btn active" id="callpath-go" type="button">Find</button>
-            <button class="code-btn" id="callpath-close" type="button" title="Close">✕</button>
+            <button class="code-btn" id="callpath-close" type="button" title="Close" aria-label="Close">✕</button>
           </div>
           <div class="callpath-status kconfig-muted" aria-live="polite"></div>
           <div class="callpath-results"></div>
@@ -63,6 +74,7 @@ export class CallgraphView {
 
     containerEl.querySelector("#callgraph-btn-ops").onclick = async () => {
       const { showOpsModal } = await import("../code_view/ops_modal.js");
+      if (!this.containerEl?.isConnected) return;
       showOpsModal({ version: this.currentVersion, name: this.functionName });
     };
     this.bindCallPath(tabData.pathTo || "");
@@ -101,14 +113,15 @@ export class CallgraphView {
       open(false);
       state.updateTabState(this.tabId, { pathTo: "" });
     };
-    let suggestTimer = null;
     toInput.addEventListener("input", () => {
-      clearTimeout(suggestTimer);
+      clearTimeout(this._suggestTimer);
       const q = toInput.value.trim();
       if (q.length < 3) return;
-      suggestTimer = setTimeout(async () => {
+      const seq = this._seq;
+      this._suggestTimer = setTimeout(async () => {
         try {
           const res = await this.api.searchSymbols(this.currentVersion, q, 15);
+          if (seq !== this._seq || !this.containerEl?.isConnected) return;
           c.querySelector("#callpath-suggest").innerHTML = (res.symbols || []).map((s) => `<option value="${escapeHtml(s.name || s.symbol_name || "")}">`).join("");
         } catch {
           // suggestions are optional
@@ -116,6 +129,7 @@ export class CallgraphView {
       }, 250);
     });
     const run = async () => {
+      const seq = ++this._pathSeq;
       const to = toInput.value.trim();
       if (!/^[A-Za-z_]\w*$/.test(to)) {
         status.textContent = "Type a function name";
@@ -133,12 +147,14 @@ export class CallgraphView {
       try {
         res = await this.api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
           // 202 while the revision's source index is assembled (the first search of a revision, §2.19)
-          timeoutMs: 600000, onProgress: (p) => { status.textContent = `Indexing the sources of ${this.currentVersion}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
+          timeoutMs: 600000, onProgress: (p) => { if (seq === this._pathSeq && this.containerEl?.isConnected) status.textContent = `Indexing the sources of ${this.currentVersion}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
         });
       } catch (err) {
+        if (seq !== this._pathSeq || !this.containerEl?.isConnected) return;
         status.textContent = `Search failed: ${err.message}`;
         return;
       }
+      if (seq !== this._pathSeq || !this.containerEl?.isConnected) return;
       const why = res.timed_out ? " (time limit reached)" : res.budget_exhausted ? " (expansion budget reached)" : "";
       const missing = !res.found?.from ? ` · ${this.functionName} is not defined or called in this revision` : !res.found?.to ? ` · ${to} is not defined or called in this revision` : "";
       status.textContent = res.paths.length
@@ -176,6 +192,7 @@ export class CallgraphView {
   }
 
   async loadCallgraph() {
+    const seq = ++this._seq;
     const headerNameEl = this.containerEl.querySelector(".callgraph-header-name");
     if (headerNameEl) {
       headerNameEl.textContent = `${this.functionName}()`;
@@ -196,6 +213,7 @@ export class CallgraphView {
     const resContainer = this.containerEl.querySelector("#callgraph-results");
     try {
       const res = await this.api.getCallgraph(this.currentVersion, this.functionName);
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       const callers = res.callers || [];
       const callees = res.callees || [];
 
@@ -336,6 +354,7 @@ export class CallgraphView {
         });
       });
     } catch (e) {
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }

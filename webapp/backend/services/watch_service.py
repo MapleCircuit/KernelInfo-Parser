@@ -117,6 +117,9 @@ class WatchChecker:
     def check(self, a: str, b: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for it in items:
+            if not isinstance(it, dict):
+                results.append({"key": "", "type": None, "error": "invalid watch item"})
+                continue
             try:
                 results.append(self.check_item(a, b, it))
             except Exception as exc:  # noqa: BLE001

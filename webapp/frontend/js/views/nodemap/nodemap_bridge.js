@@ -206,11 +206,11 @@ export function tabForNode(node, loaded = null, fallback = {}) {
     case "kapi":
       return { type: "api", title: `Kernel API · ${d.catalog || "summary"}`, view: d.catalog || "summary", arch: d.arch || "x86_64", ...(d.query ? { query: d.query } : {}), ...(d.symbol ? { sel: d.symbol } : {}), ...base };
     case "doc":
-      return d.path ? { type: "code", title: file(d.path), path: d.path, docMode: isDocumentationPath(d.path) ? "doc" : "source", ...base } : null;
+      return d.path ? { type: "code", title: file(d.path), path: d.path, docMode: isDocumentationPath(d.path) ? "rendered" : "source", ...base } : null;
     case "commit":
       return d.commitHash ? { type: "commits", title: `Commit ${d.commitHash.slice(0, 12)}`, commitId: d.commitHash, ...base } : null;
     case "history":
-      if (d.path) return { type: "code", title: file(d.path), path: d.path, cursorLine: d.line || 1, showBlame: d.mode === "blame", ...base };
+      if (d.path) return { type: "code", title: file(d.path), path: d.path, cursorLine: d.line || 1, blame: d.mode === "blame", showBlame: d.mode === "blame", ...base };
       return null;
     default:
       return null;
