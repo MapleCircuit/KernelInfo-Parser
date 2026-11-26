@@ -1,6 +1,7 @@
 """api/security.py - Pure ASGI authentication, IP lockout, rate limiting, and redacted logging."""
 from __future__ import annotations
 
+import hashlib
 import hmac
 import ipaddress
 import logging
@@ -120,11 +121,12 @@ def verify_api_key_constant_time(candidate: str | None, configured_keys: list[tu
     """
     if not configured_keys:
         return None
-    cand_bytes = (candidate or "").encode("utf-8")
+    # Fixed-length SHA-256 digests on both sides: the comparison time depends on neither key's length
+    cand_digest = hashlib.sha256((candidate or "").encode("utf-8")).digest()
     cand_non_empty = bool(candidate)
     matched_id: str | None = None
     for key_id, secret in configured_keys:
-        ok = hmac.compare_digest(cand_bytes, secret.encode("utf-8"))
+        ok = hmac.compare_digest(cand_digest, hashlib.sha256(secret.encode("utf-8")).digest())
         if ok and cand_non_empty and matched_id is None:
             matched_id = key_id
     return matched_id

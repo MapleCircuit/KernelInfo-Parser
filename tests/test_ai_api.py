@@ -55,8 +55,10 @@ class TestAiApiEndpoints(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_cfg = copy.deepcopy(core_config._ACTIVE_CONFIG)
         self._orig_cfg_path = core_config._LOADED_CONFIG_PATH
-        self._orig_env = dict(os.environ)
+        # reset_config() first: it drops the variables sync_environ exported, which a restored snapshot
+        # would otherwise bring back as user-set overrides for later test modules
         core_config.reset_config()
+        self._orig_env = dict(os.environ)
 
         self._tmp = tempfile.TemporaryDirectory()
         self.linux_dir = Path(self._tmp.name) / "linux"
@@ -381,6 +383,28 @@ class TestAiApiEndpoints(unittest.TestCase):
             r_kb = self.client.get("/api/v1/kconfig/build?path=kernel/foo.c", headers=self.auth)
             self.assertEqual(r_kb.status_code, 200)
 
+        with patch.object(v1_router._kconfig_service, "evaluate", return_value={
+            "version": "v3.0", "arch": "x86_64", "defconfig": "arch/x86/configs/x86_64_defconfig",
+            "applied": {"FOO_BAR": "y"}, "rejected": {}, "load_report": {},
+            "symbols": {"FOO_BAR": {"value": "y"}}, "files": {},
+        }) as m_eval:
+            r_ke = self.client.get(
+                "/api/v1/kconfig/eval?symbol=CONFIG_FOO_BAR&assign=FOO_BAR=y&path=kernel/foo.c", headers=self.auth
+            )
+            self.assertEqual(r_ke.status_code, 200)
+            self.assertEqual(r_ke.json()["symbols"]["FOO_BAR"]["value"], "y")
+            _args, kwargs = m_eval.call_args
+            self.assertEqual(kwargs["symbols"], ["FOO_BAR"])
+            self.assertEqual(kwargs["assignments"], {"FOO_BAR": "y"})
+            self.assertEqual(kwargs["paths"], ["kernel/foo.c"])
+        self.assertEqual(self.client.get("/api/v1/kconfig/eval", headers=self.auth).status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/v1/kconfig/eval?symbol=FOO&assign=novalue", headers=self.auth).status_code, 400
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/kconfig/eval?symbol=FOO;DROP", headers=self.auth).status_code, 400
+        )
+
         with patch.object(v1_router._maintainer_service, "match_maintainers", return_value={
             "version": "v3.0", "sections": [{"name": "FOO SUBSYSTEM"}], "recipients": [],
         }):
@@ -420,6 +444,7 @@ class TestAiApiEndpoints(unittest.TestCase):
             "/api/v1/kconfig/search?q=NET",
             "/api/v1/kconfig/symbol/NET",
             "/api/v1/kconfig/build?path=README",
+            "/api/v1/kconfig/eval?symbol=NET",
             "/api/v1/maintainers?q=net",
             "/api/v1/docs?q=net",
             "/api/v1/cve",
@@ -445,3 +470,43 @@ class TestAiApiEndpoints(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKconfigServiceEvaluate(unittest.TestCase):
+    """`KconfigService.evaluate()` (behind GET /api/v1/kconfig/eval) on a real model built from a tiny tree."""
+
+    def test_defconfig_assignments_symbols_and_build_conditions(self) -> None:
+        from parser.kconfig_ast.kconfig_model import KconfigEnv, KconfigModelBuilder
+        from webapp.backend.services.kconfig_service import KconfigService
+
+        files = {
+            "Kconfig": (
+                "config MODULES\n\tbool \"modules\"\n\toption modules\n"
+                "config FOO\n\tbool \"foo\"\n"
+                "config BAR\n\ttristate \"bar\"\n\tdepends on FOO\n"
+            ),
+        }
+        model = KconfigModelBuilder(files.get, KconfigEnv(ARCH="x86_64", SRCARCH="x86", KERNELVERSION="3.0.0")).build("Kconfig")
+
+        class _Entry:
+            arch = {"arch": "x86_64"}
+
+            def evaluator(self):
+                from parser.kconfig_ast.kconfig_eval import KconfigEvaluator
+                return KconfigEvaluator(model)
+
+        svc = KconfigService()
+        defconfig = {"arch": "x86_64", "file_path": "arch/x86/configs/x86_64_defconfig", "content": "CONFIG_FOO=y\n"}
+        conditions = {"files": {"drivers/bar.c": {"status": "ok", "expr": {"sym": "BAR"}}}}
+        with patch.object(svc, "get_defconfig_content", return_value=defconfig), \
+                patch.object(svc, "get_model", return_value=_Entry()), \
+                patch.object(svc, "build_conditions", return_value=conditions):
+            res = svc.evaluate(
+                "v3.0", "x86_64", assignments={"MODULES": "y", "BAR": "m", "NOPE": "y"},
+                symbols=["FOO", "BAR", "MISSING"], paths=["drivers/bar.c"],
+            )
+        self.assertEqual(res["symbols"]["FOO"]["value"], "y")
+        self.assertEqual(res["symbols"]["BAR"]["value"], "m")
+        self.assertFalse(res["symbols"]["MISSING"]["defined"])
+        self.assertEqual(res["rejected"], {"NOPE": "y"})
+        self.assertEqual(res["files"]["drivers/bar.c"]["result"], "m")

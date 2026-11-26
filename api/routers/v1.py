@@ -90,6 +90,7 @@ _ENDPOINT_CATALOG = [
     {"method": "GET", "path": "/api/v1/kconfig/search", "feature": "kconfig", "summary": "Kconfig symbol search by name or prompt"},
     {"method": "GET", "path": "/api/v1/kconfig/symbol/{symbol_name}", "feature": "kconfig", "summary": "Kconfig symbol definition, dependencies, help, and usage"},
     {"method": "GET", "path": "/api/v1/kconfig/build", "feature": "kconfig", "summary": "Kbuild compile conditions for source paths"},
+    {"method": "GET", "path": "/api/v1/kconfig/eval", "feature": "kconfig", "summary": "Evaluate symbols and Kbuild file conditions under a defconfig plus assignments"},
     {"method": "GET", "path": "/api/v1/maintainers", "feature": "maintainers", "summary": "Maintainers lookup by file path, section, or query"},
     {"method": "GET", "path": "/api/v1/docs", "feature": "docs", "summary": "Documentation labels or kernel-doc comments"},
     {"method": "GET", "path": "/api/v1/man", "feature": "man", "summary": "Linux man-pages lookup, index, or page content"},
@@ -934,6 +935,35 @@ def get_kconfig_build_conditions(
     ver = resolve_version(version)
     clean_paths = [_validate_rel_path(p, allow_empty=False) for p in path]
     res = _kconfig_service.build_conditions(ver, clean_paths, arch)
+    return {"repo": get_active_repo_name(), **res}
+
+
+@router.get("/kconfig/eval", dependencies=[Depends(require_feature("kconfig"))])
+def eval_kconfig(
+    symbol: Annotated[list[str], Query()] = [],  # noqa: B006 - FastAPI query list default
+    path: Annotated[list[str], Query()] = [],  # noqa: B006 - FastAPI query list default
+    assign: Annotated[list[str], Query()] = [],  # noqa: B006 - FastAPI query list default
+    defconfig: Annotated[str, Query(max_length=256)] = "",
+    version: Annotated[str | None, Query(max_length=256)] = None,
+    arch: Annotated[str, Query(max_length=64)] = DEFAULT_ARCH,
+) -> dict[str, Any]:
+    """Evaluate `symbol` values and `path` Kbuild conditions under `defconfig` plus `assign` (`NAME=value`)."""
+    if not symbol and not path:
+        raise HTTPException(status_code=400, detail="Give at least one `symbol` or `path`.")
+    if len(symbol) > 128 or len(path) > 64 or len(assign) > 128:
+        raise HTTPException(status_code=400, detail="At most 128 symbols, 64 paths, and 128 assignments.")
+    ver = resolve_version(version)
+    names = [_validate_identifier(s.strip().removeprefix("CONFIG_"), "kconfig symbol") for s in symbol]
+    clean_paths = [_validate_rel_path(p, allow_empty=False) for p in path]
+    assignments: dict[str, str] = {}
+    for item in assign:
+        name, sep, value = item.partition("=")
+        if not sep or len(value) > 256:
+            raise HTTPException(status_code=400, detail=f"Assignment must be NAME=value: {item[:64]!r}")
+        assignments[_validate_identifier(name.strip().removeprefix("CONFIG_"), "kconfig symbol")] = value.strip()
+    res = _kconfig_service.evaluate(
+        ver, arch, defconfig=defconfig.strip(), assignments=assignments, symbols=names, paths=clean_paths
+    )
     return {"repo": get_active_repo_name(), **res}
 
 

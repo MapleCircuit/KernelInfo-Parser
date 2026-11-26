@@ -69,8 +69,10 @@ class TestAiApiSecurity(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_cfg = copy.deepcopy(core_config._ACTIVE_CONFIG)
         self._orig_cfg_path = core_config._LOADED_CONFIG_PATH
-        self._orig_env = dict(os.environ)
+        # reset_config() first: it drops the variables sync_environ exported, which a restored snapshot
+        # would otherwise bring back as user-set overrides for later test modules
         core_config.reset_config()
+        self._orig_env = dict(os.environ)
         self._tmp = tempfile.TemporaryDirectory()
         self._repo_dir = Path(self._tmp.name) / "linux"
         self._repo_dir.mkdir()

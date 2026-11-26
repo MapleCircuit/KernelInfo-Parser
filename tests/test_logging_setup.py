@@ -189,7 +189,7 @@ class TestLoggingSetupRuntime(unittest.TestCase):
 
     def tearDown(self) -> None:
         log_setup.teardown_logging(None)
-        for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "webapp.request", "parser.submod", "core.submod", "nonprop.mod"):
+        for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "webapp.request", "api.request", "parser.submod", "core.submod", "nonprop.mod"):
             lg = logging.getLogger(name)
             lg.handlers.clear()
             lg.setLevel(logging.NOTSET)
@@ -432,6 +432,39 @@ class TestLoggingSetupRuntime(unittest.TestCase):
         text = (self.root / "create_app_logs/app.log").read_text(encoding="utf-8")
         self.assertNotIn("/openapi.json -> 200", text)
         self.assertIn("/nonexistent-route-xyz -> 404", text)
+
+
+    def test_api_logging_target_and_redacted_requests(self) -> None:
+        """`setup_api_logging()` files AI API requests (api.request) and never writes the presented key."""
+        from api.app import create_app as create_api_app
+
+        secret = "sk-agent-0123456789abcdef"
+        config_mod._ACTIVE_CONFIG["api"]["keys"] = {"agent": secret}
+        config_mod._ACTIVE_CONFIG["logging"]["api"] = {
+            "enabled": True,
+            "dir": str(self.root / "api_logs"),
+            "file": "api.log",
+            "request_mode": "all",
+            "error_dir": "",
+            "error_file": "",
+            "level": "INFO",
+        }
+        with patch.object(log_setup, "is_test_environment", return_value=False):
+            app = create_api_app()
+        self.assertEqual(log_setup._ACTIVE_STATE["target"], "api")
+        client = TestClient(app, raise_server_exceptions=False)
+        self.assertEqual(client.get("/api/v1/nope", headers={"Authorization": f"Bearer {secret}"}).status_code, 404)
+        self.assertEqual(client.get("/api/v1/capabilities", headers={"X-API-Key": "wrong-key"}).status_code, 401)
+        log_setup.teardown_logging("api")
+
+        text = (self.root / "api_logs/api.log").read_text(encoding="utf-8")
+        self.assertIn("GET /api/v1/nope -> 404", text)
+        self.assertIn("key=agent", text)
+        self.assertIn("GET /api/v1/capabilities -> 401", text)
+        self.assertNotIn(secret, text)
+        self.assertNotIn("wrong-key", text)
+        with self.assertRaises(ValueError):
+            log_setup.setup_logging("bogus", {}, force=True)
 
 
 def threading_mod():

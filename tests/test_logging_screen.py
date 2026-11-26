@@ -114,6 +114,11 @@ class TestLoggingScreen(unittest.TestCase):
         wide_text = "\n".join(str(args[2]) for name, args, _ in self.win.calls if name == "addstr" and len(args) >= 3)
         self.assertIn("Logging Configuration", wide_text)
         self.assertIn("Parser Logging", wide_text)
+        self.screen.sel_section.set_selected(1)
+        self.screen._rebuild_widgets()
+        self.win.calls.clear()
+        self.screen.draw()
+        wide_text = "\n".join(str(args[2]) for name, args, _ in self.win.calls if name == "addstr" and len(args) >= 3)
         self.assertIn("Webapp Backend Logging", wide_text)
 
         narrow = MockCursesWindow(24, 78)
@@ -173,6 +178,78 @@ class TestLoggingScreen(unittest.TestCase):
         self.assertFalse(self.app.popped)
         self.assertEqual(self.app.config["logging"]["webapp"]["dir"], "/tmp/w_logs")
 
+    def test_full_scope_has_section_selector_and_switches_widgets(self) -> None:
+        self.assertEqual(self.screen.sections, ["parser", "webapp", "api"])
+        self.assertIs(self.screen.widgets[0], self.screen.sel_section)
+        self.assertIn(self.screen.inp_parser_dir, self.screen.widgets)
+        self.assertNotIn(self.screen.inp_api_dir, self.screen.widgets)
+        self.screen.focus_widget(0)
+        self.assertTrue(self.screen.handle_key(curses.KEY_RIGHT))
+        self.assertEqual(self.screen.active_section(), "webapp")
+        self.assertIn(self.screen.inp_webapp_dir, self.screen.widgets)
+        self.assertTrue(self.screen.handle_key(curses.KEY_RIGHT))
+        self.assertEqual(self.screen.active_section(), "api")
+        self.assertIn(self.screen.inp_api_dir, self.screen.widgets)
+        self.assertNotIn(self.screen.inp_parser_dir, self.screen.widgets)
+
+    def test_api_edits_saved_in_full_scope_and_section_switch_is_not_dirty(self) -> None:
+        self.screen.sel_section.set_selected(2)
+        self.assertFalse(self.screen.form_is_dirty())
+        self.screen.chk_api_enabled.checked = True
+        self.screen.inp_api_file.set_value("svc_api.log")
+        self.screen.sel_api_level.selected_index = self.screen.sel_api_level.options.index("ERROR")
+        self.assertTrue(self.screen.form_is_dirty())
+        self.assertTrue(self.screen.save())
+        a = self.app.config["logging"]["api"]
+        self.assertTrue(a["enabled"])
+        self.assertEqual(a["file"], "svc_api.log")
+        self.assertEqual(a["level"], "ERROR")
+        self.assertEqual(a["request_mode"], "all")
+        self.assertEqual(self.app.config["logging"]["parser"]["file"], "p.log")
+
+    def test_api_scope_only_edits_api(self) -> None:
+        app = _MockApp({"logging": {"parser": {"file": "keep.log"}, "api": {"enabled": True, "file": "a.log"}}})
+        app.config_scope = "api"
+        screen = LoggingScreen(MockCursesWindow(24, 90), app)
+        self.assertTrue(screen.show_api)
+        self.assertFalse(screen.show_parser)
+        self.assertFalse(screen.show_webapp)
+        self.assertFalse(screen.multi_section)
+        self.assertIn(screen.inp_api_file, screen.widgets)
+        self.assertNotIn(screen.sel_section, screen.widgets)
+        self.assertTrue(screen.chk_api_enabled.is_checked())
+        self.assertEqual(screen.inp_api_file.get_value(), "a.log")
+        screen.inp_api_file.set_value("b.log")
+        self.assertTrue(screen.save())
+        self.assertEqual(app.config["logging"]["api"]["file"], "b.log")
+        self.assertEqual(app.config["logging"]["parser"]["file"], "keep.log")
+        screen.draw()
+
+    def test_api_defaults_when_missing(self) -> None:
+        screen = LoggingScreen(self.win, _MockApp({}))
+        self.assertFalse(screen.chk_api_enabled.is_checked())
+        self.assertEqual(screen.inp_api_file.get_value(), "api.log")
+        self.assertEqual(screen.sel_api_request_mode.get_selected(), "all")
+        self.assertEqual(screen.sel_api_level.get_selected(), "INFO")
+
+    def test_layout_fits_24_to_30_rows_in_every_scope_and_section(self) -> None:
+        for rows in (24, 30):
+            for scope in ("full", "daemon", "webapp", "api"):
+                app = _MockApp({})
+                app.config_scope = scope
+                win = MockCursesWindow(rows, 90)
+                screen = LoggingScreen(win, app)
+                for idx in range(len(screen.sections)):
+                    if screen.multi_section:
+                        screen.sel_section.set_selected(idx)
+                        screen._rebuild_widgets()
+                    win.calls.clear()
+                    screen.draw()
+                    ys = [args[0] for name, args, _ in win.calls if name == "addstr"]
+                    self.assertLess(max(ys), rows, (rows, scope, idx))
+                    for w in screen.widgets:
+                        self.assertLess(w.y, rows - 1, (rows, scope, idx, w))
+
     def test_cancel_confirms_only_when_dirty(self) -> None:
         with patch.object(self.screen, "confirm_discard", return_value=False) as mock_cd:
             self.screen.inp_parser_file.set_value("changed.log")
@@ -185,6 +262,8 @@ class TestLoggingScreen(unittest.TestCase):
         self.assertTrue(self.app.popped)
 
     def test_help_topic_and_f1_dialog(self) -> None:
+        self.screen.sel_section.set_selected(1)
+        self.screen._rebuild_widgets()
         self.screen.focus_widget(self.screen.widgets.index(self.screen.sel_webapp_request_mode))
         self.assertEqual(self.screen.current_help_topic(), "request_mode")
         self.assertIn("request_mode", HELP_TOPICS)

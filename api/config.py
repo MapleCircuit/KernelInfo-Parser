@@ -8,6 +8,7 @@ from core.config import (
     get_db_config,
     get_logging_config,
     get_webapp_config,
+    normalize_api_client_ip_header,
 )
 from webapp.backend.config import (
     get_active_features,
@@ -104,7 +105,7 @@ def get_api_server_config() -> dict[str, Any]:
     else:
         trusted_proxies = ["127.0.0.1", "::1"]
 
-    client_ip_header = str(raw.get("client_ip_header") or "X-Forwarded-For").strip() or "X-Forwarded-For"
+    client_ip_header = normalize_api_client_ip_header(raw.get("client_ip_header"))
     normalized_keys = normalize_api_keys(raw.get("keys"))
 
     return {

@@ -1634,6 +1634,10 @@ class TestServiceConfigIsolation(unittest.TestCase):
             self.assertTrue(loaded_api["reload"])
             self.assertEqual(loaded_api["default_version"], "v6.6")
             self.assertEqual(loaded_api["client_ip_header"], "CF-Connecting-IP")
+            from core.config import normalize_api_client_ip_header
+            self.assertEqual(normalize_api_client_ip_header("x-real-ip"), "X-Real-IP")
+            self.assertEqual(normalize_api_client_ip_header("X-Evil-Header"), "X-Forwarded-For")
+            self.assertEqual(normalize_api_client_ip_header(None), "X-Forwarded-For")
             self.assertEqual(loaded_api["trusted_proxies"], ["10.0.0.0/8"])
             srv = get_api_server_config()
             self.assertEqual(srv["normalized_keys"], [("key_0", "env-key-1"), ("key_1", "env-key-2")])
@@ -1651,6 +1655,91 @@ class TestServiceConfigIsolation(unittest.TestCase):
             api_main.apply_config_path(args)
             self.assertEqual(os.environ["CONFIG_FILE"], str(custom_file.resolve()))
             self.assertEqual(os.environ["KERNELINFO_CONFIG"], str(custom_file.resolve()))
+
+
+    def test_api_logging_section_defaults_and_env(self) -> None:
+        """`logging.api` defaults, normalization, KIP_API_LOG_* overrides, and get_logging_config("api")."""
+        from core.config import LOGGING_TARGETS, get_logging_config
+
+        self.assertEqual(LOGGING_TARGETS, ("parser", "webapp", "api"))
+        with patch("core.config.find_config_path", return_value=None):
+            cfg = load_config(config_path=None)
+        a_log = cfg["logging"]["api"]
+        self.assertEqual(
+            a_log,
+            {"enabled": False, "dir": "", "file": "api.log", "request_mode": "all",
+             "error_dir": "", "error_file": "", "level": "INFO"},
+        )
+        custom = self.root / "log_api.json"
+        custom.write_text(json.dumps({"logging": {"api": {"enabled": True, "request_mode": "errors_only", "level": "warn"}}}))
+        with mock.patch.dict(os.environ, {"KIP_API_LOG_FILE": "agents.log", "KIP_API_LOG_LEVEL": "debug"}, clear=False):
+            init_config(custom)
+            loaded = get_logging_config("api")
+        self.assertTrue(loaded["enabled"])
+        self.assertEqual(loaded["request_mode"], "errors")
+        self.assertEqual(loaded["file"], "agents.log")
+        self.assertEqual(loaded["level"], "DEBUG")
+        with self.assertRaises(ValueError):
+            get_logging_config("nope")
+
+    def test_prune_api_config_keeps_only_api_sections(self) -> None:
+        from core.config import prune_api_config
+
+        sample = {
+            "database": {"host": "db", "server_tuning": {"x": 1}, "resolved_unix_socket": "/s"},
+            "ssh_tunnel": {"enabled": True, "host": "bastion"},
+            "cache": {"engine": "sqlite"},
+            "webapp": {"port": 8000},
+            "api": {"port": 8001, "keys": ["k"]},
+            "cve": {"repo_dir": "cvelistV5"},
+            "parser": {"mem_max": 32},
+            "mailing_list": {"storage_dir": "/srv"},
+            "workspace": {"repos_dir": "repos"},
+            "logging": {"parser": {"enabled": True}, "webapp": {"enabled": True}, "api": {"enabled": True, "file": "a.log"}},
+            "repositories": [{"name": "linux", "features": {"kconfig": True}, "preparse": {"api": {"mode": "all_main"}}}],
+        }
+        pruned = prune_api_config(sample)
+        self.assertEqual(sorted(pruned), ["api", "cache", "database", "logging", "repositories", "workspace"])
+        self.assertEqual(pruned["logging"], {"api": {"enabled": True, "file": "a.log"}})
+        self.assertEqual(pruned["database"]["ssh_tunnel"]["host"], "bastion")
+        self.assertNotIn("server_tuning", pruned["database"])
+        self.assertNotIn("preparse", pruned["repositories"][0])
+        self.assertEqual(pruned["repositories"][0]["features"], {"kconfig": True})
+        self.assertEqual(pruned["api"], {"port": 8001, "keys": ["k"]})
+        # Input untouched
+        self.assertIn("parser", sample)
+        self.assertIn("webapp", sample["logging"])
+
+    def test_ensure_standalone_config_api(self) -> None:
+        from core.config import API_CONFIG_FILENAME, ensure_standalone_config, get_service_config_path
+
+        self.assertEqual(API_CONFIG_FILENAME, "config_api.json")
+        self.assertEqual(get_service_config_path("api").name, "config_api.json")
+        base_cfg = self.root / "config.json"
+        base_cfg.write_text(json.dumps({
+            "database": {"host": "10.9.9.9", "server_tuning": {"a": 1}},
+            "parser": {"mem_max": 8},
+            "webapp": {"port": 9000},
+            "api": {"port": 8123, "reload": True, "keys": {"agent": "s3cret"}},
+            "logging": {"parser": {"enabled": True}, "api": {"enabled": True}},
+        }))
+        target = self.root / "out" / API_CONFIG_FILENAME
+        path, created = ensure_standalone_config("api", config_path=target, base_config_path=base_cfg)
+        self.assertTrue(created)
+        seeded = json.loads(path.read_text())
+        self.assertEqual(sorted(seeded), ["api", "cache", "database", "logging", "repositories", "workspace"])
+        self.assertEqual(seeded["database"]["host"], "10.9.9.9")
+        self.assertNotIn("server_tuning", seeded["database"])
+        self.assertEqual(seeded["api"]["port"], 8123)
+        self.assertFalse(seeded["api"]["reload"])
+        self.assertEqual(seeded["api"]["keys"], {"agent": "s3cret"})
+        self.assertEqual(list(seeded["logging"]), ["api"])
+        self.assertTrue(seeded["logging"]["api"]["enabled"])
+        # Never overwrites an existing file
+        path.write_text('{"api": {"port": 1}}')
+        _, created_again = ensure_standalone_config("api", config_path=target, base_config_path=base_cfg)
+        self.assertFalse(created_again)
+        self.assertEqual(json.loads(path.read_text()), {"api": {"port": 1}})
 
 
 if __name__ == "__main__":

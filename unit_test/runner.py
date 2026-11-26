@@ -132,6 +132,7 @@ DEFAULT_MODULES = [
     "tests.test_parser_cve_screens",
     "tests.test_logging_screen",
     "tests.test_systemd_tui",
+    "tests.test_api_tui",
     "tests.test_git_manager_screen",
     "tests.test_version_parse_screen",
     "tests.test_db_content",

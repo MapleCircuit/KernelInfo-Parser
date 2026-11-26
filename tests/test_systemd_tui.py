@@ -14,11 +14,13 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from core.config import (
+    API_CONFIG_FILENAME,
     DAEMON_CONFIG_FILENAME,
     WEBAPP_CONFIG_FILENAME,
     get_service_config_path,
 )
 from core.systemd_manager import (
+    API_UNIT_NAME,
     DAEMON_UNIT_NAME,
     WEBAPP_UNIT_NAME,
     CommandResult,
@@ -26,6 +28,7 @@ from core.systemd_manager import (
 )
 from core.tui.app import TUIApp
 from core.tui.output_capture import TerminalOutputCapture
+from core.tui.screens.api_cfg import ApiSettingsScreen
 from core.tui.screens.database_ssh import DatabaseSSHScreen
 from core.tui.screens.logging_cfg import LoggingScreen
 from core.tui.screens.main_menu import MainMenuScreen
@@ -58,6 +61,8 @@ class TestMainMenuSystemdEntry(unittest.TestCase):
         keys = [item[0] for item in MainMenuScreen.MENU_ITEMS]
         self.assertIn("0", keys)
         self.assertEqual(keys[-1], "Q")
+        title0 = next(item[1] for item in MainMenuScreen.MENU_ITEMS if item[0] == "0")
+        self.assertEqual(title0, "Systemd Services (Daemon, Webapp & API)")
         self.assertEqual(MainMenuScreen.HOTKEYS["0"], "0")
 
     def test_hotkey_0_pushes_systemd_services_screen(self) -> None:
@@ -65,7 +70,7 @@ class TestMainMenuSystemdEntry(unittest.TestCase):
                 patch("core.tui.screens.systemd_services.get_service_status") as mock_status:
             mock_status.side_effect = lambda svc, **kw: ServiceStatus(
                 service=svc,
-                unit_name=DAEMON_UNIT_NAME if svc == "daemon" else WEBAPP_UNIT_NAME,
+                unit_name={"daemon": DAEMON_UNIT_NAME, "webapp": WEBAPP_UNIT_NAME, "api": API_UNIT_NAME}[svc],
                 unit_path=Path(f"/tmp/{svc}.service"),
                 installed=False,
                 enabled="disabled",
@@ -300,6 +305,49 @@ class TestScopedConfigFlows(unittest.TestCase):
         self.assertEqual(app.config_scope, "full")
         self.assertEqual(app.config["database"]["host"], "prod-db")
 
+    def test_api_scoped_menu_items_and_prune_on_save(self) -> None:
+        api_cfg = self.root / API_CONFIG_FILENAME
+        app = TUIApp(self.base_cfg)
+        app.stdscr = self.win
+        menu = MainMenuScreen(self.win, app)
+        app.push_screen(menu)
+        scoped = ScopedConfigMenuScreen(self.win, app, "api", config_path=api_cfg)
+        app.push_screen(scoped)
+        self.assertEqual(app.config_scope, "api")
+        self.assertTrue(api_cfg.is_file())
+        keys = [item[0] for item in scoped.menu_items]
+        self.assertEqual(keys[-2:], ["S", "B"])
+        scoped.draw()
+        self.assertIn("API Service Configuration", _window_text(self.win))
+
+        scoped._activate_key("1")
+        self.assertIsInstance(app.current_screen(), ApiSettingsScreen)
+        app.current_screen().inp_port.set_value("9100")
+        app.current_screen().save()
+        self.assertIs(app.current_screen(), scoped)
+
+        scoped._activate_key("L")
+        log_screen = app.current_screen()
+        self.assertIsInstance(log_screen, LoggingScreen)
+        self.assertTrue(log_screen.show_api)
+        self.assertFalse(log_screen.show_parser)
+        self.assertFalse(log_screen.show_webapp)
+        log_screen.chk_api_enabled.set_checked(True)
+        log_screen.save()
+
+        with patch("core.tui.screens.scoped_config.ModalDialog.show", return_value="OK"):
+            scoped._activate_key("S")
+        saved = json.loads(api_cfg.read_text(encoding="utf-8"))
+        self.assertEqual(saved["api"]["port"], 9100)
+        self.assertTrue(saved["logging"]["api"]["enabled"])
+        self.assertNotIn("parser", saved)
+        self.assertNotIn("webapp", saved)
+        self.assertNotIn("parser", saved["logging"])
+        self.assertNotIn("webapp", saved["logging"])
+
+        scoped._activate_key("B")
+        self.assertEqual(app.config_scope, "full")
+
     def test_webapp_scoped_hides_parser_screens_and_prunes_on_save(self) -> None:
         webapp_cfg = self.root / WEBAPP_CONFIG_FILENAME
         app = TUIApp(self.base_cfg)
@@ -463,6 +511,21 @@ class TestSystemdServicesScreen(unittest.TestCase):
                 main_pid=1234,
                 error=None,
             ),
+            "api": ServiceStatus(
+                service="api",
+                unit_name=API_UNIT_NAME,
+                unit_path=self.unit_dir / API_UNIT_NAME,
+                installed=False,
+                enabled="disabled",
+                active="inactive",
+                sub_state="dead",
+                mode="direct",
+                user="",
+                group="",
+                attach_command=None,
+                main_pid=None,
+                error=None,
+            ),
         }
         status_map = statuses or default_statuses
         with patch("core.tui.screens.systemd_services.get_service_status", side_effect=lambda svc, **kw: status_map[svc]):
@@ -495,6 +558,35 @@ class TestSystemdServicesScreen(unittest.TestCase):
         screen.select_service("daemon")
         self.assertEqual(screen.inp_user.get_value(), "alice")
         self.assertEqual(screen.inp_group.get_value(), "devs")
+
+    def test_three_services_listed_and_drawn_within_24_rows(self) -> None:
+        win = MockCursesWindow(24, 100)
+        self.win = win
+        screen = self._make_screen()
+        screen.stdscr = win
+        self.assertEqual(screen.sel_service.options, ["daemon", "webapp", "api"])
+        screen.select_service("api")
+        self.assertEqual(screen.selected_service, "api")
+        screen.draw()
+        text = _window_text(win)
+        self.assertIn("Daemon, Webapp & API", text)
+        self.assertIn("config_api.json", text)
+        self.assertIn(API_UNIT_NAME, text)
+        ys = [args[0] for name, args, _ in win.calls if name == "addstr"]
+        self.assertLess(max(ys), 24)
+        for w in screen.widgets:
+            self.assertLess(w.y, 23)
+        cfg = screen._build_unit_config("api")
+        self.assertEqual(cfg.config_path, (self.root / API_CONFIG_FILENAME).resolve())
+
+    def test_configure_api_opens_scoped_menu(self) -> None:
+        screen = self._make_screen()
+        screen.select_service("api")
+        with patch.object(self.app, "push_screen") as mock_push:
+            self.assertTrue(screen.configure_selected_service())
+        pushed = mock_push.call_args[0][0]
+        self.assertIsInstance(pushed, ScopedConfigMenuScreen)
+        self.assertEqual(pushed.service, "api")
 
     def test_same_user_attach_command_displayed_when_tmux_checked(self) -> None:
         screen = self._make_screen()

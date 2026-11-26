@@ -10,7 +10,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from api.config import get_db_config, get_logging_config, refresh_default_repo_dir
 from api.routers import v1_router
 from api.security import ApiAuthMiddleware, ApiRequestLoggingMiddleware
-from core.logging_setup import setup_webapp_logging
+from core.logging_setup import setup_api_logging
 from webapp.backend.security.middleware import (
     RepoContextMiddleware,
     SecurityHeadersMiddleware,
@@ -30,10 +30,10 @@ def _db_engine():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI application lifespan manager for DB pool warm-up and graceful shutdown."""
-    if get_logging_config("webapp").get("enabled") and not any(
-        getattr(h, "_kip_log_target", None) == "webapp" for h in logging.getLogger().handlers
+    if get_logging_config("api").get("enabled") and not any(
+        getattr(h, "_kip_log_target", None) == "api" for h in logging.getLogger().handlers
     ):
-        setup_webapp_logging()
+        setup_api_logging()
     try:
         _db_engine().warm_up()
     except Exception as exc:  # noqa: BLE001 - best-effort startup pre-warm
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     """Create and configure the standalone authenticated AI API FastAPI application."""
     refresh_default_repo_dir()
-    setup_webapp_logging()
+    setup_api_logging()
     app = FastAPI(
         title="KernelInfo-Parser AI & Programmatic API",
         version="1.0.0",

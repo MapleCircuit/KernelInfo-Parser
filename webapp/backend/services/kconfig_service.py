@@ -26,7 +26,7 @@ from fastapi import HTTPException
 from db_engine.spec import Join
 from parser import kbuild_symbols
 from parser.arch_layout import PRE_ARCH_ARCH
-from parser.kbuild_conditions import KbuildConditionResolver, is_other_arch_path
+from parser.kbuild_conditions import KbuildConditionResolver, evaluate as evaluate_build_condition, is_other_arch_path
 from parser.kbuild_parser import KbuildParser
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
 from parser.kconfig_ast.kconfig_model import (
@@ -1055,3 +1055,67 @@ class KconfigService:
         result = solve(ev, sym_name, want)
         result.update({"version": version_name, "arch": entry.arch["arch"], "target": sym_name, "target_symbol": sym_name})
         return result
+
+    def evaluate(
+        self,
+        version_name: str,
+        arch: str = DEFAULT_ARCH,
+        *,
+        defconfig: str = "",
+        assignments: dict[str, str] | None = None,
+        symbols: list[str] | None = None,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Values of `symbols` and Kbuild conditions of `paths` under one configuration, evaluated server-side.
+
+        The configuration is what `make ARCH=<arch> <defconfig>` writes (`defconfig` empty: the arch default),
+        then each `assignments` entry applied with kconfig's own setter rules (`set_value`; refused changes
+        are reported in `rejected`). Symbols are `{value, type, defined, visible, changeable}`; paths carry
+        their condition `expr` and its tristate `result` ("y", "m", "n", or "?").
+        """
+        dc = self.get_defconfig_content(version_name, defconfig, arch)
+        entry = self.get_model(version_name, dc["arch"])
+        ev = entry.evaluator()
+        report = ev.load_config(dc["content"])
+        ev.set_all_new_symbols("default")
+        applied: dict[str, str] = {}
+        rejected: dict[str, str] = {}
+        for raw_name, val in (assignments or {}).items():
+            name = str(raw_name).removeprefix("CONFIG_")
+            text = str(val)
+            if ev.is_defined(name) and ev.set_value(name, text):
+                applied[name] = ev.value(name)
+            else:
+                rejected[name] = text
+        sym_out: dict[str, Any] = {}
+        for raw_name in symbols or []:
+            name = str(raw_name).removeprefix("CONFIG_")
+            if not ev.is_defined(name):
+                sym_out[name] = {"value": "n", "type": None, "defined": False, "visible": False, "changeable": False}
+                continue
+            sym_out[name] = {
+                "value": ev.value(name),
+                "type": ev.get_type(name),
+                "defined": True,
+                "visible": ev.visibility(name) > 0,
+                "changeable": ev.is_changeable(name),
+            }
+        files: dict[str, Any] = {}
+        if paths:
+            conds = self.build_conditions(version_name, paths, dc["arch"])["files"]
+
+            def value_of(sym: str) -> str:
+                return ev.value(sym) if ev.is_defined(sym) else "n"
+
+            for path, cond in conds.items():
+                files[path] = {**cond, "result": evaluate_build_condition(cond.get("expr", "?"), value_of)}
+        return {
+            "version": version_name,
+            "arch": dc["arch"],
+            "defconfig": dc["file_path"],
+            "applied": applied,
+            "rejected": rejected,
+            "load_report": {k: (v[:50] if isinstance(v, list) else v) for k, v in (report or {}).items()},
+            "symbols": sym_out,
+            "files": files,
+        }

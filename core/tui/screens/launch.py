@@ -50,3 +50,35 @@ def launch_pipeline(stdscr: Any, app: Any, mode: str, **launch_args: Any) -> boo
 def launch_daemon(stdscr: Any, app: Any, mode: str) -> bool:
     """Exit the TUI into the pipeline running in singleton daemon role."""
     return launch_pipeline(stdscr, app, mode, role="daemon")
+
+
+SERVER_CHOICES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Webapp only", ("webapp",)),
+    ("API only", ("api",)),
+    ("Both Webapp & API", ("webapp", "api")),
+)
+
+
+def choose_servers(stdscr: Any) -> tuple[str, ...] | None:
+    """Ask which server(s) to launch; returns `("webapp",)`, `("api",)`, `("webapp", "api")` or None (cancelled)."""
+    labels = [label for label, _servers in SERVER_CHOICES]
+    choice = ModalDialog.show_dialog(
+        stdscr,
+        title="Launch Servers",
+        message="Which server(s) should start after the TUI exits?",
+        buttons=[*labels, "Cancel"],
+        default_button=0,
+    )
+    for label, servers in SERVER_CHOICES:
+        if choice == label:
+            return servers
+    return None
+
+
+def launch_servers(stdscr: Any, app: Any, mode: str, servers: tuple[str, ...]) -> bool:
+    """Exit the TUI into a server launch (`webapp/main.py` and/or `api/main.py`).
+
+    The launch request returned by `run_config_tui_launch()` is
+    `{"servers": ["webapp", "api"], "config_path": "<active config file>"}`; the pipeline is not run.
+    """
+    return launch_pipeline(stdscr, app, mode, servers=list(servers), config_path=str(app.config_path))

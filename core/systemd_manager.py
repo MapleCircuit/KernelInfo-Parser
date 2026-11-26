@@ -1,8 +1,8 @@
 """core/systemd_manager.py - Systemd unit generation and tmux service lifecycle management.
 
 Generates, validates, parses, installs, controls, and queries systemd `.service` units
-for the KernelInfo-Parser daemon (`main.py --role daemon`) and web application
-(`webapp/main.py`) in either direct (`Type=simple`) or `tmux` (`Type=forking`) mode.
+for the KernelInfo-Parser daemon (`main.py --role daemon`), web application
+(`webapp/main.py`) and AI API (`api/main.py`) in either direct (`Type=simple`) or `tmux` (`Type=forking`) mode.
 """
 from __future__ import annotations
 
@@ -25,14 +25,18 @@ DAEMON_SERVICE_NAME = "kernelinfo-daemon"
 DAEMON_UNIT_NAME = "kernelinfo-daemon.service"
 WEBAPP_SERVICE_NAME = "kernelinfo-webapp"
 WEBAPP_UNIT_NAME = "kernelinfo-webapp.service"
+API_SERVICE_NAME = "kernelinfo-api"
+API_UNIT_NAME = "kernelinfo-api.service"
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 
 DAEMON_TMUX_SOCKET = "kernelinfo-daemon"
 DAEMON_TMUX_SESSION = "kernelinfo-daemon"
 WEBAPP_TMUX_SOCKET = "kernelinfo-webapp"
 WEBAPP_TMUX_SESSION = "kernelinfo-webapp"
+API_TMUX_SOCKET = "kernelinfo-api"
+API_TMUX_SESSION = "kernelinfo-api"
 
-VALID_SERVICES: tuple[Literal["daemon", "webapp"], ...] = ("daemon", "webapp")
+VALID_SERVICES: tuple[Literal["daemon", "webapp", "api"], ...] = ("daemon", "webapp", "api")
 VALID_ACTIONS: tuple[str, ...] = ("start", "stop", "restart", "enable", "disable")
 
 RunnerFn = Callable[..., Any]
@@ -40,7 +44,7 @@ RunnerFn = Callable[..., Any]
 
 @dataclass(frozen=True)
 class _ServiceSpec:
-    service: Literal["daemon", "webapp"]
+    service: Literal["daemon", "webapp", "api"]
     service_name: str
     unit_name: str
     description: str
@@ -65,6 +69,14 @@ _SERVICE_SPECS: dict[str, _ServiceSpec] = {
         tmux_socket=WEBAPP_TMUX_SOCKET,
         tmux_session=WEBAPP_TMUX_SESSION,
     ),
+    "api": _ServiceSpec(
+        service="api",
+        service_name=API_SERVICE_NAME,
+        unit_name=API_UNIT_NAME,
+        description="KernelInfo-Parser API Service",
+        tmux_socket=API_TMUX_SOCKET,
+        tmux_session=API_TMUX_SESSION,
+    ),
 }
 
 
@@ -72,7 +84,7 @@ _SERVICE_SPECS: dict[str, _ServiceSpec] = {
 class ServiceUnitConfig:
     """Parameters used to render and install a systemd unit for a service."""
 
-    service: Literal["daemon", "webapp"]
+    service: Literal["daemon", "webapp", "api"]
     user: str
     group: str
     use_tmux: bool
@@ -322,6 +334,8 @@ def _build_exec_args(cfg: ServiceUnitConfig) -> list[str]:
     config_str = str(cfg.config_path)
     if cfg.service == "daemon":
         return [python_exe, str(cfg.project_root / "main.py"), "--config", config_str, "--role", "daemon"]
+    if cfg.service == "api":
+        return [python_exe, str(cfg.project_root / "api" / "main.py"), "--config", config_str]
     return [python_exe, str(cfg.project_root / "webapp" / "main.py"), "--config", config_str]
 
 
@@ -608,7 +622,7 @@ def _validate_config_fallback(config_path: Path, service: str) -> tuple[bool, li
     if not isinstance(data, dict):
         return False, [f"Configuration root in '{config_path}' must be a JSON object."], warnings
 
-    for section in ("database", "webapp", "parser"):
+    for section in ("database", "webapp", "api", "parser"):
         if section in data and not isinstance(data[section], dict):
             errors.append(f"Configuration section '{section}' must be a JSON object.")
 
@@ -616,6 +630,16 @@ def _validate_config_fallback(config_path: Path, service: str) -> tuple[bool, li
         warnings.append("Configuration has no 'database' section; built-in defaults will be used.")
     if service == "webapp" and "webapp" not in data:
         warnings.append("Configuration has no 'webapp' section; built-in defaults will be used.")
+    if service == "api" and "api" not in data:
+        warnings.append("Configuration has no 'api' section; built-in defaults will be used.")
+    if service == "api":
+        api_sec = data.get("api") if isinstance(data.get("api"), dict) else {}
+        keys = api_sec.get("keys")
+        has_key = (isinstance(keys, list) and any(isinstance(k, str) and k.strip() for k in keys)) or (
+            isinstance(keys, dict) and any(isinstance(k, str) and k.strip() for k in keys.values())
+        )
+        if not has_key:
+            warnings.append("Configuration has no 'api.keys'; the API rejects every request (401) until a key is added.")
 
     return len(errors) == 0, errors, warnings
 
@@ -676,7 +700,7 @@ def preflight_service_install(
         errors.extend(ug_errs)
     warnings.extend(ug_warns)
 
-    entrypoint = cfg.project_root / ("main.py" if cfg.service == "daemon" else Path("webapp") / "main.py")
+    entrypoint = cfg.project_root / ("main.py" if cfg.service == "daemon" else Path(cfg.service) / "main.py")
     if cfg.project_root.is_dir() and not entrypoint.is_file():
         warnings.append(f"Service entrypoint script not found at '{entrypoint}'.")
 

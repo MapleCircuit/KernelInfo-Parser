@@ -1,4 +1,4 @@
-"""core/logging_setup.py - File logging, stdio capture, and request filtering for parser & webapp."""
+"""core/logging_setup.py - File logging, stdio capture, and request filtering for parser, webapp & AI API."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import threading
 from typing import Any, TextIO
 
 from core.config import (
+    HTTP_LOGGING_TARGETS,
+    LOGGING_TARGETS,
     REPO_ROOT,
     _coerce_bool,
     get_logging_config,
@@ -81,7 +83,7 @@ def resolve_log_targets(
     target: str,
     base_root: Path | None = None,
 ) -> tuple[Path | None, Path | None]:
-    """Resolve `(main_path, error_path)` for `'parser'` or `'webapp'` (both None when disabled)."""
+    """Resolve `(main_path, error_path)` for `'parser'`, `'webapp'`, or `'api'` (both None when disabled)."""
     cfg = section_cfg or {}
     if not _coerce_bool(cfg.get("enabled"), False):
         return None, None
@@ -436,13 +438,15 @@ def setup_logging(
     force: bool = False,
     base_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Configure file logging for `'parser'` or `'webapp'` from config.
+    """Configure file logging for `'parser'`, `'webapp'`, or `'api'` from config.
 
-    Captures all Python `logging` records (including third-party/uvicorn non-propagating loggers),
+    `'webapp'` and `'api'` are HTTP servers: their main file honours `request_mode` and uvicorn's
+    non-propagating loggers are attached. Captures all Python `logging` records (including third-party/uvicorn non-propagating loggers),
     `stdout`/`stderr` output (`print()`, warnings, C-extension stderr), and uncaught exceptions.
     """
-    if target not in ("parser", "webapp"):
+    if target not in LOGGING_TARGETS:
         raise ValueError(f"Unknown logging target: {target!r}")
+    is_http = target in HTTP_LOGGING_TARGETS
 
     if not force and is_test_environment():
         return {
@@ -451,13 +455,13 @@ def setup_logging(
             "main_path": None,
             "error_path": None,
             "level": "INFO",
-            "request_mode": "all" if target == "webapp" else None,
+            "request_mode": "all" if is_http else None,
         }
 
     section_cfg = cfg if cfg is not None else get_logging_config(target)
     level_name = normalize_log_level(section_cfg.get("level"))
     level_no = getattr(logging, level_name, logging.INFO)
-    request_mode = normalize_webapp_request_mode(section_cfg.get("request_mode")) if target == "webapp" else None
+    request_mode = normalize_webapp_request_mode(section_cfg.get("request_mode")) if is_http else None
 
     main_path, error_path = resolve_log_targets(section_cfg, target, base_root=base_root)
 
@@ -481,7 +485,7 @@ def setup_logging(
         # Ensure root passes records down to file handlers without flooding existing console handlers
         old_root_level = root.level
         effective_root = level_no
-        if target == "webapp":
+        if is_http:
             effective_root = min(effective_root, logging.INFO)
         if old_root_level == logging.NOTSET:
             old_effective = logging.INFO
@@ -504,7 +508,7 @@ def setup_logging(
         handlers: list[logging.Handler] = []
         if main_path is not None:
             main_handler = _ManagedFileHandler(main_path, target, "main")
-            if target == "webapp":
+            if is_http:
                 main_handler.addFilter(WebappMainLogFilter(level_no, request_mode or "all"))
             else:
                 main_handler.addFilter(ParserMainLogFilter(level_no))
@@ -517,7 +521,7 @@ def setup_logging(
             root.addHandler(err_handler)
             handlers.append(err_handler)
 
-        if target == "webapp":
+        if is_http:
             _attach_webapp_non_propagating(handlers, request_mode or "all", level_no)
         else:
             # Attach to any non-propagating loggers used by parser modules
@@ -529,7 +533,7 @@ def setup_logging(
 
         if capture_stdio:
             capture_stdout_to_main = not (
-                target == "webapp" and (request_mode == "errors" or level_no > logging.INFO)
+                is_http and (request_mode == "errors" or level_no > logging.INFO)
             )
             _ACTIVE_STATE["orig_stdout"] = orig_stdout
             _ACTIVE_STATE["orig_stderr"] = orig_stderr
@@ -606,10 +610,33 @@ def setup_webapp_logging(
     )
 
 
+def setup_api_logging(
+    cfg: dict[str, Any] | None = None,
+    *,
+    capture_stdio: bool = True,
+    install_excepthook: bool = True,
+    force: bool = False,
+    base_root: Path | None = None,
+) -> dict[str, Any]:
+    """Activate file logging for the standalone AI API service (`logging.api`).
+
+    Request lines come from `api.security.ApiRequestLoggingMiddleware`, which never records API keys or
+    authentication headers.
+    """
+    return setup_logging(
+        "api",
+        cfg=cfg,
+        capture_stdio=capture_stdio,
+        install_excepthook=install_excepthook,
+        force=force,
+        base_root=base_root,
+    )
+
+
 def configure_worker_logging_from_env() -> dict[str, Any] | None:
     """Attach logging in a spawned worker process if `KIP_LOG_ACTIVE_TARGET` is active."""
     target = os.environ.get(ACTIVE_TARGET_ENV, "").strip()
-    if target not in ("parser", "webapp"):
+    if target not in LOGGING_TARGETS:
         return None
     if _ACTIVE_STATE.get("target") == target:
         return None

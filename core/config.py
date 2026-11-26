@@ -26,10 +26,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DAEMON_CONFIG_FILENAME = "config_daemon.json"
 WEBAPP_CONFIG_FILENAME = "config_webapp.json"
+API_CONFIG_FILENAME = "config_api.json"
 _SERVICE_CONFIG_FILENAMES: dict[str, str] = {
     "daemon": DAEMON_CONFIG_FILENAME,
     "webapp": WEBAPP_CONFIG_FILENAME,
+    "api": API_CONFIG_FILENAME,
 }
+# Targets of the `logging` section (one file-logging configuration per process kind)
+LOGGING_TARGETS: tuple[str, ...] = ("parser", "webapp", "api")
+# Targets whose records include HTTP requests (request_mode applies)
+HTTP_LOGGING_TARGETS: tuple[str, ...] = ("webapp", "api")
 
 DEFAULT_SSH_TUNNEL_CONFIG: dict[str, Any] = {
     "enabled": False,
@@ -250,7 +256,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "repos_dir": "repos",
         "auto_detect_repos": True,
     },
-    # File logging for parser and webapp backend (disabled by default)
+    # File logging for the parser, the webapp backend, and the AI API service (disabled by default)
     "logging": {
         "parser": {
             "enabled": False,
@@ -269,10 +275,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "error_file": "",
             "level": "INFO",
         },
+        "api": {
+            "enabled": False,
+            "dir": "",
+            "file": "api.log",
+            "request_mode": "all",
+            "error_dir": "",
+            "error_file": "",
+            "level": "INFO",
+        },
     },
     # Populated by sync_repositories() from Git repositories found under workspace.repos_dir
     "repositories": [],
 }
+
+# Client-IP headers the AI API reads from a trusted reverse proxy (api/API.md section 3)
+VALID_API_CLIENT_IP_HEADERS = ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP")
+
+
+def normalize_api_client_ip_header(val: Any) -> str:
+    """Canonical spelling of a supported client-IP header (case-insensitive); `X-Forwarded-For` otherwise."""
+    wanted = str(val or "").strip().lower()
+    for name in VALID_API_CLIENT_IP_HEADERS:
+        if name.lower() == wanted:
+            return name
+    return "X-Forwarded-For"
+
 
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_WEBAPP_REQUEST_MODES = ("all", "errors")
@@ -648,9 +676,9 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
             api_sec["trusted_proxies"] = list(DEFAULT_CONFIG["api"]["trusted_proxies"])
 
     if env_ip_hdr := _get_user_env("API_CLIENT_IP_HEADER"):
-        api_sec["client_ip_header"] = str(env_ip_hdr).strip() or "X-Forwarded-For"
+        api_sec["client_ip_header"] = normalize_api_client_ip_header(env_ip_hdr)
     else:
-        api_sec["client_ip_header"] = str(api_sec.get("client_ip_header") or "X-Forwarded-For").strip() or "X-Forwarded-For"
+        api_sec["client_ip_header"] = normalize_api_client_ip_header(api_sec.get("client_ip_header"))
 
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
@@ -750,7 +778,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     if "logging" not in merged or not isinstance(merged["logging"], dict):
         merged["logging"] = copy.deepcopy(DEFAULT_CONFIG["logging"])
     log_sec = merged["logging"]
-    for target in ("parser", "webapp"):
+    for target in LOGGING_TARGETS:
         default_target = copy.deepcopy(DEFAULT_CONFIG["logging"][target])
         if target not in log_sec or not isinstance(log_sec[target], dict):
             log_sec[target] = default_target
@@ -797,6 +825,28 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         w_log["level"] = normalize_log_level(env_w_log_lvl)
     else:
         w_log["level"] = normalize_log_level(w_log.get("level"))
+
+    a_log = log_sec["api"]
+    if env_a_log_en := _get_user_env("KIP_API_LOG_ENABLED"):
+        a_log["enabled"] = _coerce_bool(env_a_log_en, False)
+    else:
+        a_log["enabled"] = _coerce_bool(a_log.get("enabled"), False)
+    if (env_a_log_dir := _get_user_env("KIP_API_LOG_DIR")) is not None:
+        a_log["dir"] = env_a_log_dir
+    if (env_a_log_file := _get_user_env("KIP_API_LOG_FILE")) is not None:
+        a_log["file"] = env_a_log_file
+    if env_a_log_mode := _get_user_env("KIP_API_LOG_REQUEST_MODE"):
+        a_log["request_mode"] = normalize_webapp_request_mode(env_a_log_mode)
+    else:
+        a_log["request_mode"] = normalize_webapp_request_mode(a_log.get("request_mode"))
+    if (env_a_log_err_dir := _get_user_env("KIP_API_LOG_ERROR_DIR")) is not None:
+        a_log["error_dir"] = env_a_log_err_dir
+    if (env_a_log_err_file := _get_user_env("KIP_API_LOG_ERROR_FILE")) is not None:
+        a_log["error_file"] = env_a_log_err_file
+    if env_a_log_lvl := _get_user_env("KIP_API_LOG_LEVEL"):
+        a_log["level"] = normalize_log_level(env_a_log_lvl)
+    else:
+        a_log["level"] = normalize_log_level(a_log.get("level"))
 
     # 4. Normalize repository feature overrides if present
     if isinstance(merged.get("repositories"), list):
@@ -876,11 +926,11 @@ def get_workspace_config() -> dict[str, Any]:
 
 
 def get_logging_config(target: str | None = None) -> dict[str, Any]:
-    """Retrieve active logging configuration section (whole dict, or `'parser'` / `'webapp'`)."""
+    """Retrieve active logging configuration section (whole dict, or `'parser'` / `'webapp'` / `'api'`)."""
     log_cfg = get_config().get("logging", copy.deepcopy(DEFAULT_CONFIG["logging"]))
     if target is None:
         return log_cfg
-    if target not in ("parser", "webapp"):
+    if target not in LOGGING_TARGETS:
         raise ValueError(f"Unknown logging target: {target!r}")
     section = log_cfg.get(target)
     if isinstance(section, dict):
@@ -1990,7 +2040,7 @@ def update_repository_branches(name_or_path: str | None = None, write: bool = Tr
 
 
 def _normalize_service_name(service: str) -> str:
-    """Return canonical service key (`'daemon'` or `'webapp'`); raise ValueError otherwise."""
+    """Return canonical service key (`'daemon'`, `'webapp'`, or `'api'`); raise ValueError otherwise."""
     key = str(service or "").strip().lower()
     if key not in _SERVICE_CONFIG_FILENAMES:
         valid = ", ".join(sorted(_SERVICE_CONFIG_FILENAMES))
@@ -1999,7 +2049,7 @@ def _normalize_service_name(service: str) -> str:
 
 
 def get_service_config_path(service: str) -> Path:
-    """Return the standalone configuration path under REPO_ROOT for `'daemon'` or `'webapp'`."""
+    """Return the standalone configuration path under REPO_ROOT for `'daemon'`, `'webapp'`, or `'api'`."""
     key = _normalize_service_name(service)
     return REPO_ROOT / _SERVICE_CONFIG_FILENAMES[key]
 
@@ -2030,13 +2080,34 @@ def prune_webapp_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Top-level sections a standalone AI API configuration keeps (`logging` keeps only its `api` target)
+API_CONFIG_SECTIONS: tuple[str, ...] = ("database", "cache", "workspace", "repositories", "api", "logging")
+
+
+def prune_api_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied config dict holding only what the AI API service reads.
+
+    Keeps `database` (its `ssh_tunnel` included; a legacy top-level `ssh_tunnel` moves into it), `cache`,
+    `workspace`, `repositories` (without parser `preparse` rules), `api`, and `logging.api`; parser-only and
+    webapp-only sections and fields are removed.
+    """
+    out = prune_webapp_config(cfg)
+    for key in list(out):
+        if key not in API_CONFIG_SECTIONS:
+            out.pop(key, None)
+    log_sec = out.get("logging")
+    if isinstance(log_sec, dict):
+        out["logging"] = {"api": log_sec["api"]} if isinstance(log_sec.get("api"), dict) else {}
+    return out
+
+
 def ensure_standalone_config(
     service: str,
     *,
     config_path: Path | None = None,
     base_config_path: Path | None = None,
 ) -> tuple[Path, bool]:
-    """Seed a standalone config file for `'daemon'` or `'webapp'` if it does not exist yet.
+    """Seed a standalone config file for `'daemon'`, `'webapp'`, or `'api'` if it does not exist yet.
 
     Never overwrites or merges into an existing target file. Returns `(target_path, created)`.
     """
@@ -2089,6 +2160,13 @@ def ensure_standalone_config(
             parser_sec["distributed"] = dist_sec
         dist_sec["enabled"] = True
         dist_sec["role"] = "daemon"
+    elif key == "api":
+        seed = prune_api_config(seed)
+        api_sec = seed.get("api")
+        if not isinstance(api_sec, dict):
+            api_sec = copy.deepcopy(DEFAULT_CONFIG["api"])
+            seed["api"] = api_sec
+        api_sec["reload"] = False
     else:
         seed = prune_webapp_config(seed)
         webapp_sec = seed.get("webapp")

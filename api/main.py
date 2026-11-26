@@ -48,9 +48,9 @@ if __name__ == "__main__":
     import uvicorn
 
     from api.config import get_api_server_config
-    from core.logging_setup import setup_webapp_logging
+    from core.logging_setup import setup_api_logging
 
-    setup_webapp_logging()
+    setup_api_logging()
     cfg = get_api_server_config()
     uvicorn.run(
         "api.main:app",

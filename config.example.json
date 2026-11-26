@@ -124,6 +124,15 @@
       "error_dir": "",
       "error_file": "",
       "level": "INFO"
+    },
+    "api": {
+      "enabled": false,
+      "dir": "",
+      "file": "api.log",
+      "request_mode": "all",
+      "error_dir": "",
+      "error_file": "",
+      "level": "INFO"
     }
   },
   "repositories": [

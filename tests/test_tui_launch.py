@@ -260,5 +260,114 @@ class TestConfigureReexecPreservesLaunch(LaunchTestBase):
         self.assertFalse(child_args.reset_only)
 
 
+
+class _FakeServer:
+    """subprocess.Popen stand-in: runs until signalled (or `exit_after` polls), then reports `code`."""
+
+    _next_pid = 4000
+
+    def __init__(self, cmd, exit_after=None, code=0):
+        type(self)._next_pid += 1
+        self.pid = type(self)._next_pid
+        self.cmd = cmd
+        self.returncode = None
+        self.signals = []
+        self._polls = 0
+        self._exit_after = exit_after
+        self._code = code
+
+    def poll(self):
+        self._polls += 1
+        if self.returncode is None and self._exit_after is not None and self._polls >= self._exit_after:
+            self.returncode = self._code
+        return self.returncode
+
+    def on_signal(self, signum):
+        self.signals.append(signum)
+        if self.returncode is None:
+            self.returncode = 0
+
+
+class TestServerLaunch(LaunchTestBase):
+    """TUI "W" launches: `pipeline.cli.arg_handling()` hands off to `launch_servers()` (no parser setup)."""
+
+    def _run(self, servers, *, exits=None, stop_after_polls=None):
+        import pipeline.cli
+
+        exits = exits or {}
+        spawned = {}
+
+        def fake_popen(cmd, cwd=None, start_new_session=False):
+            self.assertTrue(start_new_session)
+            name = "api" if cmd[1].endswith("api/main.py") else "webapp"
+            exit_after, code = exits.get(name, (None, 0))
+            spawned[name] = _FakeServer(cmd, exit_after, code)
+            return spawned[name]
+
+        def fake_killpg(pid, signum):
+            for proc in spawned.values():
+                if proc.pid == pid:
+                    proc.on_signal(signum)
+
+        sleeps = {"n": 0}
+
+        def fake_sleep(_s):
+            sleeps["n"] += 1
+            if stop_after_polls is not None and sleeps["n"] == stop_after_polls:
+                # What the SIGINT handler does on Ctrl+C
+                handler = signal.getsignal(signal.SIGINT)
+                handler(signal.SIGINT, None)
+
+        with patch("pipeline.cli.time.sleep", side_effect=fake_sleep), patch("builtins.print"):
+            code = pipeline.cli.launch_servers(
+                servers, str(self.config_path), popen=fake_popen, killpg=fake_killpg, poll_interval=0
+            )
+        return code, spawned
+
+    def test_both_servers_stop_together_on_sigint(self):
+        prev = signal.getsignal(signal.SIGINT)
+        code, spawned = self._run(["webapp", "api"], stop_after_polls=3)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(spawned), ["api", "webapp"])
+        for name, entry in (("webapp", "webapp/main.py"), ("api", "api/main.py")):
+            cmd = spawned[name].cmd
+            self.assertTrue(cmd[1].endswith(entry))
+            self.assertEqual(cmd[2:], ["-c", str(self.config_path)])
+            self.assertEqual(spawned[name].signals, [signal.SIGINT])
+        self.assertIs(signal.getsignal(signal.SIGINT), prev)
+
+    def test_one_server_failing_stops_the_other(self):
+        code, spawned = self._run(["webapp", "api"], exits={"api": (2, 3)})
+        self.assertEqual(code, 3)
+        self.assertEqual(spawned["webapp"].signals, [signal.SIGINT])
+        self.assertEqual(spawned["api"].signals, [])
+
+    def test_single_server_and_invalid_selection(self):
+        code, spawned = self._run(["api"], exits={"api": (2, 0)})
+        self.assertEqual((code, list(spawned)), (0, ["api"]))
+        import pipeline.cli
+        with patch("builtins.print"):
+            self.assertEqual(pipeline.cli.launch_servers(["bogus"], None), 2)
+
+    def test_arg_handling_dispatches_before_parser_setup(self):
+        import pipeline.cli
+
+        for servers in (["webapp"], ["api"], ["webapp", "api"]):
+            launch = {"servers": servers, "config_path": str(self.config_path)}
+            with patch("sys.argv", ["main.py", "--configure", "-c", str(self.config_path)]), \
+                    patch("core.tui.app.run_config_tui_launch", return_value=launch), \
+                    patch("pipeline.cli.launch_servers", return_value=0) as run_servers, \
+                    patch("pipeline.cli.setup_memory_limit") as mem_guard, \
+                    patch("pipeline.cli.setup_parser_logging") as parser_logs, \
+                    patch("pipeline.cli.sync_repositories") as sync_repos:
+                with self.assertRaises(SystemExit) as cm:
+                    pipeline.cli.arg_handling()
+            self.assertEqual(cm.exception.code, 0)
+            run_servers.assert_called_once_with(servers, str(self.config_path))
+            mem_guard.assert_not_called()
+            parser_logs.assert_not_called()
+            sync_repos.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
