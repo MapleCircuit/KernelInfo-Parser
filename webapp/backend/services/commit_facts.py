@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 import subprocess
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.helpers import get_active_network_id
@@ -26,7 +27,7 @@ def git_facts(shas: Iterable[str]) -> dict[str, dict[str, Any]]:
     try:
         out = subprocess.run(
             ["git", "-C", str(get_repo_dir()), "log", "--no-walk=unsorted", "--format=%H%x1f%an%x1f%ae%x1f%at%x1f%s", *keys],
-            capture_output=True, text=True, timeout=30, errors="replace",
+            check=False, capture_output=True, text=True, timeout=30, errors="replace",
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return {}

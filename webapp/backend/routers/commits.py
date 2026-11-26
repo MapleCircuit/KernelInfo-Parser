@@ -1,16 +1,19 @@
 """webapp/backend/routers/commits.py - Commit History & Git Inspection."""
 from __future__ import annotations
+
 import re
 from typing import Annotated, Any
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+
 from webapp.backend.config import require_feature
 from webapp.backend.services import commit_relations, release_service
 from webapp.backend.services.commit_facts import commit_ids, git_facts, release_badges
 from webapp.backend.services.git_service import GitService
 from webapp.backend.services.jobs import retry_after_ms
 
-router = APIRouter(prefix="/api", tags=["commits"])
+router = APIRouter(prefix="/webapi", tags=["commits"])
 git_service = GitService()
 
 
@@ -89,25 +92,43 @@ def get_file_history(version_name: str, path: str, limit: int = Query(50, ge=1, 
     return git_service.get_file_history(version_name, path, limit)
 
 
+_TIMELINE_DIRECTIONS = {"past", "future", "around"}
+_TIMELINE_GRANULARITIES = {"year", "month", "week", "day"}
+
+
+def _validate_timeline_params(direction: str, granularity: str) -> str:
+    """Validate `direction` and legacy `granularity` query parameters for commit-level timeline routes."""
+    norm_dir = direction.lower().strip()
+    if norm_dir not in _TIMELINE_DIRECTIONS:
+        raise HTTPException(status_code=400, detail="direction must be 'past', 'future', or 'around'.")
+    if granularity.lower().strip() not in _TIMELINE_GRANULARITIES:
+        raise HTTPException(status_code=400, detail="granularity must be one of: year, month, week, day.")
+    return norm_dir
+
+
 @router.get("/commits/timeline", dependencies=[Depends(require_feature("commits"))])
 def get_commit_timeline_unversioned(
     limit: int = Query(100, ge=1, le=250),
-    direction: str = Query("past"),
+    direction: Annotated[str, Query()] = "past",
     cursor_id: int | None = Query(None),
+    granularity: Annotated[str, Query(description="Legacy query parameter validated against year/month/week/day; timeline responses remain commit-level.")] = "month",
 ) -> dict[str, Any]:
-    """Commit timeline from the latest commits in the repository (versionless)."""
-    return git_service.get_commit_timeline("", limit=limit, direction=direction, cursor_id=cursor_id)
+    """Commit-level timeline from the latest commits in the repository (versionless)."""
+    norm_dir = _validate_timeline_params(direction, granularity)
+    return git_service.get_commit_timeline("", limit=limit, direction=norm_dir, cursor_id=cursor_id)
 
 
 @router.get("/commits/{version_name}/timeline", dependencies=[Depends(require_feature("commits"))])
 def get_commit_timeline(
     version_name: str,
     limit: int = Query(100, ge=1, le=250),
-    direction: str = Query("past"),
+    direction: Annotated[str, Query()] = "past",
     cursor_id: int | None = Query(None),
+    granularity: Annotated[str, Query(description="Legacy query parameter validated against year/month/week/day; timeline responses remain commit-level.")] = "month",
 ) -> dict[str, Any]:
-    """Commit timeline around the version's commit, with contributor summaries."""
-    return git_service.get_commit_timeline(version_name, limit=limit, direction=direction, cursor_id=cursor_id)
+    """Commit-level timeline around the version's commit."""
+    norm_dir = _validate_timeline_params(direction, granularity)
+    return git_service.get_commit_timeline(version_name, limit=limit, direction=norm_dir, cursor_id=cursor_id)
 
 
 def _search_commits(version_name: str, q: str, limit: int) -> dict[str, Any]:
@@ -117,19 +138,26 @@ def _search_commits(version_name: str, q: str, limit: int) -> dict[str, Any]:
 
 
 @router.get("/commits/search", dependencies=[Depends(require_feature("commits"))])
-def search_commits_unversioned(q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+def search_commits_unversioned(
+    q: Annotated[str, Query(max_length=256)],
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
     """Commit search by hash prefix, subject or author (versionless)."""
     return _search_commits("", q, limit)
 
 
 @router.get("/commits/{version_name}/search", dependencies=[Depends(require_feature("commits"))])
-def search_commits(version_name: str, q: str = Query(...), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+def search_commits(
+    version_name: str,
+    q: Annotated[str, Query(max_length=256)],
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
     """Commit search by hash prefix, subject or author (at least two characters)."""
     return _search_commits(version_name, q, limit)
 
 
 @router.post("/version/{version_name}/patch/series", dependencies=[Depends(require_feature("patch"))])
-def format_patch_series(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def format_patch_series(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """A multi-file patch series in git format-patch form (P3): cover letter, [PATCH n/N], To/Cc,
     base-commit, plus whether it applies cleanly to its base (checked in memory)."""
     from webapp.backend.services.patch_series import format_series
@@ -137,20 +165,20 @@ def format_patch_series(version_name: str, payload: dict[str, Any] = Body(...)) 
 
 
 @router.post("/version/{version_name}/patch/format", dependencies=[Depends(require_feature("patch"))])
-def format_patch(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def format_patch(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """RFC-2822 email patch from in-browser edits."""
     return git_service.format_patch(version_name, payload)
 
 
 # ------------------------------------------------------------------ release containment (H3) and relations (H1)
-_HASH = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_HASH = re.compile(r"^[0-9a-fA-F]{4,64}$")
 MAX_HASHES = 200
 NO_STORE = {"Cache-Control": "no-store"}
 
 
 def _hash(value: str) -> str:
     if not isinstance(value, str) or not _HASH.match(value):
-        raise HTTPException(status_code=400, detail="Commit hash must be 7-40 hexadecimal characters.")
+        raise HTTPException(status_code=400, detail="Commit hash must be 4-64 hexadecimal characters.")
     return value.lower()
 
 
@@ -207,13 +235,13 @@ def _released_batch(payload: dict[str, Any]) -> Any:
 
 
 @router.post("/commits/released", dependencies=[Depends(require_feature("commits"))])
-def post_released_unversioned(payload: dict[str, Any] = Body(...)) -> Any:
+def post_released_unversioned(payload: Annotated[dict[str, Any], Body()]) -> Any:
     """Batched first releases (versionless)."""
     return _released_batch(payload)
 
 
 @router.post("/commits/{version_name}/released", dependencies=[Depends(require_feature("commits"))])
-def post_released(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+def post_released(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> Any:
     """Batched first releases (timeline cards, popovers): {results: {hash: {...}}, index: {state}}."""
     return _released_batch(payload)
 
@@ -298,13 +326,13 @@ def _relations_batch(payload: dict[str, Any]) -> Any:
 
 
 @router.post("/commits/relations", dependencies=[Depends(require_feature("commits"))])
-def post_relations_unversioned(payload: dict[str, Any] = Body(...)) -> Any:
+def post_relations_unversioned(payload: Annotated[dict[str, Any], Body()]) -> Any:
     """Relation counts of many commits (versionless)."""
     return _relations_batch(payload)
 
 
 @router.post("/commits/{version_name}/relations", dependencies=[Depends(require_feature("commits"))])
-def post_relations(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+def post_relations(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> Any:
     """Relation counts of many commits (timeline chips): {results: {hash: {fixed_by, reverted_by,
     backports, fixes, stable_cc}}}. Ingested commits are counted in the database; the others in the
     relation index (202 while it is first built and no commit could be answered)."""
@@ -319,7 +347,7 @@ def query_commits_unversioned(
     role: Annotated[list[str] | None, Query(description="Trailer filter role:value (reviewer, acked, tested, reported, suggested, signed, codev, cc, fixes, link)")] = None,
     since: Annotated[str, Query(description="YYYY-MM-DD")] = "",
     until: Annotated[str, Query(description="YYYY-MM-DD")] = "",
-    range: Annotated[str, Query(description="<rev>..<rev>")] = "",  # noqa: A002 - the documented parameter name
+    range: Annotated[str, Query(description="<rev>..<rev>")] = "",
     release: Annotated[str, Query(description="A release tag: its cycle (previous release..tag)")] = "",
     merges: Annotated[str, Query(description="only | none | all")] = "",
     section: Annotated[str, Query(description="MAINTAINERS section id or name: its F:/X: patterns")] = "",
@@ -343,7 +371,7 @@ def query_commits(
     role: Annotated[list[str] | None, Query(description="Trailer filter role:value (reviewer, acked, tested, reported, suggested, signed, codev, cc, fixes, link)")] = None,
     since: Annotated[str, Query(description="YYYY-MM-DD")] = "",
     until: Annotated[str, Query(description="YYYY-MM-DD")] = "",
-    range: Annotated[str, Query(description="<rev>..<rev>")] = "",  # noqa: A002 - the documented parameter name
+    range: Annotated[str, Query(description="<rev>..<rev>")] = "",
     release: Annotated[str, Query(description="A release tag: its cycle (previous release..tag)")] = "",
     merges: Annotated[str, Query(description="only | none | all")] = "",
     section: Annotated[str, Query(description="MAINTAINERS section id or name: its F:/X: patterns")] = "",

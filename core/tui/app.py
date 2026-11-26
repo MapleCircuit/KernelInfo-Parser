@@ -17,6 +17,7 @@ from core.config import (
     REPO_ROOT,
     ensure_standalone_config,
     find_config_path,
+    prune_api_config,
     prune_webapp_config,
 )
 from core.tui.screens.base import BaseScreen
@@ -144,13 +145,15 @@ class TUIApp:
 
         The top-level `ssh_tunnel` key is a legacy alias of `database.ssh_tunnel`; it is left out so
         a stale copy never shadows the tunnel edited in the TUI. When `config_scope == "webapp"`,
-        parser-only sections and fields are stripped via `prune_webapp_config()`.
+        parser-only sections and fields are stripped via `prune_webapp_config()`; `"api"` uses `prune_api_config()`.
         """
         data = dict(self.config)
         if isinstance(data.get("database"), dict) and isinstance(data["database"].get("ssh_tunnel"), dict):
             data.pop("ssh_tunnel", None)
         if self.config_scope == "webapp":
             data = prune_webapp_config(data)
+        elif self.config_scope == "api":
+            data = prune_api_config(data)
         return data
 
     def push_config_context(
@@ -162,11 +165,11 @@ class TUIApp:
     ) -> None:
         """Switch the active configuration file and scope, pushing the previous context onto a stack.
 
-        When `seed_service` (`"daemon"` or `"webapp"`) is given, `ensure_standalone_config()` is called
+        When `seed_service` (`"daemon"`, `"webapp"` or `"api"`) is given, `ensure_standalone_config()` is called
         first (bootstrap-only: existing standalone files are never overwritten).
         """
-        if scope not in ("full", "daemon", "webapp"):
-            raise ValueError(f"Invalid config scope {scope!r}; expected 'full', 'daemon', or 'webapp'")
+        if scope not in ("full", "daemon", "webapp", "api"):
+            raise ValueError(f"Invalid config scope {scope!r}; expected 'full', 'daemon', 'webapp', or 'api'")
         target = Path(config_path).expanduser().resolve()
         if seed_service is not None:
             ensure_standalone_config(
@@ -346,6 +349,12 @@ class TerminalState:
     the following SIGCONT (Ctrl+Z then `fg`, also delivered to every forked parser worker), switches
     the terminal back to curses program mode: `ONLCR` off, so every later newline moves down without
     returning to column 0. `restore()` reinstalls the saved dispositions and tty attributes.
+
+    The saved attributes are those the TUI started on, which are not always sane: a curses program
+    killed while it owned the terminal (e.g. a debugger Stop during an earlier `--configure`) leaves
+    `ONLCR` off, and `endwin()` returns to that same state. `restore()` therefore always re-enables
+    output post-processing (`OPOST | ONLCR`), so the pipeline, `launch_servers()` and the server
+    processes sharing the terminal print with CR-LF newlines.
     """
 
     def __init__(self) -> None:
@@ -387,9 +396,13 @@ class TerminalState:
         if self.fd is not None and self.attrs is not None:
             try:
                 import termios
-
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.attrs)
-            except (ImportError, OSError, ValueError):
+            except ImportError:
+                return
+            attrs = list(self.attrs)
+            attrs[1] |= getattr(termios, "OPOST", 0) | getattr(termios, "ONLCR", 0)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs)
+            except (OSError, ValueError, termios.error):
                 pass
 
 

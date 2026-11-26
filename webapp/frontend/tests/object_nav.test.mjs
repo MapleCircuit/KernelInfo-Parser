@@ -49,7 +49,7 @@ test("api.resolveObject caches per version, repo, currentFile, and objectPath", 
   const first = await api.resolveObject("v3.0", "sub/foo-bar.o", "drivers/net/Makefile");
   assert.equal(first.path, "drivers/net/sub/foo-bar.c");
   assert.equal(fetchCalls.length, 1);
-  assert.ok(fetchCalls[0].url.includes("/api/fs/resolve_object?"));
+  assert.ok(fetchCalls[0].url.includes("/webapi/fs/resolve_object?"));
   assert.ok(fetchCalls[0].url.includes("obj=sub%2Ffoo-bar.o"));
   assert.ok(fetchCalls[0].url.includes("current_file=drivers%2Fnet%2FMakefile"));
 

@@ -1,12 +1,19 @@
 """webapp/backend/routers/kconfig.py - Kconfig models, defconfigs, symbol provenance and the auto-solver."""
 from __future__ import annotations
-from typing import Annotated, Any
-from fastapi import APIRouter, Body, Depends, Query
-from webapp.backend.config import require_feature
-from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
-from webapp.backend.services.history_service import history_service
 
-router = APIRouter(prefix="/api", tags=["kconfig"], dependencies=[Depends(require_feature("kconfig"))])
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
+from fastapi.responses import JSONResponse
+
+from webapp.backend.config import require_feature
+from webapp.backend.security.git import safe_rev
+from webapp.backend.security.jail import is_safe_rel_path
+from webapp.backend.services.history_service import history_service
+from webapp.backend.services.jobs import retry_after_ms
+from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
+
+router = APIRouter(prefix="/webapi", tags=["kconfig"], dependencies=[Depends(require_feature("kconfig"))])
 kconfig_service = KconfigService()
 
 ToolchainParam = Annotated[str | None, Query(description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls")]
@@ -27,7 +34,7 @@ def get_kconfig_toolchain_defaults(version_name: str, arch: str = Query(DEFAULT_
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}")
 def get_kconfig_symbol(
     version_name: str,
-    symbol_name: str,
+    symbol_name: Annotated[str, Path(max_length=256)],
     arch: str = Query(DEFAULT_ARCH),
     toolchain: ToolchainParam = None,
 ) -> dict[str, Any]:
@@ -38,7 +45,7 @@ def get_kconfig_symbol(
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}/usage")
 def get_kconfig_symbol_usage(
     version_name: str,
-    symbol_name: str,
+    symbol_name: Annotated[str, Path(max_length=256)],
     arch: str = Query(DEFAULT_ARCH),
     limit: int = Query(400, ge=1, le=2000),
     toolchain: ToolchainParam = None,
@@ -50,17 +57,17 @@ def get_kconfig_symbol_usage(
 @router.get("/kconfig/{version_name}/build")
 def get_build_conditions(
     version_name: str,
-    path: list[str] = Query([], description="Source paths (repeatable, up to 64)"),
+    path: Annotated[list[str] | None, Query(description="Source paths (repeatable, up to 64)")] = None,
     arch: str = Query(DEFAULT_ARCH),
 ) -> dict[str, Any]:
     """Kbuild condition per file: when `make ARCH=<arch>` compiles it, as an expression over CONFIG_* symbols."""
-    return kconfig_service.build_conditions(version_name, path, arch)
+    return kconfig_service.build_conditions(version_name, path or [], arch)
 
 
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}/history")
 def get_kconfig_symbol_history(
     version_name: str,
-    symbol_name: str,
+    symbol_name: Annotated[str, Path(max_length=256)],
     include_rc: bool = Query(False, description="Also list release candidates"),
     branch: str | None = Query(None, description="Branch the timeline follows (default: chosen for version_name)"),
 ) -> dict[str, Any]:
@@ -95,7 +102,7 @@ def get_defconfig_content(
 def get_kconfig_graph(
     version_name: str,
     arch: str = Query(DEFAULT_ARCH),
-    symbol: str = Query(""),
+    symbol: Annotated[str, Query(max_length=256)] = "",
     toolchain: ToolchainParam = None,
 ) -> dict[str, Any]:
     """Direct relations of a symbol (own dependencies, selects, implies, selected by)."""
@@ -103,8 +110,13 @@ def get_kconfig_graph(
 
 
 @router.post("/kconfig/{version_name}/autosolve")
-def autosolve_kconfig(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def autosolve_kconfig(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """Legal user changes that make `target_symbol` reach `value` (default y) from `current_values`."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    current_values = payload.get("current_values") or {}
+    if not isinstance(current_values, dict) or len(current_values) > 30000:
+        raise HTTPException(status_code=400, detail="current_values must have at most 30000 entries")
     return kconfig_service.autosolve(version_name, payload)
 
 
@@ -117,7 +129,7 @@ def get_kconfig_presets(version_name: str) -> dict[str, Any]:
 @router.get("/kconfig/{version_name}/search")
 def search_kconfig_symbols(
     version_name: str,
-    q: str = Query(""),
+    q: Annotated[str, Query(max_length=256)] = "",
     limit: int = Query(25, ge=1, le=500),
     arch: str = Query(DEFAULT_ARCH),
     toolchain: ToolchainParam = None,
@@ -128,9 +140,6 @@ def search_kconfig_symbols(
 
 # ------------------------------------------------------------------ Kbuild object index (S04)
 def _kbuild_job(state: dict[str, Any]) -> Any:
-    from fastapi import HTTPException
-    from fastapi.responses import JSONResponse
-    from webapp.backend.services.jobs import retry_after_ms
     if state.get("state") == "failed":
         raise HTTPException(status_code=500, detail=f"Kbuild index failed: {state.get('error')}")
     if state.get("state") != "done":
@@ -143,8 +152,6 @@ def _kbuild_job(state: dict[str, Any]) -> Any:
 def get_kbuild_index(version_name: str, arch: Annotated[str, Query()] = DEFAULT_ARCH) -> Any:
     """Every object the Kbuild files name for one ARCH (S04): modname, kind, condition (interned), member
     sources. 202 while the index builds; ETag = cache key."""
-    from fastapi.responses import JSONResponse
-    from webapp.backend.security.git import safe_rev
     from webapp.backend.services.kbuild_index_service import compact, index_state
     safe_rev(version_name)
     st = index_state(version_name, arch, wait=2.0)
@@ -155,13 +162,15 @@ def get_kbuild_index(version_name: str, arch: Annotated[str, Query()] = DEFAULT_
 
 
 @router.post("/kconfig/{version_name}/kbuild/modules")
-def post_kbuild_modules(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+def post_kbuild_modules(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> Any:
     """Objects building the named modules (at most 2000; dashes and underscores are the same) with the
     symbols each requires: {modules: {name: {objects, required_symbols}}, unmatched}; `"gates": true` adds
     `module_gates`, every symbol gating a module-capable object (K1 trim candidates)."""
-    from fastapi import HTTPException
-    from webapp.backend.security.git import safe_rev
-    from webapp.backend.services.kbuild_index_service import index_state, module_gates, objects_for_module
+    from webapp.backend.services.kbuild_index_service import (
+        index_state,
+        module_gates,
+        objects_for_module,
+    )
     safe_rev(version_name)
     names = payload.get("names") if isinstance(payload, dict) else None
     if not isinstance(names, list) or len(names) > 2000 or not all(isinstance(n, str) and 0 < len(n) <= 64 for n in names):
@@ -179,9 +188,14 @@ def post_kbuild_modules(version_name: str, payload: dict[str, Any] = Body(...)) 
 @router.get("/kconfig/{version_name}/kbuild/file")
 def get_kbuild_file_objects(version_name: str, path: Annotated[str, Query()] = "", arch: Annotated[str, Query()] = DEFAULT_ARCH) -> Any:
     """Objects one source file is part of, with their conditions and rules."""
-    from webapp.backend.security.git import safe_rev
-    from webapp.backend.services.kbuild_index_service import index_state, objects_for_file
+    from webapp.backend.services.kbuild_index_service import (
+        index_state,
+        objects_for_file,
+    )
     safe_rev(version_name)
+    clean_path = path.strip("/")
+    if clean_path and not is_safe_rel_path(clean_path):
+        raise HTTPException(status_code=400, detail="Invalid path")
     st = index_state(version_name, arch, wait=2.0)
     building = _kbuild_job(st)
     if building is not None:

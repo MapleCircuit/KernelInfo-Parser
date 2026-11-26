@@ -255,7 +255,7 @@ registerInsightsSection({
   mountExtraChips: mountCvssControl,
   updateExtraChips: updateCvssControl,
   summaryHtml: buildSecuritySummaryHtml,
-  fetchDetail: (ctx, key) => (ctx.api || api).request(`/api/cve/${encodeURIComponent(key)}${ctx.release ? `?release=${encodeURIComponent(ctx.release)}` : ""}`),
+  fetchDetail: (ctx, key) => (ctx.api || api).request(`/webapi/cve/${encodeURIComponent(key)}${ctx.release ? `?release=${encodeURIComponent(ctx.release)}` : ""}`),
   detailHtml: (c, ctx) => renderCveDetailHtml(c, { release: ctx?.release }),
   downloads: [{ label: "CVEs", ext: "tsv", build: (rows) => toTsv(rows, [["id", (r) => r.id], ["state", (r) => r.state], ["basis", (r) => r.basis],
     ["introduced_release", (r) => r.introduced_release || ""], ["cvss", (r) => (r.score == null ? "" : r.score)], ["kev", (r) => r.kev || ""], ["published", (r) => r.published],

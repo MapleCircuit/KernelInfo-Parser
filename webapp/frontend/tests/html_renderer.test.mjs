@@ -37,4 +37,34 @@ test("html_renderer security sanitization", () => {
   assert.equal(res6.title, "Title");
   assert.ok(res6.html.includes('data-doc="Documentation/sound/guide.html"'), "relative doc link transformed");
   assert.ok(res6.html.includes('data-raw="Documentation/sound/diagram.png"'), "relative image src transformed");
+
+  // 6. HTML-entity-encoded schemes and data:// / javascript:// variants
+  const entityDoc = '<p><a href="&#106;avascript:alert(1)">EntJS</a><a href="java&#x09;script:alert(2)">TabJS</a><a href="&#100;ata:text/html,x">EntData</a><img src="&#106;avascript:alert(3)" /><img src="data://text/html,x" /></p>';
+  const res7 = renderHtmlDocument(entityDoc, "Documentation/sound/test.html");
+  assert.ok(!res7.html.includes("javascript:"), "entity-encoded javascript: must be stripped");
+  assert.ok(!res7.html.includes("data:text/html"), "entity-encoded data: must be stripped");
+  assert.ok(!res7.html.includes("data://"), "data:// image must be stripped");
+
+  // 7. target="_blank" always gets noopener and noreferrer tokens even with existing rel
+  const relDoc = '<p><a href="https://kernel.org" target="_blank" rel="external">K</a><a href="mailto:list@kernel.org" rel="author">M</a></p>';
+  const res8 = renderHtmlDocument(relDoc, "Documentation/sound/test.html");
+  assert.match(res8.html, /rel="external noopener noreferrer"/);
+  assert.match(res8.html, /<a\b[^>]*rel="author noopener noreferrer"[^>]*href="mailto:list@kernel\.org"|<a\b[^>]*href="mailto:list@kernel\.org"[^>]*rel="author noopener noreferrer"/);
+
+  // 8. Adjacent-quote event handlers, active SVG/form/video tags, srcset/xlink:href, and nested tag reconstruction
+  const bypassDoc = '<div title="x"onclick="alert(1)">ok</div>'
+    + '<svg><a xlink:href="javascript:alert(2)">x</a></svg>'
+    + '<form action="javascript:alert(3)"><button formaction="javascript:alert(4)">go</button></form>'
+    + '<video poster="javascript:alert(5)"></video>'
+    + '<img src="diagram.png" srcset="javascript:alert(6) 1x" />'
+    + '<scr<script>evil</script>ipt>alert(7)</scr<script></script>ipt>';
+  const res9 = renderHtmlDocument(bypassDoc, "Documentation/sound/test.html");
+  assert.ok(!res9.html.includes("onclick"), "adjacent-quote onclick must be stripped");
+  assert.ok(!res9.html.includes("<svg"), "svg elements must be stripped");
+  assert.ok(!res9.html.includes("xlink:href"), "xlink:href must be stripped");
+  assert.ok(!res9.html.includes("<form"), "form elements must be stripped");
+  assert.ok(!res9.html.includes("formaction"), "formaction must be stripped");
+  assert.ok(!res9.html.includes("poster="), "poster must be stripped");
+  assert.ok(!res9.html.includes("srcset="), "srcset must be stripped");
+  assert.ok(!res9.html.includes("<script"), "nested script reconstruction must be stripped");
 });

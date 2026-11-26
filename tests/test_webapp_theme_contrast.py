@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -56,9 +55,16 @@ class TestThemes(unittest.TestCase):
             bg = t["--bg-primary"]
             for fg in ["--text-primary", "--text-secondary", *SYNTAX]:
                 self.assertGreaterEqual(round(contrast(t[fg], bg), 2), need, f"{name}: {fg} {t[fg]} on {bg}")
-            # De-emphasized text: 3:1 (large / non-essential) in the normal themes, 4.5:1 in high contrast
-            self.assertGreaterEqual(round(contrast(t["--text-muted"], bg), 2), 4.5 if hc else 3.0, f"{name}: --text-muted")
+            # Muted text meets WCAG AA (4.5:1 standard, 7.0:1 high-contrast) against primary and secondary surfaces
+            self.assertGreaterEqual(round(contrast(t["--text-muted"], bg), 2), need, f"{name}: --text-muted on bg-primary")
+            self.assertGreaterEqual(round(contrast(t["--text-muted"], t["--bg-secondary"]), 2), need, f"{name}: --text-muted on bg-secondary")
             self.assertGreaterEqual(round(contrast(t["--text-primary"], t["--bg-secondary"]), 2), need, f"{name}: text on panels")
+            for accent in ("--accent-blue", "--accent-green"):
+                self.assertGreaterEqual(
+                    round(contrast(t["--text-on-accent"], t[accent]), 2),
+                    need,
+                    f"{name}: --text-on-accent {t['--text-on-accent']} on {accent} {t[accent]}",
+                )
 
     def test_every_theme_defines_the_themed_tokens(self) -> None:
         b = blocks(read(os.path.join(CSS, "variables.css")))
@@ -72,10 +78,10 @@ class TestThemes(unittest.TestCase):
             if not f.endswith(".css") or f == "variables.css":
                 continue
             text = read(os.path.join(CSS, f))
-            text = re.sub(r"/\* theme-fixed-start.*?theme-fixed-end \*/", "", text, flags=re.S)  # mconf TUI colors
+            text = re.sub(r"/\* theme-fixed-start.*?theme-fixed-end \*/", "", text, flags=re.DOTALL)  # mconf TUI colors
             text = re.sub(r":where\(:root\)\s*\{[^}]*\}", "", text)  # token definitions (docs.css)
             text = re.sub(r"var\(--[\w-]+,\s*[^)]*\)", "", text)  # fallbacks
-            text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+            text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
             stray += [f"{f}: {m.group(0)}" for m in HEX.finditer(text)]
         for root, _, files in os.walk(JS):
             for f in files:
@@ -91,6 +97,33 @@ class TestThemes(unittest.TestCase):
                         if re.search(r"[:= (\"'`,]\s*$", before) and not re.search(r"(href=|#L|#n|hash|url|\?|&)$", before):
                             stray.append(f"{f}: {m.group(0)} in {line.strip()[:80]}")
         self.assertEqual(stray, [])
+
+    def test_no_undefined_css_custom_properties(self) -> None:
+        defined: set[str] = set()
+        for root_dir in (CSS, JS):
+            for root, _, files in os.walk(root_dir):
+                for fname in files:
+                    if not fname.endswith((".css", ".js")):
+                        continue
+                    txt = read(os.path.join(root, fname))
+                    defined.update(re.findall(r"(--[\w-]+)\s*:", txt))
+                    defined.update(re.findall(r"setProperty(?:\?\.)?\(\s*['\"](--[\w-]+)['\"]", txt))
+
+        undefined_without_fallback: list[str] = []
+        forbidden_surface_refs: list[str] = []
+        var_ref_re = re.compile(r"var\(\s*(--[\w-]+)\s*(?:,\s*([^)]+))?\)")
+        for fname in sorted(os.listdir(CSS)):
+            if not fname.endswith(".css"):
+                continue
+            txt = re.sub(r"/\*.*?\*/", "", read(os.path.join(CSS, fname)), flags=re.DOTALL)
+            for match in var_ref_re.finditer(txt):
+                token, fallback = match.group(1), match.group(2)
+                if token == "--bg-surface":
+                    forbidden_surface_refs.append(f"{fname}: {token}")
+                if token not in defined and not fallback:
+                    undefined_without_fallback.append(f"{fname}: {token}")
+        self.assertEqual(forbidden_surface_refs, [], f"Undefined --bg-surface references found: {forbidden_surface_refs}")
+        self.assertEqual(undefined_without_fallback, [], f"Undefined CSS vars without fallbacks: {undefined_without_fallback}")
 
 
 if __name__ == "__main__":

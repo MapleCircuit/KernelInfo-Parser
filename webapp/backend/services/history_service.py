@@ -8,6 +8,7 @@ recycled for identical code). Kconfig symbols are followed across every Kconfig 
 each definition is re-parsed so changes are reported per property (type, prompt, depends on, select...).
 """
 from __future__ import annotations
+
 import logging
 import re
 import subprocess
@@ -15,21 +16,17 @@ import threading
 from collections import OrderedDict
 from functools import lru_cache
 from typing import Any
+
 from fastapi import HTTPException
+
 from core.globalstuff import ASTT, is_safe_git_rev, is_safe_git_spec
-from parser.kconfig_ast.kconfig_definitions import (  # noqa: F401 - re-exported
-    KCONFIG_TYPE_NAMES,
-    _cond,
-    _config_facts,
-    _expr,
+from db_engine.spec import AnyOf, Const, Join, Order, finished_ref, ge, gt, le, sub
+from parser.kconfig_ast.kconfig_definitions import (
     kconfig_definitions,
     kconfig_field_changes,
     without_raw_fields,
 )
-from webapp.backend.services import kconfig_facts
 from webapp.backend.config import get_repo_dir
-from db_engine.spec import AnyOf, Const, Join, Order, finished_ref, ge, gt, le, sub
-from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
     get_active_network_id,
     get_active_repo_id,
@@ -37,9 +34,16 @@ from webapp.backend.database.helpers import (
     hash_hex,
     safe_decode,
 )
+from webapp.backend.database.pool import get_reader
+from webapp.backend.services import kconfig_facts
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.git_service import _compute_structured_diff
-from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, definition_arch, definition_rank, git_tree_resolver
+from webapp.backend.services.tree_resolver import (
+    DEFAULT_DEFINITION_ARCH,
+    definition_arch,
+    definition_rank,
+    git_tree_resolver,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,7 @@ REF_TAG, REF_BRANCH = 1, 2
 KCONFIG_TYPES = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
 LINEAGE_LIMIT = 500
 COMMIT_FORMAT = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
-_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 # Kconfig definitions are cached per blob SHA in webapp/backend/services/kconfig_facts.py (shared with
 # Compare's Kconfig diff); kept as a name for sync_service's cache list
 _FACTS_CACHE = kconfig_facts._DEFS_CACHE
@@ -150,7 +154,7 @@ def history_scope(version_name: str | None, branch: str | None = None) -> dict[s
     the first one reaching it; the default branch when none does. Branch tags are walked once per
     branch head and cached (routers/versions.py branch_tags()).
     """
-    # The branch-tag walk and its cache live with GET /api/branch/tags (imported lazily: routers import services)
+    # The branch-tag walk and its cache live with GET /webapi/branch/tags (imported lazily: routers import services)
     from webapp.backend.routers.versions import _branch_head, branch_tags, get_branches
 
     def walk(name: str) -> set[str] | None:
@@ -201,6 +205,13 @@ def history_scope(version_name: str | None, branch: str | None = None) -> dict[s
 _TAG_CODE_CACHE: OrderedDict[int, str] = OrderedDict()
 _TAG_CODE_LOCK = threading.Lock()
 _TAG_CODE_CACHE_LIMIT = 16384
+
+
+def clear_cache() -> None:
+    """Clear in-memory snippet and git-change caches."""
+    with _TAG_CODE_LOCK:
+        _TAG_CODE_CACHE.clear()
+    _cached_change_commits.cache_clear()
 
 
 def _slice_extent(lines: list[str], s_l: int, e_l: int, s_c: int, e_c: int) -> str:
@@ -842,7 +853,7 @@ class HistoryService:
         """Whether a non-indented line names the symbol (definitions start in column 0, uses are indented)."""
         raw, _, _ = git_reader.read_file(vname, path)
         pattern = rb"^(?![ \t])[^\n]*\b" + re.escape(name.encode()) + rb"\b"
-        return raw is not None and re.search(pattern, raw, re.M) is not None
+        return raw is not None and re.search(pattern, raw, re.MULTILINE) is not None
 
     @staticmethod
     def _pick(cands: list[dict[str, Any]], lineage: set[int], ref_line: int) -> dict[str, Any] | None:
@@ -866,8 +877,7 @@ class HistoryService:
         """Every definition of CONFIG_<name> across the indexed releases of one branch, with property-level
         changes (`branch` / `scope` as in get_symbol_history)."""
         sym = (name or "").strip()
-        if sym.startswith("CONFIG_"):
-            sym = sym[7:]
+        sym = sym.removeprefix("CONFIG_")
         if not sym:
             raise HTTPException(status_code=400, detail="Kconfig symbol name is required.")
         if scope is None:

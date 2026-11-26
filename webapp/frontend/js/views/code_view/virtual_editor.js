@@ -81,15 +81,8 @@ export class VirtualEditor {
     // Full-file diff against another file/revision (toolbar "⇄ Diff"; null = the plain file)
     this.fileDiff = null;
     this.fileDiffToken = 0;
-
-    state.subscribe("codeview:font-changed", () => {
-      if (this.viewportEl && this.rawLines.length) {
-        const rowH = getCodeRowHeight();
-        if (this.spacerEl) this.spacerEl.style.height = `${this.rowCount() * rowH}px`;
-        this.updateVisibleLines();
-        this.renderMinimap();
-      }
-    });
+    this._loadSeq = 0;
+    this._blameSeq = 0;
 
     this.viewportEl = null;
     this.spacerEl = null;
@@ -117,6 +110,13 @@ export class VirtualEditor {
       this.refreshBuildBanner();
     };
     this.unsubscribers = [
+      state.subscribe("codeview:font-changed", () => {
+        if (!this.isLive() || !this.viewportEl || !this.rawLines.length) return;
+        const rowH = getCodeRowHeight();
+        if (this.spacerEl) this.spacerEl.style.height = `${this.rowCount() * rowH}px`;
+        this.updateVisibleLines();
+        this.renderMinimap();
+      }),
       state.subscribe("kconfig:engine:changed", () => {
         if (!this.isLive()) return;
         // An engine this tab followed may be gone, and a new one may now match its revision
@@ -535,6 +535,7 @@ export class VirtualEditor {
    * URL), with the options (`blameOpts`, `bo=mcw`), so a reopened tab or a link shows blame again.
    */
   async setBlame(on, { persist = true } = {}) {
+    const seq = ++this._blameSeq;
     this.showBlame = Boolean(on);
     this.containerEl?.querySelector("#btn-toggle-blame")?.classList.toggle("active", this.showBlame);
     const optsBtn = this.containerEl?.querySelector("#btn-blame-opts");
@@ -543,11 +544,12 @@ export class VirtualEditor {
     if (this.showBlame) {
       const opts = this.tabData?.blameOpts || "";
       await this.blameView.loadBlame(this.currentVersion, this.currentFilePath, opts, this.api);
+      if (!this.isLive() || seq !== this._blameSeq) return;
       if (this.blameView.blameData?.slow) {
         toast.info(`Blame took ${Math.round((this.blameView.blameData.elapsed_ms || 0) / 1000)} s (following copies compares every file of each commit)`);
       }
     }
-    if (!this.isLive()) return;
+    if (!this.isLive() || seq !== this._blameSeq) return;
     this.updateVisibleLines();
     this.updateToolbarOverflow();
   }
@@ -718,7 +720,7 @@ export class VirtualEditor {
       const note = noteOf.get(m.key) || "";
       out.set(at.line, { moved: !here, note: Boolean(note), title: `🔖 ${m.data.label}${here ? "" : ` (bookmarked at ${t.rev || t.sha}, moved?)`}${note ? `\n${note.slice(0, 300)}` : ""}` });
     }
-    if (this.currentFilePath !== path) return;
+    if (!this.isLive() || this.currentFilePath !== path) return;
     this.bookmarkMarks = out;
     this.updateVisibleLines?.();
   }
@@ -730,6 +732,10 @@ export class VirtualEditor {
   }
 
   dispose() {
+    this._loadSeq++;
+    this._blameSeq++;
+    this.fileDiffToken++;
+    this.buildToken++;
     unregisterView(this.tabId, this);
     this.occurrences.dispose();
     this.hoverCard?.dispose();
@@ -740,6 +746,9 @@ export class VirtualEditor {
     this.unsubscribers = [];
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.viewportEl = null;
+    this.spacerEl = null;
+    this.minimapCanvas = null;
     this.containerEl = null;
     this.linesContainer = null;
     this.rawLines = [];
@@ -809,7 +818,7 @@ export class VirtualEditor {
       } catch (err) {
         console.warn("Build condition unavailable:", err);
       }
-      if (token !== this.buildToken || path !== this.currentFilePath) return;
+      if (!this.isLive() || token !== this.buildToken || path !== this.currentFilePath) return;
       this.buildCond = { key, cond };
     }
     const cond = this.buildCond.cond;
@@ -944,28 +953,28 @@ export class VirtualEditor {
             ${breadcrumbsHtml}
           </div>
           <div class="code-actions">
-            ${this.isDoc ? `<button class="code-btn ${this.docMode === "rendered" ? "active" : ""}" id="btn-doc-toggle" title="Toggle rendered documentation / raw source">${this.docMode === "rendered" ? "📖 Rendered" : "&lt;/&gt; Source"}</button>` : ""}
+            ${this.isDoc ? `<button type="button" class="code-btn ${this.docMode === "rendered" ? "active" : ""}" id="btn-doc-toggle" title="Toggle rendered documentation / raw source">${this.docMode === "rendered" ? "📖 Rendered" : "&lt;/&gt; Source"}</button>` : ""}
             <button type="button" id="kconfig-dim-chip" class="code-dim-chip" style="display:none;"${kconfigOn ? "" : " hidden"} aria-pressed="false"></button>
-            ${this.diffMarks ? `<span class="code-diffmark-chip ${this.diffMarks.kind === "del" ? "del" : "add"}" title="Lines ${this.diffMarks.kind === "del" ? "removed" : "added or changed"} by commit ${this.diffMarks.commit || ""}">
-              ± ${(this.diffMarks.commit || "").slice(0, 8)}: ${this.diffMarkedLines.size} line${this.diffMarkedLines.size === 1 ? "" : "s"} ${this.diffMarks.kind === "del" ? "removed" : "changed"}
-              <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
+            ${this.diffMarks ? `<span class="code-diffmark-chip ${this.diffMarks.kind === "del" ? "del" : "add"}" title="Lines ${this.diffMarks.kind === "del" ? "removed" : "added or changed"} by commit ${escapeHtml(this.diffMarks.commit || "")}">
+              ± ${escapeHtml((this.diffMarks.commit || "").slice(0, 8))}: ${this.diffMarkedLines.size} line${this.diffMarkedLines.size === 1 ? "" : "s"} ${this.diffMarks.kind === "del" ? "removed" : "changed"}
+              <button type="button" data-diffnav="-1" title="Previous change" aria-label="Previous change">↑</button><button type="button" data-diffnav="1" title="Next change" aria-label="Next change">↓</button><button type="button" data-diffnav="0" title="Clear change markers" aria-label="Clear change markers">✕</button>
             </span>` : ""}
             <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
             <span id="file-security-badge" class="code-security-badge" style="display:none;"${cveOn ? "" : " hidden"} title="CVEs"></span>
             <span id="file-subsystem" class="code-subsystem-chip" style="display:none;"${maintOn ? "" : " hidden"} title="Subsystem"></span>
             <span id="file-last-changed" class="code-last-changed" style="display:none;"${commitsOn ? "" : " hidden"} title="Click to view full commit history"></span>
-            <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"${kconfigOn ? "" : " hidden"}></button>
-            <button class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
-            <button class="code-btn" id="btn-file-history" title="View commit history for this file"${commitsOn ? "" : " hidden"}>📜 History</button>
-            <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it"${commitsOn ? "" : " hidden"}>Blame</button>
-            <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" style="display:none;"${commitsOn ? "" : " hidden"} aria-haspopup="true">⚙</button>
-            <button class="code-btn" id="btn-copy-raw">Copy File</button>
+            <button type="button" class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"${kconfigOn ? "" : " hidden"}></button>
+            <button type="button" class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
+            <button type="button" class="code-btn" id="btn-file-history" title="View commit history for this file"${commitsOn ? "" : " hidden"}>📜 History</button>
+            <button type="button" class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it"${commitsOn ? "" : " hidden"}>Blame</button>
+            <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" aria-label="Blame options" style="display:none;"${commitsOn ? "" : " hidden"} aria-haspopup="true">⚙</button>
+            <button type="button" class="code-btn" id="btn-copy-raw">Copy File</button>
             <button type="button" class="code-btn" id="btn-outline" title="Outline of this file's definitions">☰ Outline</button>
             <button type="button" class="code-btn" id="btn-imports" title="Symbols this file uses from its #include chain">⇲ Imports</button>
             <button type="button" class="code-btn" id="btn-file-refs" title="Files including this one, Kconfig sources, Kbuild rules and documents naming it">⇇ Refs<span class="code-btn-badge" id="file-refs-count"></span></button>
             <button type="button" class="code-btn" id="btn-copy-link" title="Copy a link to the selected lines (click line numbers to select; Shift+click extends)">🔗 Link</button>
-            <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch"${patchOn ? "" : " hidden"}>✎ Patch</button>
-            <button type="button" class="code-btn code-overflow-btn" id="btn-code-overflow" title="More actions" style="display:none;" aria-haspopup="true" aria-expanded="false">▾</button>
+            <button type="button" class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch"${patchOn ? "" : " hidden"}>✎ Patch</button>
+            <button type="button" class="code-btn code-overflow-btn" id="btn-code-overflow" title="More actions" aria-label="More actions" style="display:none;" aria-haspopup="true" aria-expanded="false">▾</button>
           </div>
         </div>
         <div class="code-build-banner" id="code-build-banner" hidden></div>
@@ -1076,6 +1085,7 @@ export class VirtualEditor {
       e.stopPropagation();
       const r = (refsBtn.offsetWidth ? refsBtn : containerEl.querySelector("#btn-code-overflow") || refsBtn).getBoundingClientRect();
       const res = await contextMenu.showFileReferencesMenu(Math.max(8, r.right - 360), r.bottom + 4, this.currentVersion, this.currentFilePath);
+      if (!this.isLive()) return;
       const badge = containerEl.querySelector("#file-refs-count");
       if (badge && res) badge.textContent = ` ${referenceCount(res)}`;
     };
@@ -1092,6 +1102,7 @@ export class VirtualEditor {
     // The repository's web viewer (G06 "Copy External Link"), from the project catalog
     this.repoGitUrl = "";
     this.api.getProjects().then((res) => {
+      if (!this.isLive()) return;
       const projects = res?.projects || [];
       const p = projects.find((x) => x.repo === this.api.repo) || projects.find((x) => x.active) || projects[0];
       this.repoGitUrl = p?.git_url || "";
@@ -1332,6 +1343,7 @@ export class VirtualEditor {
   }
 
   async loadFileContent() {
+    const seq = ++this._loadSeq;
     this.hasLastChanged = false;
     const lastChangedEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-last-changed");
     if (lastChangedEl) {
@@ -1348,6 +1360,7 @@ export class VirtualEditor {
     this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">Loading ${escapeHtml(this.currentFilePath)}...</div>`;
     try {
       const res = await this.api.getFileContent(this.currentVersion, this.currentFilePath);
+      if (!this.isLive() || seq !== this._loadSeq) return;
       if (!res) {
         throw new Error("No response received from server for file content");
       }
@@ -1431,6 +1444,7 @@ export class VirtualEditor {
       // Fetch CVE security badge for this file
       if (hasFeature(this.api?.repo, "cve")) {
         this.api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
+          if (!this.isLive() || seq !== this._loadSeq) return;
           const badge = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
           if (!badge) return;
           const total = cveRes?.total ?? (Array.isArray(cveRes?.cves) ? cveRes.cves.length : 0);
@@ -1458,6 +1472,7 @@ export class VirtualEditor {
       // Fetch Subsystem indicator for this file
       if (hasFeature(this.api?.repo, "maintainers")) {
         this.api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
+          if (!this.isLive() || seq !== this._loadSeq) return;
           const subChip = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
           if (!subChip) return;
           const subs = matchRes?.subsystems || [];
@@ -1526,8 +1541,10 @@ export class VirtualEditor {
       // The tab was left showing a diff (or a deep link asks for one): show it again
       if ((this.tabData.diffWith?.version && this.tabData.diffWith?.path) || this.tabData.diffWith?.kind === "patch") {
         await this.enterFileDiff(this.tabData.diffWith, { restoring: true });
+        if (!this.isLive() || seq !== this._loadSeq) return;
       }
     } catch (err) {
+      if (!this.isLive() || seq !== this._loadSeq) return;
       this.linesContainer.innerHTML = `
         <div style="padding:20px;color:var(--accent-red);">
           Failed to load file: ${escapeHtml(err.message)}
@@ -1565,7 +1582,7 @@ export class VirtualEditor {
     docViewport.hidden = false;
     const history = this.tabData.docHistory || [];
     if (this.isMan) {
-      // Rendered from the page's document model (`/api/man/{v}/page?path=`), not from the roff text
+      // Rendered from the page's document model (`/webapi/man/{v}/page?path=`), not from the roff text
       mountManDocument(docViewport, {
         repo: this.api.repo,
         version: this.currentVersion,
@@ -1852,9 +1869,9 @@ export class VirtualEditor {
       ${r.identical ? `<span class="code-filediff-muted">identical</span>` : `<span class="code-filediff-add">+${r.additions}</span><span class="code-filediff-del">−${r.deletions}</span>`}
       ${r.truncated ? `<span class="code-filediff-warn" title="The diff was cut at the server's size limit">⚠ truncated</span>` : ""}
       ${blocks.length ? `<span class="code-filediff-muted code-filediff-pos" style="width:${String(blocks.length).length * 2 + 1}ch" title="Change blocks">${at}</span>` : ""}
-      <button data-fd="layout" title="${split ? "Unified view (one column, old and new line numbers)" : "Side-by-side view (base left, target right)"}">${split ? "☰" : "◫"}</button>
-      <button data-fd="-1" title="Previous change" ${blocks.length ? "" : "disabled"}>↑</button><button data-fd="1" title="Next change" ${blocks.length ? "" : "disabled"}>↓</button>
-      ${isPatch ? "" : `<button data-fd="swap" title="Swap base and target">⇆</button>`}<button data-fd="close" title="Close the diff">✕</button>`;
+      <button type="button" data-fd="layout" title="${split ? "Unified view (one column, old and new line numbers)" : "Side-by-side view (base left, target right)"}" aria-label="${split ? "Unified view" : "Side-by-side view"}">${split ? "☰" : "◫"}</button>
+      <button type="button" data-fd="-1" title="Previous change" aria-label="Previous change" ${blocks.length ? "" : "disabled"}>↑</button><button type="button" data-fd="1" title="Next change" aria-label="Next change" ${blocks.length ? "" : "disabled"}>↓</button>
+      ${isPatch ? "" : `<button type="button" data-fd="swap" title="Swap base and target" aria-label="Swap base and target">⇆</button>`}<button type="button" data-fd="close" title="Close the diff" aria-label="Close the diff">✕</button>`;
     chip.querySelectorAll("[data-fd]").forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();

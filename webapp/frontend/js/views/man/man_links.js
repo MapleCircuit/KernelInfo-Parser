@@ -1,6 +1,6 @@
 /**
  * man_links.js - Links from the kernel to its man pages (webapp/API_FRONTEND.md §5.38): a syscall's
- * "man 2 read" (Kernel API tab) and an rst `:manpage:` role. `GET /api/man/resolve` names the
+ * "man 2 read" (Kernel API tab) and an rst `:manpage:` role. `GET /webapi/man/resolve` names the
  * man-pages tag released on or before the kernel revision; the page opens in a man tab of the man-pages
  * repository (next to the kernel's tabs, in this workspace) when it has it, else its man7.org address opens
  * in a new browser tab.
@@ -19,7 +19,7 @@ export function manLinkHtml(name, section, label = null, cls = "") {
   return `<a href="${escapeHtml(man7Url(name, section))}" class="man-link${cls ? ` ${cls}` : ""}" data-man-link="${escapeHtml(name)}" data-man-sec="${escapeHtml(section)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(`${name}(${section}) — man page`)}">${label ?? escapeHtml(`${name}(${section})`)}</a>`;
 }
 
-/** Tab data of a man tab on a resolved page (`GET /api/man/resolve` answer). */
+/** Tab data of a man tab on a resolved page (`GET /webapi/man/resolve` answer). */
 export function manTabOfResolve(res, { kernel = "", kernelRepo = "", mode = "" } = {}) {
   const fields = manTabFields({ repo: res.repo, version: res.version, name: res.name, section: res.section, path: "", mode, kernel: res.kernel || kernel, kernelRepo });
   if (!mode) delete fields.manMode; // a reused man tab keeps the mode it shows

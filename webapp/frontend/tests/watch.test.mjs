@@ -1,6 +1,24 @@
+import "./helpers/dom_shim.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { checkGroups, dueWatches, nextState, unreadCount, validWatchTarget, watchLabel } from "../js/views/watch/watch_model.js";
+
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (...args) => {
+  const t = realSetInterval(...args);
+  t?.unref?.();
+  return t;
+};
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (...args) => {
+  const t = realSetTimeout(...args);
+  t?.unref?.();
+  return t;
+};
+
+const { api } = await import("../js/api.js");
+const { localDB } = await import("../js/db.js");
+const { checkWatches } = await import("../js/views/watch/watch_runtime.js");
 
 const W = (key, target, branch, base_sha = "aaa") => ({ key, data: { target, branch, base_sha } });
 
@@ -29,4 +47,44 @@ test("unread bookkeeping", () => {
   assert.equal(s3.unread, true, "stays unread until marked read");
   assert.equal(s3.result.status, "modified");
   assert.equal(unreadCount(new Map([["a", s3], ["b", s1]])), 1);
+});
+
+test("watch_runtime.checkWatches handles missing/null res.items safely", async () => {
+  const origUserList = localDB.userList;
+  const origRequest = api.request;
+  try {
+    localDB.userList = async (kind) => (kind === "watch"
+      ? [W("w1", { type: "file", path: "kernel/fork.c" }, "master", "aaa")]
+      : []);
+    api.request = async () => ({ to_sha: "bbb", items: null });
+    assert.equal(await checkWatches(), 0);
+    api.request = async () => null;
+    assert.equal(await checkWatches(), 0);
+  } finally {
+    localDB.userList = origUserList;
+    api.request = origRequest;
+  }
+});
+
+test("watch_runtime.checkWatches chunks groups larger than 200 items", async () => {
+  const origUserList = localDB.userList;
+  const origUserPut = localDB.userPut;
+  const origRequest = api.request;
+  const batchSizes = [];
+  try {
+    const many = Array.from({ length: 205 }, (_, i) => W(`w${i}`, { type: "file", path: `kernel/f${i}.c` }, "master", "aaa"));
+    localDB.userList = async (kind) => (kind === "watch" ? many : []);
+    localDB.userPut = async () => {};
+    api.request = async (_url, opts) => {
+      const body = JSON.parse(opts.body);
+      batchSizes.push(body.items.length);
+      return { to_sha: "bbb", items: body.items.map((it) => ({ key: it.key, status: "same", changed: false })) };
+    };
+    assert.equal(await checkWatches(), 0);
+    assert.deepEqual(batchSizes, [200, 5]);
+  } finally {
+    localDB.userList = origUserList;
+    localDB.userPut = origUserPut;
+    api.request = origRequest;
+  }
 });

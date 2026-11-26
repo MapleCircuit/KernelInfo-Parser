@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from typing import Any
+from typing import Any, Self
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,10 +35,10 @@ class _Reader:
         self.defs: list[dict[str, Any]] = [dict(C_DEF)]
         self.ref_targets: list[list[int]] = []
 
-    def __enter__(self) -> "_Reader":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         return None
 
     def select_rows(self, source: Any, columns: Any, where: Any = None, **kw: Any) -> list[dict[str, Any]]:

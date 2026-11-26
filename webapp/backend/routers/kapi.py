@@ -10,7 +10,7 @@ from webapp.backend.routers.insights import job_answer
 from webapp.backend.services import kapi_service as k
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH
 
-router = APIRouter(prefix="/api/kapi", tags=["kapi"], dependencies=[Depends(require_feature("api"))])
+router = APIRouter(prefix="/webapi/kapi", tags=["kapi"], dependencies=[Depends(require_feature("api"))])
 
 Arch = Annotated[str, Query(description="ARCH value (x86_64, i386, arm, ...)")]
 
@@ -136,11 +136,12 @@ def get_devices(
 
 
 @router.post("/{version_name}/devices/match")
-def post_devices_match(version_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def post_devices_match(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """Drivers for pasted hardware ids (N4): lspci -nn, lsusb, modalias, vendor:device, OF compatible or
     ACPI ids, one per line (at most 64 KB): {lines: [{input, ids, matches: [{module, options, path, line,
     table, match_kind}]}], unmatched}."""
     from fastapi import HTTPException
+
     from webapp.backend.services.device_index_service import match_text
     if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
         raise HTTPException(status_code=400, detail='Body must be {"text": "...", "arch": "..."}')

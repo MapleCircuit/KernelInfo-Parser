@@ -159,6 +159,20 @@ function addClass(attrsStr, newClass) {
   return s ? `class="${newClass}" ${s}` : `class="${newClass}"`;
 }
 
+function ensureBlankRelTokens(attrsStr) {
+  let s = String(attrsStr || "").trim();
+  if (!/\btarget\s*=\s*(?:(["'])_blank\1|_blank\b)/i.test(s)) return s;
+  if (/\brel\s*=\s*(["'])([^"']*)\1/i.test(s)) {
+    return s.replace(/\brel\s*=\s*(["'])([^"']*)\1/i, (m, q, rel) => {
+      const tokens = rel.split(/\s+/).filter(Boolean);
+      if (!tokens.some((t) => t.toLowerCase() === "noopener")) tokens.push("noopener");
+      if (!tokens.some((t) => t.toLowerCase() === "noreferrer")) tokens.push("noreferrer");
+      return `rel=${q}${tokens.join(" ")}${q}`;
+    });
+  }
+  return s ? `${s} rel="noopener noreferrer"` : 'rel="noopener noreferrer"';
+}
+
 /**
  * Heuristically detect language of code snippet when no explicit class is specified.
  *
@@ -240,25 +254,26 @@ export class HtmlRenderer {
       html = html.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "");
     }
 
-    // 4. Security sanitization: strip active scripts, dangerous objects, inline event handlers
-    html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
-    html = html.replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "");
-    html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "");
-    html = html.replace(/<(?:link|meta|base)\b[^>]*>/gi, "");
-    html = html.replace(/<(?:object|embed|applet|iframe|frame|frameset)\b[^>]*>([\s\S]*?<\/(?:object|embed|applet|iframe|frame|frameset)>)?/gi, "");
+    // 4. Security sanitization: fixed-point strip of active scripts, dangerous elements/attributes, inline event handlers
+    for (let pass = 0; pass < 8; pass++) {
+      const prev = html;
+      html = html.replace(/<(script|noscript|style|svg|math|form|template|object|embed|applet|iframe|frame|frameset|video|audio)\b[\s\S]*?<\/\1\s*>/gi, "");
+      html = html.replace(/<\/?(?:script|noscript|style|svg|math|form|input|button|textarea|select|template|details|link|meta|base|object|embed|applet|iframe|frame|frameset|video|audio)\b[^>]*>/gi, "");
 
-    // Strip inline event handlers (onload, onclick, etc.), including slash-separated (<div/onclick=...) and unquoted
-    html = html.replace(/[\s/]on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+      // Strip inline event handlers (onload, onclick, etc.) and dangerous attributes (including quote/slash-separated)
+      html = html.replace(/([\s/"'])(?:on[a-z0-9_-]+|formaction|srcdoc|srcset|poster|xlink:href|action|background)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "$1");
 
-    // Sanitize javascript: and vbscript: URIs in href and src (quoted or unquoted, with optional slash separation)
-    html = html.replace(/([\s/]href\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1"#"');
-    html = html.replace(/([\s/]src\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1""');
+      // Sanitize javascript: and vbscript: URIs in href and src (quoted or unquoted, with space/slash/quote separation)
+      html = html.replace(/([\s/"']href\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1"#"');
+      html = html.replace(/([\s/"']src\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1""');
 
-    // Sanitize data: URIs in href (all data: links neutralized to "#", handling parametric/unquoted/slash-separated)
-    html = html.replace(/([\s/]href\s*=\s*)(?:"\s*data:[^"]*"|'\s*data:[^']*'|data:[^\s>]*)/gi, '$1"#"');
+      // Sanitize data: URIs in href (all data: links neutralized to "#", handling parametric/unquoted/slash-separated)
+      html = html.replace(/([\s/"']href\s*=\s*)(?:"\s*data:[^"]*"|'\s*data:[^']*'|data:[^\s>]*)/gi, '$1"#"');
 
-    // Sanitize dangerous/executable data: URIs in src (e.g. text/html, javascript, svg+xml, xhtml, with any parameters/charsets)
-    html = html.replace(/([\s/]src\s*=\s*)(?:"\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^"]*"|'\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^']*'|data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^\s>]*)/gi, '$1""');
+      // Sanitize dangerous/executable data: URIs in src (e.g. text/html, javascript, svg+xml, xhtml, with any parameters/charsets)
+      html = html.replace(/([\s/"']src\s*=\s*)(?:"\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^"]*"|'\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^']*'|data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^\s>]*)/gi, '$1""');
+      if (html === prev) break;
+    }
 
     // 5. Transform legacy presentational elements into clean HTML5 / CSS
     html = html.replace(/<center\b[^>]*>([\s\S]*?)<\/center>/gi, '<div class="kdoc-align-center">$1</div>');
@@ -359,7 +374,8 @@ export class HtmlRenderer {
     // 10. Transform links (handling quoted, unquoted, and slash-separated href attributes)
     html = html.replace(/<a\b([^>]*?)[\s/]href\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+))([^>]*)>([\s\S]*?)<\/a>/gi, (match, before, quote, quotedHref, unquotedHref, after, linkText) => {
       const rawHref = quote ? quotedHref : unquotedHref;
-      const href = (rawHref || "").trim();
+      const href = unescapeHtml(rawHref || "").trim();
+      const schemeCheck = href.replace(/[\u0000-\u0020\u007f]+/g, "");
       const attrs = `${before} ${after}`.replace(/\s+/g, " ").trim();
 
       // Don't re-transform internal headerlinks
@@ -368,14 +384,18 @@ export class HtmlRenderer {
       }
 
       if (href.startsWith("#")) {
-        const fullAttrs = addClass(attrs, "reference internal");
+        const fullAttrs = ensureBlankRelTokens(addClass(attrs, "reference internal"));
         return `<a ${fullAttrs} href="${escapeHtml(href)}">${linkText}</a>`;
       }
-      if (/^[a-z]+:\/\//i.test(href) || href.startsWith("mailto:") || href.startsWith("ftp:")) {
+      if (/^(?:https?|ftp):\/\//i.test(schemeCheck) || /^mailto:/i.test(schemeCheck)) {
         let fullAttrs = addClass(attrs, "reference external");
         if (!/\btarget\s*=/i.test(fullAttrs)) fullAttrs += ' target="_blank"';
-        if (!/\brel\s*=/i.test(fullAttrs)) fullAttrs += ' rel="noopener noreferrer"';
+        fullAttrs = ensureBlankRelTokens(fullAttrs);
         return `<a ${fullAttrs} href="${escapeHtml(href)}">${linkText}</a>`;
+      }
+      if (/^[a-z][a-z0-9+.-]*:/i.test(schemeCheck)) {
+        const fullAttrs = ensureBlankRelTokens(addClass(attrs, "reference internal"));
+        return `<a ${fullAttrs} href="#">${linkText}</a>`;
       }
 
       const resolved = resolveRelativePath(href, this.path);
@@ -383,29 +403,33 @@ export class HtmlRenderer {
 
       if (cleanPath === this.path) {
         const targetHash = hash ? `#${hash}` : "#";
-        const fullAttrs = addClass(attrs, "reference internal");
+        const fullAttrs = ensureBlankRelTokens(addClass(attrs, "reference internal"));
         return `<a ${fullAttrs} href="${escapeHtml(targetHash)}">${linkText}</a>`;
       }
 
       if (/\.(rst|txt|md|markdown|tmpl|html|htm|xhtml|shtml)$/i.test(cleanPath)) {
-        const fullAttrs = addClass(attrs, "reference internal");
+        const fullAttrs = ensureBlankRelTokens(addClass(attrs, "reference internal"));
         return `<a ${fullAttrs} data-doc="${escapeHtml(resolved)}" href="#">${linkText}</a>`;
       }
 
-      const fullAttrs = addClass(attrs, "reference internal");
+      const fullAttrs = ensureBlankRelTokens(addClass(attrs, "reference internal"));
       return `<a ${fullAttrs} data-src="${escapeHtml(resolved)}" href="#">${linkText}</a>`;
     });
 
     // 11. Transform images (handling quoted, unquoted, and slash-separated src attributes)
     html = html.replace(/<img\b([^>]*?)[\s/]src\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+))([^>]*)>/gi, (match, before, quote, quotedSrc, unquotedSrc, after) => {
       const rawSrc = quote ? quotedSrc : unquotedSrc;
-      const src = (rawSrc || "").trim();
+      const src = unescapeHtml(rawSrc || "").trim();
+      const schemeCheck = src.replace(/[\u0000-\u0020\u007f]+/g, "");
       const attrs = `${before} ${after}`.replace(/\s+/g, " ").trim();
       const isBadge = /(badge|shields\.io|crates\.io\/crates\/[^\/]+\.svg|deps\.rs)/i.test(src);
       const badgeClass = isBadge ? " kdoc-badge" : "";
 
-      if (/^[a-z]+:\/\//i.test(src)) {
+      if (/^(?:https?|ftp):\/\//i.test(schemeCheck)) {
         return `<img class="kdoc-img${badgeClass}" src="${escapeHtml(src)}"${attrs ? " " + attrs : ""} />`;
+      }
+      if (/^[a-z][a-z0-9+.-]*:/i.test(schemeCheck)) {
+        return `<img class="kdoc-img${badgeClass}" src=""${attrs ? " " + attrs : ""} />`;
       }
       const resolved = resolveRelativePath(src, this.path);
       return `<img class="kdoc-img${badgeClass}" data-raw="${escapeHtml(resolved)}"${attrs ? " " + attrs : ""} />`;

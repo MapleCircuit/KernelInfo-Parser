@@ -18,6 +18,8 @@ import logging
 import os
 import re
 import threading
+import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,12 @@ _SUFFIXES = (_SUFFIX, _BIN_SUFFIX)
 _NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _KEY_RE = re.compile(r"[0-9a-f]{16,64}")
 _DEFAULT_TOTAL_MB = 1024
+_GLOBAL_EVICT_INTERVAL_S = 60.0
+_GLOBAL_EVICT_WRITES = 32
+_GLOBAL_LARGE_WRITE_BYTES = 1 << 20
+_GLOBAL_EVICT_LOCK = threading.Lock()
+_GLOBAL_WRITE_COUNT = 0
+_GLOBAL_EVICT_AT = 0.0
 
 
 def cache_root() -> Path:
@@ -44,7 +52,8 @@ def total_cap_bytes() -> int:
         from core.config import get_webapp_config
         mb = (get_webapp_config().get("cache") or {}).get("max_mb", _DEFAULT_TOTAL_MB)
         return max(1, int(mb)) << 20
-    except Exception:
+    except (OSError, TypeError, ValueError) as exc:
+        logger.debug("Using default disk cache cap: %s", exc)
         return _DEFAULT_TOTAL_MB << 20
 
 
@@ -112,7 +121,13 @@ class DiskCache:
         try:
             with gzip.open(path, "rt", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError, EOFError):
+        except (ValueError, EOFError, zlib.error, gzip.BadGzipFile):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        except OSError:
             return None
         try:
             os.utime(path)  # least recently used eviction by mtime
@@ -128,11 +143,16 @@ class DiskCache:
         directory = self.directory
         name = self.file_key(key)
         tmp = directory / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        dst = directory / f"{name}{self.suffix}"
         try:
             directory.mkdir(parents=True, exist_ok=True)
             with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as fh:
-                json.dump(obj, fh, separators=(",", ":"))
-            os.replace(tmp, directory / f"{name}{self.suffix}")
+                json.dump(obj, fh, separators=(",", ":"), allow_nan=False)
+            os.replace(tmp, dst)
+            try:
+                wrote_bytes = dst.stat().st_size
+            except OSError:
+                wrote_bytes = 0
         except (OSError, TypeError, ValueError) as exc:
             logger.debug("Disk cache %s: %s not stored: %s", self.namespace, name, exc)
             try:
@@ -140,7 +160,7 @@ class DiskCache:
             except OSError:
                 pass
             return False
-        self.evict()
+        self.evict(wrote_bytes=wrote_bytes, force_global=False)
         return True
 
     def delete(self, key: str) -> None:
@@ -167,13 +187,14 @@ class DiskCache:
     def size_bytes(self) -> int:
         return sum(size for _p, size, _m in self.entries())
 
-    def evict(self) -> int:
+    def evict(self, *, wrote_bytes: int = 0, force_global: bool = True) -> int:
         """Drop the least recently used entries beyond this namespace's caps and the global cap."""
         removed = 0
         with self._lock:
             entries = self.entries()
             total = sum(size for _p, size, _m in entries)
-            limit = min(self.max_bytes, total_cap_bytes())
+            cap = total_cap_bytes()
+            limit = min(self.max_bytes, cap)
             keep_count = self.max_entries if self.max_entries is not None else len(entries)
             while entries and (total > limit or len(entries) > keep_count):
                 path, size, _mtime = entries.pop(0)
@@ -183,7 +204,13 @@ class DiskCache:
                 except OSError:
                     pass
                 total -= size
-            removed += _evict_global(exclude=None)
+            if _should_evict_global(
+                force_global=force_global,
+                has_max_entries=self.max_entries is not None,
+                wrote_bytes=wrote_bytes,
+                cap=cap,
+            ):
+                removed += _evict_global()
         return removed
 
 
@@ -221,17 +248,36 @@ class BinaryDiskCache(DiskCache):
             except OSError:
                 pass
             return False
-        self.evict()
+        self.evict(wrote_bytes=len(data), force_global=False)
         return True
 
-    def get(self, key: str) -> Any | None:  # noqa: D102 - raw bytes only
+    def get(self, key: str) -> Any | None:
         raise TypeError("BinaryDiskCache holds bytes: use get_bytes()")
 
-    def put(self, key: str, obj: Any) -> bool:  # noqa: D102 - raw bytes only
+    def put(self, key: str, obj: Any) -> bool:
         raise TypeError("BinaryDiskCache holds bytes: use put_bytes()")
 
 
-def _evict_global(exclude: Path | None) -> int:
+def _should_evict_global(*, force_global: bool, has_max_entries: bool, wrote_bytes: int, cap: int) -> bool:
+    global _GLOBAL_WRITE_COUNT, _GLOBAL_EVICT_AT
+    now = time.monotonic()
+    with _GLOBAL_EVICT_LOCK:
+        _GLOBAL_WRITE_COUNT += 1
+        large_write = wrote_bytes >= _GLOBAL_LARGE_WRITE_BYTES or (cap > 0 and wrote_bytes >= cap // 2)
+        due = (
+            force_global
+            or has_max_entries
+            or large_write
+            or _GLOBAL_WRITE_COUNT >= _GLOBAL_EVICT_WRITES
+            or now - _GLOBAL_EVICT_AT >= _GLOBAL_EVICT_INTERVAL_S
+        )
+        if due:
+            _GLOBAL_WRITE_COUNT = 0
+            _GLOBAL_EVICT_AT = now
+        return due
+
+
+def _evict_global() -> int:
     """Keep the sum of every namespace under ``webapp.cache.max_mb`` (oldest files go first)."""
     root = cache_root()
     try:
@@ -253,8 +299,6 @@ def _evict_global(exclude: Path | None) -> int:
     for path, size, _mtime in files:
         if total <= cap:
             break
-        if exclude is not None and path == exclude:
-            continue
         try:
             path.unlink(missing_ok=True)
             removed += 1

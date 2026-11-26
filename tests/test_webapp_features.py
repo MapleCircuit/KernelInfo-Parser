@@ -96,7 +96,7 @@ class TestWebappFeatureGating(unittest.TestCase):
         self.repos[1]["features"] = {"kconfig": True}
 
         with patch.object(versions, "get_reader", side_effect=RuntimeError("no db")):
-            resp = self.client.get("/api/projects")
+            resp = self.client.get("/webapi/projects")
         self.assertEqual(resp.status_code, 200)
         by_name = {p["repo"]: p for p in resp.json()["projects"]}
 
@@ -137,20 +137,20 @@ class TestWebappFeatureGating(unittest.TestCase):
     def test_manpages_default_disables_kernel_only_routers(self) -> None:
         headers = {"X-KI-Repo": "man-pages"}
         blocked = [
-            ("GET", "/api/kconfig/v6.9/tree"),
-            ("GET", "/api/kapi/v6.9/syscalls"),
-            ("GET", "/api/kapi/diff?a=v6.8&b=v6.9"),
-            ("GET", "/api/maintainers/v6.9/overview"),
-            ("GET", "/api/mail/status"),
-            ("GET", "/api/cve/status"),
-            ("GET", "/api/docs/v6.9/labels"),
-            ("GET", "/api/insights/v6.9/stable/series"),
-            ("GET", "/api/insights/v6.9/subsystems"),
-            ("GET", "/api/insights/v6.9/cves"),
-            ("POST", "/api/commits/v6.9/resolve_mail/abcdef1"),
-            ("GET", "/api/tools/v6.9/pahole/task_struct"),
-            ("GET", "/api/tools/v6.9/callgraph/sys_read"),
-            ("GET", "/api/diff/kconfig/v6.8/v6.9"),
+            ("GET", "/webapi/kconfig/v6.9/tree"),
+            ("GET", "/webapi/kapi/v6.9/syscalls"),
+            ("GET", "/webapi/kapi/diff?a=v6.8&b=v6.9"),
+            ("GET", "/webapi/maintainers/v6.9/overview"),
+            ("GET", "/webapi/mail/status"),
+            ("GET", "/webapi/cve/status"),
+            ("GET", "/webapi/docs/v6.9/labels"),
+            ("GET", "/webapi/insights/v6.9/stable/series"),
+            ("GET", "/webapi/insights/v6.9/subsystems"),
+            ("GET", "/webapi/insights/v6.9/cves"),
+            ("POST", "/webapi/commits/v6.9/resolve_mail/abcdef1"),
+            ("GET", "/webapi/tools/v6.9/pahole/task_struct"),
+            ("GET", "/webapi/tools/v6.9/callgraph/sys_read"),
+            ("GET", "/webapi/diff/kconfig/v6.8/v6.9"),
         ]
         for method, path in blocked:
             r = self.client.request(method, path, headers=headers)
@@ -161,21 +161,21 @@ class TestWebappFeatureGating(unittest.TestCase):
         headers = {"X-KI-Repo": "man-pages"}
 
         with patch.object(kconfig.kconfig_service, "get_tree", return_value={"ok": True}):
-            r = self.client.get("/api/kconfig/man-pages-6.10/tree", headers=headers)
+            r = self.client.get("/webapi/kconfig/man-pages-6.10/tree", headers=headers)
             self.assertEqual(r.status_code, 200)
 
         with patch.object(tools.diff_service, "get_kconfig_diff", return_value={"ok": True}):
-            r = self.client.get("/api/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers)
+            r = self.client.get("/webapi/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers)
             self.assertEqual(r.status_code, 200)
 
         # Disabling compare blocks both /tools/diff/file and /diff/kconfig
         self.repos[1]["features"] = {"kconfig": True, "compare": False}
         self.assertEqual(
-            self.client.get("/api/tools/diff/file?version_a=a&version_b=b&path=README", headers=headers).status_code,
+            self.client.get("/webapi/tools/diff/file?version_a=a&version_b=b&path=README", headers=headers).status_code,
             403,
         )
         self.assertEqual(
-            self.client.get("/api/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers).status_code,
+            self.client.get("/webapi/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers).status_code,
             403,
         )
 
@@ -183,45 +183,45 @@ class TestWebappFeatureGating(unittest.TestCase):
         self.repos[1]["features"] = {"kconfig": False, "compare": True}
         with patch.object(tools.diff_service, "get_file_diff", return_value={"ok": True}):
             self.assertEqual(
-                self.client.get("/api/tools/diff/file?version_a=a&version_b=b&path=README", headers=headers).status_code,
+                self.client.get("/webapi/tools/diff/file?version_a=a&version_b=b&path=README", headers=headers).status_code,
                 200,
             )
         self.assertEqual(
-            self.client.get("/api/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers).status_code,
+            self.client.get("/webapi/diff/kconfig/man-pages-6.9/man-pages-6.10", headers=headers).status_code,
             403,
         )
 
     def test_kapi_diff_requires_api_and_compare(self) -> None:
         self.repos[0]["features"] = {"api": True, "compare": False}
-        self.assertEqual(self.client.get("/api/kapi/diff?a=v6.8&b=v6.9").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/kapi/diff?a=v6.8&b=v6.9").status_code, 403)
         with patch.object(kapi.k, "syscalls", return_value={"state": "done", "result": {"syscalls": []}}):
-            self.assertEqual(self.client.get("/api/kapi/v6.9/syscalls").status_code, 200)
+            self.assertEqual(self.client.get("/webapi/kapi/v6.9/syscalls").status_code, 200)
 
     def test_insights_sub_feature_gating(self) -> None:
         self.repos[0]["features"] = {"insights": False}
-        self.assertEqual(self.client.get("/api/insights/v6.9/release-stats").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/insights/v6.9/release-stats").status_code, 403)
 
         self.repos[0]["features"] = {"insights": True, "commits": False}
-        self.assertEqual(self.client.get("/api/insights/v6.9/release-stats").status_code, 403)
-        self.assertEqual(self.client.get("/api/insights/release-stats/series?tag=v6.9").status_code, 403)
-        self.assertEqual(self.client.get("/api/insights/v6.9/merge-window").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/insights/v6.9/release-stats").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/insights/release-stats/series?tag=v6.9").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/insights/v6.9/merge-window").status_code, 403)
 
     def test_commits_and_patch_gating(self) -> None:
         self.repos[0]["features"] = {"commits": False, "patch": True}
-        self.assertEqual(self.client.get("/api/commits/v6.9/list").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/commits/v6.9/list").status_code, 403)
         with patch.object(commits.git_service, "format_patch", return_value={"patch": ""}):
-            r = self.client.post("/api/version/v6.9/patch/format", json={})
+            r = self.client.post("/webapi/version/v6.9/patch/format", json={})
             self.assertEqual(r.status_code, 200)
 
         self.repos[0]["features"] = {"commits": True, "patch": False}
-        self.assertEqual(self.client.post("/api/version/v6.9/patch/format", json={}).status_code, 403)
-        self.assertEqual(self.client.post("/api/version/v6.9/patch/series", json={}).status_code, 403)
-        self.assertEqual(self.client.post("/api/tools/v6.9/checkpatch", json={"patch": ""}).status_code, 403)
+        self.assertEqual(self.client.post("/webapi/version/v6.9/patch/format", json={}).status_code, 403)
+        self.assertEqual(self.client.post("/webapi/version/v6.9/patch/series", json={}).status_code, 403)
+        self.assertEqual(self.client.post("/webapi/tools/v6.9/checkpatch", json={"patch": ""}).status_code, 403)
 
     def test_man_endpoints_and_service_cross_repo_gating(self) -> None:
-        # Disable man on linux repo: /api/man/resolve returns available=False, while /api/man/tags returns 403
+        # Disable man on linux repo: /webapi/man/resolve returns available=False, while /webapi/man/tags returns 403
         self.repos[0]["features"] = {"man": False}
-        r = self.client.get("/api/man/resolve?name=read&section=2&kernel=v6.9")
+        r = self.client.get("/webapi/man/resolve?name=read&section=2&kernel=v6.9")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), {
             "available": False,
@@ -229,17 +229,17 @@ class TestWebappFeatureGating(unittest.TestCase):
             "name": "read",
             "section": "2",
         })
-        self.assertEqual(self.client.get("/api/man/tags").status_code, 403)
+        self.assertEqual(self.client.get("/webapi/man/tags").status_code, 403)
 
-        # Disable man on man-pages repo: manpages_repository() returns None and /api/man/resolve on linux returns unavailable
+        # Disable man on man-pages repo: manpages_repository() returns None and /webapi/man/resolve on linux returns unavailable
         self.repos[0]["features"] = {"man": True}
         self.repos[1]["features"] = {"man": False}
         self.assertIsNone(man_service.manpages_repository())
-        self.assertEqual(self.client.get("/api/man/diff?a=a&b=b", headers={"X-KI-Repo": "man-pages"}).status_code, 403)
+        self.assertEqual(self.client.get("/webapi/man/diff?a=a&b=b", headers={"X-KI-Repo": "man-pages"}).status_code, 403)
 
-        # Disable compare on man-pages repo with man=True: /api/man/diff returns 403
+        # Disable compare on man-pages repo with man=True: /webapi/man/diff returns 403
         self.repos[1]["features"] = {"man": True, "compare": False}
-        self.assertEqual(self.client.get("/api/man/diff?a=a&b=b", headers={"X-KI-Repo": "man-pages"}).status_code, 403)
+        self.assertEqual(self.client.get("/webapi/man/diff?a=a&b=b", headers={"X-KI-Repo": "man-pages"}).status_code, 403)
 
     def test_man_linux_block_respects_api_feature(self) -> None:
         with patch.object(man_service.git_tree_resolver, "resolve_commit_sha", return_value="a" * 40):

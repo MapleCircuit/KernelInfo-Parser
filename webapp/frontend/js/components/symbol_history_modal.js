@@ -72,7 +72,9 @@ function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
   const ui = {
     includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null,
     branch: null, // branch the timeline follows ("" = chosen by the server for `version`), set on first load
-    branches: [], // the repository's branches (GET /api/branches)
+    branches: [], // the repository's branches (GET /webapi/branches)
+    seq: 0,
+    commitsSeq: 0,
   };
 
   const stopPlay = () => {
@@ -104,28 +106,32 @@ function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
     subtitle,
     width: "960px",
     onClose: () => {
+      ui.seq++;
+      ui.commitsSeq++;
       document.removeEventListener("keydown", onKey);
       stopPlay();
     }
   });
 
   async function fetchAndRender(keepVersion = null) {
+    const seq = ++ui.seq;
     stopPlay();
     if (ui.branch === null) {
       modal.body.innerHTML = `<div class="ki-modal-empty">Reading the branches…</div>`;
       ui.branches = await api.getBranches().then((r) => r.branches || []).catch(() => []);
-      if (!alive()) return;
+      if (!alive() || seq !== ui.seq) return;
       ui.branch = initialBranch(version, ui.branches);
     }
     modal.body.innerHTML = `<div class="ki-modal-empty">Tracing the definition across the releases of ${escapeHtml(ui.branch || "its branch")}…</div>`;
+    let res;
     try {
-      ui.res = await load({ includeRc: ui.includeRc, branch: ui.branch });
+      res = await load({ includeRc: ui.includeRc, branch: ui.branch });
     } catch (err) {
-      if (alive()) modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
+      if (alive() && seq === ui.seq) modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
       return;
     }
-    if (!alive()) return;
-    const res = ui.res;
+    if (!alive() || seq !== ui.seq) return;
+    ui.res = res;
     if (res.branch) ui.branch = res.branch;
     modal.el.querySelector(".ki-modal-title").textContent = `🕰 History: ${res.ast_name || title}`;
     // Select the last stop at or before the version kept (else the one the history was opened from)
@@ -300,6 +306,7 @@ function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
   }
 
   async function loadCommits(btn, entry) {
+    const seq = ++ui.commitsSeq;
     const def = entry.defs[parseInt(btn.dataset.commits, 10)];
     const box = btn.closest(".symhist-def").querySelector(".symhist-commits");
     box.hidden = false;
@@ -315,9 +322,12 @@ function openHistory({ title, subtitle, version, nodemapSpec = null, load }) {
         lineE: removed ? null : def.line_e,
       });
     } catch (err) {
-      box.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
+      if (alive() && seq === ui.commitsSeq && box.isConnected) {
+        box.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
+      }
       return;
     }
+    if (!alive() || seq !== ui.commitsSeq || !box.isConnected) return;
     const scope = removed ? "touching the file" : `touching lines ${def.line_s}–${def.line_e}`;
     box.innerHTML = res.commits.length === 0
       ? `<div class="ki-modal-empty">No commit ${scope} in ${escapeHtml(entry.prev_vname || "")}..${escapeHtml(entry.vname)}.</div>`

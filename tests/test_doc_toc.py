@@ -28,7 +28,7 @@ def _run(script: str, *args: str) -> subprocess.CompletedProcess:
 
 
 KNOWN_SPECS = (
-    "core/API.md", "webapp/API.md", "webapp/API_ENDPOINTS.md", "webapp/API_FRONTEND.md", "db_engine/DB_API.md",
+    "core/API.md", "webapp/API.md", "webapp/API_ENDPOINTS.md", "webapp/API_FRONTEND.md", "api/API.md", "db_engine/DB_API.md",
     "table_engine/TE_API.md", "cache_engine/CACHE_API.md", "parser/c_ast/CAST_API.md", "parser/asm_ast/ASM_API.md",
     "parser/kconfig_ast/KCONFIG_API.md", "parser/rust_ast/RUST_API.md", "parser/git_ast/GIT_API.md",
     "parser/maintainer_ast/MAINTAINER_API.md", "parser/man_ast/MAN_API.md", "parser/raw_ast/RAW_AST_API.md",

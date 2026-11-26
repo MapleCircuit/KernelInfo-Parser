@@ -24,7 +24,7 @@ export function insightsSections() {
 
 /**
  * Pick the release parameter an Insights section queries for, given the resolved tag context of the
- * tab's header revision (`GET /api/insights/resolve`).
+ * tab's header revision (`GET /webapi/insights/resolve`).
  */
 export function resolveSectionRelease(sectionId, resolved, fallbackVersion = "") {
   if (!resolved) return fallbackVersion || "";
@@ -75,7 +75,7 @@ export class InsightsView extends SectionedView {
     } else if (ver) {
       this.resolved = fallbackResolved(ver);
     }
-    if (signal.aborted) return;
+    if (signal.aborted || !this.containerEl?.isConnected) return;
     this.updateDetectedBadge();
   }
 

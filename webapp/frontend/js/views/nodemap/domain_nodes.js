@@ -821,9 +821,10 @@ const DOC_URL_ATTR = /([\s/"'])(href|src|xlink:href|action|poster|background)\s*
 /** An attribute value as a browser reads its scheme: entities decoded, whitespace and controls dropped. */
 function urlScheme(value) {
   const named = { tab: "\t", newline: "\n", colon: ":", lpar: "(", rpar: ")", sol: "/", amp: "&" };
+  const safeCp = (n) => (n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : " ");
   return String(value)
-    .replace(/&#x([0-9a-f]+);?/gi, (_, h) => String.fromCodePoint(parseInt(h, 16) || 32))
-    .replace(/&#(\d+);?/g, (_, d) => String.fromCodePoint(Number(d) || 32))
+    .replace(/&#x([0-9a-f]+);?/gi, (_, h) => safeCp(parseInt(h, 16) || 32))
+    .replace(/&#(\d+);?/g, (_, d) => safeCp(Number(d) || 32))
     .replace(/&([a-z]+);?/gi, (m, n) => named[n.toLowerCase()] ?? m)
     .replace(/[\u0000- \u007f-\u009f]+/g, "")
     .toLowerCase();
@@ -831,8 +832,10 @@ function urlScheme(value) {
 
 const unsafeUrl = (v) => {
   const u = urlScheme(v);
-  return /^(javascript|vbscript|livescript):/.test(u) || (/^data:/.test(u) && !/^data:image\/(png|gif|jpe?g|webp)[;,]/.test(u));
+  return /^(javascript|vbscript|livescript|blob|filesystem):/.test(u) || (/^data:/.test(u) && !/^data:image\/(png|gif|jpe?g|webp)[;,]/.test(u));
 };
+
+const DOC_BLANK_TARGET = /<([a-z][a-z0-9-]*)\b([^>]*\btarget\s*=\s*(?:"_blank"|'_blank'|_blank)[^>]*)>/gi;
 
 /**
  * Defense in depth on top of the renderers' own escaping and `html_renderer.js` sanitizing: a doc node
@@ -847,7 +850,12 @@ export function scrubDocHtml(html) {
       .replace(DOC_DROP_BLOCK, "")
       .replace(DOC_DROP_TAG, "")
       .replace(DOC_DROP_ATTR, "$1")
-      .replace(DOC_URL_ATTR, (m, lead, name, dq, sq, bare) => (unsafeUrl(dq ?? sq ?? bare ?? "") ? `${lead}${name}="#"` : m));
+      .replace(DOC_URL_ATTR, (m, lead, name, dq, sq, bare) => (unsafeUrl(dq ?? sq ?? bare ?? "") ? `${lead}${name}="#"` : m))
+      .replace(DOC_BLANK_TARGET, (m, tag, attrs) => {
+        if (/\brel\s*=\s*["'][^"']*\bnoopener\b/i.test(attrs) && /\brel\s*=\s*["'][^"']*\bnoreferrer\b/i.test(attrs)) return m;
+        const cleaned = attrs.replace(/\s+\brel\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+        return `<${tag}${cleaned} rel="noopener noreferrer">`;
+      });
     if (next === out) break;
     out = next;
   }
@@ -1014,7 +1022,7 @@ const personOf = (p, name, email) => {
 const isoDay = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toISOString().replace("T", " ").slice(0, 16) : "");
 
 /**
- * Commit details node model from `GET /api/commits/{v}/detail/{hash}`: hash, subject, author and
+ * Commit details node model from `GET /webapi/commits/{v}/detail/{hash}`: hash, subject, author and
  * committer, the message body, its trailers (the contributors list when the message has none),
  * parents and the changed files with a per-status summary.
  */

@@ -2,7 +2,7 @@
  * imports_panel.js - Imports panel of the code view (webapp/API_FRONTEND.md §5.21).
  *
  * Lists the symbols the open C / header / assembly file references that headers on its `#include` chain
- * define (GET /api/fs/imports, for the ARCH of the KConfig engine the tab follows, x86_64 without one),
+ * define (GET /webapi/fs/imports, for the ARCH of the KConfig engine the tab follows, x86_64 without one),
  * in a side panel docked in `.editor-body` with a search box and kind pills. Every entry shows the header
  * and line defining the symbol and the include chain reaching it (compiler-forced `-include` chains are
  * badged); a click opens the definition or a header of the chain (middle-click / Ctrl+click: new tab),

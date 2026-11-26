@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import re
 import subprocess
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -114,7 +115,16 @@ class WatchChecker:
         return {**out, "error": "unknown type"}
 
     def check(self, a: str, b: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [self.check_item(a, b, it) for it in items]
+        results: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                results.append({"key": "", "type": None, "error": "invalid watch item"})
+                continue
+            try:
+                results.append(self.check_item(a, b, it))
+            except Exception as exc:  # noqa: BLE001
+                results.append({"key": str(it.get("key") or ""), "type": it.get("type"), "error": str(exc)})
+        return results
 
 
 def check_changes(payload: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +150,15 @@ def check_changes(payload: dict[str, Any]) -> dict[str, Any]:
     a, b = shas
 
     def git(*args: str) -> str:
-        return subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, text=True, timeout=60).stdout
+        return subprocess.run(
+            ["git", "-C", str(get_repo_dir()), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=60,
+        ).stdout
 
     def read(rev: str, path: str) -> str | None:
         data, is_dir, _ = git_reader.read_file(rev, path)

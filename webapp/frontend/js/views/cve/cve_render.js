@@ -2,6 +2,7 @@
  * cve_render.js - Shared CVE detail rendering helpers (used by both CveView and Insights · Security).
  */
 import { escapeHtml } from "../../components/modal.js";
+import { safeHttpUrl } from "../../utils/url_safety.js";
 
 export const SETUP_HTML = `<h2>CVE records are not configured</h2>
 <p>The CVE view reads CVE records from a local git clone, either the CVE Program's list (every CNA; the Linux kernel's records are picked out) or the kernel CNA's own repository:</p>
@@ -31,10 +32,6 @@ export const KIND = {
 };
 
 const release = (r) => (r?.released ? (r.first_release || r.first_tag || r.first_stable || "released") : "not released");
-const safeHttpUrl = (u) => {
-  const s = String(u || "").trim();
-  return /^https?:\/\//i.test(s) ? s : "";
-};
 
 export const severityTag = (score, sev) => (score == null ? "" :
   `<span class="sv-tag ${score >= 7 ? "bad" : score >= 4 ? "warn" : "info"}" title="CVSS ${escapeHtml(String(score))}">${escapeHtml(String(score))}${sev ? ` ${escapeHtml(sev.toLowerCase())}` : ""}</span>`);

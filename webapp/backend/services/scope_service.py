@@ -24,11 +24,18 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import HTTPException
 
-from parser.c_ast.c_scope import extract_scopes, find_member, lookup, parse_signature, type_base
+from parser.c_ast.c_scope import (
+    extract_scopes,
+    find_member,
+    lookup,
+    parse_signature,
+    type_base,
+)
 from parser.source_facts import RETURN_ANNOTATIONS, TOKEN, TYPE_QUALIFIERS
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.security.git import is_safe_rev
@@ -135,6 +142,10 @@ class ScopeService:
         self._read_source = read_source
         self._models: RepoScopedCache = RepoScopedCache(maxsize=128)
         self._answers: RepoScopedCache = RepoScopedCache(maxsize=2048)
+
+    def clear_cache(self) -> None:
+        self._models.clear()
+        self._answers.clear()
 
     # ------------------------------------------------------------------ sources
 
@@ -248,7 +259,7 @@ class ScopeService:
         if "{" in region:
             return tdef, text, line_s, line_e
         # `typedef struct foo foo_t;`: the type between `typedef` and the name
-        m = re.search(r"\btypedef\b(.*?)\b" + re.escape(ref["name"]) + r"\s*;", region, re.S)
+        m = re.search(r"\btypedef\b(.*?)\b" + re.escape(ref["name"]) + r"\s*;", region, re.DOTALL)
         if not m:
             return None
         tb = type_base(m.group(1))

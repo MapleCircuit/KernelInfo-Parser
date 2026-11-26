@@ -3,6 +3,7 @@
  */
 import { shortcuts } from "../utils/shortcuts.js";
 import { scaleCssLength } from "../utils/ui_scale.js";
+export { safeHttpUrl } from "../utils/url_safety.js";
 
 /**
  * @param {{ title: string, subtitle?: string, width?: string, footerHtml?: string, className?: string, onClose?: () => void }} opts
@@ -18,7 +19,7 @@ export function openModal({ title, subtitle = "", width = "760px", footerHtml = 
           <h3 class="ki-modal-title"></h3>
           ${subtitle ? `<div class="ki-modal-subtitle"></div>` : ""}
         </div>
-        <button class="ki-modal-x" type="button" title="Close">&times;</button>
+        <button class="ki-modal-x" type="button" title="Close" aria-label="Close">&times;</button>
       </div>
       <div class="ki-modal-body"></div>
       <div class="ki-modal-footer">${footerHtml}<button class="code-btn ki-modal-close" type="button">Close</button></div>
@@ -34,9 +35,11 @@ export function openModal({ title, subtitle = "", width = "760px", footerHtml = 
     if (open?.length && open[open.length - 1] !== backdrop) return;
     close();
   };
+  let closed = false;
   function close() {
-    if (!backdrop.isConnected) return;
-    backdrop.remove();
+    if (closed) return;
+    closed = true;
+    if (backdrop.isConnected) backdrop.remove();
     document.removeEventListener("keydown", onKey);
     if (onClose) onClose();
   }

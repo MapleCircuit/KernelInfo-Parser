@@ -1,4 +1,4 @@
-"""core/tui/screens/systemd_services.py - Systemd service management screen for daemon and webapp."""
+"""core/tui/screens/systemd_services.py - Systemd service management screen for daemon, webapp and API."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from core.config import (
+    API_CONFIG_FILENAME,
     DAEMON_CONFIG_FILENAME,
     REPO_ROOT,
     WEBAPP_CONFIG_FILENAME,
@@ -16,6 +17,7 @@ from core.config import (
     get_service_config_path,
 )
 from core.systemd_manager import (
+    API_UNIT_NAME,
     DAEMON_UNIT_NAME,
     SYSTEMD_UNIT_DIR,
     WEBAPP_UNIT_NAME,
@@ -57,7 +59,13 @@ from core.tui.widgets import (
     TextInput,
 )
 
-SERVICES: tuple[str, str] = ("daemon", "webapp")
+SERVICES: tuple[str, str, str] = ("daemon", "webapp", "api")
+_UNIT_NAMES: dict[str, str] = {"daemon": DAEMON_UNIT_NAME, "webapp": WEBAPP_UNIT_NAME, "api": API_UNIT_NAME}
+_CONFIG_FILENAMES: dict[str, str] = {
+    "daemon": DAEMON_CONFIG_FILENAME,
+    "webapp": WEBAPP_CONFIG_FILENAME,
+    "api": API_CONFIG_FILENAME,
+}
 
 
 def _default_privileged_runner(command: list[str], *, input_text: str | None = None) -> CommandResult:
@@ -169,7 +177,7 @@ class ScrollableTextViewer:
 
 
 class SystemdServicesScreen(BaseScreen):
-    """Screen for installing, configuring, and controlling daemon and webapp systemd units."""
+    """Screen for installing, configuring, and controlling daemon, webapp and API systemd units."""
 
     def __init__(
         self,
@@ -194,6 +202,7 @@ class SystemdServicesScreen(BaseScreen):
         self._drafts: dict[str, dict[str, Any]] = {
             "daemon": {"user": def_user, "group": def_group, "use_tmux": False},
             "webapp": {"user": def_user, "group": def_group, "use_tmux": False},
+            "api": {"user": def_user, "group": def_group, "use_tmux": False},
         }
 
         self.sel_service = SelectList(
@@ -259,7 +268,7 @@ class SystemdServicesScreen(BaseScreen):
 
     def _service_config_path(self, service: str) -> Path:
         if self._explicit_project_root is not None:
-            fname = DAEMON_CONFIG_FILENAME if service == "daemon" else WEBAPP_CONFIG_FILENAME
+            fname = _CONFIG_FILENAMES[service]
             return (self._explicit_project_root / fname).resolve()
         return get_service_config_path(service).resolve()
 
@@ -299,7 +308,7 @@ class SystemdServicesScreen(BaseScreen):
             self._load_draft_into_widgets(value)
 
     def select_service(self, service: str) -> None:
-        """Switch the active service tab (`'daemon'` or `'webapp'`)."""
+        """Switch the active service tab (`'daemon'`, `'webapp'` or `'api'`)."""
         svc = str(service).strip().lower()
         if svc not in SERVICES:
             raise ValueError(f"Unknown service {service!r}")
@@ -325,7 +334,7 @@ class SystemdServicesScreen(BaseScreen):
         )
 
     def refresh_status(self, *, sync_fields: bool = False) -> dict[str, ServiceStatus]:
-        """Query live systemd status for daemon and webapp units."""
+        """Query live systemd status for daemon, webapp and API units."""
         def_user, def_group = default_user_group()
         for svc in SERVICES:
             st = get_service_status(svc, unit_dir=self.unit_dir, runner=self._runner)
@@ -379,7 +388,7 @@ class SystemdServicesScreen(BaseScreen):
         """Render the unit file for the selected service and show it in a scrollable viewer."""
         cfg = self._build_unit_config(self.selected_service)
         unit_text = render_unit_file(cfg)
-        unit_name = DAEMON_UNIT_NAME if self.selected_service == "daemon" else WEBAPP_UNIT_NAME
+        unit_name = _UNIT_NAMES[self.selected_service]
         ScrollableTextViewer(self.stdscr, f"Preview: {unit_name}", unit_text).show()
         return unit_text
 
@@ -450,7 +459,7 @@ class SystemdServicesScreen(BaseScreen):
     def control_selected_service(self, action: str) -> bool:
         """Run `start`/`stop`/`restart`/`enable`/`disable` via sudo under `app.suspend()`."""
         svc = self.selected_service
-        unit_name = DAEMON_UNIT_NAME if svc == "daemon" else WEBAPP_UNIT_NAME
+        unit_name = _UNIT_NAMES[svc]
         with self._suspend_context():
             res = control_service(svc, action, privileged_runner=self._privileged_runner)
 
@@ -467,7 +476,7 @@ class SystemdServicesScreen(BaseScreen):
     def view_logs(self, lines: int = 100) -> str:
         """Fetch recent `journalctl` logs for the selected service and display them."""
         svc = self.selected_service
-        unit_name = DAEMON_UNIT_NAME if svc == "daemon" else WEBAPP_UNIT_NAME
+        unit_name = _UNIT_NAMES[svc]
         res = read_service_logs(svc, lines=lines, runner=self._runner)
         if not res.ok:
             detail = res.stderr.strip() or res.stdout.strip() or f"exit code {res.returncode}"
@@ -480,7 +489,7 @@ class SystemdServicesScreen(BaseScreen):
     def uninstall_selected_service(self) -> bool:
         """Confirm and uninstall the selected systemd unit via sudo under `app.suspend()`."""
         svc = self.selected_service
-        unit_name = DAEMON_UNIT_NAME if svc == "daemon" else WEBAPP_UNIT_NAME
+        unit_name = _UNIT_NAMES[svc]
         choice = ModalDialog(
             self.stdscr,
             "Confirm Uninstall",
@@ -555,9 +564,9 @@ class SystemdServicesScreen(BaseScreen):
         self._layout_buttons(max_x)
         box_w = max(46, max_x - 2)
 
-        self.safe_addstr(0, 2, "Systemd Services (Daemon & Webapp)", get_color(PAIR_HEADER) | curses.A_BOLD)
+        self.safe_addstr(0, 2, "Systemd Services (Daemon, Webapp & API)", get_color(PAIR_HEADER) | curses.A_BOLD)
 
-        # Status Overview Box (y=1, h=7 -> rows 2..6)
+        # Status Overview Box (y=1, h=7 -> rows 2..6): one summary line per service, then the selection's config and attach lines
         draw_box(self.stdscr, 1, 1, 7, box_w, title=" Service Status & Attach Commands ", color_pair=PAIR_BORDER)
         inner_w = max(20, box_w - 4)
 
@@ -582,18 +591,13 @@ class SystemdServicesScreen(BaseScreen):
             else:
                 line_attr = get_color(PAIR_DEFAULT)
             self.safe_addstr(row_y, 3, summary[:inner_w], line_attr)
+            row_y += 1
 
-            cfg_path = self._service_config_path(svc)
-            cfg_state = "exists" if cfg_path.is_file() else "not created yet"
-            attach_cmd = self._effective_attach_command(svc)
-            sub_line = f"  Config: {cfg_path.name} [{cfg_state}]"
-            if attach_cmd:
-                sub_line += f" | Attach: {attach_cmd}"
-            self.safe_addstr(row_y + 1, 3, sub_line[:inner_w], get_color(PAIR_MUTED))
-            row_y += 2
-
+        sel_cfg_path = self._service_config_path(self.selected_service)
+        cfg_state = "exists" if sel_cfg_path.is_file() else "not created yet"
         sel_attach = self._effective_attach_command(self.selected_service)
         sel_status = self.statuses.get(self.selected_service)
+        self.safe_addstr(5, 3, f"Config: {sel_cfg_path.name} [{cfg_state}]"[:inner_w], get_color(PAIR_MUTED))
         if sel_attach:
             self.safe_addstr(6, 3, f"Attach: {sel_attach}"[:inner_w], get_color(PAIR_SUCCESS))
         elif sel_status and sel_status.error and not sel_status.installed:
@@ -606,8 +610,7 @@ class SystemdServicesScreen(BaseScreen):
 
         # Actions Box (y=14, h=8 -> rows 15..20)
         draw_box(self.stdscr, 14, 1, 8, box_w, title=" Actions ", color_pair=PAIR_BORDER)
-        sel_cfg_path = self._service_config_path(self.selected_service)
-        sel_unit_path = self.unit_dir / (DAEMON_UNIT_NAME if self.selected_service == "daemon" else WEBAPP_UNIT_NAME)
+        sel_unit_path = self.unit_dir / _UNIT_NAMES[self.selected_service]
         self.safe_addstr(19, 4, f"Config Path: {sel_cfg_path}"[:inner_w], get_color(PAIR_MUTED))
         self.safe_addstr(20, 4, f"Unit Path:   {sel_unit_path}"[:inner_w], get_color(PAIR_MUTED))
 

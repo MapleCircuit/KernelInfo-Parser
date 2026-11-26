@@ -35,7 +35,7 @@ export function dueWatches(watches, { changed = [], added = [] } = {}) {
   return watches.filter((w) => moved.has(w.data.branch));
 }
 
-/** Watches grouped by the check they need: one `POST /api/watch/changes` per (from, to). */
+/** Watches grouped by the check they need: one `POST /webapi/watch/changes` per (from, to). */
 export function checkGroups(watches, states) {
   const groups = new Map();
   for (const w of watches) {

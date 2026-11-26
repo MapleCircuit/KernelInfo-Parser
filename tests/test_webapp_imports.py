@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from typing import ClassVar
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -188,15 +189,16 @@ class TestImportsService(unittest.TestCase):
 
     def test_endpoint(self) -> None:
         from fastapi.testclient import TestClient
+
         from webapp.backend.app import create_app
 
         self._svc()
         with patch("webapp.backend.routers.filesystem.imports_service", ImportsService()):
             client = TestClient(create_app())
-            res = client.get("/api/fs/imports/v3.0", params={"path": "a.c", "arch": "x86_64"})
+            res = client.get("/webapi/fs/imports/v3.0", params={"path": "a.c", "arch": "x86_64"})
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.json()["path"], "a.c")
-            self.assertEqual(client.get("/api/fs/imports/v3.0", params={"path": "../x.c"}).status_code, 400)
+            self.assertEqual(client.get("/webapi/fs/imports/v3.0", params={"path": "../x.c"}).status_code, 400)
 
 
 # A header compiled in its includer's context (2.6.0 include/linux/lockd/bind.h): h.h includes nothing that
@@ -300,7 +302,7 @@ class TestImportsNameSpacesAndContext(unittest.TestCase):
         self.assertNotIn("late_fn", items)
 
     def test_own_chain_wins_over_context(self) -> None:
-        svc, mocks = self._svc(own_reach={"h.h": None, "fs.h": "h.h"})
+        svc, _mocks = self._svc(own_reach={"h.h": None, "fs.h": "h.h"})
         out = svc.get_imports("v2.6.0", "h.h")
         items = {it["name"]: it for it in out["items"]}
         self.assertEqual((items["file"]["via"], items["file"]["chain"]), ("include", ["h.h", "fs.h"]))
@@ -332,7 +334,6 @@ class TestImportsNameSpacesAndContext(unittest.TestCase):
         shas = {p: f"{i + 20:040x}" for i, p in enumerate(paths)}
         blobs = {p: i + 20 for i, p in enumerate(paths)}
         ids = {shas[p]: (blobs[p], 1) for p in paths}
-        ast = {"nlm_host": 1, "svc_rqst": 2, "CONFIG_LOCKD_V4": 3, "LOCKD_V4": 4}
         fnids = {p: i + 1 for i, p in enumerate(paths)}
         includers = ["fs/nfs/a.c", "fs/nfs/b.c", "fs/nfs/c.c", "fs/nfs/d.c", "fs/nfs/e.c",
                      "fs/nfsd/nfssvc.c", "include/linux/lockd/lockd.h"]
@@ -494,10 +495,10 @@ class TestIncludeSymbols(unittest.TestCase):
 
     XDR = "include/linux/lockd/xdr.h"
     BIND = "include/linux/lockd/bind.h"
-    PATHS = [BIND, XDR, "include/linux/fs.h", "include/linux/types.h", "include/asm-x86_64/types.h",
-             "arch/powerpc/boot/types.h", "security/selinux/include/av_inherit.h", "fs/jffs2/summary.c",
-             "fs/nfsd/nfsproc.c", "include/linux/sunrpc/svc.h", "fs/nfsd/nfsxdr.c", "include/linux/nfs.h",
-             "arch/arm/include/asm/nfs.h"]
+    PATHS: ClassVar[list[str]] = [BIND, XDR, "include/linux/fs.h", "include/linux/types.h", "include/asm-x86_64/types.h",
+                                  "arch/powerpc/boot/types.h", "security/selinux/include/av_inherit.h", "fs/jffs2/summary.c",
+                                  "fs/nfsd/nfsproc.c", "include/linux/sunrpc/svc.h", "fs/nfsd/nfsxdr.c", "include/linux/nfs.h",
+                                  "arch/arm/include/asm/nfs.h"]
 
     def _run(self, refs: list[str], arch: str | None = "x86_64") -> dict:
         from webapp.backend.services import symbol_service as ssvc
@@ -634,7 +635,10 @@ class TestContextWalk(unittest.TestCase):
     def test_reachable_before_and_assembly_filter(self) -> None:
         from parser.arch_layout import ArchLayout
         from parser.include_graph import IncludeResolver
-        from webapp.backend.services.arch_layout_service import ArchLayoutService, condition_filter
+        from webapp.backend.services.arch_layout_service import (
+            ArchLayoutService,
+            condition_filter,
+        )
 
         layout = ArchLayout("x86_64", "x86", includes=["include/"])
         files = {p: f"{i:040x}" for i, p in enumerate(["x.c", "include/fs.h", "include/h.h", "include/late.h",
@@ -747,6 +751,7 @@ class TestDefinitionArch(unittest.TestCase):
 
     def test_falls_back_to_i386(self) -> None:
         from fastapi import HTTPException as Missing
+
         from webapp.backend.services import tree_resolver as tr
         from webapp.backend.services.kconfig_service import KconfigService
 
@@ -757,7 +762,7 @@ class TestDefinitionArch(unittest.TestCase):
 
         with patch.object(KconfigService, "resolve_arch", resolve_arch), \
                 patch.object(isvc.arch_layout_service, "layout", return_value=None):
-            arch, scope, bits = tr.definition_arch("2.3.35pre2", None)
+            arch, _scope, bits = tr.definition_arch("2.3.35pre2", None)
         self.assertEqual((arch, bits), ("i386", 32))
 
     def test_tree_before_arch_resolves_i386(self) -> None:

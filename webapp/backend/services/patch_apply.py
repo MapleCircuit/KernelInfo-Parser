@@ -17,17 +17,17 @@ import email
 import email.policy
 import hashlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 MAX_MESSAGES = 50
 MAX_PATCH_BYTES = 5 << 20
 MAX_FILES = 500
-SEARCH_WINDOW = None  # search the whole file, like git's find_pos
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-_BASE_RE = re.compile(r"^base-commit:\s*([0-9a-f]{7,40})\s*$", re.M)
-_DIFF_START_RE = re.compile(r"^(diff --git |--- (?:a/|/dev/null))", re.M)
+_BASE_RE = re.compile(r"^base-commit:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
+_DIFF_START_RE = re.compile(r"^(diff --git |--- (?:a/|/dev/null))", re.MULTILINE)
 
 
 @dataclass
@@ -100,7 +100,11 @@ def _strip_prefix(path: str) -> str | None:
     if path == "/dev/null":
         return None
     if path.startswith('"') and path.endswith('"'):
-        path = path[1:-1].encode("latin-1", errors="replace").decode("unicode_escape").encode("latin-1", errors="replace").decode("utf-8", errors="replace")
+        inner = path[1:-1]
+        try:
+            path = inner.encode("latin-1", errors="replace").decode("unicode_escape").encode("latin-1", errors="replace").decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            path = inner
     path = path.split("\t", 1)[0]
     return path[2:] if path[:2] in ("a/", "b/") else path
 
@@ -156,7 +160,7 @@ def parse_patch(text: str) -> list[FilePatch]:
                 cur.status, cur.new_path = "R", line[10:].rstrip("\n")
             elif line.startswith(("old mode", "new mode")):
                 cur.mode_change = True
-            elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            elif line.startswith(("Binary files ", "GIT binary patch")):
                 cur.binary = True
             else:
                 h = _HUNK_RE.match(line)
@@ -186,7 +190,7 @@ def parse_patch(text: str) -> list[FilePatch]:
                         # "\ No newline at end of file" applies to the line just read
                         if i < n and lines[i].startswith("\\ No newline"):
                             o, t = hunk.lines[-1]
-                            hunk.lines[-1] = (o, t[:-1] if t.endswith("\n") else t)
+                            hunk.lines[-1] = (o, t.removesuffix("\n"))
                             i += 1
                     cur.hunks.append(hunk)
                     continue
@@ -230,7 +234,7 @@ def nearest_partial(image: list[str], pre: list[str], expected: int) -> dict[str
         return {"line": max(1, expected + 1), "matched": 0, "of": len(pre)}
     best = (-1, 0)
     span = len(pre)
-    for at in range(0, max(1, len(image) - span + 1)):
+    for at in range(max(1, len(image) - span + 1)):
         score = sum(1 for k in range(span) if at + k < len(image) and image[at + k] == pre[k])
         if score > best[0] or (score == best[0] and abs(at - expected) < abs(best[1] - expected)):
             best = (score, at)
@@ -296,8 +300,8 @@ def apply_series(sha: str, patches: list[tuple[str, list[FilePatch]]], read: Cal
             elif fp.binary:
                 res.update(status="unsupported", reason="binary patch")
             else:
-                def current(p: str) -> list[str] | None:
-                    return staged[p] if p in staged else load(p)
+                def current(p: str, _staged: dict[str, list[str] | None] = staged) -> list[str] | None:
+                    return _staged[p] if p in _staged else load(p)
                 src = None if fp.status == "A" else current(fp.old_path or fp.path)
                 if fp.status == "A" and current(fp.path) is not None:
                     res.update(status="failed", reason="already exists")
@@ -334,7 +338,7 @@ def apply_series(sha: str, patches: list[tuple[str, list[FilePatch]]], read: Cal
 
 
 def diff_hunks(old: str | None, new: str | None) -> list[dict[str, Any]]:
-    """-U0 hunks between two texts in the shape of `GET /api/tools/diff/blobs` rows ([kind, old, new, text])."""
+    """-U0 hunks between two texts in the shape of `GET /webapi/tools/diff/blobs` rows ([kind, old, new, text])."""
     a = (old or "").splitlines()
     b = (new or "").splitlines()
     hunks = []
@@ -366,11 +370,12 @@ class PatchApplyService:
             data, is_dir, _ = git_reader.read_file(sha, path)
             if is_dir or data is None:
                 return None
-            return data.decode("utf-8", errors="surrogateescape")
+            return data.decode("utf-8", errors="replace")
         return read
 
     def apply(self, revision: str, message_ids: list[str]) -> dict[str, Any]:
         from fastapi import HTTPException
+
         from webapp.backend.services.mailing_list_service import mailing_list_service
         from webapp.backend.services.tree_resolver import git_tree_resolver
         mids = [str(m).strip().strip("<>") for m in message_ids if str(m).strip()]

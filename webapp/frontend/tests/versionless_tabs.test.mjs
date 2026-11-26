@@ -272,19 +272,19 @@ test("api commit endpoints route without version segment when version is empty",
   await api.resolveCommitMail("", "deadbeef");
 
   const urls = requests.map((r) => r.url);
-  assert.equal(urls[0], "/api/commits/detail/deadbeef");
-  assert.equal(urls[1], "/api/commits/diff/deadbeef?context=3");
-  assert.equal(urls[2], "/api/commits/timeline?limit=50&direction=past");
-  assert.equal(urls[3], "/api/commits/list?page=1&limit=50&q=ext4");
-  assert.equal(urls[4], "/api/commits/query?author=linus");
-  assert.equal(urls[5], "/api/commits/relations/deadbeef");
-  assert.equal(urls[6], "/api/commits/released/deadbeef");
-  assert.equal(urls[7], "/api/commits/resolve_mail/deadbeef");
+  assert.equal(urls[0], "/webapi/commits/detail/deadbeef");
+  assert.equal(urls[1], "/webapi/commits/diff/deadbeef?context=3");
+  assert.equal(urls[2], "/webapi/commits/timeline?limit=50&direction=past");
+  assert.equal(urls[3], "/webapi/commits/list?page=1&limit=50&q=ext4");
+  assert.equal(urls[4], "/webapi/commits/query?author=linus");
+  assert.equal(urls[5], "/webapi/commits/relations/deadbeef");
+  assert.equal(urls[6], "/webapi/commits/released/deadbeef");
+  assert.equal(urls[7], "/webapi/commits/resolve_mail/deadbeef");
 
   // With a version, routes keep the version path segment
   requests.length = 0;
   await api.getCommitDetail("v3.0", "deadbeef");
-  assert.equal(requests[0].url, "/api/commits/v3.0/detail/deadbeef");
+  assert.equal(requests[0].url, "/webapi/commits/v3.0/detail/deadbeef");
 });
 
 test("TabsComponent omits .tab-version badge on versionless tabs", () => {

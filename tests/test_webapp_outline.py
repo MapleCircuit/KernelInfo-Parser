@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,7 +14,12 @@ from core import DBLayout as D
 from core.globalstuff import ASTT
 from tests.db_fixtures import make_db, patch_reader
 from webapp.backend.services import outline_service as osvc
-from webapp.backend.services.outline_service import OutlineService, build_outline, flatten, outline_kind
+from webapp.backend.services.outline_service import (
+    OutlineService,
+    build_outline,
+    flatten,
+    outline_kind,
+)
 
 
 def row(name, type_name, s, e, linkage=1):
@@ -102,7 +107,7 @@ class TestOutlineService(unittest.TestCase):
 
     def test_unindexed_blob_and_errors(self) -> None:
         sha = "b" * 40
-        svc, cursor = self._svc({"x.c": sha}, {}, [])
+        svc, _cursor = self._svc({"x.c": sha}, {}, [])
         out = svc.get_outline("v3.0", "x.c")
         self.assertEqual((out["indexed"], out["items"]), (False, []))
         for bad in ("../etc/passwd", ""):

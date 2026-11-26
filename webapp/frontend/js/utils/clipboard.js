@@ -20,8 +20,9 @@ export async function copyToClipboard(text) {
 
   // 2. Fallback to hidden textarea with document.execCommand('copy')
   if (typeof document !== "undefined") {
+    let textarea = null;
     try {
-      const textarea = document.createElement("textarea");
+      textarea = document.createElement("textarea");
       textarea.value = text;
       textarea.style.position = "fixed";
       textarea.style.left = "-999999px";
@@ -33,10 +34,11 @@ export async function copyToClipboard(text) {
       textarea.select();
 
       const successful = document.execCommand("copy");
-      textarea.remove();
       if (successful) return true;
     } catch (e) {
       console.error("[Clipboard] execCommand fallback failed:", e);
+    } finally {
+      textarea?.remove();
     }
   }
 

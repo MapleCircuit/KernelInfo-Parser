@@ -12,17 +12,28 @@ from fastapi import HTTPException
 
 from core.globalstuff import is_safe_git_rev
 
-
-def safe_rev(rev: str, what: str = "revision") -> str:
-    """Return rev unchanged, or raise HTTP 400 when it is not a plain tag / branch / commit SHA."""
-    if not is_safe_git_rev(rev):
-        raise HTTPException(status_code=400, detail=f"Invalid {what}: must be a tag, branch or commit SHA.")
-    return rev
+MAX_REV_LEN = 256
 
 
 def is_safe_rev(rev: object) -> bool:
     """Non-raising form of safe_rev(), for services that fall back instead of failing a request."""
+    if not isinstance(rev, str) or not rev or len(rev) > MAX_REV_LEN:
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in rev):
+        return False
+    if "@{" in rev or "//" in rev or ".." in rev or rev.endswith((".", ".lock")):
+        return False
     return is_safe_git_rev(rev)
+
+
+def safe_rev(rev: str, what: str = "revision") -> str:
+    """Return rev unchanged, or raise HTTP 400 when it is not a plain tag / branch / commit SHA."""
+    if not is_safe_rev(rev):
+        raise HTTPException(status_code=400, detail=f"Invalid {what}: must be a tag, branch or commit SHA.")
+    return rev
+
+
+validate_git_revision = safe_rev
 
 
 MAX_GREP_PATTERN = 256
@@ -49,7 +60,7 @@ def validate_pathspec(spec: object) -> str:
     """One caller-supplied path filter: relative, no `..` segment, no `:` magic; HTTP 400 otherwise."""
     if not isinstance(spec, str):
         raise HTTPException(status_code=400, detail="Invalid path filter.")
-    body = spec[1:] if spec.startswith("!") else spec
+    body = spec.removeprefix("!")
     if (not body or len(spec) > MAX_PATHSPEC_LEN or body.startswith(("/", ":", "!"))
             or any(c in body for c in "\0\r\n\\")
             or any(seg == ".." for seg in body.split("/"))):
@@ -87,6 +98,14 @@ def git_pathspecs(specs: list[str]) -> list[str]:
 
 
 __all__ = [
-    "safe_rev", "is_safe_rev", "validate_grep_pattern", "validate_pathspec", "validate_pathspecs",
-    "git_pathspecs", "MAX_GREP_PATTERN", "MAX_PATHSPECS",
+    "MAX_GREP_PATTERN",
+    "MAX_PATHSPECS",
+    "MAX_REV_LEN",
+    "git_pathspecs",
+    "is_safe_rev",
+    "safe_rev",
+    "validate_git_revision",
+    "validate_grep_pattern",
+    "validate_pathspec",
+    "validate_pathspecs",
 ]

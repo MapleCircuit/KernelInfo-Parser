@@ -20,14 +20,20 @@ import itertools
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any
+
+from fastapi import HTTPException
 
 from cache_engine import Eq, In, Range
-from fastapi import HTTPException
 from parser.git_ast.commit_relations import parse_relations, resolve_prefixes
 from parser.git_ast.insights_deltas import extract_release_deltas_from_git
-from parser.git_ast.release_order import release_ranges, series_ord_for, series_track_for
+from parser.git_ast.release_order import (
+    release_ranges,
+    series_ord_for,
+    series_track_for,
+)
 from webapp.backend.config import get_active_insights_config, get_active_repo_name
 from webapp.backend.services import commit_relations, release_service
 from webapp.backend.services.disk_cache import DiskCache
@@ -91,7 +97,7 @@ def annotation_applies(annotation: str, series: str) -> bool:
 def _tag_dates(tags: dict[str, str], names: list[str]) -> dict[str, int]:
     """Commit time (%ct) of each named tag's commit, with one `git log --no-walk`."""
     cached = release_service.tag_dates()
-    dates: dict[str, int] = {n: cached[n] for n in names if n in cached and cached[n]}
+    dates: dict[str, int] = {n: cached[n] for n in names if cached.get(n)}
     missing = [n for n in names if n not in dates and n in tags]
     if missing:
         shas = sorted({tags[n] for n in missing})
@@ -200,6 +206,7 @@ def build_report(series: str, progress=None, use_db: bool = False) -> dict[str, 
 def _git_stdout(args: list[str], *, repo_dir: Any, timeout: float = 180.0) -> str:
     proc = subprocess.run(
         ["git", "-C", str(repo_dir), *args],
+        check=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -227,8 +234,8 @@ def _target_releases_from_git(
             ml = info.get("mainline")
             if ml and release_service.release_key(ml) <= series_key:
                 out[sha] = ml
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("db_lookup for target releases failed: %s", exc)
     remaining = target_shas - set(out)
     if not remaining:
         return out
@@ -239,8 +246,8 @@ def _target_releases_from_git(
                 ml = info.get("mainline")
                 if ml and release_service.release_key(ml) <= series_key:
                     out[sha] = ml
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release_index lookup for target releases failed: %s", exc)
     remaining = target_shas - set(out)
     if not remaining:
         return out
@@ -536,8 +543,11 @@ def db_scope_covered(scope: dict[str, Any]) -> bool:
 def _report_db(series: str, scope: dict[str, Any], progress=None) -> dict[str, Any] | None:
     """The report from m_commit_relation, m_commit_release, m_release_segment and m_commit (read only);
     None when a query fails."""
-    from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
     from db_engine.spec import Join, Value
+    from webapp.backend.database.helpers import (
+        get_active_network_id,
+        get_active_repo_id,
+    )
     from webapp.backend.database.pool import get_reader
     k_fix, k_cc, k_up = commit_relations.KIND_FIXES, commit_relations.KIND_STABLE_CC, commit_relations.KIND_UPSTREAM
     tags = release_service.tag_commits()

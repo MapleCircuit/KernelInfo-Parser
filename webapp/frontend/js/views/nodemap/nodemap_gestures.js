@@ -1320,7 +1320,7 @@ function typeNodeOf(ctrl, ref, version, repo = "") {
 }
 
 /**
- * A new node for type `ref`: a struct node for a `struct` / `union` (`GET /api/nodemap/{v}/struct/{name}`),
+ * A new node for type `ref`: a struct node for a `struct` / `union` (`GET /webapi/nodemap/{v}/struct/{name}`),
  * a symbol node for an `enum` or typedef (its definition resolves through `getSymbolDetail` and
  * its members expand like any symbol node).
  */
@@ -1408,13 +1408,18 @@ export async function expandCallgraph(ctrl, id, direction = "both") {
   if (!node || node.type !== "symbol" || !node.data?.name) return [];
   const client = ctrl.clientFor(node);
   const ver = node.version || ctrl.currentVersion;
+  const gen = ctrl._disposeGen;
+  const canvas = ctrl.canvas;
+  const canvasId = ctrl.canvas?.id;
   let res;
   try {
     res = await client.getCallgraph(ver, node.data.name);
   } catch (err) {
+    if (ctrl._disposeGen !== gen || !ctrl.containerEl?.isConnected) return [];
     toast.error(`Callgraph failed: ${err.message}`);
     return [];
   }
+  if (ctrl._disposeGen !== gen || !ctrl.containerEl?.isConnected || ctrl.canvas !== canvas || ctrl.canvas?.id !== canvasId || !ctrl.canvas?.nodes?.some((n) => n.id === node.id)) return [];
   const created = [];
   const addSide = (entries, isCaller) => {
     const list = Array.isArray(entries) ? entries.slice(0, 30) : [];
@@ -1458,13 +1463,18 @@ export async function expandCallPath(ctrl, fromId, targetFn, { maxDepth = 6, k =
   if (!node || !targetFn) return [];
   const client = ctrl.clientFor(node);
   const ver = node.version || ctrl.currentVersion;
+  const gen = ctrl._disposeGen;
+  const canvas = ctrl.canvas;
+  const canvasId = ctrl.canvas?.id;
   let res;
   try {
     res = await client.getCallpath(ver, { from: node.data?.name || "", to: targetFn, maxDepth, k });
   } catch (err) {
+    if (ctrl._disposeGen !== gen || !ctrl.containerEl?.isConnected) return [];
     toast.error(`Call path failed: ${err.message}`);
     return [];
   }
+  if (ctrl._disposeGen !== gen || !ctrl.containerEl?.isConnected || ctrl.canvas !== canvas || ctrl.canvas?.id !== canvasId || !ctrl.canvas?.nodes?.some((n) => n.id === node.id)) return [];
   const paths = Array.isArray(res?.paths) ? res.paths : [];
   const created = [];
   const lim = M.SIZE_LIMITS.symbol;

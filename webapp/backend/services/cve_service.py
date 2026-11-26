@@ -23,33 +23,38 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from fastapi import HTTPException
 
 from db_engine.spec import Agg, Join
 from parser.cve.cve_records import (  # noqa: F401 - re-exported for callers and tests
+    _VERSION_TEXT,
     CVE_ID,
-    HEXSHA as _HEXSHA,
     KIND_NAMES,
     RECORD_FORMAT,
     ROLE_FIX,
     ROLE_INTRODUCED,
-    _VERSION_TEXT,
     description_bound,
     kernel_commits,
     parse_record,
     summarize_versions,
     version_status,
 )
+from parser.cve.cve_records import (
+    HEXSHA as _HEXSHA,
+)
 from parser.cve.cve_releases import (
     CVE_RELEASE_FORMAT,
     ID_TO_BASIS,
     ID_TO_STATE,
     BaseReleaseContext,
-    affects as _affects,
     earliest_final_release,
     is_fixed_here,
+)
+from parser.cve.cve_releases import (
+    affects as _affects,
 )
 from parser.git_ast.commit_relations import KIND_FIXES
 from webapp.backend.config import RepoScopedCache
@@ -75,7 +80,6 @@ _CVSS_OP_ALIASES = {
     "≥": "ge",
     "ge": "ge",
 }
-CVSS_OPS = frozenset({"lt", "gt", "eq", "ge"})
 
 _DISK = DiskCache("cve-index", max_bytes=256 << 20, max_entries=6)
 _PREFETCH_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
@@ -94,8 +98,9 @@ def _text(value: Any) -> str:
 def source(fresh: bool = False) -> dict[str, Any] | None:
     """The CVE list the parser ingested (m_cve_source), checked at most every SOURCE_TTL seconds; None if none."""
     now = time.monotonic()
-    if not fresh and now - _SOURCE["checked"] < SOURCE_TTL:
-        return _SOURCE["row"]
+    with _LOCK:
+        if not fresh and now - _SOURCE["checked"] < SOURCE_TTL:
+            return _SOURCE["row"]
     row = None
     try:
         with get_reader() as reader:
@@ -107,7 +112,8 @@ def source(fresh: bool = False) -> dict[str, Any] | None:
                    "format": int(r["format"]), "records": int(r["records"]), "built_at": int(r["built_at"])}
     except Exception as exc:  # noqa: BLE001 - no database, or one without the CVE tables
         logger.debug("m_cve_source unavailable: %s", exc)
-    _SOURCE.update(checked=now, row=row)
+    with _LOCK:
+        _SOURCE.update(checked=now, row=row)
     return row
 
 
@@ -321,7 +327,7 @@ class Context(BaseReleaseContext):
         self._rkeys: dict[str, Any] = {}
         self._ptags: dict[str, Any] = {}
         self.p = self.parse_tag(release)
-        self.version = release[1:] if release.startswith("v") else release
+        self.version = release.removeprefix("v")
         self.key = self.release_key(release)
         is_stable = bool(self.p and self.p.get("kind") != "next" and self.p.get("stable"))
         self.base_key = self.release_key(rs.series_name(self.p["series"])) if is_stable else None
@@ -354,23 +360,24 @@ class Context(BaseReleaseContext):
         full() runs `git rev-parse` only for prefixes the database does not hold."""
         src = source()
         cache_token = (src["built_at"] if src else 0, rs.release_token())
-        cached_entry = _PREFETCH_CACHE.get(cache_token)
-        if cached_entry is None:
-            cached_full: dict[str, str | None] = {}
-            cached_tags: dict[str, dict[str, Any] | None] = {}
-            _PREFETCH_CACHE[cache_token] = (cached_full, cached_tags)
-        else:
-            cached_full, cached_tags = cached_entry
-
-        self._full.update(cached_full)
-        self._tags.update(cached_tags)
+        with _LOCK:
+            cached_entry = _PREFETCH_CACHE.get(cache_token)
+            if cached_entry is None:
+                cached_full: dict[str, str | None] = {}
+                cached_tags: dict[str, dict[str, Any] | None] = {}
+                _PREFETCH_CACHE[cache_token] = (cached_full, cached_tags)
+            else:
+                cached_full, cached_tags = cached_entry
+            self._full.update(cached_full)
+            self._tags.update(cached_tags)
 
         shas = list(dict.fromkeys(s for s in shas if s))
         short = [s for s in shas if not _FULL.match(s) and _HEXSHA.match(s) and s not in self._full]
         if short:
             resolved_short = stored_prefixes(short)
             self._full.update(resolved_short)
-            cached_full.update(resolved_short)
+            with _LOCK:
+                cached_full.update(resolved_short)
         shas = [self._full.get(s, s) if not _FULL.match(s) else s for s in shas]
         want = [s for s in dict.fromkeys(shas) if s and _FULL.match(s) and s not in self._tags]
         if want:
@@ -381,7 +388,8 @@ class Context(BaseReleaseContext):
                 entry = hit if hit and (hit.get("mainline") or hit.get("stable")) else None
                 self._tags[s] = entry
                 new_tags[s] = entry
-            cached_tags.update(new_tags)
+            with _LOCK:
+                cached_tags.update(new_tags)
 
     def tags(self, sha: str | None) -> dict[str, Any] | None:
         full = self.full(sha)
@@ -406,9 +414,16 @@ class Context(BaseReleaseContext):
             if q.get("kind") == "next":
                 if is_next and self.release_key(t) <= self.key:
                     out.append(t)
-            elif not q["stable"] and self.release_key(t) <= self.key:
-                out.append(t)
-            elif not is_next and self.p["stable"] and q["stable"] and q["series"] == self.p["series"] and q["stable"] <= self.p["stable"]:
+            elif (
+                (not q["stable"] and self.release_key(t) <= self.key)
+                or (
+                    not is_next
+                    and self.p["stable"]
+                    and q["stable"]
+                    and q["series"] == self.p["series"]
+                    and q["stable"] <= self.p["stable"]
+                )
+            ):
                 out.append(t)
         return out
 

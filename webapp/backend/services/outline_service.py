@@ -14,9 +14,9 @@ from typing import Any
 from fastapi import HTTPException
 
 from core.globalstuff import SymbolLinkage
+from db_engine.spec import Join
 from webapp.backend.config import RepoScopedCache
 from webapp.backend.database.helpers import safe_decode
-from db_engine.spec import Join
 from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
@@ -150,7 +150,9 @@ class OutlineService:
                     elif clean.endswith((".S", ".s")):
                         _status, payload, _err = git_reader.read_object(blob_sha, "")
                         if payload:
-                            from parser.asm_ast.asm_pure_extractor import extract_asm_outline
+                            from parser.asm_ast.asm_pure_extractor import (
+                                extract_asm_outline,
+                            )
                             items = extract_asm_outline(payload)
                             body = {"indexed": True, "items": items, "count": len(flatten(items)), "truncated": False}
                             self._cache[blob_sha] = body
@@ -158,7 +160,9 @@ class OutlineService:
                     elif clean.endswith(".rs"):
                         _status, payload, _err = git_reader.read_object(blob_sha, "")
                         if payload:
-                            from parser.rust_ast.rust_pure_extractor import extract_rust_outline
+                            from parser.rust_ast.rust_pure_extractor import (
+                                extract_rust_outline,
+                            )
                             items = extract_rust_outline(payload)
                             body = {"indexed": True, "items": items, "count": len(flatten(items)), "truncated": False}
                             self._cache[blob_sha] = body

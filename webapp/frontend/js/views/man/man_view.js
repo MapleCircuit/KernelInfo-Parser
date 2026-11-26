@@ -3,9 +3,9 @@
  * of a code tab of the man-pages repository (`mountManDocument`).
  *
  * The tab belongs to the man-pages repository (`tab.repo`) at one of its tags (`tab.version`), like every
- * tab, and asks `/api/man/*` with that repository named on every request. Without a page it shows the
- * tag's index (`/api/man/{v}/index`), grouped by section with a filter box. The toolbar holds the tag
- * dropdown (`/api/man/tags`), the Web/Terminal toggle (per tab, default `kip-man-mode` in localStorage)
+ * tab, and asks `/webapi/man/*` with that repository named on every request. Without a page it shows the
+ * tag's index (`/webapi/man/{v}/index`), grouped by section with a filter box. The toolbar holds the tag
+ * dropdown (`/webapi/man/tags`), the Web/Terminal toggle (per tab, default `kip-man-mode` in localStorage)
  * and the links back into the kernel: the syscall in the Kernel API tab and the SYNOPSIS symbols'
  * definitions, opened as tabs of the kernel's repository next to this one.
  */
@@ -212,8 +212,11 @@ export class ManView {
 
   dispose() {
     this.seq++;
+    clearTimeout(this._filterTimer);
+    this._filterTimer = null;
     this.ro?.disconnect();
     this.ro = null;
+    this.containerEl = null;
   }
 
   mode() {
@@ -421,10 +424,11 @@ export class ManView {
       <div class="man-index-groups"></div>
     </div>`;
     const input = this.body().querySelector(".man-filter");
-    let timer = null;
+    clearTimeout(this._filterTimer);
+    this._filterTimer = null;
     input.addEventListener("input", () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
+      clearTimeout(this._filterTimer);
+      this._filterTimer = setTimeout(() => {
         if (!this.live(seq)) return;
         this.persist({ manQuery: input.value.trim() });
         this.renderIndexGroups();

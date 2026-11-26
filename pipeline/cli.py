@@ -23,7 +23,11 @@ from core.ssh_tunnel import start_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 import argparse
 from db_engine import (
@@ -655,6 +659,95 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# HTTP servers the configuration TUI can launch ("W": webapp, AI API, or both), by entry script
+SERVER_ENTRYPOINTS: dict[str, str] = {"webapp": "webapp/main.py", "api": "api/main.py"}
+SERVER_STOP_GRACE_SECONDS = 15.0
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def launch_servers(
+    servers: list[str],
+    config_path: str | None,
+    *,
+    popen=subprocess.Popen,
+    killpg=os.killpg,
+    poll_interval: float = 0.2,
+    grace_seconds: float = SERVER_STOP_GRACE_SECONDS,
+) -> int:
+    """Run the webapp and/or AI API servers chosen in the TUI until they exit or the user stops them.
+
+    Each server runs as `python3 <entry> -c <config_path>` in its own session (process group), so uvicorn's
+    reloader and its worker receive the stop signal together. SIGINT/SIGTERM received here are forwarded to
+    every running server; when one server exits on its own the others are stopped as well. A server still
+    running `grace_seconds` after the stop signal is killed. Returns the first non-zero exit status (0 when
+    every server stopped cleanly or the stop was requested). The parser's memory guard and log files are
+    never set up for these processes.
+    """
+    names = [s for s in dict.fromkeys(servers or []) if s in SERVER_ENTRYPOINTS]
+    if not names:
+        print("No server selected.", file=sys.stderr)
+        return 2
+    procs: dict[str, subprocess.Popen] = {}
+    stop_requested = {"signal": None}
+
+    def _on_signal(signum, _frame):
+        stop_requested["signal"] = signum
+
+    prev_handlers = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            prev_handlers[signum] = signal.signal(signum, _on_signal)
+        except ValueError:  # not the main thread (tests)
+            pass
+
+    def _signal_all(signum: int) -> None:
+        for proc in procs.values():
+            if proc.poll() is None:
+                try:
+                    killpg(proc.pid, signum)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
+    exit_code = 0
+    try:
+        for name in names:
+            cmd = [sys.executable, str(_REPO_ROOT / SERVER_ENTRYPOINTS[name])]
+            if config_path:
+                cmd += ["-c", str(config_path)]
+            procs[name] = popen(cmd, cwd=str(_REPO_ROOT), start_new_session=True)
+            print(COLOR.green(f"Started {name} server (pid {procs[name].pid}): {' '.join(cmd[1:])}"))
+
+        stopping_since: float | None = None
+        while True:
+            running = [n for n, p in procs.items() if p.poll() is None]
+            if not running:
+                break
+            if stopping_since is None:
+                finished = [n for n in procs if n not in running]
+                if stop_requested["signal"] is not None or finished:
+                    for n in finished:
+                        code = procs[n].returncode
+                        print(f"{n} server exited with status {code}; stopping the others.", file=sys.stderr)
+                        if code and not exit_code:
+                            exit_code = code
+                    _signal_all(signal.SIGINT)
+                    stopping_since = time.monotonic()
+            elif time.monotonic() - stopping_since > grace_seconds:
+                _signal_all(signal.SIGKILL)
+            time.sleep(poll_interval)
+
+        if stop_requested["signal"] is None and not exit_code:
+            for name, proc in procs.items():
+                if proc.returncode:
+                    exit_code = proc.returncode
+                    break
+    finally:
+        _signal_all(signal.SIGKILL)
+        for signum, handler in prev_handlers.items():
+            signal.signal(signum, handler)
+    return exit_code
+
+
 def arg_handling() -> argparse.Namespace:
     """Handle arguments passed with python."""
     parser = build_arg_parser()
@@ -696,6 +789,10 @@ def arg_handling() -> argparse.Namespace:
             launch = run_config_tui_launch(args.config)
             if launch is None:
                 sys.exit(0)
+            # Webapp / AI API launch ("W"): servers run as their own processes, before the parser's
+            # memory guard (systemd-run re-exec) and parser logging are set up
+            if launch.get("servers"):
+                sys.exit(launch_servers(launch["servers"], launch.get("config_path") or args.config))
             # TUI run actions (parse selected tags, table reset) arrive as CLI argument overrides
             for key, value in launch.items():
                 setattr(args, key, value)

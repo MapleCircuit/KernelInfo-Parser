@@ -1,6 +1,6 @@
 /**
  * man_diff.js - "Man pages" mode helpers of the Compare view (webapp/API_FRONTEND.md §5.11):
- * filtering, section grouping, delta badges and exports for GET /api/man/diff. DOM-free.
+ * filtering, section grouping, delta badges and exports for GET /webapi/man/diff. DOM-free.
  */
 import { manLabel, sectionRank, sectionTitle } from "../man/man_model.js";
 

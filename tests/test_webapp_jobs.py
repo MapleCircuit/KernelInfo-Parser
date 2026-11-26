@@ -159,5 +159,35 @@ class TestJobs(unittest.TestCase):
         self.assertEqual(jobs_mod.retry_after_ms({"started_at": now - 100}), 5000)
 
 
+class TestJobManagerConcurrency(unittest.TestCase):
+    """BE-014 regression: result visible before done state and locked cancel_all."""
+
+    def test_result_populated_when_state_turns_done(self) -> None:
+        from webapp.backend.services.jobs import JobManager
+
+        mgr = JobManager(workers=2)
+        try:
+            gate = threading.Event()
+
+            def build(_p: object) -> dict[str, int]:
+                gate.wait(timeout=2.0)
+                return {"answer": 42}
+
+            snap = mgr.submit("be014:k", build)
+            self.assertIn(snap["state"], ("building", "done"))
+            gate.set()
+            res = mgr.wait("be014:k", timeout=3.0)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["state"], "done")
+            self.assertEqual(res["result"], {"answer": 42})
+
+            # cancel_all must set shutdown safely even concurrently with get()
+            mgr.cancel_all()
+            rejected = mgr.submit("be014:after", lambda _p: {"x": 1})
+            self.assertEqual(rejected["state"], "failed")
+        finally:
+            mgr.reset()
+
+
 if __name__ == "__main__":
     unittest.main()

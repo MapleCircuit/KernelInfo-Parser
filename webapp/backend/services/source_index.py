@@ -36,24 +36,34 @@ import time
 import zlib
 from array import array
 from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any
 
+from cache_engine import (
+    BYTES,
+    INT,
+    CacheError,
+    CacheSpace,
+    In,
+    Range,
+    StoreSpec,
+    get_cache_engine,
+)
 from parser.source_facts import (
     EMPTY,
-    FACTS_FORMAT,
-    FAMILY,
-    READABLE_FORMATS,
     F_MACRO_FN,
     F_MACRO_OBJ,
     F_STATIC,
+    FACTS_FORMAT,
+    FAMILY,
+    READABLE_FORMATS,
     blob_text,
     decode,
     encode,
     extract_many,
     init_worker,
 )
-from cache_engine import BYTES, INT, CacheError, CacheSpace, In, Range, StoreSpec, get_cache_engine
 from webapp.backend.config import get_active_repo_name, get_repo_dir
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services import disk_cache
@@ -234,7 +244,7 @@ def load_facts(shas: list[str]) -> dict[str, dict[str, Any]]:
 
 def _git(args: list[str], timeout: float = 120.0) -> bytes | None:
     try:
-        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, timeout=timeout)
+        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout if out.returncode == 0 else None
@@ -268,6 +278,10 @@ def read_blobs(shas: list[str]) -> Iterator[tuple[str, str | None]]:
             proc.stdin.flush()
             header = proc.stdout.readline().split()
             if len(header) < 3 or header[1] != b"blob":
+                if len(header) >= 3 and header[2].isdigit():
+                    size = int(header[2])
+                    proc.stdout.read(size)
+                    proc.stdout.read(1)
                 yield sha, None
                 continue
             size = int(header[2])
@@ -869,23 +883,4 @@ def revision_state(sha: str, wait: float = 0.0) -> dict[str, Any]:
             return revision_state(sha, wait)
         return {"state": "done", "index": idx}
     return state
-
-
-def _db_blob_estimate() -> int | None:
-    try:
-        with get_reader() as reader:
-            stats = reader.table_stats(["m_blob_facts"])
-        # An estimate of the rows of both families (calls for .c/.h, Kernel API for .c/.h/.S): about two per blob
-        return int(stats[0].rows) // 2 if stats else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def status() -> dict[str, Any]:
-    try:
-        return {"db_blobs": _db_blob_estimate(), "blobs": fact_store.count(), "bytes": fact_store.size(),
-                "saved_revisions": len(_SAVED.entries()), "saved_bytes": _SAVED.size_bytes(),
-                "revisions": [i.summary() for i in list(_REVISIONS.values())], **_settings()}
-    except CacheError as exc:
-        return {"error": str(exc)}
 

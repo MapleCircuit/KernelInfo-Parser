@@ -731,15 +731,29 @@ class KernelIdeApp {
     const storageEst = await localDB.getStorageEstimate();
     const usedMB = storageEst?.usage ? (storageEst.usage / (1024 * 1024)).toFixed(1) : null;
 
-    const curCodeFontSize = parseInt(localStorage.getItem("kip-code-font-size") || "12", 10);
-    const curUiFontScale = parseInt(localStorage.getItem("kip-ui-font-scale") || "100", 10);
+    const readLsInt = (k, def) => {
+      try {
+        return parseInt(localStorage.getItem(k) || String(def), 10);
+      } catch {
+        return def;
+      }
+    };
+    const readLsStr = (k) => {
+      try {
+        return localStorage.getItem(k);
+      } catch {
+        return null;
+      }
+    };
+    const curCodeFontSize = readLsInt("kip-code-font-size", 12);
+    const curUiFontScale = readLsInt("kip-ui-font-scale", 100);
 
     popover.innerHTML = `
       <div class="settings-popover-header">
         <div class="settings-popover-title">
           <span>⚙️ Settings &amp; Local Storage</span>
         </div>
-        <button id="close-settings-btn" style="background:none;border:none;color:var(--text-muted);font-size:var(--fs-16, 16px);cursor:pointer;">&times;</button>
+        <button id="close-settings-btn" type="button" aria-label="Close settings" style="background:none;border:none;color:var(--text-muted);font-size:var(--fs-16, 16px);cursor:pointer;">&times;</button>
       </div>
 
       <div class="settings-popover-body">
@@ -755,11 +769,11 @@ class KernelIdeApp {
               <span style="font-size:var(--fs-10, 10px);color:var(--text-muted);font-family:var(--font-mono);">${connDetail}</span>
             </div>
 
-            <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);" title="Database Instance: ${cachedHash}">
+            <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);" title="Database Instance: ${escapeHtml(cachedHash)}">
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent-blue);"></span>
                 <span style="font-size:var(--fs-11, 11px);color:var(--text-secondary);">DB Instance:</span>
-                <code style="font-family:var(--font-mono);font-size:var(--fs-11, 11px);color:var(--accent-blue);">${shortHash}</code>
+                <code style="font-family:var(--font-mono);font-size:var(--fs-11, 11px);color:var(--accent-blue);">${escapeHtml(shortHash)}</code>
               </div>
               <span style="font-size:var(--fs-10, 10px);color:var(--accent-green);font-weight:500;">● Synced</span>
             </div>
@@ -794,14 +808,14 @@ class KernelIdeApp {
           <div class="settings-section-title">Hover Cards</div>
           <div style="display:flex;flex-direction:column;gap:8px;background:var(--bg-primary);padding:10px 12px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
             <label style="display:flex;align-items:center;gap:6px;font-size:var(--fs-11, 11px);color:var(--text-secondary);cursor:pointer;">
-              <input type="checkbox" id="setting-hover-enabled" ${localStorage.getItem("kip-hover-cards") === "0" ? "" : "checked"} /> Show a card when the pointer rests on a symbol
+              <input type="checkbox" id="setting-hover-enabled" ${readLsStr("kip-hover-cards") === "0" ? "" : "checked"} /> Show a card when the pointer rests on a symbol
             </label>
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                 <label for="setting-hover-delay" style="font-size:var(--fs-11, 11px);font-weight:600;color:var(--text-secondary);">Delay</label>
-                <span id="setting-hover-delay-val" style="font-size:var(--fs-11, 11px);font-family:var(--font-mono);color:var(--accent-blue);">${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)} ms</span>
+                <span id="setting-hover-delay-val" style="font-size:var(--fs-11, 11px);font-family:var(--font-mono);color:var(--accent-blue);">${readLsInt("kip-hover-delay", 450)} ms</span>
               </div>
-              <input type="range" id="setting-hover-delay" min="300" max="1000" step="50" value="${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)}" style="width:100%;cursor:pointer;" />
+              <input type="range" id="setting-hover-delay" min="300" max="1000" step="50" value="${readLsInt("kip-hover-delay", 450)}" style="width:100%;cursor:pointer;" />
             </div>
           </div>
         </div>
@@ -946,6 +960,7 @@ class KernelIdeApp {
     });
 
     const closePopover = () => {
+      clearTimeout(outsideTimer);
       unsubUser?.();
       popover.remove();
       document.removeEventListener("click", outsideClickHandler);
@@ -957,7 +972,9 @@ class KernelIdeApp {
         closePopover();
       }
     };
-    setTimeout(() => document.addEventListener("click", outsideClickHandler), 10);
+    const outsideTimer = setTimeout(() => {
+      if (popover.isConnected) document.addEventListener("click", outsideClickHandler);
+    }, 10);
 
     popover.querySelector("#close-settings-btn").onclick = closePopover;
 
@@ -1254,7 +1271,7 @@ class KernelIdeApp {
       // Selecting changes nothing on its own: **Apply** or **New Tab** act on the selection.
       select.onchange = (e) => {
         const base = e.target.value;
-        if (!base || base.includes("object")) return;
+        if (!base || base.includes("[object")) return;
         const scope = state.branchTags;
         let target = (this.versionByName.has(base) && (!scope || scope.has(base))) ? base : null;
         if (!target) {
@@ -2011,7 +2028,7 @@ class KernelIdeApp {
   /**
    * Man activity button (§5.38): the man pages index. In the man-pages project, at the explored tag;
    * from the kernel, at the man-pages tag released on or before the explored kernel revision
-   * (`/api/man/resolve`), else the newest tag.
+   * (`/webapi/man/resolve`), else the newest tag.
    */
   updateActivityBar(repo = state.currentRepo || state.activeRepo()) {
     const gated = ["kconfig", "nodemap", "maintainers", "commits", "mail", "api", "insights", "cve", "man", "compare"];
@@ -2140,9 +2157,11 @@ class KernelIdeApp {
       const items = res.entries || res.tree || [];
       treeContainer.innerHTML = "";
 
+      const frag = document.createDocumentFragment();
       items.forEach((item) => {
-        this.renderFileTreeNode(treeContainer, item, 0);
+        this.renderFileTreeNode(frag, item, 0);
       });
+      treeContainer.appendChild(frag);
     } catch (e) {
       treeContainer.innerHTML = `<div style="padding:12px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
     }
@@ -2163,7 +2182,7 @@ class KernelIdeApp {
         : '<path d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v9.086A1.75 1.75 0 0 1 12.75 16h-8.5A1.75 1.75 0 0 1 2 14.25V1.75z"/>'
       }
       </svg>
-      <span style="overflow:hidden;text-overflow:ellipsis;">${item.name}</span>
+      <span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.name || "")}</span>
     `;
 
     row.addEventListener("contextmenu", (e) => {
@@ -2195,11 +2214,15 @@ class KernelIdeApp {
           row.dataset.loading = "true";
           try {
             if (Array.isArray(item.children) && item.children.length > 0) {
-              item.children.forEach((c) => this.renderFileTreeNode(childContainer, c, depth + 1));
+              const frag = document.createDocumentFragment();
+              item.children.forEach((c) => this.renderFileTreeNode(frag, c, depth + 1));
+              childContainer.appendChild(frag);
             } else {
               const res = await api.getDirectoryTree(state.currentVersion, item.path);
               const children = res.entries || res.tree || [];
-              children.forEach((c) => this.renderFileTreeNode(childContainer, c, depth + 1));
+              const frag = document.createDocumentFragment();
+              children.forEach((c) => this.renderFileTreeNode(frag, c, depth + 1));
+              childContainer.appendChild(frag);
             }
           } catch (err) {
             console.warn("Failed to expand dir:", err);
@@ -2239,15 +2262,24 @@ class KernelIdeApp {
 export function applyTypographySettings(codeFontSize = null, uiFontScale = null) {
   let cfs = codeFontSize;
   if (cfs === null) {
-    const raw = localStorage.getItem("kip-code-font-size");
+    let raw = null;
+    try {
+      raw = localStorage.getItem("kip-code-font-size");
+    } catch {
+      raw = null;
+    }
     cfs = raw ? parseInt(raw, 10) : 12;
   }
   cfs = Math.max(10, Math.min(26, Number.isFinite(cfs) ? cfs : 12));
 
   const { uiFontScale: ufs, fontScale, layoutScale } = computeUiScale(uiFontScale);
 
-  localStorage.setItem("kip-code-font-size", String(cfs));
-  localStorage.setItem("kip-ui-font-scale", String(ufs));
+  try {
+    localStorage.setItem("kip-code-font-size", String(cfs));
+    localStorage.setItem("kip-ui-font-scale", String(ufs));
+  } catch {
+    // storage unavailable: settings still apply for this page
+  }
 
   const rowHeight = Math.max(16, Math.round(cfs * 1.667));
   document.documentElement.style.setProperty("--code-font-size", `${cfs}px`);

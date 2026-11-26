@@ -97,9 +97,6 @@ export function seriesOf(tag) {
   return p.series[0] === 2 && p.series[1] === 6 ? `v2.6.${p.series[2]}` : `v${p.series[0]}.${p.series[1]}`;
 }
 
-/** Same series (`series` arrays of parseTag). */
-export const sameSeries = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]);
-
 /**
  * Release (Tag dropdown entry) of a prefixed release tag in a repository without kernel tags: its series'
  * final tag (`finals`: Map series name -> final tag name, whatever its spelling) else the tag's own spelling of

@@ -9,8 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 import unittest.mock
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,7 +53,7 @@ class TestReleaseOrdering(unittest.TestCase):
         ])
 
     def test_previous(self) -> None:
-        prev = lambda t: rs.previous_in(t, REAL_TAGS)  # noqa: E731
+        prev = lambda t: rs.previous_in(t, REAL_TAGS)
         self.assertEqual(prev("v3.1"), "v3.0")
         self.assertEqual(prev("v3.1-rc1"), "v3.0")
         self.assertEqual(prev("v3.1-rc2"), "v3.1-rc1")
@@ -199,7 +199,7 @@ class TestIndexesOnRepository(unittest.TestCase):
         self.assertEqual(rs.releases("mainline"), ["v1.0", "v1.1-rc1", "v1.1"])
         self.assertEqual(rs.releases("stable"), ["v1.0.1"])
         self.assertEqual(rs.previous("v1.1-rc1"), "v1.0")
-        prev, sha = rs.range_of("v1.1")
+        prev, _sha = rs.range_of("v1.1")
         self.assertEqual(prev, self.run_git("rev-parse", "v1.0^{commit}").strip())
         out = rs.release_index.build()
         self.assertEqual(out["ranges_indexed"], 4)
@@ -257,8 +257,8 @@ class TestDatabaseMembership(TestIndexesOnRepository):
         for p in self.patches[-2:]:
             p.stop()
         self.patches = self.patches[:-2]
-        from tests.test_release_stats import _release_db
         from parser.git_ast import release_stats
+        from tests.test_release_stats import _release_db
         self.engine = _release_db()
         release_stats.ingest(self.engine, self.repo, repo_id=1, workers=2)
         self.before = self.engine.count_rows("m_commit_release"), self.engine.count_rows("m_release_segment")
@@ -330,6 +330,7 @@ class TestHistoryEndpoints(unittest.TestCase):
     def test_released_endpoint(self) -> None:
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse
+
         from webapp.backend.routers import commits
         released = {"sha": "a" * 40, "indexed": True, "released": True, "first_tag": "v3.1-rc1", "first_release": "v3.1", "first_stable": None}
         with patch.object(commits.release_service, "first_containing", return_value=released):

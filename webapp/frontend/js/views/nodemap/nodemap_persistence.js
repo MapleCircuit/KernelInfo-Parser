@@ -20,6 +20,7 @@ import { collectReferencedTabIds, pruneOrphanedTabCanvases } from "./nodemap_lib
 const SAVE_DELAY_MS = 300;
 const PASTE_STEP = 24;
 const PUSH_ACK_GRACE_MS = 400;
+const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
 let memoryClipboard = null;
 
 export function hasIndexedDbBackend(ctrl) {
@@ -509,8 +510,18 @@ export async function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT
 
 export function importJSON(ctrl, file) {
   if (!file) return;
+  if (file.size > MAX_IMPORT_BYTES) {
+    toast.error("Import failed: file exceeds the 50 MB size limit");
+    return;
+  }
+  const gen = ctrl._disposeGen;
   const reader = new FileReader();
+  reader.onerror = () => {
+    if (ctrl._disposeGen !== gen) return;
+    toast.error(`Import failed: ${reader.error?.message || "could not read file"}`);
+  };
   reader.onload = (e) => {
+    if (ctrl._disposeGen !== gen) return;
     let parsed = null;
     try {
       parsed = JSON.parse(e.target.result);

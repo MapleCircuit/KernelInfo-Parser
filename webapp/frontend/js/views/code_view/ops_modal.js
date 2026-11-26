@@ -1,11 +1,10 @@
 /**
  * ops_modal.js - Ops implementations (N1, webapp/API.md §5.6): who fills a struct's function-pointer field
- * (`GET /api/tools/{v}/implementations?struct=&field=`) and which ops tables use a function (`?function=`).
+ * (`GET /webapi/tools/{v}/implementations?struct=&field=`) and which ops tables use a function (`?function=`).
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { openModal, escapeHtml } from "../../components/modal.js";
-import { pollJob } from "../../utils/job_poll.js";
 import { viewOf } from "../../utils/active_views.js";
 import { enclosingStruct, tokenRole } from "./ops_model.js";
 
@@ -32,7 +31,8 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
   const isStruct = /(_operations|_ops|_struct)$/.test(name);
   const role = isStruct ? "" : tokenRole(lines[line - 1] || "", name);
   const guess = isStruct ? name : (enclosingStruct(lines, line) || "file_operations");
-  const modal = openModal({ title: "Ops implementations", subtitle: `Function pointers set by struct initializers at ${version} (source index: macro-generated tables are not seen)`, width: "860px", className: "ops-modal" });
+  const abort = new AbortController();
+  const modal = openModal({ title: "Ops implementations", subtitle: `Function pointers set by struct initializers at ${version} (source index: macro-generated tables are not seen)`, width: "860px", className: "ops-modal", onClose: () => abort.abort() });
   modal.body.innerHTML = `
     <div class="ops-form">
       <label>struct <input id="ops-struct" list="ops-structs" value="${escapeHtml(guess)}" spellcheck="false" /></label>
@@ -58,10 +58,11 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
     try {
       const params = new URLSearchParams({ struct });
       if (field) params.set("field", field);
-      const res = await api.requestJob(`/api/tools/${encodeURIComponent(version)}/implementations?${params}`, {
+      const res = await api.requestJob(`/webapi/tools/${encodeURIComponent(version)}/implementations?${params}`, {
         // 202 while the revision's source index is assembled (§2.19); then every struct answers at once
-        timeoutMs: 600000, onProgress: (p) => { status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
+        signal: abort.signal, timeoutMs: 600000, onProgress: (p) => { if (!abort.signal.aborted && status.isConnected) status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
       });
+      if (abort.signal.aborted || !modal.body.isConnected) return;
       status.textContent = `${res.tables.toLocaleString("en-US")} struct ${res.struct} tables in ${res.files} files, ${res.positional_skipped} positional entries not resolved`;
       if (field) {
         results.innerHTML = res.implementations.length
@@ -71,6 +72,7 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
         results.innerHTML = `<div class="ops-fields">${res.fields.map((f) => `<a href="#" data-field="${escapeHtml(f.field)}">.${escapeHtml(f.field)} <span class="kconfig-muted">${f.count}</span></a>`).join("")}</div>`;
       }
     } catch (err) {
+      if (abort.signal.aborted || !modal.body.isConnected) return;
       status.textContent = `Failed: ${err.message}`;
     }
   };
@@ -80,12 +82,14 @@ export function showOpsModal({ version = state.activeVersion?.() || state.curren
     status.textContent = `Looking for ops tables using ${fn}…`;
     results.innerHTML = "";
     try {
-      const res = await api.requestJob(`/api/tools/${encodeURIComponent(version)}/implementations?${new URLSearchParams({ function: fn })}`, {
-        timeoutMs: 600000, onProgress: (p) => { status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
+      const res = await api.requestJob(`/webapi/tools/${encodeURIComponent(version)}/implementations?${new URLSearchParams({ function: fn })}`, {
+        signal: abort.signal, timeoutMs: 600000, onProgress: (p) => { if (!abort.signal.aborted && status.isConnected) status.textContent = `Indexing the sources of ${version}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
       });
+      if (abort.signal.aborted || !modal.body.isConnected) return;
       status.textContent = `${res.uses.length} use${res.uses.length === 1 ? "" : "s"} of ${fn} in struct initializers`;
       results.innerHTML = res.uses.length ? implRows(res.uses.map((u) => ({ ...u, function: fn })), version) : "";
     } catch (err) {
+      if (abort.signal.aborted || !modal.body.isConnected) return;
       status.textContent = `Failed: ${err.message}`;
     }
   };

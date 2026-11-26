@@ -9,7 +9,7 @@ from core.tui.screens.database_ssh import DatabaseSSHScreen
 from core.tui.screens.db_content import DBContentScreen
 from core.tui.screens.diagnostics import DiagnosticsScreen
 from core.tui.screens.git_select import GitRepoSelectScreen
-from core.tui.screens.launch import RUN_SAVED, launch_pipeline
+from core.tui.screens.launch import RUN_SAVED, choose_launch_config, choose_servers, launch_pipeline, launch_servers
 from core.tui.screens.logging_cfg import LoggingScreen
 from core.tui.screens.parser_dist import ParserDistributedScreen
 from core.tui.screens.repos import RepositoriesScreen
@@ -37,16 +37,17 @@ class MainMenuScreen(BaseScreen):
         ("2", "Database, SSH Tunnel & Auth", "Database credentials, socket, and SSH port forwarding"),
         ("3", "Parser Engine & Distributed Node ID", "Memory limit, hugepages, worker_id, standalone/master/worker/daemon role"),
         ("4", "CVE Catalog & Mailing List", "CVE list clone directory, lore storage & ML daemon tunnel"),
-        ("L", "Logging Configuration", "Parser & webapp log files, directories, levels & request filter"),
+        ("L", "Logging Configuration", "Parser, webapp & API log files, directories, levels & request filter"),
         ("5", "Run Diagnostics (Test All)", "Verify all database, SSH, git, CVE, and daemon configurations"),
         ("6", "Git Repository Manager", "Linux, CVE & other repos: select, clone, add, remotes, fetch all"),
         ("7", "Parse & Pre-Parse Versions / Tags", "Select tags to parse now and configure Insights / API pre-parse rules"),
         ("8", "Table Reset", "Drop & recreate every database table (type RESET to confirm)"),
         ("9", "DB Content Viewer", "Parsed versions, repos & branches, ML/CVE data, table sizes, clean partial runs"),
-        ("0", "Systemd Services (Daemon & Webapp)", "Install & manage daemon/webapp systemd units, tmux mode & configs"),
+        ("0", "Systemd Services (Daemon, Webapp & API)", "Install & manage daemon/webapp/api systemd units, tmux mode & configs"),
         ("S", "Save Configuration", "Saves to Active Config File"),
         ("R", "Save & Run Pipeline", "Save settings and proceed directly to running the parser pipeline"),
         ("P", "Run Pipeline (saved config.json)", "Run the parser with config.json as saved on disk, without saving"),
+        ("W", "Launch Webapp / API Servers", "Exit the TUI and start the webapp, the API, or both in the foreground"),
         ("Q", "Exit", "Exit the configuration utility"),
     ]
     # Hotkey (lower-case) -> MENU_ITEMS key
@@ -61,6 +62,7 @@ class MainMenuScreen(BaseScreen):
             ("S", "Save"),
             ("R", "Save & Run"),
             ("P", "Run Saved"),
+            ("W", "Servers"),
             ("Q", "Exit"),
         ])
 
@@ -92,7 +94,7 @@ class MainMenuScreen(BaseScreen):
         self.safe_addstr(
             2,
             2,
-            "Use Arrow keys and [Enter] to navigate, or press hotkeys [0-9, L, S, R, P, Q].",
+            "Use Arrow keys and [Enter] to navigate, or press hotkeys [0-9, L, S, R, P, W, Q].",
             curses.A_NORMAL,
         )
 
@@ -205,6 +207,8 @@ class MainMenuScreen(BaseScreen):
             return True
         if key == "P":  # Run Pipeline with the saved config.json
             return self._run_saved_config()
+        if key == "W":  # Launch webapp / API servers
+            return self._launch_servers()
         if key == "Q":  # Exit
             if self.app.is_dirty:
                 dlg = ModalDialog(
@@ -236,4 +240,15 @@ class MainMenuScreen(BaseScreen):
             if choice != "Run (discard edits)":
                 return True
         launch_pipeline(self.stdscr, self.app, RUN_SAVED)
+        return True
+
+    def _launch_servers(self) -> bool:
+        """Pick the server(s), resolve unsaved edits, then exit the TUI with a server launch request."""
+        servers = choose_servers(self.stdscr)
+        if servers is None:
+            return True
+        mode = choose_launch_config(self.stdscr, self.app, "Launch")
+        if mode is None:
+            return True
+        launch_servers(self.stdscr, self.app, mode, servers)
         return True

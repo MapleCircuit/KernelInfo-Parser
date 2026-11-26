@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Query
 from webapp.backend.config import require_feature
 from webapp.backend.services import man_service
 
-router = APIRouter(prefix="/api/man", tags=["man"])
+router = APIRouter(prefix="/webapi/man", tags=["man"])
 
 
 @router.get("/tags", dependencies=[Depends(require_feature("man"))])

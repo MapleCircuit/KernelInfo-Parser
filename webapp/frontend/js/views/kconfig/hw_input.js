@@ -43,8 +43,6 @@ export function parseModuleList(text) {
   return out;
 }
 
-const TRI = ["n", "m", "y"];
-
 /**
  * localmodconfig on `probe` (mutated): returns {disabled: [name], kept: [{name, why}]}.
  * `needed` are the symbols the listed modules require; `gates` the symbols gating any module-capable object.
@@ -139,6 +137,3 @@ export async function ensureModules(probe, modules, solve, { limit = 200, onProg
   }
   return { toggles, blocked };
 }
-
-/** Value letter of a tristate (for tests and labels). */
-export const triChar = (probe, name) => TRI[probe.symTri(name)];

@@ -219,6 +219,9 @@ def _read_blobs(shas: list[str]) -> dict[str, str]:
             pos = nl + 1  # "<sha> missing"
             continue
         size = int(header[2])
+        if header[1] != b"blob":
+            pos = nl + 1 + size + 1
+            continue
         texts[header[0].decode("ascii")] = raw[nl + 1:nl + 1 + size].decode("utf-8", errors="replace")
         pos = nl + 1 + size + 1
     return texts

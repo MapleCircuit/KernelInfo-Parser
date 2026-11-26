@@ -22,6 +22,13 @@ class TestConstantsAndTypes(unittest.TestCase):
         self.assertEqual(sm.DAEMON_TMUX_SESSION, "kernelinfo-daemon")
         self.assertEqual(sm.WEBAPP_TMUX_SOCKET, "kernelinfo-webapp")
         self.assertEqual(sm.WEBAPP_TMUX_SESSION, "kernelinfo-webapp")
+        self.assertEqual(sm.API_SERVICE_NAME, "kernelinfo-api")
+        self.assertEqual(sm.API_UNIT_NAME, "kernelinfo-api.service")
+        self.assertEqual(sm.API_TMUX_SOCKET, "kernelinfo-api")
+        self.assertEqual(sm.API_TMUX_SESSION, "kernelinfo-api")
+
+    def test_valid_services_include_api(self) -> None:
+        self.assertEqual(sm.VALID_SERVICES, ("daemon", "webapp", "api"))
 
     def test_service_unit_config_validation(self) -> None:
         cfg = sm.ServiceUnitConfig(
@@ -111,6 +118,49 @@ class TestUnitRenderingAndParsing(unittest.TestCase):
         self.assertEqual(parsed["group"], "www-data")
         self.assertEqual(parsed["mode"], "direct")
         self.assertEqual(parsed["config_path"], "/etc/kip/prod.json")
+
+    def test_render_direct_api(self) -> None:
+        cfg = sm.ServiceUnitConfig(
+            service="api",
+            user="kip",
+            group="kip",
+            use_tmux=False,
+            project_root=Path("/opt/kip"),
+            config_path=Path("/opt/kip/config_api.json"),
+            python_executable="/opt/venv/bin/python",
+        )
+        unit = sm.render_unit_file(cfg)
+        self.assertIn("Description=KernelInfo-Parser API Service", unit)
+        self.assertIn("Type=simple", unit)
+        self.assertIn(
+            "ExecStart=/opt/venv/bin/python /opt/kip/api/main.py --config /opt/kip/config_api.json",
+            unit,
+        )
+        self.assertNotIn("--role daemon", unit)
+        parsed = sm.parse_unit_file(unit, "api")
+        self.assertEqual(parsed["user"], "kip")
+        self.assertEqual(parsed["mode"], "direct")
+        self.assertEqual(parsed["config_path"], "/opt/kip/config_api.json")
+
+    def test_render_tmux_api(self) -> None:
+        cfg = sm.ServiceUnitConfig(
+            service="api",
+            user="alice",
+            group="alice",
+            use_tmux=True,
+            project_root=Path("/opt/kip"),
+            config_path=Path("/opt/kip/config_api.json"),
+            python_executable="/usr/bin/python3",
+        )
+        unit = sm.render_unit_file(cfg, tmux_bin="/usr/bin/tmux")
+        self.assertIn("Type=forking", unit)
+        self.assertIn("api/main.py", unit)
+        self.assertIn("kernelinfo-api", unit)
+        self.assertEqual(sm.parse_unit_file(unit, "api")["mode"], "tmux")
+        self.assertEqual(
+            sm.get_attach_command("api", "kipuser", current_user="alice"),
+            "sudo -u kipuser tmux -L kernelinfo-api attach -t kernelinfo-api",
+        )
 
     def test_render_tmux_daemon_and_webapp(self) -> None:
         for svc, socket, session, expected_tail in (

@@ -13,8 +13,9 @@ import difflib
 import hashlib
 import re
 import subprocess
-from datetime import datetime, timezone
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -30,7 +31,7 @@ _TAG_RE = re.compile(r"^\s*\[[^\]]*\]\s*")
 
 def blob_sha(text: str) -> str:
     """The blob id `git hash-object` gives this text (nothing is written)."""
-    data = text.encode("utf-8", errors="surrogateescape")
+    data = text.encode("utf-8", errors="replace")
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
@@ -146,7 +147,7 @@ class PatchSeriesFormatter:
         patches = req["patches"]
         total = len(patches)
         cover = req.get("cover") if total > 1 else None
-        when = self.now or datetime.now(timezone.utc)
+        when = self.now or datetime.now(UTC)
         date = when.strftime("%a, %d %b %Y %H:%M:%S +0000")
         signoff = f"Signed-off-by: {author['name'].strip()} <{author['email'].strip()}>"
         version = int(req.get("version") or 1)
@@ -222,16 +223,16 @@ def _git_read(sha: str, path: str) -> tuple[str | None, str | None, str]:
         return None, None, "100644"
     mode = "100644"
     try:
-        ls = subprocess.run(["git", "-C", str(get_repo_dir()), "ls-tree", sha, "--", path], capture_output=True, text=True, timeout=10).stdout
+        ls = subprocess.run(["git", "-C", str(get_repo_dir()), "ls-tree", sha, "--", path], capture_output=True, text=True, errors="replace", check=False, timeout=10).stdout
         if ls:
             mode = ls.split()[0]
     except (OSError, subprocess.SubprocessError):
         pass
-    return data.decode("utf-8", errors="surrogateescape"), blob, mode
+    return data.decode("utf-8", errors="replace"), blob, mode
 
 
 def format_series(revision: str, req: dict[str, Any]) -> dict[str, Any]:
-    """`POST /api/version/{v}/patch/series`: the formatted series plus whether it applies to its base."""
+    """`POST /webapi/version/{v}/patch/series`: the formatted series plus whether it applies to its base."""
     from webapp.backend.services.tree_resolver import git_tree_resolver
     if not isinstance(req, dict):
         raise HTTPException(status_code=400, detail="Body must be a JSON object")

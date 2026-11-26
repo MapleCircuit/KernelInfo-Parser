@@ -75,6 +75,12 @@ export class CveView {
   }
 
   render(containerEl, tabData) {
+    clearTimeout(this.queryTimer);
+    clearTimeout(this.versionTimer);
+    this.queryTimer = null;
+    this.versionTimer = null;
+    this.list?.dispose();
+    this.list = null;
     this.containerEl = containerEl;
     this.tabId = tabData.id;
     this.tab = tabData;
@@ -350,6 +356,8 @@ export class CveView {
   }
 
   dispose() {
+    this.listSeq++;
+    this.detailSeq++;
     clearTimeout(this.queryTimer);
     clearTimeout(this.versionTimer);
     this.abort?.abort();

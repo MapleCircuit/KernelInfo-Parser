@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,9 +14,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import HTTPException
 
-from webapp.backend.security.git import git_pathspecs, validate_grep_pattern, validate_pathspecs
+from webapp.backend.security.git import (
+    git_pathspecs,
+    validate_grep_pattern,
+    validate_pathspecs,
+)
 from webapp.backend.services import grep_service as gs
-from webapp.backend.services.grep_service import GrepService, clip_line, parse_colored_line
+from webapp.backend.services.grep_service import (
+    GrepService,
+    clip_line,
+    parse_colored_line,
+)
 from webapp.backend.services.tree_resolver import GitTreeResolver
 
 
@@ -78,7 +85,7 @@ class TestGrepIntegration(unittest.TestCase):
         repo = Path(cls.tmp.name)
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e", "GIT_COMMITTER_NAME": "t",
                "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
-        run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, env=env)  # noqa: E731
+        run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, env=env)
         run("init", "-q")
         (repo / "fs").mkdir()
         (repo / "drivers" / "staging").mkdir(parents=True)
@@ -188,7 +195,7 @@ class TestGrepIntegration(unittest.TestCase):
             limited = fs_router.grep_code("v1.0", q="foo", limit=2)
             self.assertTrue(limited["truncated"])
             self.assertNotIn("cached", fs_router.grep_code("v1.0", q="foo", limit=2))
-            for bad in (dict(q="foo", path=["../etc"]), dict(q=""), dict(q="a\nb")):
+            for bad in ({"q": "foo", "path": ["../etc"]}, {"q": ""}, {"q": "a\nb"}):
                 with self.assertRaises(HTTPException) as ctx:
                     fs_router.grep_code("v1.0", **bad)
                 self.assertEqual(ctx.exception.status_code, 400)

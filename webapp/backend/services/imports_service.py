@@ -51,7 +51,11 @@ from webapp.backend.services import kconfig_facts
 from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.outline_service import outline_kind
-from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, GitTreeResolver, git_tree_resolver
+from webapp.backend.services.tree_resolver import (
+    DEFAULT_DEFINITION_ARCH,
+    GitTreeResolver,
+    git_tree_resolver,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +254,7 @@ class ImportsService:
         extra: list[dict[str, Any]] = []
         if unresolved and arch_used:
             try:
-                extra, context = self._context_items(rev, arch_used, clean, tree, blob_id, unresolved, set(reached))
+                extra, context = self._context_items(rev, arch_used, clean, tree, blob_id, unresolved)
             except Exception as exc:  # noqa: BLE001 - context imports are best effort over the stored rows
                 logger.debug("context imports of %s unavailable: %s", clean, exc)
                 extra = []
@@ -344,9 +348,7 @@ class ImportsService:
         target-arch Kconfig files ahead of foreign `arch/*/` trees, then shorter paths."""
         karch = path_arch(kpath)
         arch_norm = "x86" if arch in ("x86_64", "i386") else arch
-        if karch is None:
-            arch_tier = 0
-        elif karch in (arch, arch_norm):
+        if karch is None or karch in (arch, arch_norm):
             arch_tier = 0
         else:
             arch_tier = 1
@@ -547,7 +549,7 @@ class ImportsService:
 
     # ------------------------------------------------------------------ context imports
     def _context_items(self, rev: str, arch: str, path: str, tree: dict[str, str], blob_id: int,
-                       unresolved: dict[str, dict[str, Any]], searched: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+                       unresolved: dict[str, dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
         """Items for `unresolved` names defined by what the files including `path` include before it, or
         forward-declared tag types completed later in a direct includer header itself."""
         with get_reader() as reader:
@@ -576,9 +578,11 @@ class ImportsService:
                 for d in defs:
                     if int(d.get("blob_id") or 0) in self_blobs:
                         tname = safe_decode(d.get("type_name"))
-                        if def_namespace(tname) != NS_TAG or tname in _FORWARD:
-                            if blob_paths.get(int(d.get("blob_id") or 0)) == [includer]:
-                                continue
+                        if (
+                            (def_namespace(tname) != NS_TAG or tname in _FORWARD)
+                            and blob_paths.get(int(d.get("blob_id") or 0)) == [includer]
+                        ):
+                            continue
                     filtered_defs.append(d)
                 defs = filtered_defs
             body = self._build(includer, unresolved, walk, blob_paths, defs)

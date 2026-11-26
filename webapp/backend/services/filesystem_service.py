@@ -1,24 +1,28 @@
 """webapp/backend/services/filesystem_service.py - Directory & Source File Inspection."""
 from __future__ import annotations
-from collections.abc import Iterator
+
 import heapq
 import logging
 import os
 import posixpath
-from webapp.backend.config import RepoScopedCache, get_repo_dir
+from collections.abc import Iterator
 from typing import Any
+
 from fastapi import HTTPException
+
 from db_engine.spec import AnyOf, Join, like, ne
-from webapp.backend.database.pool import get_reader
+from webapp.backend.config import RepoScopedCache, get_repo_dir
 from webapp.backend.database.helpers import (
-    safe_decode,
     format_stat_label,
     get_version_info,
+    safe_decode,
 )
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.git_reader import git_reader
-from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
+from webapp.backend.services.tree_resolver import git_tree_resolver, tree_resolver
+
 logger = logging.getLogger(__name__)
 
 # Bounded: every key below carries a request parameter (a header, a path), so an unbounded cache
@@ -250,8 +254,8 @@ class FilesystemService:
         try:
             from webapp.backend.services.git_service import GitService
             last_changed = GitService().get_file_last_changed(vname, norm_path, blob_id=fid)
-        except Exception:  # noqa: BLE001 - the header line is optional
-            pass
+        except Exception as exc:  # noqa: BLE001 - the header line is optional
+            logger.debug("last_changed skipped for %s: %s", norm_path, exc)
 
         return {
             "type": "file",
@@ -485,7 +489,7 @@ class FilesystemService:
         lists: dict[str, list[dict[str, Any]]] = {"included_by": [], "sourced_by": [], "documented_in": [], "built_by": []}
         out: dict[str, Any] = {"version": version_name, "path": norm, "includes_source": "parser", "indexed": False}
         with get_reader() as reader:
-            vid, vname = get_version_info(reader, version_name)
+            _vid, vname = get_version_info(reader, version_name)
             rev = vname or version_name
             blob_paths = git_tree_resolver.blob_paths(reader, rev)
             if blob_paths is None:
@@ -801,7 +805,8 @@ class FilesystemService:
 
             if not norm_obj.endswith(".o") or len(norm_obj) <= 2 or norm_obj.endswith("/.o"):
                 res: dict[str, Any] = {"object": norm_obj, "path": None, "resolved": False}
-                _OBJECT_CACHE[cache_key] = res
+                if vid or res.get("resolved"):
+                    _OBJECT_CACHE[cache_key] = res
                 return res
 
             stem = norm_obj[:-2]
@@ -836,7 +841,8 @@ class FilesystemService:
                 "path": None,
                 "resolved": False,
             }
-            _OBJECT_CACHE[cache_key] = res
+            if vid or res.get("resolved"):
+                _OBJECT_CACHE[cache_key] = res
             return res
 
 

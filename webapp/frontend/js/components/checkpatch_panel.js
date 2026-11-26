@@ -1,7 +1,7 @@
 /**
  * checkpatch_panel.js - "Run checkpatch" for a generated patch (P4, webapp/API.md §5.17).
  *
- * `POST /api/tools/{v}/checkpatch` runs scripts/checkpatch.pl of a configured release tag on the server
+ * `POST /webapi/tools/{v}/checkpatch` runs scripts/checkpatch.pl of a configured release tag on the server
  * (off by default; the panel then names the config key). Results are grouped by level; `onJump(line)`
  * receives the patch line of a result (the patch preview scrolls to it and marks it).
  */

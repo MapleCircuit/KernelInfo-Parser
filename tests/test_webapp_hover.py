@@ -9,32 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webapp.backend.services.hover_service import extract_doc, extract_signature
 
-SRC = """/**
- * list_add - add a new entry
- * @new: new entry to be added
- * @head: list head to add it after
- *
- * Insert a new entry after the specified head.
- * This is good for implementing stacks.
- *
- * More text.
- */
-static inline void list_add(struct list_head *new,
-			    struct list_head *head)
-{
-	__list_add(new, head, head->next);
-}
-
-/* plain comment */
-#define container_of(ptr, type, member) ({			\\
-	const typeof( ((type *)0)->member ) *__mptr = (ptr);	\\
-	(type *)( (char *)__mptr - offsetof(type,member) );})
-
-struct inode {
-	umode_t i_mode;
-};
-extern void *kmalloc(size_t size, gfp_t flags);
-""".split("\n")
+SRC = ["/**", " * list_add - add a new entry", " * @new: new entry to be added", " * @head: list head to add it after", " *", " * Insert a new entry after the specified head.", " * This is good for implementing stacks.", " *", " * More text.", " */", "static inline void list_add(struct list_head *new,", "\t\t\t    struct list_head *head)", "{", "\t__list_add(new, head, head->next);", "}", "", "/* plain comment */", "#define container_of(ptr, type, member) ({\t\t\t\\", "\tconst typeof( ((type *)0)->member ) *__mptr = (ptr);\t\\", "\t(type *)( (char *)__mptr - offsetof(type,member) );})", "", "struct inode {", "\tumode_t i_mode;", "};", "extern void *kmalloc(size_t size, gfp_t flags);", ""]
 
 
 class TestHover(unittest.TestCase):
@@ -88,6 +63,7 @@ class TestPositionAwareHover(unittest.TestCase):
 
     def setUp(self) -> None:
         from unittest.mock import MagicMock, patch
+
         from tests import test_webapp_scope as ts
         from webapp.backend.routers import symbols as router
         from webapp.backend.services import hover_service as hs
@@ -131,6 +107,29 @@ class TestPositionAwareHover(unittest.TestCase):
         out = self.router.get_symbol_hover("v3.0", "dev", "x86_64", self.ts.SYSCALL)
         self.assertEqual(out, {"global": True})
         self.global_hover.assert_called_once()
+
+
+class TestHoverNoneDefinition(unittest.TestCase):
+    """BE-013 regression: HoverService handles detail dicts whose definition is None."""
+
+    def test_hover_with_none_definition_does_not_raise(self) -> None:
+        from unittest.mock import patch
+
+        from webapp.backend.services.hover_service import HoverService
+
+        svc = HoverService()
+        detail = {
+            "file_path": "kernel/fork.c",
+            "line_s": 1,
+            "type_name": "function",
+            "definition": None,
+            "attributes": None,
+        }
+        with patch("webapp.backend.services.tree_resolver.git_tree_resolver.resolve_commit_sha", return_value="abc123"), \
+                patch("webapp.backend.services.git_reader.git_reader.read_file", return_value=(b"void foo(void) {}\n", False, "1" * 40)):
+            out = svc.hover("v3.0", "foo", "x86", "kernel/fork.c", lambda *_args: detail)
+        self.assertTrue(out["found"])
+        self.assertEqual(out["file"], "kernel/fork.c")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from webapp.backend.config import require_feature
 from webapp.backend.services import cve_service
 
-router = APIRouter(prefix="/api/cve", tags=["cve"], dependencies=[Depends(require_feature("cve"))])
+router = APIRouter(prefix="/webapi/cve", tags=["cve"], dependencies=[Depends(require_feature("cve"))])
 
 
 @router.get("/status")

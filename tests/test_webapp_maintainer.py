@@ -4,25 +4,27 @@ Validates the FastAPI web endpoints for the subsystems catalog, developer profil
 cross-referencing, and the credits overview.
 """
 from __future__ import annotations
+
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from db_engine.spec import gt
 from tests import require_indexed_ref
 from tests.db_fixtures import requires_live_db
-from db_engine.spec import gt
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.maintainer_service import (
+    MaintainerService,
     _address_in_domain,
     _build_identity_index,
     _clean_name,
     _domain_query,
     _emails_in_domain,
     _identity_key,
-    MaintainerService,
 )
+
 maintainer_service = MaintainerService()
 get_maintainers_overview = maintainer_service.get_overview
 get_person_profile = maintainer_service.get_person_profile
@@ -43,7 +45,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         except unittest.SkipTest:
             raise
         except Exception as e:
-            raise unittest.SkipTest(f"Database check failed: {e}")
+            raise unittest.SkipTest(f"Database check failed: {e}") from e
 
     def test_maintainers_overview_and_search(self) -> None:
         require_indexed_ref("v3.0")
@@ -184,6 +186,47 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         prof = get_person_profile("v3.0", top["person_id"])
         self.assertEqual(prof["alias_person_ids"], top["alias_person_ids"])
         self.assertEqual(prof["subsystems_count"], top["subsystems_count"])
+
+
+class TestMaintainerHardening(unittest.TestCase):
+    """BE-012 & BE-024 regression: indexed=False on unparsed version, no empty cache poisoning, match path bounds."""
+
+    def test_unindexed_version_not_poisoned_in_cache(self) -> None:
+        from unittest.mock import patch
+
+        from core.DBLayout import TABLES
+        from tests.db_fixtures import make_db, patch_reader
+        from webapp.backend.services.maintainer_service import (
+            _MAINTAINER_CACHE,
+            MaintainerService,
+        )
+
+        db = make_db("mock", tables=TABLES)
+        _MAINTAINER_CACHE.clear()
+        self.addCleanup(_MAINTAINER_CACHE.clear)
+        svc = MaintainerService()
+
+        with patch_reader(db), \
+                patch("webapp.backend.services.maintainer_service.get_version_info", return_value=(1, "v-unindexed")), \
+                patch("webapp.backend.services.tree_resolver.git_tree_resolver.blob_paths", return_value={}):
+            overview = svc.get_overview("v-unindexed")
+            self.assertFalse(overview["indexed"])
+            sections, _matcher = svc.get_maintainer_data("v-unindexed")
+        self.assertEqual(sections, [])
+        self.assertIsNone(_MAINTAINER_CACHE.get("v-unindexed"))
+
+    def test_match_router_rejects_traversal_and_oversized_patch(self) -> None:
+        from fastapi import HTTPException
+
+        from webapp.backend.routers.maintainers import match_maintainers
+
+        with self.assertRaises(HTTPException) as bad_path:
+            match_maintainers("v3.0", {"paths": ["../../etc/passwd"]})
+        self.assertEqual(bad_path.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as too_big:
+            match_maintainers("v3.0", {"patch_text": "x" * 5_000_001})
+        self.assertEqual(too_big.exception.status_code, 413)
 
 
 if __name__ == "__main__":

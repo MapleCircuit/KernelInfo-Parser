@@ -6,6 +6,7 @@
  */
 import { localDB } from "./db.js";
 import { embedSessionChannel, embedSessionId, isEmbedMode } from "./utils/embed_mode.js";
+import { TAB_TYPES } from "./utils/session_transfer.js";
 
 const SESSIONS_INDEX_KEY = "kip_sessions_index";
 const SESSION_STORAGE_PIN_KEY = "kip_active_session_id";
@@ -263,7 +264,9 @@ class SessionManager {
           // closes its copy once this one answers `tab:transfer:accepted`.
           if (msg.winId === this.getWindowId()) break;
           if (!msg.targetSessionId || msg.targetSessionId !== this.activeSessionId) break;
-          this.emit("tab:push:received", msg.payload || null);
+          const incomingType = msg.payload?.tabData?.type;
+          if (typeof incomingType !== "string" || !TAB_TYPES.includes(incomingType)) break;
+          this.emit("tab:push:received", msg.payload);
           break;
         }
 
@@ -1078,7 +1081,7 @@ class SessionManager {
     if (this.embedded) return null; // embed shells never write workspace sessions
     const session = this.readSession(sessionId);
     const tabData = payload?.tabData;
-    if (!session || !tabData) return null;
+    if (!session || !tabData || typeof tabData !== "object" || typeof tabData.type !== "string" || !TAB_TYPES.includes(tabData.type)) return null;
 
     const panes = Array.isArray(session.panes) && session.panes.length > 0
       ? session.panes
@@ -1086,7 +1089,10 @@ class SessionManager {
     const pane = panes.find((p) => p.id === session.activePaneId) || panes[0];
     if (!Array.isArray(pane.tabs)) pane.tabs = [];
 
-    const tab = { ...tabData };
+    const tab = {};
+    for (const [k, v] of Object.entries(tabData)) {
+      if (k !== "__proto__" && k !== "constructor" && k !== "prototype") tab[k] = v;
+    }
     // Tab ids are unique per session, not globally: a duplicate of the source session may be stored
     // here, and two tabs of one session sharing an id would announce one engine under both.
     const taken = new Set(panes.flatMap((p) => (p.tabs || []).map((t) => t.id)));

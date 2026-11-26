@@ -35,12 +35,11 @@ class TestArgumentBuilder(unittest.TestCase):
         self.assertLess(args.index("a" * 40), sep)
 
     def test_validation(self) -> None:
-        for kwargs in (dict(author="x" * 101), dict(author="a\nb"), dict(since="2011-1-1"), dict(until="2011-02-30"),
-                       dict(roles=["boss:x"]), dict(paths=["../etc"]), dict(range_="--output=x..v1"), dict(range_="v1"),
-                       dict(merges="maybe")):
-            with self.assertRaises(HTTPException, msg=kwargs):
-                with patch.object(cq, "_resolve", return_value="a" * 40):
-                    cq.query_commits("v1.0", **kwargs)
+        for kwargs in ({"author": "x" * 101}, {"author": "a\nb"}, {"since": "2011-1-1"}, {"until": "2011-02-30"},
+                       {"roles": ["boss:x"]}, {"paths": ["../etc"]}, {"range_": "--output=x..v1"}, {"range_": "v1"},
+                       {"merges": "maybe"}):
+            with self.assertRaises(HTTPException, msg=kwargs), patch.object(cq, "_resolve", return_value="a" * 40):
+                cq.query_commits("v1.0", **kwargs)
         self.assertEqual(cq.parse_roles(["reviewer:Ann", "acked:"]), [("Reviewed-by", "Ann")])
 
 

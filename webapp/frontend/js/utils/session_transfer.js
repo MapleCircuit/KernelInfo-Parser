@@ -6,7 +6,7 @@
 export const SESSION_FORMAT = "kip-session";
 export const MAX_SESSION_BYTES = 5 << 20;
 export const TAB_TYPES = ["code", "kconfig", "explorer", "mail", "nodemap", "maintainers", "commits", "pahole", "callgraph",
-  "diff", "treemap", "search", "status", "patch", "bookmarks", "api", "insights", "man"];
+  "diff", "treemap", "search", "status", "patch", "bookmarks", "api", "insights", "man", "watch", "cve"];
 
 export const profileKeyOf = (version, arch, name = "") => `${version}|${arch}${String(name || "").trim() ? `|${String(name).trim()}` : ""}`;
 
@@ -37,7 +37,19 @@ export function buildSessionExport({ session, profiles = {}, toolchains = {}, us
 }
 
 const SAFE_PATH = (p) => typeof p === "string" && p.length <= 1024 && !p.startsWith("/") && !p.includes("\0") && !p.split("/").includes("..");
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const STR = (v, max = 512) => (typeof v === "string" ? v.slice(0, max) : "");
+
+function sanitizeNestedJson(value, depth = 0) {
+  if (depth > 16 || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => sanitizeNestedJson(item, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (UNSAFE_KEYS.has(k)) continue;
+    out[k] = sanitizeNestedJson(v, depth + 1);
+  }
+  return out;
+}
 
 /** The validated, cleaned content of a session file; throws with the reason when it cannot be imported. */
 export function validateSessionFile(text) {
@@ -59,9 +71,10 @@ export function validateSessionFile(text) {
       for (const k of ["path", "filePath"]) if (t[k] !== undefined && t[k] !== "" && !SAFE_PATH(t[k])) throw new Error(`Invalid path in a ${t.type} tab`);
       const clean = {};
       for (const [k, v] of Object.entries(t)) {
+        if (UNSAFE_KEYS.has(k)) continue;
         if (typeof v === "string") clean[k] = v.slice(0, 4096);
         else if (typeof v === "number" || typeof v === "boolean" || v === null) clean[k] = v;
-        else if (typeof v === "object" && JSON.stringify(v).length <= 65536) clean[k] = JSON.parse(JSON.stringify(v));
+        else if (typeof v === "object" && JSON.stringify(v).length <= 65536) clean[k] = sanitizeNestedJson(JSON.parse(JSON.stringify(v)));
       }
       clean.id = STR(t.id, 64) || `tab-${Math.random().toString(36).slice(2, 9)}`;
       return clean;
@@ -71,17 +84,23 @@ export function validateSessionFile(text) {
   const objOf = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
   const profiles = {};
   for (const [k, v] of Object.entries(objOf(doc.kconfig?.profiles))) {
-    if (typeof k === "string" && k.length <= 300 && v && typeof v === "object") profiles[k] = Object.fromEntries(Object.entries(v).filter(([n, x]) => /^[A-Za-z0-9_]{1,200}$/.test(n) && typeof x === "string" && x.length <= 4096));
+    if (typeof k === "string" && k.length <= 300 && !UNSAFE_KEYS.has(k) && v && typeof v === "object") profiles[k] = Object.fromEntries(Object.entries(v).filter(([n, x]) => !UNSAFE_KEYS.has(n) && /^[A-Za-z0-9_]{1,200}$/.test(n) && typeof x === "string" && x.length <= 4096));
   }
   const toolchains = {};
-  for (const [k, v] of Object.entries(objOf(doc.kconfig?.toolchains))) if (k.length <= 300 && v && typeof v === "object") toolchains[k] = JSON.parse(JSON.stringify(v));
+  for (const [k, v] of Object.entries(objOf(doc.kconfig?.toolchains))) if (k.length <= 300 && !UNSAFE_KEYS.has(k) && v && typeof v === "object") toolchains[k] = sanitizeNestedJson(JSON.parse(JSON.stringify(v)));
+  const kconfigEngineProfiles = {};
+  for (const [k, v] of Object.entries(objOf(s.kconfigEngineProfiles))) {
+    if (k.length <= 200 && !UNSAFE_KEYS.has(k) && v && typeof v === "object" && !Array.isArray(v)) {
+      kconfigEngineProfiles[k] = sanitizeNestedJson(v);
+    }
+  }
   return {
     repository: STR(doc.repository, 200), build: STR(doc.build, 80), exported_at: STR(doc.exported_at, 40),
     session: {
       name: STR(s.name, 200) || "Imported session", version: STR(s.version, 200), selectedBranch: STR(s.selectedBranch, 200),
       splitMode: ["single", "horizontal", "vertical"].includes(s.splitMode) ? s.splitMode : "single", activePaneId: STR(s.activePaneId, 64), panes,
       kconfigEngineTabIds: Array.isArray(s.kconfigEngineTabIds) ? s.kconfigEngineTabIds.filter((x) => typeof x === "string").slice(0, 50) : [],
-      kconfigEngineProfiles: objOf(s.kconfigEngineProfiles),
+      kconfigEngineProfiles,
     },
     profiles, toolchains,
     user: Array.isArray(doc.user?.records) ? doc.user.records : [],

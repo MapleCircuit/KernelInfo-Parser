@@ -1,18 +1,25 @@
 """webapp/backend/services/symbol_service.py - Semantic Symbol Indexing, XRefs & AST Container Inspection."""
 from __future__ import annotations
+
 from typing import Any
+
 from fastapi import HTTPException
+
 from core.globalstuff import ASTT
 from db_engine.spec import Agg, Join, ge, le, like
-from webapp.backend.database.pool import get_reader
 from webapp.backend.database.helpers import (
-    safe_decode,
     get_version_info,
+    safe_decode,
 )
+from webapp.backend.database.pool import get_reader
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import is_valid_identifier
 from webapp.backend.services.arch_layout_service import arch_layout_service
-from webapp.backend.services.imports_service import def_namespace, import_kind, imports_service
+from webapp.backend.services.imports_service import (
+    def_namespace,
+    import_kind,
+    imports_service,
+)
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
     best_path,
@@ -222,7 +229,7 @@ class SymbolService:
     @staticmethod
     def _kconfig_detail(vname: str, name: str, arch_id: str) -> dict[str, Any] | None:
         """Symbol detail of a Kconfig symbol (CONFIG_ prefix optional) in the ARCH's model, else None."""
-        clean_name = name[7:] if name.startswith("CONFIG_") else name
+        clean_name = name.removeprefix("CONFIG_")
         try:
             from webapp.backend.services.kconfig_service import KconfigService
             k_detail = KconfigService().get_symbol_detail(vname, clean_name, arch_id)
@@ -707,7 +714,9 @@ class SymbolService:
                 # If include AST node is unindexed or queried with fallback parameters, attempt to resolve header target path gracefully
                 hdr_file = ""
                 if header:
-                    from webapp.backend.services.filesystem_service import filesystem_service
+                    from webapp.backend.services.filesystem_service import (
+                        filesystem_service,
+                    )
                     try:
                         resolved = filesystem_service.resolve_include(version_name, header, current_file=file_path,
                                                                       arch=arch)

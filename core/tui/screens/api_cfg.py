@@ -1,0 +1,514 @@
+"""core/tui/screens/api_cfg.py - AI API service configuration screen (`api` section of `config_api.json`)."""
+
+from __future__ import annotations
+
+import curses
+import ipaddress
+from typing import Any
+
+from core.config import _coerce_bool
+from core.tui.screens.base import BaseScreen
+from core.tui.screens.parser_dist import wrap_help
+from core.tui.screens.repos import ModalTextInputDialog
+from core.tui.theme import (
+    PAIR_BORDER,
+    PAIR_DEFAULT,
+    PAIR_HEADER,
+    PAIR_MUTED,
+    draw_box,
+    get_color,
+    safe_addstr,
+)
+from core.tui.widgets import (
+    Button,
+    Checkbox,
+    ModalDialog,
+    ScrollableList,
+    SelectList,
+    StatusBar,
+    TextInput,
+)
+
+CLIENT_IP_HEADERS: tuple[str, ...] = ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP")
+SECTIONS: tuple[str, ...] = ("Server", "Keys", "Limits")
+_DEFAULT_PROXIES = ["127.0.0.1", "::1"]
+
+HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
+    "section": (
+        "Settings Section",
+        [
+            "Switch pages with Left/Right: Server (bind address, proxies), Keys (API keys), Limits (rate limit, auth lockout).",
+            "All pages are saved together.",
+        ],
+    ),
+    "host": (
+        "API Bind Host",
+        ["Network interface address uvicorn binds to. Defaults to 127.0.0.1 (local only)."],
+    ),
+    "port": ("API Port", ["TCP port (1-65535) the API service listens on. Defaults to 8001."]),
+    "reload": (
+        "Auto-Reload",
+        ["Enable uvicorn auto-reload on source changes (development only). Disable it for systemd services."],
+    ),
+    "trusted_proxies": (
+        "Trusted Proxies",
+        [
+            "Comma-separated IP addresses or CIDR networks of reverse proxies whose client-IP header is trusted.",
+            "Example: 127.0.0.1, ::1, 10.0.0.0/8",
+        ],
+    ),
+    "client_ip_header": (
+        "Client IP Header",
+        ["Header carrying the real client address when the request comes from a trusted proxy."],
+    ),
+    "keys": (
+        "API Keys",
+        [
+            "Keys are shown masked (first 4 characters of keys of 16+ characters, else only the length) and never in full after entry.",
+            "- Add Key: enter a new key (a name is asked for when keys are stored as a name/key map).",
+            "- Remove Key: delete the highlighted key.",
+        ],
+    ),
+    "rate_limit": (
+        "Rate Limit",
+        ["Maximum requests per client within the window in seconds."],
+    ),
+    "auth_lockout": (
+        "Auth Lockout",
+        [
+            "Clients exceeding Max Failures within the Failure Window are locked out.",
+            "The lockout starts at Base Lockout and grows up to Max Lockout (seconds).",
+        ],
+    ),
+    "overview": (
+        "Help",
+        [
+            "Move to a field to see its help here (F1 opens it in a dialog).",
+            "- Server: host, port, reload, trusted proxies, client IP header.",
+            "- Keys: API keys, masked.",
+            "- Limits: rate limit and auth lockout.",
+        ],
+    ),
+}
+
+_FORM_MIN_W = 52
+_HELP_MIN_W = 30
+
+
+# Shortest key whose first 4 characters may be shown (at most a quarter of it)
+MASK_PREFIX_MIN_LEN = 16
+
+
+def mask_key(key: str) -> str:
+    """Masked form of `key`, never the full key: its first 4 characters plus an ellipsis when it has at least
+    `MASK_PREFIX_MIN_LEN` characters, otherwise no character of it, only its length."""
+    if len(key) >= MASK_PREFIX_MIN_LEN:
+        return f"{key[:4]}…"
+    return f"•••• ({len(key)} chars)"
+
+
+def _load_keys(raw: Any) -> tuple[list[tuple[str, str]], bool]:
+    """Return ([(name, key)], stored_as_dict) for the `api.keys` value (list of strings or {name: key})."""
+    if isinstance(raw, dict):
+        return [(str(n), str(k)) for n, k in raw.items() if isinstance(k, str) and k], True
+    if isinstance(raw, (list, tuple)):
+        return [("", k) for k in raw if isinstance(k, str) and k], False
+    return [], False
+
+
+class ApiSettingsScreen(BaseScreen):
+    """Configuration screen for the standalone AI API service (`api` section)."""
+
+    def __init__(self, stdscr: Any, app: Any = None) -> None:
+        super().__init__(stdscr, app)
+
+        if self.app is not None and isinstance(getattr(self.app, "config", None), dict):
+            api_cfg = self.app.config.get("api")
+            if not isinstance(api_cfg, dict):
+                api_cfg = {}
+                self.app.config["api"] = api_cfg
+        else:
+            api_cfg = {}
+        self.api_cfg = api_cfg
+
+        rl = api_cfg.get("rate_limit") if isinstance(api_cfg.get("rate_limit"), dict) else {}
+        lo = api_cfg.get("auth_lockout") if isinstance(api_cfg.get("auth_lockout"), dict) else {}
+        proxies_raw = api_cfg.get("trusted_proxies")
+        if isinstance(proxies_raw, (list, tuple)):
+            proxies = [str(p) for p in proxies_raw]
+        elif isinstance(proxies_raw, str):
+            proxies = [p.strip() for p in proxies_raw.split(",") if p.strip()]
+        else:
+            proxies = list(_DEFAULT_PROXIES)
+        hdr = str(api_cfg.get("client_ip_header") or CLIENT_IP_HEADERS[0])
+        hdr_idx = CLIENT_IP_HEADERS.index(hdr) if hdr in CLIENT_IP_HEADERS else 0
+
+        def num(src: dict[str, Any], key: str, default: int) -> str:
+            return str(src.get(key) if src.get(key) is not None else default)
+
+        self.keys, self.keys_as_dict = _load_keys(api_cfg.get("keys"))
+
+        self.sel_section = SelectList(
+            y=2, x=4, width=16, label="Section", options=list(SECTIONS), selected_index=0, label_width=20
+        )
+
+        # Server page (box y=3)
+        self.inp_host = TextInput(
+            y=4, x=4, width=26, label="Bind Host", value=str(api_cfg.get("host") or "127.0.0.1"), label_width=20
+        )
+        self.inp_port = TextInput(
+            y=5, x=4, width=12, label="Listen Port", value=num(api_cfg, "port", 8001), label_width=20
+        )
+        self.chk_reload = Checkbox(
+            y=6, x=4, label="Enable Uvicorn Auto-Reload", checked=_coerce_bool(api_cfg.get("reload"), False)
+        )
+        self.inp_proxies = TextInput(
+            y=7, x=4, width=34, label="Trusted Proxies", value=", ".join(proxies), label_width=20, max_len=1024
+        )
+        self.sel_client_ip_header = SelectList(
+            y=8, x=4, width=22, label="Client IP Header", options=list(CLIENT_IP_HEADERS),
+            selected_index=hdr_idx, label_width=20,
+        )
+
+        # Keys page
+        self.lst_keys = ScrollableList(
+            y=3, x=2, height=9, width=60, items=list(range(len(self.keys))), title="API Keys (masked)",
+            render_item_func=self._render_key,
+        )
+        self.btn_add_key = Button(y=12, x=4, label="Add Key", on_click=self.add_key)
+        self.btn_remove_key = Button(y=12, x=18, label="Remove Key", on_click=self.remove_key)
+
+        # Limits page
+        self.inp_rl_max = TextInput(
+            y=4, x=4, width=12, label="Max Requests", value=num(rl, "max_requests", 120), label_width=22
+        )
+        self.inp_rl_window = TextInput(
+            y=5, x=4, width=12, label="Window (s)", value=num(rl, "window_seconds", 60), label_width=22
+        )
+        self.inp_lo_max = TextInput(
+            y=7, x=4, width=12, label="Max Failures", value=num(lo, "max_failures", 5), label_width=22
+        )
+        self.inp_lo_window = TextInput(
+            y=8, x=4, width=12, label="Failure Window (s)", value=num(lo, "failure_window_seconds", 60), label_width=22
+        )
+        self.inp_lo_base = TextInput(
+            y=9, x=4, width=12, label="Base Lockout (s)", value=num(lo, "base_lockout_seconds", 30), label_width=22
+        )
+        self.inp_lo_max_lock = TextInput(
+            y=10, x=4, width=12, label="Max Lockout (s)", value=num(lo, "max_lockout_seconds", 3600), label_width=22
+        )
+
+        self.btn_save = Button(y=14, x=4, label="Save Settings", on_click=self.save)
+        self.btn_cancel = Button(y=14, x=24, label="Cancel", on_click=self.cancel)
+
+        self.status_bar = StatusBar(
+            shortcuts=[
+                ("Tab/Down", "Next"),
+                ("Shift-Tab/Up", "Prev"),
+                ("S", "Save"),
+                ("F1/?", "Help"),
+                ("Esc", "Back"),
+            ]
+        )
+
+        self._section_widgets: dict[str, list[Any]] = {
+            "Server": [self.inp_host, self.inp_port, self.chk_reload, self.inp_proxies, self.sel_client_ip_header],
+            "Keys": [self.lst_keys, self.btn_add_key, self.btn_remove_key],
+            "Limits": [
+                self.inp_rl_max, self.inp_rl_window, self.inp_lo_max,
+                self.inp_lo_window, self.inp_lo_base, self.inp_lo_max_lock,
+            ],
+        }
+        self.help_topic_for = {
+            id(self.sel_section): "section",
+            id(self.inp_host): "host",
+            id(self.inp_port): "port",
+            id(self.chk_reload): "reload",
+            id(self.inp_proxies): "trusted_proxies",
+            id(self.sel_client_ip_header): "client_ip_header",
+            id(self.lst_keys): "keys",
+            id(self.btn_add_key): "keys",
+            id(self.btn_remove_key): "keys",
+            id(self.inp_rl_max): "rate_limit",
+            id(self.inp_rl_window): "rate_limit",
+            id(self.inp_lo_max): "auth_lockout",
+            id(self.inp_lo_window): "auth_lockout",
+            id(self.inp_lo_base): "auth_lockout",
+            id(self.inp_lo_max_lock): "auth_lockout",
+        }
+        self._rebuild_widgets()
+        self.focus_widget(0)
+        self.mark_form_clean()
+
+    # --- key list helpers ---
+
+    def _render_key(self, idx: int) -> str:
+        name, key = self.keys[idx]
+        label = name if self.keys_as_dict else f"key {idx + 1}"
+        return f"{label}  {mask_key(key)}"
+
+    def _refresh_key_list(self) -> None:
+        self.lst_keys.set_items(list(range(len(self.keys))), keep_selection=True)
+
+    @staticmethod
+    def _prompt(stdscr: Any, title: str, prompt: str, default: str = "") -> str | None:
+        value = ModalTextInputDialog(stdscr, title=title, prompt=prompt, default_val=default).show()
+        return value.strip() if value is not None else None
+
+    def add_key(self) -> bool:
+        """Prompt for a new key (and a name for map-form storage); return True when one was added."""
+        key = self._prompt(self.stdscr, "Add API Key", "New API key:")
+        if not key:
+            return False
+        if "\x00" in key or any(ch.isspace() for ch in key):
+            ModalDialog(self.stdscr, "Invalid Key", "A key cannot contain whitespace or NUL bytes.", ["OK"]).show()
+            return False
+        if any(key == existing for _n, existing in self.keys):
+            ModalDialog(self.stdscr, "Duplicate Key", "That key is already configured.", ["OK"]).show()
+            return False
+        name = ""
+        if self.keys_as_dict:
+            used = {n for n, _k in self.keys}
+            default = f"key{len(self.keys) + 1}"
+            while default in used:
+                default += "_"
+            name = self._prompt(self.stdscr, "Name API Key", "Key name:", default) or default
+            if name in used:
+                ModalDialog(self.stdscr, "Duplicate Name", f"A key named '{name}' already exists.", ["OK"]).show()
+                return False
+        self.keys.append((name, key))
+        self._refresh_key_list()
+        self.lst_keys.select_last()
+        return True
+
+    def remove_key(self) -> bool:
+        """Remove the highlighted key after confirmation; return True when removed."""
+        idx = self.lst_keys.get_selected()
+        if idx is None or not 0 <= idx < len(self.keys):
+            return False
+        choice = ModalDialog.show_dialog(
+            self.stdscr,
+            title="Remove API Key",
+            message=f"Remove key {self._render_key(idx)}?",
+            buttons=["Remove", "Cancel"],
+            default_button=1,
+        )
+        if choice != "Remove":
+            return False
+        del self.keys[idx]
+        self._refresh_key_list()
+        return True
+
+    # --- widgets / form state ---
+
+    def active_section(self) -> str:
+        return self.sel_section.get_selected()
+
+    def _rebuild_widgets(self) -> None:
+        self.widgets = [self.sel_section, *self._section_widgets[self.active_section()], self.btn_save, self.btn_cancel]
+
+    def form_snapshot(self) -> list[Any]:
+        values: list[Any] = []
+        for widgets in self._section_widgets.values():
+            for w in widgets:
+                if hasattr(w, "get_value"):
+                    values.append(w.get_value())
+                elif hasattr(w, "is_checked"):
+                    values.append(w.is_checked())
+                elif hasattr(w, "options"):
+                    values.append(w.get_selected())
+        values.append(list(self.keys))
+        return values
+
+    def current_help_topic(self) -> str:
+        return self.help_topic_for.get(id(self.get_focused_widget()), "overview")
+
+    def show_help_dialog(self) -> None:
+        title, paragraphs = HELP_TOPICS[self.current_help_topic()]
+        ModalDialog(self.stdscr, title, "\n".join(paragraphs), ["OK"]).show()
+
+    def _layout_widths(self, max_x: int) -> tuple[int, int]:
+        if max_x - 4 - 1 - _FORM_MIN_W < _HELP_MIN_W:
+            return max(40, min(76, max_x - 4)), 0
+        box_w = min(76, max(_FORM_MIN_W, max_x - 4 - 1 - 40))
+        return box_w, max_x - 2 - box_w - 1 - 2
+
+    def _draw_help_panel(self, y: int, x: int, h: int, w: int) -> None:
+        title, paragraphs = HELP_TOPICS[self.current_help_topic()]
+        draw_box(self.stdscr, y, x, h, w, title=title, color_pair=PAIR_BORDER)
+        inner_h = h - 2
+        lines = wrap_help(paragraphs, w - 4)
+        if len(lines) > inner_h:
+            lines = lines[: max(0, inner_h - 1)] + ["... F1: full text"]
+        for i, line in enumerate(lines):
+            attr = get_color(PAIR_MUTED) if line.startswith("... F1") else get_color(PAIR_DEFAULT)
+            safe_addstr(self.stdscr, y + 1 + i, x + 2, line, attr)
+
+    def _validate_fields(self) -> tuple[dict[str, Any], list[str]]:
+        """Validate all inputs; return (parsed values, errors)."""
+        values: dict[str, Any] = {}
+        errors: list[str] = []
+
+        host = self.inp_host.get_value().strip()
+        if not host or "\x00" in host:
+            errors.append("Bind Host: must be a non-empty string without NUL bytes")
+        else:
+            values["host"] = host
+
+        int_specs = (
+            ("port", self.inp_port, 65535),
+            ("max_requests", self.inp_rl_max, None),
+            ("window_seconds", self.inp_rl_window, None),
+            ("max_failures", self.inp_lo_max, None),
+            ("failure_window_seconds", self.inp_lo_window, None),
+            ("base_lockout_seconds", self.inp_lo_base, None),
+            ("max_lockout_seconds", self.inp_lo_max_lock, None),
+        )
+        for key, widget, max_val in int_specs:
+            raw = widget.get_value().strip()
+            try:
+                num = int(raw)
+            except (ValueError, TypeError):
+                num = None
+            if num is None or num < 1 or (max_val is not None and num > max_val):
+                desc = "an integer between 1 and 65535" if max_val else "a positive whole number"
+                errors.append(f"{widget.label}: '{raw}' must be {desc}")
+            else:
+                values[key] = num
+        if (
+            "base_lockout_seconds" in values
+            and "max_lockout_seconds" in values
+            and values["max_lockout_seconds"] < values["base_lockout_seconds"]
+        ):
+            errors.append("Max Lockout (s): must be >= Base Lockout (s)")
+
+        proxies = [p.strip() for p in self.inp_proxies.get_value().split(",") if p.strip()]
+        for p in proxies:
+            try:
+                ipaddress.ip_network(p, strict=False)
+            except ValueError:
+                errors.append(f"Trusted Proxies: '{p}' is not an IP address or CIDR network")
+        values["trusted_proxies"] = proxies
+        return values, errors
+
+    def draw(self) -> None:
+        """Render the API settings screen."""
+        self.clear()
+        max_y, max_x = self.get_maxyx()
+        safe_addstr(self.stdscr, 1, 2, "API Service Configuration", get_color(PAIR_HEADER) | curses.A_BOLD)
+        box_w, help_w = self._layout_widths(max_x)
+        section = self.active_section()
+        if section == "Server":
+            draw_box(self.stdscr, 3, 2, 7, box_w, title="API Server", color_pair=PAIR_BORDER)
+        elif section == "Limits":
+            draw_box(self.stdscr, 3, 2, 3, box_w, title="Rate Limit", color_pair=PAIR_BORDER)
+            draw_box(self.stdscr, 6, 2, 6, box_w, title="Auth Lockout", color_pair=PAIR_BORDER)
+        else:
+            self.lst_keys.width = max(20, box_w)
+        if help_w:
+            self._draw_help_panel(3, 2 + box_w + 1, max(4, max_y - 4), help_w)
+        for widget in self.widgets:
+            if hasattr(widget, "draw"):
+                widget.draw(self.stdscr)
+        self.status_bar.draw(self.stdscr)
+        self.refresh()
+
+    def handle_key(self, ch: int) -> bool:
+        """Handle navigation, shortcuts, and widget key events."""
+        if ch in (9, curses.KEY_DOWN):
+            if (
+                ch == curses.KEY_DOWN
+                and self.get_focused_widget() is self.lst_keys
+                and self.lst_keys.selected_index < len(self.lst_keys.items) - 1
+            ):
+                self.lst_keys.select_next()
+            else:
+                self.focus_next()
+            return True
+        if ch in (curses.KEY_UP, getattr(curses, "KEY_BTAB", 353), 353):
+            if self.get_focused_widget() is self.lst_keys and self.lst_keys.selected_index > 0:
+                self.lst_keys.select_prev()
+            else:
+                self.focus_prev()
+            return True
+        if ch == 27:
+            self.cancel()
+            return True
+        if ch == 19:
+            self.save()
+            return True
+        if ch == getattr(curses, "KEY_F1", 265):
+            self.show_help_dialog()
+            return True
+
+        focused = self.get_focused_widget()
+        if focused is self.lst_keys and ch in (curses.KEY_DC, ord("d"), ord("D")):
+            self.remove_key()
+            return True
+        if focused is not None and hasattr(focused, "handle_key") and focused.handle_key(ch):
+            if focused is self.sel_section:
+                self._rebuild_widgets()
+                self.focus_widget(0)
+            return True
+        if ch == ord("?"):
+            self.show_help_dialog()
+            return True
+        if ch in (ord("s"), ord("S")):
+            self.save()
+            return True
+        return False
+
+    def _keys_value(self) -> Any:
+        if self.keys_as_dict:
+            return {name: key for name, key in self.keys}
+        return [key for _name, key in self.keys]
+
+    def save(self) -> bool:
+        """Validate and persist settings to `app.config['api']`, mark dirty, and pop the screen."""
+        parsed, errors = self._validate_fields()
+        if errors:
+            ModalDialog(
+                self.stdscr, "Invalid Value", "Settings were not saved:\n" + "\n".join(errors), ["OK"]
+            ).show()
+            return False
+
+        if self.app is not None and isinstance(getattr(self.app, "config", None), dict):
+            api_cfg = self.app.config.setdefault("api", {})
+            if not isinstance(api_cfg, dict):
+                api_cfg = {}
+                self.app.config["api"] = api_cfg
+        else:
+            api_cfg = self.api_cfg
+
+        api_cfg["host"] = parsed["host"]
+        api_cfg["port"] = parsed["port"]
+        api_cfg["reload"] = self.chk_reload.is_checked()
+        api_cfg["trusted_proxies"] = parsed["trusted_proxies"]
+        api_cfg["client_ip_header"] = self.sel_client_ip_header.get_selected()
+        api_cfg["keys"] = self._keys_value()
+        api_cfg["rate_limit"] = {
+            "max_requests": parsed["max_requests"],
+            "window_seconds": parsed["window_seconds"],
+        }
+        api_cfg["auth_lockout"] = {
+            "max_failures": parsed["max_failures"],
+            "failure_window_seconds": parsed["failure_window_seconds"],
+            "base_lockout_seconds": parsed["base_lockout_seconds"],
+            "max_lockout_seconds": parsed["max_lockout_seconds"],
+        }
+        self.api_cfg = api_cfg
+
+        if self.app is not None:
+            if hasattr(self.app, "is_dirty"):
+                self.app.is_dirty = True
+            if hasattr(self.app, "pop_screen") and callable(self.app.pop_screen):
+                self.app.pop_screen()
+        self.mark_form_clean()
+        return True
+
+    def cancel(self) -> None:
+        """Dismiss the screen without persisting (confirming first when edits are unsaved)."""
+        if not self.confirm_discard():
+            return
+        if self.app is not None and hasattr(self.app, "pop_screen") and callable(self.app.pop_screen):
+            self.app.pop_screen()

@@ -1,25 +1,32 @@
 """webapp/backend/routers/symbols.py - Symbol Search, XRefs, History & AST Container Inspection."""
 from __future__ import annotations
+
 import logging
 from typing import Annotated, Any
+
 from fastapi import APIRouter, HTTPException, Query
+
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import is_valid_identifier
-from webapp.backend.services.symbol_service import SymbolService
 from webapp.backend.services.history_service import history_service
+from webapp.backend.services.symbol_service import SymbolService
 from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
 
 # ARCH whose definitions win when a symbol is defined per architecture (the KConfig engine's ARCH)
 ArchParam = Annotated[str, Query(description="ARCH value ranking arch-specific definitions (default x86_64)")]
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["symbols"])
+router = APIRouter(prefix="/webapi", tags=["symbols"])
 symbol_service = SymbolService()
 
 
 @router.get("/symbols/{version_name}/search")
-def search_symbols(version_name: str, q: str = Query(""), limit: int = Query(50)) -> dict[str, Any]:
+def search_symbols(
+    version_name: str,
+    q: Annotated[str, Query(max_length=256)] = "",
+    limit: int = Query(50),
+) -> dict[str, Any]:
     """Search symbol definitions by prefix."""
     results = symbol_service.search_symbols(version_name, q, limit=limit)
     return {"total": len(results), "symbols": results}
@@ -59,7 +66,7 @@ def get_symbol_scope(
     path: Annotated[str, Query(description="Repository-relative .c / .h file the token is in")],
     line: Annotated[int, Query(ge=1, description="1-based line of the token")],
     col: Annotated[int, Query(ge=0, description="1-based byte column of the token (0: the name's single use on the line)")] = 0,
-    name: Annotated[str | None, Query(description="The token's text")] = None,
+    name: Annotated[str | None, Query(max_length=256, description="The token's text")] = None,
     arch: ArchParam = DEFAULT_DEFINITION_ARCH,
 ) -> dict[str, Any]:
     """ScopeInfo of a local variable, parameter, file variable or struct field at path:line:col
@@ -147,12 +154,15 @@ def get_symbol_history(
     path: str = Query(...),
     line: int | None = Query(None),
     ast_id: int | None = Query(None),
-    name: str | None = Query(None, description="Symbol under the cursor: anchors on its definition"),
+    name: Annotated[str | None, Query(max_length=256, description="Symbol under the cursor: anchors on its definition")] = None,
     include_rc: bool = Query(False, description="Also list release candidates"),
     arch: ArchParam = DEFAULT_DEFINITION_ARCH,
     branch: str | None = Query(None, description="Branch the timeline follows (default: chosen for version_name)"),
 ) -> dict[str, Any]:
     """Release-by-release history of the definition at path:line (a Kconfig entry returns its Kconfig history)."""
+    clean = path.strip().strip("/")
+    if not clean or not is_safe_rel_path(clean):
+        raise HTTPException(status_code=400, detail="Invalid path")
     return history_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line, name=name,
                                               include_rc=include_rc, arch=arch, branch=branch or None)
 
@@ -167,6 +177,9 @@ def get_history_commits(
     limit: int = Query(100, ge=1, le=500),
 ) -> dict[str, Any]:
     """Commits of from..to that touched lines line_s..line_e (at `to`) of path (`git log -L`)."""
+    clean = path.strip().strip("/")
+    if not clean or not is_safe_rel_path(clean):
+        raise HTTPException(status_code=400, detail="Invalid path")
     return history_service.get_change_commits(path, to, from_rev, line_s, line_e, limit)
 
 
@@ -181,6 +194,10 @@ def get_include_symbols(
     arch: str | None = Query(None, description="ARCH whose #include closure locates the definitions (default x86_64)"),
 ) -> dict[str, Any]:
     """Imported symbols and target header file path of a CPPro_include AST node."""
+    if file_path is not None:
+        clean_file = file_path.strip().strip("/")
+        if clean_file and not is_safe_rel_path(clean_file):
+            raise HTTPException(status_code=400, detail="Invalid file_path")
     return symbol_service.get_include_symbols(
         version_name,
         ast_id,

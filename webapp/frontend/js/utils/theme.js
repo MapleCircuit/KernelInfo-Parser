@@ -31,20 +31,6 @@ export function applyTheme(theme) {
   window.dispatchEvent(new CustomEvent("kip:theme-changed", { detail: { theme: t } }));
 }
 
-export function onThemeChange(cb) {
-  const fn = () => cb(document.documentElement.dataset.theme || "dark");
-  window.addEventListener("kip:theme-changed", fn);
-  const mq = window.matchMedia?.("(prefers-color-scheme: light)");
-  const sys = () => {
-    if (document.documentElement.dataset.theme === "auto") fn();
-  };
-  mq?.addEventListener?.("change", sys);
-  return () => {
-    window.removeEventListener("kip:theme-changed", fn);
-    mq?.removeEventListener?.("change", sys);
-  };
-}
-
 /** The current value of a design token (`--bg-canvas`), or `fallback` when it is not defined. */
 export function token(name, fallback = "", read = (n) => getComputedStyle(document.documentElement).getPropertyValue(n)) {
   try {

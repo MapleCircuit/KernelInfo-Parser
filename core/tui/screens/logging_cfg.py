@@ -1,4 +1,4 @@
-"""core/tui/screens/logging_cfg.py - Parser and webapp file logging configuration screen."""
+"""core/tui/screens/logging_cfg.py - Parser, webapp and API file logging configuration screen."""
 
 from __future__ import annotations
 
@@ -98,12 +98,40 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
             "Filename (or path) for the webapp backend log file. Defaults to webapp.log.",
         ],
     ),
+    "api_enabled": (
+        "API File Logging",
+        [
+            "Enable or disable writing AI API service logs to disk.",
+            "When enabled, FastAPI/uvicorn backend and request logs are recorded according to Request Logging and Log Level.",
+        ],
+    ),
+    "api_dir": (
+        "API Log Directory",
+        [
+            "Directory where the API service log file is written.",
+            "Leave empty to use the project root or default log location when enabled.",
+        ],
+    ),
+    "api_file": (
+        "API Log File",
+        [
+            "Filename (or path) for the API service log file. Defaults to api.log.",
+        ],
+    ),
+    "section": (
+        "Logging Section",
+        [
+            "Choose which log target is edited with Left/Right: parser, webapp or api.",
+            "All sections are saved together.",
+        ],
+    ),
     "overview": (
         "Help",
         [
             "Move to a field to see its help here (F1 opens it in a dialog).",
             "- Parser Logging: file output, optional error split, and level for the parser pipeline.",
             "- Webapp Backend Logging: file output, request filter (all vs. errors), optional error split, and level.",
+            "- API Service Logging: same fields as the webapp for the AI API service.",
         ],
     ),
 }
@@ -113,7 +141,10 @@ _HELP_MIN_W = 30
 
 
 class LoggingScreen(BaseScreen):
-    """Configuration screen for Parser and Webapp Backend file logging options.
+    """Configuration screen for Parser, Webapp Backend and API file logging options.
+
+    The `full` scope shows one section at a time (selector row: parser / webapp / api) so the
+    form fits 24-row terminals; every section is saved together.
 
     Attributes:
         app: Controller reference exposing .config, .is_dirty, and .pop_screen().
@@ -123,11 +154,17 @@ class LoggingScreen(BaseScreen):
         super().__init__(stdscr, app)
 
         scope = str(getattr(self.app, "config_scope", "full") or "full").strip().lower()
-        if scope not in ("full", "daemon", "webapp"):
+        if scope not in ("full", "daemon", "webapp", "api"):
             scope = "full"
         self.config_scope = scope
         self.show_parser = scope in ("full", "daemon")
         self.show_webapp = scope in ("full", "webapp")
+        self.show_api = scope in ("full", "api")
+        self.sections: list[str] = [
+            name
+            for name, shown in (("parser", self.show_parser), ("webapp", self.show_webapp), ("api", self.show_api))
+            if shown
+        ]
 
         # Retrieve or initialize config sections
         if self.app is not None and hasattr(self.app, "config") and isinstance(self.app.config, dict):
@@ -156,9 +193,19 @@ class LoggingScreen(BaseScreen):
             raw_w = logging_cfg.get("webapp")
             webapp_cfg = raw_w if isinstance(raw_w, dict) else {}
 
+        if self.show_api:
+            api_cfg = logging_cfg.get("api")
+            if not isinstance(api_cfg, dict):
+                api_cfg = {}
+                logging_cfg["api"] = api_cfg
+        else:
+            raw_a = logging_cfg.get("api")
+            api_cfg = raw_a if isinstance(raw_a, dict) else {}
+
         self.logging_cfg = logging_cfg
         self.parser_log_cfg = parser_cfg
         self.webapp_log_cfg = webapp_cfg
+        self.api_log_cfg = api_cfg
 
         level_opts = list(VALID_LOG_LEVELS)
         req_mode_opts = list(VALID_WEBAPP_REQUEST_MODES)
@@ -185,6 +232,24 @@ class LoggingScreen(BaseScreen):
         cur_w_level = normalize_log_level(webapp_cfg.get("level", "INFO"))
         idx_w_level = level_opts.index(cur_w_level) if cur_w_level in level_opts else 1
 
+        # Initial API logging values
+        cur_a_enabled = _coerce_bool(api_cfg.get("enabled"), False)
+        cur_a_req_mode = normalize_webapp_request_mode(api_cfg.get("request_mode", "all"))
+        idx_a_req_mode = req_mode_opts.index(cur_a_req_mode) if cur_a_req_mode in req_mode_opts else 0
+        cur_a_dir = str(api_cfg.get("dir") or "")
+        a_file_raw = api_cfg.get("file")
+        cur_a_file = "api.log" if a_file_raw is None else str(a_file_raw)
+        cur_a_err_dir = str(api_cfg.get("error_dir") or "")
+        cur_a_err_file = str(api_cfg.get("error_file") or "")
+        cur_a_level = normalize_log_level(api_cfg.get("level", "INFO"))
+        idx_a_level = level_opts.index(cur_a_level) if cur_a_level in level_opts else 1
+
+        # Section selector (row 2) only when several sections share the screen; sections overlay row 3+
+        self.sel_section = SelectList(
+            y=2, x=4, width=28, label="Section", options=list(self.sections), selected_index=0, label_width=20
+        )
+        self.multi_section = len(self.sections) > 1
+
         # Box 1: Parser Logging widgets (y=4..9 inside box y=3, h=8)
         self.chk_parser_enabled = Checkbox(
             y=4, x=4, label="Enable parser file logging", checked=cur_p_enabled
@@ -205,8 +270,8 @@ class LoggingScreen(BaseScreen):
             y=9, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_p_level, label_width=20
         )
 
-        # Box 2: Webapp Backend Logging widgets (y=12..18 in full scope, y=4..10 in webapp scope)
-        webapp_box_y = 11 if self.show_parser else 3
+        # Box 2: Webapp Backend Logging widgets (box y=3; rows 4..10)
+        webapp_box_y = 3
         self._webapp_box_y = webapp_box_y
         wy = webapp_box_y + 1
         self.chk_webapp_enabled = Checkbox(
@@ -237,8 +302,32 @@ class LoggingScreen(BaseScreen):
             y=wy + 6, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_w_level, label_width=20
         )
 
-        # Action buttons
-        btn_y = 21 if (self.show_parser and self.show_webapp) else (12 if self.show_parser else 13)
+        # Box 3: API Logging widgets (same geometry as the webapp box)
+        ay = 4
+        self.chk_api_enabled = Checkbox(y=ay, x=4, label="Enable API file logging", checked=cur_a_enabled)
+        self.sel_api_request_mode = SelectList(
+            y=ay + 1,
+            x=4,
+            width=16,
+            label="Request Logging",
+            options=req_mode_opts,
+            selected_index=idx_a_req_mode,
+            label_width=20,
+        )
+        self.inp_api_dir = TextInput(y=ay + 2, x=4, width=26, label="Log Directory", value=cur_a_dir, label_width=20)
+        self.inp_api_file = TextInput(y=ay + 3, x=4, width=26, label="Log File", value=cur_a_file, label_width=20)
+        self.inp_api_error_dir = TextInput(
+            y=ay + 4, x=4, width=26, label="Error Dir (opt)", value=cur_a_err_dir, label_width=20
+        )
+        self.inp_api_error_file = TextInput(
+            y=ay + 5, x=4, width=26, label="Error File (opt)", value=cur_a_err_file, label_width=20
+        )
+        self.sel_api_level = SelectList(
+            y=ay + 6, x=4, width=16, label="Log Level", options=level_opts, selected_index=idx_a_level, label_width=20
+        )
+
+        # Action buttons (below the tallest visible box)
+        btn_y = 13 if (self.show_webapp or self.show_api) else 12
         self.btn_save = Button(y=btn_y, x=4, label="Save Settings", on_click=self.save)
         self.btn_cancel = Button(y=btn_y, x=24, label="Cancel", on_click=self.cancel)
 
@@ -253,18 +342,16 @@ class LoggingScreen(BaseScreen):
             ]
         )
 
-        widgets: list[Any] = []
-        if self.show_parser:
-            widgets.extend([
+        self._section_widgets: dict[str, list[Any]] = {
+            "parser": [
                 self.chk_parser_enabled,
                 self.inp_parser_dir,
                 self.inp_parser_file,
                 self.inp_parser_error_dir,
                 self.inp_parser_error_file,
                 self.sel_parser_level,
-            ])
-        if self.show_webapp:
-            widgets.extend([
+            ],
+            "webapp": [
                 self.chk_webapp_enabled,
                 self.sel_webapp_request_mode,
                 self.inp_webapp_dir,
@@ -272,9 +359,19 @@ class LoggingScreen(BaseScreen):
                 self.inp_webapp_error_dir,
                 self.inp_webapp_error_file,
                 self.sel_webapp_level,
-            ])
-        widgets.extend([self.btn_save, self.btn_cancel])
-        self.widgets = widgets
+            ],
+            "api": [
+                self.chk_api_enabled,
+                self.sel_api_request_mode,
+                self.inp_api_dir,
+                self.inp_api_file,
+                self.inp_api_error_dir,
+                self.inp_api_error_file,
+                self.sel_api_level,
+            ],
+        }
+        self.widgets = []
+        self._rebuild_widgets()
 
         self.help_topic_for = {
             id(self.chk_parser_enabled): "parser_enabled",
@@ -290,9 +387,43 @@ class LoggingScreen(BaseScreen):
             id(self.inp_webapp_error_dir): "error_split",
             id(self.inp_webapp_error_file): "error_split",
             id(self.sel_webapp_level): "log_level",
+            id(self.chk_api_enabled): "api_enabled",
+            id(self.sel_api_request_mode): "request_mode",
+            id(self.inp_api_dir): "api_dir",
+            id(self.inp_api_file): "api_file",
+            id(self.inp_api_error_dir): "error_split",
+            id(self.inp_api_error_file): "error_split",
+            id(self.sel_api_level): "log_level",
+            id(self.sel_section): "section",
         }
         self.focus_widget(0)
         self.mark_form_clean()
+
+    def active_section(self) -> str:
+        """Name of the section currently shown (`parser`, `webapp` or `api`)."""
+        return self.sel_section.get_selected() if self.multi_section else self.sections[0]
+
+    def _rebuild_widgets(self) -> None:
+        """Rebuild the focusable widget list for the active section (selector, fields, buttons)."""
+        widgets: list[Any] = []
+        if self.multi_section:
+            widgets.append(self.sel_section)
+        widgets.extend(self._section_widgets[self.active_section()])
+        widgets.extend([self.btn_save, self.btn_cancel])
+        self.widgets = widgets
+
+    def form_snapshot(self) -> list[Any]:
+        """Values of every visible-scope section's fields (hidden sections included, selector excluded)."""
+        values: list[Any] = []
+        for name in self.sections:
+            for w in self._section_widgets[name]:
+                if hasattr(w, "get_value"):
+                    values.append(w.get_value())
+                elif hasattr(w, "is_checked"):
+                    values.append(w.is_checked())
+                else:
+                    values.append(w.get_selected())
+        return values
 
     def current_help_topic(self) -> str:
         """Return the HELP_TOPICS key for the focused widget ('overview' when it has none)."""
@@ -340,6 +471,13 @@ class LoggingScreen(BaseScreen):
                 ("Webapp", self.inp_webapp_error_dir),
                 ("Webapp", self.inp_webapp_error_file),
             ])
+        if self.show_api:
+            path_widgets.extend([
+                ("API", self.inp_api_dir),
+                ("API", self.inp_api_file),
+                ("API", self.inp_api_error_dir),
+                ("API", self.inp_api_error_file),
+            ])
         for section, widget in path_widgets:
             if "\x00" in widget.get_value():
                 errors.append(f"{section} {widget.label}: path cannot contain NUL bytes")
@@ -355,27 +493,22 @@ class LoggingScreen(BaseScreen):
             title = "Parser Logging Configuration"
         elif self.config_scope == "webapp":
             title = "Webapp Logging Configuration"
+        elif self.config_scope == "api":
+            title = "API Logging Configuration"
         else:
             title = "Logging Configuration"
         safe_addstr(self.stdscr, 1, 2, title, get_color(PAIR_HEADER) | curses.A_BOLD)
 
         box_w, help_w = self._layout_widths(max_x)
 
-        # Box 1: Parser Logging
-        if self.show_parser:
+        # Only the active section's box is drawn (all sections share the same rows)
+        section = self.active_section()
+        if section == "parser":
             draw_box(self.stdscr, 3, 2, 8, box_w, title="Parser Logging", color_pair=PAIR_BORDER)
-
-        # Box 2: Webapp Backend Logging
-        if self.show_webapp:
-            draw_box(
-                self.stdscr,
-                self._webapp_box_y,
-                2,
-                9,
-                box_w,
-                title="Webapp Backend Logging",
-                color_pair=PAIR_BORDER,
-            )
+        elif section == "webapp":
+            draw_box(self.stdscr, self._webapp_box_y, 2, 9, box_w, title="Webapp Backend Logging", color_pair=PAIR_BORDER)
+        else:
+            draw_box(self.stdscr, 3, 2, 9, box_w, title="API Service Logging", color_pair=PAIR_BORDER)
 
         # Side help panel for the focused field (F1 shows it as a dialog when the terminal is too narrow)
         if help_w:
@@ -421,6 +554,9 @@ class LoggingScreen(BaseScreen):
         focused = self.get_focused_widget()
         if focused is not None and hasattr(focused, "handle_key"):
             if focused.handle_key(ch):
+                if focused is self.sel_section and self.multi_section:
+                    self._rebuild_widgets()
+                    self.focus_widget(0)
                 return True
 
         # Hotkey '?' when not editing a text input
@@ -490,6 +626,20 @@ class LoggingScreen(BaseScreen):
             webapp_cfg["error_file"] = self.inp_webapp_error_file.get_value().strip()
             webapp_cfg["level"] = normalize_log_level(self.sel_webapp_level.get_selected())
             self.webapp_log_cfg = webapp_cfg
+
+        if self.show_api:
+            api_cfg = logging_cfg.get("api")
+            if not isinstance(api_cfg, dict):
+                api_cfg = {}
+                logging_cfg["api"] = api_cfg
+            api_cfg["enabled"] = self.chk_api_enabled.is_checked()
+            api_cfg["request_mode"] = normalize_webapp_request_mode(self.sel_api_request_mode.get_selected())
+            api_cfg["dir"] = self.inp_api_dir.get_value().strip()
+            api_cfg["file"] = self.inp_api_file.get_value().strip()
+            api_cfg["error_dir"] = self.inp_api_error_dir.get_value().strip()
+            api_cfg["error_file"] = self.inp_api_error_file.get_value().strip()
+            api_cfg["level"] = normalize_log_level(self.sel_api_level.get_selected())
+            self.api_log_cfg = api_cfg
 
         # Update references
         self.logging_cfg = logging_cfg

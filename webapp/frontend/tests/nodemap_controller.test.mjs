@@ -1229,3 +1229,266 @@ test("dialog pickers: revision popover and autocomplete fill the form inputs", a
   assert.match(modals[0].cfg.subtitle, /v6\.6/, "scoped to the form's revision");
   assert.ok(inputs.name._nmAutocomplete, "the struct name autocompletes");
 });
+
+test("FE-041: iframe load listener skips supersample when frame or controller container is disconnected", () => {
+  const { c } = controller();
+  c.containerEl = { isConnected: true };
+  c.canvas.viewport.zoom = 2;
+  const tabNode = c.addNode({ type: "tab", data: { tabType: "commits", hash: "v=v3.0&tab=commits", embedSessionId: "nms-1" } });
+  const loadListeners = [];
+  let styleUpdates = 0;
+  const rootStyle = { zoom: "" };
+  const frame = {
+    isConnected: true,
+    dataset: {},
+    style: {
+      setProperty() { styleUpdates += 1; },
+      removeProperty() { styleUpdates += 1; },
+    },
+    contentDocument: { documentElement: { style: rootStyle } },
+    addEventListener(ev, fn) {
+      if (ev === "load") loadListeners.push(fn);
+    },
+  };
+  const body = {
+    innerHTML: "",
+    querySelector: (sel) => (sel === "iframe.nm-iframe" ? frame : null),
+  };
+
+  c.renderBody(tabNode, body);
+  assert.equal(loadListeners.length, 1);
+
+  styleUpdates = 0;
+  rootStyle.zoom = "stale";
+  frame.isConnected = false;
+  loadListeners[0]();
+  assert.equal(styleUpdates, 0, "disconnected iframe ignores load");
+  assert.equal(rootStyle.zoom, "stale");
+
+  frame.isConnected = true;
+  c.containerEl.isConnected = false;
+  loadListeners[0]();
+  assert.equal(styleUpdates, 0, "disconnected controller container ignores load");
+  assert.equal(rootStyle.zoom, "stale");
+
+  c.containerEl.isConnected = true;
+  loadListeners[0]();
+  assert.equal(styleUpdates, 1, "connected iframe reapplies supersample on load");
+  assert.notEqual(rootStyle.zoom, "stale");
+});
+
+test("FE-044: importJSON enforces 50 MB size limit and handles FileReader errors cleanly", async () => {
+  const { toast } = await import("../js/components/toast.js");
+  const { importJSON } = await import("../js/views/nodemap/nodemap_persistence.js");
+  const OrigFileReader = globalThis.FileReader;
+  const origError = toast.error;
+  const origSuccess = toast.success;
+  const errors = [];
+  const successes = [];
+  toast.error = (m) => errors.push(m);
+  toast.success = (m) => successes.push(m);
+
+  let readCalls = 0;
+  let lastReader = null;
+  globalThis.FileReader = class MockFileReader {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.error = null;
+      lastReader = this;
+    }
+    readAsText() {
+      readCalls += 1;
+    }
+  };
+
+  try {
+    const { c } = controller();
+    let loaded = 0;
+    c.loadCanvasDocument = () => { loaded += 1; };
+
+    // Over 50 MB rejected before FileReader.readAsText
+    importJSON(c, { size: 50 * 1024 * 1024 + 1 });
+    assert.equal(readCalls, 0);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /50 MB/);
+
+    // Read error invokes toast.error cleanly
+    importJSON(c, { size: 64 });
+    assert.equal(readCalls, 1);
+    assert.equal(typeof lastReader.onerror, "function");
+    lastReader.error = new Error("disk failure");
+    lastReader.onerror();
+    assert.equal(errors.length, 2);
+    assert.match(errors[1], /disk failure/);
+
+    // Disposed controller ignores late FileReader callbacks
+    importJSON(c, { size: 64 });
+    c.dispose();
+    lastReader.error = new Error("late error");
+    lastReader.onerror();
+    lastReader.onload({ target: { result: JSON.stringify(M.serializeCanvas(M.emptyCanvas())) } });
+    assert.equal(errors.length, 2);
+    assert.equal(loaded, 0);
+    assert.equal(successes.length, 0);
+  } finally {
+    globalThis.FileReader = OrigFileReader;
+    toast.error = origError;
+    toast.success = origSuccess;
+  }
+});
+
+test("PERF-003: commit and NodeRenderer.sync memoize sorted kconfig node names per sync pass", async () => {
+  const { NodeRenderer } = await import("../js/views/nodemap/node_renderer.js");
+  const { c } = controller();
+  for (const sym of ["Z_OPT", "A_OPT", "M_OPT", "B_OPT"]) {
+    c.addNode({ type: "kconfig", data: { symbol: sym, arch: "x86_64" } });
+  }
+
+  let filterCalls = 0;
+  const origFilter = Array.prototype.filter;
+  const targetNodes = c.canvas.nodes;
+  targetNodes.filter = function (...args) {
+    filterCalls += 1;
+    return origFilter.apply(this, args);
+  };
+
+  let passCount = 0;
+  c.renderer = {
+    sync(nodes) {
+      c._beginSyncPass();
+      try {
+        passCount = nodes.map((n) => c.bodyKey(n)).length;
+      } finally {
+        c._endSyncPass();
+      }
+    },
+    invalidate() {},
+    element: () => null,
+    clear() {},
+  };
+
+  c.commit({ save: false, inspector: false });
+  assert.equal(passCount, 4);
+  assert.equal(filterCalls, 1, "kconfigNamesKey filters/sorts canvas nodes once per sync pass");
+  assert.equal(c._syncPassDepth, 0);
+  assert.equal(c._kconfigNamesPass, null);
+
+  // Outside a sync pass, adding a kconfig node is immediately reflected
+  const extra = M.createNode("kconfig", { data: { symbol: "AA_FIRST", arch: "x86_64" } });
+  c.canvas.nodes.push(extra);
+  assert.equal(c.kconfigNamesKey(), "AA_FIRST,A_OPT,B_OPT,M_OPT,Z_OPT");
+
+  // Also verify NodeRenderer.sync invokes beginSync/endSync hooks around its node loop
+  let begins = 0;
+  let ends = 0;
+  const host = document.createElement("div");
+  const elProto = Object.getPrototypeOf(host);
+  const hadAfter = Object.prototype.hasOwnProperty.call(elProto, "after");
+  const origAfter = elProto.after;
+  if (!hadAfter) {
+    elProto.after = function (...nodes) {
+      for (const n of nodes) this.parentNode?.appendChild?.(n);
+    };
+  }
+  let nrKconfigFilters = 0;
+  let nrBodyKeys = 0;
+  const nr = new NodeRenderer(host, {
+    beginSync: () => { begins += 1; c._beginSyncPass(); },
+    endSync: () => { ends += 1; c._endSyncPass(); },
+    bodyKey: (n) => { nrBodyKeys += 1; return c.bodyKey(n); },
+    renderBody: () => {},
+  });
+  c.canvas.nodes.filter = function (fn, ...args) {
+    if (String(fn).includes("kconfig")) nrKconfigFilters += 1;
+    return origFilter.call(this, fn, ...args);
+  };
+  try {
+    nr.sync(c.canvas.nodes, c.selected);
+  } finally {
+    if (!hadAfter) delete elProto.after;
+    else elProto.after = origAfter;
+  }
+  assert.deepEqual([begins, ends, nrBodyKeys, nrKconfigFilters], [1, 1, 5, 1]);
+  assert.equal(c._syncPassDepth, 0);
+  assert.equal(c._kconfigNamesPass, null);
+});
+
+test("openLibraryDialog discards stale overlapping refresh responses and skips detached modal bodies", async () => {
+  const { openLibraryDialog } = await import("../js/views/nodemap/nodemap_dialogs.js");
+  const { NAMED_CANVAS_KIND } = await import("../js/views/nodemap/nodemap_library.js");
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+
+  // 1. Overlapping refresh: older request resolves after newer request is issued
+  {
+    const { c } = controller();
+    const d1 = deferred();
+    const d2 = deferred();
+    const d3 = deferred();
+    const queue = [d1, d2, d3];
+    c.userDb = {
+      userList: async (kind) => (kind === NAMED_CANVAS_KIND ? queue.shift().promise : []),
+      userGet: async () => null,
+    };
+    let tabBtns = [];
+    const modalBody = {
+      isConnected: true,
+      _html: "",
+      get innerHTML() { return this._html; },
+      set innerHTML(v) {
+        this._html = v;
+        tabBtns = [
+          { dataset: { libTab: "library" }, onclick: null },
+          { dataset: { libTab: "templates" }, onclick: null },
+        ];
+      },
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel === "[data-lib-tab]" ? tabBtns : []),
+    };
+    c.openModalFn = () => ({ body: modalBody, close() { modalBody.isConnected = false; } });
+
+    openLibraryDialog(c);
+    d1.resolve([{ key: "k1", name: "Initial", nodeCount: 1, edgeCount: 0 }]);
+    await flush();
+    assert.match(modalBody.innerHTML, /Initial/);
+
+    const [libBtn, tplBtn] = tabBtns;
+    tplBtn.onclick(); // refresh #2 (stale)
+    libBtn.onclick(); // refresh #3 (latest)
+
+    d2.resolve([{ key: "k2", name: "StaleMap", nodeCount: 1, edgeCount: 0 }]);
+    await flush();
+    assert.doesNotMatch(modalBody.innerHTML, /StaleMap/, "stale refresh response does not overwrite modal");
+
+    d3.resolve([{ key: "k3", name: "FreshMap", nodeCount: 2, edgeCount: 1 }]);
+    await flush();
+    assert.match(modalBody.innerHTML, /FreshMap/, "latest refresh response renders");
+  }
+
+  // 2. Detached modal body mid-await aborts cleanly
+  {
+    const { c } = controller();
+    const d = deferred();
+    c.userDb = {
+      userList: async (kind) => (kind === NAMED_CANVAS_KIND ? d.promise : []),
+      userGet: async () => null,
+    };
+    const modalBody = {
+      isConnected: true,
+      innerHTML: "",
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    c.openModalFn = () => ({ body: modalBody, close() { modalBody.isConnected = false; } });
+
+    openLibraryDialog(c);
+    modalBody.isConnected = false;
+    d.resolve([{ key: "k4", name: "DetachedMap", nodeCount: 1, edgeCount: 0 }]);
+    await flush();
+    assert.equal(modalBody.innerHTML, "");
+  }
+});

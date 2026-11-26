@@ -1,25 +1,36 @@
 """webapp/backend/services/maintainer_service.py - Subsystems Catalog, Maintainers Roster & CREDITS."""
 from __future__ import annotations
-from webapp.backend.config import RepoScopedCache
+
+import logging
 from typing import Any
+
 from fastapi import HTTPException
+
 from db_engine.spec import Agg, AnyOf, Join, gt, is_null, like
-from webapp.backend.database.pool import get_reader
-from webapp.backend.database.helpers import (
-    safe_decode,
-    hash_hex,
-    get_version_info,
+from parser.git_ast.identity import (
+    build_identity_index,
+    clean_name,
+    identity_key,
+    merge_emails,
 )
-from parser.maintainer_ast.maintainer_types import (
-    MaintainerRole,
-    PatternType,
-    MaintainerPerson,
-    PatternRule,
-    MaintainerSection,
-)
-from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 from parser.maintainer_ast import maintainer_store
-from parser.git_ast.identity import build_identity_index, clean_name, identity_key, merge_emails
+from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+from parser.maintainer_ast.maintainer_types import (
+    MaintainerPerson,
+    MaintainerRole,
+    MaintainerSection,
+    PatternRule,
+    PatternType,
+)
+from webapp.backend.config import RepoScopedCache
+from webapp.backend.database.helpers import (
+    get_version_info,
+    hash_hex,
+    safe_decode,
+)
+from webapp.backend.database.pool import get_reader
+
+logger = logging.getLogger(__name__)
 
 # Bounded: keyed by the requested version, and any revision a caller names (a commit SHA) adds a whole
 # MAINTAINERS model
@@ -115,8 +126,8 @@ class MaintainerService:
                             m_blob_id = b_id
                         if "CREDITS" in paths and c_blob_id is None:
                             c_blob_id = b_id
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("git_tree_resolver.blob_paths failed for %s: %s", vname, exc)
         return m_blob_id, c_blob_id
 
     @staticmethod
@@ -174,7 +185,7 @@ class MaintainerService:
         }
         if not by_fnid:
             return {}
-        wanted = set(int(s) for s in sec_ids)
+        wanted = {int(s) for s in sec_ids}
         out: dict[str, set[int]] = {}
         fnids = sorted(by_fnid)
         for r in reader.select_rows("m_maintainer_file", ["fnid", "sec_id"], {"fnid": fnids}):
@@ -267,6 +278,7 @@ class MaintainerService:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
             sec_ids, _ = self._version_scope(reader, vid, vname)
+            is_indexed = sec_ids is not None
             if domain:
                 all_raw = reader.maintainer_sections(
                     _ids(sec_ids), member_person_ids=self._domain_person_ids(reader, domain)
@@ -323,7 +335,7 @@ class MaintainerService:
                     "maintainers": members_by_sec.get(sec_id, []),
                 })
 
-            return {"version": vname, "indexed": sec_ids is not None, "sections": sections}
+            return {"version": vname, "indexed": is_indexed, "sections": sections}
 
     def get_developers(
         self,
@@ -875,7 +887,7 @@ class MaintainerService:
                             email=safe_decode(mr["email"]) or "",
                             role=MaintainerRole(mr["role_type"]) if mr["role_type"] in (1, 2, 3, 4) else MaintainerRole.MAINTAINER,
                         )
-                        setattr(person, "person_id", mr["person_id"])
+                        person.person_id = mr["person_id"]
                         sec_map[s_id].members.append(person)
 
                 # Patterns
@@ -895,7 +907,8 @@ class MaintainerService:
 
         sections = list(sec_map.values())
         matcher = MaintainerMatcher(sections)
-        _MAINTAINER_CACHE[version_name] = (sections, matcher)
+        if (vid is not None and sec_ids is not None) or sections:
+            _MAINTAINER_CACHE[version_name] = (sections, matcher)
         return sections, matcher
 
     def sections_for_paths(self, version_name: str, paths: list[str]) -> dict[str, list[MaintainerSection]]:
@@ -1018,16 +1031,13 @@ class MaintainerService:
                 parts = line.split(" ")
                 if len(parts) >= 4 and parts[3].startswith("b/"):
                     curr_file = parts[3][2:].strip()
-            elif line.startswith("+++ b/"):
+            elif line.startswith("+++ b/") or (line.startswith("--- a/") and not curr_file):
                 curr_file = line[6:].strip()
-            elif line.startswith("--- a/") and not curr_file:
-                curr_file = line[6:].strip()
-            elif line.startswith("+") and not line.startswith("+++"):
-                if curr_file:
-                    touched_files[curr_file] = None
-            elif line.startswith("-") and not line.startswith("---"):
-                if curr_file:
-                    touched_files[curr_file] = None
+            elif (
+                (line.startswith("+") and not line.startswith("+++"))
+                or (line.startswith("-") and not line.startswith("---"))
+            ) and curr_file:
+                touched_files[curr_file] = None
 
         if not touched_files and curr_file:
             touched_files[curr_file] = None

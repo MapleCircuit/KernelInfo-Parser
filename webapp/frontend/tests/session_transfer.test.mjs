@@ -48,3 +48,35 @@ test("import plan and conflict choices", () => {
   assert.equal(copy.session.kconfigEngineProfiles.t3.profileKey, "v3.0|x86_64|v2");
   assert.equal(imported.session.panes[0].tabs[2].configName, undefined, "the plan input is not mutated");
 });
+
+test("watch and cve tabs validate and __proto__/constructor/prototype keys are stripped", () => {
+  const doc = buildSessionExport({
+    session: {
+      ...SESSION,
+      panes: [{
+        id: "pane-1",
+        activeTabId: "w1",
+        tabs: [
+          { id: "w1", type: "watch", title: "Watch" },
+          { id: "c1", type: "cve", title: "CVEs", version: "v3.0" },
+        ],
+      }],
+    },
+    profiles: PROFILES,
+    includeAll: false,
+  });
+  const rawJson = JSON.stringify(doc)
+    .replace('"title":"Watch"', '"title":"Watch","meta":{"__proto__":{"deep":1},"ok":true},"__proto__":{"polluted":true},"constructor":"bad","prototype":"bad"')
+    .replace('"kconfigEngineProfiles":{', '"kconfigEngineProfiles":{"__proto__":{"eng":1},');
+  const validated = validateSessionFile(rawJson);
+  assert.deepEqual(validated.session.panes[0].tabs.map((t) => t.type), ["watch", "cve"]);
+  assert.equal(({}).polluted, undefined);
+  assert.equal(({}).deep, undefined);
+  assert.equal(({}).eng, undefined);
+  assert.equal(Object.hasOwn(validated.session.panes[0].tabs[0], "__proto__"), false);
+  assert.equal(Object.hasOwn(validated.session.panes[0].tabs[0], "constructor"), false);
+  assert.equal(Object.hasOwn(validated.session.panes[0].tabs[0], "prototype"), false);
+  assert.equal(Object.hasOwn(validated.session.panes[0].tabs[0].meta, "__proto__"), false);
+  assert.equal(validated.session.panes[0].tabs[0].meta.ok, true);
+  assert.equal(Object.hasOwn(validated.session.kconfigEngineProfiles, "__proto__"), false);
+});

@@ -1,11 +1,14 @@
 """webapp/backend/database/helpers.py - Version Caching & Data Serialization Helpers."""
 from __future__ import annotations
+
 import logging
-from webapp.backend.config import RepoScopedCache, get_active_repository, get_repo_dir
-from core.globalstuff import is_safe_git_rev
+import subprocess
+import threading
 from typing import Any
 
+from core.globalstuff import is_safe_git_rev
 from db_engine.spec import finished_ref, gt, hash_prefix
+from webapp.backend.config import RepoScopedCache, get_active_repository, get_repo_dir
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,12 @@ _NAME_TO_VID_CACHE: dict[str, int] = RepoScopedCache(maxsize=50_000)
 _VID_TO_NAME_CACHE: dict[int, str] = RepoScopedCache(maxsize=50_000)
 # Whether the repository's refs were preloaded into the two caches above
 _PRELOADED: dict[str, bool] = RepoScopedCache()
+_VERSION_LOCK = threading.RLock()
+
+
+def _is_ascii_digits(value: Any) -> bool:
+    s = str(value)
+    return bool(s) and s.isascii() and s.isdigit()
 
 
 def safe_decode(val: Any) -> Any:
@@ -64,8 +73,9 @@ _REPO_ID_CACHE: dict[str, int] = RepoScopedCache()
 
 def get_active_repo_id(reader: Any) -> int:
     """m_repository.repo_id of the request's repository (-1 when that repository was never parsed)."""
-    if "repo_id" in _REPO_ID_CACHE:
-        return _REPO_ID_CACHE["repo_id"]
+    cached = _REPO_ID_CACHE.get("repo_id")
+    if cached is not None:
+        return cached
     repo = get_active_repository()
     repo_id = -1
     try:
@@ -74,7 +84,7 @@ def get_active_repo_id(reader: Any) -> int:
             row = reader.select_one("m_repository", ["repo_id"], {"git_url": repo["git_url"], "repo_id": gt(0)})
         if row:
             repo_id = row["repo_id"]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - unparsed repo or unavailable DB
         logger.debug("Could not resolve repo_id for '%s': %s", repo.get("name"), e)
         return repo_id
     _REPO_ID_CACHE["repo_id"] = repo_id
@@ -92,34 +102,46 @@ def get_active_network_id(reader: Any) -> int | None:
     if repo_id > 0:
         try:
             row = reader.select_one("m_repository", ["network_id"], {"repo_id": repo_id})
-            if row:
+            if row and row.get("network_id") is not None:
                 network_id = int(row["network_id"])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - unavailable DB or schema mismatch
             logger.debug("Could not resolve network_id of repo %s: %s", repo_id, e)
             return None
     _REPO_ID_CACHE["network_id"] = network_id
     return network_id if network_id >= 0 else None
 
 
+def clear_version_caches() -> None:
+    """Atomically clear all version and repository ID lookup caches under _VERSION_LOCK."""
+    with _VERSION_LOCK:
+        _NAME_TO_VID_CACHE.clear()
+        _VID_TO_NAME_CACHE.clear()
+        _REPO_ID_CACHE.clear()
+        _PRELOADED.clear()
+
+
 def preload_version_cache(reader: Any) -> None:
     """Preload the active repository's refs into in-memory caches from native m_git_ref."""
-    _PRELOADED["loaded"] = True
-    try:
-        rows = reader.select_rows(
-            ("m_git_ref", "r"),
-            ["r.commit_id", "r.ref_name"],
-            [{"r.commit_id": gt(0), "r.repo_id": get_active_repo_id(reader)}, finished_ref("r")],
-            order_by=["r.commit_id"],
-        )
-        for r in rows:
-            rvid = r["commit_id"]
-            rvname = safe_decode(r["ref_name"])
-            if rvid and rvname:
-                _NAME_TO_VID_CACHE[rvname] = rvid
-                _NAME_TO_VID_CACHE[str(rvid)] = rvid
-                _VID_TO_NAME_CACHE[rvid] = rvname
-    except Exception as e:
-        logger.debug("Error preloading version cache: %s", e)
+    with _VERSION_LOCK:
+        if _PRELOADED.get("loaded"):
+            return
+        try:
+            rows = reader.select_rows(
+                ("m_git_ref", "r"),
+                ["r.commit_id", "r.ref_name"],
+                [{"r.commit_id": gt(0), "r.repo_id": get_active_repo_id(reader)}, finished_ref("r")],
+                order_by=["r.commit_id"],
+            )
+            for r in rows:
+                rvid = r["commit_id"]
+                rvname = safe_decode(r["ref_name"])
+                if rvid and rvname:
+                    _NAME_TO_VID_CACHE[rvname] = rvid
+                    _NAME_TO_VID_CACHE[str(rvid)] = rvid
+                    _VID_TO_NAME_CACHE[rvid] = rvname
+            _PRELOADED["loaded"] = True
+        except Exception as e:  # noqa: BLE001 - best-effort preload
+            logger.debug("Error preloading version cache: %s", e)
 
 
 def _ref_row(reader: Any, where: dict[str, Any]) -> dict[str, Any] | None:
@@ -131,40 +153,55 @@ def _ref_row(reader: Any, where: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def _finished_commits(reader: Any, where: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+def _finished_commits(
+    reader: Any, where: dict[str, Any], limit: int, network_id: int | None = None
+) -> list[dict[str, Any]]:
     """Up to `limit` finished m_commit rows (`commit_id`, `commit_hash`) matching `where`."""
+    cond = dict(where)
+    if network_id is not None:
+        cond["c.network_id"] = network_id
     return reader.select_rows(
-        ("m_commit", "c"), ["c.commit_id", "c.commit_hash"], [where, finished_ref("c")], limit=limit
+        ("m_commit", "c"), ["c.commit_id", "c.commit_hash"], [cond, finished_ref("c")], limit=limit
     )
 
 
 def get_version_info(reader: Any, version_name_or_id: str | int) -> tuple[int | None, str]:
     """Resolve both vid (commit_id) and vname with thread-safe in-memory caching and Git commit SHA lookup."""
-    if not _PRELOADED.get("loaded"):
+    with _VERSION_LOCK:
+        loaded = bool(_PRELOADED.get("loaded"))
+    if not loaded:
         preload_version_cache(reader)
 
     # .get() into locals: both caches evict, so contains-then-get could race a miss
-    if isinstance(version_name_or_id, int) or str(version_name_or_id).isdigit():
+    is_int_input = isinstance(version_name_or_id, int) and not isinstance(version_name_or_id, bool)
+    if is_int_input or _is_ascii_digits(version_name_or_id):
         vid_int = int(version_name_or_id)
         cached_name = _VID_TO_NAME_CACHE.get(vid_int)
         if cached_name is not None:
             return vid_int, cached_name
 
     ver_str = str(version_name_or_id).strip()
+    is_ver_digits = _is_ascii_digits(ver_str)
     cached_vid = _NAME_TO_VID_CACHE.get(ver_str)
     if cached_vid is not None:
-        if not ver_str.isdigit():
+        if not is_ver_digits:
             return cached_vid, ver_str
         return cached_vid, _VID_TO_NAME_CACHE.get(cached_vid, ver_str)
 
     # Database query: try m_git_ref (for tags/branches), then m_commit (for arbitrary Git commit SHAs)
     try:
         repo_id = get_active_repo_id(reader)
-        if ver_str.isdigit():
+        network_id = get_active_network_id(reader)
+        if is_ver_digits:
             row = _ref_row(reader, {"r.commit_id": int(ver_str), "r.repo_id": repo_id})
             if not row:
+                commit_where: dict[str, Any] = {"c.commit_id": int(ver_str)}
+                if network_id is not None:
+                    commit_where["c.network_id"] = network_id
                 c_row = reader.select_one(
-                    "m_commit", {"vid": "commit_id", "commit_hash": "commit_hash"}, {"commit_id": int(ver_str)}
+                    ("m_commit", "c"),
+                    {"vid": "c.commit_id", "commit_hash": "c.commit_hash"},
+                    [commit_where, finished_ref("c")],
                 )
                 if c_row:
                     cid = c_row["vid"]
@@ -189,10 +226,10 @@ def get_version_info(reader: Any, version_name_or_id: str | int) -> tuple[int | 
         is_hex = len(ver_str) >= 7 and all(c in "0123456789abcdefABCDEF" for c in ver_str)
         if is_hex:
             if len(ver_str) == 40:
-                c_rows = _finished_commits(reader, {"c.commit_hash": bytes.fromhex(ver_str)}, 1)
+                c_rows = _finished_commits(reader, {"c.commit_hash": bytes.fromhex(ver_str)}, 1, network_id)
             else:
                 # Every digit counts (git abbreviates to 7), and a prefix two commits share names neither
-                c_rows = _finished_commits(reader, {"c.commit_hash": hash_prefix(ver_str)}, 2)
+                c_rows = _finished_commits(reader, {"c.commit_hash": hash_prefix(ver_str)}, 2, network_id)
                 if len(c_rows) > 1:
                     return None, ver_str
             c_row = c_rows[0] if c_rows else None
@@ -211,18 +248,20 @@ def get_version_info(reader: Any, version_name_or_id: str | int) -> tuple[int | 
             # The name reaches git's command line below, where "-..." would be read as an option
             return None, ver_str
         try:
-            import subprocess
             out = subprocess.run(
                 ["git", "rev-parse", "--verify", f"{ver_str}^{{commit}}"],
                 cwd=str(get_repo_dir()),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
                 timeout=5,
             )
             if out.returncode == 0:
                 git_sha = out.stdout.strip()
                 if len(git_sha) == 40:
-                    c_rows = _finished_commits(reader, {"c.commit_hash": bytes.fromhex(git_sha)}, 1)
+                    c_rows = _finished_commits(reader, {"c.commit_hash": bytes.fromhex(git_sha)}, 1, network_id)
                     if c_rows:
                         cid = c_rows[0]["commit_id"]
                         _NAME_TO_VID_CACHE[ver_str] = cid
@@ -234,9 +273,9 @@ def get_version_info(reader: Any, version_name_or_id: str | int) -> tuple[int | 
                     _NAME_TO_VID_CACHE[ver_str] = 0
                     _NAME_TO_VID_CACHE[git_sha] = 0
                     return 0, ver_str
-        except Exception as git_err:
+        except Exception as git_err:  # noqa: BLE001 - git rev-parse fallback is best-effort
             logger.debug("git rev-parse fallback failed for '%s': %s", ver_str, git_err)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - DB query failure returns (None, ver_str)
         logger.error("Failed to query version info: %s", e)
 
     return None, ver_str

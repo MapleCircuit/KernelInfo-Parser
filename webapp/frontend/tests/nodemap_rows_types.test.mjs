@@ -404,10 +404,17 @@ test("doc nodes render through the Kernel Docs renderers inside .kdoc-body; scri
   assert.equal(D.scrubDocHtml('<img src="data:image/png;base64,AA" onerror="x()"><a href="data:text/html,1">d</a><style>body{}</style>'), '<img src="data:image/png;base64,AA" ><a href="#">d</a>');
   for (const evil of ['<img src=x o onerror="a"nerror="alert(1)">', "<svg/onload=alert(1)>", "<img/onerror=alert(1) src=x>", '<a/href="javascript:alert(1)">x</a>',
     '<a href="&#106;avascript:alert(1)">x</a>', '<a href="java&Tab;script:alert(1)">x</a>', '<a href=" JaVaScRiPt:alert(1)">x</a>',
+    '<a href="blob:https://kernel.org/1">x</a>', '<a href="filesystem:https://kernel.org/1">x</a>', '<a href="&#99999999;javascript:alert(1)">x</a>',
     '<div style="position:fixed;inset:0">x</div>', '<button data-act="refresh">x</button>', '<p data-act="refresh">x</p>', "<scr<script>ipt>alert(1)</script>"]) {
     const out = D.scrubDocHtml(evil);
-    assert.doesNotMatch(out, /on(error|load)\s*=|javascript|&#106;|&Tab;|style=|data-act|<script|<svg|<button/i, `${evil} -> ${out}`);
+    assert.doesNotMatch(out, /on(error|load)\s*=|javascript|blob:|filesystem:|&#106;|&Tab;|style=|data-act|<script|<svg|<button/i, `${evil} -> ${out}`);
   }
+  const blankAdded = D.scrubDocHtml('<a href="https://kernel.org" target="_blank">kernel</a>');
+  assert.match(blankAdded, /rel="noopener noreferrer"/);
+  const blankUpgraded = D.scrubDocHtml('<a href="https://kernel.org" target="_blank" rel="noopener">kernel</a>');
+  assert.match(blankUpgraded, /rel="noopener noreferrer"/);
+  const blankPreserved = D.scrubDocHtml('<a href="https://kernel.org" target="_blank" rel="noreferrer noopener">kernel</a>');
+  assert.match(blankPreserved, /rel="noreferrer noopener"/);
   const kd = D.renderDocBody(D.docModel({ path: "kernel/fork.c", entries: [{ kind: "function", name: "copy_process", brief: "create a @clone_flags task", signature: "struct task_struct *copy_process(unsigned long clone_flags)", line: 42, params: [{ name: "clone_flags", desc: "flags of &struct kernel_clone_args" }], sections: [{ title: "Return", body: "the new task" }] }] }));
   assert.match(kd, /<dl class="c function">/);
   assert.match(kd, /<code class="sig-name"><span class="hl-k">struct<\/span>/);

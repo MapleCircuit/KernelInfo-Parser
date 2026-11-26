@@ -181,7 +181,13 @@ export class DocPage {
       } else if ((a.getAttribute("href") || "").startsWith("#")) {
         // In-page anchors must not touch location.hash (it drives the app router)
         e.preventDefault();
-        this.scrollToId(decodeURIComponent(a.getAttribute("href").slice(1)));
+        let targetId = a.getAttribute("href").slice(1);
+        try {
+          targetId = decodeURIComponent(targetId);
+        } catch {
+          // Keep raw fragment if percent-encoding is malformed
+        }
+        this.scrollToId(targetId);
       }
     });
 
@@ -243,7 +249,7 @@ export class DocPage {
     await Promise.all(Array.from({ length: TITLE_FETCH_CONCURRENCY }, worker));
   }
 
-  /** Figures and images are served from the Git tree through /api/fs/raw. */
+  /** Figures and images are served from the Git tree through /webapi/fs/raw. */
   hydrateImages() {
     this.root.querySelectorAll("img.kdoc-img[data-raw]").forEach((img) => {
       img.addEventListener("error", () => {
@@ -287,6 +293,7 @@ export class DocPage {
           el.innerHTML = res.entries.map((e) => this.renderKernelDocEntry(e, el.dataset.kdocPath, Boolean(query.doc))).join("");
           this.bindKernelDocSources(el);
         } catch (err) {
+          if (!el.isConnected) return;
           el.querySelector(".kdoc-directive-card")?.insertAdjacentHTML("beforeend", `<div class="kdoc-muted">kernel-doc unavailable: ${escapeHtml(err.message)}</div>`);
         }
       }
@@ -340,6 +347,7 @@ export class DocPage {
     const links = [];
     try {
       const listing = await this.client.getDirectoryTree(this.opts.version, dir);
+      if (!box?.isConnected || !this.root?.isConnected) return;
       const names = new Set((listing.entries || []).map((e) => e.name));
       const base = path.split("/").pop();
       for (const idx of ["index.rst", "00-INDEX"]) {
@@ -349,8 +357,10 @@ export class DocPage {
         }
       }
     } catch {
+      if (!box?.isConnected || !this.root?.isConnected) return;
       // Directory listing unavailable: show only the root link
     }
+    if (!box?.isConnected || !this.root?.isConnected) return;
     if (path !== "Documentation/index.rst") {
       links.push(`<li><a href="#" data-doc="Documentation/index.rst">Documentation home</a></li>`);
     }

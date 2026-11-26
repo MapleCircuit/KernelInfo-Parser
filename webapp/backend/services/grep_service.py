@@ -20,7 +20,11 @@ from typing import Any
 from fastapi import HTTPException
 
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
-from webapp.backend.security.git import git_pathspecs, validate_grep_pattern, validate_pathspecs
+from webapp.backend.security.git import (
+    git_pathspecs,
+    validate_grep_pattern,
+    validate_pathspecs,
+)
 from webapp.backend.services.tree_resolver import git_tree_resolver
 
 logger = logging.getLogger(__name__)
@@ -97,7 +101,7 @@ def git_supports_max_count() -> bool:
     with _VERSION_LOCK:
         if _GIT_VERSION is None:
             try:
-                out = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=5).stdout
+                out = subprocess.run(["git", "--version"], check=False, capture_output=True, text=True, timeout=5).stdout
                 m = re.search(r"(\d+)\.(\d+)", out)
                 _GIT_VERSION = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
             except (OSError, subprocess.SubprocessError):
@@ -198,8 +202,7 @@ class GrepService:
                 if len(parts) != 3:
                     continue
                 name, lineno, body = parts
-                if name.startswith(prefix):
-                    name = name[len(prefix):]
+                name = name.removeprefix(prefix)
                 path = name.decode("utf-8", errors="replace")
                 count = per_file.get(path, 0)
                 if count >= max_per_file:

@@ -3,7 +3,7 @@
  *
  * Staged files (from the patch modal's **Add to series**) are grouped into ordered patches, each with its
  * subject and description; a cover letter and the recipients (suggested from MAINTAINERS) complete the
- * series, and **Generate** formats it (`POST /api/version/{base}/patch/series`) with a check that it applies
+ * series, and **Generate** formats it (`POST /webapi/version/{base}/patch/series`) with a check that it applies
  * cleanly to its base, an mbox download and per-patch copies. The draft is session state (`patchDrafts`).
  */
 import { api } from "../../api.js";
@@ -30,6 +30,7 @@ export class PatchSeriesView {
   constructor() {
     this.containerEl = null;
     this.unsub = null;
+    this._seq = 0;
   }
 
   get draft() {
@@ -57,8 +58,10 @@ export class PatchSeriesView {
   }
 
   dispose() {
+    this._seq = (this._seq || 0) + 1;
     this.unsub?.();
     this.unsub = null;
+    this.containerEl = null;
   }
 
   renderBody() {
@@ -89,16 +92,16 @@ export class PatchSeriesView {
             <select data-assign="${escapeHtml(path)}" aria-label="Patch of ${escapeHtml(path)}">${options(patchOf(path))}</select>
             <button class="code-btn" type="button" data-open="${escapeHtml(path)}" title="Open the file at the base revision">Open</button>
             <button class="code-btn" type="button" data-edit="${escapeHtml(path)}" title="Edit the staged text again">Edit</button>
-            <button class="code-btn" type="button" data-remove="${escapeHtml(path)}" title="Unstage this file">✕</button>
+            <button class="code-btn" type="button" data-remove="${escapeHtml(path)}" title="Unstage this file" aria-label="Unstage this file">✕</button>
           </div>`).join("") || `<div class="kconfig-muted">—</div>`}
         </section>
         <section class="pseries-col">
           <h3>Patches <button class="code-btn" type="button" data-act="add-patch">+ Patch</button></h3>
           ${d.series.map((p, i) => `<div class="pseries-patch" data-pid="${escapeHtml(p.id)}">
             <div class="pseries-patch-head"><strong>[PATCH ${i + 1}/${d.series.length}]</strong>
-              <button class="code-btn" type="button" data-move="-1" ${i === 0 ? "disabled" : ""} title="Move up">↑</button>
-              <button class="code-btn" type="button" data-move="1" ${i === d.series.length - 1 ? "disabled" : ""} title="Move down">↓</button>
-              <button class="code-btn" type="button" data-act="remove-patch" ${d.series.length === 1 ? "disabled" : ""} title="Remove (its files go to the previous patch)">✕</button></div>
+              <button class="code-btn" type="button" data-move="-1" ${i === 0 ? "disabled" : ""} title="Move up" aria-label="Move up">↑</button>
+              <button class="code-btn" type="button" data-move="1" ${i === d.series.length - 1 ? "disabled" : ""} title="Move down" aria-label="Move down">↓</button>
+              <button class="code-btn" type="button" data-act="remove-patch" ${d.series.length === 1 ? "disabled" : ""} title="Remove (its files go to the previous patch)" aria-label="Remove patch">✕</button></div>
             <input type="text" data-field="subject" value="${escapeHtml(p.subject)}" placeholder="subsystem: what it does" aria-label="Subject of patch ${i + 1}" />
             <textarea data-field="body" rows="3" placeholder="Why the change is needed" aria-label="Description of patch ${i + 1}">${escapeHtml(p.body)}</textarea>
             <div class="kconfig-muted pseries-patch-files">${p.files.map(escapeHtml).join(", ") || "no files"}</div>
@@ -163,6 +166,7 @@ export class PatchSeriesView {
       state.openTab({ type: "code", title: btn.dataset.open.split("/").pop(), path: btn.dataset.open, version: d.base, forceNew: e.ctrlKey || e.metaKey });
     } else if (btn.dataset.edit) {
       const { showPatchModal } = await import("../../components/patch_modal.js");
+      if (!this.containerEl?.isConnected) return;
       showPatchModal(d.base, btn.dataset.edit, null, { staged: d.edits[btn.dataset.edit]?.modified });
     } else if (btn.dataset.remove) {
       this.save(removeEdit(d, btn.dataset.remove));
@@ -181,6 +185,7 @@ export class PatchSeriesView {
         m.body.innerHTML = `<div class="kconfig-muted">Close keeps the draft.</div>`;
         m.footer.querySelector("#pseries-discard").onclick = () => { yes = true; m.close(); };
       });
+      if (!this.containerEl?.isConnected) return;
       if (ok) this.save(null);
     } else if (btn.dataset.act === "suggest") {
       await this.suggestRecipients(btn);
@@ -193,6 +198,7 @@ export class PatchSeriesView {
 
   /** Build a layered Patch Impact Map in a new NodeMap tab for this draft's staged files. */
   async buildImpactMap(btn) {
+    const seq = this._seq || 0;
     const d = this.draft;
     const files = Object.keys(d.edits || {}).map((path) => ({ path }));
     if (!files.length) return;
@@ -204,6 +210,7 @@ export class PatchSeriesView {
       const client = typeof baseApi.forRepo === "function" && repo ? baseApi.forRepo(repo) : baseApi;
       const title = d.cover?.subject || d.series?.[0]?.subject || "Patch Series Impact Map";
       const mapCanvas = await generateImpactMap({ api: client, version, repo, title, files });
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       state.openTab({
         type: "nodemap",
         title: `Impact: ${title.slice(0, 28)}`,
@@ -214,18 +221,21 @@ export class PatchSeriesView {
       });
       toast.success(`Generated Impact Map (${mapCanvas.nodes.length} nodes)`);
     } catch (err) {
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       toast.error(`Could not build Impact Map: ${err.message}`);
     } finally {
-      btn.disabled = false;
+      if (this.containerEl?.isConnected && btn.isConnected) btn.disabled = false;
     }
   }
 
   /** Recipients from MAINTAINERS for every touched file; the user's own entries are kept. */
   async suggestRecipients(btn) {
+    const seq = this._seq || 0;
     const d = this.draft;
     btn.disabled = true;
     try {
       const res = await this.api.matchMaintainers(d.base, "", Object.keys(d.edits));
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       const next = structuredClone(d);
       const merge = (have, add) => [...new Set([...have, ...(add || [])])];
       next.to = merge(next.to, res.suggested_to);
@@ -233,13 +243,15 @@ export class PatchSeriesView {
       this.save(next);
       toast.success(`${(res.suggested_to || []).length} maintainers, ${(res.suggested_cc || []).length} lists and reviewers suggested`);
     } catch (err) {
+      if (seq !== this._seq || !this.containerEl?.isConnected) return;
       toast.error(`Could not match maintainers: ${err.message}`);
     } finally {
-      btn.disabled = false;
+      if (this.containerEl?.isConnected && btn.isConnected) btn.disabled = false;
     }
   }
 
   async generate(btn) {
+    const seq = this._seq || 0;
     const d = this.draft;
     try {
       localStorage.setItem(IDENTITY_KEY, JSON.stringify({ name: d.author.name, email: d.author.email }));
@@ -251,11 +263,14 @@ export class PatchSeriesView {
     try {
       res = await this.api.formatPatchSeries(d.base, seriesPayload(d));
     } catch (err) {
-      toast.error(`Could not generate the series: ${err.message}`);
+      if (seq === this._seq && this.containerEl?.isConnected) {
+        toast.error(`Could not generate the series: ${err.message}`);
+      }
       return;
     } finally {
-      btn.disabled = false;
+      if (this.containerEl?.isConnected && btn.isConnected) btn.disabled = false;
     }
+    if (seq !== this._seq || !this.containerEl?.isConnected) return;
     const modal = openModal({
       title: `Patch series (${res.patches.length} message${res.patches.length === 1 ? "" : "s"})`,
       subtitle: res.check.applies ? `Applies cleanly to ${d.base} (${res.base.slice(0, 12)})` : `Does NOT apply cleanly to ${d.base}`,

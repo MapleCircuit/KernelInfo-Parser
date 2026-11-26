@@ -36,7 +36,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-PRODUCTION_ROOTS = ("main.py", "pipeline/", "core/", "parser/", "webapp/", "table_engine/", "cache_engine/")
+PRODUCTION_ROOTS = ("main.py", "pipeline/", "core/", "parser/", "webapp/", "api/", "table_engine/", "cache_engine/")
 EXCLUDED_PREFIXES = ("db_engine/", "tool/", "repos/")
 
 DRIVER_MODULES = ("sqlite3", "mysql", "pymysql", "MySQLdb", "psycopg", "psycopg2", "psycopg3")

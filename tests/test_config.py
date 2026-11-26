@@ -4,9 +4,9 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
-from pathlib import Path
 
 from core.config import (
     DEFAULT_BRANCH_FILTER,
@@ -14,9 +14,6 @@ from core.config import (
     DEFAULT_TAG_VIEWS,
     find_config_path,
     find_repository_branches,
-    get_config,
-    get_db_config,
-    get_parser_config,
     get_repository,
     get_webapp_config,
     init_config,
@@ -33,6 +30,7 @@ from webapp.backend.config import get_backend_db_config
 class TestConfigManagement(unittest.TestCase):
     def setUp(self) -> None:
         import copy
+
         import core.config
         self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
         self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
@@ -41,6 +39,7 @@ class TestConfigManagement(unittest.TestCase):
 
     def tearDown(self) -> None:
         import copy
+
         import core.config
         reset_config()
         os.environ.clear()
@@ -60,7 +59,65 @@ class TestConfigManagement(unittest.TestCase):
             # No default account: credentials come from the configuration or the connect fails with a clear error
             self.assertEqual((cfg["database"]["user"], cfg["database"]["password"]), ("", ""))
             self.assertEqual(cfg["webapp"]["port"], 8000)
+            self.assertEqual(cfg["webapp"]["pool_size"], 10)
+            self.assertEqual(cfg["webapp"]["default_version"], "v3.0")
             self.assertEqual(cfg["parser"]["table_engine"], "cached")
+
+    def test_default_config_webapp_keys_and_no_duplicate_dict_literals(self) -> None:
+        """DEFAULT_CONFIG['webapp'] has all expected keys (including default_version and pool_size) and zero duplicate literal keys."""
+        import ast
+
+        import core.config
+        from webapp.backend.config import get_backend_server_config
+
+        wa = DEFAULT_CONFIG["webapp"]
+        for expected_key in (
+            "host",
+            "port",
+            "reload",
+            "pool_size",
+            "default_version",
+            "cache",
+            "jobs",
+            "prewarm_indexes",
+            "tools",
+            "source_index",
+        ):
+            self.assertIn(expected_key, wa)
+        self.assertEqual(wa["default_version"], "v3.0")
+        self.assertEqual(wa["pool_size"], 10)
+        self.assertIn("repositories", DEFAULT_CONFIG)
+
+        source_path = Path(core.config.__file__)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        default_cfg_dicts: list[ast.Dict] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "DEFAULT_CONFIG":
+                if isinstance(node.value, ast.Dict):
+                    default_cfg_dicts.append(node.value)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "DEFAULT_CONFIG" and isinstance(node.value, ast.Dict):
+                        default_cfg_dicts.append(node.value)
+        self.assertEqual(len(default_cfg_dicts), 1)
+
+        for dict_node in ast.walk(default_cfg_dicts[0]):
+            if isinstance(dict_node, ast.Dict):
+                literal_keys = [
+                    k.value for k in dict_node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                ]
+                self.assertEqual(
+                    len(literal_keys),
+                    len(set(literal_keys)),
+                    f"Duplicate literal key in DEFAULT_CONFIG at line {dict_node.lineno}: {literal_keys}",
+                )
+
+        with patch("core.config.find_config_path", return_value=None):
+            init_config(None)
+            srv_cfg = get_backend_server_config()
+            self.assertEqual(srv_cfg["default_version"], "v3.0")
+            self.assertEqual(srv_cfg["pool_size"], 10)
+            self.assertEqual(srv_cfg["port"], 8000)
 
     def test_load_custom_config_file(self) -> None:
         """Config file values override defaults."""
@@ -190,7 +247,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_main_cli_config_integration(self) -> None:
         """main.py arg_handling correctly parses -c and loads parser configuration."""
-        import main
         import pipeline.cli
         custom_data = {
             "parser": {
@@ -245,7 +301,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_default_continuous_parsing_arguments(self) -> None:
         """Verify pipeline.cli.arg_handling defaults single_version to False for continuous parsing."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
             args = pipeline.cli.arg_handling()
@@ -253,7 +308,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_single_version_argument(self) -> None:
         """Verify pipeline.cli.arg_handling recognizes --single-version and --single flags."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--single-version"]):
             args = pipeline.cli.arg_handling()
@@ -265,7 +319,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_no_rc_argument(self) -> None:
         """--no-rc / --releases-only disables pre-release discovery; the default includes them."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py"]):
             self.assertTrue(pipeline.cli.arg_handling().include_pre_releases)
@@ -276,7 +329,6 @@ class TestConfigManagement(unittest.TestCase):
 
     def test_cli_rc_arguments(self) -> None:
         """Verify pipeline.cli.arg_handling recognizes --rc, --include-rc, and --include-pre-releases flags."""
-        import main
         import pipeline.cli
         with mock.patch("sys.argv", ["main.py", "--rc"]):
             args = pipeline.cli.arg_handling()
@@ -466,7 +518,11 @@ class TestRepositoryDetection(unittest.TestCase):
         """Verify DEFAULT_TAG_VIEWS regex rules partition Linux 2.6.x, 3.x+, historical, and next tags."""
         import copy
         import re
-        from core.config import _LEGACY_DEFAULT_TAG_VIEWS, _normalize_repo_entry_features
+
+        from core.config import (
+            _LEGACY_DEFAULT_TAG_VIEWS,
+            _normalize_repo_entry_features,
+        )
 
         self.assertGreaterEqual(len(DEFAULT_TAG_VIEWS), 1)
         linux_view = DEFAULT_TAG_VIEWS[0]
@@ -1093,6 +1149,7 @@ class TestServiceConfigIsolation(unittest.TestCase):
 
     def setUp(self) -> None:
         import copy
+
         import core.config
 
         self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
@@ -1104,6 +1161,7 @@ class TestServiceConfigIsolation(unittest.TestCase):
 
     def tearDown(self) -> None:
         import copy
+
         import core.config
 
         reset_config()
@@ -1391,17 +1449,21 @@ class TestServiceConfigIsolation(unittest.TestCase):
         import pipeline.cli
 
         new_cfg = self.root / "new_daemon.json"
-        with mock.patch("sys.argv", ["main.py", "--configure", "--config", str(new_cfg)]):
-            with mock.patch("core.tui.app.run_config_tui_launch", return_value=None) as mock_tui:
-                with self.assertRaises(SystemExit) as cm:
-                    pipeline.cli.arg_handling()
-                self.assertEqual(cm.exception.code, 0)
-                mock_tui.assert_called_once_with(str(new_cfg))
+        with (
+            mock.patch("sys.argv", ["main.py", "--configure", "--config", str(new_cfg)]),
+            mock.patch("core.tui.app.run_config_tui_launch", return_value=None) as mock_tui,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            pipeline.cli.arg_handling()
+        self.assertEqual(cm.exception.code, 0)
+        mock_tui.assert_called_once_with(str(new_cfg))
 
         # Non-TUI run with missing --config raises FileNotFoundError (no fallback to config.json)
-        with mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(new_cfg)]):
-            with self.assertRaises(FileNotFoundError):
-                pipeline.cli.arg_handling()
+        with (
+            mock.patch("sys.argv", ["main.py", "--role", "daemon", "--config", str(new_cfg)]),
+            self.assertRaises(FileNotFoundError),
+        ):
+            pipeline.cli.arg_handling()
 
         # sync_repositories(write=True) writes to the --config file, not REPO_ROOT/config.json
         repos_dir = self.root / "repos"
@@ -1498,6 +1560,186 @@ class TestServiceConfigIsolation(unittest.TestCase):
                 self.assertIn("--user", mock_execvp.call_args.args[1])
         finally:
             gs._MEMORY_GUARD_INITIALIZED = orig_initialized
+
+    def test_api_config_defaults_file_env_and_cli(self) -> None:
+        """`api` section defaults, config.json overrides, env-var precedence, and api/main.py CLI flags."""
+        from api import main as api_main
+        from api.config import get_api_server_config, normalize_api_keys
+        from core.config import get_api_config
+
+        with patch("core.config.find_config_path", return_value=None):
+            cfg = load_config(config_path=None)
+        api_cfg = cfg["api"]
+        self.assertEqual(api_cfg["host"], "127.0.0.1")
+        self.assertEqual(api_cfg["port"], 8001)
+        self.assertFalse(api_cfg["reload"])
+        self.assertEqual(api_cfg["default_version"], "v3.0")
+        self.assertEqual(api_cfg["keys"], [])
+        self.assertEqual(api_cfg["rate_limit"], {"max_requests": 120, "window_seconds": 60})
+        self.assertEqual(
+            api_cfg["auth_lockout"],
+            {
+                "max_failures": 5,
+                "failure_window_seconds": 60,
+                "base_lockout_seconds": 30,
+                "max_lockout_seconds": 3600,
+            },
+        )
+        self.assertEqual(api_cfg["trusted_proxies"], ["127.0.0.1", "::1"])
+        self.assertEqual(api_cfg["client_ip_header"], "X-Forwarded-For")
+
+        # Key normalization supports list[str] and {name: key}, rejecting blanks/non-strings
+        self.assertEqual(normalize_api_keys([" k1 ", "", 123]), [("key_0", "k1")])
+        self.assertEqual(normalize_api_keys({"agent": " s1 ", "empty": "  "}), [("agent", "s1")])
+        self.assertEqual(normalize_api_keys(None), [])
+
+        custom_file = self.root / "api_cfg.json"
+        custom_file.write_text(
+            json.dumps(
+                {
+                    "api": {
+                        "host": "0.0.0.0",
+                        "port": 8111,
+                        "reload": True,
+                        "default_version": "v6.6",
+                        "keys": {"ci": "secret-ci"},
+                        "rate_limit": {"max_requests": 50, "window_seconds": 30},
+                        "auth_lockout": {
+                            "max_failures": 3,
+                            "failure_window_seconds": 120,
+                            "base_lockout_seconds": 10,
+                            "max_lockout_seconds": 600,
+                        },
+                        "trusted_proxies": ["10.0.0.0/8"],
+                        "client_ip_header": "X-Real-IP",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "API_PORT": "8222",
+                "API_KEYS": "env-key-1, env-key-2",
+                "API_CLIENT_IP_HEADER": "CF-Connecting-IP",
+            },
+            clear=False,
+        ):
+            init_config(custom_file)
+            loaded_api = get_api_config()
+            self.assertEqual(loaded_api["host"], "0.0.0.0")
+            self.assertEqual(loaded_api["port"], 8222)
+            self.assertTrue(loaded_api["reload"])
+            self.assertEqual(loaded_api["default_version"], "v6.6")
+            self.assertEqual(loaded_api["client_ip_header"], "CF-Connecting-IP")
+            from core.config import normalize_api_client_ip_header
+            self.assertEqual(normalize_api_client_ip_header("x-real-ip"), "X-Real-IP")
+            self.assertEqual(normalize_api_client_ip_header("X-Evil-Header"), "X-Forwarded-For")
+            self.assertEqual(normalize_api_client_ip_header(None), "X-Forwarded-For")
+            self.assertEqual(loaded_api["trusted_proxies"], ["10.0.0.0/8"])
+            srv = get_api_server_config()
+            self.assertEqual(srv["normalized_keys"], [("key_0", "env-key-1"), ("key_1", "env-key-2")])
+
+        args = api_main.parse_args(["-c", str(custom_file), "--host", "127.0.0.1", "--port", "8333", "--no-reload"])
+        self.assertEqual(args.config, str(custom_file))
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 8333)
+        self.assertFalse(args.reload)
+        self.assertIsNone(api_main.parse_args([]).reload)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CONFIG_FILE", None)
+            os.environ.pop("KERNELINFO_CONFIG", None)
+            api_main.apply_config_path(args)
+            self.assertEqual(os.environ["CONFIG_FILE"], str(custom_file.resolve()))
+            self.assertEqual(os.environ["KERNELINFO_CONFIG"], str(custom_file.resolve()))
+
+
+    def test_api_logging_section_defaults_and_env(self) -> None:
+        """`logging.api` defaults, normalization, KIP_API_LOG_* overrides, and get_logging_config("api")."""
+        from core.config import LOGGING_TARGETS, get_logging_config
+
+        self.assertEqual(LOGGING_TARGETS, ("parser", "webapp", "api"))
+        with patch("core.config.find_config_path", return_value=None):
+            cfg = load_config(config_path=None)
+        a_log = cfg["logging"]["api"]
+        self.assertEqual(
+            a_log,
+            {"enabled": False, "dir": "", "file": "api.log", "request_mode": "all",
+             "error_dir": "", "error_file": "", "level": "INFO"},
+        )
+        custom = self.root / "log_api.json"
+        custom.write_text(json.dumps({"logging": {"api": {"enabled": True, "request_mode": "errors_only", "level": "warn"}}}))
+        with mock.patch.dict(os.environ, {"KIP_API_LOG_FILE": "agents.log", "KIP_API_LOG_LEVEL": "debug"}, clear=False):
+            init_config(custom)
+            loaded = get_logging_config("api")
+        self.assertTrue(loaded["enabled"])
+        self.assertEqual(loaded["request_mode"], "errors")
+        self.assertEqual(loaded["file"], "agents.log")
+        self.assertEqual(loaded["level"], "DEBUG")
+        with self.assertRaises(ValueError):
+            get_logging_config("nope")
+
+    def test_prune_api_config_keeps_only_api_sections(self) -> None:
+        from core.config import prune_api_config
+
+        sample = {
+            "database": {"host": "db", "server_tuning": {"x": 1}, "resolved_unix_socket": "/s"},
+            "ssh_tunnel": {"enabled": True, "host": "bastion"},
+            "cache": {"engine": "sqlite"},
+            "webapp": {"port": 8000},
+            "api": {"port": 8001, "keys": ["k"]},
+            "cve": {"repo_dir": "cvelistV5"},
+            "parser": {"mem_max": 32},
+            "mailing_list": {"storage_dir": "/srv"},
+            "workspace": {"repos_dir": "repos"},
+            "logging": {"parser": {"enabled": True}, "webapp": {"enabled": True}, "api": {"enabled": True, "file": "a.log"}},
+            "repositories": [{"name": "linux", "features": {"kconfig": True}, "preparse": {"api": {"mode": "all_main"}}}],
+        }
+        pruned = prune_api_config(sample)
+        self.assertEqual(sorted(pruned), ["api", "cache", "database", "logging", "repositories", "workspace"])
+        self.assertEqual(pruned["logging"], {"api": {"enabled": True, "file": "a.log"}})
+        self.assertEqual(pruned["database"]["ssh_tunnel"]["host"], "bastion")
+        self.assertNotIn("server_tuning", pruned["database"])
+        self.assertNotIn("preparse", pruned["repositories"][0])
+        self.assertEqual(pruned["repositories"][0]["features"], {"kconfig": True})
+        self.assertEqual(pruned["api"], {"port": 8001, "keys": ["k"]})
+        # Input untouched
+        self.assertIn("parser", sample)
+        self.assertIn("webapp", sample["logging"])
+
+    def test_ensure_standalone_config_api(self) -> None:
+        from core.config import API_CONFIG_FILENAME, ensure_standalone_config, get_service_config_path
+
+        self.assertEqual(API_CONFIG_FILENAME, "config_api.json")
+        self.assertEqual(get_service_config_path("api").name, "config_api.json")
+        base_cfg = self.root / "config.json"
+        base_cfg.write_text(json.dumps({
+            "database": {"host": "10.9.9.9", "server_tuning": {"a": 1}},
+            "parser": {"mem_max": 8},
+            "webapp": {"port": 9000},
+            "api": {"port": 8123, "reload": True, "keys": {"agent": "s3cret"}},
+            "logging": {"parser": {"enabled": True}, "api": {"enabled": True}},
+        }))
+        target = self.root / "out" / API_CONFIG_FILENAME
+        path, created = ensure_standalone_config("api", config_path=target, base_config_path=base_cfg)
+        self.assertTrue(created)
+        seeded = json.loads(path.read_text())
+        self.assertEqual(sorted(seeded), ["api", "cache", "database", "logging", "repositories", "workspace"])
+        self.assertEqual(seeded["database"]["host"], "10.9.9.9")
+        self.assertNotIn("server_tuning", seeded["database"])
+        self.assertEqual(seeded["api"]["port"], 8123)
+        self.assertFalse(seeded["api"]["reload"])
+        self.assertEqual(seeded["api"]["keys"], {"agent": "s3cret"})
+        self.assertEqual(list(seeded["logging"]), ["api"])
+        self.assertTrue(seeded["logging"]["api"]["enabled"])
+        # Never overwrites an existing file
+        path.write_text('{"api": {"port": 1}}')
+        _, created_again = ensure_standalone_config("api", config_path=target, base_config_path=base_cfg)
+        self.assertFalse(created_again)
+        self.assertEqual(json.loads(path.read_text()), {"api": {"port": 1}})
 
 
 if __name__ == "__main__":

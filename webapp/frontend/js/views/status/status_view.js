@@ -1,7 +1,7 @@
 /**
  * status_view.js - Parser status tab (tab type `status`, G11, webapp/API.md §5.37).
  *
- * What the parser has done for the active repository (GET /api/system/ingest): the catalog counters,
+ * What the parser has done for the active repository (GET /webapi/system/ingest): the catalog counters,
  * the versions being parsed (an entry not updated for 30 minutes is *stale*: an interrupted run, rolled
  * back by the parser's next start), recent completions, the database's table sizes (sortable), the
  * server's sync tokens, background jobs and caches. Refreshed every 15 s while the tab is visible.
@@ -9,7 +9,7 @@
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { escapeHtml } from "../../components/modal.js";
-import { ago, formatDuration, formatMb, sortTables } from "./status_model.js";
+import { ago, fmtTime, formatDuration, formatMb, sortTables } from "./status_model.js";
 
 const REFRESH_MS = 15000;
 
@@ -70,7 +70,7 @@ export class StatusView {
     const el = this.containerEl;
     if (!el) return;
     try {
-      this.data = await this.api.getIngestStatus();
+      this.data = await (this.api || api).getIngestStatus();
       this.error = null;
     } catch (err) {
       this.error = err.message;
@@ -114,7 +114,7 @@ export class StatusView {
       <section class="status-section">
         <h3>Recent completions</h3>
         ${(d.recent || []).length ? `<table class="status-table"><thead><tr><th>Version</th><th>Commit</th><th>Finished</th></tr></thead><tbody>
-          ${d.recent.map((r) => `<tr><td><a href="#" data-version="${escapeHtml(r.version)}">${escapeHtml(r.version)}</a></td><td><code>${escapeHtml(r.commit)}</code></td><td title="${escapeHtml(new Date(r.finished_at * 1000).toISOString())}">${escapeHtml(ago(r.finished_at))}</td></tr>`).join("")}
+          ${d.recent.map((r) => `<tr><td><a href="#" data-version="${escapeHtml(r.version)}">${escapeHtml(r.version)}</a></td><td><code>${escapeHtml(r.commit)}</code></td><td title="${escapeHtml(fmtTime(r.finished_at))}">${escapeHtml(ago(r.finished_at))}</td></tr>`).join("")}
         </tbody></table>` : '<div class="status-empty">No version finished yet.</div>'}
       </section>
       <section class="status-section">

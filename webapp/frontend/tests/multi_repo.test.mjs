@@ -85,7 +85,7 @@ test("each tab's requests name its own repository, whichever tab is active", asy
   await api.getSync();
   assert.deepEqual(requests.map((r) => r.repo), ["linux", "man-pages"]);
   // URLs that cannot carry headers name the repository too
-  assert.match(kernelView.api.withRepo("/api/fs/raw/v3.0?path=a"), /[?&]repo=linux$/);
+  assert.match(kernelView.api.withRepo("/webapi/fs/raw/v3.0?path=a"), /[?&]repo=linux$/);
   assert.match(manView.api.withRepo("/x"), /\?repo=man-pages$/);
 });
 

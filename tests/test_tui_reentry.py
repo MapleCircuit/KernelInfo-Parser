@@ -14,7 +14,7 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 from core.tui.app import TUIApp
@@ -22,6 +22,7 @@ from core.tui.screens.cve_ml import CVEMailingListScreen
 from core.tui.screens.database_ssh import DatabaseSSHScreen
 from core.tui.screens.main_menu import MainMenuScreen
 from core.tui.screens.parser_dist import ParserDistributedScreen
+from core.tui.screens.webapp_cfg import WebappSettingsScreen, sync_webapp_repositories
 from core.tui.widgets import Button, Checkbox, ModalDialog, SelectList, TextInput
 from tests.test_tui import MockCursesWindow
 
@@ -212,7 +213,7 @@ class TestParserDistributedReentry(_ReentryCase):
     menu_key = MENU_PARSER
     screen_cls = ParserDistributedScreen
 
-    TRUTHY = {
+    TRUTHY: ClassVar[dict[str, Any]] = {
         "sel_table_engine": "direct",
         "sel_memory_mode": "very_low",
         "inp_mem_max": "48",
@@ -226,7 +227,7 @@ class TestParserDistributedReentry(_ReentryCase):
         "chk_delegate_stable": True,
     }
 
-    FALSY = {
+    FALSY: ClassVar[dict[str, Any]] = {
         "sel_table_engine": "cached",
         "sel_memory_mode": "normal",
         "inp_mem_max": "0",
@@ -331,7 +332,7 @@ class TestCVEMailingListReentry(_ReentryCase):
     menu_key = MENU_CVE
     screen_cls = CVEMailingListScreen
 
-    TRUTHY = {
+    TRUTHY: ClassVar[dict[str, Any]] = {
         "inp_cve_repo_dir": "/data/vulns",
         "inp_ml_storage_dir": "/mnt/lore",
         "inp_ml_port": "9001",
@@ -343,7 +344,7 @@ class TestCVEMailingListReentry(_ReentryCase):
         "inp_ssh_key_file": "~/.ssh/id_lore",
     }
 
-    FALSY = {
+    FALSY: ClassVar[dict[str, Any]] = {
         "inp_cve_repo_dir": "",
         "inp_ml_storage_dir": "",
         "inp_ml_port": "8192",
@@ -404,7 +405,7 @@ class TestDatabaseSSHReentry(_ReentryCase):
     menu_key = MENU_DATABASE
     screen_cls = DatabaseSSHScreen
 
-    DB_FIELDS = {
+    DB_FIELDS: ClassVar[dict[str, Any]] = {
         "engine": "mariadb",
         "host": "db.internal",
         "port": "3310",
@@ -414,7 +415,7 @@ class TestDatabaseSSHReentry(_ReentryCase):
         "unix_socket": "",
     }
 
-    SSH_FIELDS_DISABLED = {
+    SSH_FIELDS_DISABLED: ClassVar[dict[str, Any]] = {
         "ssh_enabled": False,
         "ssh_host": "bastion.example.net",
         "ssh_port": "2201",
@@ -497,6 +498,95 @@ class TestDatabaseSSHReentry(_ReentryCase):
         screen = self.open_screen(app)
         self.assertEqual(screen.user.get_value(), "first")
         self.assertEqual(screen.database.get_value(), "second")
+
+
+class TestWebappSettingsReentry(_ReentryCase):
+    """WebappSettingsScreen: scalar fields, cache settings, and repositories stay synchronized across saves."""
+
+    screen_cls = WebappSettingsScreen
+
+    def open_screen(self, app: TUIApp) -> Any:
+        screen = WebappSettingsScreen(app.stdscr, app)
+        app.push_screen(screen)
+        screen.draw()
+        return screen
+
+    def test_all_fields_and_repositories_sync_round_trip(self) -> None:
+        self.write_config({
+            "webapp": {
+                "host": "0.0.0.0",
+                "port": 8000,
+                "reload": True,
+                "default_version": "v6.6",
+                "pool_size": 16,
+                "repo_dir": "repos/custom-linux",
+                "lore_archive_db": "/srv/custom-lore",
+                "cve_dir": "custom-cves",
+                "repositories": [
+                    {
+                        "name": "linux",
+                        "path": "repos/stale-linux",
+                        "repo_dir": "repos/stale-linux",
+                        "lore_archive_db": "/srv/stale-lore",
+                        "cve_dir": "stale-cves",
+                        "default_version": "v3.0",
+                        "default": True,
+                        "enabled": True,
+                    }
+                ],
+            },
+            "repositories": [
+                {
+                    "name": "linux",
+                    "path": "repos/stale-linux",
+                    "default": True,
+                    "enabled": True,
+                }
+            ],
+        })
+
+        values = {
+            "inp_host": "127.0.0.1",
+            "inp_port": "8088",
+            "chk_reload": False,
+            "sel_cache_engine": "sqlite",
+            "inp_cache_dir": "/tmp/kip-wa-cache",
+            "inp_cache_max_mb": "2048",
+            "inp_jobs_workers": "4",
+            "chk_prewarm_indexes": True,
+            "chk_checkpatch_enabled": True,
+            "inp_checkpatch_ref": "v6.6",
+            "inp_tools_sandbox": "bwrap",
+            "inp_source_index_workers": "3",
+            "inp_source_index_max_mb": "512",
+            "inp_source_index_revisions": "6",
+        }
+        self.round_trip(values)
+
+        disk = json.loads(self.config_path.read_text(encoding="utf-8"))
+        wa = disk["webapp"]
+        self.assertEqual(wa["host"], "127.0.0.1")
+        self.assertEqual(wa["port"], 8088)
+        self.assertFalse(wa["reload"])
+        self.assertEqual(wa["default_version"], "v6.6")
+        self.assertEqual(wa["pool_size"], 16)
+        self.assertEqual(wa["repositories"][0]["path"], "repos/custom-linux")
+        self.assertEqual(wa["repositories"][0]["repo_dir"], "repos/custom-linux")
+        self.assertEqual(wa["repositories"][0]["lore_archive_db"], "/srv/custom-lore")
+        self.assertEqual(wa["repositories"][0]["cve_dir"], "custom-cves")
+        self.assertEqual(wa["repositories"][0]["default_version"], "v6.6")
+        self.assertEqual(disk["repositories"][0]["path"], "repos/custom-linux")
+        self.assertEqual(disk["mailing_list"]["storage_dir"], "/srv/custom-lore")
+        self.assertEqual(disk["cve"]["repo_dir"], "custom-cves")
+
+    def test_sync_webapp_repositories_canonical_defaults(self) -> None:
+        app_cfg: dict[str, Any] = {"repositories": [{"name": "linux", "path": "repos/linux", "enabled": True}]}
+        wa_cfg: dict[str, Any] = {"host": "127.0.0.1", "port": 8000}
+        sync_webapp_repositories(app_cfg, wa_cfg)
+        self.assertEqual(wa_cfg["default_version"], "v3.0")
+        self.assertEqual(wa_cfg["pool_size"], 10)
+        self.assertEqual(app_cfg["repositories"][0]["path"], "repos/linux")
+        self.assertNotIn("repositories", wa_cfg)
 
 
 if __name__ == "__main__":

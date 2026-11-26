@@ -148,6 +148,8 @@ class CommandPalette {
   }
 
   close() {
+    this.debouncedSearch?.cancel?.();
+    this.debouncedGrep?.cancel?.();
     this.el?.remove();
     this.el = null;
     this.items = [];

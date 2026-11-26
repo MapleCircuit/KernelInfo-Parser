@@ -549,8 +549,10 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
     width: "700px",
   });
   let tab = initialTab === "templates" ? "templates" : "library";
+  let refreshSeq = 0;
 
   const refresh = async () => {
+    const seq = ++refreshSeq;
     const activeTabIds = collectReferencedTabIds({
       openPanes: state.panes || [],
       sessionsIndex: (ctrl.sessions || sessionManager).getSessionsIndex?.() || [],
@@ -565,6 +567,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
         fallbackStorage: globalThis.localStorage,
       }),
     ]);
+    if (seq !== refreshSeq || !modal.body?.isConnected) return;
 
     const libHtml = `
       <form class="nm-form nm-lib-save-form">
@@ -616,6 +619,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
       const name = String(inp?.value || "").trim();
       if (!name) return;
       await saveNamedCanvas(ctrl.userDb, { name, repo: ctrl.repo, canvas: ctrl.rootCanvas || ctrl.canvas }, globalThis.localStorage);
+      if (!modal.body?.isConnected) return;
       toast.success(`Saved map "${name}" to Library`);
       refresh();
     });
@@ -633,6 +637,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
         const key = b.dataset.key;
         if (act === "load") {
           const loaded = await loadNamedCanvas(ctrl.userDb, key, globalThis.localStorage);
+          if (!modal.body?.isConnected) return;
           if (loaded?.canvas) {
             ctrl.loadCanvasDocument(loaded.canvas);
             modal.close();
@@ -643,16 +648,20 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
           const next = prompt("Rename saved map:", curName);
           if (next && next.trim()) {
             await renameNamedCanvas(ctrl.userDb, key, next.trim(), globalThis.localStorage);
+            if (!modal.body?.isConnected) return;
             refresh();
           }
         } else if (act === "dup") {
           await duplicateNamedCanvas(ctrl.userDb, key, "", globalThis.localStorage);
+          if (!modal.body?.isConnected) return;
           refresh();
         } else if (act === "del") {
           await deleteNamedCanvas(ctrl.userDb, key, globalThis.localStorage);
+          if (!modal.body?.isConnected) return;
           refresh();
         } else if (act === "prune") {
           const res = await ctrl.pruneOrphanedCanvases();
+          if (!modal.body?.isConnected) return;
           toast.success(`Pruned ${res.prunedCount} orphaned tab cache${res.prunedCount === 1 ? "" : "s"}`);
           refresh();
         } else if (act === "template") {

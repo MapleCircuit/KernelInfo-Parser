@@ -16,8 +16,8 @@ import os
 import re
 import stat
 import subprocess
-from pathlib import Path
 from collections.abc import Iterable, Iterator, Mapping
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -26,10 +26,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DAEMON_CONFIG_FILENAME = "config_daemon.json"
 WEBAPP_CONFIG_FILENAME = "config_webapp.json"
+API_CONFIG_FILENAME = "config_api.json"
 _SERVICE_CONFIG_FILENAMES: dict[str, str] = {
     "daemon": DAEMON_CONFIG_FILENAME,
     "webapp": WEBAPP_CONFIG_FILENAME,
+    "api": API_CONFIG_FILENAME,
 }
+# Targets of the `logging` section (one file-logging configuration per process kind)
+LOGGING_TARGETS: tuple[str, ...] = ("parser", "webapp", "api")
+# Targets whose records include HTTP requests (request_mode applies)
+HTTP_LOGGING_TARGETS: tuple[str, ...] = ("webapp", "api")
 
 DEFAULT_SSH_TUNNEL_CONFIG: dict[str, Any] = {
     "enabled": False,
@@ -135,6 +141,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "host": "0.0.0.0",
         "port": 8000,
         "reload": True,
+        "pool_size": 10,
+        "default_version": "v3.0",
         # Disk cache of derived data under KERNELINFO_CACHE_DIR (webapp/API.md section 2.14)
         "cache": {"max_mb": 1024},
         # Background jobs: worker threads per process (webapp/API.md section 2.15)
@@ -150,6 +158,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # ingested), into a SQLite store capped at max_mb (least recently used blobs dropped past it). Assembled
         # revisions are kept on disk (at most `revisions`), so a restart does not assemble them again.
         "source_index": {"workers": 2, "max_mb": 1024, "revisions": 8},
+    },
+    # Standalone authenticated AI & programmatic API service (api/API.md)
+    "api": {
+        "host": "127.0.0.1",
+        "port": 8001,
+        "reload": False,
+        "default_version": "v3.0",
+        "keys": [],
+        "rate_limit": {
+            "max_requests": 120,
+            "window_seconds": 60,
+        },
+        "auth_lockout": {
+            "max_failures": 5,
+            "failure_window_seconds": 60,
+            "base_lockout_seconds": 30,
+            "max_lockout_seconds": 3600,
+        },
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        "client_ip_header": "X-Forwarded-For",
     },
     # CVE records: a local clone of the CVE Program's list (cvelistV5) or of the kernel CNA's vulns.git, kept
     # current by the operator (git pull). The parser ingests it into m_cve / m_cve_commit when its HEAD changed
@@ -228,7 +256,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "repos_dir": "repos",
         "auto_detect_repos": True,
     },
-    # File logging for parser and webapp backend (disabled by default)
+    # File logging for the parser, the webapp backend, and the AI API service (disabled by default)
     "logging": {
         "parser": {
             "enabled": False,
@@ -247,10 +275,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "error_file": "",
             "level": "INFO",
         },
+        "api": {
+            "enabled": False,
+            "dir": "",
+            "file": "api.log",
+            "request_mode": "all",
+            "error_dir": "",
+            "error_file": "",
+            "level": "INFO",
+        },
     },
     # Populated by sync_repositories() from Git repositories found under workspace.repos_dir
     "repositories": [],
 }
+
+# Client-IP headers the AI API reads from a trusted reverse proxy (api/API.md section 3)
+VALID_API_CLIENT_IP_HEADERS = ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP")
+
+
+def normalize_api_client_ip_header(val: Any) -> str:
+    """Canonical spelling of a supported client-IP header (case-insensitive); `X-Forwarded-For` otherwise."""
+    wanted = str(val or "").strip().lower()
+    for name in VALID_API_CLIENT_IP_HEADERS:
+        if name.lower() == wanted:
+            return name
+    return "X-Forwarded-For"
+
 
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_WEBAPP_REQUEST_MODES = ("all", "errors")
@@ -397,7 +447,6 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
     legacy webapp connection logic (which checks MYSQL_*), and spawned
     multiprocessing worker processes all observe the exact same configuration.
     """
-    global _EXPORTED_ENV_VARS
     db_cfg = cfg.get("database", {})
 
     host = str(db_cfg.get("host") or "127.0.0.1")
@@ -490,7 +539,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
             with open(resolved_path, "r", encoding="utf-8") as f:
                 file_data = json.load(f)
             if not isinstance(file_data, dict):
-                raise ValueError(f"Root JSON element must be an object, got {type(file_data).__name__}")
+                raise TypeError(f"Root JSON element must be an object, got {type(file_data).__name__}")
             # Backward compatibility: migrate legacy top-level ssh_tunnel to database.ssh_tunnel if needed
             if "ssh_tunnel" in file_data and isinstance(file_data["ssh_tunnel"], dict):
                 db_data = file_data.setdefault("database", {})
@@ -558,6 +607,78 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         webapp_sec["reload"] = _coerce_bool(env_wa_reload, webapp_sec["reload"])
     else:
         webapp_sec["reload"] = _coerce_bool(webapp_sec.get("reload"), True)
+    webapp_sec["pool_size"] = max(1, _coerce_int(webapp_sec.get("pool_size"), 10))
+    webapp_sec["default_version"] = str(webapp_sec.get("default_version") or "v3.0").strip() or "v3.0"
+
+    if "api" not in merged or not isinstance(merged["api"], dict):
+        merged["api"] = copy.deepcopy(DEFAULT_CONFIG["api"])
+    api_sec = merged["api"]
+    if env_api_host := _get_user_env("API_HOST"):
+        api_sec["host"] = str(env_api_host).strip() or "127.0.0.1"
+    else:
+        api_sec["host"] = str(api_sec.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    if env_api_port := _get_user_env("API_PORT"):
+        api_sec["port"] = _coerce_int(env_api_port, api_sec.get("port", 8001))
+    else:
+        api_sec["port"] = _coerce_int(api_sec.get("port"), 8001)
+    if env_api_reload := _get_user_env("API_RELOAD"):
+        api_sec["reload"] = _coerce_bool(env_api_reload, api_sec.get("reload", False))
+    else:
+        api_sec["reload"] = _coerce_bool(api_sec.get("reload"), False)
+    if env_api_ver := _get_user_env("API_DEFAULT_VERSION"):
+        api_sec["default_version"] = str(env_api_ver).strip() or "v3.0"
+    else:
+        api_sec["default_version"] = str(api_sec.get("default_version") or webapp_sec["default_version"] or "v3.0").strip() or "v3.0"
+
+    if (env_api_keys := (_get_user_env("API_KEYS") or _get_user_env("KIP_API_KEYS"))) is not None:
+        raw_env_keys = env_api_keys.strip()
+        if raw_env_keys.startswith(("[", "{")):
+            try:
+                api_sec["keys"] = json.loads(raw_env_keys)
+            except json.JSONDecodeError:
+                api_sec["keys"] = [k.strip() for k in raw_env_keys.split(",") if k.strip()]
+        else:
+            api_sec["keys"] = [k.strip() for k in raw_env_keys.split(",") if k.strip()]
+    elif not isinstance(api_sec.get("keys"), (list, dict)):
+        api_sec["keys"] = []
+
+    default_rl = DEFAULT_CONFIG["api"]["rate_limit"]
+    rl_sec = api_sec.get("rate_limit")
+    if not isinstance(rl_sec, dict):
+        rl_sec = copy.deepcopy(default_rl)
+    api_sec["rate_limit"] = {
+        "max_requests": max(1, _coerce_int(rl_sec.get("max_requests"), default_rl["max_requests"])),
+        "window_seconds": max(1, _coerce_int(rl_sec.get("window_seconds"), default_rl["window_seconds"])),
+    }
+
+    default_lo = DEFAULT_CONFIG["api"]["auth_lockout"]
+    lo_sec = api_sec.get("auth_lockout")
+    if not isinstance(lo_sec, dict):
+        lo_sec = copy.deepcopy(default_lo)
+    base_lock = max(1, _coerce_int(lo_sec.get("base_lockout_seconds"), default_lo["base_lockout_seconds"]))
+    max_lock = max(base_lock, _coerce_int(lo_sec.get("max_lockout_seconds"), default_lo["max_lockout_seconds"]))
+    api_sec["auth_lockout"] = {
+        "max_failures": max(1, _coerce_int(lo_sec.get("max_failures"), default_lo["max_failures"])),
+        "failure_window_seconds": max(1, _coerce_int(lo_sec.get("failure_window_seconds"), default_lo["failure_window_seconds"])),
+        "base_lockout_seconds": base_lock,
+        "max_lockout_seconds": max_lock,
+    }
+
+    if (env_proxies := _get_user_env("API_TRUSTED_PROXIES")) is not None:
+        api_sec["trusted_proxies"] = [p.strip() for p in env_proxies.split(",") if p.strip()]
+    else:
+        raw_proxies = api_sec.get("trusted_proxies")
+        if isinstance(raw_proxies, str):
+            api_sec["trusted_proxies"] = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+        elif isinstance(raw_proxies, (list, tuple)):
+            api_sec["trusted_proxies"] = [str(p).strip() for p in raw_proxies if isinstance(p, str) and p.strip()]
+        else:
+            api_sec["trusted_proxies"] = list(DEFAULT_CONFIG["api"]["trusted_proxies"])
+
+    if env_ip_hdr := _get_user_env("API_CLIENT_IP_HEADER"):
+        api_sec["client_ip_header"] = normalize_api_client_ip_header(env_ip_hdr)
+    else:
+        api_sec["client_ip_header"] = normalize_api_client_ip_header(api_sec.get("client_ip_header"))
 
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
@@ -657,7 +778,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     if "logging" not in merged or not isinstance(merged["logging"], dict):
         merged["logging"] = copy.deepcopy(DEFAULT_CONFIG["logging"])
     log_sec = merged["logging"]
-    for target in ("parser", "webapp"):
+    for target in LOGGING_TARGETS:
         default_target = copy.deepcopy(DEFAULT_CONFIG["logging"][target])
         if target not in log_sec or not isinstance(log_sec[target], dict):
             log_sec[target] = default_target
@@ -705,6 +826,28 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         w_log["level"] = normalize_log_level(w_log.get("level"))
 
+    a_log = log_sec["api"]
+    if env_a_log_en := _get_user_env("KIP_API_LOG_ENABLED"):
+        a_log["enabled"] = _coerce_bool(env_a_log_en, False)
+    else:
+        a_log["enabled"] = _coerce_bool(a_log.get("enabled"), False)
+    if (env_a_log_dir := _get_user_env("KIP_API_LOG_DIR")) is not None:
+        a_log["dir"] = env_a_log_dir
+    if (env_a_log_file := _get_user_env("KIP_API_LOG_FILE")) is not None:
+        a_log["file"] = env_a_log_file
+    if env_a_log_mode := _get_user_env("KIP_API_LOG_REQUEST_MODE"):
+        a_log["request_mode"] = normalize_webapp_request_mode(env_a_log_mode)
+    else:
+        a_log["request_mode"] = normalize_webapp_request_mode(a_log.get("request_mode"))
+    if (env_a_log_err_dir := _get_user_env("KIP_API_LOG_ERROR_DIR")) is not None:
+        a_log["error_dir"] = env_a_log_err_dir
+    if (env_a_log_err_file := _get_user_env("KIP_API_LOG_ERROR_FILE")) is not None:
+        a_log["error_file"] = env_a_log_err_file
+    if env_a_log_lvl := _get_user_env("KIP_API_LOG_LEVEL"):
+        a_log["level"] = normalize_log_level(env_a_log_lvl)
+    else:
+        a_log["level"] = normalize_log_level(a_log.get("level"))
+
     # 4. Normalize repository feature overrides if present
     if isinstance(merged.get("repositories"), list):
         merged["repositories"] = [
@@ -746,6 +889,11 @@ def get_webapp_config() -> dict[str, Any]:
     return get_config().get("webapp", copy.deepcopy(DEFAULT_CONFIG["webapp"]))
 
 
+def get_api_config() -> dict[str, Any]:
+    """Retrieve active standalone AI API configuration section."""
+    return get_config().get("api", copy.deepcopy(DEFAULT_CONFIG["api"]))
+
+
 def get_parser_config() -> dict[str, Any]:
     """Retrieve active parser configuration section."""
     return get_config().get("parser", copy.deepcopy(DEFAULT_CONFIG["parser"]))
@@ -778,11 +926,11 @@ def get_workspace_config() -> dict[str, Any]:
 
 
 def get_logging_config(target: str | None = None) -> dict[str, Any]:
-    """Retrieve active logging configuration section (whole dict, or `'parser'` / `'webapp'`)."""
+    """Retrieve active logging configuration section (whole dict, or `'parser'` / `'webapp'` / `'api'`)."""
     log_cfg = get_config().get("logging", copy.deepcopy(DEFAULT_CONFIG["logging"]))
     if target is None:
         return log_cfg
-    if target not in ("parser", "webapp"):
+    if target not in LOGGING_TARGETS:
         raise ValueError(f"Unknown logging target: {target!r}")
     section = log_cfg.get(target)
     if isinstance(section, dict):
@@ -1207,10 +1355,7 @@ def default_project_insights(slug: str | None, entry: Mapping[str, Any] | None =
             names.append(name)
         git_url = str(entry.get("git_url") or "").strip().rstrip("/")
         if git_url:
-            base = Path(git_url).name
-            if base.endswith(".git"):
-                base = base[:-4]
-            base = base.strip().lower()
+            base = Path(git_url).name.removesuffix(".git").strip().lower()
             if base and base not in names:
                 names.append(base)
     cfg["generic_repo_names"] = names
@@ -1264,7 +1409,7 @@ def normalize_insights_overrides(raw: Any) -> dict[str, Any]:
         elif expected_type == "int":
             try:
                 if isinstance(val, bool):
-                    raise ValueError("bool is not int")
+                    raise TypeError("bool is not int")
                 iv = int(val)
                 if iv < 0:
                     raise ValueError("must be >= 0")
@@ -1274,7 +1419,7 @@ def normalize_insights_overrides(raw: Any) -> dict[str, Any]:
         elif expected_type == "float":
             try:
                 if isinstance(val, bool):
-                    raise ValueError("bool is not float")
+                    raise TypeError("bool is not float")
                 fv = float(val)
                 if not (0.0 <= fv <= 1.0):
                     raise ValueError("must be in 0.0..1.0")
@@ -1475,7 +1620,7 @@ def detect_repository_insights(
         tag_out = _git_out(repo, "tag", "-l")
         tags = [t.strip() for t in tag_out.splitlines() if t.strip()]
         if tags:
-            has_pre_rc = any(re.search(r"-(?:rc|pre)\d+$", t, re.I) for t in tags)
+            has_pre_rc = any(re.search(r"-(?:rc|pre)\d+$", t, re.IGNORECASE) for t in tags)
             base["milestone_rc"] = 1 if has_pre_rc else 0
         else:
             base["milestone_rc"] = 1 if effective_slug == LINUX_PROJECT else 0
@@ -1517,7 +1662,7 @@ def detect_repository_insights(
                     if count >= thresh
                 ]
                 if effective_slug == LINUX_PROJECT:
-                    has_linus = any("linus" in c.lower() for c in committer_counts.keys())
+                    has_linus = any("linus" in c.lower() for c in committer_counts)
                     if merge_commits < 3 or has_linus:
                         base["lead_mergers"] = ["Linus Torvalds"]
                     elif sorted_committers:
@@ -1541,10 +1686,7 @@ def detect_repository_insights(
         else:
             url_base = ""
             if url:
-                ub = Path(url.rstrip("/")).name
-                if ub.endswith(".git"):
-                    ub = ub[:-4]
-                url_base = ub.strip().lower()
+                url_base = Path(url.rstrip("/")).name.removesuffix(".git").strip().lower()
             names = []
             for candidate in (repo.name.lower(), effective_slug.lower(), url_base):
                 if candidate and candidate not in names:
@@ -1609,9 +1751,7 @@ def matches_branch_filter(branch: str, branch_filter: dict[str, Any] | None = No
 
     if not any(fnmatch.fnmatch(branch, pat) for pat in includes):
         return False
-    if any(fnmatch.fnmatch(branch, pat) for pat in excludes):
-        return False
-    return True
+    return not any(fnmatch.fnmatch(branch, pat) for pat in excludes)
 
 
 def find_repository_branches(
@@ -1695,7 +1835,7 @@ def find_repository_branches(
         # Tier 4: Linux-next integration branches (linux-next/master first)
         if b in ("linux-next/master", "linux-next/HEAD"):
             return (4, (0,), b)
-        if b.startswith("linux-next/") or b.startswith("next/"):
+        if b.startswith(("linux-next/", "next/")):
             return (4, (1,), b)
         # Tier 5: Remaining topic branches
         return (5, (), b)
@@ -1900,7 +2040,7 @@ def update_repository_branches(name_or_path: str | None = None, write: bool = Tr
 
 
 def _normalize_service_name(service: str) -> str:
-    """Return canonical service key (`'daemon'` or `'webapp'`); raise ValueError otherwise."""
+    """Return canonical service key (`'daemon'`, `'webapp'`, or `'api'`); raise ValueError otherwise."""
     key = str(service or "").strip().lower()
     if key not in _SERVICE_CONFIG_FILENAMES:
         valid = ", ".join(sorted(_SERVICE_CONFIG_FILENAMES))
@@ -1909,7 +2049,7 @@ def _normalize_service_name(service: str) -> str:
 
 
 def get_service_config_path(service: str) -> Path:
-    """Return the standalone configuration path under REPO_ROOT for `'daemon'` or `'webapp'`."""
+    """Return the standalone configuration path under REPO_ROOT for `'daemon'`, `'webapp'`, or `'api'`."""
     key = _normalize_service_name(service)
     return REPO_ROOT / _SERVICE_CONFIG_FILENAMES[key]
 
@@ -1940,13 +2080,34 @@ def prune_webapp_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Top-level sections a standalone AI API configuration keeps (`logging` keeps only its `api` target)
+API_CONFIG_SECTIONS: tuple[str, ...] = ("database", "cache", "workspace", "repositories", "api", "logging")
+
+
+def prune_api_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied config dict holding only what the AI API service reads.
+
+    Keeps `database` (its `ssh_tunnel` included; a legacy top-level `ssh_tunnel` moves into it), `cache`,
+    `workspace`, `repositories` (without parser `preparse` rules), `api`, and `logging.api`; parser-only and
+    webapp-only sections and fields are removed.
+    """
+    out = prune_webapp_config(cfg)
+    for key in list(out):
+        if key not in API_CONFIG_SECTIONS:
+            out.pop(key, None)
+    log_sec = out.get("logging")
+    if isinstance(log_sec, dict):
+        out["logging"] = {"api": log_sec["api"]} if isinstance(log_sec.get("api"), dict) else {}
+    return out
+
+
 def ensure_standalone_config(
     service: str,
     *,
     config_path: Path | None = None,
     base_config_path: Path | None = None,
 ) -> tuple[Path, bool]:
-    """Seed a standalone config file for `'daemon'` or `'webapp'` if it does not exist yet.
+    """Seed a standalone config file for `'daemon'`, `'webapp'`, or `'api'` if it does not exist yet.
 
     Never overwrites or merges into an existing target file. Returns `(target_path, created)`.
     """
@@ -1999,6 +2160,13 @@ def ensure_standalone_config(
             parser_sec["distributed"] = dist_sec
         dist_sec["enabled"] = True
         dist_sec["role"] = "daemon"
+    elif key == "api":
+        seed = prune_api_config(seed)
+        api_sec = seed.get("api")
+        if not isinstance(api_sec, dict):
+            api_sec = copy.deepcopy(DEFAULT_CONFIG["api"])
+            seed["api"] = api_sec
+        api_sec["reload"] = False
     else:
         seed = prune_webapp_config(seed)
         webapp_sec = seed.get("webapp")
@@ -2066,7 +2234,7 @@ def validate_service_config(
     prev_exported = dict(_EXPORTED_ENV_VARS)
     try:
         loaded = load_config(path)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return False, [str(exc)], None
     finally:
         for env_key in list(_EXPORTED_ENV_VARS.keys()):
@@ -2158,7 +2326,7 @@ def validate_service_config(
 
 def reset_config() -> None:
     """Reset the active configuration to uninitialized state (useful for tests)."""
-    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH, _EXPORTED_ENV_VARS
+    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH
     _ACTIVE_CONFIG = None
     _LOADED_CONFIG_PATH = None
     _DETECTED_REPO_CACHE.clear()

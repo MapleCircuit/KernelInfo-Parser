@@ -80,7 +80,7 @@ export function manPageLink(baseHref, { repo = "", version = "", name = "", sect
 }
 
 /**
- * Index sections of `/api/man/{v}/index` pages: [{section, title, pages}] in section order, each list
+ * Index sections of `/webapi/man/{v}/index` pages: [{section, title, pages}] in section order, each list
  * sorted by name, keeping the pages whose name or summary hold every word of `filter`.
  */
 export function groupIndex(pages, filter = "") {

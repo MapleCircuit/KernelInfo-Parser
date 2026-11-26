@@ -48,12 +48,15 @@ export class WatchView {
 
   dispose() {
     this.unsub?.();
+    this.unsub = null;
+    this.containerEl = null;
   }
 
   async refresh() {
     const watches = await listWatches();
     const states = await watchStates();
-    const host = this.containerEl?.querySelector(".watch-list");
+    if (!this.containerEl?.isConnected) return;
+    const host = this.containerEl.querySelector(".watch-list");
     if (!host) return;
     host.innerHTML = watches.length ? watches.map((w) => {
       const s = states.get(w.key) || {};
@@ -91,8 +94,13 @@ export class WatchView {
     const row = btn.closest(".watch-row");
     if (act === "check") {
       btn.disabled = true;
-      const n = await checkWatches();
-      btn.disabled = false;
+      let n = 0;
+      try {
+        n = await checkWatches();
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+      if (!this.containerEl?.isConnected) return;
       toast.success(n ? `${n} watched item${n === 1 ? "" : "s"} changed` : "No watched item changed");
       return;
     }

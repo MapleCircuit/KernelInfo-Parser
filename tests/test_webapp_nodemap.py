@@ -213,7 +213,7 @@ class NodeMapApiTests(unittest.TestCase):
             return self.client.get(url)
 
     def test_struct_from_db(self) -> None:
-        r = self._get("/api/nodemap/v3.0/struct/foo", True, SRC.encode())
+        r = self._get("/webapi/nodemap/v3.0/struct/foo", True, SRC.encode())
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual((body["span_source"], body["guard_source"], body["kind"]), ("db", "source", "struct"))
@@ -223,35 +223,35 @@ class NodeMapApiTests(unittest.TestCase):
         self.assertEqual(body["items"][0]["name"], "a")
 
     def test_struct_prefix_and_kind_filter(self) -> None:
-        r = self._get("/api/nodemap/v3.0/struct/struct%20foo?kind=union", True, SRC.encode())
+        r = self._get("/webapi/nodemap/v3.0/struct/struct%20foo?kind=union", True, SRC.encode())
         self.assertEqual(r.status_code, 404)
-        r = self._get("/api/nodemap/v3.0/struct/struct%20foo?kind=struct&line=10&path=include/foo.h", True, SRC.encode())
+        r = self._get("/webapi/nodemap/v3.0/struct/struct%20foo?kind=struct&line=10&path=include/foo.h", True, SRC.encode())
         self.assertEqual(r.status_code, 200)
-        r = self._get("/api/nodemap/v3.0/struct/foo?path=other.h", True, SRC.encode())
+        r = self._get("/webapi/nodemap/v3.0/struct/foo?path=other.h", True, SRC.encode())
         self.assertEqual(r.status_code, 200)   # the DB definition is in another file: the hinted file is read from Git
         self.assertEqual((r.json()["span_source"], r.json()["file_path"]), ("git", "other.h"))
 
     def test_struct_git_fallback(self) -> None:
-        r = self._get("/api/nodemap/v9.9/struct/bar?path=a/b.h", False, SRC.encode())
+        r = self._get("/webapi/nodemap/v9.9/struct/bar?path=a/b.h", False, SRC.encode())
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual((body["span_source"], body["file_path"], body["line_s"], body["line_e"]), ("git", "a/b.h", 32, 32))
-        r = self._get("/api/nodemap/v9.9/struct/uni_t?path=a/b.h", False, SRC.encode())
+        r = self._get("/webapi/nodemap/v9.9/struct/uni_t?path=a/b.h", False, SRC.encode())
         self.assertEqual(r.json()["kind"], "union")
 
     def test_struct_errors(self) -> None:
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/foo", False, SRC.encode()).status_code, 404)
-        self.assertIn("path", self._get("/api/nodemap/v9.9/struct/foo", False).json()["detail"])
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/foo?path=a.h", False, None).status_code, 404)
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/nope?path=a.h", False, SRC.encode()).status_code, 404)
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/a%3Bb", False).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/foo?path=../x", False).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/foo?kind=enum&path=a.h", False).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/--output=x/struct/foo?path=a.h", False).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/struct/foo?path=a.h", False, b"\0\1").status_code, 415)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/foo", False, SRC.encode()).status_code, 404)
+        self.assertIn("path", self._get("/webapi/nodemap/v9.9/struct/foo", False).json()["detail"])
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/foo?path=a.h", False, None).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/nope?path=a.h", False, SRC.encode()).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/a%3Bb", False).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/foo?path=../x", False).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/foo?kind=enum&path=a.h", False).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/--output=x/struct/foo?path=a.h", False).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/struct/foo?path=a.h", False, b"\0\1").status_code, 415)
 
     def test_source_symbol_db_and_context(self) -> None:
-        r = self._get("/api/nodemap/v3.0/source?symbol=func&context=2", True, SRC.encode())
+        r = self._get("/webapi/nodemap/v3.0/source?symbol=func&context=2", True, SRC.encode())
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual(body["path"], "include/foo.h")
@@ -260,36 +260,36 @@ class NodeMapApiTests(unittest.TestCase):
         self.assertEqual(len(body["lines"]), body["end_line"] - body["start_line"] + 1)
 
     def test_source_symbol_git(self) -> None:
-        r = self._get("/api/nodemap/v9.9/source?symbol=M&path=a.h", False, SRC.encode())
+        r = self._get("/webapi/nodemap/v9.9/source?symbol=M&path=a.h", False, SRC.encode())
         body = r.json()
         self.assertEqual(body["symbol"], {"name": "M", "kind": "macro", "line_s": 30, "line_e": 31, "span_source": "git"})
         self.assertEqual(body["lines"][0], "#define M(x) \\")
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?symbol=M", False, SRC.encode()).status_code, 404)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?symbol=zz&path=a.h", False, SRC.encode()).status_code, 404)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?symbol=M&kind=struct&path=a.h", False, SRC.encode()).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?symbol=M", False, SRC.encode()).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?symbol=zz&path=a.h", False, SRC.encode()).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?symbol=M&kind=struct&path=a.h", False, SRC.encode()).status_code, 404)
 
     def test_source_ranges(self) -> None:
         body = "\n".join(f"l{i}" for i in range(1, 11)) + "\n"
-        r = self._get("/api/nodemap/v9.9/source?path=a.c", False, body.encode()).json()
+        r = self._get("/webapi/nodemap/v9.9/source?path=a.c", False, body.encode()).json()
         self.assertEqual((r["total_lines"], r["start_line"], r["end_line"], r["truncated"], r["symbol"]), (10, 1, 10, False, None))
-        r = self._get("/api/nodemap/v9.9/source?path=a.c&start=3&end=99", False, body.encode()).json()
+        r = self._get("/webapi/nodemap/v9.9/source?path=a.c&start=3&end=99", False, body.encode()).json()
         self.assertEqual((r["start_line"], r["end_line"], r["lines"][0]), (3, 10, "l3"))
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&start=99", False, body.encode()).json()["start_line"], 10)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&start=5&end=2", False, body.encode()).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&start=99", False, body.encode()).json()["start_line"], 10)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&start=5&end=2", False, body.encode()).status_code, 400)
 
     def test_source_truncation_and_errors(self) -> None:
         big = "\n".join("x" for _ in range(7000)).encode()
-        r = self._get("/api/nodemap/v9.9/source?path=a.c", False, big).json()
+        r = self._get("/webapi/nodemap/v9.9/source?path=a.c", False, big).json()
         self.assertEqual((r["truncated"], r["end_line"], len(r["lines"]), r["total_lines"]), (True, 6000, 6000, 7000))
-        self.assertEqual(self._get("/api/nodemap/v9.9/source", False, big).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&context=201", False, big).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&kind=x", False, big).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&start=0", False, big).status_code, 422)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=..%2Fa", False, big).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c&symbol=a%3Bb", False, big).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.c", False, None).status_code, 404)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=d", False, None, True).status_code, 400)
-        self.assertEqual(self._get("/api/nodemap/v9.9/source?path=a.bin", False, b"\0\0").status_code, 415)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source", False, big).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&context=201", False, big).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&kind=x", False, big).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&start=0", False, big).status_code, 422)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=..%2Fa", False, big).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c&symbol=a%3Bb", False, big).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.c", False, None).status_code, 404)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=d", False, None, True).status_code, 400)
+        self.assertEqual(self._get("/webapi/nodemap/v9.9/source?path=a.bin", False, b"\0\0").status_code, 415)
 
 
 class EmbedFramingHeaderTests(unittest.TestCase):

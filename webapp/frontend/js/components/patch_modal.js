@@ -45,8 +45,10 @@ export async function showPatchModal(version, filePath, originalContent = null, 
   if (original === null) {
     try {
       const res = await api.getFileContent(version, filePath);
+      if (!modal.body.isConnected) return;
       original = res.content || "";
     } catch (err) {
+      if (!modal.body.isConnected) return;
       modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
       return;
     }
@@ -84,8 +86,10 @@ export async function showPatchModal(version, filePath, originalContent = null, 
       return;
     }
     const subject = modal.body.querySelector("#patch-subject").value.trim();
+    const blobSha = await gitBlobSha(original);
+    if (!modal.body.isConnected) return;
     const res = addEdit(state.getPatchDrafts(), {
-      base: version, path: filePath, originalBlob: await gitBlobSha(original), modified: editor.value,
+      base: version, path: filePath, originalBlob: blobSha, modified: editor.value,
       subject: /:\s*$/.test(subject) ? "" : subject, body: modal.body.querySelector("#patch-body").value,
     });
     if (res.error) {
@@ -121,6 +125,7 @@ export async function showPatchModal(version, filePath, originalContent = null, 
     out.innerHTML = `<div class="ki-modal-empty">Formatting patch…</div>`;
     try {
       const res = await api.formatPatch(version, payload);
+      if (!modal.body.isConnected || !out.isConnected) return;
       const patch = res.patch || res.formatted_patch || res.content || "";
       const lines = patch.split("\n").map((l) => {
         const cls = l.startsWith("+") && !l.startsWith("+++") ? "diff-add" : l.startsWith("-") && !l.startsWith("---") ? "diff-del" : l.startsWith("@@") ? "diff-hunk" : "";
@@ -150,6 +155,7 @@ export async function showPatchModal(version, filePath, originalContent = null, 
             row.scrollIntoView({ block: "center" });
           },
         });
+        if (!modal.body.isConnected || !content.isConnected) return;
         // Gutter marks on the preview lines checkpatch reported
         for (const r of res?.results || []) content.children[r.line - 1]?.classList.add(`cp-mark-${r.level.toLowerCase()}`);
       };
@@ -162,6 +168,7 @@ export async function showPatchModal(version, filePath, originalContent = null, 
       };
       out.scrollIntoView({ behavior: "smooth", block: "nearest" });
     } catch (err) {
+      if (!modal.body.isConnected || !out.isConnected) return;
       out.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
     }
   };

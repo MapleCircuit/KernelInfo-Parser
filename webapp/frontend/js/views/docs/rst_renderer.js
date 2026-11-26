@@ -15,6 +15,31 @@ const ADORNMENT_CHARS = "=-`:.'\"~^_*+#<>!$%&,;?@[]\\/|{}()";
 const ADMONITIONS = new Set([
   "note", "warning", "attention", "caution", "danger", "error", "hint", "important", "tip", "seealso", "todo"
 ]);
+
+function buildInlineTokenRe(plain) {
+  const parts = [
+    plain ? null : String.raw`(?<esc>\\([^\sA-Za-z0-9]))`,
+    String.raw`(?<lit>\`\`(?<litText>[^\`]+?(?:\`(?!\`)[^\`]*?)*)\`\`)`,
+    plain ? null : String.raw`(?<role>:(?<roleName>[A-Za-z0-9_.:+-]+):\`(?<roleText>[^\`]+)\`)`,
+    plain ? null : String.raw`(?<link>\`(?<linkText>[^\`<]*?)\s*<(?<linkUri>[^>\`]+)>\`__?)`,
+    plain ? null : String.raw`(?<named>\`(?<namedText>[^\`]+)\`__?)`,
+    plain ? null : String.raw`(?<cite>\`(?<citeText>[^\`]+)\`)`,
+    String.raw`(?<strong>(?<![\w*])\*\*(?=\S)(?<strongText>[^*]+?)(?<=\S)\*\*(?![\w*]))`,
+    String.raw`(?<em>(?<![\w*])\*(?=[^\s*])(?<emText>[^*\n]+?)(?<=[^\s*])\*(?![\w*]))`,
+    plain ? null : String.raw`(?<sub>\|(?<subName>[^|\s][^|]*?)\|(?=[^\w]|$))`,
+    plain ? null : String.raw`(?<fnref>\[(?<fnLabel>#?[\w-]*|\*)\]_)`,
+    String.raw`(?<url>\b(?:https?|ftp):\/\/[^\s<>"'\`)\]]*[^\s<>"'\`).,;:\]!?])`,
+    String.raw`(?<docpath>\bDocumentation\/[\w./+-]*\w\.(?:rst|txt)\b)`,
+    String.raw`(?<wordref>\b(?<wordRefName>[A-Za-z0-9][\w.-]*)_(?![\w]))`,
+    String.raw`(?<func>\b(?<funcName>[A-Za-z_][A-Za-z0-9_]*)\(\))`,
+    String.raw`(?<cstruct>\b(?<cKind>struct|union|enum|typedef)\s+(?<cName>[A-Za-z_][A-Za-z0-9_]*)\b)`,
+    String.raw`(?<config>\bCONFIG_[A-Z0-9_]+\b)`,
+  ].filter(Boolean);
+  return new RegExp(parts.join("|"), "g");
+}
+
+const INLINE_TOKEN_RE = buildInlineTokenRe(false);
+const INLINE_PLAIN_TOKEN_RE = buildInlineTokenRe(true);
 const C_KEYWORDS = new Set([
   "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern",
   "float", "for", "goto", "if", "inline", "int", "long", "register", "restrict", "return", "short", "signed",
@@ -870,25 +895,8 @@ class RstRenderer {
   inline(text) {
     const src = String(text ?? "");
     if (!src) return "";
-    const parts = [
-      this.plain ? null : String.raw`(?<esc>\\([^\sA-Za-z0-9]))`,
-      String.raw`(?<lit>\`\`(?<litText>[^\`]+?(?:\`(?!\`)[^\`]*?)*)\`\`)`,
-      this.plain ? null : String.raw`(?<role>:(?<roleName>[A-Za-z0-9_.:+-]+):\`(?<roleText>[^\`]+)\`)`,
-      this.plain ? null : String.raw`(?<link>\`(?<linkText>[^\`<]*?)\s*<(?<linkUri>[^>\`]+)>\`__?)`,
-      this.plain ? null : String.raw`(?<named>\`(?<namedText>[^\`]+)\`__?)`,
-      this.plain ? null : String.raw`(?<cite>\`(?<citeText>[^\`]+)\`)`,
-      String.raw`(?<strong>(?<![\w*])\*\*(?=\S)(?<strongText>[^*]+?)(?<=\S)\*\*(?![\w*]))`,
-      String.raw`(?<em>(?<![\w*])\*(?=[^\s*])(?<emText>[^*\n]+?)(?<=[^\s*])\*(?![\w*]))`,
-      this.plain ? null : String.raw`(?<sub>\|(?<subName>[^|\s][^|]*?)\|(?=[^\w]|$))`,
-      this.plain ? null : String.raw`(?<fnref>\[(?<fnLabel>#?[\w-]*|\*)\]_)`,
-      String.raw`(?<url>\b(?:https?|ftp):\/\/[^\s<>"'\`)\]]*[^\s<>"'\`).,;:\]!?])`,
-      String.raw`(?<docpath>\bDocumentation\/[\w./+-]*\w\.(?:rst|txt)\b)`,
-      String.raw`(?<wordref>\b(?<wordRefName>[A-Za-z0-9][\w.-]*)_(?![\w]))`,
-      String.raw`(?<func>\b(?<funcName>[A-Za-z_][A-Za-z0-9_]*)\(\))`,
-      String.raw`(?<cstruct>\b(?<cKind>struct|union|enum|typedef)\s+(?<cName>[A-Za-z_][A-Za-z0-9_]*)\b)`,
-      String.raw`(?<config>\bCONFIG_[A-Z0-9_]+\b)`,
-    ].filter(Boolean);
-    const re = new RegExp(parts.join("|"), "g");
+    const re = this.plain ? INLINE_PLAIN_TOKEN_RE : INLINE_TOKEN_RE;
+    re.lastIndex = 0;
 
     let out = "";
     let last = 0;
@@ -912,7 +920,13 @@ class RstRenderer {
       else if (g.strong !== undefined) rendered = `<strong>${escapeHtml(g.strongText)}</strong>`;
       else if (g.em !== undefined) rendered = `<em>${escapeHtml(g.emText)}</em>`;
       else if (g.sub !== undefined) {
-        rendered = this.subs.has(g.subName) ? this.inline(this.subs.get(g.subName)) : null;
+        if (this.subs.has(g.subName)) {
+          const savedLast = re.lastIndex;
+          rendered = this.inline(this.subs.get(g.subName));
+          re.lastIndex = savedLast;
+        } else {
+          rendered = null;
+        }
       } else if (g.fnref !== undefined) {
         const label = g.fnLabel.replace(/^#/, "") || "*";
         rendered = `<sup class="footnote-reference"><a href="#fn-${slugify(label)}">[${escapeHtml(label)}]</a></sup>`;
@@ -1030,7 +1044,7 @@ export function kernelDocToRst(text) {
 }
 
 /**
- * HTML of one kernel-doc entry (`GET /api/docs/.../kernel-doc` `entries[]`): a `dl.c` definition card with a
+ * HTML of one kernel-doc entry (`GET /webapi/docs/.../kernel-doc` `entries[]`): a `dl.c` definition card with a
  * syntax-highlighted signature, parameters / members and sections, rendered as reStructuredText.
  * `opts.path` is the document the entry renders in, `opts.srcPath` the source file it was read from.
  */

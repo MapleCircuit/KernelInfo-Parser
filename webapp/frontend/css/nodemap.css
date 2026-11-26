@@ -1202,8 +1202,8 @@
 /* 13. CVE, KAPI, Kernel Docs, and History nodes */
 .nm-cve, .nm-kapi, .nm-doc, .nm-hist { padding: 6px 8px; display: flex; flex-direction: column; gap: 5px; }
 .nm-cve-head, .nm-kapi-head, .nm-hist-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--border-muted); padding-bottom: 4px; }
-.nm-cve-id, .nm-doc-title { font-family: var(--font-mono); font-weight: 700; color: var(--text-primary); }
-.nm-cve-score, .nm-cve-state, .nm-cve-badge, .nm-kapi-cat, .nm-kapi-arch, .nm-doc-kind, .nm-hist-st, .nm-cve-tag {
+.nm-cve-id { font-family: var(--font-mono); font-weight: 700; color: var(--text-primary); }
+.nm-cve-score, .nm-cve-state, .nm-cve-badge, .nm-kapi-cat, .nm-kapi-arch, .nm-hist-st, .nm-cve-tag {
   font-size: var(--fs-9, 9px);
   font-family: var(--font-mono);
   padding: 0 5px;
@@ -1226,10 +1226,10 @@
   white-space: nowrap;
 }
 .nm-cve-subj, .nm-cve-fpath, .nm-kapi-sub, .nm-hist-subj { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); }
-.nm-kapi-name, .nm-doc-name { font-weight: 600; color: var(--text-primary); }
+.nm-kapi-name { font-weight: 600; color: var(--text-primary); }
 .nm-kapi-tag { color: var(--accent-blue); font-size: var(--fs-9, 9px); }
 .nm-kapi-acts { display: inline-flex; gap: 3px; flex-shrink: 0; }
-.nm-cve-btn, .nm-cve-link, .nm-kapi-btn, .nm-kapi-chip, .nm-doc-btn, .nm-hist-btn {
+.nm-cve-btn, .nm-cve-link, .nm-kapi-btn, .nm-kapi-chip, .nm-hist-btn {
   border: 1px solid var(--border-color);
   background: none;
   color: var(--accent-blue);
@@ -1240,13 +1240,7 @@
   cursor: pointer;
   flex-shrink: 0;
 }
-.nm-cve-btn:hover, .nm-kapi-btn:hover, .nm-doc-btn:hover, .nm-hist-btn:hover { background: var(--bg-hover); border-color: var(--accent-blue); }
-.nm-doc-entry { border-bottom: 1px solid var(--border-muted); padding-bottom: 5px; display: flex; flex-direction: column; gap: 3px; }
-.nm-doc-entry-head { display: flex; align-items: center; gap: 6px; }
-.nm-doc-brief { color: var(--text-secondary); }
-.nm-doc-sig, .nm-doc-text { margin: 0; padding: 4px 6px; background: var(--bg-primary); border-radius: 4px; font-family: var(--font-mono); font-size: var(--fs-10, 10px); white-space: pre-wrap; color: var(--text-primary); }
-.nm-doc-h { font-weight: 700; color: var(--text-primary); margin-bottom: 2px; }
-.nm-doc-param { font-size: var(--fs-10, 10px); color: var(--text-secondary); }
+.nm-cve-btn:hover, .nm-kapi-btn:hover, .nm-hist-btn:hover { background: var(--bg-hover); border-color: var(--accent-blue); }
 
 /* Beautified doc nodes: the Kernel Docs page (`docs.css` `.kdoc-body`) scaled into the node */
 .nm-doc.nm-doc-rendered { display: block; padding: 0; }

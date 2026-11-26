@@ -8,9 +8,9 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.db_setup import ensure_db_instance
 from core.DBLayout import m_db_instance
 from db_engine import MockDB
+from pipeline.db_setup import ensure_db_instance
 from tests.db_fixtures import patch_reader
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.sync_service import SyncService
@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
 
 class TestIngestStatus(unittest.TestCase):
-    """GET /api/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
+    """GET /webapi/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
 
     def _run(self, states, refs, now=1_000_000.0, network_id=7, repo_id=3):
         from webapp.backend.routers import system
@@ -133,3 +133,184 @@ class TestIngestStatus(unittest.TestCase):
             out = system.ingest_status(1.0)
         self.assertFalse(out["available"])
         self.assertIn("no database", out["error"])
+
+
+class TestSecurityAndCoreHardening(unittest.TestCase):
+    """Regression and fault-injection coverage for BE-003, BE-005, BE-006, BE-018, BE-020, QUAL-003, QUAL-016."""
+
+    def test_jail_rejects_traversal_whitespace_control_and_root(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from fastapi import HTTPException
+
+        from webapp.backend.security.jail import (
+            is_safe_rel_path,
+            resolve_and_verify_repo_path,
+        )
+
+        for bad_rel in ("", " ", ".", "..", " kernel/fork.c", "kernel/fork.c ", "foo\nbar", "foo\x00bar", "a/../b", "foo\x7fbar"):
+            self.assertFalse(is_safe_rel_path(bad_rel), f"Expected unsafe: {bad_rel!r}")
+        self.assertTrue(is_safe_rel_path("kernel/fork.c"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kernel").mkdir()
+            (repo / "kernel" / "fork.c").write_text("int x;\n", encoding="utf-8")
+
+            # Benign leading slash normalizes inside repo when no '..' exists
+            ok = resolve_and_verify_repo_path("/kernel/fork.c", repo)
+            self.assertEqual(ok, (repo / "kernel" / "fork.c").resolve())
+
+            for bad_req in ("/../../etc/passwd", "  ", ".", "", "kernel\nfork.c", "kernel/../../etc/passwd"):
+                with self.assertRaises(HTTPException, msg=f"Expected 400 for {bad_req!r}") as ctx:
+                    resolve_and_verify_repo_path(bad_req, repo)
+                self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_identifier_and_git_rev_validation(self) -> None:
+        from fastapi import HTTPException
+
+        from webapp.backend.security.git import is_safe_rev, safe_rev
+        from webapp.backend.security.sql import is_valid_identifier
+
+        self.assertTrue(is_valid_identifier("EXT4_FS"))
+        self.assertTrue(is_valid_identifier("v6.1+rc1"))
+        for bad_ident in ("", "-flag", "sym\n", "a..b", "a b", "a" * 129):
+            self.assertFalse(is_valid_identifier(bad_ident), f"Expected invalid identifier: {bad_ident!r}")
+
+        self.assertTrue(is_safe_rev("v6.1-rc1"))
+        for bad_rev in ("", "-bad", "HEAD@{1}", "a//b", "foo.", "foo.lock", "rev\x00", "a" * 257):
+            self.assertFalse(is_safe_rev(bad_rev), f"Expected unsafe rev: {bad_rev!r}")
+            with self.assertRaises(HTTPException):
+                safe_rev(bad_rev)
+
+    def test_helpers_non_ascii_digits_and_preload_failure(self) -> None:
+        from core.DBLayout import TABLES
+        from tests.db_fixtures import make_db
+        from webapp.backend.database import helpers
+
+        db = make_db("mock", tables=TABLES)
+
+        helpers._NAME_TO_VID_CACHE.clear()
+        helpers._VID_TO_NAME_CACHE.clear()
+        helpers._PRELOADED["loaded"] = False
+        self.addCleanup(helpers._NAME_TO_VID_CACHE.clear)
+        self.addCleanup(helpers._VID_TO_NAME_CACHE.clear)
+
+        # Superscript '²' returns True from str.isdigit() in Python, must NOT trigger int('²')
+        vid, vname = helpers.get_version_info(db, "²")
+        self.assertIsNone(vid)
+        self.assertEqual(vname, "²")
+
+        helpers._PRELOADED["loaded"] = False
+
+        class FailingReader:
+            def select_rows(self, *_args: object, **_kwargs: object) -> list[dict[str, object]]:
+                raise RuntimeError("db unavailable")
+
+        helpers.preload_version_cache(FailingReader())
+        self.assertFalse(helpers._PRELOADED["loaded"])
+        helpers._REPO_ID_CACHE["repo_id"] = 42
+        helpers.clear_version_caches()
+        self.assertEqual(len(helpers._REPO_ID_CACHE), 0)
+        self.assertFalse(helpers._PRELOADED.get("loaded", False))
+
+    def test_repo_scoped_cache_lru_and_config_clamping(self) -> None:
+        from webapp.backend import config as cfg
+
+        cache: cfg.RepoScopedCache = cfg.RepoScopedCache(maxsize=2)
+        with patch.object(cfg, "get_active_repo_name", return_value="linux"):
+            cache["a"] = 1
+            cache["b"] = 2
+            # Re-writing 'a' via __setitem__ must refresh recency so 'b' is evicted next
+            cache["a"] = 10
+            cache["c"] = 3
+            self.assertEqual(len(cache), 2)
+            self.assertEqual(cache["a"], 10)
+            self.assertNotIn("b", cache)
+            self.assertEqual(cache.setdefault("c", 99), 3)
+            cache.clear()
+            self.assertEqual(len(cache), 0)
+
+        with patch.object(cfg, "get_webapp_config", return_value={"pool_size": -5, "port": 99999}):
+            out = cfg.get_backend_server_config()
+        self.assertEqual(out["pool_size"], 1)
+        self.assertEqual(out["port"], 8000)
+        self.assertEqual(out["default_version"], "v3.0")
+
+    def test_app_api_404_security_headers_and_rate_limiter_thread_safety(self) -> None:
+        import asyncio
+        import threading
+
+        from fastapi.testclient import TestClient
+
+        from webapp.backend.app import create_app
+        from webapp.backend.security.middleware import (
+            SecurityHeadersMiddleware,
+            SlidingWindowRateLimiter,
+        )
+        from webapp.backend.services import sync_service as _sync_mod
+
+        with patch.object(_sync_mod.sync_service, "cached_header_value", return_value=None), \
+                patch.object(_sync_mod.sync_service, "header_value", return_value="0.0.0"):
+            client = TestClient(create_app())
+            resp = client.get("/webapi/nonexistent-endpoint-check")
+            resp_405 = client.delete("/webapi/versions")
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json(), {"detail": "Not Found"})
+        self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(resp.headers.get("X-Frame-Options"), "SAMEORIGIN")
+        self.assertEqual(resp.headers.get("Referrer-Policy"), "strict-origin-when-cross-origin")
+        self.assertEqual(resp_405.status_code, 405)
+        self.assertEqual(resp_405.headers.get("X-Content-Type-Options"), "nosniff")
+
+        statuses: list[int] = []
+
+        async def ok_app(scope, receive, send) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        limiter = SlidingWindowRateLimiter(ok_app, max_requests=20, window_seconds=60)
+        wrapped = SecurityHeadersMiddleware(limiter)
+        barrier = threading.Barrier(4)
+        status_lock = threading.Lock()
+
+        async def call_once() -> tuple[int, dict[bytes, bytes]]:
+            captured: dict[bytes, bytes] = {}
+            code = 0
+
+            async def send(msg) -> None:
+                nonlocal code
+                if msg["type"] == "http.response.start":
+                    code = msg["status"]
+                    captured.update(dict(msg.get("headers", [])))
+
+            async def recv() -> dict[str, object]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            await wrapped({"type": "http", "path": "/webapi/test", "client": ("127.0.0.1", 1234), "headers": []}, recv, send)
+            return code, captured
+
+        hdr_429: list[dict[bytes, bytes]] = []
+
+        def worker() -> None:
+            barrier.wait()
+            for _ in range(10):
+                code, hdrs = asyncio.run(call_once())
+                with status_lock:
+                    statuses.append(code)
+                    if code == 429:
+                        hdr_429.append(hdrs)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(statuses.count(200), 20)
+        self.assertEqual(statuses.count(429), 20)
+        self.assertTrue(all(h.get(b"x-content-type-options") == b"nosniff" for h in hdr_429))
+
+
+if __name__ == "__main__":
+    unittest.main()

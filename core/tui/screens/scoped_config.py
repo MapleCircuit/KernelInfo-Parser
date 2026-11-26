@@ -1,4 +1,4 @@
-"""core/tui/screens/scoped_config.py - Scoped configuration menu for standalone daemon/webapp configs."""
+"""core/tui/screens/scoped_config.py - Scoped configuration menu for standalone daemon/webapp/api configs."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 
 from core.config import get_service_config_path
 from core.tui.screens.base import BaseScreen
+from core.tui.screens.api_cfg import ApiSettingsScreen
 from core.tui.screens.cve_ml import CVEMailingListScreen
 from core.tui.screens.database_ssh import DatabaseSSHScreen
 from core.tui.screens.diagnostics import DiagnosticsScreen
@@ -29,7 +30,7 @@ from core.tui.widgets import ModalDialog, StatusBar
 
 
 class ScopedConfigMenuScreen(BaseScreen):
-    """Scoped configuration menu editing `config_daemon.json` or `config_webapp.json`."""
+    """Scoped configuration menu editing `config_daemon.json`, `config_webapp.json` or `config_api.json`."""
 
     DAEMON_MENU_ITEMS = [
         ("1", "Repositories, Git & Branch Filters", "Detect repos, configure branches, start_ref, tag rules"),
@@ -53,6 +54,16 @@ class ScopedConfigMenuScreen(BaseScreen):
         ("B", "Back to Systemd Services", "Return to Systemd Services screen"),
     ]
 
+    API_MENU_ITEMS = [
+        ("1", "API Server, Keys & Limits", "Host, port, reload, API keys, rate limit, auth lockout & trusted proxies"),
+        ("2", "Repositories, Git & Branch Filters", "Detect repos, configure branches, start_ref, tag rules"),
+        ("3", "Database, SSH Tunnel & Auth", "Database credentials, socket, and SSH port forwarding"),
+        ("L", "API Logging Configuration", "API service log files, request mode, error split & level"),
+        ("5", "Run Diagnostics", "Verify database, SSH and git configurations"),
+        ("S", "Save Configuration", "Save changes strictly to config_api.json (other sections pruned)"),
+        ("B", "Back to Systemd Services", "Return to Systemd Services screen"),
+    ]
+
     def __init__(
         self,
         stdscr: Any,
@@ -63,8 +74,8 @@ class ScopedConfigMenuScreen(BaseScreen):
     ) -> None:
         super().__init__(stdscr, app)
         svc = str(service or "").strip().lower()
-        if svc not in ("daemon", "webapp"):
-            raise ValueError(f"Unknown service {service!r}; expected 'daemon' or 'webapp'")
+        if svc not in ("daemon", "webapp", "api"):
+            raise ValueError(f"Unknown service {service!r}; expected 'daemon', 'webapp' or 'api'")
         self.service: str = svc
         self.target_path: Path = (
             Path(config_path).expanduser().resolve()
@@ -73,7 +84,9 @@ class ScopedConfigMenuScreen(BaseScreen):
         )
         self._context_pushed: bool = False
 
-        self.menu_items = list(self.DAEMON_MENU_ITEMS if self.service == "daemon" else self.WEBAPP_MENU_ITEMS)
+        self.menu_items = list(
+            {"daemon": self.DAEMON_MENU_ITEMS, "webapp": self.WEBAPP_MENU_ITEMS, "api": self.API_MENU_ITEMS}[self.service]
+        )
         self.hotkeys: dict[str, str] = {item[0].lower(): item[0] for item in self.menu_items}
         self.hotkeys["q"] = "B"
 
@@ -114,7 +127,11 @@ class ScopedConfigMenuScreen(BaseScreen):
             self.refresh()
             return
 
-        svc_title = "Daemon Service Configuration" if self.service == "daemon" else "Webapp Service Configuration"
+        svc_title = {
+            "daemon": "Daemon Service Configuration",
+            "webapp": "Webapp Service Configuration",
+            "api": "API Service Configuration",
+        }[self.service]
         self.draw_box(0, 0, 5, max_x, title=f" {svc_title} ", color_pair=PAIR_HEADER)
 
         cfg_path = getattr(self.app, "config_path", self.target_path)
@@ -134,11 +151,11 @@ class ScopedConfigMenuScreen(BaseScreen):
             "Use Arrow keys and [Enter] to navigate, or press hotkeys [1-5, L, S, B/Q].",
             curses.A_NORMAL,
         )
-        scope_note = (
-            "Scope: Daemon parser service (writes strictly to config_daemon.json)."
-            if self.service == "daemon"
-            else "Scope: Webapp backend service (parser-only sections hidden & pruned on save)."
-        )
+        scope_note = {
+            "daemon": "Scope: Daemon parser service (writes strictly to config_daemon.json).",
+            "webapp": "Scope: Webapp backend service (parser-only sections hidden & pruned on save).",
+            "api": "Scope: AI API service (writes strictly to config_api.json; other sections pruned on save).",
+        }[self.service]
         self.safe_addstr(3, 2, scope_note[: max(1, max_x - 4)], get_color(PAIR_MUTED))
 
         menu_y = 5
@@ -217,6 +234,14 @@ class ScopedConfigMenuScreen(BaseScreen):
                 "2": DatabaseSSHScreen,
                 "3": ParserDistributedScreen,
                 "4": CVEMailingListScreen,
+                "L": LoggingScreen,
+                "5": DiagnosticsScreen,
+            }
+        elif self.service == "api":
+            screens = {
+                "1": ApiSettingsScreen,
+                "2": RepositoriesScreen,
+                "3": DatabaseSSHScreen,
                 "L": LoggingScreen,
                 "5": DiagnosticsScreen,
             }

@@ -5,6 +5,7 @@
 import { canBeVersionlessTab, isAlwaysVersionlessTab, tabRoute } from "./tab_routes.js";
 import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
+import { TAB_TYPES } from "./utils/session_transfer.js";
 import { isEmbedMode } from "./utils/embed_mode.js";
 import { emitUiScaleChanged } from "./utils/ui_scale.js";
 
@@ -76,7 +77,7 @@ class GlobalState {
     // reachable from it are offered, since v2.6.16.62 belongs to stable/linux-2.6.16.y and not to
     // master. It scopes what can be picked; it never moves a tab on its own.
     this.selectedBranch = "";
-    // The tags of that branch (`GET /api/branch/tags`), null while nothing scopes them. app.js fills
+    // The tags of that branch (`GET /webapi/branch/tags`), null while nothing scopes them. app.js fills
     // it; every control that offers tags goes through tagOnSelectedBranch(), so the Tag and RC lists
     // and the Commit picker's tag search all narrow to the same set.
     this.branchTags = null;
@@ -218,7 +219,7 @@ class GlobalState {
   /** Normalize whatever a selector or the URL hash hands over into a revision string. */
   static refOf(version) {
     const vStr = typeof version === "string" ? version : (version?.vname || version?.name || "");
-    if (!vStr || vStr === "[object Object]" || vStr.includes("object")) return "";
+    if (!vStr || vStr === "[object Object]" || vStr.includes("[object")) return "";
     return vStr;
   }
 
@@ -1163,11 +1164,14 @@ class GlobalState {
    */
   acceptTransferredTab(payload, targetPaneId = null, targetIndex = null) {
     const tabData = payload?.tabData;
-    if (!tabData) return null;
+    if (!tabData || typeof tabData !== "object" || typeof tabData.type !== "string" || !TAB_TYPES.includes(tabData.type)) return null;
     const pane = targetPaneId ? this.getPane(targetPaneId) : this.getActivePane();
     if (!pane) return null;
 
-    const tab = { ...tabData };
+    const tab = {};
+    for (const [k, v] of Object.entries(tabData)) {
+      if (k !== "__proto__" && k !== "constructor" && k !== "prototype") tab[k] = v;
+    }
     // Tab ids are unique per session, not globally: a duplicate of the source session may be open here
     if (this.findTab(tab.id)) tab.id = `tab-${Math.random().toString(36).substring(2, 9)}`;
     if (isAlwaysVersionlessTab(tab.type)) tab.version = "";

@@ -296,7 +296,7 @@ F_V1 = "int f(int x)\n{\n\treturn x;\n}\n\nint g(int y)\n{\n\treturn y;\n}\n"
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class TestChangeCommitsFromDatabase(unittest.TestCase):
-    """GET /api/history/commits from m_bridge_commit_tag / m_commit_file (D05), against `git log` on a
+    """GET /webapi/history/commits from m_bridge_commit_tag / m_commit_file (D05), against `git log` on a
     temporary repository: v1.0 -> (f changed, g changed, f changed) -> v1.1 -> a.c renamed to b.c -> v1.2."""
 
     @classmethod

@@ -35,7 +35,6 @@ class IncludeSymbolsPopover {
     popover.style.left = `${posX}px`;
     popover.style.top = `${posY}px`;
 
-    const targetHeader = data.header_file || includeInfo.header || includeInfo.name || "#include";
     const titleText = data.include_text || includeInfo.header || includeInfo.name || "#include";
 
     popover.innerHTML = `
@@ -47,12 +46,12 @@ class IncludeSymbolsPopover {
         <div class="include-popover-actions">
           ${
             data.header_file
-              ? `<button id="btn-include-open-header" class="btn-include-header" title="Open ${this.escapeHtml(data.header_file)}">
+              ? `<button id="btn-include-open-header" type="button" class="btn-include-header" title="Open ${this.escapeHtml(data.header_file)}">
                   <span>📄</span> Open Header
                 </button>`
               : ""
           }
-          <button id="btn-include-close" class="btn-include-close" title="Close (Esc)">&times;</button>
+          <button id="btn-include-close" type="button" class="btn-include-close" title="Close (Esc)" aria-label="Close">&times;</button>
         </div>
       </div>
 
@@ -112,8 +111,12 @@ class IncludeSymbolsPopover {
 
     // Global dismiss listeners
     document.addEventListener("keydown", this._handleKeyDown);
-    setTimeout(() => {
-      document.addEventListener("click", this._handleClickOutside);
+    const activeContainer = this.container;
+    this._outsideTimer = setTimeout(() => {
+      this._outsideTimer = null;
+      if (this.container === activeContainer) {
+        document.addEventListener("click", this._handleClickOutside);
+      }
     }, 10);
   }
 
@@ -274,6 +277,10 @@ class IncludeSymbolsPopover {
   }
 
   close() {
+    if (this._outsideTimer) {
+      clearTimeout(this._outsideTimer);
+      this._outsideTimer = null;
+    }
     if (this.container) {
       this.container.remove();
       this.container = null;

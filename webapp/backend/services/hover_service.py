@@ -6,8 +6,11 @@ signature, and the kernel-doc comment directly above it gives the summary and th
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 MAX_SIG_LINES = 6
 MAX_DOC_LINES = 120
@@ -142,6 +145,9 @@ class HoverService:
         from webapp.backend.config import RepoScopedCache
         self._cache: RepoScopedCache = RepoScopedCache(maxsize=4096)
 
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
     def hover(self, version: str, name: str, arch: str, from_file: str | None, detail_fn) -> dict[str, Any]:
         from webapp.backend.services.git_reader import git_reader
         from webapp.backend.services.tree_resolver import git_tree_resolver
@@ -164,17 +170,19 @@ class HoverService:
             selected_by = [str(d) for d in (k.get("selected_by") or [])][:12]
             implied_by = [str(d) for d in (k.get("implied_by") or [])][:12]
             if not selected_by and not implied_by:
-                clean_sym = k.get("name") or (name[7:] if name.startswith("CONFIG_") else name)
+                clean_sym = k.get("name") or name.removeprefix("CONFIG_")
                 try:
                     from webapp.backend.services import kconfig_facts
                     sb, ib = kconfig_facts.reverse_dependencies(clean_sym)
                     selected_by = sb[:12]
                     implied_by = ib[:12]
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - optional reverse deps
+                    logger.debug("kconfig_facts reverse_dependencies failed for %s: %s", clean_sym, exc)
                 if not selected_by and not implied_by:
                     try:
-                        from webapp.backend.services.kconfig_service import kconfig_service
+                        from webapp.backend.services.kconfig_service import (
+                            kconfig_service,
+                        )
                         graph = kconfig_service.get_graph(version, clean_sym, arch=arch)
                         for edge in graph.get("edges", []):
                             if edge.get("to") == clean_sym:
@@ -184,8 +192,8 @@ class HoverService:
                                     implied_by.append(edge["from"])
                         selected_by = list(dict.fromkeys(selected_by))[:12]
                         implied_by = list(dict.fromkeys(implied_by))[:12]
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - optional graph fallback
+                        logger.debug("kconfig graph fallback failed for %s: %s", clean_sym, exc)
             out.update(kind="kconfig", file=detail.get("file_path"), line=detail.get("line_s"),
                        kconfig={"name": k.get("name"), "type": k.get("type_name"), "prompt": k.get("prompt") or "",
                                 "depends_on": [str(d) for d in (k.get("depends_on") or [])][:12],
@@ -204,18 +212,18 @@ class HoverService:
                        signature=extract_signature(lines, line_s - 1) if lines else "",
                        doc=extract_doc(lines, line_s - 1) if lines else None)
             # Struct field offsets and cacheline positions from m_ast_attribute
-            attrs = detail.get("attributes") or detail.get("definition", {}).get("attributes") or []
+            attrs = detail.get("attributes") or (detail.get("definition") or {}).get("attributes") or []
             attr_dict = {a.get("name"): a.get("val") for a in attrs if isinstance(a, dict)}
-            ast_id = detail.get("ast_id") or detail.get("definition", {}).get("ast_id")
+            ast_id = detail.get("ast_id") or (detail.get("definition") or {}).get("ast_id")
             if not attr_dict and ast_id:
                 try:
-                    from webapp.backend.database.pool import get_reader
                     from webapp.backend.database.helpers import safe_decode
+                    from webapp.backend.database.pool import get_reader
                     with get_reader() as reader:
                         rows = reader.select_rows("m_ast_attribute", ["name", "val"], {"ast_id": ast_id})
                         attr_dict = {safe_decode(r.get("name")): safe_decode(r.get("val")) for r in rows}
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - optional struct attributes
+                    logger.debug("m_ast_attribute lookup failed for %s: %s", ast_id, exc)
             if "offset_bits" in attr_dict or "offset_bytes" in attr_dict:
                 try:
                     raw_offset_bits = int(attr_dict["offset_bits"]) if "offset_bits" in attr_dict else int(attr_dict["offset_bytes"]) * 8

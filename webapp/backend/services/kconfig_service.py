@@ -19,18 +19,16 @@ import os
 import re
 import subprocess
 import threading
-from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 
-from parser.kbuild_conditions import KbuildConditionResolver, is_other_arch_path
-from parser.kbuild_parser import KbuildParser
+from db_engine.spec import Join
 from parser import kbuild_symbols
 from parser.arch_layout import PRE_ARCH_ARCH
+from parser.kbuild_conditions import KbuildConditionResolver, evaluate as evaluate_build_condition, is_other_arch_path
+from parser.kbuild_parser import KbuildParser
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
-from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
-from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
 from parser.kconfig_ast.kconfig_model import (
     MODEL_FORMAT,
     ExprTable,
@@ -41,15 +39,16 @@ from parser.kconfig_ast.kconfig_model import (
     kernel_version_string,
     resolve_kbuild_defconfig,
 )
+from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
+from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_version_info
-from db_engine.spec import Join
 from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import safe_rev
-from webapp.backend.services.tree_resolver import git_tree_resolver
 from webapp.backend.security.sql import is_valid_identifier
-from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.disk_cache import DiskCache, module_fingerprint
+from webapp.backend.services.git_reader import git_reader
+from webapp.backend.services.tree_resolver import git_tree_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +81,7 @@ class _ModelEntry:
         self.exprs = ExprTable()
         self.exprs.nodes = [tuple(node) for node in model["exprs"]]
         self.selected_by: dict[str, list[tuple[str, int]]] = {}
+        self.implied_by: dict[str, list[tuple[str, int]]] = {}
         # Symbols named by each entry's own `depends on` lines (not inherited from menus/ifs)
         self.own_depends: dict[str, list[str]] = {}
         for target, refs in self.references.items():
@@ -92,6 +92,8 @@ class _ModelEntry:
         for name, sym in model["symbols"].items():
             for target, vis in sym["selects"]:
                 self.selected_by.setdefault(target, []).append((name, vis))
+            for target, vis in sym.get("implies", []):
+                self.implied_by.setdefault(target, []).append((name, vis))
 
     def expr(self, eid: int) -> str:
         return self.exprs.to_string(None if eid < 0 else eid)
@@ -123,7 +125,7 @@ def _disk_store(key: str, data: dict[str, Any]) -> None:
     _MODEL_DISK.put(key, data)
 
 
-_MODELS: "RepoScopedCache" = RepoScopedCache()
+_MODELS: RepoScopedCache = RepoScopedCache()
 # Guards _MODELS and _MODEL_BUILD_LOCKS only; a model is never built while it is held
 _MODEL_LOCK = threading.Lock()
 # One lock per model key, held for that key's build and dropped once it is cached
@@ -131,23 +133,23 @@ _MODEL_BUILD_LOCKS: dict[tuple[Any, ...], threading.Lock] = {}
 # Concurrent model builds allowed across all keys (each costs ~1s of CPU and tens of MB)
 _MODEL_BUILD_SEMAPHORE = threading.BoundedSemaphore(2)
 # Bounded: keyed by revision, and any revision a caller names adds an entry
-_LISTING_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=64)
+_LISTING_CACHE: RepoScopedCache = RepoScopedCache(maxsize=64)
 # Separate and much smaller: each entry is a revision's whole file list (~4.5 MiB at v3.0)
-_PATHS_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=4)
+_PATHS_CACHE: RepoScopedCache = RepoScopedCache(maxsize=4)
 # Bounded: keyed by the requested symbol name, and each entry holds that symbol's reference list
-_USAGE_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=256)
+_USAGE_CACHE: RepoScopedCache = RepoScopedCache(maxsize=256)
 # Commit SHA -> {(blob_id, fnid): path} of its Makefile/Kbuild files when all are in m_kbuild_symbol ({}: not
 # all indexed, final); content addressed per commit
-_KBUILD_COVERAGE: "RepoScopedCache" = RepoScopedCache(maxsize=16)
+_KBUILD_COVERAGE: RepoScopedCache = RepoScopedCache(maxsize=16)
 # Makefiles one kbuild_usage() answer reads at most (both paths)
 KBUILD_USAGE_MAKEFILES = 200
 
 
 def _text(value: Any) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else ("" if value is None else str(value))
-_BUILD_RESOLVERS: "RepoScopedCache" = RepoScopedCache()
+_BUILD_RESOLVERS: RepoScopedCache = RepoScopedCache()
 # resolve_arch() answers per (commit SHA, ARCH): bounded, any revision a caller names adds one
-_ARCH_INFO_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=256)
+_ARCH_INFO_CACHE: RepoScopedCache = RepoScopedCache(maxsize=256)
 _BUILD_LOCK = threading.Lock()
 
 
@@ -170,7 +172,7 @@ class KconfigService:
                     return safe_rev(vname or ver, "version")
             except HTTPException:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("Version id %s not resolvable: %s", ver, exc)
         return safe_rev(ver, "version")
 
@@ -178,7 +180,7 @@ class KconfigService:
     def _read(rev: str, path: str) -> str | None:
         try:
             raw, is_dir, _ = git_reader.read_file(rev, path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("git read %s:%s failed: %s", rev, path, exc)
             return None
         if raw is None or is_dir:
@@ -194,9 +196,7 @@ class KconfigService:
         in the tree), so the whole result would be read, parsed and cached under a name the caller
         chose. Patterns built from a validated name are still escaped at the call site.
         """
-        clean = (name or "").strip()
-        if clean.startswith("CONFIG_"):
-            clean = clean[7:]
+        clean = (name or "").strip().removeprefix("CONFIG_")
         if not is_valid_identifier(clean):
             raise HTTPException(status_code=400, detail="Invalid KConfig symbol name.")
         return clean
@@ -206,8 +206,8 @@ class KconfigService:
         """stdout of git (exit status 1 is `git grep` finding nothing), or None when git failed or timed
         out: callers must not cache that as an empty answer."""
         try:
-            proc = subprocess.run(["git", *args], cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=timeout)
-        except Exception as exc:
+            proc = subprocess.run(["git", *args], check=False, cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
             logger.debug("git %s failed: %s", args[:2], exc)
             return None
         return proc.stdout if proc.returncode in (0, 1) else None
@@ -366,7 +366,7 @@ class KconfigService:
 
     def _parse_model(self, rev: str, info: dict[str, Any], profile: ToolchainProfile) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build one revision's model from Git: (model, {help, menu_help, references})."""
-        read = lambda p: self._read(rev, p)  # noqa: E731
+        read = lambda p: self._read(rev, p)
         env_vars = profile.environment(info["arch"], info["srcarch"], info["kernelversion"])
         env_vars.setdefault("KBUILD_DEFCONFIG", self._default_defconfig(rev, info["arch"], info["srcarch"]) or "")
         if info["arch"] == "um":
@@ -631,9 +631,7 @@ class KconfigService:
 
     def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
         """Arch-scoped definition(s), dependencies, help and compiled files of a symbol."""
-        clean = (name or "").strip()
-        if clean.startswith("CONFIG_"):
-            clean = clean[7:]
+        clean = (name or "").strip().removeprefix("CONFIG_")
         entry = self.get_model(version_name, arch, toolchain)
         sym = entry.model["symbols"].get(clean)
         rev = entry.arch["rev"]
@@ -648,8 +646,8 @@ class KconfigService:
                 "file_path": first["file_path"], "line": first["line_s"], "line_s": first["line_s"], "line_e": first["line_e"],
                 "definition": {**first, "file": first["file_path"], "line": first["line_s"]},
                 "declarations": others, "definitions": [], "depends_on": [], "selects": [],
-                "implies": [], "defaults": [], "compiled_files": [], "kbuild": [],
-                "kconfig_refs": [], "def_val": "",
+                "implies": [], "selected_by": [], "implied_by": [], "defaults": [],
+                "compiled_files": [], "kbuild": [], "kconfig_refs": [], "def_val": "",
             }
         definitions = self._definitions(entry, clean)
         primary = definitions[0] if definitions else {"file_path": "", "line_s": 1, "line_e": 1}
@@ -678,6 +676,8 @@ class KconfigService:
             "depends_on": entry.own_depends.get(clean, []),
             "selects": [t for t, _ in sym["selects"]],
             "implies": [t for t, _ in sym["implies"]],
+            "selected_by": sorted({n for n, _ in entry.selected_by.get(clean, [])}),
+            "implied_by": sorted({n for n, _ in entry.implied_by.get(clean, [])}),
             "defaults": defaults,
             "def_val": defaults[0]["value"] if defaults else "",
             "ranges": [{"min": entry.expr(lo), "max": entry.expr(hi), "cond": entry.expr(c) if c >= 0 else None} for lo, hi, c in sym["ranges"]],
@@ -941,9 +941,7 @@ class KconfigService:
 
     def get_graph(self, version_name: str, symbol: str, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
         """Direct relations of a symbol: its own dependencies (left) and what it selects/implies (right)."""
-        target = (symbol or "").strip()
-        if target.startswith("CONFIG_"):
-            target = target[7:]
+        target = (symbol or "").strip().removeprefix("CONFIG_")
         entry = self.get_model(version_name, arch, toolchain)
         edges: list[dict[str, Any]] = []
         sym = entry.model["symbols"].get(target)
@@ -955,13 +953,13 @@ class KconfigService:
                     edges.append({"from": target, "to": t, "type": kind})
             for n, _ in entry.selected_by.get(target, []):
                 edges.append({"from": n, "to": target, "type": "selects"})
+            for n, _ in getattr(entry, "implied_by", {}).get(target, []):
+                edges.append({"from": n, "to": target, "type": "implies"})
         return {"version": version_name, "arch": entry.arch["arch"], "symbol": target, "edges": edges}
 
     def search_symbols(self, version_name: str, q: str = "", limit: int = 50, arch: str | None = None, toolchain: Any = None) -> dict[str, Any]:
         """Search symbol names and prompts (CONFIG_ prefix optional) in the arch model."""
-        clean_q = q.strip()
-        if clean_q.startswith("CONFIG_"):
-            clean_q = clean_q[7:]
+        clean_q = q.strip().removeprefix("CONFIG_")
         needle = clean_q.lower()
         entry = self.get_model(version_name, arch, toolchain)
         nodes = entry.model["nodes"]
@@ -1015,7 +1013,7 @@ class KconfigService:
         """Render {NAME: value} as .config lines, so it is loaded with exact conf_read semantics."""
         lines = []
         for raw_name, val in symbols.items():
-            name = raw_name[7:] if raw_name.startswith("CONFIG_") else raw_name
+            name = raw_name.removeprefix("CONFIG_")
             text = "" if val is None else str(val)
             if text in ("n", "N", "false", "False"):
                 lines.append(f"# CONFIG_{name} is not set")
@@ -1036,7 +1034,7 @@ class KconfigService:
             # String-typed symbols must be quoted in .config syntax; types come from the model
             lines = []
             for raw_name, val in symbols.items():
-                bare = raw_name[7:] if raw_name.startswith("CONFIG_") else raw_name
+                bare = raw_name.removeprefix("CONFIG_")
                 t = ev.syms.get(bare, {}).get("type")
                 if t == "string":
                     lines.append(f'CONFIG_{bare}="{escape_string(str(val))}"')
@@ -1051,11 +1049,73 @@ class KconfigService:
 
         `data`: {target_symbol, current_values, arch, value ("y" or "m"), toolchain}.
         """
-        sym_name = (data.get("target_symbol") or data.get("symbol") or "").strip()
-        if sym_name.startswith("CONFIG_"):
-            sym_name = sym_name[7:]
+        sym_name = (data.get("target_symbol") or data.get("symbol") or "").strip().removeprefix("CONFIG_")
         entry, ev, _ = self._load(version_name, data.get("arch"), {"symbols": data.get("current_values") or {}, "toolchain": data.get("toolchain")})
         want = 1 if str(data.get("value") or "y").lower() == "m" else 2
         result = solve(ev, sym_name, want)
         result.update({"version": version_name, "arch": entry.arch["arch"], "target": sym_name, "target_symbol": sym_name})
         return result
+
+    def evaluate(
+        self,
+        version_name: str,
+        arch: str = DEFAULT_ARCH,
+        *,
+        defconfig: str = "",
+        assignments: dict[str, str] | None = None,
+        symbols: list[str] | None = None,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Values of `symbols` and Kbuild conditions of `paths` under one configuration, evaluated server-side.
+
+        The configuration is what `make ARCH=<arch> <defconfig>` writes (`defconfig` empty: the arch default),
+        then each `assignments` entry applied with kconfig's own setter rules (`set_value`; refused changes
+        are reported in `rejected`). Symbols are `{value, type, defined, visible, changeable}`; paths carry
+        their condition `expr` and its tristate `result` ("y", "m", "n", or "?").
+        """
+        dc = self.get_defconfig_content(version_name, defconfig, arch)
+        entry = self.get_model(version_name, dc["arch"])
+        ev = entry.evaluator()
+        report = ev.load_config(dc["content"])
+        ev.set_all_new_symbols("default")
+        applied: dict[str, str] = {}
+        rejected: dict[str, str] = {}
+        for raw_name, val in (assignments or {}).items():
+            name = str(raw_name).removeprefix("CONFIG_")
+            text = str(val)
+            if ev.is_defined(name) and ev.set_value(name, text):
+                applied[name] = ev.value(name)
+            else:
+                rejected[name] = text
+        sym_out: dict[str, Any] = {}
+        for raw_name in symbols or []:
+            name = str(raw_name).removeprefix("CONFIG_")
+            if not ev.is_defined(name):
+                sym_out[name] = {"value": "n", "type": None, "defined": False, "visible": False, "changeable": False}
+                continue
+            sym_out[name] = {
+                "value": ev.value(name),
+                "type": ev.get_type(name),
+                "defined": True,
+                "visible": ev.visibility(name) > 0,
+                "changeable": ev.is_changeable(name),
+            }
+        files: dict[str, Any] = {}
+        if paths:
+            conds = self.build_conditions(version_name, paths, dc["arch"])["files"]
+
+            def value_of(sym: str) -> str:
+                return ev.value(sym) if ev.is_defined(sym) else "n"
+
+            for path, cond in conds.items():
+                files[path] = {**cond, "result": evaluate_build_condition(cond.get("expr", "?"), value_of)}
+        return {
+            "version": version_name,
+            "arch": dc["arch"],
+            "defconfig": dc["file_path"],
+            "applied": applied,
+            "rejected": rejected,
+            "load_report": {k: (v[:50] if isinstance(v, list) else v) for k, v in (report or {}).items()},
+            "symbols": sym_out,
+            "files": files,
+        }

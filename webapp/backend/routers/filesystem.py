@@ -1,30 +1,45 @@
 """webapp/backend/routers/filesystem.py - Tree, File, Include, Treemap & Search Endpoints."""
 from __future__ import annotations
+
 import json
 import re
 from typing import Annotated, Any
-from fastapi import APIRouter, Body, Query
+
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
+
 from webapp.backend.security.git import safe_rev
+from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.filesystem_service import FilesystemService
 from webapp.backend.services.grep_service import grep_service
 from webapp.backend.services.imports_service import imports_service
 from webapp.backend.services.outline_service import outline_service
 from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
 
-router = APIRouter(prefix="/api", tags=["filesystem"])
+router = APIRouter(prefix="/webapi", tags=["filesystem"])
 fs_service = FilesystemService()
+
+
+def _validate_rel_path(path: str, *, allow_glob_ext: bool = False) -> None:
+    clean = path.strip().strip("/")
+    if not clean:
+        return
+    check = clean.replace(".*", ".x") if allow_glob_ext else clean
+    if not is_safe_rel_path(check):
+        raise HTTPException(status_code=400, detail="Invalid path")
 
 
 @router.get("/fs/tree/{version_name}")
 def get_tree(version_name: str, path: str = Query("")) -> dict[str, Any]:
     """Direct children of a directory at a revision."""
+    _validate_rel_path(path)
     return fs_service.get_tree(version_name, path)
 
 
 @router.get("/fs/file/{version_name}")
 def get_file(version_name: str, path: str = Query(...)) -> dict[str, Any]:
     """File content and AST tokens (a directory path answers with its listing)."""
+    _validate_rel_path(path)
     return fs_service.get_file(version_name, path)
 
 
@@ -35,13 +50,14 @@ def get_file_references(
     limit: Annotated[int, Query(ge=1, le=1000, description="Entries per list")] = 200,
 ) -> dict[str, Any]:
     """What refers to a file at a revision: includers, Kconfig `source`s, documents, Kbuild rules."""
+    _validate_rel_path(path)
     return fs_service.get_file_references(version_name, path, limit)
 
 
 @router.get("/fs/resolve_include")
 def resolve_include(
     version: str = Query("v3.0"),
-    header: str = Query(...),
+    header: str = Query(..., max_length=256),
     ast_id: int | None = Query(None),
     current_file: str | None = Query(None),
     arch: str | None = Query(None, description="ARCH whose build layout resolves the include (default x86_64)"),
@@ -53,7 +69,7 @@ def resolve_include(
 @router.get("/fs/resolve_object")
 def resolve_object(
     version: str = Query("v3.0"),
-    obj: str = Query(...),
+    obj: str = Query(..., max_length=256),
     current_file: str | None = Query(None),
 ) -> dict[str, Any]:
     """Resolve a Makefile/Kbuild .o object target into a repository source file path."""
@@ -63,6 +79,7 @@ def resolve_object(
 @router.get("/version/{version_name}/treemap")
 def get_codebase_treemap(version_name: str, max_depth: int = Query(3), path: str = Query("")) -> dict[str, Any]:
     """Directory hierarchy weighted by bytes and file counts (squarified treemap)."""
+    _validate_rel_path(path)
     return fs_service.get_codebase_treemap(version_name, max_depth, path)
 
 
@@ -84,7 +101,11 @@ def _filename_part(value: str) -> str:
 
 
 @router.get("/fs/search/{version_name}")
-def search_files(version_name: str, q: str = Query(""), limit: int = Query(50)) -> dict[str, Any]:
+def search_files(
+    version_name: str,
+    q: Annotated[str, Query(max_length=256)] = "",
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+) -> dict[str, Any]:
     """Fuzzy search of file paths in the revision's tree."""
     return fs_service.search_files(version_name, q, limit)
 
@@ -92,6 +113,7 @@ def search_files(version_name: str, q: str = Query(""), limit: int = Query(50)) 
 @router.get("/fs/raw/{version_name}")
 def get_raw_file(version_name: str, path: str = Query(...)) -> Response:
     """Serve an image blob (documentation figures). SVG is sandboxed so embedded scripts never run."""
+    _validate_rel_path(path, allow_glob_ext=True)
     data, media_type = fs_service.read_raw(version_name, path)
     return Response(
         content=data,
@@ -134,6 +156,7 @@ def get_outline(
 ) -> dict[str, Any]:
     """Definitions of one file (functions, types, macros, variables, kernel API entries, Kconfig entries,
     Rust items) sorted by line and nested by containment, for the code view's outline and sticky scroll."""
+    _validate_rel_path(path)
     return outline_service.get_outline(version_name, path)
 
 
@@ -145,24 +168,25 @@ def get_imports(
 ) -> dict[str, Any]:
     """Symbols a C / header / assembly file references that headers on its #include chain define, with each
     header's include chain, for the code view's Imports panel."""
+    _validate_rel_path(path)
     return imports_service.get_imports(version_name, path, arch)
 
 
 @router.post("/version/{version_name}/treemap/build")
-def post_build_treemap(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+def post_build_treemap(version_name: str, payload: Annotated[dict[str, Any], Body()]) -> Any:
     """The treemap of a subtree with what a configuration compiles (K4): per node bytes and files built
     in, as modules, not built and unknown. Body {arch, assignments: {SYM: value}, path, max_depth};
     202 while the Kbuild index builds."""
-    from fastapi import HTTPException
     from webapp.backend.routers.insights import job_answer
-    from webapp.backend.services.kbuild_index_service import build_treemap, validate_assignments
+    from webapp.backend.services.kbuild_index_service import (
+        build_treemap,
+        validate_assignments,
+    )
     safe_rev(version_name)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Body must be an object")
     path = str(payload.get("path") or "")
-    from webapp.backend.security.jail import is_safe_rel_path
-    if path and not is_safe_rel_path(path):
-        raise HTTPException(status_code=400, detail="Invalid path")
+    _validate_rel_path(path)
     assignments = validate_assignments(payload.get("assignments") or {})
     return job_answer(build_treemap(version_name, str(payload.get("arch") or "x86_64"), assignments, path,
                                     int(payload.get("max_depth") or 2)))

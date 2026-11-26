@@ -154,6 +154,8 @@ export class NodeMapController {
     this.canvasMeta = {};
     this.userDb = localDB;
     this._disposeGen = 0;
+    this._syncPassDepth = 0;
+    this._kconfigNamesPass = null;
     this._seededAtMount = false;
     this._incomingAtMount = [];
     this._userEdited = false;
@@ -231,6 +233,8 @@ export class NodeMapController {
       headMeta: (node) => this.headMeta(node),
       bodyKey: (node) => this.bodyKey(node),
       keyData: (node) => (node.type === "tab" ? tabKeyData(this, node) : undefined),
+      beginSync: () => this._beginSyncPass(),
+      endSync: () => this._endSyncPass(),
     });
 
     this.attachToolbar();
@@ -582,6 +586,25 @@ export class NodeMapController {
     return entry.status === "ok" ? entry.value : null;
   }
 
+  _beginSyncPass() {
+    this._syncPassDepth = (this._syncPassDepth || 0) + 1;
+  }
+
+  _endSyncPass() {
+    if (this._syncPassDepth > 0) this._syncPassDepth -= 1;
+    if (this._syncPassDepth <= 0) {
+      this._syncPassDepth = 0;
+      this._kconfigNamesPass = null;
+    }
+  }
+
+  kconfigNamesKey() {
+    if (this._syncPassDepth > 0 && this._kconfigNamesPass !== null) return this._kconfigNamesPass;
+    const names = (this.canvas?.nodes || []).filter((n) => n.type === "kconfig").map((n) => n.data.symbol).sort().join(",");
+    if (this._syncPassDepth > 0) this._kconfigNamesPass = names;
+    return names;
+  }
+
   bodyKey(node) {
     if (node.type === "struct") {
       return JSON.stringify([
@@ -595,7 +618,7 @@ export class NodeMapController {
     if (node.type === "note") return this.canvas.settings.editMode ? "edit" : "";
     if (node.type === "kconfig") {
       const values = this.kconfigValuesFor(node);
-      const names = this.canvas.nodes.filter((n) => n.type === "kconfig").map((n) => n.data.symbol).sort().join(",");
+      const names = this.kconfigNamesKey();
       return JSON.stringify([values ? kconfigValue(values, node.data.symbol) : null, names, this.kconfigEpoch]);
     }
     if (node.type === "mail") return String(this.mailEpoch || 0);
@@ -1000,6 +1023,7 @@ export class NodeMapController {
         applyFrameSupersample(frame, M.iframeSupersample(this.canvas.settings.renderQuality, this.zoom, node.scale));
         // Each load starts a new document: it takes the current factor again
         frame.addEventListener?.("load", () => {
+          if (!frame.isConnected || !this.containerEl?.isConnected) return;
           // a PNG export reads it at 1× meanwhile (it puts the factor back when done)
           if (!this._exportingFrames) applyFrameSupersample(frame, Number(frame.dataset?.ss) || 1, { force: true });
         });
@@ -1181,7 +1205,7 @@ export class NodeMapController {
     if (cat === "syscalls") return client.getKapi(v, `syscalls?arch=${encodeURIComponent(d.arch || "x86_64")}`);
     if (cat === "exports") {
       return d.symbol
-        ? client.request(`/api/kapi/${encodeURIComponent(v)}/exports/${encodeURIComponent(d.symbol)}?arch=${encodeURIComponent(d.arch || "x86_64")}`)
+        ? client.request(`/webapi/kapi/${encodeURIComponent(v)}/exports/${encodeURIComponent(d.symbol)}?arch=${encodeURIComponent(d.arch || "x86_64")}`)
         : client.getKapi(v, "exports");
     }
     if (cat === "params") return client.getKapi(v, `params?arch=${encodeURIComponent(d.arch || "x86_64")}`);
@@ -1319,7 +1343,12 @@ export class NodeMapController {
     if (this.selectedEdge && !this.canvas.edges.some((e) => e.id === this.selectedEdge)) this.selectedEdge = null;
     if (this.active && !ids.has(this.active)) this.active = null;
     this.rootEl?.classList.toggle("nm-edit", Boolean(this.canvas.settings.editMode));
-    this.renderer.sync(this.canvas.nodes, this.selected, this.active, this.canvas.settings);
+    this._beginSyncPass();
+    try {
+      this.renderer.sync(this.canvas.nodes, this.selected, this.active, this.canvas.settings);
+    } finally {
+      this._endSyncPass();
+    }
     this.updateViewportCulling();
     const fitted = this.autoFitPass();
     this.applyBackground();

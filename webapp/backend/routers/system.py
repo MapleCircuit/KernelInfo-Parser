@@ -9,13 +9,16 @@ from typing import Any
 from fastapi import APIRouter
 
 from db_engine.spec import Join, gt
-
 from webapp.backend.config import get_active_repo_name, get_repo_dir
-from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id, safe_decode
+from webapp.backend.database.helpers import (
+    get_active_network_id,
+    get_active_repo_id,
+    safe_decode,
+)
 from webapp.backend.database.pool import get_reader
 from webapp.backend.services.sync_service import sync_service
 
-sync_router = APIRouter(prefix="/api", tags=["system"])
+sync_router = APIRouter(prefix="/webapi", tags=["system"])
 
 SERVER_STARTED = time.time()
 # A version still marked "parsing" after this long was most likely interrupted; the parser rolls such a
@@ -44,8 +47,14 @@ def get_sync(fresh: bool = False) -> dict[str, Any]:
 
 def _git_tag_count() -> int | None:
     try:
-        out = subprocess.run(["git", "-C", str(get_repo_dir()), "for-each-ref", "--format=x", "refs/tags"],
-                             capture_output=True, text=True, timeout=10)
+        out = subprocess.run(
+            ["git", "-C", str(get_repo_dir()), "for-each-ref", "--format=x", "refs/tags"],
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.count("\n") if out.returncode == 0 else None
@@ -107,16 +116,19 @@ def ingest_status(now: float | None = None) -> dict[str, Any]:
                         "commit": _short(r["commit_hash"]),
                         "finished_at": int(r["updated_at"] or 0),
                     })
-            total = 0
-            for stat in reader.table_stats():
-                total += stat.data_bytes + stat.index_bytes
-                out["db"]["tables"].append({
-                    "name": safe_decode(stat.name),
-                    "rows_estimate": int(stat.rows or 0),
-                    "data_mb": round(stat.data_bytes / 1048576, 1),
-                    "index_mb": round(stat.index_bytes / 1048576, 1),
-                })
-            out["db"]["total_mb"] = round(total / 1048576, 1)
+            try:
+                total = 0
+                for stat in reader.table_stats():
+                    total += stat.data_bytes + stat.index_bytes
+                    out["db"]["tables"].append({
+                        "name": safe_decode(stat.name),
+                        "rows_estimate": int(stat.rows or 0),
+                        "data_mb": round(stat.data_bytes / 1048576, 1),
+                        "index_mb": round(stat.index_bytes / 1048576, 1),
+                    })
+                out["db"]["total_mb"] = round(total / 1048576, 1)
+            except Exception:  # noqa: BLE001 - table metadata failure must not mark status unavailable
+                out["db"] = {"tables": [], "total_mb": 0.0}
     except Exception as exc:  # noqa: BLE001 - the status page also reports a missing database
         out["available"] = False
         out["error"] = str(exc)[:300]

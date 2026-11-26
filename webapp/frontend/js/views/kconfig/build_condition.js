@@ -1,5 +1,5 @@
 /**
- * build_condition.js - Evaluate Kbuild build conditions (GET /api/kconfig/{v}/build) against a configuration.
+ * build_condition.js - Evaluate Kbuild build conditions (GET /webapi/kconfig/{v}/build) against a configuration.
  *
  * Expressions come from parser/kbuild_conditions.py (whose `evaluate()` is the reference twin):
  * "y" / "m" / "n" / "?" constants, {sym}, {def}, {eq: [a, b]} (make strings of literals and {val}),

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from typing import Annotated, Any
+
 from fastapi import APIRouter, Body, Depends, Query
 
 from webapp.backend.config import require_feature
 from webapp.backend.services.mailing_list_service import mailing_list_service
 
-router = APIRouter(prefix="/api/mail", tags=["mail"], dependencies=[Depends(require_feature("mail"))])
+router = APIRouter(prefix="/webapi/mail", tags=["mail"], dependencies=[Depends(require_feature("mail"))])
 
 
 @router.get("/status")
@@ -65,11 +66,12 @@ def get_merged_commits(
 
 
 @router.post("/apply")
-def post_mail_apply(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def post_mail_apply(payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     """Apply patches from the archive to a revision in memory (P1): {revision, message_ids: [...]} (in series
     order, at most 50 messages and 5 MB) -> {apply_id, base, base_commit, patches: [{message_id, subject, status,
     files: [{path, status, hunks}]}], summary}. Nothing is written to the repository or the database."""
     from fastapi import HTTPException
+
     from webapp.backend.services.patch_apply import patch_apply_service
     if not isinstance(payload, dict) or not isinstance(payload.get("message_ids"), list):
         raise HTTPException(status_code=400, detail='Body must be {"revision": "...", "message_ids": ["..."]}')

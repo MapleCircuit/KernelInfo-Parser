@@ -39,8 +39,10 @@ export class MenuconfigTui {
   hide() {
     if (this.keyHandler) window.removeEventListener("keydown", this.keyHandler, true);
     this.keyHandler = null;
+    this.helpOpen = false;
     this.modalEl?.remove();
     this.modalEl = null;
+    if (this.view.tui === this) this.view.tui = null;
     this.view.renderTree();
   }
 
@@ -205,6 +207,7 @@ export class MenuconfigTui {
     const item = this.selectedItem();
     if (!item || !item.node.sym || this.engine.syms[item.node.sym]?.is_choice) return;
     await this.view.changeValue(item.node);
+    if (!this.modalEl?.isConnected) return;
     this.render();
   }
 
@@ -214,6 +217,7 @@ export class MenuconfigTui {
     const s = sym && this.engine.syms[sym];
     if (!s || (s.type !== "bool" && s.type !== "tristate") || s.is_choice) return;
     await this.view.applyValue(sym, value);
+    if (!this.modalEl?.isConnected) return;
     this.render();
   }
 
@@ -286,8 +290,10 @@ export class MenuconfigTui {
     if (sym) {
       try {
         const detail = await (this.view.api || api).getKconfigSymbol(this.view.currentVersion, sym, this.view.currentArch, this.view.toolchain);
+        if (!this.modalEl?.isConnected) return;
         paint(detail.help || "There is no help available for this option.");
       } catch {
+        if (!this.modalEl?.isConnected) return;
         paint("(help unavailable)");
       }
     }

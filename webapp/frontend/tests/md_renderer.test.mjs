@@ -224,3 +224,25 @@ test("indented block-like lines never stall the parser", async () => {
   }
   assert.match(renderMarkdownFragment("  # heading"), /<h1/);
 });
+
+test("markdown renderer rejects unsafe URL schemes in links and images", () => {
+  const md = [
+    "[js](javascript:alert(1))",
+    "[js-slash](javascript://evil.com/%0aalert(1))",
+    "[data](data:text/html,<script>alert(1)</script>)",
+    "[vbs](vbscript:msgbox(1))",
+    "![img-js](javascript:alert(1))",
+    "![img-data](data:image/svg+xml;base64,PHN2Zz4=)",
+    "[mail](mailto:dev@kernel.org)",
+    "[ftp](ftp://ftp.kernel.org/pub/)",
+    "![ftp-img](ftp://ftp.kernel.org/logo.png)",
+  ].join("\n\n");
+  const { html } = renderMarkdownDocument(md, "Documentation/test.md");
+  assert(!html.includes("javascript:"), "javascript: URL must be rejected");
+  assert(!html.includes("data:text/html"), "data: link must be rejected");
+  assert(!html.includes("data:image/svg+xml"), "data: image must be rejected");
+  assert(!html.includes("vbscript:"), "vbscript: URL must be rejected");
+  assert(html.includes('href="mailto:dev@kernel.org"'), "mailto: link allowed");
+  assert(html.includes('href="ftp://ftp.kernel.org/pub/"'), "ftp:// link allowed");
+  assert(html.includes('src="ftp://ftp.kernel.org/logo.png"'), "ftp:// image allowed");
+});

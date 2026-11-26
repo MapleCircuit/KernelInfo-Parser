@@ -45,6 +45,7 @@ export class SectionedView {
     this.detailSeq = 0;
     this.abort = null;
     this.result = null;
+    this._qTimer = null;
   }
 
   repo() {
@@ -95,7 +96,11 @@ export class SectionedView {
 
   async render(containerEl, tabData) {
     const rseq = ++this.renderSeq;
+    clearTimeout(this._qTimer);
+    this._qTimer = null;
     this.abort?.abort();
+    this.list?.dispose();
+    this.list = null;
     this.rows = [];
     this.filtered = [];
     this.result = null;
@@ -136,10 +141,10 @@ export class SectionedView {
       </div>`;
     const q = containerEl.querySelector(".sv-search");
     q.value = tabData.query || "";
-    let qTimer = null;
     q.addEventListener("input", () => {
-      clearTimeout(qTimer);
-      qTimer = setTimeout(() => {
+      clearTimeout(this._qTimer);
+      this._qTimer = setTimeout(() => {
+        if (!this.containerEl?.isConnected) return;
         this.persist({ query: q.value.trim() });
         this.applyFilter();
       }, 150);
@@ -236,6 +241,7 @@ export class SectionedView {
       } catch {
         targets = [];
       }
+      if (!this.containerEl?.isConnected) return;
       if (!this.tab.arch) this.tab.arch = state.kconfigArch() || "x86_64";
       if (targets.length && !targets.some((t) => t.id === this.tab.arch)) targets.unshift({ id: this.tab.arch, label: this.tab.arch });
       archSel.innerHTML = (targets.length ? targets : [{ id: this.tab.arch, label: this.tab.arch }])
@@ -287,7 +293,7 @@ export class SectionedView {
       res = await sec.fetchList(this.ctx({
         signal: this.abort.signal,
         onProgress: (p) => {
-          if (seq === this.listSeq) this.setStatus(`Building… ${progressLabel(p)}`, p);
+          if (seq === this.listSeq && this.containerEl?.isConnected) this.setStatus(`Building… ${progressLabel(p)}`, p);
         },
       }));
     } catch (err) {
@@ -370,7 +376,8 @@ export class SectionedView {
 
   async showDetail(row, key) {
     const sec = this.section;
-    const el = this.containerEl.querySelector(".sv-detail");
+    const el = this.containerEl?.querySelector(".sv-detail");
+    if (!el) return;
     const seq = ++this.detailSeq;
     if (!row && !sec.fetchDetail) {
       el.innerHTML = `<div class="sv-empty">${escapeHtml(key ? `${key} is not in this list.` : "Select an entry.")}</div>`;
@@ -382,10 +389,10 @@ export class SectionedView {
       try {
         detail = await sec.fetchDetail(this.ctx(), key, row);
       } catch (err) {
-        if (seq === this.detailSeq) el.innerHTML = `<div class="sv-empty">Could not load: ${escapeHtml(err.message)}</div>`;
+        if (seq === this.detailSeq && this.containerEl?.isConnected) el.innerHTML = `<div class="sv-empty">Could not load: ${escapeHtml(err.message)}</div>`;
         return;
       }
-      if (seq !== this.detailSeq) return;
+      if (seq !== this.detailSeq || !this.containerEl?.isConnected) return;
     }
     el.innerHTML = sec.detailHtml ? sec.detailHtml(detail, this.ctx()) : `<pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>`;
     sec.afterDetail?.(el, detail, this.ctx());
@@ -434,6 +441,11 @@ export class SectionedView {
   }
 
   dispose() {
+    clearTimeout(this._qTimer);
+    this._qTimer = null;
+    this.renderSeq++;
+    this.listSeq++;
+    this.detailSeq++;
     this.abort?.abort();
     this.list?.dispose();
     this.containerEl = null;

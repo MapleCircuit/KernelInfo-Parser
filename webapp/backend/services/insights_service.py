@@ -11,17 +11,26 @@ import json
 import logging
 import re
 import subprocess
-import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import HTTPException
 
 from db_engine.spec import Agg, Join, NotExists, Value, gt
 from parser.git_ast.git_types import CommitRole
-from parser.git_ast.release_order import release_ranges, series_ord_for, series_track_for
-from webapp.backend.config import RepoScopedCache, get_active_insights_config, get_active_repo_name, get_repo_dir
+from parser.git_ast.release_order import (
+    release_ranges,
+    series_ord_for,
+    series_track_for,
+)
+from webapp.backend.config import (
+    RepoScopedCache,
+    get_active_insights_config,
+    get_active_repo_name,
+    get_repo_dir,
+)
 from webapp.backend.services import release_service as rs
 from webapp.backend.services.disk_cache import DiskCache
 from webapp.backend.services.jobs import JobCancelled, jobs
@@ -43,7 +52,7 @@ TOP = 25
 
 def _git(args: list[str], timeout: float = 120.0) -> str:
     try:
-        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, text=True, timeout=timeout,
+        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, text=True, timeout=timeout,
                              errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"git {args[0]} failed: {exc}") from exc
@@ -581,35 +590,6 @@ def parse_pull(subject: str) -> dict[str, str]:
     return {"ref": "", "url": ""}
 
 
-def _tree_index(tag: str) -> dict[str, dict[str, Any]]:
-    """normalized T: tree url -> {sec_id, name} from the release's MAINTAINERS (best effort)."""
-    out: dict[str, dict[str, Any]] = {}
-    try:
-        from webapp.backend.services.maintainer_service import MaintainerService
-        sections, _ = MaintainerService().get_maintainer_data(tag)
-    except Exception as exc:  # noqa: BLE001 - an unparsed release has no MAINTAINERS rows
-        logger.debug("MAINTAINERS of %s unavailable: %s", tag, exc)
-        return out
-    owners: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for sec in sections:
-        for tree in re.split(r"[\n;]", sec.scm_tree or ""):
-            tree = re.sub(r"^git\s+", "", tree.strip())
-            url = (tree.split()[0] if tree else "").rstrip(",.;")
-            if "://" not in url:
-                continue  # "quilt …", "hg …": not a git tree a pull comes from
-            entry = {"sec_id": sec.sec_id, "name": sec.name}
-            norm = normalize_url(url)
-            out.setdefault(norm, entry)
-            if owner_of(norm) and entry not in owners[owner_of(norm)]:
-                owners[owner_of(norm)].append(entry)
-    # A tree renamed since MAINTAINERS was written (linux-2.6-kgdb vs kgdb) still matches through its
-    # owner's directory when that owner maintains a single tree
-    for own, entries in owners.items():
-        if len(entries) == 1:
-            out.setdefault(f"owner:{own}", entries[0])
-    return out
-
-
 def owner_of(norm_url: str) -> str:
     """`git.kernel.org/linux/kernel/git/jwessel/kgdb` -> `git.kernel.org/linux/kernel/git/jwessel`."""
     m = re.match(r"(git\.kernel\.org/.*/git/[^/]+)/", norm_url + "/")
@@ -630,7 +610,7 @@ _REF_STOPWORDS = frozenset({
 _SEC_STOPWORDS = frozenset({
     "driver", "drivers", "subsystem", "support", "linux", "kernel", "the", "and", "for", "with", "common", "core",
 })
-_SIGNED_OFF_RE = re.compile(r"^Signed-off-by:\s*(.+?)\s*(?:<([^>\n]+)>)?\s*$", re.M | re.I)
+_SIGNED_OFF_RE = re.compile(r"^Signed-off-by:\s*(.+?)\s*(?:<([^>\n]+)>)?\s*$", re.MULTILINE | re.IGNORECASE)
 
 
 def _norm_person_name(name: str) -> str:
@@ -658,7 +638,10 @@ def _is_maintainer_indexed(tag: str, sha: str | None = None) -> bool:
         return False
     try:
         from db_engine.spec import finished_ref, gt
-        from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
+        from webapp.backend.database.helpers import (
+            get_active_network_id,
+            get_active_repo_id,
+        )
         from webapp.backend.database.pool import get_reader
 
         with get_reader() as reader:
@@ -689,9 +672,7 @@ def _is_maintainer_indexed(tag: str, sha: str | None = None) -> bool:
                         cid = int(row["commit_id"])
             if cid is None:
                 return False
-            if has_ckpt and not reader.checkpoint_tree_exists(cid):
-                return False
-            return True
+            return not (has_ckpt and not reader.checkpoint_tree_exists(cid))
     except Exception as exc:  # noqa: BLE001
         logger.debug("MAINTAINERS index check of %s failed: %s", tag, exc)
         return False
@@ -1321,11 +1302,13 @@ def db_merge_window(tag: str) -> dict[str, Any] | None:
                 if any(_text(r["sec_name"]) and int(r["sec_id"] or 0) == 0 for r in rows):
                     try:
                         if cur.row_exists("m_git_ref", {"repo_id": repo_id, "ref_name": tag}):
-                            from webapp.backend.services.maintainer_service import MaintainerService
+                            from webapp.backend.services.maintainer_service import (
+                                MaintainerService,
+                            )
                             m_sections, _ = MaintainerService().get_maintainer_data(tag)
                             sec_name_to_id = {s.name: s.sec_id for s in m_sections if getattr(s, "sec_id", None) is not None}
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Maintainer section lookup for %s failed: %s", tag, exc)
 
                 pulls = []
                 for r in rows:
@@ -1345,8 +1328,8 @@ def db_merge_window(tag: str) -> dict[str, Any] | None:
                                     parents = parsed_dirs["parents"]
                             elif isinstance(parsed_dirs, list):
                                 dirs = parsed_dirs
-                        except Exception:
-                            pass
+                        except (ValueError, TypeError) as exc:
+                            logger.debug("Failed to parse dirs_json for merge window %s: %s", tag, exc)
                     sec_name = _text(r["sec_name"])
                     sec_id = int(r["sec_id"] or 0)
                     if not sec_id and sec_name in sec_name_to_id:
@@ -1403,7 +1386,7 @@ def _sender(body: str) -> str:
         r"^Pull\s+.+?\b(?:updates?|fixes|changes?)\s+([A-Z][^:\n]+?):",
         r"^(?:Pull|Merge)\b[^:\n]*\bfrom\s+([A-Z][^:\n.]{2,60}?)(?::|\.\s*$|\s+that\b|\s*$)",
     ):
-        m = re.search(pat, text, re.M)
+        m = re.search(pat, text, re.MULTILINE)
         if m:
             return m.group(1).strip().rstrip(".")
     first_line = text.splitlines()[0] if text else ""
@@ -1698,7 +1681,8 @@ def _read_precomputed_health(
         try:
             for r in cur.release_section_health(list(valid_segs.values())):
                 health_by_seg.setdefault(int(r["segment_id"]), []).append(r)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release_section_health unavailable: %s", exc)
             health_by_seg = {}
 
     precomputed: dict[str, dict[str, tuple[int, int, dict[str, int], dict[str, int]]]] = {}
@@ -1884,8 +1868,8 @@ def _read_delta_health(
         if not boundary_git and not unanswered and hasattr(cur, "subsystem_distinct_authors"):
             try:
                 distinct_authors.update(cur.subsystem_distinct_authors(track, tags=all_selected))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("subsystem_distinct_authors failed on track %s: %s", track, exc)
 
         seg_to_w = {s: w for w in track_tags for s in covered_segs_by_w.get(w, ())}
         sec_acc: dict[str, dict[str, list[Any]]] = {w: {} for w in track_tags if covered_segs_by_w.get(w)}
@@ -2043,7 +2027,10 @@ def compute_subsystem_health(
     tc = rs.tag_commits()
     if non_latest:
         try:
-            from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
+            from webapp.backend.database.helpers import (
+                get_active_network_id,
+                get_active_repo_id,
+            )
             from webapp.backend.database.pool import get_reader
 
             with get_reader() as cur:
@@ -2073,7 +2060,7 @@ def compute_subsystem_health(
                             )
         except JobCancelled:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("partial DB health lookup failed: %s", exc)
 
     def _commits(t: str) -> list[dict[str, Any]]:
@@ -2117,7 +2104,10 @@ def health_coverage(cur: Any, tags: list[str], *, partial: bool = False) -> dict
     """{release: segment_ids} when the database holds every input of the window, else None (or per-tag
     covered subset when `partial=True`)."""
     from parser.git_ast import release_stats
-    from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
+    from webapp.backend.database.helpers import (
+        get_active_network_id,
+        get_active_repo_id,
+    )
     from webapp.backend.services.history_service import _ingest_chain
     tc = rs.tag_commits()
     network_id = get_active_network_id(cur)
@@ -2157,7 +2147,10 @@ def health_coverage(cur: Any, tags: list[str], *, partial: bool = False) -> dict
 def health_from_db(tag: str, tags: list[str], sections: list[Any], matcher: Any,
                    progress: Callable | None = None) -> dict[str, Any] | None:
     """The report from the database (read only), or None when it does not cover the window."""
-    from webapp.backend.database.helpers import get_active_network_id, get_active_repo_id
+    from webapp.backend.database.helpers import (
+        get_active_network_id,
+        get_active_repo_id,
+    )
     from webapp.backend.database.pool import get_reader
 
     if not tags or rs.LATEST_RELEASE in tags:

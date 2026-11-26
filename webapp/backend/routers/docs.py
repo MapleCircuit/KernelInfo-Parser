@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from webapp.backend.config import require_feature
 from webapp.backend.services.docs_service import DocsService
 
-router = APIRouter(prefix="/api", tags=["docs"], dependencies=[Depends(require_feature("docs"))])
+router = APIRouter(prefix="/webapi", tags=["docs"], dependencies=[Depends(require_feature("docs"))])
 docs_service = DocsService()
 
 

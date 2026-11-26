@@ -5,6 +5,7 @@ Starts the FastAPI server:
     uvicorn webapp.main:app --host 0.0.0.0 --port 8000 --reload
 """
 from __future__ import annotations
+
 import argparse
 import os
 import sys
@@ -46,6 +47,7 @@ if __name__ == "__main__":
     cli = parse_args()
     apply_config_path(cli)
     import uvicorn
+
     from core.logging_setup import setup_webapp_logging
     from webapp.backend.config import get_backend_server_config
 

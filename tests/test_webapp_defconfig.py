@@ -1,5 +1,6 @@
 """tests/test_webapp_defconfig.py - Unit tests for WebApp Defconfig retrieval, architecture scoping, and 64BIT resolution."""
 from __future__ import annotations
+
 import os
 import sys
 import unittest
@@ -85,8 +86,8 @@ class TestWebappDefconfig(unittest.TestCase):
         """Verify the Kconfig symbol detail the KConfig view reads (definition sites, help, Kbuild rules)."""
         try:
             sym = get_kconfig_symbol_detail("v3.0", "EXT4_FS")
-        except Exception:
-            raise unittest.SkipTest("EXT4_FS symbol not indexed in database.")
+        except Exception as exc:
+            raise unittest.SkipTest("EXT4_FS symbol not indexed in database.") from exc
         self.assertEqual(sym["name"], "EXT4_FS")
         self.assertTrue(sym["defined_for_arch"])
         self.assertEqual(sym["declarations"][0]["file_path"], "fs/ext4/Kconfig")
@@ -96,6 +97,55 @@ class TestWebappDefconfig(unittest.TestCase):
         # The per-revision model has no lifecycle: those compatibility fields are gone
         for key in ("vname_s", "added_version", "is_active", "lifecycle_status", "menu_path"):
             self.assertNotIn(key, sym)
+
+
+class TestKconfigServiceAndFactsHardening(unittest.TestCase):
+    """BE-013 / BE-010b regression: implied_by exposure, reverse_dependencies sha scoping, and batch draining."""
+
+    def test_reverse_dependencies_shas_filter_and_read_blobs_drains_non_blob(self) -> None:
+        import subprocess
+        from unittest.mock import MagicMock, patch
+
+        from webapp.backend.services import kconfig_facts
+        from webapp.backend.services.kconfig_service import _ModelEntry
+
+        with kconfig_facts._LOCK:
+            orig_defs = dict(kconfig_facts._DEFS_CACHE)
+            kconfig_facts._DEFS_CACHE.clear()
+            kconfig_facts._DEFS_CACHE["sha_a"] = {"DRIVER_A": [{"selects": ["SHARED_DEP"], "implies": []}]}
+            kconfig_facts._DEFS_CACHE["sha_b"] = {"DRIVER_B": [{"selects": [], "implies": ["SHARED_DEP"]}]}
+        try:
+            self.assertEqual(kconfig_facts.reverse_dependencies("SHARED_DEP", shas=["sha_a"]), (["DRIVER_A"], []))
+            self.assertEqual(kconfig_facts.reverse_dependencies("SHARED_DEP", shas=["sha_b"]), ([], ["DRIVER_B"]))
+        finally:
+            with kconfig_facts._LOCK:
+                kconfig_facts._DEFS_CACHE.clear()
+                kconfig_facts._DEFS_CACHE.update(orig_defs)
+
+        sha_tree = "a" * 40
+        sha_missing = "b" * 40
+        sha_blob = "c" * 40
+        payload = (
+            f"{sha_tree} tree 4\n1234\n"
+            f"{sha_missing} missing\n"
+            f"{sha_blob} blob 12\nconfig TEST\n\n"
+        ).encode()
+        proc_res = MagicMock(stdout=payload)
+        with patch.object(kconfig_facts, "load_stored"), \
+                patch.object(kconfig_facts, "cached", return_value=None), \
+                patch.object(kconfig_facts, "get_repo_dir", return_value="/tmp"), \
+                patch.object(subprocess, "run", return_value=proc_res):
+            texts = kconfig_facts.read_blobs([sha_blob, sha_tree, sha_missing], skip_cached=False)
+        self.assertEqual(texts, {sha_blob: "config TEST\n"})
+
+        # _ModelEntry carries implied_by alongside selected_by
+        entry = _ModelEntry(
+            {"symbols": {"FOO": {"selects": [], "implies": [("BAR", -1)], "type": "bool", "defaults": [], "ranges": []}},
+             "nodes": [], "files": [], "exprs": []},
+            {"rev": "v3.0", "arch": "x86", "srcarch": "x86"},
+            {"help": {}, "menu_help": {}, "references": {}},
+        )
+        self.assertEqual(entry.implied_by.get("BAR"), [("FOO", -1)])
 
 
 if __name__ == "__main__":

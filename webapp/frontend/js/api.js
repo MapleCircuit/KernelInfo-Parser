@@ -9,7 +9,7 @@ import { pollJob } from "./utils/job_poll.js";
 import { grepParams } from "./utils/grep_format.js";
 import { blameQuery, formatBlameOpts } from "./views/code_view/blame_options.js";
 
-// Heartbeat probing GET /api/sync (cheap, server-cached): slow while the backend answers, fast while it
+// Heartbeat probing GET /webapi/sync (cheap, server-cached): slow while the backend answers, fast while it
 // does not, so the badge recovers quickly once the server is back.
 const HEARTBEAT_UP_MS = 60000;
 const HEARTBEAT_DOWN_MS = 5000;
@@ -26,6 +26,48 @@ const RENAME_SEARCH_TIMEOUT_MS = 120000;
 // Callgraph: the callers of a widely used function are looked up across every indexed blob (~25 s for schedule)
 const CALLGRAPH_TIMEOUT_MS = 60000;
 
+/** Format JSON/text error payload from FastAPI/REST endpoints into a human-readable string. */
+export function formatApiErrorDetail(errObj, fallback = "Request failed") {
+  if (!errObj || typeof errObj !== "object") return fallback;
+  const detail = errObj.detail;
+  if (Array.isArray(detail)) {
+    const joined = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          const msg = item.msg ? String(item.msg) : "";
+          const locParts = Array.isArray(item.loc)
+            ? (item.loc.length > 1 && ["body", "query", "path", "header", "cookie"].includes(item.loc[0]) ? item.loc.slice(1) : item.loc)
+            : [];
+          const loc = locParts.join(".");
+          if (msg) return loc ? `${loc}: ${msg}` : msg;
+          try {
+            return JSON.stringify(item);
+          } catch {
+            return String(item);
+          }
+        }
+        return item == null ? "" : String(item);
+      })
+      .filter(Boolean)
+      .join("; ");
+    return joined || fallback;
+  }
+  if (typeof detail === "string" && detail) return detail;
+  if (detail && typeof detail === "object") {
+    if (typeof detail.message === "string" && detail.message) return detail.message;
+    if (typeof detail.error === "string" && detail.error) return detail.error;
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return fallback;
+    }
+  }
+  if (typeof errObj.error === "string" && errObj.error) return errObj.error;
+  if (typeof errObj.message === "string" && errObj.message) return errObj.message;
+  return fallback;
+}
+
 class ApiClient {
   constructor() {
     this.baseUrl = "";
@@ -34,7 +76,7 @@ class ApiClient {
     // browser's link state, so it stays true when the server is down; this is what the badge follows.
     this.serverUp = navigator.onLine;
     this.activeRequests = 0;
-    // Repository -> {version name -> stamp (commit + parse completion)} from /api/versions and /api/branches;
+    // Repository -> {version name -> stamp (commit + parse completion)} from /webapi/versions and /webapi/branches;
     // part of every cache key of version data, so a re-parsed version or a moved branch never serves older
     // cached data. `versionStamps` is the map of the client's repository.
     this._stampsByRepo = {};
@@ -45,10 +87,11 @@ class ApiClient {
     this._insightsResolveMemo = new Map();
     // Called with (X-KIP-Sync header, repository of the request) of every API response (js/sync.js)
     this.onSyncHeader = null;
-    // Called with the parsed JSON body of GET /api/sync (js/sync.js)
+    // Called with the parsed JSON body of GET /webapi/sync (js/sync.js)
     this.onSyncData = null;
     this._showTimer = null;
     this._heartbeatTimer = null;
+    this._pingInFlight = null;
 
     window.addEventListener("online", () => {
       this.isOnline = true;
@@ -83,6 +126,14 @@ class ApiClient {
 
   /** One heartbeat request; resolves to the reachability it observed. Never throws, never cached. */
   async pingServer() {
+    if (this._pingInFlight) return this._pingInFlight;
+    this._pingInFlight = this._doPingServer().finally(() => {
+      this._pingInFlight = null;
+    });
+    return this._pingInFlight;
+  }
+
+  async _doPingServer() {
     if (!navigator.onLine) {
       this._setServerUp(false);
       return false;
@@ -90,7 +141,7 @@ class ApiClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HEARTBEAT_TIMEOUT_MS);
     try {
-      const res = await fetch(`${this.baseUrl}/api/sync`, {
+      const res = await fetch(`${this.baseUrl}/webapi/sync`, {
         method: "GET",
         signal: controller.signal,
         headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
@@ -260,7 +311,7 @@ class ApiClient {
         let errMsg = `Request failed: ${response.status}`;
         try {
           const errObj = JSON.parse(errText);
-          if (errObj.detail) errMsg = errObj.detail;
+          errMsg = formatApiErrorDetail(errObj, errMsg);
         } catch {
           if (errText) errMsg = errText;
         }
@@ -364,7 +415,7 @@ class ApiClient {
   }
 
   /**
-   * First tag and release containing a commit (`GET /api/commits/{v}/released/{hash}`, H3). A released
+   * First tag and release containing a commit (`GET /webapi/commits/{v}/released/{hash}`, H3). A released
    * answer never changes and is kept in the `commits` store; "not released yet" is asked again later.
    * Polls while the release index is first built (202, §2.15).
    */
@@ -378,7 +429,7 @@ class ApiClient {
   }
 
   /**
-   * Relations of a commit (`GET /api/commits/{v}/relations/{hash}`, H1/H2): fixes, fixed by, reverts,
+   * Relations of a commit (`GET /webapi/commits/{v}/relations/{hash}`, H1/H2): fixes, fixed by, reverts,
    * backports, Cc: stable, mail links, each enriched with its first release. Polls while the index is
    * first built; never cached (later commits add to "fixed by").
    */
@@ -391,29 +442,29 @@ class ApiClient {
     return this.requestJob(this._commitPath(version, "relations"), { method: "POST", body: { hashes: hashes.slice(0, 200) }, signal, timeoutMs: 30000 });
   }
 
-  /** Structured commit query (`GET /api/commits/{v}/query`, H8); `params` from commit_query.queryParams(). Not cached. */
+  /** Structured commit query (`GET /webapi/commits/{v}/query`, H8); `params` from commit_query.queryParams(). Not cached. */
   async queryCommits(version, params) {
     return this.request(`${this._commitPath(version, "query")}?${params}`, { timeoutMs: COMMITS_TIMEOUT_MS });
   }
 
-  /** Commits a mail thread or patch became (`GET /api/mail/merged`, P2); kept in the `mail` store under the `parsed` token. */
+  /** Commits a mail thread or patch became (`GET /webapi/mail/merged`, P2); kept in the `mail` store under the `parsed` token. */
   async getMergedCommits({ mid = "", tid = 0 } = {}) {
     const params = new URLSearchParams();
     if (mid) params.set("mid", mid);
     if (tid) params.set("tid", String(tid));
     // The parser may link more commits later: the cache key follows the `parsed` token (§2.11)
     const token = ((await localDB.get("meta", "sync_tokens").catch(() => null)) || {}).parsed || "";
-    return this.request(`/api/mail/merged?${params}`, { timeoutMs: 30000 }, "tools", `merged_${token}_${params}`);
+    return this.request(`/webapi/mail/merged?${params}`, { timeoutMs: 30000 }, "tools", `merged_${token}_${params}`);
   }
 
-  /** CVE records for a file at a version (`GET /api/cve/file?version={v}&file_path={p}`). */
+  /** CVE records for a file at a version (`GET /webapi/cve/file?version={v}&file_path={p}`). */
   async getFileCves(version, filePath) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ version: ver, file_path: filePath || "" }).toString();
-    return this.request(`/api/cve/file?${q}`, {}, "tools", `cve_file_${this._vk(ver)}_${filePath}`);
+    return this.request(`/webapi/cve/file?${q}`, {}, "tools", `cve_file_${this._vk(ver)}_${filePath}`);
   }
 
-  /** Fast, release-independent catalog of all ingested CVEs (`GET /api/cve/list`). */
+  /** Fast, release-independent catalog of all ingested CVEs (`GET /webapi/cve/list`). */
   async getCveList(opts = {}, reqOpts = {}) {
     const params = new URLSearchParams();
     if (opts.q) params.set("q", opts.q);
@@ -421,13 +472,13 @@ class ApiClient {
     if (opts.version) params.set("version", opts.version);
     params.set("offset", String(opts.offset ?? 0));
     params.set("limit", String(opts.limit ?? 50000));
-    return this.request(`/api/cve/list?${params.toString()}`, reqOpts);
+    return this.request(`/webapi/cve/list?${params.toString()}`, reqOpts);
   }
 
-  /** Full CVE record with optional single-release evaluation (`GET /api/cve/{cve_id}`). */
+  /** Full CVE record with optional single-release evaluation (`GET /webapi/cve/{cve_id}`). */
   async getCveDetail(cveId, release = "", reqOpts = {}) {
     const q = release ? `?release=${encodeURIComponent(release)}` : "";
-    return this.request(`/api/cve/${encodeURIComponent(cveId)}${q}`, reqOpts);
+    return this.request(`/webapi/cve/${encodeURIComponent(cveId)}${q}`, reqOpts);
   }
 
   /**
@@ -439,14 +490,14 @@ class ApiClient {
     const memoKey = `${this.repo || ""}|${ver}`;
     const hit = this._insightsResolveMemo?.get(memoKey);
     if (hit) return hit;
-    const { data } = await this._fetchJson(`/api/insights/resolve?rev=${encodeURIComponent(ver)}`, { signal });
+    const { data } = await this._fetchJson(`/webapi/insights/resolve?rev=${encodeURIComponent(ver)}`, { signal });
     if (data && data.final && (data.exact || data.source === "exact_sha" || data.source === "release_index")) {
       this._insightsResolveMemo?.set(memoKey, data);
     }
     return data;
   }
 
-  /** Clear memoized `/api/insights/resolve` entries (all repos when `repo == null`, else only `repo`). */
+  /** Clear memoized `/webapi/insights/resolve` entries (all repos when `repo == null`, else only `repo`). */
   clearInsightsResolveMemo(repo = null) {
     if (!this._insightsResolveMemo) return;
     if (repo === null || repo === undefined) {
@@ -460,19 +511,19 @@ class ApiClient {
   }
 
   /**
-   * An Insights report (`GET /api/insights/{v}/<path>`, §4.10): polls while its background job runs
+   * An Insights report (`GET /webapi/insights/{v}/<path>`, §4.10): polls while its background job runs
    * (202, §2.15). `cacheKey` (optional) keeps the final body in the `tools` store.
    */
   async getInsights(version, path, { onProgress = null, signal = null, cacheKey = null, networkFirst = false } = {}) {
     const ver = this._sanitizeVer(version);
-    return this.requestJob(`/api/insights/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
+    return this.requestJob(`/webapi/insights/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
       cacheStore: cacheKey ? "tools" : null, cacheKey, networkFirst });
   }
 
-  /** A Kernel API catalog (`GET /api/kapi/{v}/<path>`, §4.9), polling while its job runs. */
+  /** A Kernel API catalog (`GET /webapi/kapi/{v}/<path>`, §4.9), polling while its job runs. */
   async getKapi(version, path, { onProgress = null, signal = null, cacheKey = null } = {}) {
     const ver = this._sanitizeVer(version);
-    return this.requestJob(`/api/kapi/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
+    return this.requestJob(`/webapi/kapi/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
       cacheStore: cacheKey ? "tools" : null, cacheKey: cacheKey ? `${cacheKey}_${this._vk(ver)}` : null });
   }
 
@@ -502,19 +553,19 @@ class ApiClient {
   }
 
   /**
-   * Ingestion status of the active repository (`GET /api/system/ingest`, §4.1, G11): versions parsed and
+   * Ingestion status of the active repository (`GET /webapi/system/ingest`, §4.1, G11): versions parsed and
    * being parsed, recent completions, database size, the server's tokens, jobs and caches. Always asked
    * of the server (cached 10 s there); the last answer is kept for offline display.
    */
   async getIngestStatus() {
-    return this.request("/api/system/ingest", { networkFirst: true }, "tools", "ingest_status");
+    return this.request("/webapi/system/ingest", { networkFirst: true }, "tools", "ingest_status");
   }
 
   /** Server change tokens {db, frontend, parsed, git, repo}; never cached. `fresh` makes the server recompute them. */
   async getSync({ fresh = false } = {}) {
     let res;
     try {
-      res = await fetch(`${this.baseUrl}/api/sync${fresh ? "?fresh=true" : ""}`, {
+      res = await fetch(`${this.baseUrl}/webapi/sync${fresh ? "?fresh=true" : ""}`, {
         headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
         cache: "no-store",
       });
@@ -543,20 +594,20 @@ class ApiClient {
   _commitPath(version, suffix) {
     const ver = this._optVer(version);
     const tail = suffix.replace(/^\/+/, "");
-    return ver ? `/api/commits/${encodeURIComponent(ver)}/${tail}` : `/api/commits/${tail}`;
+    return ver ? `/webapi/commits/${encodeURIComponent(ver)}/${tail}` : `/webapi/commits/${tail}`;
   }
 
   // --- Versions & Projects ---
   async getProjects(options = {}) {
-    return this.request("/api/projects", options, "files", "app_projects2");
+    return this.request("/webapi/projects", options, "files", "app_projects2");
   }
 
   async getBranches(options = {}) {
-    return this.request("/api/branches", options, "files", "app_branches");
+    return this.request("/webapi/branches", options, "files", "app_branches");
   }
 
   /**
-   * Tag names reachable from a branch (`/api/branch/tags`): what the header's Branch selector scopes
+   * Tag names reachable from a branch (`/webapi/branch/tags`): what the header's Branch selector scopes
    * the Tag and RC lists with (§5.13). The server walks that branch's history for it, so the request
    * gets a long timeout and the answer is cached under the branch's stamp — a branch that moved gets
    * a new key and is recomputed, an unchanged one is read from IndexedDB.
@@ -569,14 +620,14 @@ class ApiClient {
       const stamp = this._sourceStamp(src);
       const cacheKey = stamp ? `branch_tags_src_${src}@${stamp}~` : `branch_tags_src_${src}`;
       return this.request(
-        `/api/branch/tags?source=${encodeURIComponent(src)}`,
+        `/webapi/branch/tags?source=${encodeURIComponent(src)}`,
         { timeoutMs: BRANCH_TAGS_TIMEOUT_MS },
         "files",
         cacheKey,
       );
     }
     return this.request(
-      `/api/branch/tags?branch=${encodeURIComponent(b)}`,
+      `/webapi/branch/tags?branch=${encodeURIComponent(b)}`,
       { timeoutMs: BRANCH_TAGS_TIMEOUT_MS },
       "files",
       `branch_tags_${this._vk(b)}`,
@@ -607,7 +658,7 @@ class ApiClient {
     if (!isCatalog(base)) base = null;
     if (base && !networkFirst) return this._rememberVersions(memoKey, base);
 
-    const url = `${this.baseUrl}/api/versions?include_rc=${includeRc ? "true" : "false"}&compact=1`;
+    const url = `${this.baseUrl}/webapi/versions?include_rc=${includeRc ? "true" : "false"}&compact=1`;
     let catalog = null;
     try {
       const headers = base ? { "If-None-Match": `W/"${VERSION_CATALOG_FORMAT}-${base.g}"` } : {};
@@ -658,16 +709,16 @@ class ApiClient {
 
   getRawFileUrl(version, path) {
     const ver = this._sanitizeVer(version);
-    return this.withRepo(`/api/fs/raw/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`);
+    return this.withRepo(`/webapi/fs/raw/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`);
   }
 
   getCompileCommandsDownloadUrl(version, arch = "x86") {
     const ver = this._sanitizeVer(version);
-    return this.withRepo(`/api/fs/compile_commands/${encodeURIComponent(ver)}/export?arch=${encodeURIComponent(arch)}`);
+    return this.withRepo(`/webapi/fs/compile_commands/${encodeURIComponent(ver)}/export?arch=${encodeURIComponent(arch)}`);
   }
 
   /**
-   * Full-text search of a revision (`GET /api/fs/grep`, §4.2, §2.1.3). `opts`: {q, regex, caseSensitive,
+   * Full-text search of a revision (`GET /webapi/fs/grep`, §4.2, §2.1.3). `opts`: {q, regex, caseSensitive,
    * word, paths, limit}. Answers are kept in the `tools` store under the version's stamp (a commit's
    * content never changes); a timed-out, partial answer is never stored.
    */
@@ -678,41 +729,41 @@ class ApiClient {
     const scopedKey = this.repo ? `${this.repo}::${cacheKey}` : cacheKey;
     const cached = await localDB.get("tools", scopedKey);
     if (cached) return cached;
-    const data = await this.request(`/api/fs/grep/${encodeURIComponent(ver)}?${params}`, { timeoutMs: 30000 });
+    const data = await this.request(`/webapi/fs/grep/${encodeURIComponent(ver)}?${params}`, { timeoutMs: 30000 });
     if (data && !data.timed_out) localDB.set("tools", scopedKey, data).catch(() => {});
     return data;
   }
 
-  /** What refers to a file at a revision (`GET /api/fs/references`, §4.2): includers, Kconfig sources, Kbuild rules, documents. */
+  /** What refers to a file at a revision (`GET /webapi/fs/references`, §4.2): includers, Kconfig sources, Kbuild rules, documents. */
   async getFileReferences(version, path) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/fs/references/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `fref_${this._vk(ver)}_${path}`);
+    return this.request(`/webapi/fs/references/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `fref_${this._vk(ver)}_${path}`);
   }
 
-  /** Definitions of one file for the outline and sticky scroll (`GET /api/fs/outline`, §4.2, G03). */
+  /** Definitions of one file for the outline and sticky scroll (`GET /webapi/fs/outline`, §4.2, G03). */
   async getOutline(version, path) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/fs/outline/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `outline_${this._vk(ver)}_${path}`);
+    return this.request(`/webapi/fs/outline/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `outline_${this._vk(ver)}_${path}`);
   }
 
   /** Symbols a C / header / assembly file imports through its `#include` chain for ARCH=`arch`
-   * (`GET /api/fs/imports`, §4.2): the code view's Imports panel. */
+   * (`GET /webapi/fs/imports`, §4.2): the code view's Imports panel. */
   async getFileImports(version, path, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
     const a = arch || "x86_64";
     const q = new URLSearchParams({ path, arch: a }).toString();
-    return this.request(`/api/fs/imports/${encodeURIComponent(ver)}?${q}`, {}, "files", `imports_${this._vk(ver)}_${a}_${path}`);
+    return this.request(`/webapi/fs/imports/${encodeURIComponent(ver)}?${q}`, {}, "files", `imports_${this._vk(ver)}_${a}_${path}`);
   }
 
   async searchFiles(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit }).toString();
-    return this.request(`/api/fs/search/${encodeURIComponent(ver)}?${q}`);
+    return this.request(`/webapi/fs/search/${encodeURIComponent(ver)}?${q}`);
   }
 
   async getDocLabels(version) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/docs/${encodeURIComponent(ver)}/labels`, {}, "files", `doclabels_${this._vk(ver)}`);
+    return this.request(`/webapi/docs/${encodeURIComponent(ver)}/labels`, {}, "files", `doclabels_${this._vk(ver)}`);
   }
 
   async getKernelDoc(version, path, options = {}) {
@@ -720,7 +771,7 @@ class ApiClient {
     const params = new URLSearchParams({ path });
     for (const key of ["export", "internal"]) if (options[key]) params.set(key, "true");
     for (const key of ["functions", "doc", "no_identifiers"]) if (options[key]) params.set(key, options[key]);
-    return this.request(`/api/docs/${encodeURIComponent(ver)}/kernel-doc?${params.toString()}`, {}, "files", `kdoc_${this._vk(ver)}_${params.toString()}`);
+    return this.request(`/webapi/docs/${encodeURIComponent(ver)}/kernel-doc?${params.toString()}`, {}, "files", `kdoc_${this._vk(ver)}_${params.toString()}`);
   }
 
   // --- Man pages (§5.38): the man-pages repository is named per request (`repo`), so a man tab works
@@ -733,13 +784,13 @@ class ApiClient {
       cacheKey ? "files" : null, cacheKey ? `man_${repo}_${cacheKey}` : null);
   }
 
-  /** `GET /api/man/{v}/index`: every page of a man-pages tag. */
+  /** `GET /webapi/man/{v}/index`: every page of a man-pages tag. */
   async getManIndex(repo, version) {
     const ver = this._sanitizeVer(version);
-    return this._manRequest(repo, `/api/man/${encodeURIComponent(ver)}/index`, null, `index_${ver}`);
+    return this._manRequest(repo, `/webapi/man/${encodeURIComponent(ver)}/index`, null, `index_${ver}`);
   }
 
-  /** `GET /api/man/{v}/page`: a page by `path`, or by `name` (+ `section`); `kernel`/`kernelRepo` name where the reader came from. */
+  /** `GET /webapi/man/{v}/page`: a page by `path`, or by `name` (+ `section`); `kernel`/`kernelRepo` name where the reader came from. */
   async getManPage(repo, version, { path = "", name = "", section = "", kernel = "", kernelRepo = "" } = {}) {
     const ver = this._sanitizeVer(version);
     const params = {};
@@ -750,27 +801,27 @@ class ApiClient {
     }
     if (kernel) params.kernel = kernel;
     if (kernelRepo) params.kernel_repo = kernelRepo;
-    return this._manRequest(repo, `/api/man/${encodeURIComponent(ver)}/page`, params, `page_${ver}_${new URLSearchParams(params).toString()}`);
+    return this._manRequest(repo, `/webapi/man/${encodeURIComponent(ver)}/page`, params, `page_${ver}_${new URLSearchParams(params).toString()}`);
   }
 
-  /** `GET /api/man/tags`: the man-pages release tags, newest first. */
+  /** `GET /webapi/man/tags`: the man-pages release tags, newest first. */
   async getManTags(repo) {
-    return this._manRequest(repo, "/api/man/tags", null, "tags");
+    return this._manRequest(repo, "/webapi/man/tags", null, "tags");
   }
 
-  /** `GET /api/man/diff`: man entries added, modified or deleted between two revisions. */
+  /** `GET /webapi/man/diff`: man entries added, modified or deleted between two revisions. */
   async getManDiff(repo, versionA, versionB) {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
-    return this._manRequest(repo, "/api/man/diff", { a: va, b: vb }, `diff_${this._vk(va)}_${this._vk(vb)}`);
+    return this._manRequest(repo, "/webapi/man/diff", { a: va, b: vb }, `diff_${this._vk(va)}_${this._vk(vb)}`);
   }
 
-  /** `GET /api/man/resolve` (current repository = the kernel): our copy of name(section) for `kernel`, or the man7.org URL. */
+  /** `GET /webapi/man/resolve` (current repository = the kernel): our copy of name(section) for `kernel`, or the man7.org URL. */
   async resolveMan(name, section = "", kernel = "") {
     const params = new URLSearchParams({ name });
     if (section) params.set("section", section);
     if (kernel) params.set("kernel", kernel);
-    return this.request(`/api/man/resolve?${params.toString()}`, { networkFirst: true });
+    return this.request(`/webapi/man/resolve?${params.toString()}`, { networkFirst: true });
   }
 
   /** Release-by-release history of the definition at path:line (`name`: symbol under the cursor). */
@@ -782,7 +833,7 @@ class ApiClient {
     if (includeRc) params.set("include_rc", "true");
     if (branch) params.set("branch", branch);
     // The first history of a branch walks its tags (~18 s for master when not pre-warmed)
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`, { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`, { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
   /** Release-by-release history of every definition of CONFIG_<name>, with property-level changes. */
@@ -792,7 +843,7 @@ class ApiClient {
     if (includeRc) params.set("include_rc", "true");
     if (branch) params.set("branch", branch);
     const q = params.toString() ? `?${params.toString()}` : "";
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(name)}/history${q}`,
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(name)}/history${q}`,
       { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
@@ -804,26 +855,26 @@ class ApiClient {
       params.set("line_s", lineS);
       params.set("line_e", lineE);
     }
-    return this.request(`/api/history/commits?${params.toString()}`, { timeoutMs: COMMITS_TIMEOUT_MS }, "files", `histcommits_${params.toString()}`);
+    return this.request(`/webapi/history/commits?${params.toString()}`, { timeoutMs: COMMITS_TIMEOUT_MS }, "files", `histcommits_${params.toString()}`);
   }
 
   async searchKconfig(version, query, limit = 25, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit, arch }).toString();
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/search?${q}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/search?${q}`);
   }
 
   // --- Filesystem ---
   async getDirectoryTree(version, path = "") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ path }).toString();
-    return this.request(`/api/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree3_${this._vk(ver)}_${path}`);
+    return this.request(`/webapi/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree3_${this._vk(ver)}_${path}`);
   }
 
   async getFileContent(version, path) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ path }).toString();
-    return this.request(`/api/fs/file/${encodeURIComponent(ver)}?${q}`, {}, "files", `file_${this._vk(ver)}_${path}`);
+    return this.request(`/webapi/fs/file/${encodeURIComponent(ver)}?${q}`, {}, "files", `file_${this._vk(ver)}_${path}`);
   }
 
   /** `git blame` of a file (§4.6); `opts` = {move, copy, ws} or their letters ("mcw", H9). */
@@ -832,7 +883,7 @@ class ApiClient {
     const query = blameQuery(opts);
     const letters = typeof opts === "string" ? opts : formatBlameOpts(opts);
     return this.request(
-      `/api/commits/${encodeURIComponent(ver)}/blame/${encodeURIComponent(path)}${query ? `?${query}` : ""}`,
+      `/webapi/commits/${encodeURIComponent(ver)}/blame/${encodeURIComponent(path)}${query ? `?${query}` : ""}`,
       { timeoutMs: opts && (opts.copy || String(opts).includes("c")) ? 45000 : 0 },
       "files",
       `blame2_${this._vk(ver)}_${letters}_${path}`,
@@ -849,7 +900,7 @@ class ApiClient {
     if (astId) params.set("ast_id", astId);
     if (currentFile) params.set("current_file", currentFile);
     const cacheKey = `inc_res2_${this._vk(ver)}_${arch}_${header || ''}_${astId || 0}_${currentFile || ''}`;
-    return this.request(`/api/fs/resolve_include?${params.toString()}`, {}, "files", cacheKey);
+    return this.request(`/webapi/fs/resolve_include?${params.toString()}`, {}, "files", cacheKey);
   }
 
   async resolveObject(version, objectPath, currentFile = null) {
@@ -860,7 +911,7 @@ class ApiClient {
     });
     if (currentFile) params.set("current_file", currentFile);
     const cacheKey = `obj_res_${this._vk(ver)}_${currentFile || ""}_${objectPath || ""}`;
-    return this.request(`/api/fs/resolve_object?${params.toString()}`, {}, "files", cacheKey);
+    return this.request(`/webapi/fs/resolve_object?${params.toString()}`, {}, "files", cacheKey);
   }
 
   async getIncludeSymbols(version, astId, options = {}) {
@@ -876,20 +927,20 @@ class ApiClient {
 
     const queryStr = `?${params.toString()}`;
     const cacheKey = `inc_syms2_${this._vk(ver)}_${arch}_${targetId}_${options.tagId || ""}_${options.filePath || ""}_${options.line || ""}_${options.header || ""}`;
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/include/${targetId}${queryStr}`, {}, "symbols", cacheKey);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/include/${targetId}${queryStr}`, {}, "symbols", cacheKey);
   }
 
   async getTreemap(version, maxDepth = 3, path = "") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ max_depth: maxDepth, path }).toString();
-    return this.request(`/api/version/${encodeURIComponent(ver)}/treemap?${q}`, {}, "files", `treemap_${this._vk(ver)}_${path}_${maxDepth}`);
+    return this.request(`/webapi/version/${encodeURIComponent(ver)}/treemap?${q}`, {}, "files", `treemap_${this._vk(ver)}_${path}_${maxDepth}`);
   }
 
   // --- Symbols ---
   async searchSymbols(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit }).toString();
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/search?${q}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/search?${q}`);
   }
 
   /**
@@ -921,7 +972,7 @@ class ApiClient {
     const params = new URLSearchParams({ arch });
     if (fromFile) params.set("from_file", fromFile);
     const posKey = this._positionParams(params, fromFile ? pos || {} : { kind: pos?.kind });
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
   }
 
   /** Hover card of a symbol (G04): kind, signature, definition, kernel-doc or Kconfig summary; cached like detail. */
@@ -930,7 +981,7 @@ class ApiClient {
     const params = new URLSearchParams({ arch });
     if (fromFile) params.set("from_file", fromFile);
     const posKey = fromFile ? this._positionParams(params, { line: pos?.line, col: pos?.col }) : "";
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/hover/${encodeURIComponent(symbolName)}?${params}`, signal ? { signal } : {}, "symbols", `hover1_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/hover/${encodeURIComponent(symbolName)}?${params}`, signal ? { signal } : {}, "symbols", `hover1_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
   }
 
   /** Cross-references; `opts`: `{fromFile, line, col}` (a local variable lists its in-scope uses). */
@@ -941,7 +992,7 @@ class ApiClient {
     const fromFile = opts?.fromFile || null;
     if (fromFile) params.set("from_file", fromFile);
     const posKey = fromFile ? this._positionParams(params, { line: opts.line, col: opts.col }) : "";
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/xref/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `xref2_${this._vk(ver)}_${arch}_${symbolName}_${limit || 'all'}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/xref/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `xref2_${this._vk(ver)}_${arch}_${symbolName}_${limit || 'all'}${fromFile ? `_from_${fromFile}` : ""}${posKey}`);
   }
 
   /**
@@ -953,7 +1004,7 @@ class ApiClient {
     // `col` is optional: without it the backend takes the single use of `name` on that line
     const params = new URLSearchParams({ path, line, name, arch });
     if (col) params.set("col", col);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/scope?${params}`, signal ? { signal } : {}, "symbols", `scope1_${this._vk(ver)}_${arch}_${path}_${line}:${col || 0}_${name}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/scope?${params}`, signal ? { signal } : {}, "symbols", `scope1_${this._vk(ver)}_${arch}_${path}_${line}:${col || 0}_${name}`);
   }
 
   /** Kbuild build condition of each path for an ARCH (expressions evaluated by build_condition.js). */
@@ -961,12 +1012,12 @@ class ApiClient {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     for (const p of paths) params.append("path", p);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/build?${params}`, {}, "kconfigs", `build1_${this._vk(ver)}_${arch}_${paths.join("|")}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/build?${params}`, {}, "kconfigs", `build1_${this._vk(ver)}_${arch}_${paths.join("|")}`);
   }
 
   async getAstTree(version, astId) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/ast/${astId}`, {}, "symbols", `ast_${this._vk(ver)}_${astId}`);
+    return this.request(`/webapi/symbols/${encodeURIComponent(ver)}/ast/${astId}`, {}, "symbols", `ast_${this._vk(ver)}_${astId}`);
   }
 
   // --- KConfig ---
@@ -984,54 +1035,54 @@ class ApiClient {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/tree?${params}`, {}, "kconfigs", `kmodel3_${this._vk(ver)}_${arch}${suffix}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/tree?${params}`, {}, "kconfigs", `kmodel3_${this._vk(ver)}_${arch}${suffix}`);
   }
 
   /** Default gcc/clang toolchain profiles of a revision (and whether its Kconfig has $(...) macros). */
   async getKconfigToolchainDefaults(version, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ arch }).toString();
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/toolchain?${q}`, {}, "kconfigs", `ktoolchain_${this._vk(ver)}_${arch}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/toolchain?${q}`, {}, "kconfigs", `ktoolchain_${this._vk(ver)}_${arch}`);
   }
 
   async getKconfigDefconfigs(version, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ arch }).toString();
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfigs?${q}`, {}, "kconfigs", `defconfigs_${this._vk(ver)}_${arch}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/defconfigs?${q}`, {}, "kconfigs", `defconfigs_${this._vk(ver)}_${arch}`);
   }
 
   /** Run checkpatch.pl of the configured release tag on a patch (P4; {enabled: false} when the operator has not enabled it). */
   async checkpatch(version, patch) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/tools/${encodeURIComponent(ver)}/checkpatch`, { method: "POST", body: JSON.stringify({ patch }), timeoutMs: 60000 });
+    return this.request(`/webapi/tools/${encodeURIComponent(ver)}/checkpatch`, { method: "POST", body: JSON.stringify({ patch }), timeoutMs: 60000 });
   }
 
   /** Format a multi-file patch series (P3): {patches: [{name, subject, text}], mbox, diffstat, base, check}. */
   async formatPatchSeries(version, payload) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/version/${encodeURIComponent(ver)}/patch/series`, { method: "POST", body: JSON.stringify(payload), timeoutMs: 60000 });
+    return this.request(`/webapi/version/${encodeURIComponent(ver)}/patch/series`, { method: "POST", body: JSON.stringify(payload), timeoutMs: 60000 });
   }
 
   /** Apply archive messages (series order) to a revision in memory (P1): results per patch, file and hunk. */
   async applyMailPatches(revision, messageIds) {
-    return this.request(`/api/mail/apply`, { method: "POST", body: JSON.stringify({ revision, message_ids: messageIds }), timeoutMs: 60000 });
+    return this.request(`/webapi/mail/apply`, { method: "POST", body: JSON.stringify({ revision, message_ids: messageIds }), timeoutMs: 60000 });
   }
 
   /** Changed lines of one patched file (blob-diff hunk shape); a 410 means the result was evicted: apply again. */
   async getAppliedFile(applyId, path) {
-    return this.request(`/api/mail/apply/${encodeURIComponent(applyId)}/file?${new URLSearchParams({ path })}`);
+    return this.request(`/webapi/mail/apply/${encodeURIComponent(applyId)}/file?${new URLSearchParams({ path })}`);
   }
 
   /** Configuration fragments of a revision (K2): kernel/configs/*.config and arch/$SRCARCH/configs/*.config. */
   async getKconfigFragments(version, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/fragments?${new URLSearchParams({ arch })}`, {}, "kconfigs", `fragments_${this._vk(ver)}_${arch}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/fragments?${new URLSearchParams({ arch })}`, {}, "kconfigs", `fragments_${this._vk(ver)}_${arch}`);
   }
 
   /** Objects and required symbols of module names (K1; `gates` adds every symbol gating a module-capable object). */
   async getKbuildModules(version, arch, names, { gates = false, onProgress = null, signal = null } = {}) {
     const ver = this._sanitizeVer(version);
-    return this.requestJob(`/api/kconfig/${encodeURIComponent(ver)}/kbuild/modules`, { method: "POST", body: { arch, names: names.slice(0, 2000), gates }, onProgress, signal, timeoutMs: 120000 });
+    return this.requestJob(`/webapi/kconfig/${encodeURIComponent(ver)}/kbuild/modules`, { method: "POST", body: { arch, names: names.slice(0, 2000), gates }, onProgress, signal, timeoutMs: 120000 });
   }
 
   /** Defconfig text (empty filePath: the arch's default, i.e. what `make ARCH=<arch> defconfig` loads). */
@@ -1039,14 +1090,14 @@ class ApiClient {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ file_path: filePath || "", arch });
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfig?${params}`, {}, "kconfigs", `defconfig3_${this._vk(ver)}_${arch}_${filePath || "default"}${suffix}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/defconfig?${params}`, {}, "kconfigs", `defconfig3_${this._vk(ver)}_${arch}_${filePath || "default"}${suffix}`);
   }
 
   async getKconfigSymbol(version, symbolName, arch = "x86_64", toolchain = null) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}?${params}`, {}, "kconfigs", `ksym3_${this._vk(ver)}_${arch}_${symbolName}${suffix}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}?${params}`, {}, "kconfigs", `ksym3_${this._vk(ver)}_${arch}_${symbolName}${suffix}`);
   }
 
   /** Kbuild rules, source references and Kconfig references of CONFIG_<symbolName>. */
@@ -1054,12 +1105,12 @@ class ApiClient {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}/usage?${params}`, {}, "kconfigs", `kusage2_${this._vk(ver)}_${arch}_${symbolName}${suffix}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}/usage?${params}`, {}, "kconfigs", `kusage2_${this._vk(ver)}_${arch}_${symbolName}${suffix}`);
   }
 
   async autosolveKconfig(version, payload) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/autosolve`, {
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/autosolve`, {
       method: "POST",
       body: JSON.stringify(payload)
     });
@@ -1067,7 +1118,7 @@ class ApiClient {
 
   async getKconfigPresets(version) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets2_${this._vk(ver)}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets2_${this._vk(ver)}`);
   }
 
   async getKconfigGraph(version, arch = "x86_64", symbol = null, toolchain = null) {
@@ -1075,7 +1126,7 @@ class ApiClient {
     const params = new URLSearchParams({ arch });
     if (symbol) params.set("symbol", symbol);
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph4_${this._vk(ver)}_${arch}_${symbol || 'all'}${suffix}`);
+    return this.request(`/webapi/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph4_${this._vk(ver)}_${arch}_${symbol || 'all'}${suffix}`);
   }
 
   // --- Maintainers ---
@@ -1084,12 +1135,12 @@ class ApiClient {
     const q = new URLSearchParams({ q: query }).toString();
     const cacheStore = !query ? "maintainers" : null;
     const cacheKey = !query ? `m_overview_${this._vk(ver)}` : null;
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/overview?${q}`, {}, cacheStore, cacheKey);
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/overview?${q}`, {}, cacheStore, cacheKey);
   }
 
   async getMaintainerSection(version, secId) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/section/${secId}`, {}, "maintainers", `m_sec_${this._vk(ver)}_${secId}`);
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/section/${secId}`, {}, "maintainers", `m_sec_${this._vk(ver)}_${secId}`);
   }
 
   async getPersonProfile(version, personIdOrEmail) {
@@ -1097,14 +1148,14 @@ class ApiClient {
     const idStr = String(personIdOrEmail || "").trim();
     if (idStr.includes("@") || idStr.includes("/") || idStr.includes("<")) {
       const q = new URLSearchParams({ email: idStr }).toString();
-      return this.request(`/api/maintainers/${encodeURIComponent(ver)}/person?${q}`, {}, "maintainers", `m_person_${this._vk(ver)}_${idStr}`);
+      return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/person?${q}`, {}, "maintainers", `m_person_${this._vk(ver)}_${idStr}`);
     }
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/person/${encodeURIComponent(idStr)}`, {}, "maintainers", `m_person_${this._vk(ver)}_${idStr}`);
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/person/${encodeURIComponent(idStr)}`, {}, "maintainers", `m_person_${this._vk(ver)}_${idStr}`);
   }
 
   async matchMaintainers(version, patchText, touchedFiles = []) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/match`, {
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/match`, {
       method: "POST",
       body: JSON.stringify({ patch: patchText, touched_files: touchedFiles })
     });
@@ -1115,7 +1166,7 @@ class ApiClient {
     const q = new URLSearchParams({ q: query }).toString();
     const cacheStore = !query ? "maintainers" : null;
     const cacheKey = !query ? `m_credits_${this._vk(ver)}` : null;
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/credits?${q}`, {}, cacheStore, cacheKey);
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/credits?${q}`, {}, cacheStore, cacheKey);
   }
 
   async getDevelopers(version, options = {}) {
@@ -1130,7 +1181,7 @@ class ApiClient {
     const qs = params.toString() ? `?${params.toString()}` : "";
     const cacheStore = (!query && role === "all" && sort === "activity") ? "maintainers" : null;
     const cacheKey = (!query && role === "all" && sort === "activity") ? `m_devs_${this._vk(ver)}` : null;
-    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/developers${qs}`, {}, cacheStore, cacheKey);
+    return this.request(`/webapi/maintainers/${encodeURIComponent(ver)}/developers${qs}`, {}, cacheStore, cacheKey);
   }
 
   // --- Commits ---
@@ -1166,12 +1217,12 @@ class ApiClient {
   async getFileHistory(version, filePath, limit = 50) {
     const ver = this._sanitizeVer(version);
     const cleanPath = filePath.replace(/^\/+/, "");
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/history/${encodeURIComponent(cleanPath)}?limit=${limit}`, { timeoutMs: COMMITS_TIMEOUT_MS });
+    return this.request(`/webapi/commits/${encodeURIComponent(ver)}/history/${encodeURIComponent(cleanPath)}?limit=${limit}`, { timeoutMs: COMMITS_TIMEOUT_MS });
   }
 
   async formatPatch(version, payload) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/version/${encodeURIComponent(ver)}/patch/format`, {
+    return this.request(`/webapi/version/${encodeURIComponent(ver)}/patch/format`, {
       method: "POST",
       body: JSON.stringify(payload)
     });
@@ -1180,10 +1231,10 @@ class ApiClient {
   // --- Tools ---
   async getPaholeLayout(version, structName) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/tools/${encodeURIComponent(ver)}/pahole/${encodeURIComponent(structName)}`, {}, "tools", `pahole_${this._vk(ver)}_${structName}`);
+    return this.request(`/webapi/tools/${encodeURIComponent(ver)}/pahole/${encodeURIComponent(structName)}`, {}, "tools", `pahole_${this._vk(ver)}_${structName}`);
   }
 
-  /** `GET /api/nodemap/{v}/struct/{name}`: members, nested aggregates and `#if` guard lines of a struct/union (§4.14). */
+  /** `GET /webapi/nodemap/{v}/struct/{name}`: members, nested aggregates and `#if` guard lines of a struct/union (§4.14). */
   async getNodemapStruct(version, name, { path = "", kind = "", line = null, fresh = false } = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams();
@@ -1191,10 +1242,10 @@ class ApiClient {
     if (kind) params.set("kind", kind);
     if (line) params.set("line", String(line));
     const q = params.toString();
-    return this.request(`/api/nodemap/${encodeURIComponent(ver)}/struct/${encodeURIComponent(name)}${q ? `?${q}` : ""}`, { networkFirst: fresh }, "tools", `nmstruct_${this._vk(ver)}_${name}_${q}`);
+    return this.request(`/webapi/nodemap/${encodeURIComponent(ver)}/struct/${encodeURIComponent(name)}${q ? `?${q}` : ""}`, { networkFirst: fresh }, "tools", `nmstruct_${this._vk(ver)}_${name}_${q}`);
   }
 
-  /** `GET /api/nodemap/{v}/source`: a file, a line range or a symbol's definition slice (§4.14). */
+  /** `GET /webapi/nodemap/{v}/source`: a file, a line range or a symbol's definition slice (§4.14). */
   async getNodemapSource(version, { path = "", start = null, end = null, symbol = "", kind = "", context = 0, fresh = false } = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams();
@@ -1208,16 +1259,16 @@ class ApiClient {
       if (end) params.set("end", String(end));
     }
     const q = params.toString();
-    return this.request(`/api/nodemap/${encodeURIComponent(ver)}/source?${q}`, { networkFirst: fresh }, "tools", `nmsrc_${this._vk(ver)}_${q}`);
+    return this.request(`/webapi/nodemap/${encodeURIComponent(ver)}/source?${q}`, { networkFirst: fresh }, "tools", `nmsrc_${this._vk(ver)}_${q}`);
   }
 
   async getCallgraph(version, functionName) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);
+    return this.request(`/webapi/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);
   }
 
   /**
-   * Shortest call paths between two functions (`GET /api/tools/{v}/callpath`, §4.4 / N2).
+   * Shortest call paths between two functions (`GET /webapi/tools/{v}/callpath`, §4.4 / N2).
    * Polls while the callpath index is built (`202` -> `200`).
    */
   async getCallpath(version, { from = "", to = "", maxDepth = 6, k = 5, exclude = "", indirect = false, arch = "" } = {}, { onProgress = null, signal = null } = {}) {
@@ -1230,7 +1281,7 @@ class ApiClient {
     if (exclude) params.set("exclude", String(exclude));
     if (indirect) params.set("indirect", "true");
     if (arch) params.set("arch", String(arch));
-    return this.requestJob(`/api/tools/${encodeURIComponent(ver)}/callpath?${params.toString()}`, {
+    return this.requestJob(`/webapi/tools/${encodeURIComponent(ver)}/callpath?${params.toString()}`, {
       onProgress,
       signal,
       timeoutMs: CALLGRAPH_TIMEOUT_MS,
@@ -1241,7 +1292,7 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const q = new URLSearchParams({ version_a: va, version_b: vb }).toString();
-    return this.request(`/api/tools/diff/versions?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `diff3_${this._vk(va)}_${this._vk(vb)}`);
+    return this.request(`/webapi/tools/diff/versions?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `diff3_${this._vk(va)}_${this._vk(vb)}`);
   }
 
   async getFileDiff(versionA, versionB, path, oldPath = "", similarity = 50) {
@@ -1252,7 +1303,7 @@ class ApiClient {
     // A rename below Git's default 50% only shows as one diff when git diff -M uses its score
     const sim = Math.max(1, Math.min(50, Math.round(similarity) || 50));
     if (sim !== 50) params.set("similarity", String(sim));
-    return this.request(`/api/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${this._vk(va)}_${this._vk(vb)}_${sim}_${oldPath || ""}_${path}`);
+    return this.request(`/webapi/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${this._vk(va)}_${this._vk(vb)}_${sim}_${oldPath || ""}_${path}`);
   }
 
   /** Changed lines (-U0 hunks) between any two files at any two revisions (code view "⇄ Diff"). */
@@ -1260,7 +1311,7 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const params = new URLSearchParams({ version_a: va, path_a: pathA, version_b: vb, path_b: pathB });
-    return this.request(`/api/tools/diff/blobs?${params.toString()}`, { timeoutMs: 45000 }, "tools", `bdiff_${this._vk(va)}_${this._vk(vb)}_${pathA}_${pathB}`);
+    return this.request(`/webapi/tools/diff/blobs?${params.toString()}`, { timeoutMs: 45000 }, "tools", `bdiff_${this._vk(va)}_${this._vk(vb)}_${pathA}_${pathB}`);
   }
 
   /** Paths with the same content at both revisions (the diff's unchanged count; ~29k at v3.0…v3.1). */
@@ -1268,7 +1319,7 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const q = new URLSearchParams({ version_a: va, version_b: vb }).toString();
-    return this.request(`/api/tools/diff/unchanged?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `unchanged_${this._vk(va)}_${this._vk(vb)}`);
+    return this.request(`/webapi/tools/diff/unchanged?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `unchanged_${this._vk(va)}_${this._vk(vb)}`);
   }
 
   /** Exhaustive rename search (every deleted x added pair under `path`); can take tens of seconds. */
@@ -1276,14 +1327,14 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const params = new URLSearchParams({ version_a: va, version_b: vb, path, similarity: String(similarity) });
-    return this.request(`/api/tools/diff/renames?${params.toString()}`, { timeoutMs: RENAME_SEARCH_TIMEOUT_MS }, "tools",
+    return this.request(`/webapi/tools/diff/renames?${params.toString()}`, { timeoutMs: RENAME_SEARCH_TIMEOUT_MS }, "tools",
       `renames_${this._vk(va)}_${this._vk(vb)}_${similarity}_${path}`);
   }
 
   async getKconfigDiff(versionA, versionB) {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
-    return this.request(`/api/diff/kconfig/${encodeURIComponent(va)}/${encodeURIComponent(vb)}`, {}, "tools", `kdiff2_${this._vk(va)}_${this._vk(vb)}`);
+    return this.request(`/webapi/diff/kconfig/${encodeURIComponent(va)}/${encodeURIComponent(vb)}`, {}, "tools", `kdiff2_${this._vk(va)}_${this._vk(vb)}`);
   }
 
   // --- Mailing List & LKML ---
@@ -1292,7 +1343,7 @@ class ApiClient {
     if (!force && this._mailStatusCache && (now - (this._mailStatusCacheTime || 0) < 15000)) {
       return this._mailStatusCache;
     }
-    const data = await this.request("/api/mail/status", { networkFirst: true }, "mail", "daemon_status");
+    const data = await this.request("/webapi/mail/status", { networkFirst: true }, "mail", "daemon_status");
     this._mailStatusCache = data;
     this._mailStatusCacheTime = now;
     return data;
@@ -1301,7 +1352,7 @@ class ApiClient {
   async getMailMessage(midOrNum, { networkFirst = true } = {}) {
     const target = encodeURIComponent(String(midOrNum).trim());
     return this.request(
-      `/api/mail/message?mid=${target}`,
+      `/webapi/mail/message?mid=${target}`,
       { networkFirst },
       "mail",
       `msg_${target}`
@@ -1314,7 +1365,7 @@ class ApiClient {
     if (mid) params.set("mid", mid);
     const key = `thread_${tid || 0}_${mid || ""}`;
     return this.request(
-      `/api/mail/thread?${params.toString()}`,
+      `/webapi/mail/thread?${params.toString()}`,
       { networkFirst },
       "mail",
       key
@@ -1327,7 +1378,7 @@ class ApiClient {
     if (mid) params.set("mid", mid);
     const key = `versions_${tid || 0}_${mid || ""}`;
     return this.request(
-      `/api/mail/versions?${params.toString()}`,
+      `/webapi/mail/versions?${params.toString()}`,
       { networkFirst },
       "mail",
       key
@@ -1346,7 +1397,7 @@ class ApiClient {
       filter: filterType,
     });
     return this.request(
-      `/api/mail/search?${params.toString()}`,
+      `/webapi/mail/search?${params.toString()}`,
       { networkFirst: true },
       query ? null : "mail",
       query ? null : `search__${page}_${limit}_${filterType}`

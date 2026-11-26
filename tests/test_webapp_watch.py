@@ -8,7 +8,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from webapp.backend.services.watch_service import WatchChecker, compare_texts, section_block
+from webapp.backend.services.watch_service import (
+    WatchChecker,
+    compare_texts,
+    section_block,
+)
 
 TREES = {
     "A": {"kernel/fork.c": "int a;\nint copy_process(void)\n{\n\treturn 0;\n}\n", "MAINTAINERS": "EXT4 FILE SYSTEM\nM:\tTed\nF:\tfs/ext4/\n\nOTHER\nM:\tx\n",
@@ -37,7 +41,7 @@ def git(*args):
 
 
 def normalize(code):
-    return re.sub(r"\s+", "", re.sub(r"/\*.*?\*/", "", code, flags=re.S))
+    return re.sub(r"\s+", "", re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL))
 
 
 CHECK = WatchChecker(git, read, detail, normalize)
@@ -69,6 +73,24 @@ class TestWatch(unittest.TestCase):
         self.assertEqual(compare_texts("a", None, str), "removed")
         self.assertEqual(section_block("X\nM:\ta\n\nY\nM:\tb\n", "Y"), "Y\nM:\tb")
         self.assertIsNone(section_block("X\n", "Z"))
+
+    def test_watch_router_rejects_bad_rev_and_item_cap(self) -> None:
+        from fastapi import HTTPException
+
+        from webapp.backend.routers.watch import post_watch_changes
+
+        with self.assertRaises(HTTPException) as bad_rev:
+            post_watch_changes({"from": "HEAD@{1}", "to": "v3.0", "items": []})
+        self.assertEqual(bad_rev.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as too_many:
+            post_watch_changes({"from": "v3.0", "to": "v3.1", "items": [{"key": str(i)} for i in range(201)]})
+        self.assertEqual(too_many.exception.status_code, 400)
+
+        # Non-dict items are isolated per-item instead of raising AttributeError
+        res = CHECK.check("A", "B", ["bad-item", {"key": "f", "type": "file", "path": "kernel/fork.c"}])
+        self.assertEqual(res[0]["error"], "invalid watch item")
+        self.assertTrue(res[1]["changed"])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,24 @@
+import "./helpers/dom_shim.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (...args) => {
+  const t = realSetInterval(...args);
+  t?.unref?.();
+  return t;
+};
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (...args) => {
+  const t = realSetTimeout(...args);
+  t?.unref?.();
+  return t;
+};
+
+import { FakeElement } from "./helpers/dom_shim.mjs";
 import { scrollToShow, stepIndex, visibleRange } from "../js/components/virtual_list.js";
 import { chipCounts, filterRows, findRowBySel, formatChips, parseChips, sectionParamsFromState, sectionStateFromParams, toTsv } from "../js/views/sections/section_model.js";
+const { SectionedView } = await import("../js/views/sections/sectioned_view.js");
 import { compareReleases, isFinalRelease, seriesOf } from "../js/views/sections/release_order.js";
 import { tabRoute } from "../js/tab_routes.js";
 import "../js/routes.js";
@@ -76,4 +93,79 @@ test("sel selects by exact key, else by the key's last segment", () => {
   assert.equal(findRowBySel(rows, key, ""), null);
   // An exact key wins over a segment match
   assert.equal(findRowBySel([{ key: "a:read" }, { key: "read" }], key, "read").key, "read");
+});
+
+test("chipCounts single-pass equivalence across multiple chips and empty rows", () => {
+  const sec = {
+    getChips: (_rows, ctx) => [
+      { id: "even", label: "Even", test: (r) => r.n % 2 === 0 },
+      { id: "big", label: "Big", test: (r) => r.n >= ctx.min },
+      { id: "none", label: "None", test: () => false },
+      { id: "server", label: "Server-only" },
+    ],
+  };
+  const rows = [{ n: 1 }, { n: 2 }, { n: 4 }, { n: 5 }, { n: 8 }];
+  assert.deepEqual(chipCounts(sec, rows, { min: 4 }), { even: 3, big: 3, none: 0 });
+  assert.deepEqual(chipCounts(sec, [], { min: 4 }), { even: 0, big: 0, none: 0 });
+});
+
+test("SectionedView.dispose clears _qTimer, increments seq counters, and nulls containerEl", async () => {
+  const mk = (tag = "div") => {
+    const el = new FakeElement(tag);
+    el.isConnected = true;
+    el.clientHeight = 300;
+    el.setAttribute = () => {};
+    el.removeAttribute = () => {};
+    el.classList = { _s: new Set(), add(x) { this._s.add(x); }, remove(x) { this._s.delete(x); }, toggle(x, on) { if (on) this._s.add(x); else this._s.delete(x); }, contains(x) { return this._s.has(x); } };
+    return el;
+  };
+  const listEl = mk("div");
+  const vl = { ".vl-viewport": mk("div"), ".vl-spacer": mk("div"), ".vl-rows": mk("div") };
+  listEl.querySelector = (s) => vl[s] || null;
+  const els = {
+    ".sv-container": mk("div"), ".sv-sections": mk("div"), ".sv-chips": mk("div"),
+    ".sv-download": mk("button"), ".sv-collapse": mk("button"), ".sv-rail": mk("button"),
+    ".sv-detail": mk("div"), ".sv-list": listEl, ".sv-status": mk("div"), ".sv-summary": mk("div"),
+    ".sv-arch": mk("select"), ".sv-window": mk("select"), ".sv-search": mk("input"),
+    ".sv-toggles": mk("span"), ".sv-filter-extra": mk("div"),
+  };
+  const containerEl = {
+    isConnected: true,
+    _html: "",
+    set innerHTML(v) { this._html = v; },
+    get innerHTML() { return this._html; },
+    querySelector: (s) => els[s] || null,
+    querySelectorAll: () => [],
+  };
+
+  const view = new SectionedView({
+    type: "api",
+    title: "Kernel API",
+    sections: [{
+      id: "s1", label: "S1", archScoped: false,
+      fetchList: async () => ({ rows: [{ id: "a" }] }),
+      rowKey: (r) => r.id,
+      rowHtml: (r) => r.id,
+    }],
+  });
+  await view.render(containerEl, { id: "t-sv-1", type: "api", view: "s1", version: "v3.0" });
+
+  let persisted = 0;
+  view.persist = () => { persisted++; };
+  els[".sv-search"].value = "abc";
+  els[".sv-search"].dispatchEvent({ type: "input" });
+  assert.ok(view._qTimer !== null);
+
+  const rSeq = view.renderSeq;
+  const lSeq = view.listSeq;
+  const dSeq = view.detailSeq;
+  view.dispose();
+
+  assert.equal(view._qTimer, null);
+  assert.equal(view.containerEl, null);
+  assert.ok(view.renderSeq > rSeq);
+  assert.ok(view.listSeq > lSeq);
+  assert.ok(view.detailSeq > dSeq);
+  await new Promise((r) => realSetTimeout(r, 180));
+  assert.equal(persisted, 0);
 });

@@ -19,14 +19,26 @@ import re
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import HTTPException
 
+from cache_engine import (
+    BYTES,
+    INT,
+    TEXT,
+    CacheError,
+    CacheSpace,
+    In,
+    StoreSpec,
+    get_cache_engine,
+)
+from db_engine.spec import Agg, Join
 from parser.git_ast.git_commit_parser import iter_trailers
 from parser.git_ast.git_types import CommitRole
-from parser.git_ast.release_order import (  # noqa: F401 - re-exported
+from parser.git_ast.release_order import (
     KERNEL_FAMILY,
     family_of,
     final_of,
@@ -37,10 +49,8 @@ from parser.git_ast.release_order import (  # noqa: F401 - re-exported
     release_tag_names,
     series_name,
 )
-from cache_engine import BYTES, INT, TEXT, CacheError, CacheSpace, In, StoreSpec, get_cache_engine
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_repo_id
-from db_engine.spec import Agg, Join
 from webapp.backend.database.pool import get_reader
 from webapp.backend.security.git import is_safe_rev
 from webapp.backend.services.disk_cache import DiskCache
@@ -65,8 +75,7 @@ def parse_describe(text: str) -> str | None:
     s = str(text or "").strip()
     if not s or s == "undefined":
         return None
-    if s.startswith("tags/"):
-        s = s[5:]
+    s = s.removeprefix("tags/")
     return re.split(r"[~^]", s, maxsplit=1)[0] or None
 
 
@@ -75,7 +84,7 @@ def parse_describe(text: str) -> str | None:
 
 def _git(args: list[str], timeout: float = 60.0) -> str | None:
     try:
-        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], capture_output=True, text=True,
+        out = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, text=True,
                              timeout=timeout, errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("git %s failed: %s", args[:2], exc)
@@ -190,8 +199,8 @@ def latest_branch() -> str:
         detected = detect_default_branch(get_repo_dir())
         if detected and detected not in candidates:
             candidates.append(detected)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("detect_default_branch failed: %s", exc)
     for fb in ("master", "main", "origin/master", "origin/main", "HEAD"):
         if fb not in candidates:
             candidates.append(fb)
@@ -244,7 +253,8 @@ def latest_info() -> dict[str, Any]:
     try:
         from webapp.backend.config import get_active_insights_config
         milestone_rc = int(get_active_insights_config().get("milestone_rc", 1))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("insights milestone_rc config unavailable: %s", exc)
         milestone_rc = 1
     if milestone_rc > 0:
         rc1 = next((t for t in post_rcs if parse_tag(t)["pre"] == milestone_rc), None)
@@ -509,8 +519,8 @@ def release_token() -> str:
                     {"repo_id": get_active_repo_id(cursor)},
                 ) or {}
             return f"db:{row.get('m')}:{row.get('n')}"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release_token DB check failed: %s", exc)
     return f"index:{release_index.stats().get('built_at')}"
 
 

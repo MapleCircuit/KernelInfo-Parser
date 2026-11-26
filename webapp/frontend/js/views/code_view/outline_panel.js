@@ -2,7 +2,7 @@
  * outline_panel.js - Outline panel, sticky scroll and the breadcrumb's current definition (G03,
  * webapp/API.md §5.21).
  *
- * The outline lists the open file's definitions (GET /api/fs/outline; Kconfig files are outlined from
+ * The outline lists the open file's definitions (GET /webapi/fs/outline; Kconfig files are outlined from
  * their text) in a side panel with a filter, grouped by kind; a click scrolls to the definition and
  * the one containing the top visible line is highlighted. Sticky scroll pins the first line of the
  * definitions the viewport is inside (two levels at most) over the top of the viewport.

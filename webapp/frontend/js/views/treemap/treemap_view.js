@@ -94,9 +94,15 @@ function squarify(items, x, y, w, h) {
 export class TreemapView {
   constructor() {
     this.tab = null;
+    this.containerEl = null;
     this.data = null;
     this.metric = "size";
     this._resizeObserver = null;
+    this._reloadTimer = null;
+    this._loadSeq = 0;
+    this._rafId = 0;
+    this._lastHoveredPath = null;
+    this._cachedViewRect = null;
   }
 
   async render(containerEl, tabData) {
@@ -141,11 +147,18 @@ export class TreemapView {
     };
     this.updateBuildButton();
     this.offEngine?.();
-    let reloadTimer = null;
+    clearTimeout(this._reloadTimer);
+    this._reloadTimer = null;
+    if (this._rafId) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = 0;
+    }
     const offA = state.subscribe("kconfig:assignments:updated", ({ tabId } = {}) => {
       if (!this.engineTabId || tabId !== this.engineTabId || !this.containerEl?.isConnected) return;
-      clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(() => this.load(), 500);
+      clearTimeout(this._reloadTimer);
+      this._reloadTimer = setTimeout(() => {
+        if (this.containerEl?.isConnected) this.load();
+      }, 500);
     });
     const offB = state.subscribe("kconfig:engine:changed", () => {
       if (this.engineTabId && !state.hasEngine(this.engineTabId)) this.setEngine("");
@@ -153,7 +166,13 @@ export class TreemapView {
     const offC = state.subscribe("ui:scale-changed", () => this.draw());
     this.offEngine = () => { offA?.(); offB?.(); offC?.(); };
     this._resizeObserver?.disconnect();
-    this._resizeObserver = new ResizeObserver(() => this.draw());
+    this._resizeObserver = new ResizeObserver(() => {
+      if (this._rafId) return;
+      this._rafId = requestAnimationFrame(() => {
+        this._rafId = 0;
+        if (this.containerEl?.isConnected) this.draw();
+      });
+    });
     this._resizeObserver.observe(containerEl.querySelector(".treemap-canvas"));
     await this.load();
   }
@@ -193,23 +212,33 @@ export class TreemapView {
   }
 
   async load() {
-    const canvas = this.containerEl.querySelector(".treemap-canvas");
+    const seq = ++this._loadSeq;
+    const canvas = this.containerEl?.querySelector(".treemap-canvas");
+    if (!canvas) return;
     const eng = this.engineTabId ? state.getEngine(this.engineTabId) : null;
+    let data;
     try {
       if (eng && state.kconfigConfigActive(this.engineTabId)) {
         // Unprefixed names only: the engine publishes both X and CONFIG_X
         const assignments = Object.fromEntries(Object.entries(eng.assignments || {}).filter(([k]) => !k.startsWith("CONFIG_")));
-        this.data = await this.api.requestJob(`/api/version/${encodeURIComponent(this.version)}/treemap/build`, {
+        data = await (this.api || api).requestJob(`/webapi/version/${encodeURIComponent(this.version)}/treemap/build`, {
           method: "POST", body: { arch: eng.arch, assignments, path: this.path, max_depth: 2 }, timeoutMs: 60000,
-          onProgress: (p) => { canvas.innerHTML = `<div class="treemap-loading">Indexing Kbuild objects… ${escapeHtml(progressLabel(p))}</div>`; },
+          onProgress: (p) => {
+            if (seq === this._loadSeq && this.containerEl?.isConnected) {
+              canvas.innerHTML = `<div class="treemap-loading">Indexing Kbuild objects… ${escapeHtml(progressLabel(p))}</div>`;
+            }
+          },
         });
       } else {
-        this.data = await this.api.getTreemap(this.version, 2, this.path);
+        data = await (this.api || api).getTreemap(this.version, 2, this.path);
       }
     } catch (err) {
+      if (seq !== this._loadSeq || !this.containerEl?.isConnected) return;
       canvas.innerHTML = `<div class="treemap-loading error">Failed: ${escapeHtml(err.message)}</div>`;
       return;
     }
+    if (seq !== this._loadSeq || !this.containerEl?.isConnected) return;
+    this.data = data;
     this.renderCrumbs();
     this.draw();
   }
@@ -297,24 +326,36 @@ export class TreemapView {
     };
     (this.data.children || []).forEach(index);
 
+    this._lastHoveredPath = null;
+    this._cachedViewRect = null;
     const tooltip = this.containerEl.querySelector(".treemap-tooltip");
+    const viewEl = this.containerEl.querySelector(".treemap-view");
     canvas.onmousemove = (e) => {
       const el = e.target.closest("[data-path]");
-      const node = el && lookup.get(el.dataset.path);
+      const path = el?.dataset.path;
+      const node = path ? lookup.get(path) : null;
       if (!node) {
+        this._lastHoveredPath = null;
+        this._cachedViewRect = null;
         tooltip.hidden = true;
         return;
       }
+      if (path !== this._lastHoveredPath) {
+        this._lastHoveredPath = path;
+        this._cachedViewRect = viewEl ? viewEl.getBoundingClientRect() : null;
+        const build = node.built_y !== undefined
+          ? `<br>built in ${formatBytes(node.built_y)} (${node.files_y}) · module ${formatBytes(node.built_m)} (${node.files_m})<br>not built ${formatBytes(node.not_built)} (${node.files_n}) · unknown ${formatBytes(node.unknown)} (${node.files_unknown})`
+          : "";
+        tooltip.innerHTML = `<strong>${escapeHtml(node.path)}</strong><br>${formatBytes(node.size)} · ${node.file_count.toLocaleString()} file${node.file_count === 1 ? "" : "s"}${build}<br><span>${node.type === "dir" ? "Click to zoom in" : "Click to open"} · middle-click: new tab</span>`;
+      }
       tooltip.hidden = false;
-      const build = node.built_y !== undefined
-        ? `<br>built in ${formatBytes(node.built_y)} (${node.files_y}) · module ${formatBytes(node.built_m)} (${node.files_m})<br>not built ${formatBytes(node.not_built)} (${node.files_n}) · unknown ${formatBytes(node.unknown)} (${node.files_unknown})`
-        : "";
-      tooltip.innerHTML = `<strong>${escapeHtml(node.path)}</strong><br>${formatBytes(node.size)} · ${node.file_count.toLocaleString()} file${node.file_count === 1 ? "" : "s"}${build}<br><span>${node.type === "dir" ? "Click to zoom in" : "Click to open"} · middle-click: new tab</span>`;
-      const rect = this.containerEl.querySelector(".treemap-view").getBoundingClientRect();
+      const rect = this._cachedViewRect || (viewEl ? (this._cachedViewRect = viewEl.getBoundingClientRect()) : { left: 0, top: 0, width: 800 });
       tooltip.style.left = `${Math.min(e.clientX - rect.left + 14, rect.width - 260)}px`;
       tooltip.style.top = `${e.clientY - rect.top + 14}px`;
     };
     canvas.onmouseleave = () => {
+      this._lastHoveredPath = null;
+      this._cachedViewRect = null;
       tooltip.hidden = true;
     };
     const open = (el, forceNew) => {
@@ -332,10 +373,21 @@ export class TreemapView {
   }
 
   dispose() {
+    this._loadSeq++;
+    clearTimeout(this._reloadTimer);
+    this._reloadTimer = null;
+    if (this._rafId) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = 0;
+    }
+    this._lastHoveredPath = null;
+    this._cachedViewRect = null;
     this.offEngine?.();
+    this.offEngine = null;
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
     }
+    this.containerEl = null;
   }
 }

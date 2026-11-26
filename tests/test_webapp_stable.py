@@ -183,12 +183,13 @@ class TestScopedGitAndStableDeltas(unittest.TestCase):
             self.assertEqual(st["error"], "boom")
 
         with patch.object(ss, "series_scope", return_value=scope), \
-                patch.object(ss, "_report_db", return_value=None):
-            with self.assertRaises(RuntimeError):
-                ss.build_report("v1.0", use_db=True)
+                patch.object(ss, "_report_db", return_value=None), \
+                self.assertRaises(RuntimeError):
+            ss.build_report("v1.0", use_db=True)
 
     def test_tags_ingested_without_db_covers_all(self) -> None:
         from contextlib import ExitStack
+
         from tests.test_commit_relations import Store
         from tests.test_webapp_stable import TestMissingReport as T
         T.setUpClass()
@@ -216,6 +217,7 @@ class TestScopedGitAndStableDeltas(unittest.TestCase):
 
     def test_stable_summary_delta_aggregation_boundary_fallback_and_endpoint(self) -> None:
         from fastapi.testclient import TestClient
+
         from core import DBLayout as D
         from parser.git_ast.release_order import series_ord_for, series_track_for
         from tests.db_fixtures import make_db, patch_reader
@@ -308,10 +310,10 @@ class TestScopedGitAndStableDeltas(unittest.TestCase):
 
             # HTTP endpoint
             client = TestClient(create_app())
-            resp = client.get("/api/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0&to_ref=v3.0.1")
+            resp = client.get("/webapi/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0&to_ref=v3.0.1")
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.json()["commits"], 5)
-            bad = client.get("/api/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0.2&to_ref=v3.0.1")
+            bad = client.get("/webapi/insights/v3.0/stable/summary?series=v3.0&from_ref=v3.0.2&to_ref=v3.0.1")
             self.assertEqual(bad.status_code, 400)
 
 

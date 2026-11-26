@@ -58,6 +58,7 @@ class TestKconfigFragments(unittest.TestCase):
 
     def setUp(self) -> None:
         from unittest import mock
+
         from webapp.backend.services.kconfig_service import KconfigService
         self.svc = KconfigService()
         info = {"rev": "abc", "arch": "x86_64", "srcarch": "x86"}

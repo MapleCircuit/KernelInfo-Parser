@@ -102,37 +102,37 @@
     <div id="main-body">
       <!-- Activity Bar -->
       <aside id="activity-bar">
-        <button class="activity-btn active" data-action="explorer" title="File Explorer">
+        <button type="button" class="activity-btn active" data-action="explorer" title="File Explorer" aria-label="File Explorer">
           <svg viewBox="0 0 16 16"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>
         </button>
-        <button class="activity-btn" data-action="kconfig" title="KConfig Engine & TUI">
+        <button type="button" class="activity-btn" data-action="kconfig" title="KConfig Engine & TUI" aria-label="KConfig Engine & TUI">
           <svg viewBox="0 0 16 16"><path d="M8 0a8 8 0 1 0 8 8A8 8 0 0 0 8 0zm3.5 7.5h-3v3H7v-3H4V6h3V3h1.5v3h3z"/></svg>
         </button>
-        <button class="activity-btn" data-action="nodemap" title="NodeMap Schematic Canvas">
+        <button type="button" class="activity-btn" data-action="nodemap" title="NodeMap Schematic Canvas" aria-label="NodeMap Schematic Canvas">
           <svg viewBox="0 0 16 16"><path d="M6 1v3H1V1h5zM1 0a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V1a1 1 0 0 0-1-1H1zm14 12v3h-5v-3h5zm-5-1a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-3a1 1 0 0 0-1-1h-5zM6 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/></svg>
         </button>
-        <button class="activity-btn" data-action="maintainers" title="Subsystems & Maintainers">
+        <button type="button" class="activity-btn" data-action="maintainers" title="Subsystems & Maintainers" aria-label="Subsystems & Maintainers">
           <svg viewBox="0 0 16 16"><path d="M7 14s-1 0-1-1 1-4 5-4 5 3 5 4-1 1-1 1H7zm4-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM5.5 9c-.83 0-1.5-.67-1.5-1.5S4.67 6 5.5 6s1.5.67 1.5 1.5S6.33 9 5.5 9zm0 1c1.33 0 4 .67 4 2v1H1v-1c0-1.33 2.67-2 4-2z"/></svg>
         </button>
-        <button class="activity-btn" data-action="commits" title="Git Timeline & Commits">
+        <button type="button" class="activity-btn" data-action="commits" title="Git Timeline & Commits" aria-label="Git Timeline & Commits">
           <svg viewBox="0 0 16 16"><path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z"/></svg>
         </button>
-        <button class="activity-btn" data-action="mail" title="Mailing List &amp; LKML Threads">
+        <button type="button" class="activity-btn" data-action="mail" title="Mailing List &amp; LKML Threads" aria-label="Mailing List &amp; LKML Threads">
           <svg viewBox="0 0 16 16"><path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4zm2-1a1 1 0 0 0-1 1v.217l7 4.2 7-4.2V4a1 1 0 0 0-1-1H2zm13 2.383-4.708 2.825L15 11.105V5.383zm-.034 6.876-5.64-3.471L8 9.583l-1.326-.795-5.64 3.47A1 1 0 0 0 2 13h12a1 1 0 0 0 .966-.741zM1 11.105l4.708-2.897L1 5.383v5.722z"/></svg>
         </button>
-        <button class="activity-btn" data-action="api" title="Kernel API: syscalls, exports, parameters, tracepoints, modules">
+        <button type="button" class="activity-btn" data-action="api" title="Kernel API: syscalls, exports, parameters, tracepoints, modules" aria-label="Kernel API">
           <svg viewBox="0 0 16 16"><path d="M4.72 3.22a.75.75 0 0 1 1.06 1.06L2.06 8l3.72 3.72a.75.75 0 1 1-1.06 1.06L.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25zm6.56 0a.75.75 0 1 0-1.06 1.06L13.94 8l-3.72 3.72a.75.75 0 1 0 1.06 1.06l4.25-4.25a.75.75 0 0 0 0-1.06l-4.25-4.25z"/></svg>
         </button>
-        <button class="activity-btn" data-action="insights" title="Insights: release stats, merge window, subsystem health, stable, security">
+        <button type="button" class="activity-btn" data-action="insights" title="Insights: release stats, merge window, subsystem health, stable, security" aria-label="Insights">
           <svg viewBox="0 0 16 16"><path d="M1.5 14.25V1.75a.75.75 0 0 0-1.5 0v12.5C0 15.216.784 16 1.75 16h12.5a.75.75 0 0 0 0-1.5H1.75a.25.25 0 0 1-.25-.25zM5 12V8.5h2V12H5zm3.5 0V4h2v8h-2zM12 12V6.5h2V12h-2z"/></svg>
         </button>
-        <button class="activity-btn" data-action="cve" title="CVEs: all Linux kernel CVEs &amp; affected versions">
+        <button type="button" class="activity-btn" data-action="cve" title="CVEs: all Linux kernel CVEs &amp; affected versions" aria-label="CVEs">
           <svg viewBox="0 0 16 16"><path d="M8 0c-.69 0-1.843.265-2.928.56-1.11.3-2.229.655-2.887.87a1.54 1.54 0 0 0-1.044 1.262c-.596 4.477.787 7.795 2.465 9.99a11.777 11.777 0 0 0 2.517 2.453c.386.273.744.482 1.048.625.28.132.581.24.829.24s.548-.108.829-.24a7.159 7.159 0 0 0 1.048-.625 11.775 11.775 0 0 0 2.517-2.453c1.678-2.195 3.061-5.513 2.465-9.99a1.541 1.541 0 0 0-1.044-1.263 62.467 62.467 0 0 0-2.887-.87C9.843.266 8.69 0 8 0zm0 1.5c.546 0 1.62.238 2.66.52.976.265 1.933.568 2.51.757.03.01.055.028.07.053.49 3.922-.648 6.87-2.167 8.856a10.295 10.295 0 0 1-2.203 2.15 5.8 5.8 0 0 1-.87.515 5.8 5.8 0 0 1-.87-.514 10.295 10.295 0 0 1-2.203-2.15C3.408 9.7 2.27 6.752 2.76 2.83a.14.14 0 0 1 .07-.053c.577-.19 1.534-.492 2.51-.756C6.38 1.738 7.454 1.5 8 1.5z"/></svg>
         </button>
-        <button class="activity-btn" data-action="man" title="Man pages: the Linux man-pages index" hidden>
+        <button type="button" class="activity-btn" data-action="man" title="Man pages: the Linux man-pages index" aria-label="Man pages" hidden>
           <svg viewBox="0 0 16 16"><path d="M1 2.75C1 1.78 1.78 1 2.75 1h4.5c.3 0 .58.08.75.2.17-.12.45-.2.75-.2h4.5c.97 0 1.75.78 1.75 1.75v9.5c0 .97-.78 1.75-1.75 1.75H9.06a1.5 1.5 0 0 0-1.06.44 1.5 1.5 0 0 0-1.06-.44H2.75C1.78 14 1 13.22 1 12.25v-9.5zm6.25 10.62V2.75a.25.25 0 0 0-.25-.25H2.75a.25.25 0 0 0-.25.25v9.5c0 .14.11.25.25.25h4.19c.11 0 .21.01.31.03v-.16zm1.5.16c.1-.02.2-.03.31-.03h4.19a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25H9a.25.25 0 0 0-.25.25v10.78zM3.5 4.5h2.5V6H3.5V4.5zm0 2.5h2.5v1.5H3.5V7zm6.5-2.5h2.5V6H10V4.5z"/></svg>
         </button>
-        <button class="activity-btn" data-action="compare" title="Compare Versions & Commits">
+        <button type="button" class="activity-btn" data-action="compare" title="Compare Versions & Commits" aria-label="Compare Versions & Commits">
           <svg viewBox="0 0 16 16"><path d="M8.75 1.75V5H6.5L9.5 8 6.5 11h2.25v3.25a.75.75 0 0 1-1.5 0V12.5H2.75A1.75 1.75 0 0 1 1 10.75v-5.5C1 4.28 1.78 3.5 2.75 3.5h4.5V1.75a.75.75 0 0 1 1.5 0zM2.75 5a.25.25 0 0 0-.25.25v5.5c0 .14.11.25.25.25h4.5V5h-4.5zm7.75-1.5h2.75c.97 0 1.75.78 1.75 1.75v5.5c0 .97-.78 1.75-1.75 1.75H10.5V11h2.75a.25.25 0 0 0 .25-.25v-5.5a.25.25 0 0 0-.25-.25H10.5V3.5z"/></svg>
         </button>
       </aside>
@@ -141,7 +141,7 @@
       <nav id="sidebar">
         <div class="sidebar-header">
           <span>Repository Explorer</span>
-          <button class="collapse-btn" id="sidebar-collapse" title="Collapse sidebar" aria-label="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
+          <button type="button" class="collapse-btn" id="sidebar-collapse" title="Collapse sidebar" aria-label="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.47 3.72a.75.75 0 0 1 0 1.06L7.31 8l3.16 3.22a.75.75 0 1 1-1.07 1.06l-3.69-3.75a.75.75 0 0 1 0-1.06l3.69-3.75a.75.75 0 0 1 1.07 0z"/><path d="M13.25 2.5a.75.75 0 0 1 .75.75v9.5a.75.75 0 0 1-1.5 0v-9.5a.75.75 0 0 1 .75-.75z"/></svg>
           </button>
         </div>

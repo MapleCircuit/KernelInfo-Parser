@@ -74,6 +74,9 @@ class LocalDatabase {
           db.close();
           if (this.db === db) this.db = null;
         };
+        db.onclose = () => {
+          if (this.db === db) this.db = null;
+        };
         if (settled) {
           // Opened after the blocked fallback below: from now on the cache is usable
           this.db = db;

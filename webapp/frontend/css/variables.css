@@ -13,7 +13,7 @@
 
   --text-primary: #c9d1d9;
   --text-secondary: #8b949e;
-  --text-muted: #6e7681;
+  --text-muted: #848d97;
   --text-inverse: #0d1117;
 
   --accent-blue: #58a6ff;
@@ -29,7 +29,7 @@
   --accent-blue-strong: #4a94e8;
   --accent-green-strong: #34a853;
   --text-bright: #e6edf3;
-  --text-on-accent: #ffffff;
+  --text-on-accent: #0d1117;
   --bg-canvas: #0a0d12;
   /* Figures keep a light backing in every theme */
   --figure-bg: #f6f8fa;
@@ -127,7 +127,7 @@
   --border-focus: #0969da;
   --text-primary: #1f2328;
   --text-secondary: #59636e;
-  --text-muted: #6e7781;
+  --text-muted: #59636e;
   --text-inverse: #ffffff;
   --text-bright: #1f2328;
   --text-on-accent: #ffffff;
@@ -304,7 +304,7 @@
     --border-focus: #0969da;
     --text-primary: #1f2328;
     --text-secondary: #59636e;
-    --text-muted: #6e7781;
+    --text-muted: #59636e;
     --text-inverse: #ffffff;
     --text-bright: #1f2328;
     --text-on-accent: #ffffff;
@@ -394,9 +394,7 @@ body {
 [style*="font-size: 28px"], [style*="font-size:28px"] { font-size: var(--fs-28, 28px) !important; }
 
 /* Keep code viewer tokens respected */
-.code-viewer-container .code-row,
-.virtual-editor-viewport .code-row,
-.cdiff-body .cdiff-line {
+.code-viewer-container .code-row {
   font-size: var(--code-font-size, 12px) !important;
 }
 

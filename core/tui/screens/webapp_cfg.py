@@ -5,7 +5,12 @@ from __future__ import annotations
 import curses
 from typing import Any
 
-from cache_engine import DEFAULT_ENGINE, UnknownCacheEngine, available_cache_engines, get_cache_engine
+from cache_engine import (
+    DEFAULT_ENGINE,
+    UnknownCacheEngine,
+    available_cache_engines,
+    get_cache_engine,
+)
 from core.config import _coerce_bool
 from core.tui.screens.base import BaseScreen
 from core.tui.screens.parser_dist import wrap_help
@@ -110,6 +115,110 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
 
 _FORM_MIN_W = 52
 _HELP_MIN_W = 30
+
+
+def _select_primary_repo(repos: list[Any]) -> dict[str, Any] | None:
+    """Return the primary repository dict entry (`default: True`, else first enabled, else first dict)."""
+    dicts = [r for r in repos if isinstance(r, dict)]
+    if not dicts:
+        return None
+    for entry in dicts:
+        if _coerce_bool(entry.get("default"), False):
+            return entry
+    for entry in dicts:
+        if _coerce_bool(entry.get("enabled"), True):
+            return entry
+    return dicts[0]
+
+
+def sync_webapp_repositories(app_config: dict[str, Any] | None, webapp_cfg: dict[str, Any]) -> None:
+    """Synchronize scalar webapp settings with `webapp.repositories` and canonical top-level sections.
+
+    Ensures `default_version` and `pool_size` carry valid defaults, and keeps any legacy scalar
+    fields (`webapp.repo_dir`, `webapp.lore_archive_db`, `webapp.cve_dir`, `webapp.default_version`)
+    synchronized with the primary entry in `webapp.repositories` and top-level `repositories`,
+    `cve.repo_dir`, and `mailing_list.storage_dir` so TUI saves never leave conflicting entries.
+    """
+    default_ver = str(webapp_cfg.get("default_version") or "v3.0").strip() or "v3.0"
+    webapp_cfg["default_version"] = default_ver
+    try:
+        pool_size = max(1, int(webapp_cfg.get("pool_size") or 10))
+    except (TypeError, ValueError):
+        pool_size = 10
+    webapp_cfg["pool_size"] = pool_size
+
+    wa_repos = webapp_cfg.get("repositories")
+    wa_primary = _select_primary_repo(wa_repos) if isinstance(wa_repos, list) else None
+    top_repos = app_config.get("repositories") if isinstance(app_config, dict) else None
+    top_primary = _select_primary_repo(top_repos) if isinstance(top_repos, list) else None
+
+    repo_dir_raw = webapp_cfg.get("repo_dir")
+    repo_dir = str(repo_dir_raw).strip() if isinstance(repo_dir_raw, str) else ""
+    if repo_dir:
+        if wa_primary is not None:
+            wa_primary["path"] = repo_dir
+            if "repo_dir" in wa_primary:
+                wa_primary["repo_dir"] = repo_dir
+        if top_primary is not None:
+            top_primary["path"] = repo_dir
+    elif wa_primary is not None:
+        if top_primary is not None and isinstance(top_primary.get("path"), str) and top_primary["path"].strip():
+            wa_primary["path"] = top_primary["path"].strip()
+            if "repo_dir" in wa_primary:
+                wa_primary["repo_dir"] = top_primary["path"].strip()
+        if "repo_dir" in webapp_cfg and isinstance(wa_primary.get("path"), str) and wa_primary["path"].strip():
+            webapp_cfg["repo_dir"] = wa_primary["path"].strip()
+
+    lore_raw = webapp_cfg.get("lore_archive_db")
+    lore_db = str(lore_raw).strip() if isinstance(lore_raw, str) else ""
+    if lore_db:
+        if wa_primary is not None:
+            wa_primary["lore_archive_db"] = lore_db
+        if isinstance(app_config, dict):
+            ml_sec = app_config.setdefault("mailing_list", {})
+            if isinstance(ml_sec, dict):
+                ml_sec["storage_dir"] = lore_db
+    elif wa_primary is not None:
+        ml_dir = (
+            str(app_config["mailing_list"].get("storage_dir") or "").strip()
+            if isinstance(app_config, dict) and isinstance(app_config.get("mailing_list"), dict)
+            else ""
+        )
+        if ml_dir and "lore_archive_db" in wa_primary:
+            wa_primary["lore_archive_db"] = ml_dir
+        elif (
+            "lore_archive_db" in webapp_cfg
+            and isinstance(wa_primary.get("lore_archive_db"), str)
+            and wa_primary["lore_archive_db"].strip()
+        ):
+            webapp_cfg["lore_archive_db"] = wa_primary["lore_archive_db"].strip()
+
+    cve_raw = webapp_cfg.get("cve_dir")
+    cve_dir = str(cve_raw).strip() if isinstance(cve_raw, str) else ""
+    if cve_dir:
+        if wa_primary is not None:
+            wa_primary["cve_dir"] = cve_dir
+        if isinstance(app_config, dict):
+            cve_sec = app_config.setdefault("cve", {})
+            if isinstance(cve_sec, dict):
+                cve_sec["repo_dir"] = cve_dir
+    elif wa_primary is not None:
+        top_cve = (
+            str(app_config["cve"].get("repo_dir") or "").strip()
+            if isinstance(app_config, dict) and isinstance(app_config.get("cve"), dict)
+            else ""
+        )
+        if top_cve and "cve_dir" in wa_primary:
+            wa_primary["cve_dir"] = top_cve
+        elif (
+            "cve_dir" in webapp_cfg
+            and isinstance(wa_primary.get("cve_dir"), str)
+            and wa_primary["cve_dir"].strip()
+        ):
+            webapp_cfg["cve_dir"] = wa_primary["cve_dir"].strip()
+
+    if wa_primary is not None:
+        wa_primary["default_version"] = default_ver
 
 
 class WebappSettingsScreen(BaseScreen):
@@ -364,9 +473,8 @@ class WebappSettingsScreen(BaseScreen):
             return True
 
         focused = self.get_focused_widget()
-        if focused is not None and hasattr(focused, "handle_key"):
-            if focused.handle_key(ch):
-                return True
+        if focused is not None and hasattr(focused, "handle_key") and focused.handle_key(ch):
+            return True
 
         if ch == ord("?"):
             self.show_help_dialog()
@@ -448,6 +556,9 @@ class WebappSettingsScreen(BaseScreen):
 
         cache_cfg["engine"] = self.sel_cache_engine.get_selected()
         cache_cfg["dir"] = self.inp_cache_dir.get_value().strip()
+
+        app_cfg = self.app.config if (self.app is not None and hasattr(self.app, "config") and isinstance(self.app.config, dict)) else None
+        sync_webapp_repositories(app_cfg, webapp_cfg)
 
         self.webapp_cfg = webapp_cfg
         self.cache_cfg = cache_cfg

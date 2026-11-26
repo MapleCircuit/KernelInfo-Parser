@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -38,7 +38,7 @@ def request(**extra):
 
 
 def fmt(req):
-    return ps.PatchSeriesFormatter(read, now=datetime(2026, 11, 5, tzinfo=timezone.utc)).format("f" * 40, req)
+    return ps.PatchSeriesFormatter(read, now=datetime(2026, 11, 5, tzinfo=UTC)).format("f" * 40, req)
 
 
 class TestPatchSeries(unittest.TestCase):
@@ -103,9 +103,9 @@ class TestPatchSeries(unittest.TestCase):
             mbox = os.path.join(tmp, "series.mbox")
             with open(mbox, "w") as fh:
                 fh.write("".join(p["text"] for p in res["patches"][1:]))
-            am = subprocess.run([git, "am", "-q", mbox], cwd=tmp, env=env, capture_output=True, text=True)
+            am = subprocess.run([git, "am", "-q", mbox], check=False, cwd=tmp, env=env, capture_output=True, text=True)
             self.assertEqual(am.returncode, 0, am.stderr)
-            log = subprocess.run([git, "log", "--format=%an|%s", "-2"], cwd=tmp, capture_output=True, text=True).stdout.split("\n")
+            log = subprocess.run([git, "log", "--format=%an|%s", "-2"], check=False, cwd=tmp, capture_output=True, text=True).stdout.split("\n")
             self.assertEqual(log[:2], ["Ada Dev|lib: bump C", "Ada Dev|lib: init a5"])
             with open(os.path.join(tmp, "lib/new.c")) as fh:
                 self.assertEqual(fh.read(), "new\n")

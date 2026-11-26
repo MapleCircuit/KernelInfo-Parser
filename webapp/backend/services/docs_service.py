@@ -20,8 +20,6 @@ from typing import Any
 from fastapi import HTTPException
 
 from parser import doc_labels
-from parser.doc_labels import ADORNMENT_RE, LABEL_RE  # noqa: F401 - moved to parser/doc_labels.py, re-exported
-
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.helpers import get_version_info
 from webapp.backend.database.pool import get_reader
@@ -52,6 +50,10 @@ class DocsService:
         self._label_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
         self._max_cache_size = max_cache_size
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._label_cache.clear()
 
     # ------------------------------------------------------------------
     # Label index
@@ -96,7 +98,8 @@ class DocsService:
                         stored[b] = doc_labels.extract(text)
                     else:
                         stored[b] = []
-                except Exception:
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("git cat-file -p %s failed: %s", b, exc)
                     stored[b] = []
             labels = {}
             for path, blob in files:
@@ -108,11 +111,6 @@ class DocsService:
             if len(self._label_cache) > self._max_cache_size:
                 self._label_cache.popitem(last=False)
         return result
-
-    @staticmethod
-    def _title_after(lines: list[str]) -> str:
-        """Section title following a label (skips blank lines, further labels, and overlines)."""
-        return doc_labels.title_after(lines)
 
     @staticmethod
     def _labels_from_facts(sha: str) -> dict[str, dict[str, Any]] | None:
