@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 
 from api.config import get_db_config, get_logging_config, refresh_default_repo_dir
+from api.mcp import router as mcp_router
 from api.routers import v1_router
 from api.security import ApiAuthMiddleware, ApiRequestLoggingMiddleware
 from core.logging_setup import setup_api_logging
@@ -27,18 +28,16 @@ def _db_engine():
     return get_db_engine(get_db_config().get("engine"))
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """FastAPI application lifespan manager for DB pool warm-up and graceful shutdown."""
-    if get_logging_config("api").get("enabled") and not any(
-        getattr(h, "_kip_log_target", None) == "api" for h in logging.getLogger().handlers
-    ):
-        setup_api_logging()
+def startup_resources() -> None:
+    """Best-effort DB pool warm-up shared by the HTTP lifespan and `api/mcp_stdio.py`."""
     try:
         _db_engine().warm_up()
     except Exception as exc:  # noqa: BLE001 - best-effort startup pre-warm
         logger.debug("Database pool startup pre-warm deferred: %s", exc)
-    yield
+
+
+def shutdown_resources() -> None:
+    """Cancel jobs, shut the DB engine down, and stop the database SSH tunnel (HTTP lifespan and stdio)."""
     try:
         from webapp.backend.services.jobs import jobs
 
@@ -55,6 +54,18 @@ async def lifespan(app: FastAPI):
         stop_ssh_tunnel("database")
     except Exception as exc:  # noqa: BLE001 - shutdown best-effort cleanup
         logger.debug("Shutdown SSH tunnel skipped: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI application lifespan manager for DB pool warm-up and graceful shutdown."""
+    if get_logging_config("api").get("enabled") and not any(
+        getattr(h, "_kip_log_target", None) == "api" for h in logging.getLogger().handlers
+    ):
+        setup_api_logging()
+    startup_resources()
+    yield
+    shutdown_resources()
 
 
 def create_app() -> FastAPI:
@@ -83,4 +94,6 @@ def create_app() -> FastAPI:
     app.add_middleware(SecurityHeadersMiddleware)
 
     app.include_router(v1_router)
+    # MCP Streamable HTTP (`POST /api/mcp`) sits behind the same middleware stack as /api/v1/*.
+    app.include_router(mcp_router)
     return app

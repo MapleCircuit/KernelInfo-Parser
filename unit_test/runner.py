@@ -120,6 +120,7 @@ DEFAULT_MODULES = [
     "tests.test_webapp_frontend_js",
     "tests.test_ai_api_security",
     "tests.test_ai_api",
+    "tests.test_ai_mcp",
     "tests.test_tui",
     "tests.test_tui_app",
     "tests.test_tui_testing",

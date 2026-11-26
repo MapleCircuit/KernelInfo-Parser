@@ -1,6 +1,8 @@
 """api/config.py - Configuration, key normalization, and repository context bridge for the AI API."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 from core.config import (
@@ -122,6 +124,19 @@ def get_api_server_config() -> dict[str, Any]:
     }
 
 
+def apply_config_file(path: str | os.PathLike[str]) -> Path:
+    """Activate a `-c` configuration file: export `CONFIG_FILE` / `KERNELINFO_CONFIG` and `init_config()` it."""
+    from core.config import init_config
+
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Specified configuration file not found: {resolved}")
+    os.environ["CONFIG_FILE"] = str(resolved)
+    os.environ["KERNELINFO_CONFIG"] = str(resolved)
+    init_config(resolved)
+    return resolved
+
+
 def resolve_version(version: str | None = None) -> str:
     """Resolve and validate a caller-supplied version or fall back to the configured default."""
     candidate = (version or "").strip() or get_api_server_config()["default_version"]
@@ -145,6 +160,7 @@ def paginate_items(
 __all__ = [
     "DEFAULT_API_HOST",
     "DEFAULT_API_PORT",
+    "apply_config_file",
     "get_active_features",
     "get_active_repo_name",
     "get_active_repository",

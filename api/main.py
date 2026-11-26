@@ -7,7 +7,6 @@ Starts the FastAPI server:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -31,15 +30,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def apply_config_path(args: argparse.Namespace) -> None:
     """Propagate `-c` configuration path into environment variables and active core.config."""
     if args.config:
-        from core.config import init_config
+        from api.config import apply_config_file
 
-        resolved = Path(args.config).expanduser().resolve()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"Specified configuration file not found: {resolved}")
-        resolved_str = str(resolved)
-        os.environ["CONFIG_FILE"] = resolved_str
-        os.environ["KERNELINFO_CONFIG"] = resolved_str
-        init_config(resolved)
+        apply_config_file(args.config)
 
 
 if __name__ == "__main__":

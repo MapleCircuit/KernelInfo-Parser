@@ -96,6 +96,7 @@ _ENDPOINT_CATALOG = [
     {"method": "GET", "path": "/api/v1/man", "feature": "man", "summary": "Linux man-pages lookup, index, or page content"},
     {"method": "GET", "path": "/api/v1/cve", "feature": "cve", "summary": "CVE catalog or per-file CVE lookup"},
     {"method": "GET", "path": "/api/v1/cve/{cve_id}", "feature": "cve", "summary": "Single CVE record with commit ranges and optional release state"},
+    {"method": "POST", "path": "/api/mcp", "feature": None, "summary": "MCP Streamable HTTP endpoint (JSON-RPC 2.0); one read-only tool per GET /api/v1/* endpoint"},
 ]
 
 
@@ -125,6 +126,8 @@ def _validate_identifier(name: str, label: str = "identifier") -> str:
 @router.get("/capabilities")
 def get_capabilities() -> dict[str, Any]:
     """Compact machine-readable summary of available endpoints, repos, features, and limits."""
+    from api.mcp import MCP_PATH, SUPPORTED_PROTOCOL_VERSIONS, TOOLS  # lazy: api.mcp imports this module
+
     cfg = get_api_server_config()
     active_repo = get_active_repo_name()
     repos = [
@@ -143,6 +146,14 @@ def get_capabilities() -> dict[str, Any]:
         "service": "KernelInfo-Parser AI API",
         "version": "1.0.0",
         "openapi_url": "/api/openapi.json",
+        "mcp": {
+            "endpoint": MCP_PATH,
+            "transport": "streamable-http",
+            "stateless": True,
+            "protocol_versions": list(SUPPORTED_PROTOCOL_VERSIONS),
+            "stdio": "python3 api/mcp_stdio.py [-c config.json] [--repo NAME]",
+            "tools": len(TOOLS),
+        },
         "active_repo": active_repo,
         "default_version": cfg["default_version"],
         "repo_selection": {"header": "X-KI-Repo", "query": "repo"},
