@@ -349,6 +349,12 @@ class TerminalState:
     the following SIGCONT (Ctrl+Z then `fg`, also delivered to every forked parser worker), switches
     the terminal back to curses program mode: `ONLCR` off, so every later newline moves down without
     returning to column 0. `restore()` reinstalls the saved dispositions and tty attributes.
+
+    The saved attributes are those the TUI started on, which are not always sane: a curses program
+    killed while it owned the terminal (e.g. a debugger Stop during an earlier `--configure`) leaves
+    `ONLCR` off, and `endwin()` returns to that same state. `restore()` therefore always re-enables
+    output post-processing (`OPOST | ONLCR`), so the pipeline, `launch_servers()` and the server
+    processes sharing the terminal print with CR-LF newlines.
     """
 
     def __init__(self) -> None:
@@ -390,9 +396,13 @@ class TerminalState:
         if self.fd is not None and self.attrs is not None:
             try:
                 import termios
-
-                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.attrs)
-            except (ImportError, OSError, ValueError):
+            except ImportError:
+                return
+            attrs = list(self.attrs)
+            attrs[1] |= getattr(termios, "OPOST", 0) | getattr(termios, "ONLCR", 0)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs)
+            except (OSError, ValueError, termios.error):
                 pass
 
 

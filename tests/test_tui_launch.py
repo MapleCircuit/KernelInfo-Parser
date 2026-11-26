@@ -1,8 +1,13 @@
 """Unit tests for TUI pipeline launch actions: Run Saved, Table Reset, and the launch hand-off."""
 
 import json
+import os
+import select
 import signal
+import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -367,6 +372,97 @@ class TestServerLaunch(LaunchTestBase):
             mem_guard.assert_not_called()
             parser_logs.assert_not_called()
             sync_repos.assert_not_called()
+
+
+# Child program for the PTY test: the terminal starts with `ONLCR` off (curses program mode left
+# behind by a TUI killed while it owned the terminal), a real curses session requests a "W" launch
+# of both servers, then `pipeline.cli.launch_servers()` runs with a Popen stand-in that reports the
+# tty output modes at spawn time.
+_SERVER_LAUNCH_CHILD = textwrap.dedent(
+    """
+    import os, sys, termios
+    sys.path.insert(0, ROOT)
+    attrs = termios.tcgetattr(0)
+    attrs[1] &= ~termios.ONLCR
+    termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+    from core.tui.app import TUIApp, run_config_tui_launch
+    from core.tui.screens.launch import RUN_SAVED, launch_servers as request_servers
+    import pipeline.cli
+
+    def run_loop(self, stdscr):
+        request_servers(stdscr, self, RUN_SAVED, ("webapp", "api"))
+        return self.should_run_pipeline
+
+    TUIApp._run_loop = run_loop
+    launch = run_config_tui_launch(CONFIG)
+
+    class Server:
+        pid = 4242
+        returncode = 0
+        def poll(self):
+            return 0
+
+    def popen(cmd, cwd=None, start_new_session=False):
+        oflag = termios.tcgetattr(0)[1]
+        print("SPAWN", bool(oflag & termios.OPOST), bool(oflag & termios.ONLCR), flush=True)
+        return Server()
+
+    code = pipeline.cli.launch_servers(
+        launch["servers"], launch["config_path"], popen=popen, killpg=lambda *a: None, poll_interval=0
+    )
+    print("DONE", code, flush=True)
+    """
+)
+
+
+def _read_pty_until(fd: int, marker: bytes, timeout: float = 20.0) -> bytes:
+    buf = b""
+    end = time.time() + timeout
+    while marker not in buf and time.time() < end:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+    return buf
+
+
+@unittest.skipUnless(os.name == "posix", "pty-based test requires POSIX")
+class TestServerLaunchTerminalModes(LaunchTestBase):
+    """A TUI server launch prints CR-LF newlines even when the TUI started on a tty with `ONLCR` off."""
+
+    def test_launch_servers_output_after_tui_uses_crlf(self):
+        import pty
+
+        root = str(Path(__file__).resolve().parent.parent)
+        program = _SERVER_LAUNCH_CHILD.replace("ROOT", repr(root)).replace("CONFIG", repr(str(self.config_path)))
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - child process
+            try:
+                os.environ["TERM"] = "xterm"
+                os.environ["CONFIG_FILE"] = str(self.config_path)
+                os.environ["KERNELINFO_CONFIG"] = str(self.config_path)
+                os.execv(sys.executable, [sys.executable, "-c", program])
+            finally:
+                os._exit(127)
+        try:
+            out = _read_pty_until(fd, b"DONE")
+            out += _read_pty_until(fd, b"\n", timeout=2)
+        finally:
+            os.waitpid(pid, 0)
+            os.close(fd)
+        # Output modes are back before the first server is spawned ...
+        self.assertEqual(out.count(b"SPAWN True True"), 2, out)
+        self.assertIn(b"DONE 0", out)
+        # ... and every line launch_servers() prints ends with CR-LF (no bare LF staircase)
+        tail = out[out.index(b"Started webapp server"):]
+        self.assertIn(b"Started api server", tail)
+        self.assertNotRegex(tail, rb"[^\r]\n")
 
 
 if __name__ == "__main__":
