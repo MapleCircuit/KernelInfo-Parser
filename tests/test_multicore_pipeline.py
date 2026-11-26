@@ -1461,5 +1461,87 @@ class TestParentPoolAndWorkerLogging(unittest.TestCase):
             G.DB, G.TE, G.node_id, G.heartbeat_daemon, G.singleton_lock = saved
 
 
+
+class _FailingCommitTE:
+    """A TableEngine stand-in whose `commit_all()` / `wait_for_commit()` raise the scripted errors in turn."""
+
+    def __init__(self, commit_errors=(), wait_error=None) -> None:
+        self.commit_errors = list(commit_errors)
+        self.wait_error = wait_error
+        self.commits = 0
+        self.async_commits = True
+        self.pending_commit_rows = 0
+        self.staged_rows = 1_000_000
+        self.db = mock.Mock()
+
+    def commit_all(self) -> None:
+        self.commits += 1
+        err = self.commit_errors.pop(0) if self.commit_errors else None
+        if err is not None:
+            raise err
+
+    def wait_for_commit(self) -> None:
+        if self.wait_error is not None:
+            raise self.wait_error
+
+
+class TestCommitRetryClassification(unittest.TestCase):
+    """A duplicate key fails the stage at once; only transient errors get the one reconnect-and-retry."""
+
+    def setUp(self) -> None:
+        saved = G.TE
+        self.addCleanup(setattr, G, "TE", saved)
+
+    def _dup(self):
+        from db_engine import DuplicateKeyError
+        return DuplicateKeyError("Duplicate entry '238638393-65535' for key 'PRIMARY'")
+
+    def test_duplicate_key_is_not_retried(self) -> None:
+        G.TE = te = _FailingCommitTE([self._dup()])
+        from db_engine import DuplicateKeyError
+        with self.assertLogs(pipeline.state.logger, level="ERROR") as logs, self.assertRaises(DuplicateKeyError):
+            pipeline.worker_stage._commit_all_with_retry("Chunk")
+        self.assertEqual(te.commits, 1)
+        te.db.check_if_connected.assert_not_called()
+        self.assertFalse(any("transient" in line for line in logs.output))
+
+    def test_transient_error_is_retried_once(self) -> None:
+        from db_engine import ConnectionLostError
+        G.TE = te = _FailingCommitTE([ConnectionLostError("gone"), None])
+        pipeline.worker_stage._commit_all_with_retry("Chunk")
+        self.assertEqual(te.commits, 2)
+        te.db.check_if_connected.assert_called_once()
+
+    def test_duplicate_key_on_the_retry_is_raised(self) -> None:
+        from db_engine import ConnectionLostError, DuplicateKeyError
+        G.TE = te = _FailingCommitTE([ConnectionLostError("gone"), self._dup()])
+        with self.assertRaises(DuplicateKeyError):
+            pipeline.worker_stage._commit_all_with_retry("Chunk")
+        self.assertEqual(te.commits, 2)
+
+    def test_failed_background_commit_with_duplicate_is_not_recommitted(self) -> None:
+        from db_engine import DuplicateKeyError
+        G.TE = te = _FailingCommitTE(wait_error=self._dup())
+        with self.assertRaises(DuplicateKeyError):
+            pipeline.worker_stage._end_background_commits("Stage 2")
+        self.assertEqual(te.commits, 0)
+        self.assertFalse(te.async_commits)
+
+    def test_failed_background_commit_with_transient_error_is_recommitted(self) -> None:
+        from db_engine import ConnectionLostError
+        G.TE = te = _FailingCommitTE(wait_error=ConnectionLostError("gone"))
+        pipeline.worker_stage._end_background_commits("Stage 2")
+        self.assertEqual(te.commits, 1)
+
+    def test_idle_commit_raises_a_duplicate_key(self) -> None:
+        from db_engine import ConnectionLostError, DuplicateKeyError
+        G.TE = te = _FailingCommitTE([self._dup()])
+        with self.assertRaises(DuplicateKeyError):
+            pipeline.worker_stage._maybe_idle_commit()
+        G.TE = te = _FailingCommitTE([ConnectionLostError("gone")])
+        pipeline.worker_stage._maybe_idle_commit()                      # left in staging for the next commit
+        self.assertEqual(te.commits, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

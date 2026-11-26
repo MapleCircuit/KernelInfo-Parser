@@ -313,7 +313,8 @@ m_ast_container = Table(
     table_name="m_ast_container",
     columns=(
         ("ast_id", INT()),
-        ("priority", SMALLINT(unsigned=True)),
+        # A parent's child ordinal (0..N-1): MEDIUMINT UNSIGNED (16.7M), since one parent can exceed 65,535 children
+        ("priority", MEDIUMINT(unsigned=True)),
         ("type_id", SMALLINT(unsigned=True)),
         ("ref_ast_id", INT()),
     ),
@@ -1024,7 +1025,7 @@ m_ast_attribute = Table(
     table_name="m_ast_attribute",
     columns=(
         ("ast_id", INT()),
-        ("priority", SMALLINT(unsigned=True)),
+        ("priority", MEDIUMINT(unsigned=True)),  # attribute ordinal, as wide as m_ast_container.priority
         ("name", VARCHAR(64, bin_collation=True)),
         ("val", VARCHAR(255, null=None, default='', bin_collation=True)),
     ),

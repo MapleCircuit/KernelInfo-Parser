@@ -35,11 +35,13 @@ from db_engine.errors import (
     DeadlockError,
     DuplicateKeyError,
     MissingTableError,
+    NON_RETRYABLE_ERRORS,
     PacketTooLargeError,
     ConfigurationError,
     ReadOnlyViolation,
     SpecError,
     UnsupportedOperation,
+    is_retryable_error,
 )
 
 
@@ -256,6 +258,8 @@ __all__ = [
     "UnsupportedOperation",
     "SpecError",
     "DuplicateKeyError",
+    "NON_RETRYABLE_ERRORS",
+    "is_retryable_error",
     "ConnectionLostError",
     "PacketTooLargeError",
     "ReadOnlyViolation",

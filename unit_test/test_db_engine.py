@@ -29,6 +29,7 @@ import sys
 import unittest
 from unittest.mock import MagicMock
 from typing import Any, Type
+import contextlib
 import mysql.connector
 
 # Ensure project root is in sys.path
@@ -71,7 +72,7 @@ from db_engine import (
 )
 from db_engine.DBHandling import MariaDB
 from db_engine.mariadb_support import parse_server_setting
-from db_engine.errors import ConnectionLostError, MissingTableError, PacketTooLargeError
+from db_engine.errors import ConnectionLostError, DuplicateKeyError, MissingTableError, PacketTooLargeError
 from unit_test.harness import (
     TestTableCollection,
     test_feature,
@@ -1419,6 +1420,70 @@ class TestMariaDBCommitAtomicity(unittest.TestCase):
         self.assertIn("ON DUPLICATE KEY UPDATE `id` = `id`", inserts[2], "the retried chunk skips existing rows")
         self.assertNotIn("ON DUPLICATE KEY", inserts[3])
         self.assertEqual(_inserted_ids(server.committed), set(range(1, 12001)))
+
+
+    def test_duplicate_key_fails_fast_without_skip_existing_retry(self) -> None:
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT"):
+                return mysql.connector.IntegrityError(errno=1062, msg="Duplicate entry '7-65535' for key 'PRIMARY'")
+            return None
+
+        server = _Server(fail=fail)
+        db = _scripted_mariadb(server)
+        table = _scratch_table()
+        with self.assertRaises(DuplicateKeyError) as ctx:
+            db.commit_tables_parallel([(table, ((1, 1), (2, 2)), ())])
+        self.assertEqual(ctx.exception.failed_table_ids, {table.table_id})
+        inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 1, "a duplicate key is deterministic: one attempt, no reconnect retry")
+        self.assertNotIn("ON DUPLICATE KEY", inserts[0], "no skip_existing retry may swallow the colliding rows")
+        self.assertEqual(_inserted_ids(server.committed), set())
+
+    def test_parallel_duplicate_key_fails_fast(self) -> None:
+        dup, ok = _scratch_table("t_dup", 9004), _scratch_table("t_ok", 9005)
+
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT") and "t_dup" in sql:
+                return mysql.connector.IntegrityError(errno=1062, msg="Duplicate entry '1' for key 'PRIMARY'")
+            return None
+
+        server = _Server(fail=fail)
+        db = _scripted_mariadb(server)
+        with self.assertRaises(DuplicateKeyError) as ctx:
+            db.commit_tables_parallel([(dup, ((1, 1),), ()), (ok, ((2, 2),), ())], max_workers=2)
+        self.assertEqual(ctx.exception.failed_table_ids, {dup.table_id})
+        dup_inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT") and "t_dup" in sql]
+        self.assertEqual(len(dup_inserts), 1)
+
+    def test_lost_connection_while_handling_a_duplicate_is_not_retried(self) -> None:
+        def fail(sql, params, cnx):
+            if sql.startswith("INSERT"):
+                return mysql.connector.IntegrityError(errno=1062, msg="Duplicate entry '1' for key 'PRIMARY'")
+            return None
+
+        server = _Server(fail=fail)
+        db = _scripted_mariadb(server)
+        lease = db._lease_writer
+
+        def _lease():
+            writer = lease()
+            real = writer.transaction
+
+            @contextlib.contextmanager
+            def _txn():
+                try:
+                    with real():
+                        yield
+                except DuplicateKeyError:
+                    raise ConnectionLostError("rollback lost the connection")   # chained on __context__
+            writer.transaction = _txn
+            return writer
+
+        db._lease_writer = _lease
+        with self.assertRaises(ConnectionLostError):
+            db.commit_tables_parallel([(_scratch_table(), ((1, 1),), ())], dedicated=True)
+        inserts = [sql for sql, _, _ in server.log if sql.startswith("INSERT")]
+        self.assertEqual(len(inserts), 1, "a connection error raised over a duplicate key is not retried")
 
 
 class _TuningCursor:

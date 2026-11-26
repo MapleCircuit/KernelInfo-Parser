@@ -21,6 +21,7 @@ import pickle
 import traceback
 from table_engine.shared_buffer import SharedSymbolBuilder, SharedSymbolChain
 from core.config import get_parser_config
+from db_engine import is_retryable_error
 from core.ssh_tunnel import ensure_ssh_tunnel
 from core.globalstuff import MEMORY_RECLAIM_STATS
 from core.SymbolRows import STATS as SYMBOL_STATS
@@ -169,11 +170,23 @@ def _register_file_names(items: list[str]) -> None:
     G.TE.commit(m_file_name.table_id)
 
 
+def _raise_if_not_retryable(context: str, e: BaseException) -> None:
+    """Re-raise a commit error a retry would only repeat (`db_engine.is_retryable_error()`: a duplicate key, ...)."""
+    if not is_retryable_error(e):
+        logger.error(f"{context} TableEngine commit failed with a non-retryable error ({type(e).__name__}: {e}); not retrying.")
+        raise e
+
+
 def _commit_all_with_retry(context: str) -> None:
-    """Commit every staged TableEngine row, re-checking the DB connection once on a transient failure."""
+    """Commit every staged TableEngine row, re-checking the DB connection once on a transient failure.
+
+    A non-retryable error (`db_engine.is_retryable_error()`: duplicate key, malformed spec, missing table, ...) is
+    raised at once: the rows that failed are back in staging and would fail the same way again.
+    """
     try:
         G.TE.commit_all()
     except Exception as e:
+        _raise_if_not_retryable(context, e)
         logger.warning(f"{context} TableEngine commit hit transient error ({e}); re-verifying DB connection and retrying...")
         if getattr(G.TE, "db", None) is not None:
             G.TE.db.check_if_connected()
@@ -189,7 +202,8 @@ def _begin_background_commits() -> None:
 def _end_background_commits(context: str) -> None:
     """Switch background commits off and wait for the last one (nothing may fork while a writer runs).
 
-    A failed background commit put its rows back into staging; they are committed again here.
+    A failed background commit put its rows back into staging; they are committed again here unless its error is
+    non-retryable (`db_engine.is_retryable_error()`), which is raised.
     """
     if not hasattr(G.TE, "wait_for_commit"):
         return
@@ -197,6 +211,7 @@ def _end_background_commits(context: str) -> None:
     try:
         G.TE.wait_for_commit()
     except Exception as e:
+        _raise_if_not_retryable(context, e)
         logger.warning(COLOR.yellow(f"{context} background commit failed ({e}); its rows were put back, committing them again..."))
         _commit_all_with_retry(context)
 
@@ -217,6 +232,7 @@ def _maybe_idle_commit() -> None:
     try:
         te.commit_all()
     except Exception as e:
+        _raise_if_not_retryable("Background", e)
         # A failed batch is back in staging; the next commit writes it again
         logger.warning(COLOR.yellow(f"Background commit while waiting for workers failed ({e}); retrying with the next commit."))
 

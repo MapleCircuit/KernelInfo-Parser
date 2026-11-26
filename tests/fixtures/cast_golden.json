@@ -349,41 +349,41 @@
   },
   "include/linux/drbd_tag_magic.h": {
     "full": {
-      "ops_count": 358,
-      "ops_hash": "ec8456a2447fd9fb5217cfe7bce5a497e9a9aba9812eae4d54b047f0ec1bb5e6",
+      "ops_count": 341,
+      "ops_hash": "ec6dbae0c876b0f29719a3391c697c96596cdec7ce0dbe75baef7f5fa5ea1fff",
       "store_hashes": {
-        "m_ast": "8a71e7ae84e3c99f",
+        "m_ast": "2d421f361ebb9487",
         "m_ast_attribute": "2250b0c2371a12e8",
-        "m_ast_container": "2e0576dab7ff9108",
-        "m_ast_hash": "05054dc394c589a3",
+        "m_ast_container": "8b76f4e6a51d3bb4",
+        "m_ast_hash": "11e42f46fc88bb62",
         "m_ast_include": "4d2c2e8782542924",
         "m_bridge_checkpoint": "028ab3525e29917f",
         "m_bridge_tag": "8da7e899dad08d3f",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "f36789109d30e66d",
-        "m_map_ast": "be6bde6b69d852b8",
-        "m_symbol_def": "02468ed06613a672",
-        "m_symbol_ref": "83ccf39766e20002",
-        "m_tag": "4da73a55d8a59930"
+        "m_map_ast": "c3d63bfb1a91d527",
+        "m_symbol_def": "f977c20c2e5c6824",
+        "m_symbol_ref": "9fd2f4d38421d15b",
+        "m_tag": "31fdabc8fd94e64e"
       }
     },
     "isolated": {
-      "ops_count": 359,
-      "ops_hash": "0a9b970d2db24ac74b3aeb713963206f740625628e2232523e195b2c186ce713",
+      "ops_count": 342,
+      "ops_hash": "b6530000d7ca3e2cf58e8c9cd8a5faa8a4b58cb1b3cd6ce00feead5b4031b601",
       "store_hashes": {
-        "m_ast": "241ad42365c1f3b0",
+        "m_ast": "1a97b7c216d1e8d7",
         "m_ast_attribute": "795ce35c0557cb4b",
-        "m_ast_container": "123e30032380cccd",
-        "m_ast_hash": "b65870c55d095607",
+        "m_ast_container": "dd10c656e39c68e9",
+        "m_ast_hash": "6c9cc857194a2f7d",
         "m_ast_include": "cda82467cf050dda",
         "m_bridge_checkpoint": "028ab3525e29917f",
         "m_bridge_tag": "8da7e899dad08d3f",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "2f9b938d588910ca",
-        "m_map_ast": "3fd038a7eea44668",
-        "m_symbol_def": "1c10000d72a8f8d2",
-        "m_symbol_ref": "bc1aae16de9b705c",
-        "m_tag": "ee27eba2e954986a"
+        "m_map_ast": "778085a4227bc3d9",
+        "m_symbol_def": "49e6971a3f23a157",
+        "m_symbol_ref": "fe7467c0675b3c34",
+        "m_tag": "e85d7b7ecca40364"
       }
     }
   },

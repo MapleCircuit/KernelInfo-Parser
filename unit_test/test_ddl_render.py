@@ -41,6 +41,15 @@ class TestMariaDBDdlBaseline(unittest.TestCase):
                 self.assertEqual([i for i, c in enumerate(cols) if c[1].is_large], meta["large"])
                 self.assertEqual([i for i, c in enumerate(cols) if not c[1].nullable], meta["not_null"])
 
+    def test_ast_ordinals_hold_more_than_16_bits(self) -> None:
+        # A parent's child / attribute ordinal exceeds 65,535 on real kernel input: never a 16-bit column
+        for table in (D.m_ast_container, D.m_ast_attribute):
+            spec = dict(table.init_columns)["priority"]
+            with self.subTest(table=table.table_name):
+                self.assertIn(spec.type, (ColumnType.MEDIUMINT, ColumnType.INT, ColumnType.BIGINT))
+                self.assertTrue(spec.unsigned)
+                self.assertIn("priority MEDIUMINT UNSIGNED NOT NULL", render_create_table(table, "mariadb"))
+
     def test_columns_are_neutral_specs(self) -> None:
         for table in D.TABLES:
             for name, spec in table.init_columns:

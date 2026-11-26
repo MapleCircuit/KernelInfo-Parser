@@ -48,7 +48,7 @@ from db_engine.spec import Pred, Value, all_of, any_of, eq, add, between, exists
 
 SCHEMA = (
     D.m_project, D.m_git_network, D.m_file_name, D.m_file_blob, D.m_bridge_checkpoint, D.m_parse_task, D.m_table_sequence,
-    D.m_ingest_state, D.m_checkpoint_base, D.m_git_ref, D.m_ast, D.m_tag, D.m_bridge_tag, D.m_symbol_own, D.m_blob_symbol,
+    D.m_ingest_state, D.m_checkpoint_base, D.m_git_ref, D.m_ast, D.m_ast_container, D.m_ast_attribute, D.m_tag, D.m_bridge_tag, D.m_symbol_own, D.m_blob_symbol,
     D.m_blob_symbol_ref, D.m_blob_symbol_def, D.m_tag_ref, D.m_tag_def,
 )
 SCHEMA_NAMES = [t.table_name for t in SCHEMA]
@@ -139,6 +139,18 @@ class ContractMixin(_BackendCase):
         self.assertEqual(rows, [("a",), ("b",)])
         self.db.drop_view("v_contract")
         self.assertFalse(self.db.table_exists("v_contract"))
+
+    # ---- AST ordinal widths ----------------------------------------------------------------------------------
+    def test_ast_ordinals_above_16_bits_do_not_collide(self) -> None:
+        # One parent may hold more than 65,535 children (rtw89 power tables in v6.5); a 16-bit column clamps them
+        # all to 65535 on MariaDB (non-strict session) and the second one is a duplicate primary key
+        self.db.insert_rows("m_ast", ["ast_id", "name", "type_id"], [(1, "{}", 66), (2, "24", 62)])
+        prios = [0, 65534, 65535, 65536, 74175, 16_777_215]
+        self.db.insert_rows("m_ast_container", ["ast_id", "priority", "type_id", "ref_ast_id"], [(1, p, 62, 2) for p in prios])
+        self.db.insert_rows("m_ast_attribute", ["ast_id", "priority", "name", "val"], [(1, p, f"a{p}", "") for p in prios])
+        for table in ("m_ast_container", "m_ast_attribute"):
+            got = self.db.select_rows(table, ["priority"], {"ast_id": 1}, order_by=["priority"], as_dict=False)
+            self.assertEqual([r[0] for r in got], prios, table)
 
     # ---- inserts ---------------------------------------------------------------------------------------------
     def test_insert_error_duplicate(self) -> None:

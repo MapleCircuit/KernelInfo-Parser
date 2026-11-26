@@ -54,6 +54,34 @@ class DeadlockError(DBError):
     """A transaction failed due to a lock deadlock, lock wait timeout, snapshot conflict, or auto-increment lock failure; callers may retry."""
 
 
+# Errors that a retry of the same statement repeats: the data or the request is wrong, not the connection
+NON_RETRYABLE_ERRORS: tuple[type[DBError], ...] = (
+    DuplicateKeyError,
+    SpecError,
+    MissingTableError,
+    ConfigurationError,
+    UnsupportedOperation,
+    ReadOnlyViolation,
+)
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """Whether re-running the failed write may succeed: False for a `NON_RETRYABLE_ERRORS` error anywhere in the chain.
+
+    The chain is `exc`, its `__cause__` and its unsuppressed `__context__`, so a deterministic error stays visible
+    when a later handler wraps it or a rollback raises during its handling (a duplicate key never becomes a "lost
+    connection" retry).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, NON_RETRYABLE_ERRORS):
+            return False
+        seen.add(id(cur))
+        cur = cur.__cause__ if cur.__cause__ is not None else (None if cur.__suppress_context__ else cur.__context__)
+    return True
+
+
 # MySQL / MariaDB client error numbers
 _DUP_ERRNOS = frozenset({1062, 1586})
 _MISSING_TABLE_ERRNOS = frozenset({1146, 1051})
@@ -136,6 +164,9 @@ __all__ = [
     "PacketTooLargeError",
     "ReadOnlyViolation",
     "DeadlockError",
+    "ConfigurationError",
+    "NON_RETRYABLE_ERRORS",
+    "is_retryable_error",
     "translate_mysql_error",
     "translate_sqlite_error",
     "raise_translated",

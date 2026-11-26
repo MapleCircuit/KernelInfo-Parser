@@ -388,6 +388,11 @@ _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_DEFINITION,
     cc.CursorKind.INCLUSION_DIRECTIVE,
 })
+_DIRECTIVE_KINDS = frozenset({
+    cc.CursorKind.PREPROCESSING_DIRECTIVE,
+    cc.CursorKind.MACRO_DEFINITION,
+    cc.CursorKind.INCLUSION_DIRECTIVE,
+})
 _tu_foreign_type_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
 _tu_typedef_cache = _tu_foreign_type_cache
 
@@ -2055,6 +2060,11 @@ class AST_Initializer(AST_Expression):
         self.entry_state: int = 0
         self.has_braces: bool = False
         self.init_extent: Line | None = None
+        # The previous significant token: a designator starts an element (after `{` or `,`)
+        self._prev_spelling: str = ""
+        # The open `[...]` subscript continues the current entry (`[a][b] = v`) instead of starting one
+        self._desig_extend: bool = False
+        self._directive_line: int = -1
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -2097,17 +2107,36 @@ class AST_Initializer(AST_Expression):
             return
 
         spelling = token.spelling_str
+        # Directive lines inside the braces (`#ifdef CONFIG_X`, a `#define` body) are no initializer elements: they
+        # neither open an entry nor hide the element start of the designator after them. The directive's own tokens
+        # carry a directive cursor, the rest of its line (the macro of `#ifdef X`) does not: the line counts too
+        in_directive = getattr(cursor, "kind", None) in _DIRECTIVE_KINDS
+        line_no = int(token.line.line_pos[0])
+        if in_directive and spelling == "#":
+            self._directive_line = line_no
+        elif line_no == self._directive_line:
+            in_directive = True
+        prev_spelling = self._prev_spelling
+        if not in_directive:
+            self._prev_spelling = spelling
 
-        if self.brace_depth >= 1:
-            if spelling == "." and self.paren_depth == 0 and self.bracket_depth == 0:
+        if self.brace_depth >= 1 and not in_directive:
+            # A designator (`.member` / `[index]`) opens an element or follows another designator (`[0].x`,
+            # `[a][b]`); a `.` or `[` inside a value (`= s.x`, `= tbl[3]`, positional `a[0]`) is part of the value
+            desig_pos = prev_spelling in ("{", ",", "=") or (self.entry_state == 2 and self.cur_entry is not None)
+            if spelling == "." and self.paren_depth == 0 and self.bracket_depth == 0 and desig_pos:
                 if self.cur_entry is not None:
                     self.entries.append(self.cur_entry)
                     self.cur_entry = None
                 self.entry_state = 1
                 return
 
-            if spelling == "[" and self.paren_depth == 0 and self.bracket_depth == 1:
-                if self.cur_entry is not None:
+            if spelling == "[" and self.paren_depth == 0 and self.bracket_depth == 1 and desig_pos:
+                # `[a][b] = v` designates one element of a multi-dimensional array: one entry, not one per subscript
+                self._desig_extend = (
+                    self.entry_state == 2 and self.cur_entry is not None and self.cur_entry.member_name.endswith("]")
+                )
+                if self.cur_entry is not None and not self._desig_extend:
                     self.entries.append(self.cur_entry)
                     self.cur_entry = None
                 self.entry_state = 4
@@ -2115,9 +2144,13 @@ class AST_Initializer(AST_Expression):
                 return
 
             if self.entry_state == 4:
-                if spelling == "]":
+                if spelling == "]" and self.bracket_depth == 0:
                     desig_name = "[" + "".join(getattr(self, "_array_desig_tokens", [])) + "]"
-                    self.cur_entry = InitializerEntry(desig_name, token.line, cursor)
+                    if self._desig_extend and self.cur_entry is not None:
+                        self.cur_entry.member_name += desig_name
+                    else:
+                        self.cur_entry = InitializerEntry(desig_name, token.line, cursor)
+                    self._desig_extend = False
                     self.entry_state = 2
                     return
                 if not hasattr(self, "_array_desig_tokens"):

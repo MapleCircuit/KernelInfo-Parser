@@ -15,6 +15,7 @@ from db_engine.base import (
 )
 from db_engine.errors import (
     DuplicateKeyError,
+    is_retryable_error,
 )
 from db_engine.sql_render import (
     render_create_table,
@@ -454,6 +455,7 @@ class MariaDBTables:
                (`_lease_writer()`) of a ThreadPoolExecutor. A lost connection rolls that table back and the
                table is written again (3 attempts); since a lost COMMIT acknowledgement may hide a committed
                attempt, the later attempts skip rows whose key already exists (`_insert(skip_existing=True)`).
+               A non-retryable error (`is_retryable_error()` False: a duplicate key, ...) is raised at once.
             3. If any table fails, the first error is raised once every table has finished, with
                `failed_table_ids` naming all tables that were not committed (the others are).
 
@@ -485,7 +487,9 @@ class MariaDBTables:
                     ok = True
                     break
                 except transient as e:
-                    if attempt == 2:
+                    # A connection error raised while a duplicate key (or another deterministic error) was handled
+                    # is not retried: the skip_existing retry would drop the colliding rows silently
+                    if attempt == 2 or not is_retryable_error(e):
                         raise
                     logger.warning(
                         f"Commit of '{table.table_name}' lost its connection ({e}); "

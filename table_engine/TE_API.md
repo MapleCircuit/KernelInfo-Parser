@@ -15,14 +15,14 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - 3.3. `get_table_engine(name: str | type | None) -> type[TEDirectDB | TECachedDB]` [L140-L153]
   - 3.4. `TECachedDB` Internal Cache Management [L154-L188]
   - 3.5. Structured Shared Memory with Huge Pages (`table_engine/shared_buffer.py`) [L189-L229]
-- 4. Exhaustive API Method Specifications [L230-L602]
+- 4. Exhaustive API Method Specifications [L230-L603]
   - 4.1. Lifecycle & Connection Management [L232-L346]
   - 4.2. Single-Table Operations (`get`, `set`, `update`) [L347-L449]
   - 4.3. Multi-Table Relational Views (`view_get`, `view_get_multiple`, `view_set`) [L450-L524]
-  - 4.4. Transaction Commit Protocol (`commit`, `commit_all`) [L525-L602]
-- 5. Expected Database Driver Interface (`G.DB` / `BaseDBEngine`) [L603-L622]
-- 6. Critical Invariants for Custom Implementations [L623-L716]
-- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L717-L744]
+  - 4.4. Transaction Commit Protocol (`commit`, `commit_all`) [L525-L603]
+- 5. Expected Database Driver Interface (`G.DB` / `BaseDBEngine`) [L604-L623]
+- 6. Critical Invariants for Custom Implementations [L624-L717]
+- 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`) [L718-L745]
 <!-- toc:end -->
 
 ---
@@ -565,7 +565,8 @@ failed.
 
 - **`commit_all(max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None`**
   1. Waits for the previous background commit (`wait_for_commit()`: on failure its rows are restored and its
-     error raised, so `_commit_all_with_retry()` simply calls `commit_all()` again).
+     error raised, so `_commit_all_with_retry()` simply calls `commit_all()` again, unless the error is
+     non-retryable: `db_engine.is_retryable_error()`, a duplicate key, which it raises).
   2. Takes one batch across all tables.
   3. **Background write**: with `async_commits`, `update_in_mem_indexes=True` and a driver with
      `supports_background_commit`, starts a writer thread running `db.commit_tables_parallel(...,

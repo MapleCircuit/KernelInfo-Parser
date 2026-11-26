@@ -62,7 +62,14 @@ from db_engine import (
 )
 from db_engine.base import BaseDBEngine
 from db_engine.mariadb_support import _coerce_bytes, _normalize_row, _wrap_driver_errors
-from db_engine.errors import translate_mysql_error
+from db_engine.errors import (
+    ConfigurationError,
+    DeadlockError,
+    MissingTableError as _MissingTable,
+    NON_RETRYABLE_ERRORS,
+    is_retryable_error,
+    translate_mysql_error,
+)
 from db_engine.spec import CURRENT_TIMESTAMP, Join
 from db_engine.sql_render import (
     inline_params,
@@ -430,6 +437,33 @@ class TestErrorMapping(unittest.TestCase):
         self.assertTrue(issubclass(DuplicateKeyError, ValueError))
         self.assertTrue(issubclass(ConnectionLostError, ConnectionError))
         self.assertTrue(issubclass(PacketTooLargeError, DBError))
+
+    def test_retry_classification(self) -> None:
+        for exc in (DuplicateKeyError("Duplicate entry '1-65535'"), SpecError("bad"), _MissingTable("t"), ConfigurationError("no user")):
+            self.assertFalse(is_retryable_error(exc), repr(exc))
+        for exc in (ConnectionLostError("gone"), DeadlockError("deadlock"), PacketTooLargeError("big"), OSError("io"), RuntimeError("x")):
+            self.assertTrue(is_retryable_error(exc), repr(exc))
+        self.assertIn(DuplicateKeyError, NON_RETRYABLE_ERRORS)
+
+    def test_retry_classification_follows_the_chain(self) -> None:
+        dup = DuplicateKeyError("Duplicate entry")
+        try:
+            try:
+                raise dup
+            except DuplicateKeyError:
+                raise ConnectionLostError("rollback lost the connection")   # implicit __context__
+        except ConnectionLostError as lost:
+            self.assertFalse(is_retryable_error(lost))
+        wrapped = RuntimeError("commit failed")
+        wrapped.__cause__ = dup
+        self.assertFalse(is_retryable_error(wrapped))
+        suppressed = ConnectionLostError("unrelated")
+        suppressed.__context__ = dup
+        suppressed.__suppress_context__ = True                          # `raise ... from None`
+        self.assertTrue(is_retryable_error(suppressed))
+        loop = ConnectionLostError("cycle")
+        loop.__context__ = loop
+        self.assertTrue(is_retryable_error(loop))
 
     def test_wrapper_chains_original(self) -> None:
         err = mysql.connector.IntegrityError(msg="Duplicate entry", errno=1062)

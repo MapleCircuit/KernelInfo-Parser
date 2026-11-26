@@ -12,37 +12,37 @@ agents.
   - 1.3. Global Constants & Enums [L158-L249]
 - 2. Filesystem & Git Subsystem (`core/FileHandler.py`) [L250-L322]
   - 2.1. `MasterFile` (`mf`) [L252-L322]
-- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L552]
-  - 3.1. `GreatProcessor` (`gp`) [L325-L552]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L553-L751]
-  - Relational Table Families (`core/DBLayout.py`) [L565-L634]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L635-L724]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L725-L751]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L752-L948]
-  - 5.1. Data Sanitization Helpers [L754-L760]
-  - 5.2. `Table` Class Interface [L761-L794]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L795-L901]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L902-L924]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L925-L948]
-- 6. End-to-End Inter-Module Execution Lifecycle [L949-L1096]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1097-L1533]
-  - 7.1. Unified Configuration Hierarchy [L1099-L1232]
-  - 7.1.1. Repository Auto-Detection & Selection [L1233-L1298]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1299-L1368]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1369-L1418]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1419-L1533]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1534-L1804]
-  - 8.1. High-Level Architecture [L1536-L1579]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1580-L1605]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1606-L1804]
-- 9. CVE List Ingestion (`parser/cve/`) [L1805-L1861]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1862-L1929]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1930-L2064]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1938-L1969]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1970-L2014]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L2015-L2047]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2048-L2064]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2065-L2112]
+- 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L555]
+  - 3.1. `GreatProcessor` (`gp`) [L325-L555]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L556-L757]
+  - Relational Table Families (`core/DBLayout.py`) [L568-L640]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L641-L730]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L731-L757]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L758-L954]
+  - 5.1. Data Sanitization Helpers [L760-L766]
+  - 5.2. `Table` Class Interface [L767-L800]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L801-L907]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L908-L930]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L931-L954]
+- 6. End-to-End Inter-Module Execution Lifecycle [L955-L1102]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1103-L1539]
+  - 7.1. Unified Configuration Hierarchy [L1105-L1238]
+  - 7.1.1. Repository Auto-Detection & Selection [L1239-L1304]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1305-L1374]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1375-L1424]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1425-L1539]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1540-L1810]
+  - 8.1. High-Level Architecture [L1542-L1585]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1586-L1611]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1612-L1810]
+- 9. CVE List Ingestion (`parser/cve/`) [L1811-L1867]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1868-L1935]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1936-L2070]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1944-L1975]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1976-L2020]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L2021-L2053]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2054-L2070]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2071-L2118]
 <!-- toc:end -->
 
 ---
@@ -469,7 +469,10 @@ Central runtime container, schema registry, and worker IPC coordinator.
     written by the TableEngine's writer thread while the parent keeps ingesting. `_end_background_commits()`
     switches them off and joins the last one before anything forks again (also called first thing in every
     stage); a failed background commit puts its rows back into staging, and they are committed again there
-    through `_commit_all_with_retry()`. While the parent waits for worker results (a 1s poll without a batch),
+    through `_commit_all_with_retry()`. `_commit_all_with_retry()` retries a commit once after re-checking the
+    connection; a non-retryable error (`db_engine.is_retryable_error()` False: `DuplicateKeyError`, `SpecError`,
+    `MissingTableError`, ...) is raised at once by it, `_end_background_commits()` and `_maybe_idle_commit()`, so
+    the stage fails on its first occurrence. While the parent waits for worker results (a 1s poll without a batch),
     `_maybe_idle_commit()` also starts a background commit once 100k rows are staged (`_IDLE_COMMIT_MIN_ROWS`,
     `G.TE.staged_rows`) and none is running. `DependencyScheduler.resolve_headers()` also enables
     `async_commits` so the final Stage 1 wave commit overlaps `_publish_file_symbols()`, and `finalize()`
@@ -601,7 +604,10 @@ For authoritative table definitions, primary keys, indexes, and the full relatio
 > **Column widths.** Line, column and index numbers (`m_bridge_tag`, `m_map_ast`, `m_tag_def`, `m_tag_ref`,
 > `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference.line_no`) are `MEDIUMINT` (3 bytes, ±8.3M;
 > `m_tag_ref.ref_idx` unsigned, 16.7M): the largest values seen are line 3,195 within a tag and index 8,286.
-> The session runs without strict mode (`sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `db_engine/DB_API.md` §2.1), so
+> AST child and attribute ordinals (`m_ast_container.priority`, `m_ast_attribute.priority`) are `MEDIUMINT
+> UNSIGNED` (16.7M): a single parent node (a long function body, a large designated initializer, whose nested
+> designators all flatten into the outermost `C_InitListExpr`) can exceed the 65,535 children `SMALLINT UNSIGNED`
+> holds. The session runs without strict mode (`sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `db_engine/DB_API.md` §2.1), so
 > an out-of-range value would be clamped, not rejected. The database also holds `m_tag_code (hash, code)`,
 > written by the database driver (`db_engine`) outside this registry.
 

@@ -4776,6 +4776,54 @@ class TestDeclaratorAndNamespaceFidelity(unittest.TestCase):
         self.assertEqual(resolve({("jiffies", int(ASTT.C_long)): 10}, "jiffies", ASTT.C_DeclRefExpr), 10)
 
 
+
+class TestInitializerDesignators(unittest.TestCase):
+    """One container entry per designated element: chained subscripts, values and directives do not split it."""
+
+    def tearDown(self) -> None:
+        MockDB.store.clear()
+
+    def _init_lists(self, code: str) -> dict[int, list[tuple[str, int]]]:
+        parse_snippet(code, "drivers/x/desig.c")
+        ast = MockDB.store.get(m_ast.table_name, {})
+        cont = MockDB.store.get(m_ast_container.table_name, {}).values()
+        lists = {}
+        for aid, row in ast.items():
+            if row[2] == ASTT.C_InitListExpr:
+                kids = sorted((r for r in cont if r[0] == aid), key=lambda r: r[1])
+                self.assertEqual([r[1] for r in kids], list(range(len(kids))), "priorities are 0..N-1")
+                lists[aid] = [(ast[r[3]][1], int(r[2])) for r in kids]
+        return lists
+
+    def test_multi_dimensional_designator_is_one_entry(self) -> None:
+        lists = self._init_lists(
+            "static int tbl[4];\n"
+            "static const signed char lmt[2][3][4] = {\n"
+            "\t[0][1][2] = 24,\n\t[1][2][3] = 56,\n\t[1][tbl[1]][0] = 7,\n};\n"
+        )
+        self.assertIn([
+            ("[0][1][2]", int(ASTT.C_MemberRefExpr)), ("24", int(ASTT.C_DeclRefExpr)),
+            ("[1][2][3]", int(ASTT.C_MemberRefExpr)), ("56", int(ASTT.C_DeclRefExpr)),
+            ("[1][tbl[1]][0]", int(ASTT.C_MemberRefExpr)), ("7", int(ASTT.C_DeclRefExpr)),
+        ], list(lists.values()))
+
+    def test_subscripts_and_members_inside_values_are_no_designators(self) -> None:
+        lists = self._init_lists(
+            "struct s { int x; int y; };\nstatic int tbl[4];\n"
+            "static struct s one = { .x = tbl[2], .y = one.x };\n"
+        )
+        self.assertIn([("x", int(ASTT.C_MemberRefExpr)), ("tbl", int(ASTT.C_DeclRefExpr)),
+                       ("y", int(ASTT.C_MemberRefExpr)), ("one", int(ASTT.C_DeclRefExpr))], list(lists.values()))
+
+    def test_designators_after_directive_lines_are_kept(self) -> None:
+        lists = self._init_lists(
+            "#define CONFIG_FOO 1\nenum { FOO, BAR };\nstatic int tbl[2] = {\n"
+            "#ifdef CONFIG_FOO\n\t[FOO] = 1,\n#endif\n#define MKV(x) [x] = 9,\n\t[BAR] = 2,\n};\n"
+        )
+        self.assertIn([("[FOO]", int(ASTT.C_MemberRefExpr)), ("1", int(ASTT.C_DeclRefExpr)),
+                       ("[BAR]", int(ASTT.C_MemberRefExpr)), ("2", int(ASTT.C_DeclRefExpr))], list(lists.values()))
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
