@@ -19,6 +19,7 @@ from core.config import (
     get_db_config,
     get_default_repo_path,
     get_logging_config,
+    get_nodemap_canvas_dir,
     get_repositories_config,
     get_repository,
     get_webapp_config,

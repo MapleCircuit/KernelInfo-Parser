@@ -1262,6 +1262,21 @@ class ApiClient {
     return this.request(`/webapi/nodemap/${encodeURIComponent(ver)}/source?${q}`, { networkFirst: fresh }, "tools", `nmsrc_${this._vk(ver)}_${q}`);
   }
 
+  /** `GET /webapi/nodemap/canvases`: list server-side saved NodeMap canvases for the active project (§4.14). */
+  async getNodemapCanvases({ q = "", limit = 100, offset = 0 } = {}) {
+    const params = new URLSearchParams();
+    if (q) params.set("q", String(q));
+    if (limit) params.set("limit", String(limit));
+    if (offset) params.set("offset", String(offset));
+    const qs = params.toString();
+    return this.request(`/webapi/nodemap/canvases${qs ? `?${qs}` : ""}`, { networkFirst: true });
+  }
+
+  /** `GET /webapi/nodemap/canvases/{canvas_id}`: fetch a saved server-side NodeMap canvas document (§4.14). */
+  async getNodemapCanvas(canvasId) {
+    return this.request(`/webapi/nodemap/canvases/${encodeURIComponent(String(canvasId || "").trim())}`, { networkFirst: true });
+  }
+
   async getCallgraph(version, functionName) {
     const ver = this._sanitizeVer(version);
     return this.request(`/webapi/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);

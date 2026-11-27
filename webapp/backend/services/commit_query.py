@@ -159,10 +159,11 @@ def build_log_args(*, start: list[str], paths: list[str], author: str = "", comm
 def query_commits(version_name: str, *, paths: list[str] | None = None, author: str = "", committer: str = "",
                   roles: list[str] | None = None, since: str = "", until: str = "", range_: str = "",
                   release: str = "", merges: str = "", section: str = "", text: str = "",
-                  page: int = 1, limit: int = 50) -> dict[str, Any]:
+                  page: int = 1, limit: int = 50, offset: int | None = None) -> dict[str, Any]:
     """Commits matching a structured query, newest first: the shape of GET /commits/{v}/list plus has_more."""
     limit = max(1, min(int(limit), 200))
     page = max(1, int(page))
+    skip_rows = max(0, int(offset)) if offset is not None else (page - 1) * limit
     specs = validate_pathspecs(paths or [])
     if section:
         specs = specs + section_pathspecs(version_name, section)
@@ -206,7 +207,7 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
             start = [_resolve(version_name, "revision")]
     args = build_log_args(start=start, paths=specs, author=author, committer=committer, roles=role_list,
                           since=since, until=until, merges="" if merges == "all" else merges, text=text,
-                          skip=(page - 1) * limit, limit=limit)
+                          skip=skip_rows, limit=limit)
     try:
         proc = subprocess.run(["git", "-C", str(get_repo_dir()), *args], check=False, capture_output=True, text=True,
                               timeout=QUERY_TIMEOUT, errors="replace")

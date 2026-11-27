@@ -48,7 +48,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "api.main:app",
         host=cli.host or cfg.get("host", "127.0.0.1"),
-        port=cli.port or int(cfg.get("port", 8001)),
+        port=cli.port if cli.port is not None else int(cfg.get("port", 8001)),
         reload=bool(cfg.get("reload", False)) if cli.reload is None else cli.reload,
     )
 else:

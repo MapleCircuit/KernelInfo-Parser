@@ -947,6 +947,7 @@ class GlobalState {
           if (t.type === "explorer") return (t.path || "") === (tabData.path || "") && t.version === tabData.version;
           if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version && (t.configName || "") === (tabData.configName || "");
           if (t.type === "nodemap" && (tabData.initialNodes || tabData.initialNode)) return false;
+          if (t.type === "nodemap" && tabData.canvasId && t.canvasId && t.canvasId !== tabData.canvasId) return false;
           if (t.type === "mail") {
             if (tabData.threadId || tabData.messageId) {
               return t.threadId === tabData.threadId && t.messageId === tabData.messageId;
@@ -1058,6 +1059,13 @@ class GlobalState {
         for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
           "apiKinds", "apiStatuses", "apiQuery", "apiArch", "manStatuses", "manSection", "manQuery"]) {
           if (tabData[key] !== undefined) existing[key] = tabData[key];
+        }
+      }
+      if (tabData.type === "nodemap") {
+        for (const key of ["canvasId", "tourId"]) {
+          if (tabData[key] === undefined) continue;
+          if (tabData[key] === "" || tabData[key] === null) delete existing[key];
+          else existing[key] = tabData[key];
         }
       }
     } else {

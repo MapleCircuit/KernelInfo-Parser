@@ -28,6 +28,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KernelInfo-Parser MCP server (stdio transport)")
     parser.add_argument("-c", "--config", type=str, default=None, help="Path to config.json file")
     parser.add_argument("--repo", type=str, default=None, help="Default repository for tool calls")
+    parser.add_argument(
+        "--allow-writes",
+        dest="allow_writes",
+        action="store_true",
+        default=False,
+        help="Enable write-scoped MCP tools (nodemap:write) for this stdio session",
+    )
     return parser.parse_args(argv)
 
 
@@ -58,21 +65,51 @@ def read_lines(stream: BinaryIO, limit: int) -> Iterator[bytes]:
         yield line
 
 
-def serve(lines: Iterable[bytes | str], out: BinaryIO) -> None:
+def serve(lines: Iterable[bytes | str], out: BinaryIO, *, allow_writes: bool | None = None) -> None:
     """Dispatch each non-blank stdin line and write its response (notifications produce no output)."""
+    from api.config import (
+        get_api_server_config,
+        reset_allow_writes_override,
+        set_allow_writes_override,
+    )
     from api.mcp import INVALID_REQUEST, MAX_BODY_BYTES, handle_raw
+    from api.security import reset_active_api_scopes, set_active_api_scopes
+    from core.config import get_config
 
-    for line in lines:
-        text = line.strip()
-        if not text:
-            continue
-        if len(text) > MAX_BODY_BYTES:
-            response: Any = {"jsonrpc": "2.0", "id": None, "error": {"code": INVALID_REQUEST, "message": "Message too large."}}
-        else:
-            response = handle_raw(text)
-        if response is not None:
-            out.write(encode_frame(response))
-            out.flush()
+    override_token = set_allow_writes_override(bool(allow_writes)) if allow_writes is not None else None
+    prev_cfg_allow: Any = None
+    api_sec: dict[str, Any] | None = None
+    if allow_writes is True:
+        api_sec = get_config().setdefault("api", {})
+        prev_cfg_allow = api_sec.get("allow_writes", False)
+        api_sec["allow_writes"] = True
+
+    writes_enabled = bool(get_api_server_config().get("allow_writes", False))
+    active_scopes = frozenset({"read", "nodemap:write"}) if writes_enabled else frozenset({"read"})
+    scope_token = set_active_api_scopes(active_scopes)
+
+    try:
+        for line in lines:
+            raw = line.rstrip(b"\r\n") if isinstance(line, (bytes, bytearray)) else line.rstrip("\r\n")
+            if len(raw) > MAX_BODY_BYTES:
+                response: Any = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": INVALID_REQUEST, "message": "Message too large."},
+                }
+            else:
+                text = raw.strip()
+                if not text:
+                    continue
+                response = handle_raw(text)
+            if response is not None:
+                out.write(encode_frame(response))
+                out.flush()
+    finally:
+        if api_sec is not None:
+            api_sec["allow_writes"] = prev_cfg_allow
+        reset_allow_writes_override(override_token)
+        reset_active_api_scopes(scope_token)
 
 
 def _terminate(_signum: int, _frame: Any) -> None:
@@ -107,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Unknown repository: {args.repo!r}", file=sys.stderr)
                 return 2
         startup_resources()
-        serve(read_lines(sys.stdin.buffer, MAX_BODY_BYTES), out)
+        serve(read_lines(sys.stdin.buffer, MAX_BODY_BYTES), out, allow_writes=True if args.allow_writes else None)
     except KeyboardInterrupt:
         pass
     finally:

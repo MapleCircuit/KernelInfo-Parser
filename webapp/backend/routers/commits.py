@@ -89,7 +89,7 @@ def get_blame(
 @router.get("/commits/{version_name}/history/{path:path}", dependencies=[Depends(require_feature("commits"))])
 def get_file_history(version_name: str, path: str, limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     """Commits that changed a file, newest first, and its last change."""
-    return git_service.get_file_history(version_name, path, limit)
+    return git_service.get_file_history(version_name, path, min(max(1, limit), 200))
 
 
 _TIMELINE_DIRECTIONS = {"past", "future", "around"}

@@ -61,12 +61,27 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
         "Client IP Header",
         ["Header carrying the real client address when the request comes from a trusted proxy."],
     ),
+    "allow_writes": (
+        "Allow Write Operations",
+        [
+            "Enable write-scoped REST and MCP endpoints (such as saving and mutating NodeMap canvases).",
+            "Disabled by default (strictly read-only). Callers also need an API key with 'nodemap:write' or 'write' scope.",
+        ],
+    ),
+    "nodemap_canvas_dir": (
+        "Canvas Storage Directory",
+        [
+            "Persistent directory on disk for saved NodeMap canvas JSON files (shared with the WebApp).",
+            "Leave empty to use the default 'nodemap-canvases' directory.",
+        ],
+    ),
     "keys": (
         "API Keys",
         [
             "Keys are shown masked (first 4 characters of keys of 16+ characters, else only the length) and never in full after entry.",
             "- Add Key: enter a new key (a name is asked for when keys are stored as a name/key map).",
             "- Remove Key: delete the highlighted key.",
+            "- Key Scopes: choose scopes ('read', 'nodemap:write', 'write') for the highlighted key.",
         ],
     ),
     "rate_limit": (
@@ -107,13 +122,49 @@ def mask_key(key: str) -> str:
     return f"•••• ({len(key)} chars)"
 
 
-def _load_keys(raw: Any) -> tuple[list[tuple[str, str]], bool]:
-    """Return ([(name, key)], stored_as_dict) for the `api.keys` value (list of strings or {name: key})."""
+SCOPE_PRESETS: tuple[tuple[str, ...], ...] = (
+    ("read",),
+    ("read", "nodemap:write"),
+    ("read", "write"),
+)
+
+
+def _load_keys(raw: Any) -> tuple[list[tuple[str, str]], bool, dict[int, tuple[str, ...]], set[int]]:
+    """Return `(keys, stored_as_dict, scopes_by_idx, explicit_scoped_indices)` for `api.keys`."""
+    from api.config import VALID_API_SCOPES
+
+    keys: list[tuple[str, str]] = []
+    scopes_by_idx: dict[int, tuple[str, ...]] = {}
+    explicit_scoped: set[int] = set()
     if isinstance(raw, dict):
-        return [(str(n), str(k)) for n, k in raw.items() if isinstance(k, str) and k], True
+        for n, item in raw.items():
+            if isinstance(item, str) and item:
+                idx = len(keys)
+                keys.append((str(n), str(item)))
+                scopes_by_idx[idx] = ("read",)
+            elif isinstance(item, dict):
+                secret = item.get("key") if "key" in item else item.get("secret")
+                if isinstance(secret, str) and secret.strip():
+                    raw_scopes = item.get("scopes")
+                    if isinstance(raw_scopes, (list, tuple, set, frozenset)):
+                        valid = tuple(str(s).strip() for s in raw_scopes if isinstance(s, str) and str(s).strip() in VALID_API_SCOPES)
+                    else:
+                        valid = ("read",)
+                    if not valid:
+                        valid = ("read",)
+                    idx = len(keys)
+                    keys.append((str(n), secret.strip()))
+                    scopes_by_idx[idx] = valid
+                    explicit_scoped.add(idx)
+        return keys, True, scopes_by_idx, explicit_scoped
     if isinstance(raw, (list, tuple)):
-        return [("", k) for k in raw if isinstance(k, str) and k], False
-    return [], False
+        for item in raw:
+            if isinstance(item, str) and item:
+                idx = len(keys)
+                keys.append(("", item))
+                scopes_by_idx[idx] = ("read",)
+        return keys, False, scopes_by_idx, explicit_scoped
+    return [], False, {}, set()
 
 
 class ApiSettingsScreen(BaseScreen):
@@ -146,7 +197,7 @@ class ApiSettingsScreen(BaseScreen):
         def num(src: dict[str, Any], key: str, default: int) -> str:
             return str(src.get(key) if src.get(key) is not None else default)
 
-        self.keys, self.keys_as_dict = _load_keys(api_cfg.get("keys"))
+        self.keys, self.keys_as_dict, self.key_scopes, self.explicit_scoped_keys = _load_keys(api_cfg.get("keys"))
 
         self.sel_section = SelectList(
             y=2, x=4, width=16, label="Section", options=list(SECTIONS), selected_index=0, label_width=20
@@ -169,6 +220,14 @@ class ApiSettingsScreen(BaseScreen):
             y=8, x=4, width=22, label="Client IP Header", options=list(CLIENT_IP_HEADERS),
             selected_index=hdr_idx, label_width=20,
         )
+        self.chk_allow_writes = Checkbox(
+            y=9, x=4, label="Allow Write Operations (Nodemap Canvases)",
+            checked=_coerce_bool(api_cfg.get("allow_writes"), False),
+        )
+        self.inp_canvas_dir = TextInput(
+            y=10, x=4, width=34, label="Canvas Storage Dir",
+            value=str(api_cfg.get("nodemap_canvas_dir") or ""), label_width=20, max_len=1024,
+        )
 
         # Keys page
         self.lst_keys = ScrollableList(
@@ -177,6 +236,7 @@ class ApiSettingsScreen(BaseScreen):
         )
         self.btn_add_key = Button(y=12, x=4, label="Add Key", on_click=self.add_key)
         self.btn_remove_key = Button(y=12, x=18, label="Remove Key", on_click=self.remove_key)
+        self.btn_key_scopes = Button(y=12, x=35, label="Key Scopes", on_click=self.edit_key_scopes)
 
         # Limits page
         self.inp_rl_max = TextInput(
@@ -212,8 +272,16 @@ class ApiSettingsScreen(BaseScreen):
         )
 
         self._section_widgets: dict[str, list[Any]] = {
-            "Server": [self.inp_host, self.inp_port, self.chk_reload, self.inp_proxies, self.sel_client_ip_header],
-            "Keys": [self.lst_keys, self.btn_add_key, self.btn_remove_key],
+            "Server": [
+                self.inp_host,
+                self.inp_port,
+                self.chk_reload,
+                self.inp_proxies,
+                self.sel_client_ip_header,
+                self.chk_allow_writes,
+                self.inp_canvas_dir,
+            ],
+            "Keys": [self.lst_keys, self.btn_add_key, self.btn_remove_key, self.btn_key_scopes],
             "Limits": [
                 self.inp_rl_max, self.inp_rl_window, self.inp_lo_max,
                 self.inp_lo_window, self.inp_lo_base, self.inp_lo_max_lock,
@@ -226,9 +294,12 @@ class ApiSettingsScreen(BaseScreen):
             id(self.chk_reload): "reload",
             id(self.inp_proxies): "trusted_proxies",
             id(self.sel_client_ip_header): "client_ip_header",
+            id(self.chk_allow_writes): "allow_writes",
+            id(self.inp_canvas_dir): "nodemap_canvas_dir",
             id(self.lst_keys): "keys",
             id(self.btn_add_key): "keys",
             id(self.btn_remove_key): "keys",
+            id(self.btn_key_scopes): "keys",
             id(self.inp_rl_max): "rate_limit",
             id(self.inp_rl_window): "rate_limit",
             id(self.inp_lo_max): "auth_lockout",
@@ -242,9 +313,15 @@ class ApiSettingsScreen(BaseScreen):
 
     # --- key list helpers ---
 
+    def _scopes_for(self, idx: int) -> tuple[str, ...]:
+        return self.key_scopes.get(idx, ("read",))
+
     def _render_key(self, idx: int) -> str:
         name, key = self.keys[idx]
         label = name if self.keys_as_dict else f"key {idx + 1}"
+        scopes = self._scopes_for(idx)
+        if idx in self.explicit_scoped_keys or set(scopes) != {"read"}:
+            return f"{label}  {mask_key(key)}  [{', '.join(scopes)}]"
         return f"{label}  {mask_key(key)}"
 
     def _refresh_key_list(self) -> None:
@@ -276,7 +353,9 @@ class ApiSettingsScreen(BaseScreen):
             if name in used:
                 ModalDialog(self.stdscr, "Duplicate Name", f"A key named '{name}' already exists.", ["OK"]).show()
                 return False
+        new_idx = len(self.keys)
         self.keys.append((name, key))
+        self.key_scopes[new_idx] = ("read",)
         self._refresh_key_list()
         self.lst_keys.select_last()
         return True
@@ -296,6 +375,54 @@ class ApiSettingsScreen(BaseScreen):
         if choice != "Remove":
             return False
         del self.keys[idx]
+        new_scopes: dict[int, tuple[str, ...]] = {}
+        new_explicit: set[int] = set()
+        for old_i, sc in self.key_scopes.items():
+            if old_i < idx:
+                new_scopes[old_i] = sc
+                if old_i in self.explicit_scoped_keys:
+                    new_explicit.add(old_i)
+            elif old_i > idx:
+                new_scopes[old_i - 1] = sc
+                if old_i in self.explicit_scoped_keys:
+                    new_explicit.add(old_i - 1)
+        self.key_scopes = new_scopes
+        self.explicit_scoped_keys = new_explicit
+        self._refresh_key_list()
+        return True
+
+    def edit_key_scopes(self) -> bool:
+        """Select or edit the scopes for the highlighted API key."""
+        from api.config import VALID_API_SCOPES
+
+        idx = self.lst_keys.get_selected()
+        if idx is None or not 0 <= idx < len(self.keys):
+            return False
+        cur_scopes = self._scopes_for(idx)
+        raw = self._prompt(
+            self.stdscr,
+            "API Key Scopes",
+            "Comma-separated scopes (read, nodemap:write, write):",
+            ", ".join(cur_scopes),
+        )
+        if raw is None:
+            return False
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        invalid = [p for p in parts if p not in VALID_API_SCOPES]
+        if not parts or invalid:
+            ModalDialog(
+                self.stdscr,
+                "Invalid Scopes",
+                "Allowed scopes are: read, nodemap:write, write.",
+                ["OK"],
+            ).show()
+            return False
+        deduped = tuple(dict.fromkeys(parts))
+        self.key_scopes[idx] = deduped
+        self.explicit_scoped_keys.add(idx)
+        if not self.keys_as_dict:
+            self.keys_as_dict = True
+            self.keys = [(n or f"key{i + 1}", k) for i, (n, k) in enumerate(self.keys)]
         self._refresh_key_list()
         return True
 
@@ -318,6 +445,7 @@ class ApiSettingsScreen(BaseScreen):
                 elif hasattr(w, "options"):
                     values.append(w.get_selected())
         values.append(list(self.keys))
+        values.append(dict(self.key_scopes))
         return values
 
     def current_help_topic(self) -> str:
@@ -389,6 +517,12 @@ class ApiSettingsScreen(BaseScreen):
             except ValueError:
                 errors.append(f"Trusted Proxies: '{p}' is not an IP address or CIDR network")
         values["trusted_proxies"] = proxies
+
+        canvas_dir = self.inp_canvas_dir.get_value().strip()
+        if "\x00" in canvas_dir:
+            errors.append("Canvas Storage Dir: cannot contain NUL bytes")
+        else:
+            values["nodemap_canvas_dir"] = canvas_dir
         return values, errors
 
     def draw(self) -> None:
@@ -399,7 +533,7 @@ class ApiSettingsScreen(BaseScreen):
         box_w, help_w = self._layout_widths(max_x)
         section = self.active_section()
         if section == "Server":
-            draw_box(self.stdscr, 3, 2, 7, box_w, title="API Server", color_pair=PAIR_BORDER)
+            draw_box(self.stdscr, 3, 2, 9, box_w, title="API Server", color_pair=PAIR_BORDER)
         elif section == "Limits":
             draw_box(self.stdscr, 3, 2, 3, box_w, title="Rate Limit", color_pair=PAIR_BORDER)
             draw_box(self.stdscr, 6, 2, 6, box_w, title="Auth Lockout", color_pair=PAIR_BORDER)
@@ -459,8 +593,17 @@ class ApiSettingsScreen(BaseScreen):
         return False
 
     def _keys_value(self) -> Any:
-        if self.keys_as_dict:
-            return {name: key for name, key in self.keys}
+        has_scoped = any(idx in self.explicit_scoped_keys or set(self._scopes_for(idx)) != {"read"} for idx in range(len(self.keys)))
+        if self.keys_as_dict or has_scoped:
+            out: dict[str, Any] = {}
+            for idx, (name, key) in enumerate(self.keys):
+                label = name or f"key{idx + 1}"
+                scopes = self._scopes_for(idx)
+                if idx in self.explicit_scoped_keys or set(scopes) != {"read"}:
+                    out[label] = {"key": key, "scopes": list(scopes)}
+                else:
+                    out[label] = key
+            return out
         return [key for _name, key in self.keys]
 
     def save(self) -> bool:
@@ -483,6 +626,8 @@ class ApiSettingsScreen(BaseScreen):
         api_cfg["host"] = parsed["host"]
         api_cfg["port"] = parsed["port"]
         api_cfg["reload"] = self.chk_reload.is_checked()
+        api_cfg["allow_writes"] = self.chk_allow_writes.is_checked()
+        api_cfg["nodemap_canvas_dir"] = parsed["nodemap_canvas_dir"]
         api_cfg["trusted_proxies"] = parsed["trusted_proxies"]
         api_cfg["client_ip_header"] = self.sel_client_ip_header.get_selected()
         api_cfg["keys"] = self._keys_value()

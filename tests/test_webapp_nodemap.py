@@ -326,5 +326,89 @@ class EmbedFramingHeaderTests(unittest.TestCase):
         self.assertEqual(r.headers.get_list("x-frame-options"), ["SAMEORIGIN"])
 
 
+class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
+    """Verify Python NodeMap canvas schema parity with `canvas_model.js` and `/webapi/nodemap/canvases` routes."""
+
+    def test_python_schema_matches_frontend_canvas_model_js(self) -> None:
+        import re
+        from pathlib import Path
+        from webapp.backend.services import nodemap_canvas_schema as pcs
+
+        js_path = (
+            Path(__file__).resolve().parent.parent
+            / "webapp"
+            / "frontend"
+            / "js"
+            / "views"
+            / "nodemap"
+            / "canvas_model.js"
+        )
+        js_src = js_path.read_text(encoding="utf-8")
+
+        m_types = re.search(r"export const NODE_TYPES\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.S)
+        self.assertIsNotNone(m_types)
+        js_node_types = tuple(re.findall(r'"([^"]+)"', m_types.group(1)))
+        self.assertEqual(tuple(pcs.NODE_TYPES), js_node_types)
+
+        m_locks = re.search(r"export const LOCK_KINDS\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.S)
+        self.assertIsNotNone(m_locks)
+        js_lock_kinds = tuple(re.findall(r'"([a-z0-9_-]+)"', m_locks.group(1)))
+        for lk in pcs.LOCK_KINDS:
+            if lk:
+                self.assertIn(lk, js_lock_kinds)
+
+        # Normalization invariants: dangling/self-loop edge pruning and group cycle pruning
+        doc = pcs.normalize_canvas(
+            {
+                "schema": "kip-nodemap-canvas",
+                "version": 1,
+                "nodes": [
+                    {"id": "g1", "type": "group", "title": "G1", "groupId": "g2"},
+                    {"id": "g2", "type": "group", "title": "G2", "groupId": "g1"},
+                    {"id": "n1", "type": "struct", "data": {"name": "foo"}},
+                ],
+                "edges": [
+                    {"id": "e_self", "from": "n1", "to": "n1"},
+                    {"id": "e_dangling", "from": "n1", "to": "missing"},
+                    {"id": "e_ok", "from": "n1", "to": "g1"},
+                ],
+            }
+        )
+        self.assertIsNotNone(doc)
+        by_id = {n["id"]: n for n in doc["nodes"]}
+        # Cycle between g1 and g2 must be broken
+        self.assertFalse(by_id["g1"]["groupId"] == "g2" and by_id["g2"]["groupId"] == "g1")
+        # Self-loop and dangling edges pruned
+        self.assertEqual([e["id"] for e in doc["edges"]], ["e_ok"])
+
+    def test_webapi_nodemap_canvases_endpoints(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from webapp.backend.services.nodemap_canvas_service import nodemap_canvas_service
+
+        app = FastAPI()
+        app.include_router(nodemap_router)
+        client = TestClient(app)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("webapp.backend.services.nodemap_canvas_service.get_nodemap_canvas_dir", return_value=Path(tmp)):
+                nodemap_canvas_service.create_canvas(
+                    canvas_id="demo-map",
+                    name="Demo Canvas",
+                    description="Saved for UI test",
+                    version="v3.0",
+                    canvas={"nodes": [{"id": "n1", "type": "note", "title": "Note", "data": {"text": "hi"}}], "edges": []},
+                )
+                r_list = client.get("/webapi/nodemap/canvases")
+                self.assertEqual(r_list.status_code, 200)
+                self.assertEqual(r_list.json()["total"], 1)
+                self.assertEqual(r_list.json()["items"][0]["id"], "demo-map")
+
+                r_get = client.get("/webapi/nodemap/canvases/demo-map")
+                self.assertEqual(r_get.status_code, 200)
+                self.assertEqual(r_get.json()["name"], "Demo Canvas")
+                self.assertEqual(len(r_get.json()["canvas"]["nodes"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

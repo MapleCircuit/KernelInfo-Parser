@@ -165,6 +165,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "port": 8001,
         "reload": False,
         "default_version": "v3.0",
+        "allow_writes": False,
+        "nodemap_canvas_dir": "",
         "keys": [],
         "rate_limit": {
             "max_requests": 120,
@@ -680,6 +682,24 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         api_sec["client_ip_header"] = normalize_api_client_ip_header(api_sec.get("client_ip_header"))
 
+    env_allow_writes = _get_user_env("API_ALLOW_WRITES")
+    if env_allow_writes is None:
+        env_allow_writes = _get_user_env("KIP_API_ALLOW_WRITES")
+    if env_allow_writes is not None:
+        api_sec["allow_writes"] = _coerce_bool(env_allow_writes, api_sec.get("allow_writes", False))
+    else:
+        api_sec["allow_writes"] = _coerce_bool(api_sec.get("allow_writes"), False)
+
+    env_canvas_dir = (
+        _get_user_env("API_NODEMAP_CANVAS_DIR")
+        or _get_user_env("KIP_NODEMAP_CANVAS_DIR")
+        or _get_user_env("NODEMAP_CANVAS_DIR")
+    )
+    if env_canvas_dir is not None:
+        api_sec["nodemap_canvas_dir"] = str(env_canvas_dir).strip()
+    else:
+        api_sec["nodemap_canvas_dir"] = str(api_sec.get("nodemap_canvas_dir") or "").strip()
+
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
         parser_sec["table_engine"] = env_p_te
@@ -892,6 +912,22 @@ def get_webapp_config() -> dict[str, Any]:
 def get_api_config() -> dict[str, Any]:
     """Retrieve active standalone AI API configuration section."""
     return get_config().get("api", copy.deepcopy(DEFAULT_CONFIG["api"]))
+
+
+def get_nodemap_canvas_dir() -> Path:
+    """Resolve persistent directory for saved NodeMap canvas JSON files (`api.nodemap_canvas_dir`).
+
+    Shared by both `api/` and `webapp/` services outside `cache_engine`. Relative paths resolve against
+    `REPO_ROOT`; an empty value defaults to `<config_dir>/nodemap-canvases` (or `<REPO_ROOT>/nodemap-canvases`).
+    """
+    api_cfg = get_api_config()
+    webapp_cfg = get_webapp_config()
+    raw = str(api_cfg.get("nodemap_canvas_dir") or webapp_cfg.get("nodemap_canvas_dir") or "").strip()
+    if raw:
+        p = Path(os.path.expanduser(raw))
+        return (p if p.is_absolute() else REPO_ROOT / p).resolve()
+    base = _LOADED_CONFIG_PATH.parent if _LOADED_CONFIG_PATH is not None else REPO_ROOT
+    return (base / "nodemap-canvases").resolve()
 
 
 def get_parser_config() -> dict[str, Any]:
@@ -1246,7 +1282,16 @@ def prune_default_feature_overrides(slug: str | None, overrides: Mapping[str, An
 
 def repo_feature_enabled(entry: dict[str, Any] | None, feature: str) -> bool:
     """True when `feature` is enabled for repository `entry`."""
-    return bool(resolve_repo_features(entry).get(feature, False))
+    resolved = resolve_repo_features(entry)
+    if feature in ("api", "kapi"):
+        raw_feats = entry.get("features") if isinstance(entry, Mapping) else None
+        if isinstance(raw_feats, Mapping):
+            if "kapi" in raw_feats and isinstance(raw_feats["kapi"], bool):
+                return raw_feats["kapi"]
+            if "api" in raw_feats and isinstance(raw_feats["api"], bool):
+                return raw_feats["api"]
+        return bool(resolved.get("api", False))
+    return bool(resolved.get(feature, False))
 
 
 PROJECT_INSIGHTS_DEFS: tuple[dict[str, Any], ...] = (

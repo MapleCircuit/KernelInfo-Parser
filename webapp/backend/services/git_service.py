@@ -144,7 +144,7 @@ def _cached_git_file_history(
         return None, []
     args = [
         "log",
-        f"-n{max(1, min(limit, 200))}",
+        f"-n{max(1, min(limit, 2000))}",
         "--format=%H%x00%an%x00%ae%x00%at%x00%s",
         rev,
         "--",
@@ -497,7 +497,7 @@ class GitService:
         rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
-            last_changed, commits = _cached_git_file_history(rev, rel_path, max(1, min(limit, 200)), str(get_repo_dir()))
+            last_changed, commits = _cached_git_file_history(rev, rel_path, max(1, min(limit, 2000)), str(get_repo_dir()))
         except subprocess.TimeoutExpired:
             raise HTTPException(
                 status_code=504,

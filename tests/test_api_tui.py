@@ -222,6 +222,35 @@ class TestApiSettingsScreen(unittest.TestCase):
         screen.cancel()
         self.assertTrue(app.popped)
 
+    def test_allow_writes_canvas_dir_and_scoped_keys(self) -> None:
+        cfg = {
+            "api": {
+                "allow_writes": True,
+                "nodemap_canvas_dir": "/tmp/custom-canvases",
+                "keys": {
+                    "reader": "readsecret1",
+                    "writer": {"key": "writesecret2", "scopes": ["read", "nodemap:write"]},
+                },
+            }
+        }
+        screen, app, _ = _screen(cfg)
+        self.assertTrue(screen.chk_allow_writes.is_checked())
+        self.assertEqual(screen.inp_canvas_dir.get_value(), "/tmp/custom-canvases")
+        self.assertIn("[read, nodemap:write]", screen._render_key(1))
+
+        # Edit scopes on reader key
+        screen.lst_keys.selected_index = 0
+        with patch.object(ApiSettingsScreen, "_prompt", return_value="read, nodemap:write"):
+            self.assertTrue(screen.edit_key_scopes())
+        self.assertTrue(screen.save())
+        saved_keys = app.config["api"]["keys"]
+        self.assertEqual(
+            saved_keys["reader"],
+            {"key": "readsecret1", "scopes": ["read", "nodemap:write"]},
+        )
+        self.assertTrue(app.config["api"]["allow_writes"])
+        self.assertEqual(app.config["api"]["nodemap_canvas_dir"], "/tmp/custom-canvases")
+
 
 class TestApiConfigScope(unittest.TestCase):
     def setUp(self) -> None:

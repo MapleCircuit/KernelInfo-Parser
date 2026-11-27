@@ -24,6 +24,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.config import reset_active_repository, set_active_repository
 from api.routers import v1 as v1_module
+from api.security import has_write_scope
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,12 @@ class McpTool:
     input_schema: dict[str, Any]
     dependencies: tuple[Callable[[], Any], ...] = ()
     list_params: frozenset[str] = field(default_factory=frozenset)
+    http_method: str = "GET"
+    required_scope: str | None = None
+    annotations: dict[str, bool] = field(default_factory=lambda: dict(TOOL_ANNOTATIONS))
+    body_param_name: str | None = None
+    body_model: type[BaseModel] | None = None
+    direct_param_names: frozenset[str] = field(default_factory=frozenset)
 
     def describe(self) -> dict[str, Any]:
         """`tools/list` entry for this tool."""
@@ -104,7 +111,7 @@ class McpTool:
             "title": self.title,
             "description": self.description,
             "inputSchema": self.input_schema,
-            "annotations": {"title": self.title, **TOOL_ANNOTATIONS},
+            "annotations": {"title": self.title, **self.annotations},
         }
 
 
@@ -118,65 +125,151 @@ def _is_list_annotation(annotation: Any) -> bool:
     return any(get_origin(arg) is list for arg in get_args(annotation))
 
 
-def _clean_property(prop: dict[str, Any]) -> dict[str, Any]:
-    """Drop pydantic titles and collapse `anyOf: [X, null]` into `X` (an omitted argument means null)."""
-    out = {k: v for k, v in prop.items() if k != "title"}
+def _deref_schema(node: Any, defs: dict[str, Any], seen: set[str] | None = None) -> Any:
+    """Recursively inline/dereference Pydantic `$defs` / `$ref` pointers."""
+    if not isinstance(node, dict):
+        if isinstance(node, list):
+            return [_deref_schema(item, defs, seen) for item in node]
+        return node
+    active_seen = set(seen or ())
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        ref_name = ref[len("#/$defs/") :]
+        if ref_name in defs and ref_name not in active_seen:
+            active_seen.add(ref_name)
+            target = _deref_schema(dict(defs[ref_name]), defs, active_seen)
+            overlay = {k: v for k, v in node.items() if k != "$ref"}
+            return {**target, **_deref_schema(overlay, defs, active_seen)}
+        return {"type": "object"}
+    return {k: _deref_schema(v, defs, active_seen) for k, v in node.items() if k != "$defs"}
+
+
+def _clean_property(prop: dict[str, Any], defs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Drop pydantic titles, inline `$ref`, and collapse `anyOf: [X, null]` into `X`."""
+    derefed = _deref_schema(prop, defs or {}) if defs else prop
+    out = {k: v for k, v in derefed.items() if k not in ("title", "$defs", "$ref")}
     variants = out.get("anyOf")
     if isinstance(variants, list):
         non_null = [v for v in variants if v != {"type": "null"}]
-        if len(non_null) == 1 and len(non_null) < len(variants):
+        if non_null:
             out.pop("anyOf")
-            out = {**non_null[0], **out}
+            primary = _clean_property(non_null[0], defs) if isinstance(non_null[0], dict) else {}
+            out = {**primary, **out}
     if out.get("default", "") is None:
         out.pop("default")
+    if "type" not in out:
+        out["type"] = "object"
     if isinstance(out.get("items"), dict):
-        out["items"] = _clean_property(out["items"])
+        cleaned_items = _clean_property(out["items"], defs) if out["items"] else {"type": "string"}
+        out["items"] = cleaned_items
+    elif out.get("type") == "array" and "items" not in out:
+        out["items"] = {"type": "string"}
+    if isinstance(out.get("properties"), dict):
+        out["properties"] = {k: _clean_property(v, defs) for k, v in out["properties"].items()}
+    if isinstance(out.get("additionalProperties"), dict):
+        out["additionalProperties"] = _clean_property(out["additionalProperties"], defs)
     return out
 
 
-def _build_tool(route: APIRoute, catalog: dict[str, dict[str, Any]]) -> McpTool:
+def _annotations_for_route(http_method: str, required_scope: str | None, tool_name: str) -> dict[str, bool]:
+    if required_scope is None:
+        return dict(TOOL_ANNOTATIONS)
+    is_delete = http_method == "DELETE"
+    is_idempotent = http_method in ("PUT", "DELETE") or tool_name == "layout_nodemap_canvas"
+    return {
+        "readOnlyHint": False,
+        "destructiveHint": is_delete,
+        "idempotentHint": is_idempotent,
+        "openWorldHint": False,
+    }
+
+
+def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]], http_method: str) -> McpTool:
     endpoint = route.endpoint
     name = endpoint.__name__
     fields: dict[str, Any] = {}
     list_params: set[str] = set()
+    direct_param_names: set[str] = set()
+
     for param in [*route.dependant.path_params, *route.dependant.query_params]:
         info = param.field_info
         annotation = Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation
         alias = param.alias if param.alias != param.name else None
         default = ... if param.required else param.default
         fields[param.name] = (annotation, Field(default, alias=alias))
+        direct_param_names.add(param.name)
         if _is_list_annotation(info.annotation):
             list_params.add(param.alias)
+            list_params.add(param.name)
+
+    body_param_name: str | None = None
+    body_model: type[BaseModel] | None = None
+    for bparam in route.dependant.body_params:
+        btype = bparam.field_info.annotation
+        if isinstance(btype, type) and issubclass(btype, BaseModel):
+            body_param_name = bparam.name
+            body_model = btype
+            for bfname, bfinfo in btype.model_fields.items():
+                if bfname == "repo" or bfinfo.alias == "repo" or bfname in fields:
+                    continue
+                b_annotation = Annotated[(bfinfo.annotation, *bfinfo.metadata)] if bfinfo.metadata else bfinfo.annotation
+                b_alias = bfinfo.alias if bfinfo.alias and bfinfo.alias != bfname else None
+                if bfinfo.is_required():
+                    b_field = Field(..., alias=b_alias, description=bfinfo.description)
+                elif bfinfo.default_factory is not None:
+                    b_field = Field(default_factory=bfinfo.default_factory, alias=b_alias, description=bfinfo.description)
+                else:
+                    b_field = Field(default=bfinfo.default, alias=b_alias, description=bfinfo.description)
+                fields[bfname] = (b_annotation, b_field)
+                if _is_list_annotation(bfinfo.annotation):
+                    list_params.add(bfname)
+                    if b_alias:
+                        list_params.add(b_alias)
+
     model = create_model(
         f"McpArgs_{name}",
         __config__=ConfigDict(extra="forbid", validate_by_alias=True, validate_by_name=True),
         **fields,
     )
     raw = model.model_json_schema(by_alias=True)
-    properties = {key: _clean_property(value) for key, value in (raw.get("properties") or {}).items()}
+    defs = raw.get("$defs") if isinstance(raw.get("$defs"), dict) else {}
+    properties = {key: _clean_property(value, defs) for key, value in (raw.get("properties") or {}).items()}
     for key, prop in properties.items():
         doc = _PARAM_DOCS.get(key, "")
         if key in list_params:
             doc = f"{doc} List of values; a single string counts as a one-item list.".strip()
         if doc:
             prop.setdefault("description", doc)
-    properties["repo"] = {"type": "string", "maxLength": MAX_REPO_NAME_LENGTH, "description": _PARAM_DOCS["repo"]}
+    properties["repo"] = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_REPO_NAME_LENGTH,
+        "description": _PARAM_DOCS["repo"],
+    }
     schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
     if raw.get("required"):
-        schema["required"] = list(raw["required"])
+        schema["required"] = [r for r in raw["required"] if r != "repo"]
 
     deps: list[Callable[[], Any]] = []
+    required_scope: str | None = None
     for dep in route.dependant.dependencies:
         if dep.path_params or dep.query_params or dep.header_params or dep.dependencies:
             raise RuntimeError(f"MCP tool {name}: unsupported parameterized dependency {dep.call!r}")
         deps.append(dep.call)
+        dep_scope = getattr(dep.call, "__kip_required_scope__", None)
+        if isinstance(dep_scope, str) and dep_scope:
+            required_scope = dep_scope
 
-    entry = catalog.get(route.path, {})
+    entry = catalog.get((http_method, route.path), {})
+    if not required_scope and isinstance(entry.get("scope"), str):
+        required_scope = entry["scope"]
     feature = entry.get("feature")
     summary = entry.get("summary") or name.replace("_", " ")
     doc = " ".join((endpoint.__doc__ or summary).split())
-    description = f"{doc} (REST twin: GET {route.path}"
+    description = f"{doc} (REST twin: {http_method} {route.path}"
     description += f"; requires the `{feature}` repository feature)" if feature else ")"
+    annotations = _annotations_for_route(http_method, required_scope, name)
+
     return McpTool(
         name=name,
         title=summary,
@@ -188,17 +281,40 @@ def _build_tool(route: APIRoute, catalog: dict[str, dict[str, Any]]) -> McpTool:
         input_schema=schema,
         dependencies=tuple(deps),
         list_params=frozenset(list_params),
+        http_method=http_method,
+        required_scope=required_scope,
+        annotations=annotations,
+        body_param_name=body_param_name,
+        body_model=body_model,
+        direct_param_names=frozenset(direct_param_names),
     )
 
 
 def build_tool_registry(routes: list[Any] | None = None) -> dict[str, McpTool]:
-    """Build the tool registry from the `/api/v1/*` GET routes (one tool per handler, in route order)."""
-    catalog = {e["path"]: e for e in v1_module._ENDPOINT_CATALOG}
+    """Build the tool registry from `/api/v1/*` GET routes (unless `mcp=False`) and explicitly marked POST/PUT/DELETE routes."""
+    catalog = {(e["method"], e["path"]): e for e in v1_module._ENDPOINT_CATALOG}
     tools: dict[str, McpTool] = {}
     for route in routes if routes is not None else v1_module.router.routes:
-        if not isinstance(route, APIRoute) or "GET" not in route.methods:
+        if not isinstance(route, APIRoute):
             continue
-        tool = _build_tool(route, catalog)
+        method: str | None = None
+        if "GET" in route.methods:
+            entry = catalog.get(("GET", route.path), {})
+            if entry.get("mcp", True) is not False:
+                method = "GET"
+        else:
+            for candidate in ("POST", "PUT", "DELETE"):
+                if candidate in route.methods:
+                    entry = catalog.get((candidate, route.path), {})
+                    if entry.get("mcp") is False:
+                        continue
+                    has_scope_dep = any(getattr(d.call, "__kip_required_scope__", None) for d in route.dependant.dependencies)
+                    if entry.get("mcp") or has_scope_dep:
+                        method = candidate
+                        break
+        if method is None:
+            continue
+        tool = _build_tool(route, catalog, method)
         if tool.name in tools:
             raise RuntimeError(f"Duplicate MCP tool name: {tool.name}")
         tools[tool.name] = tool
@@ -273,7 +389,21 @@ def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
         validated = tool.model.model_validate(args)
     except ValidationError as exc:
         return _tool_error(422, _validation_detail(exc))
-    kwargs = {key: getattr(validated, key) for key in type(validated).model_fields}
+
+    if tool.body_param_name and tool.body_model is not None:
+        kwargs = {key: getattr(validated, key) for key in tool.direct_param_names if hasattr(validated, key)}
+        set_fields = getattr(validated, "model_fields_set", set())
+        body_data = {
+            key: getattr(validated, key)
+            for key in tool.body_model.model_fields
+            if hasattr(validated, key) and (key in set_fields or getattr(validated, key) is not None)
+        }
+        try:
+            kwargs[tool.body_param_name] = tool.body_model.model_validate(body_data)
+        except ValidationError as exc:
+            return _tool_error(422, _validation_detail(exc))
+    else:
+        kwargs = {key: getattr(validated, key) for key in type(validated).model_fields}
 
     token = None
     repo_name = (repo or "").strip()
@@ -332,10 +462,19 @@ def _initialize(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def visible_tools(scopes: frozenset[str] | None = None) -> list[McpTool]:
+    """Return tools visible to the current caller (write-scoped tools hidden when disallowed)."""
+    return [
+        tool
+        for tool in TOOLS.values()
+        if tool.required_scope is None or has_write_scope(tool.required_scope, scopes)
+    ]
+
+
 def _tools_list(params: dict[str, Any]) -> dict[str, Any]:
     if params.get("cursor") not in (None, ""):
         raise McpError(INVALID_PARAMS, "Invalid cursor: this server returns every tool in one page.")
-    return {"tools": [tool.describe() for tool in TOOLS.values()]}
+    return {"tools": [tool.describe() for tool in visible_tools()]}
 
 
 def _tools_call(params: dict[str, Any]) -> dict[str, Any]:

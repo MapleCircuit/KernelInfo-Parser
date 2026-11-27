@@ -6,9 +6,26 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from webapp.backend.config import require_feature
+from webapp.backend.services.nodemap_canvas_service import nodemap_canvas_service
 from webapp.backend.services.nodemap_service import nodemap_service
 
 router = APIRouter(prefix="/webapi/nodemap", tags=["nodemap"], dependencies=[Depends(require_feature("nodemap"))])
+
+
+@router.get("/canvases")
+def list_canvases(
+    q: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """List server-side saved NodeMap canvases for the active repository."""
+    return nodemap_canvas_service.list_canvases(q=q, limit=limit, offset=offset)
+
+
+@router.get("/canvases/{canvas_id}")
+def get_canvas(canvas_id: str) -> dict[str, Any]:
+    """Load a server-side saved NodeMap canvas document by ID."""
+    return nodemap_canvas_service.get_canvas(canvas_id)
 
 
 @router.get("/{version_name}/struct/{name}")

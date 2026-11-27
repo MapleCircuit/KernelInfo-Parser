@@ -244,7 +244,7 @@ export class NodeMapController {
     this.searchBar.mount(this.wrapEl);
     this.tourPlayer.mount(this.wrapEl);
     this.subscribe();
-    this._seededAtMount = Boolean(Array.isArray(tabData?.initialNodes) || tabData?.initialCanvas);
+    this._seededAtMount = Boolean(Array.isArray(tabData?.initialNodes) || tabData?.initialCanvas || tabData?.canvasId);
     this._incomingAtMount = this._seededAtMount ? [] : this.consumeIncoming(tabData);
     if (this._seededAtMount) this.consumeIncoming(tabData);
     this.applyTransform();
@@ -632,6 +632,12 @@ export class NodeMapController {
     if (!tab) return [];
     const added = [];
     let seeded = false;
+    if (tab.canvasId && tab.canvasId !== this._loadedServerCanvasId) {
+      seeded = true;
+      this.loadServerCanvas(tab.canvasId, { tourId: tab.tourId || "" });
+    } else if (tab.canvasId && tab.canvasId === this._loadedServerCanvasId && tab.tourId && this.tourPlayer?.tourId !== tab.tourId) {
+      this.tourPlayer?.start?.(tab.tourId);
+    }
     if (tab.initialCanvas && typeof tab.initialCanvas === "object") {
       const imported = M.normalizeCanvas(tab.initialCanvas);
       if (imported) {
@@ -2265,6 +2271,42 @@ export class NodeMapController {
     this.commit({ save: true, record });
     if (fit && canvas.nodes.length) this.fitView(false);
     return true;
+  }
+
+  async loadServerCanvas(canvasId, { tourId = "" } = {}) {
+    const cid = String(canvasId || "").trim();
+    if (!cid) return false;
+    this._loadedServerCanvasId = cid;
+    this._storeLoading = true;
+    try {
+      const client = this.api || api;
+      const res = await client.getNodemapCanvas(cid);
+      if (this._loadedServerCanvasId !== cid) return false;
+      const doc = res?.canvas;
+      if (!doc || typeof doc !== "object") {
+        toast.error?.(`Canvas "${cid}" is empty or invalid`);
+        return false;
+      }
+      const ok = this.loadCanvasDocument(doc, { record: false, fit: true });
+      if (ok && res?.name && this.tab) {
+        this.tab.title = String(res.name);
+        state.updateTabState?.(this.tab.id, { title: this.tab.title });
+      }
+      const targetTour = String(tourId || this.tab?.tourId || "").trim();
+      if (ok && targetTour && Array.isArray(this.canvas?.tours) && this.canvas.tours.some((t) => t.id === targetTour)) {
+        this.tourPlayer?.start?.(targetTour);
+      }
+      return ok;
+    } catch (err) {
+      if (this._loadedServerCanvasId === cid) {
+        this._loadedServerCanvasId = "";
+      }
+      toast.error?.(`Failed to load canvas "${cid}": ${err?.message || err}`);
+      return false;
+    } finally {
+      this._storeLoading = false;
+      flushPendingHellos(this);
+    }
   }
 
   svgOptions({ foreign = true } = {}) {

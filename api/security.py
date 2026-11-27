@@ -11,18 +11,78 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
+from fastapi import HTTPException
 from starlette.responses import JSONResponse
 
-from api.config import get_api_server_config, normalize_api_keys
+from api.config import (
+    DEFAULT_API_SCOPES,
+    ApiKeyEntry,
+    get_api_server_config,
+    normalize_api_keys,
+    normalize_api_scopes,
+)
 
 MAX_TRACKED_IPS = 4096
 MAX_TRACKED_KEYS = 4096
 
+_ACTIVE_API_SCOPES: ContextVar[frozenset[str]] = ContextVar("active_api_scopes", default=DEFAULT_API_SCOPES)
+_ACTIVE_API_KEY_ID: ContextVar[str | None] = ContextVar("active_api_key_id", default=None)
+
 _BEARER_RE = re.compile(r"(Bearer\s+)[^\s,;\"']+", re.IGNORECASE)
 _API_KEY_KV_RE = re.compile(r"(X-API-Key\s*[:=]\s*)[^\s,;\"']+", re.IGNORECASE)
+
+
+def get_active_api_scopes() -> frozenset[str]:
+    """Return the active caller's API scopes for the current request/stdio context."""
+    return _ACTIVE_API_SCOPES.get()
+
+
+def set_active_api_scopes(scopes: Iterable[str]) -> Any:
+    """Bind `scopes` into `_ACTIVE_API_SCOPES` and return the reset token."""
+    return _ACTIVE_API_SCOPES.set(frozenset(str(s).strip() for s in scopes if str(s).strip()))
+
+
+def reset_active_api_scopes(token: Any) -> None:
+    """Reset `_ACTIVE_API_SCOPES` using a token from `set_active_api_scopes()`."""
+    if token is not None:
+        _ACTIVE_API_SCOPES.reset(token)
+
+
+def get_active_api_key_id() -> str | None:
+    """Return the authenticated API key identifier for the current request context, if any."""
+    return _ACTIVE_API_KEY_ID.get()
+
+
+def has_write_scope(scope_name: str = "nodemap:write", scopes: Iterable[str] | None = None) -> bool:
+    """Return True only when `api.allow_writes` is enabled and `scopes` (or active context) has `scope_name` or `'write'`."""
+    if not get_api_server_config().get("allow_writes", False):
+        return False
+    effective = frozenset(scopes) if scopes is not None else _ACTIVE_API_SCOPES.get()
+    return scope_name in effective or "write" in effective
+
+
+def require_write_scope(scope_name: str = "nodemap:write") -> Callable[[], None]:
+    """FastAPI dependency returning HTTP 403 whenever `api.allow_writes` is False or caller lacks `scope_name`."""
+
+    def _check() -> None:
+        if not get_api_server_config().get("allow_writes", False):
+            raise HTTPException(
+                status_code=403,
+                detail="Write operations are disabled on this API server (api.allow_writes is false).",
+            )
+        scopes = _ACTIVE_API_SCOPES.get()
+        if scope_name not in scopes and "write" not in scopes:
+            raise HTTPException(
+                status_code=403,
+                detail=f"API key lacks required write scope '{scope_name}'.",
+            )
+
+    _check.__kip_required_scope__ = scope_name  # type: ignore[attr-defined]
+    return _check
 
 
 def parse_trusted_proxies(entries: Iterable[str] | None) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -100,10 +160,16 @@ def extract_client_ip(
 
 
 def extract_presented_key(scope: dict[str, Any]) -> str | None:
-    """Extract an API key from `Authorization: Bearer <key>` or `X-API-Key: <key>`."""
-    x_api_key = _header_value(scope, b"x-api-key")
-    if x_api_key is not None:
-        return x_api_key.strip() or None
+    """Extract an API key from `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+
+    An empty or whitespace-only `X-API-Key` header is treated as absent so it does not shadow a valid
+    `Authorization: Bearer` header.
+    """
+    for key, val in scope.get("headers", ()):
+        if key.lower() == b"x-api-key":
+            cleaned = val.decode("latin-1", errors="replace").strip()
+            if cleaned:
+                return cleaned
 
     auth = _header_value(scope, b"authorization")
     if auth:
@@ -114,31 +180,52 @@ def extract_presented_key(scope: dict[str, Any]) -> str | None:
     return None
 
 
-def verify_api_key_constant_time(candidate: str | None, configured_keys: list[tuple[str, str]]) -> str | None:
+def _coerce_key_entry(entry: ApiKeyEntry | tuple[Any, ...], idx: int = 0) -> ApiKeyEntry:
+    if isinstance(entry, ApiKeyEntry):
+        return entry
+    if isinstance(entry, tuple) and len(entry) >= 2:
+        key_id = str(entry[0]).strip() or f"key_{idx}"
+        secret = str(entry[1])
+        scopes = (
+            normalize_api_scopes(entry[2])
+            if len(entry) >= 3 and entry[2] is not None
+            else DEFAULT_API_SCOPES
+        ) or DEFAULT_API_SCOPES
+        return ApiKeyEntry(id=key_id, secret=secret, scopes=scopes)
+    raise TypeError(f"Unsupported API key entry: {entry!r}")
+
+
+def verify_api_key_constant_time(
+    candidate: str | None,
+    configured_keys: Iterable[ApiKeyEntry | tuple[Any, ...]],
+) -> ApiKeyEntry | None:
     """Compare `candidate` against all configured keys in constant time without short-circuiting.
 
-    Returns the matched key name or None. Always returns None when `configured_keys` is empty.
+    Returns the matched `ApiKeyEntry` (`id`, `secret`, `scopes`) or None. Always returns None when
+    `configured_keys` is empty.
     """
-    if not configured_keys:
+    entries = [_coerce_key_entry(e, idx) for idx, e in enumerate(configured_keys or ())]
+    if not entries:
         return None
     # Fixed-length SHA-256 digests on both sides: the comparison time depends on neither key's length
     cand_digest = hashlib.sha256((candidate or "").encode("utf-8")).digest()
     cand_non_empty = bool(candidate)
-    matched_id: str | None = None
-    for key_id, secret in configured_keys:
-        ok = hmac.compare_digest(cand_digest, hashlib.sha256(secret.encode("utf-8")).digest())
-        if ok and cand_non_empty and matched_id is None:
-            matched_id = key_id
-    return matched_id
+    matched: ApiKeyEntry | None = None
+    for entry in entries:
+        ok = hmac.compare_digest(cand_digest, hashlib.sha256(entry.secret.encode("utf-8")).digest())
+        if ok and cand_non_empty and matched is None:
+            matched = entry
+    return matched
 
 
-def redact_sensitive_text(text: str, configured_keys: Iterable[tuple[str, str]] = ()) -> str:
+def redact_sensitive_text(text: str, configured_keys: Iterable[ApiKeyEntry | tuple[Any, ...]] = ()) -> str:
     """Scrub `Authorization: Bearer ...`, `X-API-Key`, and raw configured secrets from text."""
     if not text:
         return text
     cleaned = _BEARER_RE.sub(r"\1[REDACTED]", text)
     cleaned = _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
-    for _name, secret in configured_keys:
+    for entry in configured_keys:
+        secret = entry.secret if isinstance(entry, ApiKeyEntry) else (entry[1] if len(entry) >= 2 else "")
         if secret:
             cleaned = cleaned.replace(secret, "[REDACTED]")
     return cleaned
@@ -293,6 +380,7 @@ class ApiAuthMiddleware:
 
         keys, rate_limit, auth_lockout, trusted_networks, ip_header = self._runtime_policy()
         client_ip = extract_client_ip(scope, trusted_networks, ip_header)
+        scope["client_ip"] = client_ip
         now = self._clock()
 
         # 1. Pre-auth IP lockout check (never reveal key validity while locked out)
@@ -314,8 +402,8 @@ class ApiAuthMiddleware:
 
         # 2. Constant-time API key authentication (fail closed when no keys are configured)
         presented = extract_presented_key(scope)
-        key_id = verify_api_key_constant_time(presented, keys)
-        if key_id is None:
+        matched_key = verify_api_key_constant_time(presented, keys)
+        if matched_key is None:
             with self._lock:
                 self._record_failure(client_ip, now, auth_lockout)
             resp = JSONResponse(
@@ -325,6 +413,11 @@ class ApiAuthMiddleware:
             )
             await resp(scope, receive, send)
             return
+
+        key_id = matched_key.id
+        key_scopes = matched_key.scopes
+        scope["api_key_id"] = key_id
+        scope["api_key_scopes"] = key_scopes
 
         # 3. Reset failure streak on successful auth and enforce per-key + per-IP rate limits
         max_requests = max(1, int(rate_limit.get("max_requests", 120)))
@@ -353,9 +446,13 @@ class ApiAuthMiddleware:
             await resp(scope, receive, send)
             return
 
-        scope["api_key_id"] = key_id
-        scope["client_ip"] = client_ip
-        await self.app(scope, receive, send)
+        tok_scopes = _ACTIVE_API_SCOPES.set(key_scopes)
+        tok_key = _ACTIVE_API_KEY_ID.set(key_id)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _ACTIVE_API_KEY_ID.reset(tok_key)
+            _ACTIVE_API_SCOPES.reset(tok_scopes)
 
 
 def _has_uvicorn_access_handler() -> bool:

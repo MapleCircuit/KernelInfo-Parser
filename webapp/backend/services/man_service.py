@@ -151,6 +151,11 @@ def _man_repo_or_404() -> dict[str, Any]:
     return entry
 
 
+def _repo_dir() -> Path:
+    """Absolute Git work tree of the configured `man-pages` repository."""
+    return resolve_repo_path(_man_repo_or_404()).resolve()
+
+
 # --------------------------------------------------------------------------- git
 
 

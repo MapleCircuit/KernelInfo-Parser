@@ -258,12 +258,35 @@ class TestAiApiEndpoints(unittest.TestCase):
             self.assertEqual(r_out.json()["items"][0]["name"], "foo_helper")
 
         with patch.object(v1_router.imports_service, "get_imports", return_value={
-            "version": "v3.0", "path": "kernel/foo.c", "arch": "x86_64",
-            "headers": [{"header": "linux/foo.h", "resolved": "include/linux/foo.h", "symbols": []}],
+            "version": "v3.0",
+            "path": "kernel/foo.c",
+            "indexed": True,
+            "layout": "tree",
+            "reachable": True,
+            "arch_used": "x86_64",
+            "context": {"entry_file": "kernel/foo.c", "config_blocks": []},
+            "reason": None,
+            "items": [
+                {
+                    "header": "linux/foo.h",
+                    "resolved_path": "include/linux/foo.h",
+                    "line": 2,
+                    "active": True,
+                    "symbols": [{"name": "foo", "kind": "struct", "def_line": 1, "use_lines": [5], "total_uses": 1}],
+                }
+            ],
         }):
             r_imp = self.client.get("/api/v1/file/imports?path=kernel/foo.c", headers=self.auth)
             self.assertEqual(r_imp.status_code, 200)
-            self.assertEqual(r_imp.json()["headers"][0]["header"], "linux/foo.h")
+            imp_body = r_imp.json()
+            self.assertEqual(imp_body["repo"], "linux")
+            self.assertEqual(imp_body["items"][0]["header"], "linux/foo.h")
+            self.assertTrue(imp_body["indexed"])
+            self.assertEqual(imp_body["layout"], "tree")
+            self.assertTrue(imp_body["reachable"])
+            self.assertEqual(imp_body["arch_used"], "x86_64")
+            self.assertEqual(imp_body["total"], 1)
+            self.assertFalse(imp_body["truncated"])
 
         with patch.object(v1_router._fs_service, "get_file_references", return_value={
             "version": "v3.0", "path": "include/linux/foo.h", "included_by": [{"file": "kernel/foo.c", "line": 2}],
@@ -281,6 +304,7 @@ class TestAiApiEndpoints(unittest.TestCase):
             r_sym = self.client.get("/api/v1/symbols/search?q=foo&limit=1", headers=self.auth)
             self.assertEqual(r_sym.status_code, 200)
             self.assertTrue(r_sym.json()["truncated"])
+            self.assertEqual(r_sym.json()["total"], 2)
             self.assertEqual(r_sym.json()["symbols"][0]["name"], "foo_helper")
 
         with patch.object(v1_router._symbol_service, "get_symbol_detail", return_value={
@@ -289,6 +313,14 @@ class TestAiApiEndpoints(unittest.TestCase):
             r_def = self.client.get("/api/v1/symbols/definition?name=foo_helper", headers=self.auth)
             self.assertEqual(r_def.status_code, 200)
             self.assertEqual(r_def.json()["file_path"], "kernel/foo.c")
+            # Graceful fallback when scope_service.locate raises an unexpected exception
+            with patch("webapp.backend.services.scope_service.scope_service.locate", side_effect=RuntimeError("db offline")):
+                r_def_fallback = self.client.get(
+                    "/api/v1/symbols/definition?name=foo_helper&from_file=kernel/foo.c&line=7",
+                    headers=self.auth,
+                )
+                self.assertEqual(r_def_fallback.status_code, 200)
+                self.assertEqual(r_def_fallback.json()["file_path"], "kernel/foo.c")
 
         self.assertEqual(self.client.get("/api/v1/symbols/definition?name=bad;ident", headers=self.auth).status_code, 400)
 
@@ -309,6 +341,13 @@ class TestAiApiEndpoints(unittest.TestCase):
             r_hov = self.client.get("/api/v1/symbols/hover?name=foo_helper", headers=self.auth)
             self.assertEqual(r_hov.status_code, 200)
             self.assertTrue(r_hov.json()["found"])
+            with patch("webapp.backend.services.scope_service.scope_service.locate", side_effect=RuntimeError("boom")):
+                r_hov_fb = self.client.get(
+                    "/api/v1/symbols/hover?name=foo_helper&from_file=kernel/foo.c&line=7",
+                    headers=self.auth,
+                )
+                self.assertEqual(r_hov_fb.status_code, 200)
+                self.assertTrue(r_hov_fb.json()["found"])
 
         with patch.object(v1_router._pahole_service, "get_struct_layout", return_value={"struct": "foo", "size": 4}):
             r_st = self.client.get("/api/v1/struct?name=foo", headers=self.auth)
@@ -327,6 +366,7 @@ class TestAiApiEndpoints(unittest.TestCase):
         with patch("api.routers.v1.callpath_state", return_value={"state": "done", "result": {"paths": []}}):
             r_cp = self.client.get("/api/v1/callpath?from=main_entry&to=foo_helper", headers=self.auth)
             self.assertEqual(r_cp.status_code, 200)
+            self.assertEqual(r_cp.json()["repo"], "linux")
 
         # Real git grep against the temporary repository
         r_grep = self.client.get("/api/v1/grep?q=foo_helper&path=kernel/", headers=self.auth)
@@ -466,6 +506,851 @@ class TestAiApiEndpoints(unittest.TestCase):
             cfg = core_config.get_config()
             cfg["repositories"][0]["features"] = {"man": False}
             self.assertEqual(self.client.get("/api/v1/man?name=read", headers=self.auth).status_code, 403)
+
+    def test_pagination_offsets_commits_and_man_path_validation(self) -> None:
+        # 1. Non-multiple offset in /api/v1/commits and exact-multiple truncated=False
+        r_exact_mult = self.client.get("/api/v1/commits?limit=1&offset=0", headers=self.auth)
+        self.assertEqual(r_exact_mult.status_code, 200)
+        self.assertEqual(len(r_exact_mult.json()["commits"]), 1)
+        self.assertFalse(r_exact_mult.json()["truncated"])
+        self.assertEqual(r_exact_mult.json()["total"], 1)
+
+        with patch("api.routers.v1.run_commit_query", return_value={
+            "commits": [
+                {"commit_hash": "a" * 40, "subject": "c1"},
+                {"commit_hash": "b" * 40, "subject": "c2"},
+                {"commit_hash": "c" * 40, "subject": "c3"},
+            ],
+            "total": None,
+            "has_more": True,
+        }):
+            r_non_mult = self.client.get("/api/v1/commits?author=Test&limit=2&offset=1", headers=self.auth)
+            self.assertEqual(r_non_mult.status_code, 200)
+            b_nm = r_non_mult.json()
+            self.assertEqual(len(b_nm["commits"]), 2)
+            self.assertEqual(b_nm["commits"][0]["subject"], "c2")
+            self.assertTrue(b_nm["truncated"])
+            self.assertEqual(b_nm["offset"], 1)
+            self.assertEqual(b_nm["limit"], 2)
+
+        # 2. Search/history offset cap validation (offset >= 2000 rejected with 400)
+        for url in (
+            "/api/v1/files/search?q=foo&offset=2000",
+            "/api/v1/kconfig/search?q=FOO&offset=2000",
+            "/api/v1/history/file?path=kernel/foo.c&offset=2000",
+        ):
+            self.assertEqual(self.client.get(url, headers=self.auth).status_code, 400, url)
+
+        # 3. lookup_man(path=...) validates against man_service._repo_dir()
+        r_man_path = self.client.get(
+            "/api/v1/man?repo=man-pages&version=man-pages-6.10&path=man2/read.2",
+            headers=self.auth,
+        )
+        self.assertEqual(r_man_path.status_code, 200)
+        self.assertEqual(r_man_path.json()["mode"], "page")
+        self.assertEqual(
+            self.client.get("/api/v1/man?repo=man-pages&path=../etc/passwd", headers=self.auth).status_code,
+            400,
+        )
+
+    def test_p0_parity_endpoints(self) -> None:
+        # 1. GET /api/v1/file/resolve (header and object modes)
+        self.assertEqual(self.client.get("/api/v1/file/resolve", headers=self.auth).status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/v1/file/resolve?header=linux/foo.h&object=kernel/foo.o", headers=self.auth).status_code,
+            400,
+        )
+        r_hdr = self.client.get(
+            "/api/v1/file/resolve?header=linux/foo.h&from_file=kernel/foo.c",
+            headers=self.auth,
+        )
+        self.assertEqual(r_hdr.status_code, 200)
+        self.assertEqual(r_hdr.json()["repo"], "linux")
+        self.assertEqual(r_hdr.json()["mode"], "include")
+        self.assertEqual(r_hdr.json()["path"], "include/linux/foo.h")
+
+        with patch.object(v1_router._fs_service, "resolve_object", return_value={
+            "found": True, "path": "kernel/foo.c", "kind": "file", "candidates": ["kernel/foo.c"],
+        }):
+            r_obj = self.client.get("/api/v1/file/resolve?object=kernel/foo.o", headers=self.auth)
+            self.assertEqual(r_obj.status_code, 200)
+            self.assertEqual(r_obj.json()["mode"], "object")
+            self.assertEqual(r_obj.json()["path"], "kernel/foo.c")
+
+        # 2. GET /api/v1/implementations (struct and function modes)
+        self.assertEqual(self.client.get("/api/v1/implementations", headers=self.auth).status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/v1/implementations?struct=file_operations&function=foo_read", headers=self.auth).status_code,
+            400,
+        )
+        with patch("api.routers.v1.ops_index_state", return_value={
+            "state": "done",
+            "result": {
+                "version": "v3.0",
+                "struct": "file_operations",
+                "field": "read",
+                "source": "db",
+                "fields": ["read"],
+                "instances": [{"var": "foo_fops", "file": "kernel/foo.c", "line": 4}],
+                "by_field": {"read": [{"func": "foo_helper", "var": "foo_fops", "file": "kernel/foo.c", "line": 4}]},
+            },
+        }):
+            r_impl = self.client.get("/api/v1/implementations?struct=file_operations&field=read", headers=self.auth)
+            self.assertEqual(r_impl.status_code, 200)
+            self.assertEqual(r_impl.json()["repo"], "linux")
+            self.assertEqual(r_impl.json()["mode"], "struct")
+            self.assertEqual(r_impl.json()["struct"], "file_operations")
+
+        with patch("api.routers.v1.ops_uses_state", return_value={
+            "state": "done",
+            "result": {
+                "version": "v3.0",
+                "function": "foo_helper",
+                "source": "db",
+                "uses": [{"struct": "file_operations", "field": "read", "var": "foo_fops", "file": "kernel/foo.c", "line": 4}],
+            },
+        }):
+            r_fn_impl = self.client.get("/api/v1/implementations?function=foo_helper", headers=self.auth)
+            self.assertEqual(r_fn_impl.status_code, 200)
+            self.assertEqual(r_fn_impl.json()["mode"], "function")
+            self.assertEqual(len(r_fn_impl.json()["uses"]), 1)
+
+        # 3. GET /api/v1/commits/{commit_hash}/relations and /released
+        with patch("api.routers.v1._relations_one", return_value={
+            "commit_hash": self.linux_sha, "fixes": [], "fixed_by": [], "mentions": [], "mentioned_by": [], "Duplicate_Commits": [],
+        }):
+            r_rel = self.client.get(f"/api/v1/commits/{self.linux_sha}/relations", headers=self.auth)
+            self.assertEqual(r_rel.status_code, 200)
+            self.assertEqual(r_rel.json()["repo"], "linux")
+            self.assertEqual(r_rel.json()["commit_hash"], self.linux_sha)
+
+        with patch("api.routers.v1._released_one", return_value={
+            "commit_hash": self.linux_sha, "release": "v3.0", "first_rc": None, "contains": ["v3.0"],
+        }):
+            r_rel_in = self.client.get(f"/api/v1/commits/{self.linux_sha}/released", headers=self.auth)
+            self.assertEqual(r_rel_in.status_code, 200)
+            self.assertEqual(r_rel_in.json()["release"], "v3.0")
+
+        # 4. GET /api/v1/symbols/scope and extended /api/v1/symbols/references
+        with patch("webapp.backend.services.scope_service.scope_service.resolve", return_value={
+            "indexed": True, "function": {"name": "foo_helper", "line_s": 3, "line_e": 5}, "locals": [{"name": "x", "kind": "param"}],
+        }):
+            r_sc = self.client.get("/api/v1/symbols/scope?path=kernel/foo.c&line=4", headers=self.auth)
+            self.assertEqual(r_sc.status_code, 200)
+            self.assertEqual(r_sc.json()["repo"], "linux")
+            self.assertTrue(r_sc.json()["indexed"])
+
+        with patch("webapp.backend.services.scope_service.scope_service.locate", return_value=(
+            {
+                "scope": "local",
+                "definition": {"file": "kernel/foo.c", "line_s": 3, "line_e": 5},
+                "definitions": [{"file": "kernel/foo.c", "line_s": 3, "line_e": 5}],
+                "references": [{"file": "kernel/foo.c", "line": 4, "type": "Use"}],
+            },
+            True,
+        )):
+            r_local_xref = self.client.get(
+                "/api/v1/symbols/references?name=x&from_file=kernel/foo.c&line=4&col=12",
+                headers=self.auth,
+            )
+            self.assertEqual(r_local_xref.status_code, 200)
+            self.assertEqual(r_local_xref.json()["scope"], "local")
+            self.assertEqual(r_local_xref.json()["total"], 1)
+
+        with patch.object(v1_router._symbol_service, "get_include_symbols", return_value={
+            "ast_id": 99,
+            "include_text": "<linux/foo.h>",
+            "header_file": "include/linux/foo.h",
+            "symbols": [{"name": "foo", "kind": "struct"}],
+        }):
+            r_inc_xref = self.client.get("/api/v1/symbols/references?name=CPPro_include&ast_id=99", headers=self.auth)
+            self.assertEqual(r_inc_xref.status_code, 200)
+            self.assertEqual(r_inc_xref.json()["header_file"], "include/linux/foo.h")
+            self.assertEqual(r_inc_xref.json()["total"], 1)
+
+        # 5. GET /api/v1/nodemap/struct and /api/v1/nodemap/source
+        r_nm_st = self.client.get("/api/v1/nodemap/struct?name=foo&path=include/linux/foo.h", headers=self.auth)
+        self.assertEqual(r_nm_st.status_code, 200)
+        self.assertEqual(r_nm_st.json()["repo"], "linux")
+        self.assertEqual(r_nm_st.json()["name"], "foo")
+        self.assertEqual(r_nm_st.json()["items"][0]["name"], "a")
+
+        r_nm_src = self.client.get("/api/v1/nodemap/source?path=kernel/foo.c&start=3&end=5", headers=self.auth)
+        self.assertEqual(r_nm_src.status_code, 200)
+        self.assertEqual(r_nm_src.json()["repo"], "linux")
+        self.assertEqual((r_nm_src.json()["start_line"], r_nm_src.json()["end_line"]), (3, 5))
+
+    def test_nodemap_canvas_authoring_expansion_layout_preview_and_export(self) -> None:
+        # 1. Stateless preview works in default read-only mode
+        r_prev = self.client.post(
+            "/api/v1/nodemap/preview",
+            headers=self.auth,
+            json={
+                "name": "Preview Map",
+                "version": "v3.0",
+                "ops": [
+                    {
+                        "op": "add_nodes",
+                        "hydrate": True,
+                        "nodes": [
+                            {"id": "n_struct", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}},
+                            {"id": "n_src", "type": "source", "data": {"path": "kernel/foo.c", "symbol": "foo_helper"}},
+                        ],
+                    },
+                    {
+                        "op": "connect",
+                        "from": "n_struct",
+                        "fromField": "a",
+                        "to": "n_src",
+                        "label": "uses field a",
+                        "lock_kind": "rcu",
+                    },
+                ],
+                "layout": {"mode": "dag"},
+                "export_format": "mermaid",
+            },
+        )
+        self.assertEqual(r_prev.status_code, 200, r_prev.text)
+        prev_body = r_prev.json()
+        self.assertEqual(prev_body["repo"], "linux")
+        self.assertEqual(prev_body["node_count"], 2)
+        self.assertEqual(prev_body["edge_count"], 1)
+        self.assertIn("flowchart LR", prev_body["export"])
+        edge0 = prev_body["canvas"]["edges"][0]
+        self.assertEqual(edge0["fromField"], "2:a")
+        self.assertEqual(edge0["lockKind"], "rcu")
+
+        # 2. Write endpoints are denied (403) when api.allow_writes is False
+        r_denied = self.client.post(
+            "/api/v1/nodemap/canvases",
+            headers=self.auth,
+            json={"id": "vfs-map", "name": "VFS Map"},
+        )
+        self.assertEqual(r_denied.status_code, 403)
+
+        # 3. Enable allow_writes + configure a key with nodemap:write and a read-only key
+        cfg = core_config.get_config()
+        cfg["api"]["allow_writes"] = True
+        cfg["api"]["keys"] = {
+            "reader": {"key": "read-only-secret", "scopes": ["read"]},
+            "writer": {"key": "write-secret", "scopes": ["read", "nodemap:write"]},
+        }
+        client = TestClient(create_app())
+        read_hdr = {"Authorization": "Bearer read-only-secret"}
+        write_hdr = {"Authorization": "Bearer write-secret"}
+
+        # Reader key still gets 403 on write endpoints
+        self.assertEqual(
+            client.post("/api/v1/nodemap/canvases", headers=read_hdr, json={"id": "vfs-map", "name": "VFS"}).status_code,
+            403,
+        )
+
+        # Path traversal in canvas_id is rejected with 400
+        for bad_id in ("../evil", "a/b", "bad.id", ""):
+            r_bad = client.post("/api/v1/nodemap/canvases", headers=write_hdr, json={"id": bad_id, "name": "Bad"})
+            self.assertIn(r_bad.status_code, (400, 422), bad_id)
+
+        # Create a canvas with write_hdr
+        r_create = client.post(
+            "/api/v1/nodemap/canvases",
+            headers=write_hdr,
+            json={"id": "foo-map", "name": "Foo Architecture", "description": "Foo subsystem overview", "version": "v3.0"},
+        )
+        self.assertEqual(r_create.status_code, 200, r_create.text)
+        created = r_create.json()
+        self.assertEqual(created["id"], "foo-map")
+        self.assertEqual(created["revision"], 1)
+        self.assertEqual(created["created_by"], "writer")
+        self.assertEqual(created["webapp_url"], "/#v=v3.0&tab=nodemap&canvas=foo-map")
+
+        # Duplicate create without overwrite fails with 409
+        self.assertEqual(
+            client.post("/api/v1/nodemap/canvases", headers=write_hdr, json={"id": "foo-map", "name": "Dup"}).status_code,
+            409,
+        )
+
+        # Batch ops: add_nodes, add_group, assign_group, connect, annotate, upsert_tour
+        r_ops = client.post(
+            "/api/v1/nodemap/canvases/foo-map/ops",
+            headers=write_hdr,
+            json={
+                "expected_revision": 1,
+                "ops": [
+                    {
+                        "op": "add_nodes",
+                        "hydrate": True,
+                        "nodes": [
+                            {"id": "n_foo", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}},
+                            {"id": "n_fn", "type": "source", "data": {"path": "kernel/foo.c", "symbol": "foo_helper"}},
+                        ],
+                    },
+                    {"op": "add_group", "id": "g_core", "title": "Core", "members": ["n_foo", "n_fn"], "fit_to_members": True},
+                    {"op": "connect", "id": "e_foo_fn", "from": "n_foo", "fromField": "a", "to": "n_fn", "preset": "data_flow"},
+                    {"op": "annotate", "id": "n_note", "target_id": "n_foo", "title": "Lock Note", "text": "Protected by RCU."},
+                    {
+                        "op": "upsert_tour",
+                        "tour": {
+                            "id": "t_walk",
+                            "title": "Walkthrough",
+                            "steps": [{"nodeId": "n_foo", "title": "Step 1", "caption": "Inspect struct foo"}],
+                        },
+                    },
+                ],
+            },
+        )
+        self.assertEqual(r_ops.status_code, 200, r_ops.text)
+        after_ops = r_ops.json()
+        self.assertEqual(after_ops["revision"], 2)
+        self.assertEqual(after_ops["node_count"], 4)  # n_foo, n_fn, g_core, n_note
+        self.assertEqual(after_ops["edge_count"], 2)  # e_foo_fn + note edge
+        self.assertEqual(after_ops["tour_count"], 1)
+
+        # Stale expected_revision returns 409 Conflict
+        r_conflict = client.post(
+            "/api/v1/nodemap/canvases/foo-map/ops",
+            headers=write_hdr,
+            json={"expected_revision": 1, "ops": [{"op": "remove_edges", "ids": ["e_foo_fn"]}]},
+        )
+        self.assertEqual(r_conflict.status_code, 409)
+
+        # Expand canvas (kconfig mode + callgraph mode + impact_map mode)
+        with patch("webapp.backend.services.nodemap_canvas_service._kconfig_service.get_symbol_detail", return_value={
+            "name": "FOO_BAR", "depends_on": ["BAR_DEP"], "selects": ["BAZ_SEL"],
+        }):
+            r_exp = client.post(
+                "/api/v1/nodemap/canvases/foo-map/expand",
+                headers=write_hdr,
+                json={"mode": "kconfig", "symbol": "FOO_BAR", "version": "v3.0", "auto_layout": True},
+            )
+            self.assertEqual(r_exp.status_code, 200, r_exp.text)
+            self.assertGreaterEqual(len(r_exp.json()["added_node_ids"]), 2)
+
+        with patch("webapp.backend.services.nodemap_canvas_service._callgraph_service.get_function_callgraph", return_value={
+            "version": "v3.0", "file_path": "kernel/foo.c", "line_s": 3, "line_e": 5,
+            "callers": [{"name": "main_entry", "file_path": "kernel/foo.c", "line_s": 6, "line_e": 8}],
+            "callees": [],
+        }):
+            r_exp_cg = client.post(
+                "/api/v1/nodemap/canvases/foo-map/expand",
+                headers=write_hdr,
+                json={"mode": "callgraph", "function": "foo_helper", "version": "v3.0", "auto_layout": True},
+            )
+            self.assertEqual(r_exp_cg.status_code, 200, r_exp_cg.text)
+            self.assertGreaterEqual(len(r_exp_cg.json()["added_node_ids"]), 2)
+
+        r_exp_imp = client.post(
+            "/api/v1/nodemap/canvases/foo-map/expand",
+            headers=write_hdr,
+            json={"mode": "impact_map", "seed_kind": "file", "target": "kernel/foo.c", "version": "v3.0"},
+        )
+        self.assertEqual(r_exp_imp.status_code, 200, r_exp_imp.text)
+        self.assertGreaterEqual(len(r_exp_imp.json()["added_node_ids"]), 1)
+
+        # Layout endpoint ("force" and "dag")
+        for mode in ("dag", "force"):
+            r_lay = client.post(
+                "/api/v1/nodemap/canvases/foo-map/layout",
+                headers=write_hdr,
+                json={"mode": mode, "fit_groups": True},
+            )
+            self.assertEqual(r_lay.status_code, 200, r_lay.text)
+
+        # List, Get, and Export (json, mermaid, dot) work with read-only key
+        r_list = client.get("/api/v1/nodemap/canvases?q=Foo", headers=read_hdr)
+        self.assertEqual(r_list.status_code, 200)
+        self.assertEqual(r_list.json()["total"], 1)
+        self.assertEqual(r_list.json()["items"][0]["id"], "foo-map")
+
+        r_get = client.get("/api/v1/nodemap/canvases/foo-map", headers=read_hdr)
+        self.assertEqual(r_get.status_code, 200)
+        self.assertEqual(r_get.json()["id"], "foo-map")
+
+        for fmt, marker in (("json", '"kip-nodemap-canvas"'), ("mermaid", "flowchart"), ("dot", "digraph NodeMap")):
+            r_ex = client.get(f"/api/v1/nodemap/canvases/foo-map/export?format={fmt}", headers=read_hdr)
+            self.assertEqual(r_ex.status_code, 200)
+            self.assertIn(marker, r_ex.json()["content"])
+
+        # Delete canvas
+        r_del = client.delete("/api/v1/nodemap/canvases/foo-map", headers=write_hdr)
+        self.assertEqual(r_del.status_code, 200)
+        self.assertTrue(r_del.json()["deleted"])
+        self.assertEqual(client.get("/api/v1/nodemap/canvases/foo-map", headers=read_hdr).status_code, 404)
+
+    def test_p1_kapi_mail_kconfig_history_pahole_and_maintainers(self) -> None:
+        # 1. KAPI endpoints (summary, syscalls, exports, params, tracepoints, modules, devices)
+        with patch("webapp.backend.services.kapi_service.summary", return_value={
+            "version": "v3.0", "arch": "x86_64", "source": "database", "preparsed": True,
+            "counts": {"syscalls": 300, "exports": 10},
+        }):
+            r_ksum = self.client.get("/api/v1/kapi/summary?arch=x86_64", headers=self.auth)
+            self.assertEqual(r_ksum.status_code, 200)
+            self.assertEqual(r_ksum.json()["repo"], "linux")
+            self.assertEqual(r_ksum.json()["counts"]["syscalls"], 300)
+
+        with patch("webapp.backend.services.kapi_service.syscalls", return_value={
+            "state": "done",
+            "result": {
+                "arch": "x86_64",
+                "srcarch": "x86",
+                "sources": [{"kind": "tbl", "path": "arch/x86/entry/syscalls/syscall_64.tbl"}],
+                "syscalls": [
+                    {"nr": 0, "abi": "common", "name": "read", "entry": "sys_read", "status": "defined"},
+                    {"nr": 1, "abi": "common", "name": "write", "entry": "sys_write", "status": "defined"},
+                ],
+                "unnumbered": [{"name": "old_mmap"}],
+            },
+        }):
+            r_sc = self.client.get("/api/v1/kapi/syscalls?q=read&include_unnumbered=true", headers=self.auth)
+            self.assertEqual(r_sc.status_code, 200)
+            self.assertEqual(r_sc.json()["repo"], "linux")
+            self.assertEqual(r_sc.json()["total"], 1)
+            self.assertEqual(r_sc.json()["syscalls"][0]["name"], "read")
+            self.assertEqual(r_sc.json()["unnumbered_total"], 1)
+
+        with patch("webapp.backend.services.kapi_service.exports", return_value={
+            "state": "done",
+            "result": {
+                "counts": {"EXPORT_SYMBOL": 1, "EXPORT_SYMBOL_GPL": 1},
+                "exports": [
+                    {"symbol": "foo_helper", "variant": "EXPORT_SYMBOL", "namespace": "", "path": "kernel/foo.c", "line": 5},
+                    {"symbol": "bar_gpl", "variant": "EXPORT_SYMBOL_GPL", "namespace": "NS1", "path": "kernel/bar.c", "line": 9},
+                ],
+            },
+        }), patch("webapp.backend.services.kapi_service.export_detail", return_value={
+            "version": "v3.0", "symbol": "foo_helper", "sites": [{"path": "kernel/foo.c", "line": 5, "owner": {"modname": "vmlinux"}}],
+        }):
+            r_ex_list = self.client.get("/api/v1/kapi/exports?variant=EXPORT_SYMBOL_GPL", headers=self.auth)
+            self.assertEqual(r_ex_list.status_code, 200)
+            self.assertEqual(r_ex_list.json()["repo"], "linux")
+            self.assertEqual(r_ex_list.json()["mode"], "list")
+            self.assertEqual(r_ex_list.json()["total"], 1)
+            self.assertEqual(r_ex_list.json()["exports"][0]["symbol"], "bar_gpl")
+
+            r_ex_one = self.client.get("/api/v1/kapi/exports?name=foo_helper", headers=self.auth)
+            self.assertEqual(r_ex_one.status_code, 200)
+            self.assertEqual(r_ex_one.json()["repo"], "linux")
+            self.assertEqual(r_ex_one.json()["mode"], "detail")
+            self.assertEqual(r_ex_one.json()["sites"][0]["path"], "kernel/foo.c")
+
+        with patch("webapp.backend.services.kapi_service.params", return_value={
+            "state": "done",
+            "result": {
+                "arch": "x86_64",
+                "doc_path": "Documentation/kernel-parameters.txt",
+                "params": [
+                    {"kind": "module", "name": "debug", "full_name": "foo.debug", "path": "kernel/foo.c", "description": "Enable debug"},
+                ],
+            },
+        }), patch("webapp.backend.services.kapi_service.param_doc", return_value={
+            "path": "Documentation/kernel-parameters.txt", "line": 12, "text": "foo.debug=\tEnable debug",
+        }):
+            r_pm = self.client.get("/api/v1/kapi/params?q=debug", headers=self.auth)
+            self.assertEqual(r_pm.status_code, 200)
+            self.assertEqual(r_pm.json()["repo"], "linux")
+            self.assertEqual(r_pm.json()["total"], 1)
+            r_pmd = self.client.get("/api/v1/kapi/params?doc_line=12", headers=self.auth)
+            self.assertEqual(r_pmd.status_code, 200)
+            self.assertEqual(r_pmd.json()["mode"], "doc")
+
+        with patch("webapp.backend.services.kapi_service.tracepoints", return_value={
+            "state": "done",
+            "result": {
+                "tracepoints": [
+                    {"name": "sched_switch", "system": "sched", "kind": "event", "path": "include/trace/events/sched.h", "line": 20},
+                ],
+            },
+        }), patch("webapp.backend.services.kapi_service.tracepoint_callsites", return_value={
+            "name": "sched_switch",
+            "call_sites": [{"path": "kernel/sched/core.c", "line": 100, "text": "trace_sched_switch(...)"}],
+            "truncated": False,
+        }):
+            r_tp_list = self.client.get("/api/v1/kapi/tracepoints?system=sched", headers=self.auth)
+            self.assertEqual(r_tp_list.status_code, 200)
+            self.assertEqual(r_tp_list.json()["repo"], "linux")
+            self.assertEqual(r_tp_list.json()["total"], 1)
+
+            r_tp_one = self.client.get("/api/v1/kapi/tracepoints?name=sched_switch", headers=self.auth)
+            self.assertEqual(r_tp_one.status_code, 200)
+            self.assertEqual(r_tp_one.json()["mode"], "detail")
+            self.assertEqual(r_tp_one.json()["call_sites"][0]["path"], "kernel/sched/core.c")
+            self.assertEqual(r_tp_one.json()["tracepoint"]["system"], "sched")
+
+        with patch("webapp.backend.services.kapi_service.modules", return_value={
+            "state": "done",
+            "result": {
+                "arch": "x86_64",
+                "modules": [
+                    {"modname": "e1000e", "target": "drivers/net/e1000e/e1000e.ko", "description": "Intel PRO/1000", "required_symbols": ["E1000E"]},
+                ],
+            },
+        }), patch("webapp.backend.services.kapi_service.module_detail", return_value={
+            "modname": "e1000e", "license": "GPL", "params": [], "exports": [], "maintainers": [],
+        }):
+            r_mod_list = self.client.get("/api/v1/kapi/modules?q=e1000e", headers=self.auth)
+            self.assertEqual(r_mod_list.status_code, 200)
+            self.assertEqual(r_mod_list.json()["repo"], "linux")
+            self.assertEqual(r_mod_list.json()["total"], 1)
+
+            r_mod_one = self.client.get("/api/v1/kapi/modules?name=e1000e", headers=self.auth)
+            self.assertEqual(r_mod_one.status_code, 200)
+            self.assertEqual(r_mod_one.json()["mode"], "detail")
+            self.assertEqual(r_mod_one.json()["license"], "GPL")
+
+        with patch("webapp.backend.services.device_index_service.index_state", return_value={
+            "state": "done",
+            "result": {
+                "tables": 1,
+                "entries": [{"bus": "pci", "vendor": 0x8086, "device": 0x10D3, "table": "e1000_pci_tbl", "path": "drivers/net/e1000e/netdev.c", "line": 50, "text": "PCI_VDEVICE(INTEL, 0x10D3)"}],
+            },
+        }), patch("webapp.backend.services.device_index_service.match_text", return_value={
+            "lines": [{"input": "8086:10d3", "ids": ["pci 8086:10d3"], "matches": [{"module": "e1000e"}]}],
+            "unmatched": [],
+        }):
+            r_dev_list = self.client.get("/api/v1/kapi/devices?bus=pci", headers=self.auth)
+            self.assertEqual(r_dev_list.status_code, 200)
+            self.assertEqual(r_dev_list.json()["repo"], "linux")
+            self.assertEqual(r_dev_list.json()["mode"], "list")
+            self.assertEqual(r_dev_list.json()["total"], 1)
+
+            r_dev_match = self.client.get("/api/v1/kapi/devices?match=8086:10d3", headers=self.auth)
+            self.assertEqual(r_dev_match.status_code, 200)
+            self.assertEqual(r_dev_match.json()["mode"], "match")
+            self.assertEqual(r_dev_match.json()["lines"][0]["matches"][0]["module"], "e1000e")
+
+        # 2. Mail / LKML endpoints (search, message, thread, merged)
+        with patch("webapp.backend.services.mailing_list_service.mailing_list_service.search", return_value={
+            "total": 1, "results": [{"message_id": "msg1@example.com", "subject": "[PATCH] foo"}],
+        }), patch("webapp.backend.services.mailing_list_service.mailing_list_service.get_message", return_value={
+            "message_id": "msg1@example.com", "subject": "[PATCH] foo", "body": "Hello",
+        }), patch("webapp.backend.services.mailing_list_service.mailing_list_service.get_thread", return_value={
+            "thread_id": 42, "messages": [{"message_id": "msg1@example.com", "subject": "[PATCH] foo"}],
+        }), patch("webapp.backend.services.mailing_list_service.mailing_list_service.get_thread_versions", return_value={
+            "series": [{"version": 1, "thread_id": 42}],
+        }), patch("api.routers.mail.merged_commits", return_value={
+            "source": "db", "commits": [{"sha": self.linux_sha, "release": "v3.0"}],
+        }):
+            r_ms = self.client.get("/api/v1/mail/search?q=foo&filter=patch", headers=self.auth)
+            self.assertEqual(r_ms.status_code, 200)
+            self.assertEqual(r_ms.json()["repo"], "linux")
+            self.assertEqual(r_ms.json()["results"][0]["message_id"], "msg1@example.com")
+
+            r_mm = self.client.get("/api/v1/mail/message?mid=msg1@example.com", headers=self.auth)
+            self.assertEqual(r_mm.status_code, 200)
+            self.assertEqual(r_mm.json()["repo"], "linux")
+            self.assertEqual(r_mm.json()["body"], "Hello")
+
+            self.assertEqual(self.client.get("/api/v1/mail/thread", headers=self.auth).status_code, 400)
+            r_mt = self.client.get("/api/v1/mail/thread?tid=42&include_versions=true", headers=self.auth)
+            self.assertEqual(r_mt.status_code, 200)
+            self.assertEqual(r_mt.json()["repo"], "linux")
+            self.assertEqual(r_mt.json()["total"], 1)
+            self.assertEqual(r_mt.json()["versions"]["series"][0]["version"], 1)
+
+            self.assertEqual(self.client.get("/api/v1/mail/merged", headers=self.auth).status_code, 400)
+            r_mrg = self.client.get("/api/v1/mail/merged?mid=msg1@example.com", headers=self.auth)
+            self.assertEqual(r_mrg.status_code, 200)
+            self.assertEqual(r_mrg.json()["repo"], "linux")
+            self.assertEqual(r_mrg.json()["commits"][0]["sha"], self.linux_sha)
+
+        # 3. Kconfig & Kbuild endpoints (graph, solve, defconfigs, history, kbuild)
+        with patch.object(v1_router._kconfig_service, "get_graph", return_value={
+            "symbol": "FOO_BAR", "nodes": [{"id": "FOO_BAR"}], "edges": [],
+        }), patch.object(v1_router._kconfig_service, "autosolve", return_value={
+            "target_symbol": "FOO_BAR", "value": "y", "changes": [{"symbol": "FOO_BAR", "value": "y"}],
+        }), patch.object(v1_router._kconfig_service, "get_defconfigs", return_value={
+            "arch": "x86_64", "defconfigs": ["arch/x86/configs/x86_64_defconfig"],
+        }), patch.object(v1_router._kconfig_service, "list_fragments", return_value={
+            "fragments": ["kernel/configs/kvm_guest.config"],
+        }), patch.object(v1_router._kconfig_service, "get_defconfig_content", return_value={
+            "file_path": "arch/x86/configs/x86_64_defconfig", "content": "CONFIG_FOO_BAR=y\n",
+        }), patch("webapp.backend.services.history_service.history_service.get_kconfig_history", return_value={
+            "symbol": "FOO_BAR", "entries": [{"version": "v3.0", "status": "added"}],
+        }), patch("webapp.backend.services.kbuild_index_service.index_state", return_value={
+            "state": "done", "result": {"arch": "x86_64", "objects": {}, "files": {}},
+        }), patch("webapp.backend.services.kbuild_index_service.objects_for_file", return_value=[
+            {"target": "kernel/foo.o", "modname": "vmlinux"},
+        ]), patch("webapp.backend.services.kbuild_index_service.objects_for_module", return_value={
+            "modules": {"e1000e": {"objects": ["drivers/net/e1000e/netdev.o"], "required_symbols": ["E1000E"]}},
+            "unmatched": [],
+        }), patch("webapp.backend.services.kbuild_index_service.module_gates", return_value=["E1000E"]):
+            r_kg = self.client.get("/api/v1/kconfig/graph?symbol=CONFIG_FOO_BAR", headers=self.auth)
+            self.assertEqual(r_kg.status_code, 200)
+            self.assertEqual(r_kg.json()["repo"], "linux")
+            self.assertEqual(r_kg.json()["symbol"], "FOO_BAR")
+
+            r_ksol = self.client.get("/api/v1/kconfig/solve?symbol=FOO_BAR&value=y&assign=NET=y", headers=self.auth)
+            self.assertEqual(r_ksol.status_code, 200)
+            self.assertEqual(r_ksol.json()["repo"], "linux")
+            self.assertEqual(r_ksol.json()["changes"][0]["symbol"], "FOO_BAR")
+
+            r_kdef = self.client.get("/api/v1/kconfig/defconfigs", headers=self.auth)
+            self.assertEqual(r_kdef.status_code, 200)
+            self.assertEqual(r_kdef.json()["mode"], "list")
+            self.assertIn("arch/x86/configs/x86_64_defconfig", r_kdef.json()["defconfigs"])
+            self.assertIn("kernel/configs/kvm_guest.config", r_kdef.json()["fragments"])
+
+            r_kdef_c = self.client.get("/api/v1/kconfig/defconfigs?file_path=Kconfig", headers=self.auth)
+            self.assertEqual(r_kdef_c.status_code, 200)
+            self.assertEqual(r_kdef_c.json()["mode"], "content")
+
+            r_khist = self.client.get("/api/v1/kconfig/history?symbol=FOO_BAR", headers=self.auth)
+            self.assertEqual(r_khist.status_code, 200)
+            self.assertEqual(r_khist.json()["repo"], "linux")
+            self.assertEqual(r_khist.json()["entries"][0]["version"], "v3.0")
+
+            self.assertEqual(self.client.get("/api/v1/kconfig/kbuild", headers=self.auth).status_code, 400)
+            r_kb_file = self.client.get("/api/v1/kconfig/kbuild?path=kernel/foo.c", headers=self.auth)
+            self.assertEqual(r_kb_file.status_code, 200)
+            self.assertEqual(r_kb_file.json()["mode"], "file")
+            self.assertEqual(r_kb_file.json()["objects"][0]["target"], "kernel/foo.o")
+
+            r_kb_mod = self.client.get("/api/v1/kconfig/kbuild?module=e1000e&gates=true", headers=self.auth)
+            self.assertEqual(r_kb_mod.status_code, 200)
+            self.assertEqual(r_kb_mod.json()["mode"], "modules")
+            self.assertIn("e1000e", r_kb_mod.json()["modules"])
+            self.assertEqual(r_kb_mod.json()["module_gates"], ["E1000E"])
+
+        # 4. History & Pahole (symbol history, line-range commits, struct compare, struct history)
+        with patch("webapp.backend.services.history_service.history_service.get_symbol_history", return_value={
+            "symbol": "foo_helper", "path": "kernel/foo.c", "entries": [{"version": "v3.0", "status": "added"}],
+        }), patch("webapp.backend.services.history_service.history_service.get_change_commits", return_value={
+            "path": "kernel/foo.c", "commits": [{"sha": self.linux_sha, "subject": "Initial commit for v3.0"}],
+        }), patch("webapp.backend.services.pahole_compare.compare", return_value={
+            "struct": "foo", "a": {"size": 4}, "b": {"size": 8}, "members": [],
+        }), patch("webapp.backend.services.pahole_compare.history_state", return_value={
+            "state": "done", "result": {"struct": "foo", "entries": [{"version": "v3.0", "size": 4}]},
+        }):
+            r_sh = self.client.get("/api/v1/history/symbol?path=kernel/foo.c&name=foo_helper", headers=self.auth)
+            self.assertEqual(r_sh.status_code, 200)
+            self.assertEqual(r_sh.json()["repo"], "linux")
+            self.assertEqual(r_sh.json()["symbol"], "foo_helper")
+
+            r_lh = self.client.get("/api/v1/history/lines?path=kernel/foo.c&line_s=3&line_e=5", headers=self.auth)
+            self.assertEqual(r_lh.status_code, 200)
+            self.assertEqual(r_lh.json()["repo"], "linux")
+            self.assertEqual(r_lh.json()["total"], 1)
+
+            r_scmp = self.client.get("/api/v1/struct/compare?name=foo&version_a=v3.0&version_b=master", headers=self.auth)
+            self.assertEqual(r_scmp.status_code, 200)
+            self.assertEqual(r_scmp.json()["repo"], "linux")
+            self.assertEqual(r_scmp.json()["b"]["size"], 8)
+
+            r_shist = self.client.get("/api/v1/struct/history?name=foo", headers=self.auth)
+            self.assertEqual(r_shist.status_code, 200)
+            self.assertEqual(r_shist.json()["repo"], "linux")
+            self.assertEqual(r_shist.json()["entries"][0]["size"], 4)
+
+        # 5. Maintainers (multi-path lookup, match POST, person/developers/credits)
+        with patch.object(v1_router._maintainer_service, "match_maintainers", return_value={
+            "version": "v3.0", "sections": [{"name": "FOO SUBSYSTEM"}], "recipients": [{"email": "alice@example.com"}],
+        }) as m_match, patch.object(v1_router._maintainer_service, "get_person_profile", return_value={
+            "name": "Alice Dev", "email": "alice@example.com", "sections": ["FOO SUBSYSTEM"],
+        }), patch.object(v1_router._maintainer_service, "get_developers", return_value={
+            "version": "v3.0", "developers": [{"name": "Alice Dev", "email": "alice@example.com"}],
+        }), patch.object(v1_router._maintainer_service, "get_credits", return_value={
+            "version": "v3.0", "entries": [{"name": "Alice Dev", "email": "alice@example.com"}],
+        }):
+            r_mp = self.client.get("/api/v1/maintainers?path=kernel/foo.c&path=include/linux/foo.h", headers=self.auth)
+            self.assertEqual(r_mp.status_code, 200)
+            self.assertEqual(r_mp.json()["repo"], "linux")
+            self.assertEqual(r_mp.json()["paths"], ["kernel/foo.c", "include/linux/foo.h"])
+            self.assertEqual(m_match.call_args.kwargs["paths"], ["kernel/foo.c", "include/linux/foo.h"])
+
+            r_mmatch = self.client.post(
+                "/api/v1/maintainers/match",
+                headers=self.auth,
+                json={"patch_text": "--- a/kernel/foo.c\n+++ b/kernel/foo.c\n", "paths": ["kernel/foo.c"]},
+            )
+            self.assertEqual(r_mmatch.status_code, 200)
+            self.assertEqual(r_mmatch.json()["repo"], "linux")
+            self.assertEqual(r_mmatch.json()["recipients"][0]["email"], "alice@example.com")
+            self.assertEqual(self.client.post("/api/v1/maintainers/match", headers=self.auth, json={}).status_code, 400)
+
+            r_per = self.client.get("/api/v1/maintainers/person?email=alice@example.com", headers=self.auth)
+            self.assertEqual(r_per.status_code, 200)
+            self.assertEqual(r_per.json()["repo"], "linux")
+            self.assertEqual(r_per.json()["mode"], "profile")
+            self.assertEqual(r_per.json()["name"], "Alice Dev")
+
+            r_devs = self.client.get("/api/v1/maintainers/person?mode=developers&q=Alice", headers=self.auth)
+            self.assertEqual(r_devs.status_code, 200)
+            self.assertEqual(r_devs.json()["mode"], "developers")
+            self.assertEqual(r_devs.json()["total"], 1)
+
+            r_cred = self.client.get("/api/v1/maintainers/person?mode=credits&q=Alice", headers=self.auth)
+            self.assertEqual(r_cred.status_code, 200)
+            self.assertEqual(r_cred.json()["mode"], "credits")
+            self.assertEqual(r_cred.json()["total"], 1)
+
+    def test_p2_diffs_insights_watch_and_branch_tags(self) -> None:
+        # 1. Diffs (blobs, kconfig, kapi, man)
+        with patch.object(v1_router._diff_service, "get_blob_diff", return_value={
+            "version_a": "v3.0", "path_a": "kernel/foo.c", "version_b": "master", "path_b": "include/linux/foo.h", "hunks": [],
+        }), patch.object(v1_router._diff_service, "get_kconfig_diff", return_value={
+            "added": [], "removed": [], "changed": [{"name": "FOO_BAR"}],
+        }), patch("webapp.backend.services.kapi_diff_service.diff", return_value={
+            "state": "done", "result": {"counts": {"syscalls": 1}, "syscalls": {"added": ["getcpu"], "removed": [], "changed": []}},
+        }), patch.object(v1_router.man_service, "diff", return_value={
+            "a": "man-pages-6.10", "b": "master", "repo": "man-pages",
+            "summary": {"added": 1, "modified": 0, "deleted": 0},
+            "entries": [{"name": "read", "section": "2", "status": "added", "path": "man2/read.2"}],
+        }):
+            r_bd = self.client.get(
+                "/api/v1/diff/blobs?version_a=v3.0&path_a=kernel/foo.c&version_b=master&path_b=include/linux/foo.h",
+                headers=self.auth,
+            )
+            self.assertEqual(r_bd.status_code, 200)
+            self.assertEqual(r_bd.json()["repo"], "linux")
+            # Both paths are validated against the repo jail
+            self.assertEqual(
+                self.client.get(
+                    "/api/v1/diff/blobs?version_a=v3.0&path_a=../etc/passwd&version_b=master&path_b=kernel/foo.c",
+                    headers=self.auth,
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.get(
+                    "/api/v1/diff/blobs?version_a=v3.0&path_a=kernel/foo.c&version_b=master&path_b=../etc/passwd",
+                    headers=self.auth,
+                ).status_code,
+                400,
+            )
+
+            r_kd = self.client.get("/api/v1/diff/kconfig?version_a=v3.0&version_b=master", headers=self.auth)
+            self.assertEqual(r_kd.status_code, 200)
+            self.assertEqual(r_kd.json()["repo"], "linux")
+            self.assertEqual(r_kd.json()["changed"][0]["name"], "FOO_BAR")
+
+            r_kad = self.client.get("/api/v1/diff/kapi?version_a=v3.0&version_b=master&kinds=syscalls", headers=self.auth)
+            self.assertEqual(r_kad.status_code, 200)
+            self.assertEqual(r_kad.json()["repo"], "linux")
+            self.assertEqual(r_kad.json()["counts"]["syscalls"], 1)
+
+            r_md = self.client.get(
+                "/api/v1/diff/man?repo=man-pages&version_a=man-pages-6.10&version_b=master&path=man2/read.2",
+                headers=self.auth,
+            )
+            self.assertEqual(r_md.status_code, 200)
+            self.assertEqual(r_md.json()["repo"], "man-pages")
+            self.assertEqual(r_md.json()["total"], 1)
+            self.assertEqual(
+                self.client.get(
+                    "/api/v1/diff/man?repo=man-pages&version_a=man-pages-6.10&version_b=master&path=../etc/passwd",
+                    headers=self.auth,
+                ).status_code,
+                400,
+            )
+
+        # 2. Insights (stable series/summary/missing, subsystems, cves)
+        with patch("webapp.backend.services.stable_service.stable_series", return_value=[
+            {"series": "v3.0", "stable_tags": ["v3.0.1"], "last": "v3.0.1"},
+        ]), patch("webapp.backend.services.stable_service.stable_summary", return_value={
+            "series": "v3.0", "commits": 12, "backports": 10,
+        }), patch("webapp.backend.services.stable_service.missing_report", return_value={
+            "state": "done", "result": {"series": "v3.0", "candidates": [{"sha": self.linux_sha, "subject": "Fix foo"}]},
+        }), patch("webapp.backend.services.insights_service.subsystem_health", return_value={
+            "state": "done",
+            "result": {
+                "release": "v3.0",
+                "window": 4,
+                "sections": [{"sec_id": 1, "name": "FOO SUBSYSTEM", "commits": 5, "flags": ["single_author"]}],
+            },
+        }), patch.object(v1_router.cve_service, "report", return_value={
+            "state": "done",
+            "result": {
+                "release": "v3.0",
+                "configured": True,
+                "ingested": True,
+                "cves": [{"id": "CVE-2024-0001", "state": "affected", "score": 7.8}],
+            },
+        }):
+            r_st_ser = self.client.get("/api/v1/insights/stable", headers=self.auth)
+            self.assertEqual(r_st_ser.status_code, 200)
+            self.assertEqual(r_st_ser.json()["repo"], "linux")
+            self.assertEqual(r_st_ser.json()["mode"], "series")
+            self.assertEqual(r_st_ser.json()["total"], 1)
+
+            r_st_sum = self.client.get("/api/v1/insights/stable?series=v3.0&mode=summary", headers=self.auth)
+            self.assertEqual(r_st_sum.status_code, 200)
+            self.assertEqual(r_st_sum.json()["mode"], "summary")
+            self.assertEqual(r_st_sum.json()["commits"], 12)
+
+            r_st_mis = self.client.get("/api/v1/insights/stable?series=v3.0", headers=self.auth)
+            self.assertEqual(r_st_mis.status_code, 200)
+            self.assertEqual(r_st_mis.json()["mode"], "missing")
+            self.assertEqual(r_st_mis.json()["total"], 1)
+
+            r_sub = self.client.get("/api/v1/insights/subsystems?flag=single_author", headers=self.auth)
+            self.assertEqual(r_sub.status_code, 200)
+            self.assertEqual(r_sub.json()["repo"], "linux")
+            self.assertEqual(r_sub.json()["total"], 1)
+
+            r_sub_one = self.client.get("/api/v1/insights/subsystems?sec_id=1", headers=self.auth)
+            self.assertEqual(r_sub_one.status_code, 200)
+            self.assertEqual(r_sub_one.json()["mode"], "section")
+            self.assertEqual(r_sub_one.json()["section"]["name"], "FOO SUBSYSTEM")
+
+            r_icve = self.client.get("/api/v1/insights/cves?state=affected&cvss_op=ge&cvss_score=7.0", headers=self.auth)
+            self.assertEqual(r_icve.status_code, 200)
+            self.assertEqual(r_icve.json()["repo"], "linux")
+            self.assertEqual(r_icve.json()["total"], 1)
+
+        # 3. Watch changes & branch tags
+        r_watch = self.client.post(
+            "/api/v1/watch/changes",
+            headers=self.auth,
+            json={
+                "from": "v3.0",
+                "to": "master",
+                "items": [{"key": "w1", "type": "file", "path": "kernel/foo.c"}],
+            },
+        )
+        self.assertEqual(r_watch.status_code, 200)
+        self.assertEqual(r_watch.json()["repo"], "linux")
+        self.assertEqual(r_watch.json()["items"][0]["status"], "same")
+
+        r_btags = self.client.get("/api/v1/branches/tags?branch=master", headers=self.auth)
+        self.assertEqual(r_btags.status_code, 200)
+        self.assertEqual(r_btags.json()["repo"], "linux")
+        self.assertIn("v3.0", r_btags.json()["tags"])
+
+    def test_p3_rest_only_utilities_and_webapi_limit_clamping(self) -> None:
+        # 1. P3 REST-only endpoints: compile_commands, treemap, checkpatch
+        with patch.object(v1_router._fs_service, "export_compile_commands", return_value=[
+            {"directory": "/linux", "file": "kernel/foo.c", "command": "gcc -c kernel/foo.c"},
+        ]):
+            r_cc = self.client.get("/api/v1/compile_commands?arch=x86_64", headers=self.auth)
+            self.assertEqual(r_cc.status_code, 200)
+            self.assertEqual(r_cc.json()["repo"], "linux")
+            self.assertEqual(r_cc.json()["total"], 1)
+            self.assertEqual(r_cc.json()["commands"][0]["file"], "kernel/foo.c")
+
+        r_tm = self.client.get("/api/v1/treemap?max_depth=2", headers=self.auth)
+        self.assertEqual(r_tm.status_code, 200)
+        self.assertEqual(r_tm.json()["repo"], "linux")
+        self.assertGreaterEqual(r_tm.json()["file_count"], 1)
+
+        # Checkpatch returns {enabled: false, repo: "linux"} by default when webapp.tools.checkpatch.enabled is false
+        r_cp = self.client.post(
+            "/api/v1/checkpatch",
+            headers=self.auth,
+            json={"patch": "--- a/kernel/foo.c\n+++ b/kernel/foo.c\n@@ -1 +1 @@\n-int a;\n+int b;\n"},
+        )
+        self.assertEqual(r_cp.status_code, 200)
+        self.assertEqual(r_cp.json()["repo"], "linux")
+        self.assertFalse(r_cp.json()["enabled"])
+
+        # 2. Verify /webapi/* routes clamp user-supplied limit to <= 200
+        from webapp.backend.routers import commits as web_commits, filesystem as web_fs
+
+        with patch.object(web_fs.fs_service, "search_files", return_value={"files": [], "total": 0}) as m_sfiles:
+            web_fs.search_files("v3.0", q="foo", limit=500)
+            self.assertEqual(m_sfiles.call_args.args[2], 200)
+
+        with patch.object(web_commits.git_service, "get_file_history", return_value={"commits": []}) as m_fhist:
+            web_commits.get_file_history("v3.0", path="kernel/foo.c", limit=500)
+            self.assertEqual(m_fhist.call_args.args[2], 200)
 
 
 if __name__ == "__main__":

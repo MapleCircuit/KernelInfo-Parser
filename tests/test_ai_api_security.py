@@ -310,6 +310,106 @@ class TestAiApiSecurity(unittest.TestCase):
         self.assertNotIn("wrong-secret-value", joined)
         self.assertIn("key=bot", joined)
 
+    def test_empty_x_api_key_falls_back_to_bearer_and_audit_logs_extracted_ip(self) -> None:
+        self._write_cfg(
+            {
+                "keys": {"bot": "valid-bearer-token"},
+                "trusted_proxies": ["127.0.0.1", "testclient"],
+                "client_ip_header": "X-Forwarded-For",
+            }
+        )
+        client = TestClient(create_app())
+
+        # Empty or whitespace-only X-API-Key must not shadow a valid Authorization: Bearer header
+        r_fallback = client.get(
+            "/api/v1/capabilities",
+            headers={"X-API-Key": "   ", "Authorization": "Bearer valid-bearer-token"},
+        )
+        self.assertEqual(r_fallback.status_code, 200)
+
+        # Audit logs on 401/429 record the extracted client_ip rather than the proxy peer IP
+        from api.security import ApiRequestLoggingMiddleware
+
+        clock = _FakeClock()
+
+        async def ok_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        mw = ApiRequestLoggingMiddleware(
+            ApiAuthMiddleware(
+                ok_app,
+                keys={"bot": "valid-bearer-token"},
+                trusted_proxies=["127.0.0.1"],
+                client_ip_header="X-Forwarded-For",
+                rate_limit={"max_requests": 1, "window_seconds": 60},
+                auth_lockout={"max_failures": 5, "failure_window_seconds": 60, "base_lockout_seconds": 30, "max_lockout_seconds": 60},
+                clock=clock,
+            )
+        )
+        with self.assertLogs("api.request", level=logging.INFO) as cm:
+            st_401, _, _ = asyncio.run(
+                _run_asgi(
+                    mw,
+                    client=("127.0.0.1", 5000),
+                    headers={"X-Forwarded-For": "198.51.100.77", "X-API-Key": "wrong"},
+                )
+            )
+            st_200, _, _ = asyncio.run(
+                _run_asgi(
+                    mw,
+                    client=("127.0.0.1", 5000),
+                    headers={"X-Forwarded-For": "198.51.100.77", "X-API-Key": "valid-bearer-token"},
+                )
+            )
+            st_429, _, _ = asyncio.run(
+                _run_asgi(
+                    mw,
+                    client=("127.0.0.1", 5000),
+                    headers={"X-Forwarded-For": "198.51.100.77", "X-API-Key": "valid-bearer-token"},
+                )
+            )
+        self.assertEqual((st_401, st_200, st_429), (401, 200, 429))
+        logs = "\n".join(cm.output)
+        self.assertIn("ip=198.51.100.77 key=-", logs)
+        self.assertIn("ip=198.51.100.77 key=bot", logs)
+
+    def test_scoped_api_keys_and_write_guardrails(self) -> None:
+        from api.config import normalize_api_keys
+
+        entries = normalize_api_keys(
+            {
+                "reader": "secret-r",
+                "writer": {"key": "secret-w", "scopes": ["read", "nodemap:write"]},
+                "invalid": {"key": "secret-x", "scopes": ["unknown:scope"]},
+            }
+        )
+        by_id = {e.id: e for e in entries}
+        self.assertEqual(by_id["reader"].scopes, frozenset({"read"}))
+        self.assertEqual(by_id["writer"].scopes, frozenset({"read", "nodemap:write"}))
+        self.assertNotIn("invalid", by_id)
+
+    def test_allow_writes_env_vs_config_and_stdio_override_precedence(self) -> None:
+        from api.config import (
+            get_api_server_config,
+            reset_allow_writes_override,
+            set_allow_writes_override,
+        )
+
+        self._write_cfg({"keys": ["k1"], "allow_writes": True})
+        self.assertTrue(get_api_server_config()["allow_writes"])
+
+        # Env var API_ALLOW_WRITES=0 overrides config.json allow_writes=True when no stdio override is active
+        with patch.dict(os.environ, {"API_ALLOW_WRITES": "0"}):
+            self.assertFalse(get_api_server_config()["allow_writes"])
+            # Explicit stdio --allow-writes override wins over API_ALLOW_WRITES=0
+            tok = set_allow_writes_override(True)
+            try:
+                self.assertTrue(get_api_server_config()["allow_writes"])
+            finally:
+                reset_allow_writes_override(tok)
+            self.assertFalse(get_api_server_config()["allow_writes"])
+
 
 if __name__ == "__main__":
     unittest.main()

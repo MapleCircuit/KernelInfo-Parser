@@ -560,14 +560,34 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
       storage: globalThis.localStorage,
     });
     if (ctrl.tab?.id) activeTabIds.add(ctrl.tab.id);
-    const [saved, orphans] = await Promise.all([
+    const [saved, orphans, serverRes] = await Promise.all([
       listNamedCanvases(ctrl.userDb, {}, globalThis.localStorage),
       findOrphanedTabCanvases(ctrl.userDb, {
         activeTabIds,
         fallbackStorage: globalThis.localStorage,
       }),
+      Promise.resolve((ctrl.api || api)?.getNodemapCanvases?.()).catch(() => null),
     ]);
     if (seq !== refreshSeq || !modal.body?.isConnected) return;
+    const serverCanvases = Array.isArray(serverRes?.items) ? serverRes.items : [];
+
+    const serverHtml = serverCanvases.length ? `
+      <div class="nm-lib-section">
+        <div class="nm-hint" style="margin: 10px 0 6px; font-weight: 600;">Server / AI Canvases (${serverCanvases.length})</div>
+        <div class="nm-lib-list">
+          ${serverCanvases.map((rec) => `
+            <div class="nm-lib-card" data-server-id="${escapeHtml(rec.id)}">
+              <div class="nm-lib-meta">
+                <strong>${escapeHtml(rec.name || rec.id)}</strong>
+                <span class="nm-hint">${escapeHtml(rec.id)} · ${rec.node_count ?? 0} nodes · ${rec.edge_count ?? 0} edges${rec.updated_at ? ` · ${escapeHtml(new Date(rec.updated_at).toLocaleDateString())}` : ""}</span>
+              </div>
+              <div class="nm-lib-acts">
+                <button type="button" class="code-btn primary" data-lib-act="server-open" data-cid="${escapeHtml(rec.id)}">Open in Tab</button>
+                <button type="button" class="code-btn" data-lib-act="server-copy" data-cid="${escapeHtml(rec.id)}">Save Copy to Browser Library</button>
+              </div>
+            </div>`).join("")}
+        </div>
+      </div>` : "";
 
     const libHtml = `
       <form class="nm-form nm-lib-save-form">
@@ -591,6 +611,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
             </div>
           </div>`).join("") : '<div class="nm-empty">No saved maps yet. Save the current canvas above or start from a Kernel Template.</div>'}
       </div>
+      ${serverHtml}
       <div class="nm-lib-prune">
         <span class="nm-hint">${orphans.length} orphaned closed-tab cache${orphans.length === 1 ? "" : "s"} (&gt;14d unreferenced)</span>
         <button type="button" class="code-btn" data-lib-act="prune" ${orphans.length ? "" : "disabled"}>Prune unused tab caches</button>
@@ -670,6 +691,41 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
             ctrl.loadCanvasDocument(tplCanvas);
             modal.close();
             toast.success("Loaded kernel template");
+          }
+        } else if (act === "server-open") {
+          const cid = String(b.dataset.cid || "").trim();
+          if (!cid) return;
+          if (typeof ctrl.loadServerCanvas === "function") {
+            if (ctrl.tab) {
+              ctrl.tab.canvasId = cid;
+              state.updateTabState?.(ctrl.tab.id, { canvasId: cid });
+            }
+            const ok = await ctrl.loadServerCanvas(cid);
+            if (!modal.body?.isConnected) return;
+            if (ok) {
+              modal.close();
+              urlSync?.syncToUrl?.();
+              toast.success(`Opened server canvas "${cid}"`);
+            }
+          } else {
+            state.openTab?.({ type: "nodemap", title: cid, version: ctrl.currentVersion || "v3.0", canvasId: cid, forceNew: true });
+            modal.close();
+          }
+        } else if (act === "server-copy") {
+          const cid = String(b.dataset.cid || "").trim();
+          if (!cid) return;
+          try {
+            const loaded = await (ctrl.api || api)?.getNodemapCanvas?.(cid);
+            if (!modal.body?.isConnected) return;
+            if (loaded?.canvas) {
+              const name = String(loaded.name || cid).trim();
+              await saveNamedCanvas(ctrl.userDb, { name, repo: ctrl.repo, canvas: loaded.canvas }, globalThis.localStorage);
+              if (!modal.body?.isConnected) return;
+              toast.success(`Copied "${name}" to Browser Library`);
+              refresh();
+            }
+          } catch (err) {
+            toast.error(`Failed to copy server canvas "${cid}": ${err?.message || err}`);
           }
         }
       };

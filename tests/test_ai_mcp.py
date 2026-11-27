@@ -34,6 +34,19 @@ def _v1_get_routes() -> list[APIRoute]:
     return [r for r in v1_router.router.routes if isinstance(r, APIRoute) and "GET" in r.methods]
 
 
+def _v1_readonly_tool_routes() -> list[APIRoute]:
+    readonly_pairs = {
+        (e["method"], e["path"])
+        for e in v1_router._ENDPOINT_CATALOG
+        if e.get("mcp", e["method"] == "GET") and not e.get("scope")
+    }
+    return [
+        r
+        for r in v1_router.router.routes
+        if isinstance(r, APIRoute) and any((m, r.path) in readonly_pairs for m in r.methods)
+    ]
+
+
 class _McpFixture(_rest_tests.TestAiApiEndpoints):
     """Reuses the `/api/v1/*` git + MockDB fixture; the inherited REST tests are not collected here."""
 
@@ -185,7 +198,7 @@ class TestMcpProtocol(_McpFixture):
             headers=self.auth,
         ).json()
         self.assertEqual(mixed[0]["result"]["structuredContent"]["active"], "man-pages")
-        self.assertEqual(len(mixed[1]["result"]["tools"]), len(mcp.TOOLS))
+        self.assertEqual(len(mixed[1]["result"]["tools"]), len(mcp.visible_tools()))
         self.assertEqual(get_active_repo_name(), "linux")
 
         too_big = [{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(mcp.MAX_BATCH_SIZE + 1)]
@@ -215,33 +228,39 @@ class TestMcpTools(_McpFixture):
         self.assertNotIn("nextCursor", r.json()["result"])
         names = [t["name"] for t in tools]
         routes = _v1_get_routes()
-        self.assertEqual(names, [route.endpoint.__name__ for route in routes])
+        readonly_routes = _v1_readonly_tool_routes()
+        self.assertEqual(names, [route.endpoint.__name__ for route in readonly_routes])
         self.assertEqual(len(names), len(set(names)))
 
         # Catalog parity: every REST GET endpoint is a tool and is advertised in /api/v1/capabilities
         catalog_get = {e["path"] for e in v1_router._ENDPOINT_CATALOG if e["method"] == "GET"}
         self.assertEqual(catalog_get, {route.path for route in routes})
 
-        for tool in tools:
+        for tool_spec in mcp.TOOLS.values():
+            tool = tool_spec.describe()
             self.assertRegex(tool["name"], r"^[a-z][a-z0-9_]*$")
             self.assertTrue(tool["description"])
-            self.assertEqual(
-                tool["annotations"],
-                {"title": tool["title"], "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
-            )
+            if tool_spec.required_scope is None:
+                self.assertEqual(
+                    tool["annotations"],
+                    {"title": tool["title"], "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+                )
             schema = tool["inputSchema"]
             self.assertEqual(schema["type"], "object")
             self.assertFalse(schema["additionalProperties"])
             self.assertIn("repo", schema["properties"])
+            self.assertEqual(schema["properties"]["repo"].get("minLength"), 1)
             self.assertTrue(set(schema.get("required", [])) <= set(schema["properties"]), tool["name"])
             self.assertNotIn("repo", schema.get("required", []))
+            schema_json = json.dumps(schema)  # JSON-serializable
+            self.assertNotIn('"$ref"', schema_json, tool["name"])
+            self.assertNotIn('"$defs"', schema_json, tool["name"])
             for key, prop in schema["properties"].items():
                 self.assertIn(prop.get("type"), _ALLOWED_TYPES, f"{tool['name']}.{key}: {prop}")
                 self.assertNotIn("title", prop)
                 self.assertNotIn("anyOf", prop)
                 if prop["type"] == "array":
-                    self.assertEqual(prop["items"], {"type": "string"})
-            json.dumps(schema)  # JSON-serializable
+                    self.assertIn(prop["items"].get("type"), ("string", "object"), f"{tool['name']}.{key}")
 
         by_name = {t["name"]: t["inputSchema"] for t in tools}
         fs = by_name["get_file_slice"]
@@ -432,6 +451,183 @@ class TestMcpTools(_McpFixture):
         with patch("api.routers.v1.callpath_state", return_value={"state": "done", "result": {"paths": []}}):
             self.assertToolOk(self.call("get_callpath", {"from": "a", "to": "b"}))
 
+    def test_write_scoped_mcp_tools_visibility_and_execution(self) -> None:
+        # 1. Default (allow_writes=False): write tools hidden from tools/list and return 403 on tools/call
+        default_names = {t["name"] for t in self.rpc("tools/list", {}).json()["result"]["tools"]}
+        self.assertIn("preview_nodemap_canvas", default_names)
+        self.assertNotIn("create_nodemap_canvas", default_names)
+        self.assertToolError(self.call("create_nodemap_canvas", {"id": "mcp-map", "name": "MCP Map"}), 403)
+
+        # 2. Stateless preview works via MCP in read-only mode
+        prev = self.assertToolOk(
+            self.call(
+                "preview_nodemap_canvas",
+                {
+                    "name": "MCP Preview",
+                    "version": "v3.0",
+                    "ops": [
+                        {
+                            "op": "add_nodes",
+                            "hydrate": True,
+                            "nodes": [{"id": "n1", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}}],
+                        }
+                    ],
+                    "export_format": "dot",
+                },
+            )
+        )
+        self.assertEqual(prev["node_count"], 1)
+        self.assertIn("digraph NodeMap", prev["export"])
+
+        # 3. Enable allow_writes with a scoped key -> write tools appear in tools/list and execute via tools/call
+        cfg = core_config.get_config()
+        cfg["api"]["allow_writes"] = True
+        cfg["api"]["keys"] = {
+            "reader": {"key": "mcp-read-token", "scopes": ["read"]},
+            "writer": {"key": "mcp-write-token", "scopes": ["read", "nodemap:write"]},
+        }
+        client = TestClient(create_app())
+
+        def rpc_with(token: str, method: str, params: dict | None = None):
+            return client.post(
+                mcp.MCP_PATH,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+                headers={"Authorization": f"Bearer {token}"},
+            ).json()
+
+        read_tools = {t["name"] for t in rpc_with("mcp-read-token", "tools/list")["result"]["tools"]}
+        write_tools = {t["name"]: t for t in rpc_with("mcp-write-token", "tools/list")["result"]["tools"]}
+        self.assertNotIn("create_nodemap_canvas", read_tools)
+        self.assertIn("create_nodemap_canvas", write_tools)
+        self.assertFalse(write_tools["create_nodemap_canvas"]["annotations"]["readOnlyHint"])
+        self.assertTrue(write_tools["delete_nodemap_canvas"]["annotations"]["destructiveHint"])
+        self.assertTrue(write_tools["replace_nodemap_canvas"]["annotations"]["idempotentHint"])
+
+        # Reader token gets 403 on write tool call
+        r_denied = rpc_with(
+            "mcp-read-token",
+            "tools/call",
+            {"name": "create_nodemap_canvas", "arguments": {"id": "mcp-map", "name": "MCP Map"}},
+        )["result"]
+        self.assertTrue(r_denied["isError"])
+        self.assertEqual(r_denied["structuredContent"]["error"]["status"], 403)
+
+        # Writer token creates, mutates, lays out, and deletes canvas via MCP
+        r_created = rpc_with(
+            "mcp-write-token",
+            "tools/call",
+            {"name": "create_nodemap_canvas", "arguments": {"id": "mcp-map", "name": "MCP Map", "version": "v3.0"}},
+        )["result"]
+        self.assertFalse(r_created["isError"], r_created)
+        self.assertEqual(r_created["structuredContent"]["id"], "mcp-map")
+
+        r_mut = rpc_with(
+            "mcp-write-token",
+            "tools/call",
+            {
+                "name": "mutate_nodemap_canvas",
+                "arguments": {
+                    "canvas_id": "mcp-map",
+                    "expected_revision": 1,
+                    "ops": [
+                        {
+                            "op": "add_nodes",
+                            "nodes": [{"id": "n1", "type": "note", "title": "Hello", "data": {"text": "World"}}],
+                        }
+                    ],
+                },
+            },
+        )["result"]
+        self.assertFalse(r_mut["isError"], r_mut)
+        self.assertEqual(r_mut["structuredContent"]["node_count"], 1)
+
+        r_del = rpc_with(
+            "mcp-write-token",
+            "tools/call",
+            {"name": "delete_nodemap_canvas", "arguments": {"canvas_id": "mcp-map"}},
+        )["result"]
+        self.assertFalse(r_del["isError"], r_del)
+        self.assertTrue(r_del["structuredContent"]["deleted"])
+
+    def test_p1_p2_mcp_tools_readonly_posts_and_p3_exclusion(self) -> None:
+        # 1. Read-only POST MCP tools remain visible in tools/list and callable when allow_writes=False
+        tools = {t["name"]: t for t in self.rpc("tools/list", {}).json()["result"]["tools"]}
+        for ro_post_tool in ("preview_nodemap_canvas", "match_patch_maintainers", "check_watched_changes"):
+            self.assertIn(ro_post_tool, tools)
+            self.assertTrue(tools[ro_post_tool]["annotations"]["readOnlyHint"])
+            self.assertFalse(tools[ro_post_tool]["annotations"]["destructiveHint"])
+
+        # 2. P3 REST-only endpoints (mcp=False) are strictly excluded from TOOLS, tools/list, and tools/call
+        for p3_tool in ("get_compile_commands", "get_codebase_treemap", "run_checkpatch_tool"):
+            self.assertNotIn(p3_tool, mcp.TOOLS)
+            self.assertNotIn(p3_tool, tools)
+            r_p3 = self.rpc("tools/call", {"name": p3_tool, "arguments": {}})
+            self.assertEqual(r_p3.status_code, 200)
+            self.assertEqual(r_p3.json()["error"]["code"], mcp.INVALID_PARAMS)
+
+        # 3. Call P1 and P2 MCP tools (including read-only POST tools)
+        with patch("webapp.backend.services.kapi_service.summary", return_value={
+            "version": "v3.0", "arch": "x86_64", "counts": {"syscalls": 300},
+        }):
+            ksum = self.assertToolOk(self.call("get_kapi_summary", {"arch": "x86_64"}))
+            self.assertEqual(ksum["repo"], "linux")
+            self.assertEqual(ksum["counts"]["syscalls"], 300)
+
+        with patch("webapp.backend.services.mailing_list_service.mailing_list_service.search", return_value={
+            "total": 1, "results": [{"message_id": "m1@example.com", "subject": "[PATCH] test"}],
+        }):
+            ms = self.assertToolOk(self.call("search_mail", {"q": "test", "filter": "patch"}))
+            self.assertEqual(ms["repo"], "linux")
+            self.assertEqual(ms["results"][0]["message_id"], "m1@example.com")
+
+        with patch.object(v1_router._kconfig_service, "get_graph", return_value={
+            "symbol": "FOO_BAR", "nodes": [{"id": "FOO_BAR"}], "edges": [],
+        }):
+            kg = self.assertToolOk(self.call("get_kconfig_graph", {"symbol": "FOO_BAR"}))
+            self.assertEqual(kg["repo"], "linux")
+            self.assertEqual(kg["symbol"], "FOO_BAR")
+
+        with patch("webapp.backend.services.pahole_compare.compare", return_value={
+            "struct": "foo", "a": {"size": 4}, "b": {"size": 8},
+        }):
+            scmp = self.assertToolOk(self.call("compare_struct_layout", {"name": "foo", "version_a": "v3.0", "version_b": "master"}))
+            self.assertEqual(scmp["repo"], "linux")
+            self.assertEqual(scmp["b"]["size"], 8)
+
+        with patch.object(v1_router._maintainer_service, "match_maintainers", return_value={
+            "version": "v3.0", "sections": [{"name": "FOO SUBSYSTEM"}], "recipients": [{"email": "alice@example.com"}],
+        }):
+            # Multi-path lookup_maintainers (bare string or list)
+            mt_list = self.assertToolOk(self.call("lookup_maintainers", {"path": ["kernel/foo.c", "include/linux/foo.h"]}))
+            self.assertEqual(mt_list["paths"], ["kernel/foo.c", "include/linux/foo.h"])
+            # Read-only POST tool match_patch_maintainers
+            mp_post = self.assertToolOk(
+                self.call(
+                    "match_patch_maintainers",
+                    {"patch_text": "--- a/kernel/foo.c\n+++ b/kernel/foo.c\n", "paths": ["kernel/foo.c"]},
+                )
+            )
+            self.assertEqual(mp_post["repo"], "linux")
+            self.assertEqual(mp_post["recipients"][0]["email"], "alice@example.com")
+
+        # Read-only POST tool check_watched_changes (accepts `from` and `to` aliases)
+        w_res = self.assertToolOk(
+            self.call(
+                "check_watched_changes",
+                {
+                    "from": "v3.0",
+                    "to": "master",
+                    "items": [{"key": "w1", "type": "file", "path": "kernel/foo.c"}],
+                },
+            )
+        )
+        self.assertEqual(w_res["repo"], "linux")
+        self.assertEqual(w_res["items"][0]["status"], "same")
+
+        btags = self.assertToolOk(self.call("get_branch_tags", {"branch": "master"}))
+        self.assertEqual(btags["repo"], "linux")
+        self.assertIn("v3.0", btags["tags"])
+
 
 class TestMcpSecurity(unittest.TestCase):
     def setUp(self) -> None:
@@ -556,25 +752,36 @@ class TestMcpStdio(unittest.TestCase):
         self.assertEqual(len(frames), 6)
         self.assertEqual(frames[0]["result"]["protocolVersion"], "2025-03-26")
         self.assertEqual(frames[1]["error"]["code"], mcp.PARSE_ERROR)
-        self.assertEqual(len(frames[2]["result"]["tools"]), len(mcp.TOOLS))
+        self.assertEqual(len(frames[2]["result"]["tools"]), len(mcp.visible_tools(frozenset({"read"}))))
         self.assertEqual(frames[3], [{"jsonrpc": "2.0", "id": 3, "result": {}}])
         self.assertTrue(frames[4]["result"]["isError"])
         self.assertEqual(frames[5]["error"]["code"], mcp.PARSE_ERROR)
 
     def test_oversized_lines_are_rejected_and_skipped(self) -> None:
         limit = 64
-        stream = io.BytesIO(b"x" * 200 + b"\n" + b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n' + b"tail-without-newline")
+        stream = io.BytesIO(
+            b"x" * 200
+            + b"\n"
+            + b"   "
+            + b"y" * 200
+            + b"\n"
+            + b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+            + b"tail-without-newline"
+        )
         lines = list(mcp_stdio.read_lines(stream, limit))
-        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(lines), 4)
         self.assertEqual(len(lines[0]), limit + 1)
-        self.assertEqual(json.loads(lines[1]), {"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        self.assertEqual(len(lines[1]), limit + 1)
+        self.assertEqual(json.loads(lines[2]), {"jsonrpc": "2.0", "id": 1, "method": "ping"})
         with patch.object(mcp, "MAX_BODY_BYTES", limit):
             out = io.BytesIO()
             mcp_stdio.serve(lines, out)
         frames = [json.loads(line) for line in out.getvalue().splitlines()]
         self.assertEqual(frames[0]["error"]["code"], mcp.INVALID_REQUEST)
-        self.assertEqual(frames[1]["result"], {})
-        self.assertEqual(frames[2]["error"]["code"], mcp.PARSE_ERROR)
+        # Leading whitespace on an oversized line must still trigger INVALID_REQUEST (-32600), not PARSE_ERROR (-32700)
+        self.assertEqual(frames[1]["error"]["code"], mcp.INVALID_REQUEST)
+        self.assertEqual(frames[2]["result"], {})
+        self.assertEqual(frames[3]["error"]["code"], mcp.PARSE_ERROR)
 
     def test_encode_frame_is_single_line(self) -> None:
         frame = mcp_stdio.encode_frame({"jsonrpc": "2.0", "id": 1, "result": {"text": "a\nb c"}})
@@ -627,7 +834,7 @@ class TestMcpStdio(unittest.TestCase):
             self.assertTrue(all(f.get("jsonrpc") == "2.0" for f in frames))
             self.assertEqual([f["id"] for f in frames], [1, 2, 3, 4, 5, None])
             self.assertEqual(frames[0]["result"]["protocolVersion"], "2024-11-05")
-            self.assertEqual(len(frames[1]["result"]["tools"]), len(mcp.TOOLS))
+            self.assertEqual(len(frames[1]["result"]["tools"]), len(mcp.visible_tools(frozenset({"read"}))))
             self.assertEqual(frames[2]["result"]["structuredContent"]["active"], "other")  # --repo default
             self.assertEqual(frames[3]["result"]["structuredContent"]["active"], "linux")  # per-call override
             self.assertEqual(frames[5]["error"]["code"], mcp.PARSE_ERROR)
@@ -640,6 +847,19 @@ class TestMcpStdio(unittest.TestCase):
             self.assertEqual(bad.returncode, 2)
             self.assertEqual(bad.stdout, b"")
             self.assertIn(b"Unknown repository", bad.stderr)
+
+    def test_allow_writes_flag_overrides_env_disable_and_restores_state(self) -> None:
+        from api.config import get_api_server_config
+
+        with patch.dict(os.environ, {"API_ALLOW_WRITES": "0", "KIP_API_ALLOW_WRITES": "0"}):
+            self.assertFalse(get_api_server_config()["allow_writes"])
+            out = io.BytesIO()
+            mcp_stdio.serve([b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'], out, allow_writes=True)
+            frame = json.loads(out.getvalue().decode("utf-8").strip())
+            names = {t["name"] for t in frame["result"]["tools"]}
+            self.assertIn("create_nodemap_canvas", names)
+            # Cleanly restored on exit
+            self.assertFalse(get_api_server_config()["allow_writes"])
 
 
 if __name__ == "__main__":

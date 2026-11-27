@@ -446,7 +446,7 @@ class FilesystemService:
                 total += 1
                 yield item
 
-        best = heapq.nsmallest(max(1, min(limit, 200)), counted())
+        best = heapq.nsmallest(max(1, min(limit, 2000)), counted())
         files = [{"path": p, "name": p.rsplit("/", 1)[-1], "score": round(sc, 3)} for sc, p in best]
         return {"version": vname, "query": query, "total": total, "files": files}
 

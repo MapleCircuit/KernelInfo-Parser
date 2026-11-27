@@ -107,7 +107,7 @@ def search_files(
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
 ) -> dict[str, Any]:
     """Fuzzy search of file paths in the revision's tree."""
-    return fs_service.search_files(version_name, q, limit)
+    return fs_service.search_files(version_name, q, min(max(1, limit), 200))
 
 
 @router.get("/fs/raw/{version_name}")

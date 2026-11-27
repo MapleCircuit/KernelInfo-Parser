@@ -41,6 +41,8 @@
     "port": 8001,
     "reload": false,
     "default_version": "v3.0",
+    "allow_writes": false,
+    "nodemap_canvas_dir": "",
     "keys": [],
     "rate_limit": {
       "max_requests": 120,

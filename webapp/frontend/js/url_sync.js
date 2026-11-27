@@ -195,6 +195,7 @@ class UrlSynchronizer {
       "listCollapsed", "queryHelp", "threadId", "messageId", "listMode", "section",
       "secId", "person", "role", "sort", "versionA", "versionB", "mode",
       "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches", "apiKinds", "apiStatuses", "apiQuery", "apiArch",
+      "canvasId", "tourId",
       ...routeKeys()
     ];
 
@@ -287,7 +288,7 @@ class UrlSynchronizer {
       case "diff":
         return `${v}:${tab.type}:${tab.versionA || ""}:${tab.versionB || ""}:${tab.mode || "files"}`;
       case "nodemap":
-        return `${v}:${tab.type}`;
+        return `${v}:${tab.type}${tab.canvasId ? `:${tab.canvasId}` : ""}${tab.tourId ? `:${tab.tourId}` : ""}`;
       case "treemap":
         return `${v}:${tab.type}:${tab.path || ""}`;
       default:
@@ -354,6 +355,8 @@ class UrlSynchronizer {
           manStatuses: t.manStatuses,
           manSection: t.manSection,
           manQuery: t.manQuery,
+          canvasId: t.canvasId,
+          tourId: t.tourId,
           renameSearches: t.renameSearches ? JSON.parse(JSON.stringify(t.renameSearches)) : undefined,
           ...Object.fromEntries((tabRoute(t.type)?.keys || []).filter((k) => t[k] !== undefined)
             .map((k) => [k, typeof t[k] === "object" && t[k] !== null ? JSON.parse(JSON.stringify(t[k])) : t[k]]))
@@ -453,10 +456,14 @@ class UrlSynchronizer {
           version: ver
         });
       } else if (tabType === "nodemap") {
+        const canvasId = (params.get("canvas") || "").trim();
+        const tourId = (params.get("tour") || "").trim();
         open({
           type: "nodemap",
           title: "NodeMap Canvas",
-          version: ver
+          version: ver,
+          ...(canvasId ? { canvasId } : { canvasId: "" }),
+          ...(tourId ? { tourId } : { tourId: "" }),
         });
       } else if (tabType === "mail") {
         open({
@@ -670,6 +677,9 @@ class UrlSynchronizer {
     } else if (activeTab.type === "callgraph") {
       if (activeTab.functionName) params.set("fn", activeTab.functionName);
       if (activeTab.pathTo) params.set("to", activeTab.pathTo);
+    } else if (activeTab.type === "nodemap") {
+      if (activeTab.canvasId) params.set("canvas", activeTab.canvasId);
+      if (activeTab.tourId) params.set("tour", activeTab.tourId);
     }
     return params;
   }
