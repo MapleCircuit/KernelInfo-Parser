@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable, get_args, get_origin
 
@@ -415,6 +416,26 @@ def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
         for dep in tool.dependencies:
             dep()
         result = tool.endpoint(**kwargs)
+        # If a real background job is actively building in `jobs`, wait up to 15s for it to finish
+        # so AI agents calling MCP over HTTP do not spin in a tight polling loop burning tool-call turns.
+        if isinstance(result, Response) and result.status_code == 202:
+            try:
+                from webapp.backend.services.jobs import jobs as _job_mgr
+
+                deadline = time.monotonic() + 15.0
+                while (
+                    isinstance(result, Response)
+                    and result.status_code == 202
+                    and time.monotonic() < deadline
+                ):
+                    with _job_mgr._lock:
+                        has_active_jobs = bool(_job_mgr._jobs)
+                    if not has_active_jobs:
+                        break
+                    time.sleep(0.5)
+                    result = tool.endpoint(**kwargs)
+            except Exception:  # noqa: BLE001
+                pass
     except StarletteHTTPException as exc:
         return _tool_error(exc.status_code, exc.detail)
     except Exception:  # noqa: BLE001 - a failing handler is a tool error, never a transport crash
@@ -595,6 +616,20 @@ async def _read_body(request: Request) -> bytes | None:
     return b"".join(chunks)
 
 
+def _summarize_mcp_call(payload: Any) -> str:
+    if isinstance(payload, dict):
+        method = str(payload.get("method") or "?")
+        if method == "tools/call" and isinstance(payload.get("params"), dict):
+            tname = payload["params"].get("name", "?")
+            targs = payload["params"].get("arguments")
+            arg_str = json.dumps(targs, ensure_ascii=False)[:160] if isinstance(targs, dict) else ""
+            return f"tools/call {tname}({arg_str})"
+        return method
+    if isinstance(payload, list):
+        return f"batch[{len(payload)}]"
+    return "invalid"
+
+
 @router.post(MCP_PATH, include_in_schema=False)
 async def mcp_post(request: Request) -> Response:
     """Stateless Streamable HTTP: one JSON-RPC message (or batch) in, one `application/json` reply out."""
@@ -610,9 +645,21 @@ async def mcp_post(request: Request) -> Response:
     payload = _decode_json(body)
     if payload is _UNPARSABLE:
         return JSONResponse(_error(None, PARSE_ERROR, "Parse error: invalid JSON."), status_code=400)
+    summary = _summarize_mcp_call(payload)
+    started = time.monotonic()
     response = await run_in_threadpool(handle_payload, payload)
+    elapsed_ms = (time.monotonic() - started) * 1000.0
     if response is None:
+        logger.info("MCP %s -> 202 (%.1f ms)", summary, elapsed_ms)
         return Response(status_code=202)
+    is_err = (
+        isinstance(response, dict)
+        and (
+            "error" in response
+            or (isinstance(response.get("result"), dict) and response["result"].get("isError"))
+        )
+    )
+    logger.info("MCP %s -> %s (%.1f ms)", summary, "error" if is_err else "ok", elapsed_ms)
     return JSONResponse(response, status_code=400 if is_envelope_error(response) else 200)
 
 

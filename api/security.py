@@ -576,8 +576,11 @@ class ApiAuthMiddleware:
                 key_id, key_scopes, _payload = oauth_verified
 
         if key_id is None:
-            with self._lock:
-                self._record_failure(client_ip, now, auth_lockout)
+            # When OAuth 2.1 is enabled, credential-less requests (e.g. RFC 9728 HEAD/POST discovery probes)
+            # receive the 401 WWW-Authenticate challenge without counting as failed secret guesses.
+            if not oauth_enabled or presented is not None:
+                with self._lock:
+                    self._record_failure(client_ip, now, auth_lockout)
             if oauth_enabled:
                 www_auth = build_www_authenticate_header(
                     resolved_issuer,
