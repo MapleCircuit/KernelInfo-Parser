@@ -45,8 +45,17 @@ class SecurityHeadersMiddleware:
 
         async def send_with_headers(message) -> None:
             if message["type"] == "http.response.start":
-                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in _FIXED_NAMES]
-                headers.extend(_FIXED_HEADERS)
+                raw_headers = message.get("headers", [])
+                preserve_deny = any(
+                    k.lower() == b"x-frame-options" and v.strip().upper() == b"DENY"
+                    for k, v in raw_headers
+                )
+                headers = [(k, v) for k, v in raw_headers if k.lower() not in _FIXED_NAMES]
+                for name, val in _FIXED_HEADERS:
+                    if name == b"x-frame-options" and preserve_deny:
+                        headers.append((b"x-frame-options", b"DENY"))
+                    else:
+                        headers.append((name, val))
                 # Routes may set a stricter policy (e.g. sandboxed raw SVG); only fill in the default
                 if not any(k.lower() == b"content-security-policy" for k, _ in headers):
                     headers.append((b"content-security-policy", _CSP))

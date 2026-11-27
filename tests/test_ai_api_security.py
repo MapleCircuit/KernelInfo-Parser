@@ -410,6 +410,74 @@ class TestAiApiSecurity(unittest.TestCase):
                 reset_allow_writes_override(tok)
             self.assertFalse(get_api_server_config()["allow_writes"])
 
+    def test_oauth_disabled_by_default_and_dual_auth_with_challenge_headers(self) -> None:
+        from api.oauth import oauth_manager
+
+        # 1. Disabled by default: .well-known and /api/oauth/* return 404, WWW-Authenticate is plain "Bearer"
+        self._write_cfg({"keys": {"reader": "static-reader-key"}})
+        client = TestClient(create_app())
+        for path in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/api/mcp",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+            "/api/oauth/authorize",
+        ):
+            self.assertEqual(client.get(path).status_code, 404, path)
+        r_unauth = client.get("/api/v1/capabilities")
+        self.assertEqual(r_unauth.status_code, 401)
+        self.assertEqual(r_unauth.headers.get("WWW-Authenticate"), "Bearer")
+
+        # 2. Enabled: RFC 9728 WWW-Authenticate challenge and dual Bearer (static key + OAuth JWT)
+        oauth_dir = Path(self._tmp.name) / "oauth-data"
+        self._write_cfg(
+            {
+                "keys": {"reader": "static-reader-key"},
+                "allow_writes": False,
+                "oauth": {
+                    "enabled": True,
+                    "issuer": "https://kernelinfo.org",
+                    "data_dir": str(oauth_dir),
+                },
+            }
+        )
+        client_oauth = TestClient(create_app())
+
+        # Unauthenticated request receives RFC 9728 resource_metadata challenge
+        r_chal = client_oauth.get("/api/v1/capabilities")
+        self.assertEqual(r_chal.status_code, 401)
+        self.assertIn(
+            'resource_metadata="https://kernelinfo.org/.well-known/oauth-protected-resource/api/mcp"',
+            r_chal.headers.get("WWW-Authenticate", ""),
+        )
+
+        # Rejected Bearer token includes error="invalid_token"
+        r_bad_tok = client_oauth.get("/api/v1/capabilities", headers={"Authorization": "Bearer bogus.jwt.token"})
+        self.assertEqual(r_bad_tok.status_code, 401)
+        self.assertIn('error="invalid_token"', r_bad_tok.headers.get("WWW-Authenticate", ""))
+
+        # Static API key via Authorization: Bearer and X-API-Key still works 100%
+        self.assertEqual(
+            client_oauth.get("/api/v1/capabilities", headers={"Authorization": "Bearer static-reader-key"}).status_code,
+            200,
+        )
+        self.assertEqual(
+            client_oauth.get("/api/v1/capabilities", headers={"X-API-Key": "static-reader-key"}).status_code,
+            200,
+        )
+
+        # Valid signed OAuth access token authenticates cleanly
+        access_token, _ = oauth_manager.issue_access_token(
+            issuer="https://kernelinfo.org",
+            sub="reader",
+            aud="https://kernelinfo.org/api/mcp",
+            client_id="test-client",
+            scopes=["read"],
+            ttl=3600,
+        )
+        r_jwt = client_oauth.get("/api/v1/capabilities", headers={"Authorization": f"Bearer {access_token}"})
+        self.assertEqual(r_jwt.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

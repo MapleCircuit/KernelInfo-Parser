@@ -58,7 +58,34 @@
       "127.0.0.1",
       "::1"
     ],
-    "client_ip_header": "X-Forwarded-For"
+    "client_ip_header": "X-Forwarded-For",
+    "oauth": {
+      "enabled": false,
+      "issuer": "https://kernelinfo.org",
+      "signing_secret": "",
+      "data_dir": "",
+      "access_token_ttl": 3600,
+      "refresh_token_ttl": 2592000,
+      "auth_code_ttl": 120,
+      "allow_dcr": true,
+      "allow_cimd": true,
+      "allowed_redirect_uris": [
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector/oauth/*",
+        "https://www.cursor.com/agents/mcp/oauth/callback",
+        "cursor://anysphere.cursor-mcp/oauth/callback",
+        "https://*.google.com/*",
+        "https://gemini.google.com/*",
+        "https://vscode.dev/redirect",
+        "vscode://*",
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "http://[::1]/*"
+      ],
+      "clients": []
+    }
   },
   "parser": {
     "table_engine": "cached",

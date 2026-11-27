@@ -30,14 +30,14 @@ from core.tui.widgets import (
 )
 
 CLIENT_IP_HEADERS: tuple[str, ...] = ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP")
-SECTIONS: tuple[str, ...] = ("Server", "Keys", "Limits")
+SECTIONS: tuple[str, ...] = ("Server", "Keys", "Limits", "OAuth")
 _DEFAULT_PROXIES = ["127.0.0.1", "::1"]
 
 HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
     "section": (
         "Settings Section",
         [
-            "Switch pages with Left/Right: Server (bind address, proxies), Keys (API keys), Limits (rate limit, auth lockout).",
+            "Switch pages with Left/Right: Server (bind address, proxies), Keys (API keys), Limits (rate limit, auth lockout), OAuth (OAuth 2.1 server).",
             "All pages are saved together.",
         ],
     ),
@@ -95,6 +95,47 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
             "The lockout starts at Base Lockout and grows up to Max Lockout (seconds).",
         ],
     ),
+    "oauth_enabled": (
+        "Enable OAuth 2.1 Server",
+        [
+            "Enable the built-in MCP OAuth 2.1 authorization server (/.well-known/oauth-* and /api/oauth/*).",
+            "Existing X-API-Key and static Bearer API key authentication remain active.",
+        ],
+    ),
+    "oauth_issuer": (
+        "OAuth Issuer URL",
+        [
+            "Public HTTPS base URL of this server (e.g. https://kernelinfo.org).",
+            "Leave empty to derive automatically from X-Forwarded-Proto and Host headers.",
+        ],
+    ),
+    "oauth_dcr": (
+        "Dynamic Client Registration (RFC 7591)",
+        [
+            "Allow AI clients to self-register at POST /api/oauth/register with redirect URIs matching allowed_redirect_uris.",
+        ],
+    ),
+    "oauth_cimd": (
+        "Client ID Metadata Documents (CIMD)",
+        [
+            "Allow MCP clients using HTTPS URL client_ids to present metadata documents (fetched with SSRF protection).",
+        ],
+    ),
+    "oauth_data_dir": (
+        "OAuth Data Directory",
+        [
+            "Persistent directory for OAuth signing secret, dynamic clients, auth codes, and refresh tokens.",
+            "Leave empty to use the default 'oauth-data' directory.",
+        ],
+    ),
+    "oauth_clients": (
+        "Pre-Registered OAuth Clients",
+        [
+            "Static OAuth 2.1 clients (public PKCE or confidential with a masked client_secret).",
+            "- Add Client: configure client_id, name, redirect_uris, and optional client_secret.",
+            "- Remove Client: delete the highlighted pre-registered client.",
+        ],
+    ),
     "overview": (
         "Help",
         [
@@ -102,6 +143,7 @@ HELP_TOPICS: dict[str, tuple[str, list[str]]] = {
             "- Server: host, port, reload, trusted proxies, client IP header.",
             "- Keys: API keys, masked.",
             "- Limits: rate limit and auth lockout.",
+            "- OAuth: opt-in MCP OAuth 2.1 server and pre-registered clients.",
         ],
     ),
 }
@@ -167,6 +209,42 @@ def _load_keys(raw: Any) -> tuple[list[tuple[str, str]], bool, dict[int, tuple[s
     return [], False, {}, set()
 
 
+def _load_oauth_clients(raw: Any) -> list[dict[str, Any]]:
+    """Normalize `api.oauth.clients` into editable dictionaries preserving extra fields."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("client_id") or item.get("id") or "").strip()
+        if not cid:
+            continue
+        raw_uris = item.get("redirect_uris")
+        if isinstance(raw_uris, str):
+            uris = [u.strip() for u in raw_uris.split(",") if u.strip()]
+        elif isinstance(raw_uris, (list, tuple)):
+            uris = [str(u).strip() for u in raw_uris if isinstance(u, str) and str(u).strip()]
+        else:
+            uris = []
+        if not uris:
+            continue
+        raw_secret = item.get("client_secret") if "client_secret" in item else item.get("secret")
+        secret = str(raw_secret).strip() if isinstance(raw_secret, str) and raw_secret.strip() else ""
+        name = str(item.get("name") or item.get("client_name") or cid).strip() or cid
+        entry: dict[str, Any] = {
+            "client_id": cid,
+            "name": name,
+            "redirect_uris": uris,
+        }
+        if secret:
+            entry["client_secret"] = secret
+        if "max_scopes" in item and isinstance(item["max_scopes"], list):
+            entry["max_scopes"] = [str(s).strip() for s in item["max_scopes"] if str(s).strip()]
+        out.append(entry)
+    return out
+
+
 class ApiSettingsScreen(BaseScreen):
     """Configuration screen for the standalone AI API service (`api` section)."""
 
@@ -198,6 +276,8 @@ class ApiSettingsScreen(BaseScreen):
             return str(src.get(key) if src.get(key) is not None else default)
 
         self.keys, self.keys_as_dict, self.key_scopes, self.explicit_scoped_keys = _load_keys(api_cfg.get("keys"))
+        oauth_raw = api_cfg.get("oauth") if isinstance(api_cfg.get("oauth"), dict) else {}
+        self.oauth_clients: list[dict[str, Any]] = _load_oauth_clients(oauth_raw.get("clients"))
 
         self.sel_section = SelectList(
             y=2, x=4, width=16, label="Section", options=list(SECTIONS), selected_index=0, label_width=20
@@ -258,6 +338,35 @@ class ApiSettingsScreen(BaseScreen):
             y=10, x=4, width=12, label="Max Lockout (s)", value=num(lo, "max_lockout_seconds", 3600), label_width=22
         )
 
+        # OAuth page
+        self.chk_oauth_enabled = Checkbox(
+            y=4, x=4, label="Enable OAuth 2.1 Authorization Server",
+            checked=_coerce_bool(oauth_raw.get("enabled"), False),
+        )
+        self.inp_oauth_issuer = TextInput(
+            y=5, x=4, width=34, label="Issuer URL",
+            value=str(oauth_raw.get("issuer") or ""), label_width=20, max_len=1024,
+        )
+        self.chk_oauth_dcr = Checkbox(
+            y=6, x=4, label="Allow Dynamic Client Registration (DCR)",
+            checked=_coerce_bool(oauth_raw.get("allow_dcr"), True),
+        )
+        self.chk_oauth_cimd = Checkbox(
+            y=7, x=4, label="Allow Client ID Metadata Docs (CIMD)",
+            checked=_coerce_bool(oauth_raw.get("allow_cimd"), True),
+        )
+        self.inp_oauth_data_dir = TextInput(
+            y=8, x=4, width=34, label="OAuth Data Dir",
+            value=str(oauth_raw.get("data_dir") or ""), label_width=20, max_len=1024,
+        )
+        self.lst_oauth_clients = ScrollableList(
+            y=9, x=2, height=4, width=60, items=list(range(len(self.oauth_clients))),
+            title="OAuth Clients (secrets masked)",
+            render_item_func=self._render_oauth_client,
+        )
+        self.btn_add_oauth_client = Button(y=13, x=4, label="Add Client", on_click=self.add_oauth_client)
+        self.btn_remove_oauth_client = Button(y=13, x=20, label="Remove Client", on_click=self.remove_oauth_client)
+
         self.btn_save = Button(y=14, x=4, label="Save Settings", on_click=self.save)
         self.btn_cancel = Button(y=14, x=24, label="Cancel", on_click=self.cancel)
 
@@ -286,6 +395,16 @@ class ApiSettingsScreen(BaseScreen):
                 self.inp_rl_max, self.inp_rl_window, self.inp_lo_max,
                 self.inp_lo_window, self.inp_lo_base, self.inp_lo_max_lock,
             ],
+            "OAuth": [
+                self.chk_oauth_enabled,
+                self.inp_oauth_issuer,
+                self.chk_oauth_dcr,
+                self.chk_oauth_cimd,
+                self.inp_oauth_data_dir,
+                self.lst_oauth_clients,
+                self.btn_add_oauth_client,
+                self.btn_remove_oauth_client,
+            ],
         }
         self.help_topic_for = {
             id(self.sel_section): "section",
@@ -306,6 +425,14 @@ class ApiSettingsScreen(BaseScreen):
             id(self.inp_lo_window): "auth_lockout",
             id(self.inp_lo_base): "auth_lockout",
             id(self.inp_lo_max_lock): "auth_lockout",
+            id(self.chk_oauth_enabled): "oauth_enabled",
+            id(self.inp_oauth_issuer): "oauth_issuer",
+            id(self.chk_oauth_dcr): "oauth_dcr",
+            id(self.chk_oauth_cimd): "oauth_cimd",
+            id(self.inp_oauth_data_dir): "oauth_data_dir",
+            id(self.lst_oauth_clients): "oauth_clients",
+            id(self.btn_add_oauth_client): "oauth_clients",
+            id(self.btn_remove_oauth_client): "oauth_clients",
         }
         self._rebuild_widgets()
         self.focus_widget(0)
@@ -426,6 +553,98 @@ class ApiSettingsScreen(BaseScreen):
         self._refresh_key_list()
         return True
 
+    # --- OAuth client list helpers ---
+
+    def _render_oauth_client(self, idx: int) -> str:
+        client = self.oauth_clients[idx]
+        cid = str(client.get("client_id") or "")
+        name = str(client.get("name") or cid)
+        secret = str(client.get("client_secret") or "")
+        masked = mask_key(secret) if secret else "(public)"
+        uris = client.get("redirect_uris") or []
+        label = f"{name} ({cid})" if name and name != cid else cid
+        return f"{label}  {masked}  [{', '.join(uris)}]"
+
+    def _refresh_oauth_client_list(self) -> None:
+        self.lst_oauth_clients.set_items(list(range(len(self.oauth_clients))), keep_selection=True)
+
+    def add_oauth_client(self) -> bool:
+        """Prompt for a pre-registered OAuth client; return True when added."""
+        cid = self._prompt(self.stdscr, "Add OAuth Client", "Client ID:")
+        if not cid:
+            return False
+        if "\x00" in cid or any(ch.isspace() for ch in cid):
+            ModalDialog(self.stdscr, "Invalid Client ID", "Client ID cannot contain whitespace or NUL bytes.", ["OK"]).show()
+            return False
+        if any(c.get("client_id") == cid for c in self.oauth_clients):
+            ModalDialog(self.stdscr, "Duplicate Client ID", f"An OAuth client '{cid}' already exists.", ["OK"]).show()
+            return False
+        name = self._prompt(self.stdscr, "OAuth Client Name", "Display name:", cid) or cid
+        raw_uris = self._prompt(
+            self.stdscr,
+            "OAuth Redirect URIs",
+            "Comma-separated redirect URIs (https://... or loopback http://...):",
+        )
+        if not raw_uris:
+            return False
+        uris = [u.strip() for u in raw_uris.split(",") if u.strip()]
+        if not uris or any("\x00" in u or any(ch.isspace() for ch in u) for u in uris):
+            ModalDialog(self.stdscr, "Invalid Redirect URIs", "Provide at least one valid redirect URI.", ["OK"]).show()
+            return False
+        for u in uris:
+            lower = u.lower()
+            if lower.startswith(("javascript:", "data:", "vbscript:")):
+                ModalDialog(self.stdscr, "Invalid Redirect URI", f"Forbidden URI scheme in '{u}'.", ["OK"]).show()
+                return False
+            if lower.startswith("http://") and not lower.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]")):
+                ModalDialog(
+                    self.stdscr,
+                    "Invalid Redirect URI",
+                    "Plain http:// is only allowed for loopback hosts (localhost, 127.0.0.1, [::1]).",
+                    ["OK"],
+                ).show()
+                return False
+        secret = self._prompt(
+            self.stdscr,
+            "OAuth Client Secret",
+            "Client secret (leave empty for public PKCE client):",
+            "",
+        )
+        if secret is None:
+            secret = ""
+        if secret and ("\x00" in secret or any(ch.isspace() for ch in secret)):
+            ModalDialog(self.stdscr, "Invalid Secret", "Client secret cannot contain whitespace or NUL bytes.", ["OK"]).show()
+            return False
+        entry: dict[str, Any] = {
+            "client_id": cid,
+            "name": name,
+            "redirect_uris": uris,
+        }
+        if secret:
+            entry["client_secret"] = secret
+        self.oauth_clients.append(entry)
+        self._refresh_oauth_client_list()
+        self.lst_oauth_clients.select_last()
+        return True
+
+    def remove_oauth_client(self) -> bool:
+        """Remove the highlighted pre-registered OAuth client after confirmation."""
+        idx = self.lst_oauth_clients.get_selected()
+        if idx is None or not 0 <= idx < len(self.oauth_clients):
+            return False
+        choice = ModalDialog.show_dialog(
+            self.stdscr,
+            title="Remove OAuth Client",
+            message=f"Remove OAuth client {self._render_oauth_client(idx)}?",
+            buttons=["Remove", "Cancel"],
+            default_button=1,
+        )
+        if choice != "Remove":
+            return False
+        del self.oauth_clients[idx]
+        self._refresh_oauth_client_list()
+        return True
+
     # --- widgets / form state ---
 
     def active_section(self) -> str:
@@ -446,6 +665,7 @@ class ApiSettingsScreen(BaseScreen):
                     values.append(w.get_selected())
         values.append(list(self.keys))
         values.append(dict(self.key_scopes))
+        values.append([dict(c) for c in self.oauth_clients])
         return values
 
     def current_help_topic(self) -> str:
@@ -523,6 +743,23 @@ class ApiSettingsScreen(BaseScreen):
             errors.append("Canvas Storage Dir: cannot contain NUL bytes")
         else:
             values["nodemap_canvas_dir"] = canvas_dir
+
+        oauth_issuer = self.inp_oauth_issuer.get_value().strip().rstrip("/")
+        if "\x00" in oauth_issuer or any(ch.isspace() for ch in oauth_issuer):
+            errors.append("Issuer URL: cannot contain whitespace or NUL bytes")
+        elif oauth_issuer and not (
+            oauth_issuer.startswith("https://")
+            or oauth_issuer.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]"))
+        ):
+            errors.append("Issuer URL: must use https:// (or loopback http:// for local testing)")
+        else:
+            values["oauth_issuer"] = oauth_issuer
+
+        oauth_data_dir = self.inp_oauth_data_dir.get_value().strip()
+        if "\x00" in oauth_data_dir:
+            errors.append("OAuth Data Dir: cannot contain NUL bytes")
+        else:
+            values["oauth_data_dir"] = oauth_data_dir
         return values, errors
 
     def draw(self) -> None:
@@ -537,6 +774,9 @@ class ApiSettingsScreen(BaseScreen):
         elif section == "Limits":
             draw_box(self.stdscr, 3, 2, 3, box_w, title="Rate Limit", color_pair=PAIR_BORDER)
             draw_box(self.stdscr, 6, 2, 6, box_w, title="Auth Lockout", color_pair=PAIR_BORDER)
+        elif section == "OAuth":
+            draw_box(self.stdscr, 3, 2, 6, box_w, title="OAuth 2.1 Server", color_pair=PAIR_BORDER)
+            self.lst_oauth_clients.width = max(20, box_w)
         else:
             self.lst_keys.width = max(20, box_w)
         if help_w:
@@ -550,18 +790,20 @@ class ApiSettingsScreen(BaseScreen):
     def handle_key(self, ch: int) -> bool:
         """Handle navigation, shortcuts, and widget key events."""
         if ch in (9, curses.KEY_DOWN):
+            focused_list = self.get_focused_widget()
             if (
                 ch == curses.KEY_DOWN
-                and self.get_focused_widget() is self.lst_keys
-                and self.lst_keys.selected_index < len(self.lst_keys.items) - 1
+                and focused_list in (self.lst_keys, self.lst_oauth_clients)
+                and focused_list.selected_index < len(focused_list.items) - 1
             ):
-                self.lst_keys.select_next()
+                focused_list.select_next()
             else:
                 self.focus_next()
             return True
         if ch in (curses.KEY_UP, getattr(curses, "KEY_BTAB", 353), 353):
-            if self.get_focused_widget() is self.lst_keys and self.lst_keys.selected_index > 0:
-                self.lst_keys.select_prev()
+            focused_list = self.get_focused_widget()
+            if focused_list in (self.lst_keys, self.lst_oauth_clients) and focused_list.selected_index > 0:
+                focused_list.select_prev()
             else:
                 self.focus_prev()
             return True
@@ -578,6 +820,9 @@ class ApiSettingsScreen(BaseScreen):
         focused = self.get_focused_widget()
         if focused is self.lst_keys and ch in (curses.KEY_DC, ord("d"), ord("D")):
             self.remove_key()
+            return True
+        if focused is self.lst_oauth_clients and ch in (curses.KEY_DC, ord("d"), ord("D")):
+            self.remove_oauth_client()
             return True
         if focused is not None and hasattr(focused, "handle_key") and focused.handle_key(ch):
             if focused is self.sel_section:
@@ -641,6 +886,15 @@ class ApiSettingsScreen(BaseScreen):
             "base_lockout_seconds": parsed["base_lockout_seconds"],
             "max_lockout_seconds": parsed["max_lockout_seconds"],
         }
+        existing_oauth = api_cfg.get("oauth") if isinstance(api_cfg.get("oauth"), dict) else {}
+        oauth_out = dict(existing_oauth)
+        oauth_out["enabled"] = self.chk_oauth_enabled.is_checked()
+        oauth_out["issuer"] = parsed["oauth_issuer"]
+        oauth_out["allow_dcr"] = self.chk_oauth_dcr.is_checked()
+        oauth_out["allow_cimd"] = self.chk_oauth_cimd.is_checked()
+        oauth_out["data_dir"] = parsed["oauth_data_dir"]
+        oauth_out["clients"] = [dict(c) for c in self.oauth_clients]
+        api_cfg["oauth"] = oauth_out
         self.api_cfg = api_cfg
 
         if self.app is not None:

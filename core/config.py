@@ -180,6 +180,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "trusted_proxies": ["127.0.0.1", "::1"],
         "client_ip_header": "X-Forwarded-For",
+        "oauth": {
+            "enabled": False,
+            "issuer": "",
+            "signing_secret": "",
+            "data_dir": "",
+            "access_token_ttl": 3600,
+            "refresh_token_ttl": 2592000,
+            "auth_code_ttl": 120,
+            "allow_dcr": True,
+            "allow_cimd": True,
+            "allowed_redirect_uris": [
+                "https://claude.ai/api/mcp/auth_callback",
+                "https://claude.com/api/mcp/auth_callback",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+                "https://chatgpt.com/connector/oauth/*",
+                "https://www.cursor.com/agents/mcp/oauth/callback",
+                "cursor://anysphere.cursor-mcp/oauth/callback",
+                "https://*.google.com/*",
+                "https://gemini.google.com/*",
+                "https://vscode.dev/redirect",
+                "vscode://*",
+                "http://localhost/*",
+                "http://127.0.0.1/*",
+                "http://[::1]/*",
+            ],
+            "clients": [],
+        },
     },
     # CVE records: a local clone of the CVE Program's list (cvelistV5) or of the kernel CNA's vulns.git, kept
     # current by the operator (git pull). The parser ingests it into m_cve / m_cve_commit when its HEAD changed
@@ -293,6 +320,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 # Client-IP headers the AI API reads from a trusted reverse proxy (api/API.md section 3)
 VALID_API_CLIENT_IP_HEADERS = ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP")
+
+# Default allowed redirect URI patterns for MCP OAuth 2.1 (DCR and CIMD) covering major AI suppliers and RFC 8252 loopback
+DEFAULT_OAUTH_REDIRECT_URIS: tuple[str, ...] = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://chatgpt.com/connector/oauth/*",
+    "https://www.cursor.com/agents/mcp/oauth/callback",
+    "cursor://anysphere.cursor-mcp/oauth/callback",
+    "https://*.google.com/*",
+    "https://gemini.google.com/*",
+    "https://vscode.dev/redirect",
+    "vscode://*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://[::1]/*",
+)
 
 
 def normalize_api_client_ip_header(val: Any) -> str:
@@ -700,6 +744,132 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         api_sec["nodemap_canvas_dir"] = str(api_sec.get("nodemap_canvas_dir") or "").strip()
 
+    default_oauth = DEFAULT_CONFIG["api"]["oauth"]
+    oauth_sec = api_sec.get("oauth")
+    if not isinstance(oauth_sec, dict):
+        oauth_sec = copy.deepcopy(default_oauth)
+    env_oauth_en = _get_user_env("API_OAUTH_ENABLED")
+    if env_oauth_en is None:
+        env_oauth_en = _get_user_env("KIP_API_OAUTH_ENABLED")
+    oauth_enabled = (
+        _coerce_bool(env_oauth_en, _coerce_bool(oauth_sec.get("enabled"), False))
+        if env_oauth_en is not None
+        else _coerce_bool(oauth_sec.get("enabled"), False)
+    )
+    env_oauth_issuer = _get_user_env("API_OAUTH_ISSUER")
+    if env_oauth_issuer is None:
+        env_oauth_issuer = _get_user_env("KIP_API_OAUTH_ISSUER")
+    oauth_issuer = (
+        str(env_oauth_issuer).strip().rstrip("/")
+        if env_oauth_issuer is not None
+        else str(oauth_sec.get("issuer") or "").strip().rstrip("/")
+    )
+    env_oauth_secret = _get_user_env("API_OAUTH_SIGNING_SECRET")
+    if env_oauth_secret is None:
+        env_oauth_secret = _get_user_env("KIP_API_OAUTH_SIGNING_SECRET")
+    oauth_secret = (
+        str(env_oauth_secret).strip()
+        if env_oauth_secret is not None
+        else str(oauth_sec.get("signing_secret") or "").strip()
+    )
+    env_oauth_dir = _get_user_env("API_OAUTH_DATA_DIR")
+    if env_oauth_dir is None:
+        env_oauth_dir = _get_user_env("KIP_API_OAUTH_DATA_DIR")
+    oauth_data_dir = (
+        str(env_oauth_dir).strip()
+        if env_oauth_dir is not None
+        else str(oauth_sec.get("data_dir") or "").strip()
+    )
+    env_at_ttl = _get_user_env("API_OAUTH_ACCESS_TOKEN_TTL") or _get_user_env("KIP_API_OAUTH_ACCESS_TOKEN_TTL")
+    access_token_ttl = max(
+        1,
+        _coerce_int(
+            env_at_ttl if env_at_ttl is not None else oauth_sec.get("access_token_ttl"),
+            default_oauth["access_token_ttl"],
+        ),
+    )
+    env_rt_ttl = _get_user_env("API_OAUTH_REFRESH_TOKEN_TTL") or _get_user_env("KIP_API_OAUTH_REFRESH_TOKEN_TTL")
+    refresh_token_ttl = max(
+        1,
+        _coerce_int(
+            env_rt_ttl if env_rt_ttl is not None else oauth_sec.get("refresh_token_ttl"),
+            default_oauth["refresh_token_ttl"],
+        ),
+    )
+    env_ac_ttl = _get_user_env("API_OAUTH_AUTH_CODE_TTL") or _get_user_env("KIP_API_OAUTH_AUTH_CODE_TTL")
+    auth_code_ttl = max(
+        1,
+        _coerce_int(
+            env_ac_ttl if env_ac_ttl is not None else oauth_sec.get("auth_code_ttl"),
+            default_oauth["auth_code_ttl"],
+        ),
+    )
+    env_dcr = _get_user_env("API_OAUTH_ALLOW_DCR")
+    if env_dcr is None:
+        env_dcr = _get_user_env("KIP_API_OAUTH_ALLOW_DCR")
+    allow_dcr = (
+        _coerce_bool(env_dcr, _coerce_bool(oauth_sec.get("allow_dcr"), True))
+        if env_dcr is not None
+        else _coerce_bool(oauth_sec.get("allow_dcr"), True)
+    )
+    env_cimd = _get_user_env("API_OAUTH_ALLOW_CIMD")
+    if env_cimd is None:
+        env_cimd = _get_user_env("KIP_API_OAUTH_ALLOW_CIMD")
+    allow_cimd = (
+        _coerce_bool(env_cimd, _coerce_bool(oauth_sec.get("allow_cimd"), True))
+        if env_cimd is not None
+        else _coerce_bool(oauth_sec.get("allow_cimd"), True)
+    )
+    env_redir = _get_user_env("API_OAUTH_ALLOWED_REDIRECT_URIS")
+    if env_redir is None:
+        env_redir = _get_user_env("KIP_API_OAUTH_ALLOWED_REDIRECT_URIS")
+    if env_redir is not None:
+        raw_redir = env_redir.strip()
+        if raw_redir.startswith("["):
+            try:
+                parsed_redir = json.loads(raw_redir)
+                allowed_redirects = [str(u).strip() for u in parsed_redir if isinstance(u, str) and str(u).strip()]
+            except json.JSONDecodeError:
+                allowed_redirects = [u.strip() for u in raw_redir.split(",") if u.strip()]
+        else:
+            allowed_redirects = [u.strip() for u in raw_redir.split(",") if u.strip()]
+    elif isinstance(oauth_sec.get("allowed_redirect_uris"), (list, tuple)):
+        allowed_redirects = [
+            str(u).strip() for u in oauth_sec["allowed_redirect_uris"] if isinstance(u, str) and str(u).strip()
+        ]
+    elif isinstance(oauth_sec.get("allowed_redirect_uris"), str):
+        allowed_redirects = [u.strip() for u in oauth_sec["allowed_redirect_uris"].split(",") if u.strip()]
+    else:
+        allowed_redirects = list(DEFAULT_OAUTH_REDIRECT_URIS)
+
+    env_clients = _get_user_env("API_OAUTH_CLIENTS")
+    if env_clients is None:
+        env_clients = _get_user_env("KIP_API_OAUTH_CLIENTS")
+    if env_clients is not None:
+        try:
+            parsed_clients = json.loads(env_clients.strip())
+            oauth_clients = [dict(c) for c in parsed_clients if isinstance(c, dict)] if isinstance(parsed_clients, list) else []
+        except json.JSONDecodeError:
+            oauth_clients = []
+    elif isinstance(oauth_sec.get("clients"), list):
+        oauth_clients = [dict(c) for c in oauth_sec["clients"] if isinstance(c, dict)]
+    else:
+        oauth_clients = []
+
+    api_sec["oauth"] = {
+        "enabled": oauth_enabled,
+        "issuer": oauth_issuer,
+        "signing_secret": oauth_secret,
+        "data_dir": oauth_data_dir,
+        "access_token_ttl": access_token_ttl,
+        "refresh_token_ttl": refresh_token_ttl,
+        "auth_code_ttl": auth_code_ttl,
+        "allow_dcr": allow_dcr,
+        "allow_cimd": allow_cimd,
+        "allowed_redirect_uris": allowed_redirects,
+        "clients": oauth_clients,
+    }
+
     parser_sec = merged["parser"]
     if env_p_te := _get_user_env("TABLE_ENGINE"):
         parser_sec["table_engine"] = env_p_te
@@ -928,6 +1098,25 @@ def get_nodemap_canvas_dir() -> Path:
         return (p if p.is_absolute() else REPO_ROOT / p).resolve()
     base = _LOADED_CONFIG_PATH.parent if _LOADED_CONFIG_PATH is not None else REPO_ROOT
     return (base / "nodemap-canvases").resolve()
+
+
+def get_oauth_data_dir() -> Path:
+    """Resolve persistent directory for OAuth 2.1 state (`api.oauth.data_dir`) outside `cache_engine`.
+
+    Relative paths resolve against `REPO_ROOT`; an empty value defaults to `<config_dir>/oauth-data`
+    (or `<REPO_ROOT>/oauth-data`), matching `get_nodemap_canvas_dir()`.
+    """
+    api_cfg = get_api_config()
+    oauth_cfg = api_cfg.get("oauth") if isinstance(api_cfg.get("oauth"), dict) else {}
+    env_dir = _get_user_env("API_OAUTH_DATA_DIR")
+    if env_dir is None:
+        env_dir = _get_user_env("KIP_API_OAUTH_DATA_DIR")
+    raw = str(env_dir if env_dir is not None else (oauth_cfg.get("data_dir") or "")).strip()
+    if raw:
+        p = Path(os.path.expanduser(raw))
+        return (p if p.is_absolute() else REPO_ROOT / p).resolve()
+    base = _LOADED_CONFIG_PATH.parent if _LOADED_CONFIG_PATH is not None else REPO_ROOT
+    return (base / "oauth-data").resolve()
 
 
 def get_parser_config() -> dict[str, Any]:

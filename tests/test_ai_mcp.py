@@ -628,6 +628,96 @@ class TestMcpTools(_McpFixture):
         self.assertEqual(btags["repo"], "linux")
         self.assertIn("v3.0", btags["tags"])
 
+    def test_mcp_http_with_oauth_access_token_and_scope_visibility(self) -> None:
+        from api.oauth import oauth_manager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            oauth_dir = Path(tmp) / "oauth-data"
+            with patch.dict(
+                os.environ,
+                {
+                    "API_OAUTH_ENABLED": "1",
+                    "API_OAUTH_ISSUER": "https://kernelinfo.org",
+                    "API_OAUTH_DATA_DIR": str(oauth_dir),
+                    "API_ALLOW_WRITES": "1",
+                    "API_KEYS": json.dumps(
+                        {
+                            "ro_user": {"key": "ro-secret-key", "scopes": ["read"]},
+                            "rw_user": {"key": "rw-secret-key", "scopes": ["read", "nodemap:write"]},
+                        }
+                    ),
+                },
+            ):
+                core_config.reset_config()
+                core_config.init_config(self.cfg_path)
+
+                ro_token, _ = oauth_manager.issue_access_token(
+                    issuer="https://kernelinfo.org",
+                    sub="ro_user",
+                    aud="https://kernelinfo.org/api/mcp",
+                    client_id="claude-web",
+                    scopes=["read"],
+                    ttl=3600,
+                )
+                rw_token, _ = oauth_manager.issue_access_token(
+                    issuer="https://kernelinfo.org",
+                    sub="rw_user",
+                    aud="https://kernelinfo.org/api/mcp",
+                    client_id="claude-web",
+                    scopes=["read", "nodemap:write"],
+                    ttl=3600,
+                )
+
+                # Read-only OAuth token hides write tools in tools/list and rejects write tools/call with 403
+                r_ro_list = self.client.post(
+                    mcp.MCP_PATH,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers={"Authorization": f"Bearer {ro_token}"},
+                )
+                self.assertEqual(r_ro_list.status_code, 200)
+                ro_names = {t["name"] for t in r_ro_list.json()["result"]["tools"]}
+                self.assertNotIn("create_nodemap_canvas", ro_names)
+                self.assertIn("preview_nodemap_canvas", ro_names)
+
+                r_ro_call = self.client.post(
+                    mcp.MCP_PATH,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "create_nodemap_canvas", "arguments": {"name": "Blocked"}},
+                    },
+                    headers={"Authorization": f"Bearer {ro_token}"},
+                )
+                self.assertEqual(r_ro_call.status_code, 200)
+                self.assertToolError(r_ro_call.json()["result"], 403)
+
+                # Write-scoped OAuth token sees and executes create_nodemap_canvas
+                r_rw_list = self.client.post(
+                    mcp.MCP_PATH,
+                    json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+                    headers={"Authorization": f"Bearer {rw_token}"},
+                )
+                self.assertEqual(r_rw_list.status_code, 200)
+                rw_names = {t["name"] for t in r_rw_list.json()["result"]["tools"]}
+                self.assertIn("create_nodemap_canvas", rw_names)
+
+                r_rw_call = self.client.post(
+                    mcp.MCP_PATH,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {"name": "create_nodemap_canvas", "arguments": {"name": "OAuth Canvas"}},
+                    },
+                    headers={"Authorization": f"Bearer {rw_token}"},
+                )
+                self.assertEqual(r_rw_call.status_code, 200)
+                created = self.assertToolOk(r_rw_call.json()["result"])
+                self.assertEqual(created["name"], "OAuth Canvas")
+            core_config.reset_config()
+            core_config.init_config(self.cfg_path)
+
 
 class TestMcpSecurity(unittest.TestCase):
     def setUp(self) -> None:

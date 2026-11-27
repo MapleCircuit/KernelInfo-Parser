@@ -9,7 +9,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from api.config import get_db_config, get_logging_config, refresh_default_repo_dir
 from api.mcp import router as mcp_router
-from api.routers import v1_router
+from api.routers import oauth_router, v1_router
 from api.security import ApiAuthMiddleware, ApiRequestLoggingMiddleware
 from core.logging_setup import setup_api_logging
 from webapp.backend.security.middleware import (
@@ -93,6 +93,7 @@ def create_app() -> FastAPI:
     app.add_middleware(ApiRequestLoggingMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 
+    app.include_router(oauth_router)
     app.include_router(v1_router)
     # MCP Streamable HTTP (`POST /api/mcp`) sits behind the same middleware stack as /api/v1/*.
     app.include_router(mcp_router)

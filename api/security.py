@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from api.config import (
     DEFAULT_API_SCOPES,
@@ -31,8 +31,12 @@ MAX_TRACKED_KEYS = 4096
 
 _ACTIVE_API_SCOPES: ContextVar[frozenset[str]] = ContextVar("active_api_scopes", default=DEFAULT_API_SCOPES)
 _ACTIVE_API_KEY_ID: ContextVar[str | None] = ContextVar("active_api_key_id", default=None)
+_ACTIVE_OAUTH_ISSUER: ContextVar[str | None] = ContextVar("active_oauth_issuer", default=None)
+_ACTIVE_AUTH_MIDDLEWARE: ContextVar[Any] = ContextVar("active_auth_middleware", default=None)
+_LAST_AUTH_MIDDLEWARE: Any = None
 
 _BEARER_RE = re.compile(r"(Bearer\s+)[^\s,;\"']+", re.IGNORECASE)
+_BASIC_RE = re.compile(r"(Basic\s+)[^\s,;\"']+", re.IGNORECASE)
 _API_KEY_KV_RE = re.compile(r"(X-API-Key\s*[:=]\s*)[^\s,;\"']+", re.IGNORECASE)
 
 
@@ -69,16 +73,33 @@ def require_write_scope(scope_name: str = "nodemap:write") -> Callable[[], None]
     """FastAPI dependency returning HTTP 403 whenever `api.allow_writes` is False or caller lacks `scope_name`."""
 
     def _check() -> None:
-        if not get_api_server_config().get("allow_writes", False):
+        cfg = get_api_server_config()
+        oauth_cfg = cfg.get("oauth") if isinstance(cfg.get("oauth"), dict) else {}
+        oauth_enabled = bool(oauth_cfg.get("enabled", False))
+        headers: dict[str, str] | None = None
+        if oauth_enabled:
+            from api.oauth import build_www_authenticate_header, resolve_issuer
+
+            issuer = _ACTIVE_OAUTH_ISSUER.get() or resolve_issuer(None, oauth_cfg=oauth_cfg)
+            headers = {
+                "WWW-Authenticate": build_www_authenticate_header(
+                    issuer,
+                    error="insufficient_scope",
+                    scope=scope_name,
+                )
+            }
+        if not cfg.get("allow_writes", False):
             raise HTTPException(
                 status_code=403,
                 detail="Write operations are disabled on this API server (api.allow_writes is false).",
+                headers=headers,
             )
         scopes = _ACTIVE_API_SCOPES.get()
         if scope_name not in scopes and "write" not in scopes:
             raise HTTPException(
                 status_code=403,
                 detail=f"API key lacks required write scope '{scope_name}'.",
+                headers=headers,
             )
 
     _check.__kip_required_scope__ = scope_name  # type: ignore[attr-defined]
@@ -159,25 +180,31 @@ def extract_client_ip(
         return peer_ip
 
 
-def extract_presented_key(scope: dict[str, Any]) -> str | None:
-    """Extract an API key from `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+def extract_presented_credentials(scope: dict[str, Any]) -> tuple[str | None, bool]:
+    """Extract `(token, is_bearer)` from `X-API-Key: <key>` or `Authorization: Bearer <token>`.
 
     An empty or whitespace-only `X-API-Key` header is treated as absent so it does not shadow a valid
-    `Authorization: Bearer` header.
+    `Authorization: Bearer` header. `is_bearer` is True when the credential came from `Authorization: Bearer`.
     """
     for key, val in scope.get("headers", ()):
         if key.lower() == b"x-api-key":
             cleaned = val.decode("latin-1", errors="replace").strip()
             if cleaned:
-                return cleaned
+                return cleaned, False
 
     auth = _header_value(scope, b"authorization")
     if auth:
         parts = auth.split(None, 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1].strip()
-            return token or None
-    return None
+            return (token or None), True
+    return None, False
+
+
+def extract_presented_key(scope: dict[str, Any]) -> str | None:
+    """Extract an API key from `Authorization: Bearer <key>` or `X-API-Key: <key>`."""
+    token, _is_bearer = extract_presented_credentials(scope)
+    return token
 
 
 def _coerce_key_entry(entry: ApiKeyEntry | tuple[Any, ...], idx: int = 0) -> ApiKeyEntry:
@@ -219,16 +246,46 @@ def verify_api_key_constant_time(
 
 
 def redact_sensitive_text(text: str, configured_keys: Iterable[ApiKeyEntry | tuple[Any, ...]] = ()) -> str:
-    """Scrub `Authorization: Bearer ...`, `X-API-Key`, and raw configured secrets from text."""
+    """Scrub `Authorization: Bearer ...`, `Basic ...`, `X-API-Key`, and raw configured secrets from text."""
     if not text:
         return text
     cleaned = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    cleaned = _BASIC_RE.sub(r"\1[REDACTED]", cleaned)
     cleaned = _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
     for entry in configured_keys:
         secret = entry.secret if isinstance(entry, ApiKeyEntry) else (entry[1] if len(entry) >= 2 else "")
         if secret:
             cleaned = cleaned.replace(secret, "[REDACTED]")
     return cleaned
+
+
+def _active_middleware() -> ApiAuthMiddleware | None:
+    mw = _ACTIVE_AUTH_MIDDLEWARE.get()
+    return mw if mw is not None else _LAST_AUTH_MIDDLEWARE
+
+
+def check_ip_lockout(client_ip: str) -> int | None:
+    """Return remaining lockout seconds for `client_ip` on the active `ApiAuthMiddleware`, or None."""
+    mw = _active_middleware()
+    if mw is None:
+        return None
+    return mw.get_ip_lockout_remaining(client_ip)
+
+
+def record_ip_auth_failure(client_ip: str, auth_lockout: dict[str, int] | None = None) -> None:
+    """Record a failed authentication attempt (e.g. OAuth consent form bad API key) against `client_ip`."""
+    mw = _active_middleware()
+    if mw is None:
+        return
+    mw.record_auth_failure(client_ip, auth_lockout)
+
+
+def clear_ip_auth_failures(client_ip: str) -> None:
+    """Clear any accumulated authentication failures for `client_ip` upon valid authentication."""
+    mw = _active_middleware()
+    if mw is None:
+        return
+    mw.clear_auth_failures(client_ip)
 
 
 @dataclass
@@ -286,6 +343,27 @@ class ApiAuthMiddleware:
         self._ip_failures: OrderedDict[str, _IpAuthState] = OrderedDict()
         self._ip_hits: OrderedDict[str, deque[float]] = OrderedDict()
         self._key_hits: OrderedDict[str, deque[float]] = OrderedDict()
+        global _LAST_AUTH_MIDDLEWARE
+        _LAST_AUTH_MIDDLEWARE = self
+
+    def get_ip_lockout_remaining(self, client_ip: str) -> int | None:
+        now = self._clock()
+        with self._lock:
+            state = self._ip_failures.get(client_ip)
+            if state is not None and state.lockout_until > now:
+                self._ip_failures.move_to_end(client_ip)
+                return max(1, int(math.ceil(state.lockout_until - now)))
+        return None
+
+    def record_auth_failure(self, client_ip: str, auth_lockout: dict[str, int] | None = None) -> None:
+        now = self._clock()
+        policy = auth_lockout if auth_lockout is not None else self._runtime_policy()[2]
+        with self._lock:
+            self._record_failure(client_ip, now, policy)
+
+    def clear_auth_failures(self, client_ip: str) -> None:
+        with self._lock:
+            self._ip_failures.pop(client_ip, None)
 
     def _runtime_policy(self) -> tuple[
         list[tuple[str, str]],
@@ -378,44 +456,143 @@ class ApiAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        from api.oauth import (
+            build_www_authenticate_header,
+            is_oauth_public_path,
+            oauth_manager,
+            resolve_issuer,
+        )
+
+        cfg = get_api_server_config()
+        oauth_cfg = cfg.get("oauth") if isinstance(cfg.get("oauth"), dict) else {}
+        oauth_enabled = bool(oauth_cfg.get("enabled", False))
         keys, rate_limit, auth_lockout, trusted_networks, ip_header = self._runtime_policy()
         client_ip = extract_client_ip(scope, trusted_networks, ip_header)
         scope["client_ip"] = client_ip
         now = self._clock()
+        path = scope.get("path", "")
+        method = (scope.get("method") or "GET").upper()
+        origin = _header_value(scope, b"origin")
+
+        cors_headers: dict[str, str] = {}
+        if oauth_enabled and origin:
+            cors_headers = {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
+            }
+
+        async def send_with_cors(message: dict[str, Any]) -> None:
+            if cors_headers and message["type"] == "http.response.start":
+                raw_hdrs = list(message.get("headers", []))
+                existing_lower = {k.lower() for k, _ in raw_hdrs}
+                for hk, hv in cors_headers.items():
+                    if hk.lower().encode("latin-1") not in existing_lower:
+                        raw_hdrs.append((hk.lower().encode("latin-1"), hv.encode("latin-1")))
+                message = {**message, "headers": raw_hdrs}
+            await send(message)
+
+        # 0. Browser CORS preflight when OAuth 2.1 is enabled and Origin header is present
+        if oauth_enabled and method == "OPTIONS" and origin:
+            preflight_resp = Response(
+                status_code=204,
+                headers={
+                    **cors_headers,
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": (
+                        "Authorization, Content-Type, Accept, MCP-Protocol-Version, "
+                        "Mcp-Session-Id, X-API-Key, X-KI-Repo"
+                    ),
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+            await preflight_resp(scope, receive, send)
+            return
 
         # 1. Pre-auth IP lockout check (never reveal key validity while locked out)
-        lockout_retry_after: int | None = None
-        with self._lock:
-            state = self._ip_failures.get(client_ip)
-            if state is not None and state.lockout_until > now:
-                self._ip_failures.move_to_end(client_ip)
-                lockout_retry_after = max(1, int(math.ceil(state.lockout_until - now)))
-
+        lockout_retry_after = self.get_ip_lockout_remaining(client_ip)
         if lockout_retry_after is not None:
             resp = JSONResponse(
                 status_code=429,
                 content={"detail": "Too many failed authentication attempts. IP temporarily locked out."},
-                headers={"Retry-After": str(lockout_retry_after)},
+                headers={"Retry-After": str(lockout_retry_after), **cors_headers},
             )
             await resp(scope, receive, send)
             return
 
-        # 2. Constant-time API key authentication (fail closed when no keys are configured)
-        presented = extract_presented_key(scope)
+        resolved_issuer = resolve_issuer(scope, oauth_cfg=oauth_cfg) if oauth_enabled else ""
+
+        # 1b. OAuth 2.1 discovery and authorization endpoints (/.well-known/oauth-*, /api/oauth/*)
+        if is_oauth_public_path(path):
+            if not oauth_enabled:
+                resp = JSONResponse(status_code=404, content={"detail": "Not Found"})
+                await resp(scope, receive, send)
+                return
+
+            max_requests = max(1, int(rate_limit.get("max_requests", 120)))
+            window_seconds = max(1, int(rate_limit.get("window_seconds", 60)))
+            with self._lock:
+                ip_wait = self._check_and_record_rate_limit(
+                    self._ip_hits, client_ip, now, max_requests, window_seconds, self._max_tracked_ips
+                )
+                if ip_wait is None:
+                    self._ip_hits[client_ip].append(now)
+            if ip_wait is not None:
+                resp = JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too many requests. Please slow down."},
+                    headers={"Retry-After": str(max(1, ip_wait)), **cors_headers},
+                )
+                await resp(scope, receive, send)
+                return
+
+            scope["api_key_id"] = "oauth:public"
+            tok_mw = _ACTIVE_AUTH_MIDDLEWARE.set(self)
+            tok_iss = _ACTIVE_OAUTH_ISSUER.set(resolved_issuer)
+            try:
+                await self.app(scope, receive, send_with_cors)
+            finally:
+                _ACTIVE_OAUTH_ISSUER.reset(tok_iss)
+                _ACTIVE_AUTH_MIDDLEWARE.reset(tok_mw)
+            return
+
+        # 2. Constant-time API key authentication + dual OAuth 2.1 Bearer access token verification
+        presented, is_bearer = extract_presented_credentials(scope)
         matched_key = verify_api_key_constant_time(presented, keys)
-        if matched_key is None:
+        key_id: str | None = None
+        key_scopes: frozenset[str] = DEFAULT_API_SCOPES
+
+        if matched_key is not None:
+            key_id = matched_key.id
+            key_scopes = matched_key.scopes
+        elif oauth_enabled and is_bearer and presented:
+            oauth_verified = oauth_manager.verify_access_token(
+                presented,
+                expected_issuer=resolved_issuer,
+                allow_writes=bool(cfg.get("allow_writes", False)),
+                configured_keys=keys,
+                oauth_cfg=oauth_cfg,
+            )
+            if oauth_verified is not None:
+                key_id, key_scopes, _payload = oauth_verified
+
+        if key_id is None:
             with self._lock:
                 self._record_failure(client_ip, now, auth_lockout)
+            if oauth_enabled:
+                www_auth = build_www_authenticate_header(
+                    resolved_issuer,
+                    error="invalid_token" if (is_bearer and presented) else None,
+                )
+            else:
+                www_auth = "Bearer"
             resp = JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API key"},
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": www_auth, **cors_headers},
             )
             await resp(scope, receive, send)
             return
 
-        key_id = matched_key.id
-        key_scopes = matched_key.scopes
         scope["api_key_id"] = key_id
         scope["api_key_scopes"] = key_scopes
 
@@ -441,16 +618,20 @@ class ApiAuthMiddleware:
             resp = JSONResponse(
                 status_code=429,
                 content={"detail": "Too many requests. Please slow down."},
-                headers={"Retry-After": str(max(1, rate_retry_after))},
+                headers={"Retry-After": str(max(1, rate_retry_after)), **cors_headers},
             )
             await resp(scope, receive, send)
             return
 
         tok_scopes = _ACTIVE_API_SCOPES.set(key_scopes)
         tok_key = _ACTIVE_API_KEY_ID.set(key_id)
+        tok_iss = _ACTIVE_OAUTH_ISSUER.set(resolved_issuer if oauth_enabled else None)
+        tok_mw = _ACTIVE_AUTH_MIDDLEWARE.set(self)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_with_cors)
         finally:
+            _ACTIVE_AUTH_MIDDLEWARE.reset(tok_mw)
+            _ACTIVE_OAUTH_ISSUER.reset(tok_iss)
             _ACTIVE_API_KEY_ID.reset(tok_key)
             _ACTIVE_API_SCOPES.reset(tok_scopes)
 

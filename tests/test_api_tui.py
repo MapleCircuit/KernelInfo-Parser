@@ -203,7 +203,7 @@ class TestApiSettingsScreen(unittest.TestCase):
     def test_layout_fits_24_and_30_rows(self) -> None:
         for rows in (24, 30):
             screen, _app, win = _screen({"api": {"keys": ["k%07d" % i for i in range(12)]}}, rows=rows)
-            for section in ("Server", "Keys", "Limits"):
+            for section in ("Server", "Keys", "Limits", "OAuth"):
                 _go(screen, section)
                 win.calls.clear()
                 screen.draw()
@@ -250,6 +250,69 @@ class TestApiSettingsScreen(unittest.TestCase):
         )
         self.assertTrue(app.config["api"]["allow_writes"])
         self.assertEqual(app.config["api"]["nodemap_canvas_dir"], "/tmp/custom-canvases")
+
+    def test_oauth_settings_and_masked_clients_persistence(self) -> None:
+        client_secret = "verysecretclientkey987654"
+        cfg = {
+            "api": {
+                "oauth": {
+                    "enabled": True,
+                    "issuer": "https://kernelinfo.org",
+                    "allow_dcr": False,
+                    "allow_cimd": True,
+                    "data_dir": "/tmp/kip-oauth",
+                    "access_token_ttl": 1800,
+                    "clients": [
+                        {
+                            "client_id": "gemini-client",
+                            "client_secret": client_secret,
+                            "name": "Gemini Extension",
+                            "redirect_uris": ["https://gemini.google.com/callback"],
+                        }
+                    ],
+                }
+            }
+        }
+        screen, app, win = _screen(cfg)
+        self.assertTrue(screen.chk_oauth_enabled.is_checked())
+        self.assertEqual(screen.inp_oauth_issuer.get_value(), "https://kernelinfo.org")
+        self.assertFalse(screen.chk_oauth_dcr.is_checked())
+        self.assertTrue(screen.chk_oauth_cimd.is_checked())
+        self.assertEqual(screen.inp_oauth_data_dir.get_value(), "/tmp/kip-oauth")
+
+        # Verify client secret is masked and never rendered in full
+        _go(screen, "OAuth")
+        screen.draw()
+        text = "\n".join(str(a[2]) for n, a, _ in win.calls if n == "addstr")
+        self.assertIn("very…", text)
+        self.assertNotIn(client_secret, text)
+
+        # Add a public PKCE client and save
+        with patch.object(
+            ApiSettingsScreen,
+            "_prompt",
+            side_effect=["cursor-local", "Cursor IDE", "http://127.0.0.1/callback", ""],
+        ):
+            self.assertTrue(screen.add_oauth_client())
+        self.assertEqual(len(screen.oauth_clients), 2)
+        self.assertIn("(public)", screen._render_oauth_client(1))
+
+        screen.inp_oauth_issuer.set_value("https://api.kernelinfo.org/")
+        screen.chk_oauth_dcr.set_checked(True)
+        self.assertTrue(screen.save())
+
+        saved_oauth = app.config["api"]["oauth"]
+        self.assertTrue(saved_oauth["enabled"])
+        self.assertEqual(saved_oauth["issuer"], "https://api.kernelinfo.org")
+        self.assertTrue(saved_oauth["allow_dcr"])
+        self.assertTrue(saved_oauth["allow_cimd"])
+        self.assertEqual(saved_oauth["data_dir"], "/tmp/kip-oauth")
+        # Non-TUI keys like access_token_ttl are preserved
+        self.assertEqual(saved_oauth["access_token_ttl"], 1800)
+        self.assertEqual(len(saved_oauth["clients"]), 2)
+        self.assertEqual(saved_oauth["clients"][0]["client_secret"], client_secret)
+        self.assertEqual(saved_oauth["clients"][1]["client_id"], "cursor-local")
+        self.assertNotIn("client_secret", saved_oauth["clients"][1])
 
 
 class TestApiConfigScope(unittest.TestCase):

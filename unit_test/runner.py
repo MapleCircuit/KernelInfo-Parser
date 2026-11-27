@@ -121,6 +121,7 @@ DEFAULT_MODULES = [
     "tests.test_ai_api_security",
     "tests.test_ai_api",
     "tests.test_ai_mcp",
+    "tests.test_ai_oauth",
     "tests.test_tui",
     "tests.test_tui_app",
     "tests.test_tui_testing",
