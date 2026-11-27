@@ -423,8 +423,8 @@ def _authenticate_token_client(
 
     if basic_id and form_id and basic_id != form_id:
         raise OAuthError("invalid_client", "Mismatched client_id between Basic auth and form body.", status_code=401)
-    if basic_secret is not None and form_secret is not None:
-        raise OAuthError("invalid_client", "Client credentials must not use multiple auth methods.", status_code=401)
+    if basic_secret is not None and form_secret is not None and basic_secret != form_secret:
+        raise OAuthError("invalid_client", "Mismatched client_secret between Basic auth and form body.", status_code=401)
 
     client_id = basic_id or form_id or expected_client_id
     if not client_id:

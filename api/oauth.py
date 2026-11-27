@@ -128,6 +128,7 @@ class OAuthClient:
     token_endpoint_auth_method: str = "none"
     client_secret: str | None = None
     client_secret_sha256: str | None = None
+    secret_optional: bool = False
     grant_types: tuple[str, ...] = ("authorization_code", "refresh_token")
     response_types: tuple[str, ...] = ("code",)
     max_scopes: frozenset[str] = VALID_API_SCOPES
@@ -146,7 +147,7 @@ class OAuthClient:
         if not self.is_confidential:
             return True
         if not candidate:
-            return False
+            return bool(self.secret_optional)
         cand_hash = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
         if self.client_secret is not None:
             expected_hash = hashlib.sha256(self.client_secret.encode("utf-8")).hexdigest()
@@ -827,7 +828,9 @@ class OAuthManager:
             if uri not in redirect_uris:
                 redirect_uris.append(uri)
 
-        auth_method = str(metadata.get("token_endpoint_auth_method") or "none").strip()
+        raw_auth_method = metadata.get("token_endpoint_auth_method")
+        auth_method_omitted = raw_auth_method is None or not str(raw_auth_method).strip()
+        auth_method = "client_secret_post" if auth_method_omitted else str(raw_auth_method).strip()
         if auth_method not in _SUPPORTED_AUTH_METHODS:
             raise OAuthError(
                 "invalid_client_metadata",
@@ -877,6 +880,7 @@ class OAuthManager:
             "client_name": client_name,
             "redirect_uris": redirect_uris,
             "token_endpoint_auth_method": auth_method,
+            "secret_optional": auth_method_omitted,
             "grant_types": grant_types,
             "response_types": response_types,
             "max_scopes": sorted(max_scopes),
@@ -922,6 +926,7 @@ class OAuthManager:
             redirect_uris=tuple(str(u) for u in uris if isinstance(u, str)),
             token_endpoint_auth_method=str(data.get("token_endpoint_auth_method") or "none"),
             client_secret_sha256=data.get("client_secret_sha256"),
+            secret_optional=bool(data.get("secret_optional", False)),
             grant_types=tuple(data.get("grant_types") or ("authorization_code", "refresh_token")),
             response_types=tuple(data.get("response_types") or ("code",)),
             max_scopes=scopes,
@@ -1522,10 +1527,14 @@ class OAuthManager:
 
 # ------------------------------------------------------------------ Consent HTML Renderer
 
+# Note: Do not set `form-action 'self'` here because CSP Level 3 enforces `form-action` across
+# the entire 302 redirect chain of a POST form submission, which would cause Chrome/Safari to block
+# the 302 redirect from `POST /api/oauth/authorize` to external OAuth callback URLs
+# (e.g. `https://oauth-redirect.googleusercontent.com/...`, `https://claude.ai/...`, `http://localhost:...`).
 CONSENT_CSP = (
     "default-src 'none'; "
     "style-src 'unsafe-inline'; "
-    "form-action 'self'; "
+    "img-src 'self' data:; "
     "frame-ancestors 'none'; "
     "base-uri 'none'"
 )
