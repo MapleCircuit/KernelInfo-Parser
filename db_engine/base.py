@@ -2202,6 +2202,7 @@ class BaseDBEngine(ABC):
         role: int | None = None,
         with_caller: bool = False,
         limit: int | None = None,
+        commit_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """References of the target ASTs: dicts `role, line, char_s, fid, tag_id, ast_id` (+ `caller`).
 
@@ -2209,7 +2210,9 @@ class BaseDBEngine(ABC):
         """
         from db_engine import symbol_rows
 
-        return symbol_rows.symbol_refs_of_targets(self, ast_ids, role=role, with_caller=with_caller, limit=limit)
+        return symbol_rows.symbol_refs_of_targets(
+            self, ast_ids, role=role, with_caller=with_caller, limit=limit, commit_id=commit_id
+        )
 
     def symbol_def_blobs_of_targets(self, ast_ids: Sequence[int]) -> set[tuple[int, int]]:
         """Distinct `(ast_id, blob_id)` definitions of the target ASTs (`db_engine/symbol_rows.py`)."""

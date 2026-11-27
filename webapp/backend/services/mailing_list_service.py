@@ -152,22 +152,46 @@ class MailingListService:
             }
 
         is_healthy = False
+        integrity: dict[str, Any] | None = None
+        reason: str | None = None
         try:
             if client._in_process_resolver is not None:
-                is_healthy = True
+                store = getattr(client._in_process_resolver, "store", None)
+                if store is not None and hasattr(store, "check_integrity"):
+                    integrity = store.check_integrity(full=False)
+                    is_healthy = bool(integrity.get("ok", True))
+                    if not is_healthy:
+                        reason = "Mailing list archive integrity check failed"
+                else:
+                    is_healthy = True
             else:
-                is_healthy = client._check_health(timeout=1.5)
+                is_healthy = bool(client._check_health(timeout=1.5))
+                if is_healthy and hasattr(client, "_probe_health"):
+                    probe = client._probe_health(timeout=1.5)
+                    if isinstance(probe, dict) and isinstance(probe.get("integrity"), dict):
+                        integrity = probe["integrity"]
+                        if not integrity.get("ok", True):
+                            is_healthy = False
+                            reason = "Mailing list archive integrity check failed"
+                elif not is_healthy:
+                    reason = "Mailing list daemon not responding on port"
         except Exception as exc:  # noqa: BLE001
             logger.debug("MailingListClient health check failed: %s", exc)
             is_healthy = False
+            reason = str(exc)
 
-        return {
+        status_payload: dict[str, Any] = {
             "enabled": True,
             "available": is_healthy,
             "port": client._effective_port,
             "lore_url": LORE_BASE_URL,
-            "reason": None if is_healthy else "Mailing list daemon not responding on port",
+            "reason": None if is_healthy else (reason or "Mailing list daemon not responding on port"),
         }
+        if integrity is not None:
+            status_payload["integrity"] = integrity
+            if not integrity.get("ok", True):
+                status_payload["degraded"] = True
+        return status_payload
 
     def get_message(self, mid_or_num: str | int) -> dict[str, Any]:
         """Fetch full email detail by message-ID or sequential article number."""
@@ -295,6 +319,16 @@ class MailingListService:
 
             try:
                 thread_data = client.get_thread(tid)
+                if thread_data.get("error") or thread_data.get("available") is False:
+                    return {
+                        "available": False,
+                        "degraded": True,
+                        "tid": tid,
+                        "error": str(thread_data.get("error") or "Thread lookup failed"),
+                        "lore_url": f"{LORE_BASE_URL}t/{tid}" if tid else LORE_BASE_URL,
+                        "total": 0,
+                        "messages": [],
+                    }
                 cached_res = {
                     "available": True,
                     "lore_url": f"{LORE_BASE_URL}t/{tid}" if tid else LORE_BASE_URL,
@@ -307,6 +341,7 @@ class MailingListService:
                 logger.debug("Error retrieving thread %d: %s", tid, exc)
                 return {
                     "available": False,
+                    "degraded": True,
                     "tid": tid,
                     "error": str(exc),
                     "lore_url": LORE_BASE_URL,
@@ -509,6 +544,20 @@ class MailingListService:
                 offset=offset,
                 filter_type=filter_type,
             )
+            if search_data.get("available") is False or (
+                search_data.get("error") and not (search_data.get("degraded") and search_data.get("results"))
+            ):
+                return {
+                    "available": False,
+                    "degraded": True,
+                    "query": clean_q,
+                    "page": p,
+                    "limit": lim,
+                    "total": 0,
+                    "results": [],
+                    "error": str(search_data.get("error") or "Mailing list search failed"),
+                    "lore_url": _lore_search_url(clean_q),
+                }
             if not clean_q:
                 search_data = _drop_future_dated(search_data)
             result: dict[str, Any] = {
@@ -518,14 +567,16 @@ class MailingListService:
                 **search_data,
             }
 
-            with self._lock:
-                self._live_put(self._search_cache, cache_key, result, self._max_search_cache)
+            if not result.get("error") and not result.get("degraded"):
+                with self._lock:
+                    self._live_put(self._search_cache, cache_key, result, self._max_search_cache)
 
             return result
         except Exception as exc:  # noqa: BLE001
             logger.debug("Error executing mailing list search '%s': %s", clean_q, exc)
             return {
                 "available": False,
+                "degraded": True,
                 "query": clean_q,
                 "page": p,
                 "limit": lim,

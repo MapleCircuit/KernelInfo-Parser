@@ -15,11 +15,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from db_engine.spec import Join, NotExists, Select, add, in_select
+from db_engine.spec import Join, NotExists, Select, Value, add, gt, in_select
 
 # m_symbol_own.kind of the rows a blob stores itself instead of sharing them through its tags
 KIND_REFS = 1
 KIND_DEFS = 2
+# Fan-out probe threshold before falling back to checkpoint-driven (vid, ast_id) resolution
+HIGH_DEGREE_PROBE_LIMIT = 4000
 
 
 def _placements(own_kind: int) -> tuple[list[Join], Any]:
@@ -41,6 +43,58 @@ def _target_keys(targets: Sequence[int]) -> Any:
     return in_select("ti.sym_key", Select(("m_blob_symbol", "k"), ["k.sym_key"], {"k.target_ast_id": list(targets)}, distinct=True))
 
 
+def _checkpoint_scoped_refs(
+    reader: Any,
+    targets: list[int],
+    *,
+    commit_id: int,
+    role: int | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Resolve shared symbol references driving from the revision's checkpoint (`(commit_id, ast_id) -> m_blob_symbol`).
+
+    Used when a high-degree symbol (`printk`, `kfree`) exceeds `HIGH_DEGREE_PROBE_LIMIT` across all versions, so
+    `LIMIT` is pushed down against the target revision's blobs rather than scanning millions of historical rows.
+    """
+    if not hasattr(reader, "existing_tables") or "m_bridge_checkpoint" not in reader.existing_tables(["m_bridge_checkpoint"]):
+        return []
+    where: dict[str, Any] = {
+        "bc.commit_id": int(commit_id),
+        "bc.blob_id": gt(0),
+        "a.ast_id": targets,
+        "o.blob_id": None,
+    }
+    if role is not None:
+        where["ti.role"] = int(role)
+    joins = [
+        Join(("m_ast", "a"), {}),
+        Join(("m_blob_symbol", "bs"), {"bs.target_ast_id": "a.ast_id", "bs.blob_id": "bc.blob_id"}),
+        Join(("m_tag_ref", "ti"), {"ti.sym_key": "bs.sym_key"}),
+        Join(("m_bridge_tag", "bt"), {"bt.blob_id": "bs.blob_id", "bt.tag_id": "ti.tag_id"}),
+        Join(
+            ("m_symbol_own", "o"),
+            {"o.blob_id": "bt.blob_id", "o.tag_id": "bt.tag_id", "o.kind": Value(KIND_REFS)},
+            "left",
+        ),
+    ]
+    return list(reader.select_rows(
+        ("m_bridge_checkpoint", "bc"),
+        {
+            "role": "ti.role",
+            "line": add("bt.line_s", "ti.rel_line"),
+            "char_s": "ti.char_s",
+            "fid": "bt.blob_id",
+            "tag_id": "ti.tag_id",
+            "ast_id": "bs.target_ast_id",
+        },
+        where,
+        joins=joins,
+        limit=limit,
+        as_dict=True,
+        hint="straight_join",
+    ))
+
+
 def symbol_refs_of_targets(
     reader: Any,
     ast_ids: Sequence[int],
@@ -48,6 +102,7 @@ def symbol_refs_of_targets(
     role: int | None = None,
     with_caller: bool = False,
     limit: int | None = None,
+    commit_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """References of `ast_ids`: dicts `role, line, char_s, fid (blob), tag_id, ast_id` (+ `caller`, the AST name of the
     tag the reference sits in). Per-blob rows come first, then the shared ones; `limit` caps the result."""
@@ -64,13 +119,23 @@ def symbol_refs_of_targets(
         limit=limit,
         as_dict=True,
     ))
-    if limit is None or len(rows) < limit:
-        joins, not_own = _placements(KIND_REFS)
-        shared_where: dict[str, Any] = {"bs.target_ast_id": targets}
+    if limit is None or len(rows) < limit or commit_id is not None:
+        rem = None if limit is None else (limit if commit_id is not None and len(rows) >= limit else limit - len(rows))
+        probe_cap = max(rem * 4, HIGH_DEGREE_PROBE_LIMIT) if (rem is not None and commit_id is not None) else rem
+        shared_joins = [
+            Join(("m_tag_ref", "ti"), {"ti.sym_key": "bs.sym_key"}),
+            Join(("m_bridge_tag", "bt"), {"bt.blob_id": "bs.blob_id", "bt.tag_id": "ti.tag_id"}),
+            Join(
+                ("m_symbol_own", "o"),
+                {"o.blob_id": "bt.blob_id", "o.tag_id": "bt.tag_id", "o.kind": Value(KIND_REFS)},
+                "left",
+            ),
+        ]
+        shared_where: dict[str, Any] = {"bs.target_ast_id": targets, "o.blob_id": None}
         if role is not None:
             shared_where["ti.role"] = int(role)
-        rows.extend(reader.select_rows(
-            ("m_tag_ref", "ti"),
+        shared_rows = list(reader.select_rows(
+            ("m_blob_symbol", "bs"),
             {
                 "role": "ti.role",
                 "line": add("bt.line_s", "ti.rel_line"),
@@ -79,12 +144,33 @@ def symbol_refs_of_targets(
                 "tag_id": "ti.tag_id",
                 "ast_id": "bs.target_ast_id",
             },
-            [shared_where, _target_keys(targets), not_own],
-            joins=joins,
-            order_by=["bt.blob_id", "ti.tag_id", "ti.ref_idx"],
-            limit=None if limit is None else limit - len(rows),
+            shared_where,
+            joins=shared_joins,
+            order_by=() if probe_cap is not None else ("bt.blob_id", "ti.tag_id", "ti.ref_idx"),
+            limit=probe_cap,
             as_dict=True,
+            hint="straight_join",
         ))
+        used_scoped = False
+        if (
+            commit_id is not None
+            and rem is not None
+            and probe_cap is not None
+            and len(shared_rows) >= probe_cap
+        ):
+            scoped = _checkpoint_scoped_refs(
+                reader, targets, commit_id=int(commit_id), role=role, limit=rem
+            )
+            if scoped:
+                shared_rows = scoped
+                used_scoped = True
+        if rem is not None and len(shared_rows) > rem:
+            shared_rows = shared_rows[:rem]
+        shared_rows.sort(key=lambda r: (int(r.get("fid") or 0), int(r.get("tag_id") or 0), int(r.get("line") or 0), int(r.get("char_s") or 0)))
+        if used_scoped:
+            rows = shared_rows
+        else:
+            rows.extend(shared_rows)
     if limit is not None:
         rows = rows[:limit]
     if with_caller:
@@ -112,13 +198,29 @@ def symbol_def_blobs_of_targets(reader: Any, ast_ids: Sequence[int]) -> set[tupl
             ("m_blob_symbol_def", "d"), ["d.ast_id", "d.blob_id"], {"d.ast_id": targets}, distinct=True, as_dict=False
         )
     }
-    joins, not_own = _placements(KIND_DEFS)
+    joins = [
+        Join(("m_tag_def", "ti"), {"ti.name": "a.name"}),
+        Join(("m_bridge_tag", "bt"), {"bt.tag_id": "ti.tag_id"}),
+        Join(
+            ("m_blob_symbol", "bs"),
+            {"bs.target_ast_id": "a.ast_id", "bs.blob_id": "bt.blob_id", "bs.sym_key": "ti.sym_key"},
+        ),
+        Join(
+            ("m_symbol_own", "o"),
+            {"o.blob_id": "bt.blob_id", "o.tag_id": "bt.tag_id", "o.kind": Value(KIND_DEFS)},
+            "left",
+        ),
+    ]
     out.update(
         (int(a), int(b))
         for a, b in reader.select_rows(
-            ("m_tag_def", "ti"), ["bs.target_ast_id", "bt.blob_id"],
-            [{"bs.target_ast_id": targets}, _target_keys(targets), not_own],
-            joins=joins, distinct=True, as_dict=False,
+            ("m_ast", "a"),
+            ["bs.target_ast_id", "bt.blob_id"],
+            {"a.ast_id": targets, "o.blob_id": None},
+            joins=joins,
+            distinct=True,
+            as_dict=False,
+            hint="straight_join",
         )
     )
     return out

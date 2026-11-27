@@ -88,6 +88,38 @@ class TestQueryRepository(unittest.TestCase):
         self.assertEqual(self.run_query(range_="v1.0..v1.1", paths=["mm"]), ["mm: three journal"])
         self.assertEqual(self.run_query(text="a.c"), [])  # escaped: "." is not a wildcard
 
+    def test_token_boundary_ranking_and_files_count_fallback(self) -> None:
+        from webapp.backend.services.commit_query import commit_text_match_rank
+        from webapp.backend.services.git_service import GitService
+
+        subjects = [
+            "bpf: (zext32 (zext32 X)) -> (zext32 X) SCEV simplification rule",
+            "Remove long-stale ext3 defconfig option",
+            "Use CONFIG_EXT4_FS instead of CONFIG_EXT3_FS in all of the defconfigs",
+            "bpf: Add missed var_off setting in set_sext32_default_val()",
+            "scsi: lpfc: Define types in a union for generic void *context3 ptr",
+            "Merge tag 'timers-conversion-next3' into timers/core",
+            "ext3: Don't check quota format when there are no quota files",
+        ]
+        ranked = sorted(subjects, key=lambda s: commit_text_match_rank("ext3", s))
+        self.assertEqual(
+            ranked[:2],
+            [
+                "Remove long-stale ext3 defconfig option",
+                "ext3: Don't check quota format when there are no quota files",
+            ],
+        )
+        self.assertEqual(ranked[2], "Use CONFIG_EXT4_FS instead of CONFIG_EXT3_FS in all of the defconfigs")
+        self.assertTrue(all(any(w in s for w in ("zext32", "sext32", "context3", "next3")) for s in ranked[3:]))
+        # Explicit substring search still matches rank 0 for its own token
+        self.assertEqual(commit_text_match_rank("zext32", subjects[0]), 0)
+
+        sha = "a" * 40
+        items = [{"commit_hash": sha, "files_count": 0}]
+        with patch.object(GitService, "run_git", return_value=(f"\x1e{sha}\nkernel/bpf/scev.c\n", "", 0)):
+            GitService.fill_missing_files_counts(items)
+        self.assertEqual(items[0]["files_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

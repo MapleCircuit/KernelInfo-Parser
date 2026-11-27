@@ -43,6 +43,24 @@ def ere_escape(text: str) -> str:
     return _ERE_SPECIAL.sub(r"\\\1", text)
 
 
+def commit_text_match_rank(query: str, subject: str, author_name: str = "") -> int:
+    """Token-boundary relevance tier for commit text search (`0` = strict whole token, `1` = underscore-delimited
+    alphanumeric token such as `CONFIG_EXT3_FS`, `2` = internal substring collision such as `zext32`/`context3`)."""
+    q = (query or "").strip()
+    if not q:
+        return 0
+    esc = re.escape(q)
+    strict_re = re.compile(rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])", re.IGNORECASE)
+    subj = subject or ""
+    auth = author_name or ""
+    if strict_re.search(subj) or strict_re.search(auth):
+        return 0
+    alnum_re = re.compile(rf"(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])", re.IGNORECASE)
+    if alnum_re.search(subj) or alnum_re.search(auth):
+        return 1
+    return 2
+
+
 def clean_text(value: Any, what: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -227,6 +245,8 @@ def query_commits(version_name: str, *, paths: list[str] | None = None, author: 
             "author_date": int(parts[3]) if parts[3].isdigit() else 0, "subject": parts[4],
             "is_merge": len(parts[5].split()) > 1,
         })
+    if text and rows:
+        rows.sort(key=lambda r: commit_text_match_rank(text, r.get("subject", ""), r.get("author_name", "")))
     has_more = len(rows) > limit
     rows = rows[:limit]
     from webapp.backend.services.commit_facts import commit_ids

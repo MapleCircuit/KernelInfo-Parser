@@ -760,6 +760,7 @@ class ReadAPI(Protocol):
         role: int | None = None,
         with_caller: bool = False,
         limit: int | None = None,
+        commit_id: int | None = None,
     ) -> list[dict]: ...
 
     def symbol_def_blobs_of_targets(self, ast_ids: Sequence[int]) -> set[tuple[int, int]]: ...

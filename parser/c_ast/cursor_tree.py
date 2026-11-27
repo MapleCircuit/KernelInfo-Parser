@@ -2859,6 +2859,12 @@ class C_Type(Ast):
                     kid_file = kids.extent.start.file.name if kids.extent.start.file else None
                     if cur_file and kid_file and cur_file != kid_file:
                         continue
+                    if (
+                        zone_type == Zone_Type.Declared_Args
+                        and kids.kind in {cc.CursorKind.STRUCT_DECL, cc.CursorKind.UNION_DECL, cc.CursorKind.ENUM_DECL}
+                        and not kids.is_definition()
+                    ):
+                        continue
                     filtered_children.append(kids)
 
                 if filtered_children:
@@ -2990,7 +2996,11 @@ class C_Type(Ast):
                 ASTT.C_enum,
                 ASTT.C_functionproto,
             }:
-                if cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL} and getattr(self, "name", "") not in _KNOWN_MACRO_FUNCS:
+                if (
+                    cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
+                    and getattr(self.cursor, "kind", None) not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
+                    and getattr(self, "name", "") not in _KNOWN_MACRO_FUNCS
+                ):
                     self.name = tspelling
                 tt = TypeToken(token, self.content.content[-1].type, cursor=cursor)
                 cur_f = getattr(G, "CURRENT_PARSING_FILE", "")

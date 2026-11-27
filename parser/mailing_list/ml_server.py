@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("ml_server")
 
 
-DAEMON_VERSION = "1.4.8"
+DAEMON_VERSION = "1.4.9"
 
 # Seconds to keep retrying the listen bind while a killed predecessor releases the port.
 # Kept short so a daemon that loses the race exits instead of lingering and later
@@ -318,6 +318,7 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
                 guard = self.guard
                 rss_now = guard.observe() if guard else current_rss_mb()
                 in_flight, idle_s = self.activity.snapshot()
+                integrity = store.check_integrity(full=False) if store and hasattr(store, "check_integrity") else None
                 self._send_json(
                     200,
                     {
@@ -327,6 +328,7 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
                         "idx_dir": idx_dir,
                         "shards": shards,
                         "has_xapian": HAS_XAPIAN,
+                        "integrity": integrity,
                         "rss_mb": round(rss_now, 1),
                         "peak_rss_mb": round(guard.peak_mb, 1) if guard else None,
                         "max_rss_mb": round(guard.max_rss_mb, 1) if guard else None,

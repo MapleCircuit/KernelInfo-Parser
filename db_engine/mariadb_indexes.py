@@ -29,14 +29,14 @@ class MariaDBIndexes:
         self,
         index_name: str,
         table: Table,
-        rows: tuple[PointerType, ...],
+        rows: tuple[PointerType | str, ...],
     ) -> None:
         """Create database index on target table columns if not already existing.
 
         Args:
             index_name: Name identifier for index.
             table: Target Table schema instance.
-            rows: Tuple of pointer tuples `(table_id, col_idx)`.
+            rows: Tuple of pointer tuples `(table_id, col_idx)` or column name strings.
 
         Process:
             1. Checks if index already exists via `SHOW INDEX`.
@@ -50,8 +50,8 @@ class MariaDBIndexes:
         try:
             if self.index_exists(index_name, table):
                 return
-            sql = f"CREATE INDEX {index_name} ON {table.table_name} "
-            sql += f"({', '.join(table.init_columns[x[1]][0] for x in rows)})"
+            col_names = [x if isinstance(x, str) else table.init_columns[x[1]][0] for x in rows]
+            sql = f"CREATE INDEX {index_name} ON {table.table_name} ({', '.join(col_names)})"
             with self._long_statement():
                 self._cur.execute(sql)
             self.cnx.commit()

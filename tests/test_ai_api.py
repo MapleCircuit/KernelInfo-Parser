@@ -1353,6 +1353,118 @@ class TestAiApiEndpoints(unittest.TestCase):
             self.assertEqual(m_fhist.call_args.args[2], 200)
 
 
+class TestVersionOrderingAndDefaultResolution(unittest.TestCase):
+    """Verify `list_versions` `order` (`desc` default / `asc`) and `default_version` resolution."""
+
+    def setUp(self) -> None:
+        self._orig_cfg = copy.deepcopy(core_config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core_config._LOADED_CONFIG_PATH
+        self._orig_pinned = core_config._API_DEFAULT_VERSION_PINNED
+        core_config.reset_config()
+        self._orig_env = dict(os.environ)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.linux_dir = Path(self._tmp.name) / "linux"
+        _init_sample_git_repo(self.linux_dir, {"README": "hi\n"}, "v3.0")
+        self.cfg_path = Path(self._tmp.name) / "config.json"
+
+    def tearDown(self) -> None:
+        core_config.reset_config()
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+        core_config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core_config._LOADED_CONFIG_PATH = self._orig_cfg_path
+        core_config._API_DEFAULT_VERSION_PINNED = self._orig_pinned
+        self._tmp.cleanup()
+
+    def test_list_versions_order_desc_default_and_asc(self) -> None:
+        self.cfg_path.write_text(
+            json.dumps(
+                {
+                    "workspace": {"auto_detect_repos": False},
+                    "repositories": [{"name": "linux", "path": str(self.linux_dir), "default": True}],
+                    "api": {"keys": {"agent": "tok"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        core_config.init_config(self.cfg_path)
+        client = TestClient(create_app())
+        hdrs = {"Authorization": "Bearer tok"}
+        sample_versions = {
+            "total": 5,
+            "versions": [
+                {"vname": "0.01", "ref_type": 1, "indexed": False},
+                {"vname": "v3.0", "ref_type": 1, "indexed": True},
+                {"vname": "v6.1", "ref_type": 1, "indexed": True},
+                {"vname": "v6.6", "ref_type": 1, "indexed": True},
+                {"vname": "master", "ref_type": 2, "indexed": True},
+            ],
+        }
+        with patch.object(v1_router, "get_versions", return_value=sample_versions):
+            r_def = client.get("/api/v1/versions", headers=hdrs).json()
+            self.assertEqual(r_def["order"], "desc")
+            self.assertEqual([v["vname"] for v in r_def["versions"]], ["v6.6", "v6.1", "v3.0", "0.01", "master"])
+
+            r_asc = client.get("/api/v1/versions?order=asc", headers=hdrs).json()
+            self.assertEqual(r_asc["order"], "asc")
+            self.assertEqual([v["vname"] for v in r_asc["versions"]], ["0.01", "v3.0", "v6.1", "v6.6", "master"])
+
+    def test_default_version_resolves_latest_indexed_mainline_unless_pinned(self) -> None:
+        from api.config import resolve_default_version
+
+        sample_versions = {
+            "versions": [
+                {"vname": "v3.0", "ref_type": 1, "indexed": True},
+                {"vname": "v6.1", "ref_type": 1, "indexed": True},
+                {"vname": "v6.1.12", "ref_type": 1, "indexed": True},
+                {"vname": "v6.2-rc1", "ref_type": 1, "indexed": True},
+                {"vname": "v6.6", "ref_type": 1, "indexed": False},
+                {"vname": "master", "ref_type": 2, "indexed": True},
+            ]
+        }
+
+        # Unpinned config resolves to latest indexed final mainline release (v6.1)
+        self.cfg_path.write_text(
+            json.dumps(
+                {
+                    "workspace": {"auto_detect_repos": False},
+                    "repositories": [{"name": "linux", "path": str(self.linux_dir), "default": True}],
+                    "api": {"keys": {"agent": "tok"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        core_config.init_config(self.cfg_path)
+        with patch("webapp.backend.routers.versions.get_versions", return_value=sample_versions):
+            self.assertEqual(resolve_default_version(), "v6.1")
+            client = TestClient(create_app())
+            with patch.object(v1_router, "projects_catalog", return_value=[]):
+                caps = client.get("/api/v1/capabilities", headers={"Authorization": "Bearer tok"}).json()
+                self.assertEqual(caps["default_version"], "v6.1")
+
+        # Explicitly pinned api.default_version preserves the pin
+        self.cfg_path.write_text(
+            json.dumps(
+                {
+                    "workspace": {"auto_detect_repos": False},
+                    "repositories": [{"name": "linux", "path": str(self.linux_dir), "default": True}],
+                    "api": {"default_version": "v3.0", "keys": {"agent": "tok"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        core_config.init_config(self.cfg_path)
+        with patch("webapp.backend.routers.versions.get_versions", return_value=sample_versions):
+            self.assertEqual(resolve_default_version(), "v3.0")
+
+        # Env API_DEFAULT_VERSION overrides dynamic resolution
+        with (
+            patch.dict(os.environ, {"API_DEFAULT_VERSION": "v6.6"}),
+            patch("webapp.backend.routers.versions.get_versions", return_value=sample_versions),
+        ):
+            self.assertEqual(resolve_default_version(), "v6.6")
+
+
 if __name__ == "__main__":
     unittest.main()
 

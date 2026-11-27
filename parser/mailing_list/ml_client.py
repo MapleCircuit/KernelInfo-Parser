@@ -32,7 +32,7 @@ from parser.mailing_list.ml_types import (
 logger = logging.getLogger(__name__)
 
 
-DAEMON_VERSION = "1.4.8"
+DAEMON_VERSION = "1.4.9"
 
 # Total seconds to wait for a freshly launched remote daemon to report healthy
 DAEMON_START_TIMEOUT = 30.0
@@ -663,9 +663,19 @@ class MailingListClient:
             with urllib.request.urlopen(req, timeout=30.0) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_msg = str(exc)
+            try:
+                body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                if isinstance(body, dict) and body.get("error"):
+                    err_msg = str(body["error"])
+            except Exception:
+                pass
+            logger.error("Failed to fetch thread %d from daemon: %s", tid, err_msg)
+            return {"available": False, "degraded": True, "tid": tid, "subject": "", "total": 0, "participants": [], "messages": [], "error": err_msg}
         except Exception as exc:
             logger.error("Failed to fetch thread %d from daemon: %s", tid, exc)
-            return {"tid": tid, "subject": "", "total": 0, "participants": [], "messages": [], "error": str(exc)}
+            return {"available": False, "degraded": True, "tid": tid, "subject": "", "total": 0, "participants": [], "messages": [], "error": str(exc)}
         return {"tid": tid, "subject": "", "total": 0, "participants": [], "messages": []}
 
     def search_emails(
@@ -698,9 +708,39 @@ class MailingListClient:
             with urllib.request.urlopen(req, timeout=30.0) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_msg = str(exc)
+            try:
+                body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                if isinstance(body, dict) and body.get("error"):
+                    err_msg = str(body["error"])
+            except Exception:
+                pass
+            logger.error("Failed to search mailing list at %s: %s", url, err_msg)
+            return {
+                "available": False,
+                "degraded": True,
+                "query": query,
+                "filter_type": filter_type,
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "results": [],
+                "error": err_msg,
+            }
         except Exception as exc:
             logger.error("Failed to search mailing list at %s: %s", url, exc)
-            return {"query": query, "filter_type": filter_type, "total": 0, "limit": limit, "offset": offset, "results": [], "error": str(exc)}
+            return {
+                "available": False,
+                "degraded": True,
+                "query": query,
+                "filter_type": filter_type,
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "results": [],
+                "error": str(exc),
+            }
         return {"query": query, "filter_type": filter_type, "total": 0, "limit": limit, "offset": offset, "results": []}
 
 

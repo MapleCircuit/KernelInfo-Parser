@@ -41,7 +41,7 @@ class ForeignReader:
         path: str | Path,
         *,
         readonly: bool = True,
-        immutable: bool = True,
+        immutable: bool = False,
         timeout: float = 60.0,
         cache_kib: int = DEFAULT_CACHE_KIB,
     ) -> None:
@@ -121,8 +121,8 @@ class ForeignReader:
 
     # ---- execution -----------------------------------------------------------------
     def _run(self, sql: str, params: Sequence[Any]) -> sqlite3.Cursor:
-        conn = self._connection()
         for attempt in range(_LOCK_RETRIES):
+            conn = self._connection()
             try:
                 return conn.execute(sql, tuple(params))
             except sqlite3.OperationalError as exc:
@@ -135,9 +135,30 @@ class ForeignReader:
                     time.sleep(delay)
                     continue
                 raise DBError(f"Foreign SQLite query failed: {exc}") from exc
+            except sqlite3.DatabaseError as exc:
+                self.close_thread()
+                if attempt == 0:
+                    continue
+                raise DBError(f"Foreign SQLite query failed: {exc}") from exc
             except sqlite3.Error as exc:
                 raise DBError(f"Foreign SQLite query failed: {exc}") from exc
         raise DBError("Foreign SQLite query failed: retries exhausted")
+
+    def quick_check(self, *, full: bool = False) -> tuple[bool, str]:
+        """Run a read-only integrity probe on the foreign SQLite file, returning `(ok, status_text)`."""
+        try:
+            conn = self._connection()
+            size_bytes = self.path.stat().st_size if self.path.exists() else 0
+            if full or size_bytes <= (64 << 20):
+                rows = conn.execute("PRAGMA quick_check(1)").fetchall()
+                status = str(rows[0][0]) if rows and rows[0] else "unknown"
+                return status.lower() == "ok", status
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return (page_count > 0), ("ok" if page_count > 0 else "empty database")
+        except Exception as exc:  # noqa: BLE001
+            self.close_thread()
+            return False, str(exc)
 
     # ---- spec reads ------------------------------------------------------------------
     def select_rows(
@@ -204,7 +225,7 @@ def open_foreign_sqlite(
     path: str | Path,
     *,
     readonly: bool = True,
-    immutable: bool = True,
+    immutable: bool = False,
     timeout: float = 60.0,
     cache_kib: int = DEFAULT_CACHE_KIB,
 ) -> ForeignReader:
@@ -213,7 +234,7 @@ def open_foreign_sqlite(
     Args:
         path: Existing SQLite file (raises `ConnectionLostError` when missing or unopenable).
         readonly: Open with `mode=ro` and `PRAGMA query_only` (the default; the only supported use today).
-        immutable: With `readonly`, add `immutable=1` (no locking, valid for files nobody writes concurrently).
+        immutable: With `readonly`, add `immutable=1` (no locking, valid only for static files nobody writes concurrently).
         timeout: Busy timeout in seconds.
         cache_kib: Page cache per connection in KiB (one connection per calling thread).
     """

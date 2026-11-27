@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -18,10 +19,13 @@ from core.config import (
     get_nodemap_canvas_dir,
     get_oauth_data_dir,
     get_webapp_config,
+    is_api_default_version_pinned,
     normalize_api_client_ip_header,
 )
 from webapp.backend.config import (
     get_active_features as _webapp_get_active_features,
+)
+from webapp.backend.config import (
     get_active_repo_name,
     get_active_repository,
     get_repo_dir,
@@ -35,6 +39,8 @@ from webapp.backend.config import (
     set_active_repository,
 )
 from webapp.backend.security.git import safe_rev
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8001
@@ -430,9 +436,43 @@ def apply_config_file(path: str | os.PathLike[str]) -> Path:
     return resolved
 
 
+def resolve_default_version() -> str:
+    """Resolve the default revision: explicit config/env pin if set, else latest indexed mainline release."""
+    env_ver = _get_user_env("API_DEFAULT_VERSION")
+    if env_ver is not None:
+        cleaned_env = str(env_ver).strip()
+        if cleaned_env and cleaned_env.lower() not in ("auto", "latest"):
+            return safe_rev(cleaned_env, "version")
+
+    cfg_default = get_api_server_config()["default_version"]
+    if is_api_default_version_pinned() or (cfg_default and cfg_default != "v3.0"):
+        return cfg_default
+
+    try:
+        from parser.git_ast.release_order import parse_tag, release_key
+        from webapp.backend.routers.versions import get_versions
+
+        versions = get_versions(include_rc=False).get("versions") or []
+        mainline: list[str] = []
+        for entry in versions:
+            if not entry.get("indexed") or entry.get("ref_type") not in (None, 1):
+                continue
+            vname = str(entry.get("vname") or "").strip()
+            if not vname:
+                continue
+            parsed = parse_tag(vname)
+            if parsed is not None and parsed.get("kind") == "mainline" and parsed.get("final"):
+                mainline.append(vname)
+        if mainline:
+            return max(mainline, key=release_key)
+    except Exception as exc:  # noqa: BLE001 - fall back to configured default when DB/Git unavailable
+        logger.debug("Default version resolution fell back to %s: %s", cfg_default, exc)
+    return cfg_default
+
+
 def resolve_version(version: str | None = None) -> str:
-    """Resolve and validate a caller-supplied version or fall back to the configured default."""
-    candidate = (version or "").strip() or get_api_server_config()["default_version"]
+    """Resolve and validate a caller-supplied version or fall back to the resolved default."""
+    candidate = (version or "").strip() or resolve_default_version()
     return safe_rev(candidate, "version")
 
 
@@ -481,6 +521,7 @@ __all__ = [
     "require_feature",
     "reset_active_repository",
     "reset_allow_writes_override",
+    "resolve_default_version",
     "resolve_repo_path",
     "resolve_version",
     "set_active_repository",

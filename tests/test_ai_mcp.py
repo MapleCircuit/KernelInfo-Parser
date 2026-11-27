@@ -280,6 +280,61 @@ class TestMcpTools(_McpFixture):
         self.assertEqual(by_name["lookup_cves"]["properties"]["kind"]["pattern"], "^(|cna|commit|text)$")
         self.assertIn("`kconfig` repository feature", next(t for t in tools if t["name"] == "eval_kconfig")["description"])
 
+        # Slimming: no (REST twin: ...) boilerplate, no duplicate alias params, fixed git-revision docs
+        for t in tools:
+            self.assertNotIn("(REST twin:", t["description"], t["name"])
+        for tool_name, omitted_keys in (
+            ("resolve_file_target", ("from_file",)),
+            ("compare_struct_layout", ("struct", "a", "b")),
+            ("get_struct_history", ("struct",)),
+            ("get_kconfig_diff", ("a", "b")),
+            ("get_kapi_diff", ("a", "b")),
+            ("get_man_diff", ("a", "b")),
+            ("search_mail", ("page",)),
+            ("match_patch_maintainers", ("patch", "touched_files")),
+            ("get_maintainer_person", ("email",)),
+            ("preview_nodemap_canvas", ("expand", "layout")),
+        ):
+            props = by_name[tool_name]["properties"]
+            for alias_key in omitted_keys:
+                self.assertNotIn(alias_key, props, f"{tool_name}.{alias_key}")
+
+        lrc = by_name["get_line_range_commits"]["properties"]
+        self.assertIn("Git revision", lrc["from"]["description"])
+        self.assertIn("Git revision", lrc["to"]["description"])
+        self.assertNotIn("caller", lrc["from"]["description"].lower())
+        self.assertNotIn("callee", lrc["to"]["description"].lower())
+        self.assertIn("caller", by_name["get_callpath"]["properties"]["from"]["description"].lower())
+        self.assertIn("callee", by_name["get_callpath"]["properties"]["to"]["description"].lower())
+        self.assertEqual(by_name["list_versions"]["properties"]["order"]["default"], "desc")
+
+        # Explicit nested schema for preview_nodemap_canvas (no untyped objects, no list-of-strings hint)
+        pnc = by_name["preview_nodemap_canvas"]["properties"]
+        for obj_list_key in ("nodes", "edges", "groups", "tours"):
+            self.assertNotIn("single string", pnc[obj_list_key].get("description", ""), obj_list_key)
+        node_item = pnc["nodes"]["items"]
+        self.assertFalse(node_item["additionalProperties"])
+        self.assertIn("source", node_item["properties"]["type"]["enum"])
+        self.assertIn("struct", node_item["properties"]["type"]["enum"])
+        self.assertIn("kconfig", node_item["properties"]["type"]["enum"])
+        self.assertIn("commit", node_item["properties"]["type"]["enum"])
+        self.assertIn("mail", node_item["properties"]["type"]["enum"])
+        self.assertIn("group", node_item["properties"]["type"]["enum"])
+        self.assertFalse(node_item["properties"]["data"]["additionalProperties"])
+        self.assertIn("commitHash", node_item["properties"]["data"]["properties"])
+        edge_item = pnc["edges"]["items"]
+        self.assertFalse(edge_item["additionalProperties"])
+        self.assertEqual(sorted(edge_item["required"]), ["from", "to"])
+        self.assertEqual(edge_item["properties"]["style"]["enum"], ["solid", "dashed", "dotted"])
+        tour_item = pnc["tours"]["items"]
+        self.assertFalse(tour_item["additionalProperties"])
+        self.assertIn("id", tour_item["properties"])
+        self.assertIn("title", tour_item["properties"])
+        step_item = tour_item["properties"]["steps"]["items"]
+        self.assertIn("title", step_item["properties"])
+        self.assertIn("caption", step_item["properties"])
+        self.assertIn("nodeIds", step_item["properties"])
+
         bad_cursor = self.rpc("tools/list", {"cursor": "page-2"})
         self.assertEqual(bad_cursor.json()["error"]["code"], mcp.INVALID_PARAMS)
 
@@ -287,11 +342,18 @@ class TestMcpTools(_McpFixture):
         rest = self.client.get("/api/v1/capabilities", headers=self.auth).json()
         self.assertEqual(rest["mcp"]["endpoint"], "/api/mcp")
         self.assertEqual(rest["mcp"]["protocol_versions"], list(mcp.SUPPORTED_PROTOCOL_VERSIONS))
-        self.assertEqual(rest["mcp"]["tools"], len(mcp.TOOLS))
+        self.assertEqual(rest["mcp"]["tools"], len(mcp.visible_tools()))
+        self.assertTrue(rest["read_only"])
+        self.assertEqual(rest["scopes"], ["read"])
         self.assertIn({"method": "POST", "path": "/api/mcp"}, [{k: e[k] for k in ("method", "path")} for e in rest["endpoints"]])
         via_mcp = self.assertToolOk(self.call("get_capabilities"))
         self.assertEqual(via_mcp["mcp"]["endpoint"], "/api/mcp")
+        self.assertEqual(via_mcp["mcp"]["tools"], len(mcp.visible_tools()))
+        self.assertTrue(via_mcp["read_only"])
         self.assertEqual(via_mcp["active_repo"], "linux")
+        self.assertNotIn("endpoints", via_mcp)
+        via_mcp_full = self.assertToolOk(self.call("get_capabilities", {"include_endpoints": True}))
+        self.assertGreaterEqual(len(via_mcp_full["endpoints"]), 20)
 
     def test_tool_calls_return_structured_content(self) -> None:
         sl = self.assertToolOk(self.call("get_file_slice", {"path": "kernel/foo.c", "start_line": 1, "limit": 3}))
@@ -458,7 +520,7 @@ class TestMcpTools(_McpFixture):
         self.assertNotIn("create_nodemap_canvas", default_names)
         self.assertToolError(self.call("create_nodemap_canvas", {"id": "mcp-map", "name": "MCP Map"}), 403)
 
-        # 2. Stateless preview works via MCP in read-only mode
+        # 2. Stateless preview works via MCP in read-only mode (compact export omits canvas + export_content)
         prev = self.assertToolOk(
             self.call(
                 "preview_nodemap_canvas",
@@ -478,6 +540,43 @@ class TestMcpTools(_McpFixture):
         )
         self.assertEqual(prev["node_count"], 1)
         self.assertIn("digraph NodeMap", prev["export"])
+        self.assertNotIn("export_content", prev)
+        self.assertNotIn("canvas", prev)
+
+        # Opt-in include_canvas=True returns canvas with empty UI defaults stripped unless verbose=True
+        prev_c = self.assertToolOk(
+            self.call(
+                "preview_nodemap_canvas",
+                {
+                    "name": "MCP Preview",
+                    "version": "v3.0",
+                    "nodes": [{"id": "n1", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}}],
+                },
+            )
+        )
+        n0 = prev_c["canvas"]["nodes"][0]
+        for ui_key in ("color", "bgColor", "customTitle", "locks", "layerId"):
+            self.assertNotIn(ui_key, n0)
+        for data_ui_key in ("collapsed", "hiddenItems", "fieldLocks", "typeOverrides", "collapsedGuards"):
+            self.assertNotIn(data_ui_key, n0["data"])
+
+        prev_v = self.assertToolOk(
+            self.call(
+                "preview_nodemap_canvas",
+                {
+                    "name": "MCP Preview",
+                    "version": "v3.0",
+                    "nodes": [{"id": "n1", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}}],
+                    "export_format": "dot",
+                    "include_canvas": True,
+                    "verbose": True,
+                },
+            )
+        )
+        self.assertNotIn("export_content", prev_v)
+        self.assertIn("canvas", prev_v)
+        self.assertIn("locks", prev_v["canvas"]["nodes"][0])
+        self.assertIn("collapsed", prev_v["canvas"]["nodes"][0]["data"])
 
         # 3. Enable allow_writes with a scoped key -> write tools appear in tools/list and execute via tools/call
         cfg = core_config.get_config()
@@ -503,7 +602,17 @@ class TestMcpTools(_McpFixture):
         self.assertTrue(write_tools["delete_nodemap_canvas"]["annotations"]["destructiveHint"])
         self.assertTrue(write_tools["replace_nodemap_canvas"]["annotations"]["idempotentHint"])
 
-        # Reader token gets 403 on write tool call
+        # Reader token gets 403 on write tool call and accurate read_only capabilities
+        ro_caps = rpc_with("mcp-read-token", "tools/call", {"name": "get_capabilities", "arguments": {}})["result"]["structuredContent"]
+        self.assertTrue(ro_caps["read_only"])
+        self.assertEqual(ro_caps["scopes"], ["read"])
+        self.assertEqual(ro_caps["mcp"]["tools"], len(read_tools))
+
+        rw_caps = rpc_with("mcp-write-token", "tools/call", {"name": "get_capabilities", "arguments": {}})["result"]["structuredContent"]
+        self.assertFalse(rw_caps["read_only"])
+        self.assertEqual(rw_caps["scopes"], ["nodemap:write", "read"])
+        self.assertEqual(rw_caps["mcp"]["tools"], len(mcp.TOOLS))
+
         r_denied = rpc_with(
             "mcp-read-token",
             "tools/call",
@@ -580,6 +689,13 @@ class TestMcpTools(_McpFixture):
             self.assertEqual(ms["repo"], "linux")
             self.assertEqual(ms["results"][0]["message_id"], "m1@example.com")
 
+        with patch("webapp.backend.services.mailing_list_service.mailing_list_service.search", return_value={
+            "available": False, "degraded": True, "total": 0, "results": [], "error": "Foreign SQLite query failed",
+        }):
+            ms_err = self.call("search_mail", {"q": "ext3"})
+            self.assertTrue(ms_err.get("isError"))
+            self.assertIn("Foreign SQLite query failed", ms_err["structuredContent"]["error"])
+
         with patch.object(v1_router._kconfig_service, "get_graph", return_value={
             "symbol": "FOO_BAR", "nodes": [{"id": "FOO_BAR"}], "edges": [],
         }):
@@ -627,6 +743,229 @@ class TestMcpTools(_McpFixture):
         btags = self.assertToolOk(self.call("get_branch_tags", {"branch": "master"}))
         self.assertEqual(btags["repo"], "linux")
         self.assertIn("v3.0", btags["tags"])
+
+    def test_preview_nodemap_canvas_strict_validation_errors(self) -> None:
+        # Unknown node type ("file" instead of "source") -> actionable isError: true
+        err_type = self.assertToolError(
+            self.call("preview_nodemap_canvas", {"nodes": [{"id": "n1", "type": "file", "data": {"path": "kernel/foo.c"}}]}),
+            422,
+        )
+        self.assertEqual(err_type["detail"][0]["loc"], ["nodes", 0, "type"])
+        self.assertIn("source", err_type["detail"][0]["msg"])
+
+        # Misplaced top-level node fields outside `data` -> actionable isError: true
+        for misplaced_key, misplaced_val in (
+            ("symbol", "FOO_BAR"),
+            ("commit_hash", "deadbeef"),
+            ("mid", "m1@example.com"),
+            ("name", "foo"),
+        ):
+            err_mis = self.assertToolError(
+                self.call("preview_nodemap_canvas", {"nodes": [{"id": "n1", "type": "struct", misplaced_key: misplaced_val}]}),
+                422,
+            )
+            self.assertEqual(err_mis["detail"][0]["loc"], ["nodes", 0, misplaced_key])
+            self.assertIn("data", err_mis["detail"][0]["msg"])
+
+        # Invalid data field for node type (e.g., commit_hash inside commit.data instead of commitHash)
+        err_data = self.assertToolError(
+            self.call("preview_nodemap_canvas", {"nodes": [{"id": "n1", "type": "commit", "data": {"commit_hash": "deadbeef"}}]}),
+            422,
+        )
+        self.assertEqual(err_data["detail"][0]["loc"], ["nodes", 0, "data", "commit_hash"])
+        self.assertIn("commitHash", err_data["detail"][0]["msg"])
+
+        # Invalid groups[] / tours[] fields -> actionable isError: true
+        err_grp = self.assertToolError(
+            self.call("preview_nodemap_canvas", {"groups": [{"id": "g1", "title": "Core", "bogus_group": 1}]}),
+            422,
+        )
+        self.assertEqual(err_grp["detail"][0]["loc"], ["groups", 0, "bogus_group"])
+
+        err_tour_id = self.assertToolError(
+            self.call("preview_nodemap_canvas", {"tours": [{"title": "Missing ID", "steps": []}]}),
+            422,
+        )
+        self.assertEqual(err_tour_id["detail"][0]["loc"], ["tours", 0, "id"])
+
+        err_tour_step = self.assertToolError(
+            self.call("preview_nodemap_canvas", {"tours": [{"id": "t1", "title": "Walk", "steps": [{"title": "S1", "nodes": ["n1"]}]}]}),
+            422,
+        )
+        self.assertEqual(err_tour_step["detail"][0]["loc"], ["tours", 0, "steps", 0, "nodes"])
+
+        # Strict validation also covers ops[] payloads
+        err_ops = self.assertToolError(
+            self.call(
+                "preview_nodemap_canvas",
+                {"ops": [{"op": "add_nodes", "nodes": [{"id": "n1", "type": "file", "name": "foo"}]}]},
+            ),
+            422,
+        )
+        self.assertEqual(err_ops["detail"][0]["loc"], ["ops", 0, "nodes", 0, "type"])
+
+    def test_mcp_compact_projections_preserve_rest_defaults(self) -> None:
+        # 1. get_mail_message: compact omits raw, heavy headers, duplicate commit_message/review_trailers
+        sample_mail = {
+            "available": True,
+            "message_id": "m1@example.com",
+            "subject": "[PATCH] foo",
+            "headers": {
+                "from": "Alice <alice@example.com>",
+                "to": "lkml@vger.kernel.org",
+                "cc": "Bob <bob@example.com>",
+                "date": "Mon, 1 Jan 2024 00:00:00 +0000",
+                "subject": "[PATCH] foo",
+                "message-id": "<m1@example.com>",
+                "in-reply-to": "<m0@example.com>",
+                "references": "<m0@example.com>",
+                "arc-seal": "i=1; ...",
+                "dkim-signature": "v=1; ...",
+                "received": "from mail.example.com ...",
+                "authentication-results": "dkim=pass",
+                "x-gm-message-state": "xyz",
+                "x-google-dkim-signature": "abc",
+                "x-received": "by 2002:...",
+            },
+            "raw": "From: Alice ...\n\nBody text",
+            "body": "Body text",
+            "commit_message": "Body text",
+            "diffstat": "1 file changed",
+            "diff": "--- a/foo.c\n+++ b/foo.c\n",
+            "trailers": [{"tag": "Signed-off-by", "value": "Alice"}],
+            "review_trailers": [{"tag": "Signed-off-by", "value": "Alice"}],
+        }
+        with patch("webapp.backend.services.mailing_list_service.mailing_list_service.get_message", return_value=sample_mail):
+            rest_mail = self.client.get("/api/v1/mail/message?mid=m1@example.com", headers=self.auth).json()
+            self.assertIn("raw", rest_mail)
+            self.assertIn("dkim-signature", rest_mail["headers"])
+            self.assertEqual(rest_mail["commit_message"], "Body text")
+
+            mcp_mail = self.assertToolOk(self.call("get_mail_message", {"mid": "m1@example.com"}))
+            self.assertNotIn("raw", mcp_mail)
+            self.assertNotIn("commit_message", mcp_mail)
+            self.assertNotIn("review_trailers", mcp_mail)
+            self.assertEqual(
+                set(mcp_mail["headers"].keys()),
+                {"from", "to", "cc", "date", "subject", "message-id", "in-reply-to", "references"},
+            )
+            self.assertEqual(mcp_mail["body"], "Body text")
+            self.assertEqual(mcp_mail["trailers"], [{"tag": "Signed-off-by", "value": "Alice"}])
+
+            mcp_mail_raw = self.assertToolOk(
+                self.call("get_mail_message", {"mid": "m1@example.com", "include_raw": True, "include_headers": "all"})
+            )
+            self.assertIn("raw", mcp_mail_raw)
+            self.assertIn("dkim-signature", mcp_mail_raw["headers"])
+
+        # 2. get_kconfig_symbol: deduplicates help, prompt/prompts, declarations, and compiled_files
+        sample_kc = {
+            "version": "v3.0",
+            "arch": "x86_64",
+            "name": "FOO_BAR",
+            "type": 1,
+            "type_name": "bool",
+            "prompt": "Foo Bar support",
+            "prompts": ["Foo Bar support"],
+            "help": "Enable foo bar.",
+            "file_path": "Kconfig",
+            "line_s": 1,
+            "line_e": 5,
+            "definition": {
+                "file_path": "Kconfig",
+                "line_s": 1,
+                "line_e": 5,
+                "prompt": "Foo Bar support",
+                "help": "Enable foo bar.",
+            },
+            "declarations": [{"file_path": "Kconfig", "line_s": 1, "line_e": 5}],
+            "definitions": [
+                {"file_path": "Kconfig", "line_s": 1, "line_e": 5, "prompt": "Foo Bar support", "help": "Enable foo bar."}
+            ],
+            "kbuild": [{"path": "kernel/foo.c", "target_obj": "foo.o", "exists": True}],
+            "compiled_files": [{"file_path": "kernel/foo.c", "target_obj": "foo.o"}],
+        }
+        with patch.object(v1_router._kconfig_service, "get_symbol_detail", return_value=sample_kc):
+            rest_kc = self.client.get("/api/v1/kconfig/symbol/FOO_BAR", headers=self.auth).json()
+            self.assertIn("prompts", rest_kc)
+            self.assertIn("compiled_files", rest_kc)
+            self.assertEqual(rest_kc["definition"]["help"], "Enable foo bar.")
+
+            mcp_kc = self.assertToolOk(self.call("get_kconfig_symbol", {"symbol_name": "FOO_BAR"}))
+            self.assertEqual(mcp_kc["help"], "Enable foo bar.")
+            self.assertEqual(mcp_kc["prompt"], "Foo Bar support")
+            self.assertNotIn("prompts", mcp_kc)
+            self.assertNotIn("declarations", mcp_kc)
+            self.assertNotIn("compiled_files", mcp_kc)
+            self.assertNotIn("help", mcp_kc["definition"])
+            self.assertNotIn("help", mcp_kc["definitions"][0])
+
+            mcp_kc_v = self.assertToolOk(self.call("get_kconfig_symbol", {"symbol_name": "FOO_BAR", "verbose": True}))
+            self.assertIn("prompts", mcp_kc_v)
+            self.assertIn("compiled_files", mcp_kc_v)
+            self.assertEqual(mcp_kc_v["definition"]["help"], "Enable foo bar.")
+
+        # 3. get_nodemap_struct, get_struct_layout, get_tree: omit null/false/0/empty/internal defaults unless verbose
+        rest_nm = self.client.get("/api/v1/nodemap/struct?name=foo&path=include/linux/foo.h", headers=self.auth).json()
+        self.assertIn("bits", rest_nm["items"][0])
+        mcp_nm = self.assertToolOk(self.call("get_nodemap_struct", {"name": "foo", "path": "include/linux/foo.h"}))
+        self.assertNotIn("outer_conds", mcp_nm)
+        self.assertNotIn("bits", mcp_nm["items"][0])
+        self.assertNotIn("array", mcp_nm["items"][0])
+        self.assertNotIn("conds", mcp_nm["items"][0])
+        mcp_nm_v = self.assertToolOk(
+            self.call("get_nodemap_struct", {"name": "foo", "path": "include/linux/foo.h", "verbose": True})
+        )
+        self.assertIn("bits", mcp_nm_v["items"][0])
+
+        sample_layout = {
+            "version": "v3.0",
+            "struct_name": "struct foo",
+            "total_size": 4,
+            "members": [
+                {
+                    "name": "a",
+                    "type": "int",
+                    "size": 4,
+                    "alignment": 4,
+                    "estimated": False,
+                    "offset": 0,
+                    "padding_before": 0,
+                    "cacheline_idx": 0,
+                    "cacheline_offset": 0,
+                    "crosses_cacheline": False,
+                    "bitfield_width": None,
+                    "bit_offset": None,
+                }
+            ],
+        }
+        with patch.object(v1_router._pahole_service, "get_struct_layout", return_value=sample_layout):
+            rest_sl = self.client.get("/api/v1/struct?name=foo", headers=self.auth).json()
+            self.assertIn("bitfield_width", rest_sl["members"][0])
+            mcp_sl = self.assertToolOk(self.call("get_struct_layout", {"name": "foo"}))
+            m0 = mcp_sl["members"][0]
+            for dropped in ("estimated", "padding_before", "crosses_cacheline", "bitfield_width", "bit_offset"):
+                self.assertNotIn(dropped, m0)
+            self.assertEqual(m0["offset"], 0)
+            mcp_sl_v = self.assertToolOk(self.call("get_struct_layout", {"name": "foo", "verbose": True}))
+            self.assertIn("bitfield_width", mcp_sl_v["members"][0])
+
+        rest_tree = self.client.get("/api/v1/tree?path=kernel", headers=self.auth).json()
+        self.assertIn("s_stat_label", rest_tree["entries"][0])
+        mcp_tree = self.assertToolOk(self.call("get_tree", {"path": "kernel"}))
+        f0 = mcp_tree["entries"][0]
+        for dropped in ("fid", "ftype", "s_stat", "e_stat", "s_stat_label"):
+            self.assertNotIn(dropped, f0)
+        mcp_tree_v = self.assertToolOk(self.call("get_tree", {"path": "kernel", "verbose": True}))
+        self.assertIn("s_stat_label", mcp_tree_v["entries"][0])
+
+        # 4. Duplicate REST aliases remain accepted on REST while rejected on MCP
+        with patch("webapp.backend.services.pahole_compare.compare", return_value={"struct": "foo"}):
+            self.assertEqual(
+                self.client.get("/api/v1/struct/compare?struct=foo&a=v3.0&b=master", headers=self.auth).status_code,
+                200,
+            )
+        self.assertToolError(self.call("compare_struct_layout", {"struct": "foo", "a": "v3.0", "b": "master"}), 422)
 
     def test_mcp_http_with_oauth_access_token_and_scope_visibility(self) -> None:
         from api.oauth import oauth_manager

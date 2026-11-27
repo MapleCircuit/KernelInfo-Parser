@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
-from api.config import get_active_repo_name
+from api.config import get_active_repo_name, resolve_default_version, resolve_version
 from webapp.backend.security.jail import (
     is_safe_rel_path,
     resolve_and_verify_repo_path,
@@ -255,4 +255,6 @@ __all__ = [
     "nodemap_canvas_service",
     "nodemap_service",
     "outline_service",
+    "resolve_default_version",
+    "resolve_version",
 ]

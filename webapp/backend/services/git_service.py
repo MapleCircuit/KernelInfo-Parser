@@ -34,6 +34,9 @@ _HEX_REF = re.compile(r"[0-9a-f]{4,40}")
 _LAST_WRITER_CACHE: dict[tuple[str, int], Any] = RepoScopedCache(maxsize=4096)
 # commit_ids of finished version ingestions
 _FINISHED_CACHE: dict[int, bool] = RepoScopedCache(maxsize=4096)
+# sha -> first-parent modified file count for non-merge commits (0 for merges)
+_GIT_FILES_COUNT_CACHE: dict[str, int] = RepoScopedCache(maxsize=8192)
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 MAX_COMMIT_PAGE = 500
@@ -651,14 +654,62 @@ class GitService:
                     for r in reader.list_network_commits(network_id, authored_before=now_ts + 1, limit=limit, offset=off)
                 ]
 
-            return {
-                "version": vname,
-                "page": page,
-                "limit": limit,
-                "offset": off,
-                "total": len(commits),
-                "commits": commits,
-            }
+        self.fill_missing_files_counts(commits)
+        return {
+            "version": vname,
+            "page": page,
+            "limit": limit,
+            "offset": off,
+            "total": len(commits),
+            "commits": commits,
+        }
+
+    @classmethod
+    def fill_missing_files_counts(cls, commits: list[dict[str, Any]]) -> None:
+        """Populate `files_count` from Git for non-merge commits in `commits` that have no `m_commit_file` rows yet."""
+        if not commits:
+            return
+        to_fetch: list[str] = []
+        for c in commits:
+            if int(c.get("files_count") or 0) > 0 or c.get("is_merge") is True:
+                continue
+            sha = str(c.get("commit_hash") or "").lower()
+            if not _FULL_SHA_RE.match(sha):
+                continue
+            cached = _GIT_FILES_COUNT_CACHE.get(sha)
+            if cached is not None:
+                c["files_count"] = cached
+            elif sha not in to_fetch:
+                to_fetch.append(sha)
+        if not to_fetch:
+            return
+        try:
+            out, _, rc = cls.run_git(
+                ["-c", "core.quotePath=false", "log", "--no-walk=unsorted", "--no-merges",
+                 "--format=%x1e%H", "--name-only", *to_fetch],
+                timeout=8.0,
+            )
+            if rc != 0:
+                return
+        except Exception as exc:  # noqa: BLE001 - best-effort git fallback
+            logger.debug("fill_missing_files_counts git fallback failed: %s", exc)
+            return
+
+        resolved: dict[str, int] = {sha: 0 for sha in to_fetch}
+        for rec in out.split("\x1e"):
+            lines = [ln.strip() for ln in rec.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            sha = lines[0].lower()
+            if _FULL_SHA_RE.match(sha):
+                resolved[sha] = len(lines) - 1
+        for sha, cnt in resolved.items():
+            _GIT_FILES_COUNT_CACHE[sha] = cnt
+        for c in commits:
+            if int(c.get("files_count") or 0) == 0:
+                sha = str(c.get("commit_hash") or "").lower()
+                if sha in resolved:
+                    c["files_count"] = resolved[sha]
 
     def get_commit_detail(self, commit_id: int | str) -> dict[str, Any]:
         """Retrieve full commit metadata, modified files, and trailers."""

@@ -8,9 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from api.config import (
     get_active_repo_name,
-    get_api_server_config,
     paginate_items,
     require_feature,
+    resolve_default_version,
     resolve_version,
 )
 from api.routers.common import (
@@ -230,7 +230,7 @@ def lookup_docs(
 def lookup_man(
     name: Annotated[str, Query(max_length=128)] = "",
     section: Annotated[str, Query(max_length=16)] = "",
-    path: Annotated[str, Query(max_length=256)] = "",
+    path: Annotated[str, Query(max_length=256, description="Man-pages repository-relative path.")] = "",
     version: Annotated[str | None, Query(max_length=256)] = None,
     kernel: Annotated[str, Query(max_length=256)] = "",
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
@@ -296,7 +296,7 @@ def lookup_cves(
     ver = resolve_version(version) if version else ""
     if file_path:
         clean_path = _validate_rel_path(file_path, allow_empty=False)
-        res = cve_service.cves_for_file(ver or get_api_server_config()["default_version"], clean_path)
+        res = cve_service.cves_for_file(ver or resolve_default_version(), clean_path)
         rows = res.get("cves") or []
         page, total, truncated = paginate_items(rows, limit, offset)
         return {

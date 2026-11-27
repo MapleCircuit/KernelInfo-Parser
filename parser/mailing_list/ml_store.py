@@ -63,6 +63,10 @@ class PublicInboxLocalStore:
         "dfn": "XDFN",
         "nq": "XNQ",
     }
+    # Public-inbox indexes terms under field prefixes (S=Subject, XNQ=non-quoted body,
+    # XDFN=diff filename, A=Author); unprefixed user terms must expand across all of them
+    # (plus "" for synthetic unprefixed test shards).
+    DEFAULT_PROB_PREFIXES = ("", "S", "XNQ", "XDFN", "A")
 
     def __init__(self, inbox_root: str | Path):
         self.root = Path(inbox_root)
@@ -97,9 +101,10 @@ class PublicInboxLocalStore:
         self._msgmap_path = msgmap_file if msgmap_file.exists() else None
 
         # Read-only foreign SQLite readers (one lazily opened connection per thread, PRAGMAs set by db_engine)
-        self.over_db: ForeignReader = open_foreign_sqlite(self._over_path, cache_kib=SQLITE_CACHE_KIB)
+        self.over_db: ForeignReader = open_foreign_sqlite(self._over_path, immutable=False, cache_kib=SQLITE_CACHE_KIB)
         self.msgmap_db: ForeignReader | None = (
-            open_foreign_sqlite(self._msgmap_path, cache_kib=SQLITE_CACHE_KIB) if self._msgmap_path else None
+            open_foreign_sqlite(self._msgmap_path, immutable=False, cache_kib=SQLITE_CACHE_KIB)
+            if self._msgmap_path else None
         )
         self._cat_lock = threading.Lock()
         self._qp_lock = threading.Lock()
@@ -108,27 +113,38 @@ class PublicInboxLocalStore:
         self.xap_db: Any = None
         self.qp: Any = None
         self.shard_count = 0
+        self.shard_errors: list[str] = []
 
         if HAS_XAPIAN and xapian is not None:
             shard_dirs = sorted(
                 [p for p in self.idx_dir.iterdir() if p.is_dir() and p.name.isdigit()],
                 key=lambda p: int(p.name),
             )
-            self.shard_count = len(shard_dirs)
-            if self.shard_count > 0:
-                self.xap_db = xapian.Database()
+            if shard_dirs:
+                combined_db = xapian.Database()
+                loaded_shards = 0
                 for sd in shard_dirs:
-                    self.xap_db.add_database(xapian.Database(str(sd)))
-
-                self.qp = xapian.QueryParser()
-                self.qp.set_database(self.xap_db)
-                self.qp.set_stemmer(xapian.Stem("english"))
-                self.qp.set_stemming_strategy(xapian.QueryParser.STEM_SOME)
-                self.qp.set_default_op(xapian.Query.OP_AND)
-                for u_pfx, x_pfx in self.BOOLEAN_PREFIXES.items():
-                    self.qp.add_boolean_prefix(u_pfx, x_pfx)
-                for u_pfx, x_pfx in self.PROB_PREFIXES.items():
-                    self.qp.add_prefix(u_pfx, x_pfx)
+                    try:
+                        combined_db.add_database(xapian.Database(str(sd)))
+                        loaded_shards += 1
+                    except Exception as exc:  # noqa: BLE001
+                        err_msg = f"shard {sd.name} ({sd}): {exc}"
+                        self.shard_errors.append(err_msg)
+                        logger.warning("Failed to open Xapian %s", err_msg)
+                self.shard_count = loaded_shards
+                if loaded_shards > 0:
+                    self.xap_db = combined_db
+                    self.qp = xapian.QueryParser()
+                    self.qp.set_database(self.xap_db)
+                    self.qp.set_stemmer(xapian.Stem("english"))
+                    self.qp.set_stemming_strategy(xapian.QueryParser.STEM_SOME)
+                    self.qp.set_default_op(xapian.Query.OP_AND)
+                    for x_pfx in self.DEFAULT_PROB_PREFIXES:
+                        self.qp.add_prefix("", x_pfx)
+                    for u_pfx, x_pfx in self.BOOLEAN_PREFIXES.items():
+                        self.qp.add_boolean_prefix(u_pfx, x_pfx)
+                    for u_pfx, x_pfx in self.PROB_PREFIXES.items():
+                        self.qp.add_prefix(u_pfx, x_pfx)
         else:
             logger.info("python-xapian bindings not available; Xapian shard querying disabled.")
 
@@ -190,6 +206,32 @@ class PublicInboxLocalStore:
             logger.warning("Could not start git cat-file process against %s: %s", self._all_git, exc)
             self._cat_proc = None
             return None
+
+    def check_integrity(self, *, full: bool = False) -> dict[str, Any]:
+        """Run a lightweight read-only integrity check over SQLite overview files and Xapian shards."""
+        over_ok, over_status = self.over_db.quick_check(full=full)
+        msgmap_info: dict[str, Any] | None = None
+        msgmap_ok = True
+        if self.msgmap_db is not None and self._msgmap_path is not None:
+            msgmap_ok, msgmap_status = self.msgmap_db.quick_check(full=full)
+            msgmap_info = {
+                "path": str(self._msgmap_path),
+                "ok": msgmap_ok,
+                "status": msgmap_status,
+            }
+        shard_Errors = list(getattr(self, "shard_errors", ()))
+        ok = bool(over_ok and msgmap_ok and not shard_Errors)
+        return {
+            "ok": ok,
+            "over_sqlite": {
+                "path": str(self._over_path),
+                "ok": over_ok,
+                "status": over_status,
+            },
+            "msgmap_sqlite": msgmap_info,
+            "xapian_shards": int(getattr(self, "shard_count", 0)),
+            "shard_errors": shard_Errors,
+        }
 
     def close_thread_handles(self) -> None:
         """Close this thread's SQLite handles.
@@ -733,36 +775,41 @@ class PublicInboxLocalStore:
         estimated_total = 0
 
         # 1. Try Xapian search if available and query is present
+        xapian_used = False
+        xapian_error: str | None = None
+        shard_errors = list(getattr(self, "shard_errors", ()))
         if clean_q and self.xap_db is not None and HAS_XAPIAN and self.qp is not None and xapian is not None:
             try:
                 x_query = self.parse_query(clean_q)
                 matched_records, estimated_total = self.search_xapian_page(
                     x_query, limit=fetch, offset=offset
                 )
+                xapian_used = True
             except Exception as exc:
-                logger.debug("Xapian query error: %s, falling back to SQLite search", exc)
+                xapian_error = str(exc)
+                logger.warning("Xapian query error for %r: %s", clean_q, exc)
+        elif clean_q and shard_errors and not self.xap_db:
+            xapian_error = "; ".join(shard_errors)
 
-        # 2. Fallback to over.sqlite3 substring search
-        if not matched_records:
+        # 2. Fallback to over.sqlite3 substring search only when Xapian was not used
+        if not xapian_used and not matched_records:
             if clean_q:
                 matched_records = self.search_over_subjects(
                     clean_q, limit=fetch, scan_limit=MAX_SEARCH_SCAN, offset=offset
                 )
+                if xapian_error and not matched_records:
+                    raise RuntimeError(f"Primary Xapian search failed: {xapian_error}")
             else:
                 # Empty query: recent messages ordered chronologically, future dates excluded.
                 # A plain `ds <=` bound keeps the walk on `idx_ds` (newest first, stops at
                 # `limit`); adding `ds IS NULL OR` makes SQLite sort the whole 22M-row table
                 # (~20s). Only ghost rows (`num <= 0`) lack a `ds`, and `num > 0` drops them anyway.
-                try:
-                    rows = self.over_db.select_rows(
-                        "over", _OVER_COLS,
-                        [{"num": gt(0)}, {"ds": le(int(time.time()) + FUTURE_DATE_SKEW_SECONDS)}],
-                        order_by=["-ds"], limit=fetch, offset=offset,
-                    )
-                    matched_records = [self._unpack_row(r) for r in rows]
-                except Exception as exc:
-                    logger.warning("Empty search query failed: %s", exc)
-                    matched_records = []
+                rows = self.over_db.select_rows(
+                    "over", _OVER_COLS,
+                    [{"num": gt(0)}, {"ds": le(int(time.time()) + FUTURE_DATE_SKEW_SECONDS)}],
+                    order_by=["-ds"], limit=fetch, offset=offset,
+                )
+                matched_records = [self._unpack_row(r) for r in rows]
 
         # 3. Apply filter_type: all, patch, cover, pull
         filtered: list[SmsgRecord] = []
@@ -818,7 +865,7 @@ class PublicInboxLocalStore:
                 "patch_total": patch_total,
             })
 
-        return {
+        out_payload: dict[str, Any] = {
             "query": clean_q,
             "filter_type": filter_type,
             "total": total,
@@ -827,5 +874,13 @@ class PublicInboxLocalStore:
             "has_more": has_more,
             "results": results,
         }
+        if xapian_error or shard_errors:
+            out_payload["degraded"] = True
+            out_payload["error"] = (
+                f"Primary Xapian search failed ({xapian_error}); showing recent overview fallback only"
+                if xapian_error
+                else f"Xapian shard errors: {'; '.join(shard_errors)}"
+            )
+        return out_payload
 
 

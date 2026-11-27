@@ -509,6 +509,21 @@ class TestErrorMapping(unittest.TestCase):
         with self.assertRaises(ConnectionLostError):
             drv._raw_query("SELECT 1")
 
+    def test_maria_read_only_statement_timeout_guardrail(self) -> None:
+        drv = MariaDB.__new__(MariaDB)
+        drv.read_only = True
+        self.assertEqual(
+            drv._apply_statement_timeout("SELECT a FROM t"),
+            "SET STATEMENT max_statement_time=20 FOR SELECT a FROM t",
+        )
+        with drv.statement_timeout(5.5):
+            self.assertEqual(
+                drv._apply_statement_timeout("SELECT a FROM t"),
+                "SET STATEMENT max_statement_time=5.5 FOR SELECT a FROM t",
+            )
+        drv.read_only = False
+        self.assertEqual(drv._apply_statement_timeout("SELECT a FROM t"), "SELECT a FROM t")
+
 
 class TestCapabilitiesAndEngines(unittest.TestCase):
     def test_maria_capabilities(self) -> None:

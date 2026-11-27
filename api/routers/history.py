@@ -332,8 +332,8 @@ def get_symbol_history(
 @router.get("/history/lines", dependencies=[Depends(require_feature("commits"))])
 def get_line_range_commits(
     path: Annotated[str, Query(min_length=1, max_length=512)],
-    to: Annotated[str | None, Query(max_length=256)] = None,
-    from_rev: Annotated[str | None, Query(alias="from", max_length=256)] = None,
+    to: Annotated[str | None, Query(max_length=256, description="Target Git revision (tag, branch, or commit SHA).")] = None,
+    from_rev: Annotated[str | None, Query(alias="from", max_length=256, description="Base Git revision (tag, branch, or commit SHA).")] = None,
     line_s: Annotated[int | None, Query(ge=1)] = None,
     line_e: Annotated[int | None, Query(ge=1)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,

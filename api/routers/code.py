@@ -8,11 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from api.config import (
     get_active_features,
     get_active_repo_name,
-    get_api_server_config,
     paginate_items,
     require_feature,
+    resolve_default_version,
     resolve_version,
 )
+from api.security import get_active_api_scopes, has_write_scope
 from api.routers.common import (
     DEFAULT_DEFINITION_ARCH,
     _ENDPOINT_CATALOG,
@@ -55,12 +56,20 @@ def _v1():
 
 
 @router.get("/capabilities")
-def get_capabilities() -> dict[str, Any]:
+def get_capabilities(
+    include_endpoints: Annotated[bool, Query(description="Include full REST endpoint catalog.")] = True,
+) -> dict[str, Any]:
     """Compact machine-readable summary of available endpoints, repos, features, and limits."""
-    from api.mcp import MCP_PATH, SUPPORTED_PROTOCOL_VERSIONS, TOOLS  # lazy: api.mcp imports v1
+    from api.mcp import (  # lazy: api.mcp imports v1
+        MCP_PATH,
+        SUPPORTED_PROTOCOL_VERSIONS,
+        visible_tools,
+    )
 
-    cfg = get_api_server_config()
     active_repo = get_active_repo_name()
+    exposed = visible_tools()
+    active_scopes = sorted(get_active_api_scopes())
+    read_only = not has_write_scope("nodemap:write")
     repos = [
         {
             "repo": p["repo"],
@@ -73,27 +82,32 @@ def get_capabilities() -> dict[str, Any]:
         }
         for p in _v1().projects_catalog()
     ]
-    return {
+    out: dict[str, Any] = {
         "repo": active_repo,
         "service": "KernelInfo-Parser AI API",
         "version": "1.0.0",
         "openapi_url": "/api/openapi.json",
+        "read_only": read_only,
+        "scopes": active_scopes,
         "mcp": {
             "endpoint": MCP_PATH,
             "transport": "streamable-http",
             "stateless": True,
             "protocol_versions": list(SUPPORTED_PROTOCOL_VERSIONS),
             "stdio": "python3 api/mcp_stdio.py [-c config.json] [--repo NAME] [--allow-writes]",
-            "tools": len(TOOLS),
+            "read_only": read_only,
+            "tools": len(exposed),
         },
         "active_repo": active_repo,
-        "default_version": cfg["default_version"],
+        "default_version": resolve_default_version(),
         "repo_selection": {"header": "X-KI-Repo", "query": "repo"},
         "features": get_active_features(),
         "limits": _LIMITS,
         "repositories": repos,
-        "endpoints": _ENDPOINT_CATALOG,
     }
+    if include_endpoints:
+        out["endpoints"] = _ENDPOINT_CATALOG
+    return out
 
 
 # ------------------------------------------------------------------ Repositories & Versions
@@ -152,6 +166,7 @@ def list_versions(
     q: Annotated[str, Query(max_length=128)] = "",
     include_rc: bool = True,
     indexed_only: bool = False,
+    order: Annotated[str, Query(pattern="^(desc|asc)$", description="Sort order: 'desc' (newest-first, default) or 'asc'.")] = "desc",
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
@@ -162,9 +177,14 @@ def list_versions(
     needle = q.strip().lower()
     if needle:
         rows = [r for r in rows if needle in str(r.get("vname") or "").lower()]
+    if order == "desc":
+        tag_rows = [r for r in rows if r.get("ref_type") in (None, 1)]
+        other_rows = [r for r in rows if r.get("ref_type") not in (None, 1)]
+        rows = list(reversed(tag_rows)) + list(reversed(other_rows))
     page, total, truncated = paginate_items(rows, limit, offset)
     return {
         "repo": get_active_repo_name(),
+        "order": order,
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -241,7 +261,7 @@ def get_file_slice(
     version: Annotated[str | None, Query(max_length=256)] = None,
     start_line: Annotated[int, Query(ge=1)] = 1,
     end_line: Annotated[int | None, Query(ge=1)] = None,
-    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    limit: Annotated[int, Query(ge=1, le=500, description="Max lines to return.")] = 200,
 ) -> dict[str, Any]:
     """Token-efficient line slice of a source file at a revision."""
     if end_line is not None and end_line < start_line:
@@ -777,8 +797,8 @@ def get_callgraph(
 
 @router.get("/callpath", dependencies=[Depends(require_feature("callgraph"))])
 def get_callpath(
-    src: Annotated[str, Query(alias="from", min_length=1, max_length=256)],
-    dst: Annotated[str, Query(alias="to", min_length=1, max_length=256)],
+    src: Annotated[str, Query(alias="from", min_length=1, max_length=256, description="Starting (caller) function name.")],
+    dst: Annotated[str, Query(alias="to", min_length=1, max_length=256, description="Target (callee) function name.")],
     version: Annotated[str | None, Query(max_length=256)] = None,
     max_depth: Annotated[int, Query(ge=1, le=10)] = 6,
     k: Annotated[int, Query(ge=1, le=20)] = 5,

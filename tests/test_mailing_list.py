@@ -931,6 +931,38 @@ class TestXapianSerialization(unittest.TestCase):
         self.assertEqual(seen, [True, True], "parse_query ran without holding _qp_lock")
         self.assertFalse(store._qp_lock.locked())
 
+    def test_xapian_failure_is_not_silently_masked_as_empty_success(self):
+        import parser.mailing_list.ml_store as ml_store
+
+        store = self._bare_store()
+        store.shard_errors = []
+        store.qp = object()
+        store.parse_query = lambda q, flags=None: (_ for _ in ()).throw(RuntimeError("corrupt shard B-tree"))
+        store.search_over_subjects = lambda *a, **k: []
+
+        orig_has, orig_xapian = ml_store.HAS_XAPIAN, ml_store.xapian
+        ml_store.HAS_XAPIAN, ml_store.xapian = True, object()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                store.search_emails(query="ext3", limit=10)
+            self.assertIn("Primary Xapian search failed", str(ctx.exception))
+        finally:
+            ml_store.HAS_XAPIAN, ml_store.xapian = orig_has, orig_xapian
+
+    def test_foreign_sqlite_defaults_to_mutable_safe_ro_and_quick_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "over.sqlite3"
+            w = over_writer(db_path)
+            w.close()
+            st = PublicInboxLocalStore(Path(tmp))
+            try:
+                self.assertFalse(st.over_db.immutable)
+                integrity = st.check_integrity(full=True)
+                self.assertTrue(integrity["ok"])
+                self.assertEqual(integrity["over_sqlite"]["status"].lower(), "ok")
+            finally:
+                st.close()
+
 
 class TestBlobQueryConstruction(unittest.TestCase):
     """A blob term must never reach Xapian as a bare prefix.

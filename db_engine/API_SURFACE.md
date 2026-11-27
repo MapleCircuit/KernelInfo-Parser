@@ -126,7 +126,7 @@ class BaseDBEngine(ABC)  # Abstract Base Class for database backend driver imple
     def complete_distributed_task(task_id: int, commit_id: int, *, worker_id: str | None=None, ref_name: str | None=None, network_id: int | None=None, now: int | None=None) -> bool  # Mark a claimed task `completed` (checking `worker_id` if given); a version task (no
     def fail_distributed_task(task_id: int, error_msg: str, *, worker_id: str | None=None, max_attempts: int=3, retry_delay: int=0, now: int | None=None) -> int  # Record a failure on a claimed task; retries as `pending` (claimable again `retry_delay`...
     def release_distributed_task(task_id: int, reason: str, worker_id: str, *, retry_delay: int=0, now: int | None=None) -> bool  # Return a claimed task to `pending` without incrementing `retry_count` (claimable again
-    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None) -> list[dict[str, Any]]  # References of the target ASTs: dicts `role, line, char_s, fid, tag_id, ast_id` (+ `call...
+    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None, commit_id: int | None=None) -> list[dict[str, Any]]  # References of the target ASTs: dicts `role, line, char_s, fid, tag_id, ast_id` (+ `call...
     def symbol_def_blobs_of_targets(ast_ids: Sequence[int]) -> set[tuple[int, int]]  # Distinct `(ast_id, blob_id)` definitions of the target ASTs (`db_engine/symbol_rows.py`).
 ```
 
@@ -157,7 +157,7 @@ class ReadAPI(Protocol)  # Protocol defining the read interface exposed to webap
     def maintainer_developer_directory(sec_ids: Sequence[int] | None=None, credit_ids: Sequence[int] | None=None) -> list[dict]
     def find_maintainer_person(raw: str, stripped: str, email: str, name: str) -> dict | None
     def symbol_name_page(prefix: str, *, after: tuple[int, str] | None=None, limit: int=400) -> list[str]
-    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None) -> list[dict]
+    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None, commit_id: int | None=None) -> list[dict]
     def symbol_def_blobs_of_targets(ast_ids: Sequence[int]) -> set[tuple[int, int]]
     def checkpoint_find_file(commit_id: int, candidates: Sequence[str], suffix: str | None=None) -> str | None
 class ReadSession(ReadIntents, ReadAPI)  # Managed read session bound to a single pooled connection with as_dict=True default.
@@ -185,6 +185,7 @@ def get_db_reader() -> Generator[ReadSession, None, None]  # Lease a pooled conn
 ## db_engine/read_intents.py
 
 ```python
+def commit_text_match_rank(query: str, subject: str, author_name: str='') -> int  # Token-boundary relevance tier for commit text search (`0` = strict whole token, `1` = u...
 class ReadIntents  # Named read operations of the webapp, built from spec reads (all rows are dicts).
     def checkpoint_tree_source() -> str  # Relation holding every version's full checkpoint tree: `m_checkpoint_tree`, or `m_bridg...
     def checkpoint_tree_exists(commit_id: int) -> bool  # True when the version `commit_id` has a stored checkpoint tree.
@@ -195,7 +196,7 @@ class ReadIntents  # Named read operations of the webapp, built from spec reads 
     def maintainer_developer_directory(sec_ids: Sequence[int] | None=None, credit_ids: Sequence[int] | None=None) -> list[dict]  # One profile per registered person: `person_id, name, email, subsystems_count, is_mainta...
     def find_maintainer_person(raw: str, stripped: str, email: str, name: str) -> dict | None  # Person (`person_id, name, email`) of an id, an e-mail address or a name (case-insensiti...
     def symbol_name_page(prefix: str, *, after: tuple[int, str] | None=None, limit: int=400) -> list[str]  # Distinct symbol names starting with `prefix`, shortest first then alphabetical, keyset...
-    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None) -> list[dict]  # References of target ASTs (`role, line, char_s, fid, tag_id, ast_id` [+ `caller`]); see...
+    def symbol_refs_of_targets(ast_ids: Sequence[int], *, role: int | None=None, with_caller: bool=False, limit: int | None=None, commit_id: int | None=None) -> list[dict]  # References of target ASTs (`role, line, char_s, fid, tag_id, ast_id` [+ `caller`]); see...
     def symbol_def_blobs_of_targets(ast_ids: Sequence[int]) -> set[tuple[int, int]]  # Distinct `(ast_id, blob_id)` definitions of target ASTs; see `symbol_rows`.
     def kapi_resolve_commit_id(version_or_sha: str, repo_id: int | None=None) -> int | None  # Resolve a tag/ref name or commit hash (prefix or full 40-char SHA) to `commit_id`.
     def kapi_catalog(commit_id: int, kind: str, arch: str='') -> dict[str, Any] | None  # Return the materialized `m_kapi_catalog` row (including `data` BLOB) for `(commit_id, a...
@@ -340,11 +341,12 @@ class ForeignReader  # Thread-safe read-only view of one foreign SQLite file (on
     fields: dialect: Literal['sqlite'] = 'sqlite'
     def close_thread() -> None  # Close the calling thread's connection (request threads that finish while the reader liv...
     def close() -> None  # Close every connection opened by any thread.
+    def quick_check(*, full: bool=False) -> tuple[bool, str]  # Run a read-only integrity probe on the foreign SQLite file, returning `(ok, status_text)`.
     def select_rows(source: Source, columns: Sequence[Any] | Mapping[str, Any], where: Where | None=None, *, joins: Sequence[Any]=(), distinct: bool=False, order_by: Sequence[Any]=(), limit: int | None=None, offset: int | None=None, as_dict: bool | None=None, group_by: Sequence[Any]=(), having: Where | None=None, hint: str | None=None) -> list[tuple | dict]  # Run a spec select against the foreign file and return all rows.
     def select_spec(select: Select, *, as_dict: bool | None=None) -> list[tuple | dict]  # Run a complete `Select` specification.
     def iter_rows(source: Source, columns: Sequence[Any] | Mapping[str, Any], where: Where | None=None, *, chunk_size: int=2000, as_dict: bool | None=None, **kwargs: Any) -> Iterator[tuple | dict]  # Stream rows of a spec select in chunks of `chunk_size`.
     def table_exists(name: str) -> bool  # True when the file holds a table or view called `name`.
-def open_foreign_sqlite(path: str | Path, *, readonly: bool=True, immutable: bool=True, timeout: float=60.0, cache_kib: int=DEFAULT_CACHE_KIB) -> ForeignReader  # Open the SQLite file `path` written by another program for spec reads.
+def open_foreign_sqlite(path: str | Path, *, readonly: bool=True, immutable: bool=False, timeout: float=60.0, cache_kib: int=DEFAULT_CACHE_KIB) -> ForeignReader  # Open the SQLite file `path` written by another program for spec reads.
 class ForeignWriter  # Writable handle on a SQLite file in the layout of a foreign program (fixtures for tools...
     def create_table(name: str, columns: Mapping[str, ColumnSpec] | Sequence[tuple[str, ColumnSpec]], *, primary: Sequence[str]=()) -> None  # Create table `name` (when missing) from `{column: ColumnSpec}`; `primary` names the pri...
     def insert_rows(table: str, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> int  # Insert `rows` (one tuple per row in `columns` order); returns the number of rows written.

@@ -675,10 +675,10 @@ class SQLiteDB(BaseDBEngine):
             self._scalar("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?", (index_name, table.table_name))
         )
 
-    def create_index(self, index_name: str, table: Table, rows: tuple[PointerType, ...]) -> None:
+    def create_index(self, index_name: str, table: Table, rows: tuple[PointerType | str, ...]) -> None:
         self._require_writable()
         validate_ident(index_name)
-        cols = ", ".join(validate_ident(table.init_columns[x[1]][0]) for x in rows)
+        cols = ", ".join(validate_ident(x if isinstance(x, str) else table.init_columns[x[1]][0]) for x in rows)
         self._run(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table.table_name} ({cols})")
 
     def remove_index(self, index_name: str, table: Table) -> None:

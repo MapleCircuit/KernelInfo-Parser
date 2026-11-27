@@ -139,7 +139,7 @@ class _FixtureReader:
         names = sorted({d["name"] for d in _FIXTURE_DEFS if d["name"].startswith(prefix)}, key=lambda n: (len(n), n))
         return [n for n in names if after is None or (len(n), n) > tuple(after)][:limit]
 
-    def symbol_refs_of_targets(self, ast_ids, *, role=None, with_caller: bool = False, limit=None) -> list[dict]:
+    def symbol_refs_of_targets(self, ast_ids, *, role=None, with_caller: bool = False, limit=None, commit_id=None) -> list[dict]:
         targets = set(ast_ids)
         keep = ("role", "line", "char_s", "fid", "tag_id", "ast_id") + (("caller",) if with_caller else ())
         rows = [
@@ -373,15 +373,26 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
     def test_function_callgraph(self) -> None:
         require_indexed_ref("v3.0")
-        res = get_function_callgraph("v3.0", "ext4_fill_super")
-        self.assertEqual(res["function"], "ext4_fill_super")
-        self.assertEqual(res["file_path"], "fs/ext4/super.c")
-        self.assertIn("callers", res)
-        self.assertIn("callees", res)
-        if len(res["callees"]) > 0:
+        for fn, expected_path in (
+            ("ext4_fill_super", "fs/ext4/super.c"),
+            ("ext2_fill_super", "fs/ext2/super.c"),
+            ("ext3_fill_super", "fs/ext3/super.c"),
+        ):
+            res = get_function_callgraph("v3.0", fn)
+            self.assertEqual(res["function"], fn)
+            self.assertEqual(res["file_path"], expected_path)
+            self.assertIn("callers", res)
+            self.assertIn("callees", res)
+            self.assertGreater(len(res["callees"]), 0)
             callee = res["callees"][0]
             self.assertIn("name", callee)
             self.assertIn("file_path", callee)
+
+        # High-degree symbol (printk) must return bounded callers cleanly with truncation metadata
+        pk = get_function_callgraph("v3.0", "printk")
+        self.assertEqual(pk["function"], "printk")
+        self.assertGreater(len(pk["callers"]), 0)
+        self.assertTrue(pk["truncated"])
 
     def test_in_browser_patch_format(self) -> None:
         req = FormatPatchRequest(

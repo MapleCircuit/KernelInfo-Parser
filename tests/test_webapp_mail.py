@@ -265,6 +265,24 @@ class TestMailingListService(unittest.TestCase):
         self.assertEqual(mids, ["future@k.org", "past@k.org"])
         self.assertEqual(res["total"], 40)
 
+    def test_search_propagates_client_error_as_unavailable(self) -> None:
+        mock_client = MagicMock()
+        mock_client.search_emails.return_value = {
+            "available": False,
+            "degraded": True,
+            "total": 0,
+            "results": [],
+            "error": "Primary Xapian search failed: shard corrupt",
+        }
+        self.service._client = mock_client
+
+        res = self.service.search(query="ext3", page=1, limit=10, filter_type="all")
+        self.assertFalse(res["available"])
+        self.assertTrue(res.get("degraded"))
+        self.assertIn("Primary Xapian search failed", res["error"])
+        # Failed search must not be cached
+        self.assertEqual(len(self.service._search_cache), 0)
+
 
 class TestSeriesVersionDiscovery(unittest.TestCase):
     """Test base-subject normalization and multi-revision patch series grouping."""

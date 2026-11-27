@@ -847,8 +847,8 @@ m_blob_symbol_ref = Table(
     te_cached=False,
     blob_scoped=True,
     indexes=(
-        ("sym_ref_blob_idx", ("blob_id",)),
-        ("sym_ref_ast_idx", ("ast_id", "role")),
+        ("sym_ref_blob_idx", ("blob_id", "role", "line", "ast_id")),
+        ("sym_ref_ast_idx", ("ast_id", "role", "blob_id", "tag_id", "line", "char_s")),
     ),
     hashing_table=False,
 )
@@ -1112,7 +1112,7 @@ m_tag_ref = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
-    indexes=(("tag_ref_key_idx", ("sym_key", "tag_id")),),
+    indexes=(("tag_ref_key_idx", ("sym_key", "tag_id", "role", "rel_line", "char_s")),),
     hashing_table=False,
 )
 
@@ -1139,7 +1139,7 @@ m_blob_symbol = Table(
     te_cached=False,
     # A blob parsed twice in one run writes the same rows: duplicates are skipped
     idempotent_pk=True,
-    indexes=(("blob_symbol_target_idx", ("target_ast_id",)),),
+    indexes=(("blob_symbol_target_idx", ("target_ast_id", "blob_id", "sym_key")),),
     hashing_table=False,
 )
 

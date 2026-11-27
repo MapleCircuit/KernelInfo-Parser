@@ -8,6 +8,7 @@ SQL for a few); the others inherit these.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import re
 from typing import Any
 
 from db_engine.spec import (
@@ -34,6 +35,24 @@ def _text(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).decode("utf-8", errors="replace")
     return value
+
+
+def commit_text_match_rank(query: str, subject: str, author_name: str = "") -> int:
+    """Token-boundary relevance tier for commit text search (`0` = strict whole token, `1` = underscore-delimited
+    alphanumeric token such as `CONFIG_EXT3_FS`, `2` = internal substring collision such as `zext32`/`context3`)."""
+    q = (query or "").strip()
+    if not q:
+        return 0
+    esc = re.escape(q)
+    strict_re = re.compile(rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])", re.IGNORECASE)
+    subj = subject or ""
+    auth = author_name or ""
+    if strict_re.search(subj) or strict_re.search(auth):
+        return 0
+    alnum_re = re.compile(rf"(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])", re.IGNORECASE)
+    if alnum_re.search(subj) or alnum_re.search(auth):
+        return 1
+    return 2
 
 
 def _delta_where(
@@ -176,14 +195,25 @@ class ReadIntents:
         where: list[Any] = [{"c.commit_id": gt(0), "c.network_id": int(network_id)}]
         if hash_prefix:
             where.append({"c.commit_hash": hash_prefix_cond(hash_prefix)})
-        if text:
-            where.append(AnyOf({"c.subject": like(text, ci=True)}, {"p.name": like(text, ci=True)}))
+        q_text = (text or "").strip()
+        if q_text:
+            where.append(AnyOf({"c.subject": like(q_text, ci=True)}, {"p.name": like(q_text, ci=True)}))
         if authored_before is not None:
             where.append({"c.author_date": lt(authored_before)})
         if id_min is not None:
             where.append({"c.commit_id": gt(id_min) if id_min_exclusive else ge(id_min)})
         if id_max is not None:
             where.append({"c.commit_id": le(id_max)})
+
+        req_limit = int(limit)
+        req_offset = int(offset)
+        if q_text and req_offset + req_limit <= 250:
+            sql_limit = min(max((req_offset + req_limit) * 2, 100), 500)
+            sql_offset = 0
+        else:
+            sql_limit = req_limit
+            sql_offset = req_offset
+
         rows = self.select_rows(  # type: ignore[attr-defined]
             ("m_commit", "c"),
             {
@@ -198,10 +228,27 @@ class ReadIntents:
             where,
             joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"})],
             order_by=["-c.commit_id" if newest_first else "c.commit_id"],
-            limit=int(limit),
-            offset=int(offset),
+            limit=sql_limit,
+            offset=sql_offset,
             as_dict=True,
         )
+        if q_text and rows and sql_offset == 0:
+            esc = re.escape(q_text)
+            strict_re = re.compile(rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])", re.IGNORECASE)
+            alnum_re = re.compile(rf"(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])", re.IGNORECASE)
+
+            def _row_rank(r: dict[str, Any]) -> int:
+                subj = str(_text(r.get("subject")) or "")
+                auth = str(_text(r.get("author_name")) or "")
+                if strict_re.search(subj) or strict_re.search(auth):
+                    return 0
+                if alnum_re.search(subj) or alnum_re.search(auth):
+                    return 1
+                return 2
+
+            rows.sort(key=_row_rank)
+            rows = rows[req_offset : req_offset + req_limit]
+
         counts: dict[int, int] = {}
         if rows:
             for r in self.aggregate(  # type: ignore[attr-defined]
@@ -404,11 +451,14 @@ class ReadIntents:
         role: int | None = None,
         with_caller: bool = False,
         limit: int | None = None,
+        commit_id: int | None = None,
     ) -> list[dict]:
         """References of target ASTs (`role, line, char_s, fid, tag_id, ast_id` [+ `caller`]); see `symbol_rows`."""
         from db_engine import symbol_rows
 
-        return symbol_rows.symbol_refs_of_targets(self, ast_ids, role=role, with_caller=with_caller, limit=limit)
+        return symbol_rows.symbol_refs_of_targets(
+            self, ast_ids, role=role, with_caller=with_caller, limit=limit, commit_id=commit_id
+        )
 
     def symbol_def_blobs_of_targets(self, ast_ids: Sequence[int]) -> set[tuple[int, int]]:
         """Distinct `(ast_id, blob_id)` definitions of target ASTs; see `symbol_rows`."""

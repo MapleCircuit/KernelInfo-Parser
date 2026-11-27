@@ -9,11 +9,13 @@ each call, and handlers execute in-process (no loopback HTTP). See `api/API.md` 
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Callable, get_args, get_origin
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
@@ -54,24 +56,103 @@ TOOL_ANNOTATIONS: dict[str, bool] = {
 }
 
 SERVER_INSTRUCTIONS = (
-    "Read-only introspection of indexed kernel repositories: source files, ASTs, symbols, call graphs, "
-    "git history, Kconfig, maintainers, docs, man pages, and CVEs. Call get_capabilities first for the "
-    "repositories, enabled features, and limits. Every tool takes an optional `repo` (see list_repos); "
-    "`version` defaults to the service default revision. Paginated tools return `total` and `truncated`; "
-    "page with `limit`/`offset`."
+    "Indexed kernel repository analysis: source, ASTs, symbols, call graphs, git history, Kconfig, "
+    "Kernel API, LKML, maintainers, docs, man pages, CVEs, and NodeMap canvases. Call `get_capabilities` "
+    "first for repos, features, and limits. Optional `repo` overrides the active repository; `version` "
+    "defaults to the latest indexed mainline release."
 )
 
 _PARAM_DOCS: dict[str, str] = {
-    "repo": "Repository name (list_repos); defaults to the request or session repository.",
-    "version": "Git revision (tag, branch, or commit); defaults to the service default version.",
+    "repo": "Repository name (see list_repos).",
+    "version": "Git revision (default: active latest).",
     "path": "Repository-relative path.",
-    "limit": "Maximum number of items to return.",
-    "offset": "Number of items to skip (pagination).",
+    "limit": "Max items to return.",
+    "offset": "Pagination offset.",
     "arch": "Target architecture.",
     "q": "Search query.",
-    "from": "Starting (caller) function name.",
-    "to": "Target (callee) function name.",
 }
+
+# Duplicate REST convenience aliases omitted from MCP inputSchema (preserved on REST /api/v1/*).
+_MCP_OMITTED_PARAMS: dict[str, frozenset[str]] = {
+    "resolve_file_target": frozenset({"from_file"}),
+    "compare_struct_layout": frozenset({"struct", "a", "b"}),
+    "get_struct_history": frozenset({"struct"}),
+    "get_kconfig_diff": frozenset({"a", "b"}),
+    "get_kapi_diff": frozenset({"a", "b"}),
+    "get_man_diff": frozenset({"a", "b"}),
+    "search_mail": frozenset({"page"}),
+    "match_patch_maintainers": frozenset({"patch", "touched_files"}),
+    "get_maintainer_person": frozenset({"email"}),
+    "preview_nodemap_canvas": frozenset({"expand", "layout"}),
+    "create_nodemap_canvas": frozenset({"expand", "layout"}),
+    "replace_nodemap_canvas": frozenset({"layout"}),
+    "mutate_nodemap_canvas": frozenset({"upsert_tour", "layout"}),
+}
+
+# Canonical parameters that are optional on REST only because aliases exist, required on MCP.
+_MCP_REQUIRED_OVERRIDES: dict[str, frozenset[str]] = {
+    "compare_struct_layout": frozenset({"name", "version_a", "version_b"}),
+    "get_struct_history": frozenset({"name"}),
+    "get_kconfig_diff": frozenset({"version_a", "version_b"}),
+    "get_kapi_diff": frozenset({"version_a", "version_b"}),
+    "get_man_diff": frozenset({"version_a", "version_b"}),
+}
+
+_MCP_PROJECTION_KEYS: frozenset[str] = frozenset({
+    "verbose",
+    "include_canvas",
+    "include_endpoints",
+    "include_raw",
+    "include_headers",
+})
+
+_ESSENTIAL_MAIL_HEADERS: frozenset[str] = frozenset({
+    "from",
+    "to",
+    "cc",
+    "date",
+    "subject",
+    "message-id",
+    "in-reply-to",
+    "references",
+})
+
+_NODEMAP_STRICT_TOOLS: frozenset[str] = frozenset({
+    "preview_nodemap_canvas",
+    "create_nodemap_canvas",
+    "replace_nodemap_canvas",
+    "mutate_nodemap_canvas",
+})
+
+_EMPTY_NODE_UI_KEYS: frozenset[str] = frozenset({
+    "color",
+    "bgColor",
+    "customTitle",
+    "locks",
+    "layerId",
+    "hideHeader",
+    "autoFit",
+    "groupId",
+})
+_EMPTY_DATA_UI_KEYS: frozenset[str] = frozenset({
+    "collapsed",
+    "hiddenItems",
+    "fieldLocks",
+    "openMids",
+    "fullMids",
+    "pinnedBodies",
+    "typeOverrides",
+    "collapsedGuards",
+})
+_EMPTY_EDGE_UI_KEYS: frozenset[str] = frozenset({
+    "color",
+    "waypoints",
+    "layerId",
+    "lockKind",
+    "fromField",
+    "toField",
+    "callSite",
+})
 
 
 class McpError(Exception):
@@ -119,11 +200,62 @@ class McpTool:
 # ------------------------------------------------------------------ Tool registry
 
 
-def _is_list_annotation(annotation: Any) -> bool:
-    """True for `list[X]` and `list[X] | None`."""
+def _is_string_list_annotation(annotation: Any) -> bool:
+    """True for `list[str]` and `list[str] | None` (never `list[dict]` or `list[BaseModel]`)."""
     if get_origin(annotation) is list:
-        return True
-    return any(get_origin(arg) is list for arg in get_args(annotation))
+        args = get_args(annotation)
+        return not args or args[0] is str
+    for arg in get_args(annotation):
+        if get_origin(arg) is list:
+            sub = get_args(arg)
+            if not sub or sub[0] is str:
+                return True
+    return False
+
+
+def _mcp_extra_fields(tool_name: str) -> dict[str, Any]:
+    """MCP-only projection/compactness parameters added to specific tools."""
+    extras: dict[str, Any] = {}
+    if tool_name == "get_capabilities":
+        extras["include_endpoints"] = (
+            bool,
+            Field(default=False, description="Include full REST endpoint catalog."),
+        )
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Include full REST endpoint catalog."),
+        )
+    elif tool_name == "preview_nodemap_canvas":
+        extras["include_canvas"] = (
+            bool | None,
+            Field(
+                default=None,
+                description="Include canvas JSON (default: false when export_format is set, true otherwise).",
+            ),
+        )
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Include empty/default UI-state keys on nodes and edges."),
+        )
+    elif tool_name == "get_mail_message":
+        extras["include_raw"] = (
+            bool,
+            Field(default=False, description="Include raw RFC822 message text."),
+        )
+        extras["include_headers"] = (
+            Literal["essential", "all"],
+            Field(default="essential", description="Header set: 'essential' (default) or 'all'."),
+        )
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Include all fields without compact projection."),
+        )
+    elif tool_name in ("get_kconfig_symbol", "get_nodemap_struct", "get_struct_layout", "get_tree"):
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Include null/false/0/empty defaults and redundant fields."),
+        )
+    return extras
 
 
 def _deref_schema(node: Any, defs: dict[str, Any], seen: set[str] | None = None) -> Any:
@@ -188,18 +320,34 @@ def _annotations_for_route(http_method: str, required_scope: str | None, tool_na
 def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]], http_method: str) -> McpTool:
     endpoint = route.endpoint
     name = endpoint.__name__
+    omitted = _MCP_OMITTED_PARAMS.get(name, frozenset())
+    required_overrides = _MCP_REQUIRED_OVERRIDES.get(name, frozenset())
+    extra_fields = _mcp_extra_fields(name)
     fields: dict[str, Any] = {}
     list_params: set[str] = set()
     direct_param_names: set[str] = set()
 
     for param in [*route.dependant.path_params, *route.dependant.query_params]:
+        if param.name in omitted or param.alias in omitted:
+            continue
+        if param.name in extra_fields:
+            continue
         info = param.field_info
         annotation = Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation
         alias = param.alias if param.alias != param.name else None
-        default = ... if param.required else param.default
-        fields[param.name] = (annotation, Field(default, alias=alias))
+        is_req = param.required or param.name in required_overrides
+        if param.name in required_overrides and get_origin(info.annotation) is not None:
+            non_none = [a for a in get_args(info.annotation) if a is not type(None)]
+            if len(non_none) == 1:
+                base_ann = non_none[0]
+                meta = [m for m in info.metadata]
+                if base_ann is str and not any(getattr(m, "min_length", None) for m in meta):
+                    meta.append(Field(min_length=1))
+                annotation = Annotated[(base_ann, *meta)] if meta else base_ann
+        default = ... if is_req else param.default
+        fields[param.name] = (annotation, Field(default, alias=alias, description=info.description))
         direct_param_names.add(param.name)
-        if _is_list_annotation(info.annotation):
+        if _is_string_list_annotation(info.annotation):
             list_params.add(param.alias)
             list_params.add(param.name)
 
@@ -213,6 +361,8 @@ def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]],
             for bfname, bfinfo in btype.model_fields.items():
                 if bfname == "repo" or bfinfo.alias == "repo" or bfname in fields:
                     continue
+                if bfname in omitted or (bfinfo.alias and bfinfo.alias in omitted):
+                    continue
                 b_annotation = Annotated[(bfinfo.annotation, *bfinfo.metadata)] if bfinfo.metadata else bfinfo.annotation
                 b_alias = bfinfo.alias if bfinfo.alias and bfinfo.alias != bfname else None
                 if bfinfo.is_required():
@@ -222,10 +372,13 @@ def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]],
                 else:
                     b_field = Field(default=bfinfo.default, alias=b_alias, description=bfinfo.description)
                 fields[bfname] = (b_annotation, b_field)
-                if _is_list_annotation(bfinfo.annotation):
+                if _is_string_list_annotation(bfinfo.annotation):
                     list_params.add(bfname)
                     if b_alias:
                         list_params.add(b_alias)
+
+    for efname, efspec in extra_fields.items():
+        fields[efname] = efspec
 
     model = create_model(
         f"McpArgs_{name}",
@@ -236,11 +389,15 @@ def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]],
     defs = raw.get("$defs") if isinstance(raw.get("$defs"), dict) else {}
     properties = {key: _clean_property(value, defs) for key, value in (raw.get("properties") or {}).items()}
     for key, prop in properties.items():
-        doc = _PARAM_DOCS.get(key, "")
-        if key in list_params:
-            doc = f"{doc} List of values; a single string counts as a one-item list.".strip()
-        if doc:
-            prop.setdefault("description", doc)
+        existing = prop.get("description")
+        if not existing:
+            doc = _PARAM_DOCS.get(key, "")
+            if key in list_params:
+                doc = f"{doc} Accepts a string or list of strings.".strip()
+            if doc:
+                prop["description"] = doc
+        elif key in list_params and "string" not in existing.lower():
+            prop["description"] = f"{existing} Accepts a string or list of strings."
     properties["repo"] = {
         "type": "string",
         "minLength": 1,
@@ -267,8 +424,7 @@ def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]],
     feature = entry.get("feature")
     summary = entry.get("summary") or name.replace("_", " ")
     doc = " ".join((endpoint.__doc__ or summary).split())
-    description = f"{doc} (REST twin: {http_method} {route.path}"
-    description += f"; requires the `{feature}` repository feature)" if feature else ")"
+    description = f"{doc} Requires `{feature}` repository feature." if feature else doc
     annotations = _annotations_for_route(http_method, required_scope, name)
 
     return McpTool(
@@ -367,6 +523,223 @@ def _validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
+def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
+    """Strip empty/default UI-state keys from NodeMap nodes/edges (and nested subCanvases)."""
+    out = copy.deepcopy(canvas)
+    nodes = out.get("nodes")
+    if isinstance(nodes, list):
+        cleaned_nodes: list[Any] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                cleaned_nodes.append(node)
+                continue
+            cnode = {
+                k: v
+                for k, v in node.items()
+                if not (k in _EMPTY_NODE_UI_KEYS and (v in ("", [], {}, False, None)))
+            }
+            data = cnode.get("data")
+            if isinstance(data, dict):
+                cdata = {
+                    k: v
+                    for k, v in data.items()
+                    if not (k in _EMPTY_DATA_UI_KEYS and (v in ("", [], {})))
+                }
+                if isinstance(cdata.get("subCanvas"), dict):
+                    cdata["subCanvas"] = _compact_nodemap_canvas(cdata["subCanvas"])
+                cnode["data"] = cdata
+            cleaned_nodes.append(cnode)
+        out["nodes"] = cleaned_nodes
+    edges = out.get("edges")
+    if isinstance(edges, list):
+        out["edges"] = [
+            {
+                k: v
+                for k, v in edge.items()
+                if not (k in _EMPTY_EDGE_UI_KEYS and (v in ("", [], {}, None)))
+            }
+            if isinstance(edge, dict)
+            else edge
+            for edge in edges
+        ]
+    return out
+
+
+def _compact_nodemap_struct_items(items: list[Any]) -> list[Any]:
+    """Strip null, empty-list, and 0-default per-item fields from `get_nodemap_struct` items."""
+    out: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        c = dict(item)
+        if c.get("bits") is None:
+            c.pop("bits", None)
+        if c.get("array") is None:
+            c.pop("array", None)
+        if c.get("conds") == []:
+            c.pop("conds", None)
+        if c.get("expr") in (None, ""):
+            c.pop("expr", None)
+        if c.get("depth") == 0:
+            c.pop("depth", None)
+        if c.get("kind") == "aggregate":
+            if c.get("name") == "":
+                c.pop("name", None)
+            if c.get("type_name") == "":
+                c.pop("type_name", None)
+            if isinstance(c.get("children"), list):
+                c["children"] = _compact_nodemap_struct_items(c["children"])
+        out.append(c)
+    return out
+
+
+def _project_mcp_result(
+    name: str,
+    result: Any,
+    proj_opts: dict[str, Any],
+    input_args: dict[str, Any],
+) -> Any:
+    """Apply MCP-only compact payload projections while keeping REST responses untouched."""
+    if not isinstance(result, dict):
+        return result
+    verbose = bool(proj_opts.get("verbose"))
+
+    if name == "preview_nodemap_canvas":
+        out = dict(result)
+        out.pop("export_content", None)
+        include_canvas = proj_opts.get("include_canvas")
+        if include_canvas is None:
+            include_canvas = not bool(input_args.get("export_format"))
+        if not include_canvas:
+            out.pop("canvas", None)
+        elif not verbose and isinstance(out.get("canvas"), dict):
+            out["canvas"] = _compact_nodemap_canvas(out["canvas"])
+        return out
+
+    if verbose:
+        return result
+
+    if name == "get_mail_message":
+        out = dict(result)
+        if not proj_opts.get("include_raw"):
+            out.pop("raw", None)
+        if proj_opts.get("include_headers", "essential") != "all" and isinstance(out.get("headers"), dict):
+            out["headers"] = {
+                k: v for k, v in out["headers"].items() if str(k).lower() in _ESSENTIAL_MAIL_HEADERS
+            }
+        if "commit_message" in out and (out["commit_message"] is None or out["commit_message"] == out.get("body")):
+            out.pop("commit_message", None)
+        if "review_trailers" in out and "trailers" in out and out["review_trailers"] == out["trailers"]:
+            out.pop("review_trailers", None)
+        return out
+
+    if name == "get_kconfig_symbol":
+        out = dict(result)
+        top_help = out.get("help")
+        top_prompt = out.get("prompt")
+        if isinstance(out.get("definition"), dict):
+            defn = dict(out["definition"])
+            if defn.get("help") == top_help:
+                defn.pop("help", None)
+            if defn.get("prompt") == top_prompt:
+                defn.pop("prompt", None)
+            out["definition"] = defn
+        if isinstance(out.get("definitions"), list):
+            new_defs: list[Any] = []
+            multi_defs = len(out["definitions"]) > 1
+            for d in out["definitions"]:
+                if isinstance(d, dict):
+                    cd = dict(d)
+                    if cd.get("help") == top_help:
+                        cd.pop("help", None)
+                    if not multi_defs and cd.get("prompt") == top_prompt:
+                        cd.pop("prompt", None)
+                    new_defs.append(cd)
+                else:
+                    new_defs.append(d)
+            out["definitions"] = new_defs
+        prompts = out.get("prompts")
+        if isinstance(prompts, list) and (not prompts or (top_prompt is not None and prompts == [top_prompt])):
+            out.pop("prompts", None)
+        declarations = out.get("declarations")
+        if (
+            isinstance(declarations, list)
+            and isinstance(out.get("definitions"), list)
+            and len(declarations) == len(out["definitions"])
+            and all(
+                isinstance(d, dict)
+                and isinstance(x, dict)
+                and (d.get("file_path"), d.get("line_s"), d.get("line_e"))
+                == (x.get("file_path"), x.get("line_s"), x.get("line_e"))
+                for d, x in zip(out["definitions"], declarations)
+            )
+        ):
+            out.pop("declarations", None)
+        if (
+            isinstance(out.get("kbuild"), list)
+            and isinstance(out.get("compiled_files"), list)
+        ):
+            kb_paths = {r.get("path") for r in out["kbuild"] if isinstance(r, dict)}
+            if all(isinstance(cf, dict) and cf.get("file_path") in kb_paths for cf in out["compiled_files"]):
+                out.pop("compiled_files", None)
+        return out
+
+    if name == "get_nodemap_struct":
+        out = dict(result)
+        if out.get("outer_conds") == []:
+            out.pop("outer_conds", None)
+        if isinstance(out.get("items"), list):
+            out["items"] = _compact_nodemap_struct_items(out["items"])
+        return out
+
+    if name == "get_struct_layout":
+        out = dict(result)
+        if isinstance(out.get("members"), list):
+            compact_members: list[Any] = []
+            for m in out["members"]:
+                if not isinstance(m, dict):
+                    compact_members.append(m)
+                    continue
+                cm = dict(m)
+                if cm.get("estimated") is False:
+                    cm.pop("estimated", None)
+                if cm.get("padding_before") == 0:
+                    cm.pop("padding_before", None)
+                if cm.get("crosses_cacheline") is False:
+                    cm.pop("crosses_cacheline", None)
+                if cm.get("bitfield_width") is None:
+                    cm.pop("bitfield_width", None)
+                if cm.get("bit_offset") is None:
+                    cm.pop("bit_offset", None)
+                compact_members.append(cm)
+            out["members"] = compact_members
+        return out
+
+    if name == "get_tree":
+        out = dict(result)
+        if isinstance(out.get("entries"), list):
+            compact_entries: list[Any] = []
+            for e in out["entries"]:
+                if not isinstance(e, dict):
+                    compact_entries.append(e)
+                    continue
+                ce = dict(e)
+                ce.pop("fid", None)
+                if ce.get("ftype") in (None, "", 1, "1", 7, "7"):
+                    ce.pop("ftype", None)
+                if ce.get("s_stat") in (None, "", "0"):
+                    ce.pop("s_stat", None)
+                    ce.pop("s_stat_label", None)
+                if ce.get("e_stat") in (None, "", "0"):
+                    ce.pop("e_stat", None)
+                compact_entries.append(ce)
+            out["entries"] = compact_entries
+        return out
+
+    return result
+
+
 def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
     """Validate `arguments`, select the repository, and run one tool; handler errors become `isError` results.
 
@@ -386,10 +759,24 @@ def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
     for key in tool.list_params:
         if isinstance(args.get(key), str):
             args[key] = [args[key]]
+
+    if name in _NODEMAP_STRICT_TOOLS:
+        from api.routers.nodemap import validate_nodemap_payload_strict
+
+        strict_errors = validate_nodemap_payload_strict(args)
+        if strict_errors:
+            return _tool_error(422, strict_errors)
+
     try:
         validated = tool.model.model_validate(args)
     except ValidationError as exc:
         return _tool_error(422, _validation_detail(exc))
+
+    proj_opts = {
+        key: getattr(validated, key)
+        for key in _MCP_PROJECTION_KEYS
+        if hasattr(validated, key)
+    }
 
     if tool.body_param_name and tool.body_model is not None:
         kwargs = {key: getattr(validated, key) for key in tool.direct_param_names if hasattr(validated, key)}
@@ -404,7 +791,13 @@ def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
         except ValidationError as exc:
             return _tool_error(422, _validation_detail(exc))
     else:
-        kwargs = {key: getattr(validated, key) for key in type(validated).model_fields}
+        kwargs = {
+            key: getattr(validated, key)
+            for key in type(validated).model_fields
+            if key not in _MCP_PROJECTION_KEYS
+        }
+        if name == "get_capabilities":
+            kwargs["include_endpoints"] = bool(proj_opts.get("include_endpoints") or proj_opts.get("verbose"))
 
     token = None
     repo_name = (repo or "").strip()
@@ -445,7 +838,15 @@ def call_tool(name: Any, arguments: Any) -> dict[str, Any]:
         reset_active_repository(token)
     if isinstance(result, Response):
         return _response_result(result)
-    return _tool_success(result)
+    result = _project_mcp_result(name, result, proj_opts, args)
+    out = _tool_success(result)
+    if (
+        name in ("search_mail", "get_mail_message", "get_mail_thread")
+        and isinstance(result, dict)
+        and (result.get("available") is False or bool(result.get("error")))
+    ):
+        out["isError"] = True
+    return out
 
 
 # ------------------------------------------------------------------ JSON-RPC dispatcher

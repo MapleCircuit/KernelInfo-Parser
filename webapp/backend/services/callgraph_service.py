@@ -44,7 +44,7 @@ class CallgraphService:
     def get_function_callgraph(self, version_name: str, function_name: str) -> dict[str, Any]:
         """Incoming callers and outgoing callees of a function, within the revision's tree."""
         with get_reader() as reader:
-            _, vname, blob_paths = SymbolService._scope(reader, version_name)
+            vid, vname, blob_paths = SymbolService._scope(reader, version_name)
             _, scope, bits = definition_arch(vname, None)
             empty = {
                 "function": function_name,
@@ -94,7 +94,11 @@ class CallgraphService:
 
             # 1. Callers: calls in this revision's blobs, named by the AST of the tag they are in. The
             # references come key first (symbol_refs_of_targets); filtering the m_symbol_ref view by ast_id is slow.
-            caller_refs = reader.symbol_refs_of_targets(targets, role=3, with_caller=True)
+            caller_query_cap = MAX_CALL_SITES + 1
+            caller_refs = reader.symbol_refs_of_targets(
+                targets, role=3, with_caller=True, limit=caller_query_cap, commit_id=vid
+            )
+            caller_fanout_truncated = len(caller_refs) >= caller_query_cap
             caller_sites = []
             for r in caller_refs:
                 if r["fid"] not in blob_paths:
@@ -147,6 +151,7 @@ class CallgraphService:
                 caller_sites.append((caller_name, path, line_no))
 
             callers, callers_truncated = _group_calls(caller_sites)
+            callers_truncated = callers_truncated or caller_fanout_truncated
 
             # 2. Callees: calls inside the function's lines, with the files defining each callee in this
             # revision (joining the m_symbol_def view by ast_id would materialize it)
@@ -155,8 +160,10 @@ class CallgraphService:
                 {"ast_id": "r.ast_id", "callee_name": "a.name", "callee_type": "a.type_id", "line_no": "r.line"},
                 {"r.blob_id": fn_def["blob_id"], "r.line": between(fn_def["line_s"], fn_def["line_e"]), "r.role": 3},
                 joins=[Join(("m_ast", "a"), {"a.ast_id": "r.ast_id"})],
+                limit=MAX_CALL_SITES + 1,
             )
-            callee_ids = sorted({r["ast_id"] for r in call_rows})
+            callee_fanout_truncated = len(call_rows) > MAX_CALL_SITES
+            callee_ids = sorted({r["ast_id"] for r in call_rows if r.get("ast_id")})
             callee_files: dict[int, list[str]] = {}
             if callee_ids:
                 for def_ast, def_blob in sorted(reader.symbol_def_blobs_of_targets(callee_ids)):
@@ -193,6 +200,7 @@ class CallgraphService:
                 for path in (callee_files.get(r["ast_id"]) or [None])
             ]
             callees, callees_truncated = _group_calls(callee_sites)
+            callees_truncated = callees_truncated or callee_fanout_truncated
 
             return {
                 **empty,

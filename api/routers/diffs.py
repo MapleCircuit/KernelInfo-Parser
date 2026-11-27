@@ -139,7 +139,7 @@ def get_man_diff(
     version_b: Annotated[str | None, Query(max_length=256)] = None,
     a: Annotated[str | None, Query(max_length=256)] = None,
     b: Annotated[str | None, Query(max_length=256)] = None,
-    path: Annotated[str | None, Query(max_length=256)] = None,
+    path: Annotated[str | None, Query(max_length=256, description="Man-pages repository-relative path.")] = None,
     path_a: Annotated[str | None, Query(max_length=256)] = None,
     path_b: Annotated[str | None, Query(max_length=256)] = None,
     q: Annotated[str, Query(max_length=256)] = "",

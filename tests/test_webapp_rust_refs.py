@@ -50,7 +50,7 @@ class _Reader:
         return []  # callees of the function: none
 
     def symbol_refs_of_targets(self, ast_ids: Any, *, role: int | None = None, with_caller: bool = False,
-                               limit: int | None = None) -> list[dict[str, Any]]:
+                               limit: int | None = None, commit_id: int | None = None) -> list[dict[str, Any]]:
         self.ref_targets.append(list(ast_ids))
         # Only the binding AST has a reference (the Rust call)
         if BINDING_AST not in ast_ids or role not in (None, 3):

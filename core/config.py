@@ -395,6 +395,7 @@ OPTIONAL_REPOSITORY_KEYS = frozenset({"features", "insights", "preparse"})
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
 _EXPORTED_ENV_VARS: dict[str, str] = {}
+_API_DEFAULT_VERSION_PINNED: bool = False
 
 
 def _get_user_env(key: str) -> str | None:
@@ -577,11 +578,12 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     Precedence:
         Environment Variables > config.json > Built-in Defaults
     """
-    global _LOADED_CONFIG_PATH
+    global _LOADED_CONFIG_PATH, _API_DEFAULT_VERSION_PINNED
     resolved_path = find_config_path(config_path)
     _LOADED_CONFIG_PATH = resolved_path
 
     merged: dict[str, dict[str, Any]] = copy.deepcopy(DEFAULT_CONFIG)
+    api_default_version_pinned = False
 
     # 1. Load and merge JSON file if present
     if resolved_path:
@@ -595,6 +597,12 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
                 db_data = file_data.setdefault("database", {})
                 if isinstance(db_data, dict) and "ssh_tunnel" not in db_data:
                     db_data["ssh_tunnel"] = copy.deepcopy(file_data["ssh_tunnel"])
+            for sec_name in ("api", "webapp"):
+                sec_raw = file_data.get(sec_name)
+                if isinstance(sec_raw, dict):
+                    dv = str(sec_raw.get("default_version") or "").strip()
+                    if dv and dv.lower() not in ("auto", "latest"):
+                        api_default_version_pinned = True
             _deep_merge(merged, file_data)
             logger.info("Loaded configuration from %s", resolved_path)
         except json.JSONDecodeError as exc:
@@ -676,9 +684,13 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         api_sec["reload"] = _coerce_bool(api_sec.get("reload"), False)
     if env_api_ver := _get_user_env("API_DEFAULT_VERSION"):
-        api_sec["default_version"] = str(env_api_ver).strip() or "v3.0"
+        cleaned_env_ver = str(env_api_ver).strip()
+        if cleaned_env_ver and cleaned_env_ver.lower() not in ("auto", "latest"):
+            api_default_version_pinned = True
+        api_sec["default_version"] = cleaned_env_ver or "v3.0"
     else:
         api_sec["default_version"] = str(api_sec.get("default_version") or webapp_sec["default_version"] or "v3.0").strip() or "v3.0"
+    _API_DEFAULT_VERSION_PINNED = api_default_version_pinned
 
     if (env_api_keys := (_get_user_env("API_KEYS") or _get_user_env("KIP_API_KEYS"))) is not None:
         raw_env_keys = env_api_keys.strip()
@@ -1086,6 +1098,11 @@ def get_webapp_config() -> dict[str, Any]:
 def get_api_config() -> dict[str, Any]:
     """Retrieve active standalone AI API configuration section."""
     return get_config().get("api", copy.deepcopy(DEFAULT_CONFIG["api"]))
+
+
+def is_api_default_version_pinned() -> bool:
+    """True when `api.default_version` or `webapp.default_version` was explicitly pinned in config or env."""
+    return _API_DEFAULT_VERSION_PINNED
 
 
 def get_nodemap_canvas_dir() -> Path:
@@ -2564,9 +2581,10 @@ def validate_service_config(
 
 def reset_config() -> None:
     """Reset the active configuration to uninitialized state (useful for tests)."""
-    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH
+    global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH, _API_DEFAULT_VERSION_PINNED
     _ACTIVE_CONFIG = None
     _LOADED_CONFIG_PATH = None
+    _API_DEFAULT_VERSION_PINNED = False
     _DETECTED_REPO_CACHE.clear()
     for k in list(_EXPORTED_ENV_VARS.keys()):
         if os.environ.get(k) == _EXPORTED_ENV_VARS[k]:

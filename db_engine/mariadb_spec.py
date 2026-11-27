@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Literal, Sequence
 import mysql.connector
+
+DEFAULT_READ_MAX_STATEMENT_TIME_S = 20.0
 
 from db_engine.base import (
     NewPairs,
@@ -42,6 +45,28 @@ from db_engine.mariadb_support import _DRIVER_CONN_ERRORS, _binary_names_of, _no
 
 class MariaDBSpec:
     """Spec-based reads/writes, view creation and pipeline intents of the MariaDB driver."""
+
+    def _apply_statement_timeout(self, sql: str) -> str:
+        """Prefix a MariaDB SELECT statement with `SET STATEMENT max_statement_time=... FOR` when configured."""
+        timeout = getattr(self, "max_statement_time", None)
+        if timeout is None and getattr(self, "read_only", False):
+            env_val = os.environ.get("DB_MAX_STATEMENT_TIME", "").strip()
+            timeout = float(env_val) if env_val else DEFAULT_READ_MAX_STATEMENT_TIME_S
+        if timeout is not None and float(timeout) > 0 and sql.lstrip().upper().startswith("SELECT "):
+            fval = float(timeout)
+            val = int(fval) if fval.is_integer() else round(fval, 3)
+            return f"SET STATEMENT max_statement_time={val} FOR {sql}"
+        return sql
+
+    @contextlib.contextmanager
+    def statement_timeout(self, seconds: float | None) -> Iterator[None]:
+        """Temporarily bound SELECT statements on this connection with `SET STATEMENT max_statement_time=<seconds> FOR`."""
+        prev = getattr(self, "max_statement_time", None)
+        self.max_statement_time = seconds
+        try:
+            yield
+        finally:
+            self.max_statement_time = prev
 
     # -------------------------------------------------------------------------
     # Spec Read Primitives (§2)
@@ -117,7 +142,7 @@ class MariaDBSpec:
             hint=hint,
         )
         sql, params, col_names = render_select(select_spec, dialect=self.dialect)
-        rows = self._raw_query(sql, params, dictionary=bool(as_dict))
+        rows = self._raw_query(self._apply_statement_timeout(sql), params, dictionary=bool(as_dict))
         binary = self._binary_output_columns(source, joins, columns, col_names)
         return [_normalize_row(r, bool(as_dict), binary, col_names) for r in rows]
 
@@ -191,7 +216,7 @@ class MariaDBSpec:
         )
         sql, params, col_names = render_select(select_spec, dialect=self.dialect)
         binary = self._binary_output_columns(source, joins, columns, col_names)
-        for r in self._raw_query_iter(sql, params, dictionary=bool(as_dict)):
+        for r in self._raw_query_iter(self._apply_statement_timeout(sql), params, dictionary=bool(as_dict)):
             yield _normalize_row(r, bool(as_dict), binary, col_names)
 
     # -------------------------------------------------------------------------

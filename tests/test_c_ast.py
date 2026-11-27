@@ -4775,6 +4775,32 @@ class TestDeclaratorAndNamespaceFidelity(unittest.TestCase):
         # An ordinary identifier binds a variable node of any declared type
         self.assertEqual(resolve({("jiffies", int(ASTT.C_long)): 10}, "jiffies", ASTT.C_DeclRefExpr), 10)
 
+    def test_incomplete_embedded_struct_field_is_single_member(self) -> None:
+        parse_snippet(
+            "struct ext3_inode_info {\n"
+            "\tunsigned int i_flags;\n"
+            "\tunsigned long i_state_flags;\n"
+            "\tstruct inode vfs_inode;\n"
+            "};\n",
+            "include/linux/ext3_fs_i.h",
+        )
+        ast = MockDB.store.get(m_ast.table_name, {})
+        cont = list(MockDB.store.get(m_ast_container.table_name, {}).values())
+        outer_id = next(aid for aid, row in ast.items() if row[1] == "ext3_inode_info" and row[2] == ASTT.C_structdecl)
+        kids = sorted((r for r in cont if r[0] == outer_id), key=lambda r: r[1])
+        member_nodes = [(ast[r[3]][1], int(ast[r[3]][2])) for r in kids]
+        self.assertEqual(
+            member_nodes,
+            [
+                ("i_flags", int(ASTT.C_unsigned)),
+                ("i_state_flags", int(ASTT.C_unsigned)),
+                ("vfs_inode", int(ASTT.C_struct)),
+            ],
+        )
+        vfs_aid = kids[2][3]
+        vfs_kids = [ast[r[3]] for r in cont if r[0] == vfs_aid]
+        self.assertEqual([(row[1], int(row[2])) for row in vfs_kids], [("inode", int(ASTT.C_structnotbind))])
+
 
 
 class TestInitializerDesignators(unittest.TestCase):
