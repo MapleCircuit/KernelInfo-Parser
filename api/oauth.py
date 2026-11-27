@@ -858,7 +858,9 @@ class OAuthManager:
         client_name = str(metadata.get("client_name") or "MCP OAuth Client").strip()[:256] or "MCP OAuth Client"
         raw_scope = metadata.get("scope")
         if isinstance(raw_scope, str) and raw_scope.strip():
-            max_scopes = parse_scope_string(raw_scope)
+            tokens = [tok.strip() for tok in re.split(r"[\s,]+", raw_scope.strip()) if tok.strip()]
+            valid_tokens = [t for t in tokens if t in VALID_API_SCOPES]
+            max_scopes = frozenset(valid_tokens) if valid_tokens else VALID_API_SCOPES
         else:
             max_scopes = VALID_API_SCOPES
 
@@ -1017,6 +1019,19 @@ class OAuthManager:
         dcr_client = self._load_dcr_client(cleaned)
         if dcr_client is not None:
             return dcr_client
+
+        # 4. Ad-hoc client_id entered manually in a supplier UI (e.g. Gemini / ChatGPT custom connector form)
+        # when DCR is enabled: permitted only for redirect URIs matching api.oauth.allowed_redirect_uris.
+        if cfg.get("allow_dcr", True) and _SAFE_SEGMENT_RE.match(cleaned):
+            allowed_patterns = cfg.get("allowed_redirect_uris") or list(DEFAULT_OAUTH_REDIRECT_URIS)
+            return OAuthClient(
+                client_id=cleaned,
+                client_name=cleaned,
+                redirect_uris=tuple(allowed_patterns),
+                token_endpoint_auth_method="none",
+                max_scopes=VALID_API_SCOPES,
+                source="adhoc",
+            )
 
         raise OAuthError("invalid_client", f"Unknown OAuth client_id: {cleaned[:128]!r}.", status_code=400)
 

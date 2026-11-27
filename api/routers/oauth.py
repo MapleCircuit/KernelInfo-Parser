@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import urllib.parse
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+
+logger = logging.getLogger(__name__)
 
 from api.config import get_api_server_config
 from api.oauth import (
@@ -50,9 +53,18 @@ def _require_oauth_enabled() -> tuple[dict[str, Any], dict[str, Any]]:
     return cfg, oauth_cfg
 
 
-def _oauth_error_response(exc: OAuthError) -> JSONResponse:
+def _oauth_error_response(exc: OAuthError, request: Request | None = None) -> JSONResponse:
     if exc.status_code == 404:
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if request is not None:
+        logger.warning(
+            "OAuth %s %s -> %d (%s: %s)",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.error,
+            exc.description,
+        )
     headers = {**_NO_STORE_HEADERS, **exc.headers}
     return JSONResponse(status_code=exc.status_code, content=exc.to_dict(), headers=headers)
 
@@ -207,7 +219,7 @@ async def oauth_register_client(request: Request) -> Response:
         registered = oauth_manager.register_dcr_client(body, oauth_cfg=oauth_cfg)
         return JSONResponse(status_code=201, content=registered, headers=_NO_STORE_HEADERS)
     except OAuthError as exc:
-        return _oauth_error_response(exc)
+        return _oauth_error_response(exc, request)
 
 
 # ------------------------------------------------------------------ 4. Authorization & Consent Endpoint
@@ -294,7 +306,7 @@ async def oauth_authorize_get(request: Request) -> Response:
         )
         return _consent_html_response(body, status_code=200)
     except OAuthError as exc:
-        return _oauth_error_response(exc)
+        return _oauth_error_response(exc, request)
 
 
 @router.post("/api/oauth/authorize")
@@ -392,7 +404,7 @@ async def oauth_authorize_post(request: Request) -> Response:
             headers=_NO_STORE_HEADERS,
         )
     except OAuthError as exc:
-        return _oauth_error_response(exc)
+        return _oauth_error_response(exc, request)
 
 
 # ------------------------------------------------------------------ 5. Token Endpoint (`POST /api/oauth/token`)
@@ -549,7 +561,7 @@ async def oauth_token(request: Request) -> Response:
             status_code=400,
         )
     except OAuthError as exc:
-        return _oauth_error_response(exc)
+        return _oauth_error_response(exc, request)
 
 
 # ------------------------------------------------------------------ 6. Token Revocation (`POST /api/oauth/revoke`, RFC 7009)

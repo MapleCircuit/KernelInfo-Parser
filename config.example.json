@@ -76,6 +76,8 @@
         "https://chatgpt.com/connector/oauth/*",
         "https://www.cursor.com/agents/mcp/oauth/callback",
         "cursor://anysphere.cursor-mcp/oauth/callback",
+        "https://oauth-redirect.googleusercontent.com/*",
+        "https://*.googleusercontent.com/*",
         "https://*.google.com/*",
         "https://gemini.google.com/*",
         "https://vscode.dev/redirect",

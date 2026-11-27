@@ -212,6 +212,7 @@ class TestAiOAuthServer(unittest.TestCase):
             "https://chatgpt.com/connector/oauth/cb123",
             "https://www.cursor.com/agents/mcp/oauth/callback",
             "cursor://anysphere.cursor-mcp/oauth/callback",
+            "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-ead712414208c54e8a55b127",
             "https://gemini.google.com/oauth/callback",
             "https://a.b.google.com/callback",
             "https://vscode.dev/redirect",
