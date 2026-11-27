@@ -1267,6 +1267,12 @@ class ContextMenu {
       if (node.type === "kconfig") items.push({ label: "Expand Relations", icon: "⇶", onClick: () => controller.expandKconfigRelations(node.id) });
       const typeCount = node.type === "struct" ? controller.expandableTypesOf?.(node.id)?.length || 0 : 0;
       if (typeCount) items.push({ label: `Expand Types (${typeCount})`, icon: "⇶", onClick: () => controller.expandStructTypes(node.id) });
+      if (node.type === "nodemap") {
+        const target = d.canvasId || "";
+        const status = controller.nestedMaps?.[target]?.status;
+        items.push({ label: "Open NodeMap", icon: "↘", disabled: !target || !status || status === "missing", onClick: () => controller.openNested?.(node.id) });
+        items.push({ label: "Choose Another NodeMap…", icon: "🗺", onClick: () => controller.chooseNestedTarget?.(node.id) });
+      }
       if (node.type === "group") {
         items.push({
           label: d.subCanvas ? "Enter Sub-Map Portal" : "Convert Group to Sub-Map Portal",
@@ -1297,6 +1303,7 @@ class ContextMenu {
         }
       }
       items.push({ separator: true });
+      if (controller.groupSelectionIntoNested) items.push({ label: "Group Selection into Nested NodeMap…", icon: "🗺", onClick: () => controller.groupSelectionIntoNested() });
       if (controller.selected?.size > 1) items.push({ label: "Group Selection", icon: "▭", onClick: () => controller.addGroup() });
       items.push({ label: controller.selected?.size > 1 ? `Duplicate ${controller.selected.size} Nodes` : "Duplicate", icon: "⧉", shortcut: "Ctrl+D", onClick: () => controller.duplicateNode(node.id) });
       items.push({ label: controller.selected?.size > 1 ? `Copy ${controller.selected.size} Nodes` : "Copy", icon: "📋", shortcut: "Ctrl+C", onClick: () => controller.copySelection() });
@@ -1322,6 +1329,10 @@ class ContextMenu {
       items.push({ label: "Canvas Library & Templates…", icon: "📚", onClick: () => controller.openLibraryDialog?.("library") });
       if (at) items.push({ label: "Add Note Here", icon: "📝", onClick: () => controller.addNoteAt(Math.round(at.x), Math.round(at.y)) });
       items.push({ label: "Add Group", icon: "▭", onClick: () => controller.addGroup() });
+      if (controller.insertExistingNodemap) {
+        items.push({ label: "Insert Existing NodeMap Here…", icon: "🗺", onClick: () => controller.insertExistingNodemap(at ? { x: Math.round(at.x), y: Math.round(at.y) } : null) });
+        items.push({ label: "New Nested NodeMap Here…", icon: "➕", onClick: () => controller.createNestedNodemap(at ? { x: Math.round(at.x), y: Math.round(at.y) } : null) });
+      }
       items.push({ label: "Paste Nodes", icon: "📋", shortcut: "Ctrl+V", disabled: !controller.readClipboard?.(), onClick: () => controller.pasteClipboard() });
       items.push({ separator: true });
       items.push({ label: "Fit to View", icon: "⤢", onClick: () => controller.fitView() });

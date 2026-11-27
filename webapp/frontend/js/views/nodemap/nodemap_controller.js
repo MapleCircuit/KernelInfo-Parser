@@ -58,6 +58,8 @@ import {
 } from "./nodemap_persistence.js";
 import { layoutGraphJob } from "./nodemap_worker.js";
 import { renderStructBody } from "./struct_view.js";
+import { crumbsHtml, nestedBodyHtml } from "./nested_nodes.js";
+import * as Nested from "./nodemap_nested.js";
 import {
   flushPendingHellos, frameDisposed, frameMounted, keepLiveOnRestore, onTabFrameMessage, reconcileFrozenTabs, resetDirtyFrozenTabs, resetTabNode,
   setTabsFrozen, tabKeyData,
@@ -108,6 +110,7 @@ export class NodeMapController {
     this.canvas = null;
     this.rootCanvas = null;
     this.subMapPath = [];
+    Nested.initNested(this);
     this.selected = new Set();
     this.selectedEdge = null;
     this.active = null;
@@ -263,8 +266,22 @@ export class NodeMapController {
     };
     return Promise.resolve(loadFromIndexedDB(this)).finally(done);
   }
-  scheduleSave() { return scheduleSave(this); }
-  flushSave() { return flushSave(this); }
+  scheduleSave() {
+    scheduleSave(this);
+    Nested.scheduleServerSave(this);
+  }
+  flushSave() {
+    flushSave(this);
+    if (this.serverCanvas && this._serverSaveTimer) Nested.flushServerSave(this);
+  }
+  setNestedMaps(maps) { return Nested.setNestedMaps(this, maps); }
+  openNested(nodeId) { return Nested.openNested(this, nodeId); }
+  goToCrumb(depth) { return Nested.goToCrumb(this, depth); }
+  chooseNestedTarget(nodeId) { return Nested.chooseNestedTarget(this, nodeId); }
+  insertExistingNodemap(at = null) { return Nested.insertExistingNodemap(this, at); }
+  createNestedNodemap(at = null) { return Nested.createNestedNodemap(this, at); }
+  groupSelectionIntoNested() { return Nested.groupSelectionIntoNested(this); }
+  flushServerSave() { return Nested.flushServerSave(this); }
   embedKey(sessionId) { return embedKey(this, sessionId); }
   syncFollowChannel() { return syncFollowChannel(this); }
   closeFollowChannel() { return closeFollowChannel(this); }
@@ -623,6 +640,7 @@ export class NodeMapController {
     }
     if (node.type === "mail") return String(this.mailEpoch || 0);
     if (node.type === "tab") return this.embedKey(M.embedSessionOf(this.canvas, node).id);
+    if (node.type === "nodemap") return Nested.nestedBodyKey(this, node);
     return "";
   }
 
@@ -956,6 +974,8 @@ export class NodeMapController {
     const status = (msg, err = false) => `<div class="nm-status${err ? " nm-error" : ""}">${escapeHtml(msg)}</div>`;
     if (node.type === "group") {
       body.innerHTML = "";
+    } else if (node.type === "nodemap") {
+      body.innerHTML = nestedBodyHtml(node, Nested.nestedCard(this, node));
     } else if (node.type === "note") {
       const empty = this.canvas.settings.editMode ? "Double-click to write a note" : "Empty note (Edit Mode edits it)";
       let html = node.data.markdown ? renderNoteMarkdown(node.data.text) : `<pre class="nm-note-plain">${escapeHtml(node.data.text || empty)}</pre>`;
@@ -2110,13 +2130,14 @@ export class NodeMapController {
 
   renderBreadcrumbs() {
     if (!this.breadcrumbsEl || !this.rootCanvas) return;
+    const nestedHtml = crumbsHtml(this.nav?.root, this.nav?.stack);
     if (!this.subMapPath.length) {
-      this.breadcrumbsEl.hidden = true;
-      this.breadcrumbsEl.innerHTML = "";
+      this.breadcrumbsEl.hidden = !nestedHtml;
+      this.breadcrumbsEl.innerHTML = nestedHtml;
       return;
     }
     const { trail } = M.resolveSubMapAtPath(this.rootCanvas, this.subMapPath);
-    const parts = ['<button type="button" class="nm-bc-btn" data-bc-depth="0">Root</button>'];
+    const parts = nestedHtml ? [nestedHtml, '<span class="nm-bc-sep">›</span>', '<button type="button" class="nm-bc-btn" data-bc-depth="0">Map</button>'] : ['<button type="button" class="nm-bc-btn" data-bc-depth="0">Root</button>'];
     trail.forEach((t, i) => parts.push(`<span class="nm-bc-sep">/</span><button type="button" class="nm-bc-btn" data-bc-depth="${i + 1}">${escapeHtml(t.title)}</button>`));
     this.breadcrumbsEl.innerHTML = parts.join("");
     this.breadcrumbsEl.hidden = false;
@@ -2273,7 +2294,7 @@ export class NodeMapController {
     return true;
   }
 
-  async loadServerCanvas(canvasId, { tourId = "" } = {}) {
+  async loadServerCanvas(canvasId, { tourId = "", nav = null } = {}) {
     const cid = String(canvasId || "").trim();
     if (!cid) return false;
     this._loadedServerCanvasId = cid;
@@ -2287,7 +2308,14 @@ export class NodeMapController {
         toast.error?.(`Canvas "${cid}" is empty or invalid`);
         return false;
       }
+      this.serverCanvas = null;
+      this.nestedMaps = res?.nested_maps && typeof res.nested_maps === "object" ? res.nested_maps : {};
       const ok = this.loadCanvasDocument(doc, { record: false, fit: true });
+      if (ok) {
+        Nested.bindServerCanvas(this, { ...res, id: res?.id || cid });
+        Nested.applyNav(this, { ...res, id: res?.id || cid }, nav);
+        this.renderBreadcrumbs();
+      }
       if (ok && res?.name && this.tab) {
         this.tab.title = String(res.name);
         state.updateTabState?.(this.tab.id, { title: this.tab.title });
@@ -2312,6 +2340,7 @@ export class NodeMapController {
   svgOptions({ foreign = true } = {}) {
     return {
       editMode: Boolean(this.canvas.settings.editMode),
+      nested: (n) => Nested.nestedCard(this, n),
       content: (n) => this.modelOf(n),
       structOpts: (n) => this.structOpts(n),
       rowHeights: (n) => this.structRowHeights(n),

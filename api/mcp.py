@@ -70,6 +70,13 @@ _PARAM_DOCS: dict[str, str] = {
     "offset": "Pagination offset.",
     "arch": "Target architecture.",
     "q": "Search query.",
+    "insertable_into": "Parent canvas id; adds `insertable` (false when nesting would create a cycle or self-reference) to every listed canvas.",
+    "depth": "Maximum nesting depth of the returned reference tree (1..32, default 8).",
+    "target_id": "Existing saved canvas to reference; omit to create a new empty child canvas.",
+    "new_canvas_id": "Id for the newly created child canvas (generated when omitted).",
+    "node_ids": "Ids of the parent canvas nodes to move into the new nested canvas.",
+    "node": "Placement/styling of the nested NodeMap node added to the parent (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`).",
+    "expected_revision": "Optimistic concurrency check: fails with 409 when the saved canvas revision differs.",
 }
 
 # Duplicate REST convenience aliases omitted from MCP inputSchema (preserved on REST /api/v1/*).
@@ -122,6 +129,13 @@ _NODEMAP_STRICT_TOOLS: frozenset[str] = frozenset({
     "create_nodemap_canvas",
     "replace_nodemap_canvas",
     "mutate_nodemap_canvas",
+})
+
+# Tools whose results carry `nested_maps` cards (MCP drops preview coordinate arrays unless `verbose`).
+_NODEMAP_NESTED_TOOLS: frozenset[str] = frozenset({
+    "get_nodemap_canvas",
+    "attach_nested_nodemap",
+    "group_nodemap_nodes",
 })
 
 _EMPTY_NODE_UI_KEYS: frozenset[str] = frozenset({
@@ -249,6 +263,11 @@ def _mcp_extra_fields(tool_name: str) -> dict[str, Any]:
         extras["verbose"] = (
             bool,
             Field(default=False, description="Include all fields without compact projection."),
+        )
+    elif tool_name in _NODEMAP_NESTED_TOOLS:
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Keep full nested-map preview geometry (box/segment coordinates) in `nested_maps`."),
         )
     elif tool_name in ("get_kconfig_symbol", "get_nodemap_struct", "get_struct_layout", "get_tree"):
         extras["verbose"] = (
@@ -565,6 +584,41 @@ def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _compact_nested_maps(result: dict[str, Any]) -> dict[str, Any]:
+    """Replace each `nested_maps[*].preview` coordinate arrays with `{w, h, boxes, segments, truncated}` counts.
+
+    Applies to top-level and `parent.nested_maps`; card status, name, counts, revision, and `webapp_url` stay.
+    """
+
+    def slim(maps: Any) -> Any:
+        if not isinstance(maps, dict):
+            return maps
+        out: dict[str, Any] = {}
+        for cid, card in maps.items():
+            prev = card.get("preview") if isinstance(card, dict) else None
+            if isinstance(prev, dict):
+                card = {
+                    **card,
+                    "preview": {
+                        "w": prev.get("w"),
+                        "h": prev.get("h"),
+                        "boxes": len(prev.get("nodes") or []),
+                        "segments": len(prev.get("edges") or []),
+                        "truncated": bool(prev.get("truncated")),
+                    },
+                }
+            out[cid] = card
+        return out
+
+    out = dict(result)
+    if "nested_maps" in out:
+        out["nested_maps"] = slim(out["nested_maps"])
+    parent = out.get("parent")
+    if isinstance(parent, dict) and "nested_maps" in parent:
+        out["parent"] = {**parent, "nested_maps": slim(parent["nested_maps"])}
+    return out
+
+
 def _compact_nodemap_struct_items(items: list[Any]) -> list[Any]:
     """Strip null, empty-list, and 0-default per-item fields from `get_nodemap_struct` items."""
     out: list[Any] = []
@@ -619,6 +673,11 @@ def _project_mcp_result(
 
     if verbose:
         return result
+
+    if name in _NODEMAP_NESTED_TOOLS or name.endswith("_nodemap_canvas"):
+        result = _compact_nested_maps(result)
+        if name in _NODEMAP_NESTED_TOOLS:
+            return result
 
     if name == "get_mail_message":
         out = dict(result)

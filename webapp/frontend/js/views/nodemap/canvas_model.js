@@ -18,13 +18,13 @@ export const USER_CANVAS_KIND = "nodemap-canvas";
 
 export const NODE_TYPES = [
   "struct", "symbol", "source", "man", "tab", "note", "group",
-  "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit",
+  "diff", "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit", "nodemap",
 ];
 /** Header badge of each node type (live node and SVG export). */
 export const NODE_BADGES = {
   struct: "struct", symbol: "symbol", source: "source", man: "man", tab: "tab", note: "note", group: "group",
   diff: "diff", mail: "mail", kconfig: "kconfig", maintainer: "maint",
-  cve: "cve", kapi: "kapi", doc: "doc", history: "hist", commit: "commit",
+  cve: "cve", kapi: "kapi", doc: "doc", history: "hist", commit: "commit", nodemap: "map",
 };
 export const SIDES = ["auto", "top", "right", "bottom", "left"];
 export const ARROWS = ["none", "forward", "backward", "both"];
@@ -164,6 +164,7 @@ export const SIZE_LIMITS = {
   doc: { w: 480, h: 380, minW: 260, minH: 140, maxW: 2000, maxH: 2400 },
   history: { w: 440, h: 340, minW: 240, minH: 140, maxW: 1800, maxH: 2400 },
   commit: { w: 460, h: 420, minW: 260, minH: 140, maxW: 1800, maxH: 2400 },
+  nodemap: { w: 360, h: 260, minW: 200, minH: 140, maxW: 2400, maxH: 2400 },
 };
 
 export const GRID_DEFAULT = 20;
@@ -391,6 +392,9 @@ export function normalizeData(type, raw, depth = 0) {
       return { text: str(d.text, "", 20000), markdown: d.markdown !== false };
     case "group":
       return depth < 8 && isObj(d.subCanvas) ? { subCanvas: normalizeCanvas(d.subCanvas, depth + 1) } : {};
+    case "nodemap":
+      // Reference to another saved (server) canvas by id; its document is never embedded
+      return { canvasId: typeof d.canvasId === "string" && ID_RE.test(d.canvasId) ? d.canvasId : "" };
     default:
       return {};
   }
@@ -438,6 +442,8 @@ export function defaultTitle(type, data) {
     case "commit":
       if (!data.commitHash) return "Commit";
       return data.subject ? `${data.commitHash.slice(0, 12)} ${data.subject}` : `Commit ${data.commitHash.slice(0, 12)}`;
+    case "nodemap":
+      return "Nested NodeMap";
     default:
       return "Node";
   }
@@ -878,9 +884,13 @@ export function normalizeCanvas(raw, depth = 0) {
   for (const n of nodes) if (n.groupId && groupCycle(byId, n)) n.groupId = null;
   const edges = [];
   const edgeIds = new Set();
+  const nestedIds = new Set(nodes.filter((n) => n.type === "nodemap").map((n) => n.id));
   for (const e of Array.isArray(raw.edges) ? raw.edges.slice(0, 20000) : []) {
     const edge = normalizeEdge(e, seen);
     if (!edge || edgeIds.has(edge.id)) continue;
+    // A nested NodeMap node is attached as a whole: no port into its interior
+    if (nestedIds.has(edge.from)) edge.fromField = null;
+    if (nestedIds.has(edge.to)) edge.toField = null;
     edgeIds.add(edge.id);
     edges.push(edge);
   }

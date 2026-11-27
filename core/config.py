@@ -153,6 +153,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # is taken only from `ref` ("latest-release" or a release tag), never from a caller's revision;
         # `sandbox` optionally names a wrapper command (e.g. "bwrap") the run goes through.
         "tools": {"checkpatch": {"enabled": False, "ref": "latest-release"}, "sandbox": ""},
+        # Saved NodeMap canvas writes of the webapp (webapp/API_ENDPOINTS.md section 4.14): POST/PUT/DELETE of
+        # `/webapi/nodemap/canvases*` (JSON files under `nodemap_canvas_dir`, never the database); false -> 403
+        "nodemap_canvas_writes": True,
         # Source index (webapp/API.md section 2.19): the facts of ingested blobs come from the database (written by
         # the parser, Step 6.9); these low-priority processes only extract blobs it lacks (revisions the parser never
         # ingested), into a SQLite store capped at max_mb (least recently used blobs dropped past it). Assembled

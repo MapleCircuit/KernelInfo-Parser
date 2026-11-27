@@ -141,6 +141,7 @@ _ENDPOINT_CATALOG: list[dict[str, Any]] = [
     {"method": "GET", "path": "/api/v1/nodemap/source", "feature": "nodemap", "summary": "NodeMap source slice for a file, line range, or symbol definition span"},
     {"method": "GET", "path": "/api/v1/nodemap/canvases", "feature": "nodemap", "summary": "Paginated list of saved NodeMap canvases for the active repository"},
     {"method": "GET", "path": "/api/v1/nodemap/canvases/{canvas_id}", "feature": "nodemap", "summary": "Saved NodeMap canvas document, metadata, and webapp deep-link URL"},
+    {"method": "GET", "path": "/api/v1/nodemap/canvases/{canvas_id}/hierarchy", "feature": "nodemap", "summary": "Nested NodeMap reference tree, parents, ancestors, and invalid insertion targets of a saved canvas"},
     {"method": "GET", "path": "/api/v1/nodemap/canvases/{canvas_id}/export", "feature": "nodemap", "summary": "Export a saved NodeMap canvas as canonical JSON, Mermaid flowchart, or Graphviz DOT"},
     {"method": "POST", "path": "/api/v1/nodemap/preview", "feature": "nodemap", "mcp": True, "read_only": True, "summary": "Stateless read-only NodeMap canvas builder, expander, layout engine, and exporter"},
     {"method": "POST", "path": "/api/v1/nodemap/canvases", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Create and persist a new NodeMap canvas document"},
@@ -148,6 +149,8 @@ _ENDPOINT_CATALOG: list[dict[str, Any]] = [
     {"method": "DELETE", "path": "/api/v1/nodemap/canvases/{canvas_id}", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Delete a saved NodeMap canvas JSON file"},
     {"method": "POST", "path": "/api/v1/nodemap/canvases/{canvas_id}/ops", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Apply an atomic batch of declarative node/edge/group/annotation/tour operations to a saved canvas"},
     {"method": "POST", "path": "/api/v1/nodemap/canvases/{canvas_id}/expand", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Expand a saved NodeMap canvas with struct_types, callgraph, callpath, kconfig, commit, or impact_map"},
+    {"method": "POST", "path": "/api/v1/nodemap/canvases/{canvas_id}/nested", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Add a nested NodeMap node referencing an existing or new empty canvas (acyclic)"},
+    {"method": "POST", "path": "/api/v1/nodemap/canvases/{canvas_id}/group", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Move nodes into a new nested NodeMap canvas and rewire boundary edges"},
     {"method": "POST", "path": "/api/v1/nodemap/canvases/{canvas_id}/layout", "feature": "nodemap", "scope": "nodemap:write", "mcp": True, "summary": "Run deterministic Sugiyama DAG or force-directed layout over a saved NodeMap canvas"},
     {"method": "POST", "path": "/api/mcp", "feature": None, "summary": "MCP Streamable HTTP endpoint (JSON-RPC 2.0)"},
 ]

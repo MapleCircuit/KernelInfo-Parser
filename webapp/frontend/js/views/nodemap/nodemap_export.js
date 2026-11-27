@@ -14,6 +14,7 @@ import { headMetaOf, sourceLineSegments } from "./node_content.js";
 import { commitRowKey, diffRows, kconfigValue, mailBadges, mailLineClass, mailRowKey, maintainerLines, releaseRowKey, statusClass, valueClass } from "./domain_nodes.js";
 import { collectExpandableTypes, countDirectives, esc as escHtml, paholeRows, structRows } from "./struct_view.js";
 import { evalCssColor, formatCssColor, mixCssColors, svgPaint } from "../../utils/css_color.js";
+import { nestedExportLines } from "./nested_nodes.js";
 
 export const EXPORT_METRICS = {
   PAD: 40,
@@ -351,6 +352,7 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
 function buildSvg(canvas, resolve, opts) {
   const visCanvas = visibleCanvasSlice(canvas);
   const content = typeof opts.content === "function" ? opts.content : () => null;
+  const nestedCardOf = typeof opts.nested === "function" ? opts.nested : () => null;
   const foreignOf = typeof opts.foreign === "function" ? opts.foreign : () => null;
   // per-node rasters of live DOM bodies (PNG export, `nodemap_png.js`): `{ href: data:image/png…, w, h }`
   const rasterOf = typeof opts.rasters === "function" ? opts.rasters : () => null;
@@ -1447,6 +1449,20 @@ function buildSvg(canvas, resolve, opts) {
     return s;
   };
 
+  /** A nested NodeMap node is a titled box with its name and counts (the preview is a live-view feature). */
+  const nodemapBody = (n, box, top) => {
+    let s = "";
+    let y = top + 6;
+    for (const line of nestedExportLines(n, nestedCardOf(n))) {
+      for (const l of wrapW(line, box.w - 16, 12, false, 400)) {
+        s += txt(8, y + 12, esc(l), { fill: C.text, size: 12 });
+        y += 16.2;
+      }
+    }
+    used = Math.max(used, y);
+    return s;
+  };
+
   const commitBody = (n, box, top) => {
     const model = content(n);
     if (!model?.hash) return txt(10, top + 16, esc(n.data.commitHash ? `Commit ${n.data.commitHash.slice(0, 12)}` : "Commit"), { fill: C.faint });
@@ -1648,6 +1664,7 @@ function buildSvg(canvas, resolve, opts) {
     else if (n.type === "doc") body = docBody(n, box, top);
     else if (n.type === "history") body = historyBody(n, box, top, ctx);
     else if (n.type === "commit") body = commitBody(n, box, top);
+    else if (n.type === "nodemap") body = nodemapBody(n, box, top);
     if (n.autoFit && used > top && used < box.h) box = { ...box, h: Math.ceil(used) };
     // a scrolled body shows the same window as the live node (clamped to its content)
     const sc = selfScroll ? 0 : Math.min(ctx.sc, Math.max(0, used - box.h));

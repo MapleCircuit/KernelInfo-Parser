@@ -10,14 +10,14 @@ Authoritative specification for the standalone authenticated FastAPI service und
 - 2. Configuration & CLI Execution [L38-L86]
 - 3. Authentication, Anti-Brute-Force Lockout & Rate Limiting [L87-L138]
   - 3.1 Built-in OAuth 2.1 Authorization Server (`api/oauth.py`, `api/routers/oauth.py`) [L117-L138]
-- 4. Curated REST API Endpoints (`/api/v1/*`) [L139-L243]
-- 5. MCP Server (`/api/mcp`, `api/mcp_stdio.py`) [L244-L335]
-  - 5.1 Protocol & Methods [L248-L258]
-  - 5.2 Tool Registry & Error Semantics [L259-L276]
-  - 5.3 Streamable HTTP Transport (`/api/mcp`) [L277-L283]
-  - 5.4 stdio Transport (`api/mcp_stdio.py`) [L284-L287]
-  - 5.5 Client Configuration [L288-L335]
-- 6. Operations: Systemd, TUI Launch & Reverse Proxy [L336-L369]
+- 4. Curated REST API Endpoints (`/api/v1/*`) [L139-L248]
+- 5. MCP Server (`/api/mcp`, `api/mcp_stdio.py`) [L249-L341]
+  - 5.1 Protocol & Methods [L253-L263]
+  - 5.2 Tool Registry & Error Semantics [L264-L282]
+  - 5.3 Streamable HTTP Transport (`/api/mcp`) [L283-L289]
+  - 5.4 stdio Transport (`api/mcp_stdio.py`) [L290-L293]
+  - 5.5 Client Configuration [L294-L341]
+- 6. Operations: Systemd, TUI Launch & Reverse Proxy [L342-L375]
 <!-- toc:end -->
 
 ---
@@ -220,8 +220,9 @@ All `/api/v1/*` endpoints include `"repo": get_active_repo_name()` in their JSON
 | **Utilities (P3)** | `POST /api/v1/checkpatch` | `patch` | *(REST-only, `mcp=False`)* | Fenced `scripts/checkpatch.pl` run over `patch` text (at most 2 MiB; off unless `webapp.tools.checkpatch.enabled`) |
 | **NodeMap** | `GET /api/v1/nodemap/struct` | `nodemap` | `get_nodemap_struct` | Struct/union member tree, nested aggregates, and `#if` preprocessor guards |
 | **NodeMap** | `GET /api/v1/nodemap/source` | `nodemap` | `get_nodemap_source` | Source slice for a file, line range, or symbol definition span |
-| **NodeMap** | `GET /api/v1/nodemap/canvases` | `nodemap` | `list_nodemap_canvases` | Paginated list of saved NodeMap canvases for the active repository |
+| **NodeMap** | `GET /api/v1/nodemap/canvases` | `nodemap` | `list_nodemap_canvases` | Paginated list of saved NodeMap canvases for the active repository; `insertable_into=<canvas_id>` adds `insertable` (false when referencing the canvas from that parent would create a cycle) |
 | **NodeMap** | `GET /api/v1/nodemap/canvases/{canvas_id}` | `nodemap` | `get_nodemap_canvas` | Saved NodeMap canvas document, metadata, `revision`, and `webapp_url` |
+| **NodeMap** | `GET /api/v1/nodemap/canvases/{canvas_id}/hierarchy` | `nodemap` | `get_nodemap_hierarchy` | Nested NodeMap reference tree (`depth` 1..32, default 8), `parents`, `ancestors`, and `invalid_targets` of a saved canvas, without node payloads |
 | **NodeMap** | `GET /api/v1/nodemap/canvases/{canvas_id}/export` | `nodemap` | `export_nodemap_canvas` | Export a saved NodeMap canvas in `"json"`, `"mermaid"`, or `"dot"` format |
 | **NodeMap** | `POST /api/v1/nodemap/preview` | `nodemap` | `preview_nodemap_canvas` | Stateless read-only NodeMap canvas builder, hydrator, expander, layout engine, and exporter (`readOnlyHint: true`) |
 | **NodeMap** | `POST /api/v1/nodemap/canvases` | `nodemap` (`nodemap:write`) | `create_nodemap_canvas` | Create and persist a new NodeMap canvas document on disk |
@@ -229,11 +230,15 @@ All `/api/v1/*` endpoints include `"repo": get_active_repo_name()` in their JSON
 | **NodeMap** | `DELETE /api/v1/nodemap/canvases/{canvas_id}` | `nodemap` (`nodemap:write`) | `delete_nodemap_canvas` | Delete a saved NodeMap canvas JSON file |
 | **NodeMap** | `POST /api/v1/nodemap/canvases/{canvas_id}/ops` | `nodemap` (`nodemap:write`) | `mutate_nodemap_canvas` | Apply an atomic batch of declarative node/edge/group/annotation/tour operations to a saved canvas |
 | **NodeMap** | `POST /api/v1/nodemap/canvases/{canvas_id}/expand` | `nodemap` (`nodemap:write`) | `expand_nodemap_graph` | Expand a saved NodeMap canvas with server-side graph discovery |
+| **NodeMap** | `POST /api/v1/nodemap/canvases/{canvas_id}/nested` | `nodemap` (`nodemap:write`) | `attach_nested_nodemap` | Add a nested NodeMap node referencing `target_id` (or a new empty canvas when omitted); body `NodemapAttachNestedRequest` (`target_id`, `new_canvas_id`, `name`, `description`, `version`, `node`, `expected_revision`) |
+| **NodeMap** | `POST /api/v1/nodemap/canvases/{canvas_id}/group` | `nodemap` (`nodemap:write`) | `group_nodemap_nodes` | Move `node_ids` into a new nested canvas; internal edges move along, boundary edges rewire to the nested node; body `NodemapGroupNestedRequest` (`node_ids` required, plus the `nested` fields) |
 | **NodeMap** | `POST /api/v1/nodemap/canvases/{canvas_id}/layout` | `nodemap` (`nodemap:write`) | `layout_nodemap_canvas` | Run deterministic Sugiyama `"dag"` or `"force"` layout over a saved NodeMap canvas |
 
 `GET /api/v1/kconfig/eval` loads the configuration `make ARCH=<arch> <defconfig>` writes (`load_config()` + `set_all_new_symbols("default")`, `parser/kconfig_ast/KCONFIG_API.md` §8.3), applies each `assign` with kconfig's setter rules (`set_value()`; refused or undefined names are listed in `rejected`), and returns `symbols` (`{value, type, defined, visible, changeable}` per name) and `files` (each path's Kbuild condition `expr` with its tristate `result`: `"y"`, `"m"`, `"n"`, or `"?"`, `parser/kbuild_conditions.py` `evaluate()`). Limits: 128 symbols, 64 paths, 128 assignments.
 
-Saved NodeMap canvases (`webapp/backend/services/nodemap_canvas_service.py`, `nodemap_canvas_schema.py`, `nodemap_canvas_layout.py`) conform to the canonical `canvas_model.js` contract (`schema: "kip-nodemap-canvas"`, `version: 1`, all 16 `NODE_TYPES`, `SIZE_LIMITS`, `LOCK_KINDS`, `EDGE_PRESETS`, sub-canvases up to depth 8, and `tours`) and are written atomically (`tempfile.mkstemp` + `os.replace`) to `<nodemap_canvas_dir>/<safe_repo>/<canvas_id>.json` (`/^[\w-]{1,64}$/`).
+Saved NodeMap canvases (`webapp/backend/services/nodemap_canvas_service.py`, `nodemap_canvas_schema.py`, `nodemap_canvas_layout.py`) conform to the canonical `canvas_model.js` contract (`schema: "kip-nodemap-canvas"`, `version: 1`, all 17 `NODE_TYPES`, `SIZE_LIMITS`, `LOCK_KINDS`, `EDGE_PRESETS`, sub-canvases up to depth 8, and `tours`) and are written atomically (`tempfile.mkstemp` + `os.replace`) to `<nodemap_canvas_dir>/<safe_repo>/<canvas_id>.json` (`/^[\w-]{1,64}$/`).
+
+Nested NodeMaps: node type `nodemap` (`data.canvasId`, `^[\w-]{1,64}$`) references another saved canvas of the same repository; the child document is never embedded. Every write (`create`, `replace`, `ops`, `expand`, `layout`, `nested`, `group`) is rejected with `422` for a newly added reference to a missing canvas and for any reference cycle (including self-references, `a -> b -> a`); edges attach to a nested node as a whole, so `fromField`/`toField` on a `nodemap` endpoint is `422` (strict validation of `nodes`/`edges` payloads reports it before the service runs). `GET /nodemap/canvases/{canvas_id}` and every write result carry `nested_maps` (`{canvasId: card}`) with `status` (`ok` / `missing`), `name`, `version`, `revision`, `counts` (`nodes`, `edges`, `nested`), a geometry `preview`, and `webapp_url`; a deleted child reads as `status: "missing"` and `DELETE` returns `referenced_by`. `GET .../hierarchy` returns the reference tree (`status` `ok` / `missing` / `cycle`), `parents`, `ancestors`, and `invalid_targets`. `POST .../nested` and `POST .../group` accept `expected_revision` (`409` on conflict) and return the new `node_id`, `target_id`, and the updated `parent` envelope (`group` also `moved_node_ids`, `moved_edge_ids`, `rewired_edge_ids`, and the `child` summary).
 
 P3 utilities (`GET /api/v1/compile_commands`, `GET /api/v1/treemap`, and `POST /api/v1/checkpatch`) are registered in `_ENDPOINT_CATALOG` with `"mcp": False`: they are available over REST and advertised in `/api/v1/capabilities` as REST-only, but strictly excluded from MCP `TOOLS`, omitted from `tools/list`, and rejected with `-32602` (`INVALID_PARAMS`) on `tools/call`.
 
@@ -266,6 +271,7 @@ Intentionally unexposed on `/api/v1/*` and MCP: stateful in-memory patch applica
 - **Compact MCP projections & opt-in flags**: `_project_mcp_result()` keeps MCP responses compact while leaving `/api/v1/*` REST defaults unchanged:
   - `get_capabilities`: defaults `include_endpoints=false` on MCP (omitting `endpoints[]` unless `include_endpoints=true` or `verbose=true`) and reports session-accurate `read_only`, `scopes`, and `mcp.tools` (`len(visible_tools())`).
   - `preview_nodemap_canvas`: emits a single canonical `export` field (omitting duplicate `export_content`), defaults `include_canvas` to `false` when `export_format` is set (`true` otherwise), and strips empty/default UI-state keys (`color`, `bgColor`, `customTitle`, `locks`, `collapsed`, `hiddenItems`, `fieldLocks`, `openMids`, `fullMids`, `pinnedBodies`, `waypoints`, `typeOverrides`, `collapsedGuards`) unless `verbose=true`.
+  - `get_nodemap_canvas`, `attach_nested_nodemap`, `group_nodemap_nodes` (and `nested_maps` in the other canvas write results): each `nested_maps[*].preview` is reduced to `{w, h, boxes, segments, truncated}` counts (coordinate arrays dropped) while `status`, `name`, `counts`, `revision`, and `webapp_url` stay; `verbose=true` keeps the full geometry. Nested node `data.canvasId` stays in `canvas.nodes` so agents drill down with `get_nodemap_canvas` / `get_nodemap_hierarchy`.
   - `get_mail_message`: defaults `include_raw=false` (omits `raw`) and `include_headers="essential"` (retaining `from`, `to`, `cc`, `date`, `subject`, `message-id`, `in-reply-to`, `references`, omitting transport/auth headers), and omits duplicate `commit_message == body` and `review_trailers == trailers` unless `verbose=true`.
   - `get_kconfig_symbol`: deduplicates repeated `help`, `prompt`/`prompts`, `declarations`, and `compiled_files` covered by `kbuild` unless `verbose=true`.
   - `get_nodemap_struct`, `get_struct_layout`, and `get_tree`: omit null, `false`, `0`-default, empty-collection, and internal (`fid`, `ftype`, `s_stat`, `e_stat`, `s_stat_label`) per-item defaults unless `verbose=true`.

@@ -876,6 +876,151 @@ class TestAiApiEndpoints(unittest.TestCase):
         self.assertTrue(r_del.json()["deleted"])
         self.assertEqual(client.get("/api/v1/nodemap/canvases/foo-map", headers=read_hdr).status_code, 404)
 
+    def _nested_client(self) -> tuple[TestClient, dict[str, str], dict[str, str]]:
+        cfg = core_config.get_config()
+        cfg["api"]["allow_writes"] = True
+        cfg["api"]["nodemap_canvas_dir"] = str(Path(self._tmp.name) / "canvases")
+        cfg["api"]["keys"] = {
+            "reader": {"key": "read-only-secret", "scopes": ["read"]},
+            "writer": {"key": "write-secret", "scopes": ["read", "nodemap:write"]},
+        }
+        return (
+            TestClient(create_app()),
+            {"Authorization": "Bearer read-only-secret"},
+            {"Authorization": "Bearer write-secret"},
+        )
+
+    def test_nested_nodemap_chain_hierarchy_cycles_and_listing(self) -> None:
+        client, read_hdr, write_hdr = self._nested_client()
+        base = "/api/v1/nodemap/canvases"
+
+        def nested(nid: str, target: str) -> dict:
+            return {"id": nid, "type": "nodemap", "data": {"canvasId": target}}
+
+        def create(cid: str, nodes: list | None = None, expect: int = 200):
+            r = client.post(base, headers=write_hdr, json={"id": cid, "name": cid.upper(), "nodes": nodes or [], "hydrate": False})
+            self.assertEqual(r.status_code, expect, r.text)
+            return r.json()
+
+        # C (leaf with a note), B -> C, A -> B via create + attach
+        create("cc", [{"id": "n1", "type": "note", "data": {"text": "leaf"}}])
+        create("bb", [nested("to_c", "cc")])
+        create("aa")
+        r_att = client.post(f"{base}/aa/nested", headers=write_hdr, json={"target_id": "bb", "node": {"id": "to_b"}})
+        self.assertEqual(r_att.status_code, 200, r_att.text)
+        att = r_att.json()
+        self.assertEqual(att["target_id"], "bb")
+        self.assertEqual(att["node_id"], "to_b")
+        self.assertFalse(att["created"])
+        self.assertEqual(att["parent"]["nested_maps"]["bb"]["status"], "ok")
+
+        # Parent read returns cards, never the child's nodes
+        got = client.get(f"{base}/aa", headers=read_hdr).json()
+        card = got["nested_maps"]["bb"]
+        self.assertEqual(card["status"], "ok")
+        self.assertEqual(card["counts"]["nested"], 1)
+        self.assertIn("preview", card)
+        self.assertNotIn("n1", json.dumps(got["canvas"]))
+        self.assertEqual([n["data"]["canvasId"] for n in got["canvas"]["nodes"]], ["bb"])
+
+        # Shared child referenced by two parents
+        create("dd", [nested("to_c", "cc")])
+        h_c = client.get(f"{base}/cc/hierarchy", headers=read_hdr).json()
+        self.assertEqual({p["canvas_id"] for p in h_c["parents"]}, {"bb", "dd"})
+        self.assertIn("aa", {a["canvas_id"] if isinstance(a, dict) else a for a in h_c["ancestors"]})
+
+        # Hierarchy across the chain
+        h = client.get(f"{base}/aa/hierarchy?depth=5", headers=read_hdr)
+        self.assertEqual(h.status_code, 200, h.text)
+        tree = h.json()["tree"]
+        self.assertEqual(tree["canvas_id"], "aa")
+        self.assertEqual(tree["children"][0]["canvas_id"], "bb")
+        self.assertEqual(tree["children"][0]["children"][0]["canvas_id"], "cc")
+        self.assertIn("invalid_targets", h.json())
+        self.assertEqual(client.get(f"{base}/aa/hierarchy?depth=0", headers=read_hdr).status_code, 422)
+        self.assertEqual(client.get(f"{base}/aa/hierarchy?depth=33", headers=read_hdr).status_code, 422)
+        self.assertEqual(client.get(f"{base}/nope/hierarchy", headers=read_hdr).status_code, 404)
+
+        # insertable_into flags
+        lst = client.get(f"{base}?insertable_into=bb&limit=100", headers=read_hdr).json()
+        flags = {c["id"]: c["insertable"] for c in lst["items"]}
+        self.assertFalse(flags["bb"])
+        self.assertFalse(flags["aa"])
+        self.assertTrue(flags["cc"])
+
+        # Cycles: self, A->B->A, A->B->C->A on create/replace/mutate/attach
+        create("selfie", [nested("me", "selfie")], expect=422)
+        r = client.put(f"{base}/cc", headers=write_hdr, json={"nodes": [nested("up", "aa")], "hydrate": False})
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("cycle", json.dumps(r.json()).lower())
+        r = client.post(
+            f"{base}/cc/ops", headers=write_hdr,
+            json={"ops": [{"op": "add_nodes", "nodes": [nested("up", "bb")]}], "hydrate": False},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        for child, target in (("aa", "aa"), ("bb", "aa"), ("cc", "aa")):
+            r = client.post(f"{base}/{child}/nested", headers=write_hdr, json={"target_id": target})
+            self.assertEqual(r.status_code, 422, (child, r.text))
+        # Missing target
+        r = client.post(f"{base}/aa/nested", headers=write_hdr, json={"target_id": "ghost"})
+        self.assertEqual(r.status_code, 422, r.text)
+        create("with-ghost", [nested("g", "ghost")], expect=422)
+
+        # New empty child via attach (no target_id)
+        r = client.post(f"{base}/dd/nested", headers=write_hdr, json={"new_canvas_id": "fresh", "name": "Fresh"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["created"])
+        self.assertEqual(client.get(f"{base}/fresh", headers=read_hdr).status_code, 200)
+
+        # Field port onto a nodemap node is rejected
+        r = client.post(
+            f"{base}/aa/ops", headers=write_hdr,
+            json={"ops": [{"op": "add_nodes", "nodes": [{"id": "nn", "type": "note", "data": {"text": "x"}}]},
+                          {"op": "connect", "from": "nn", "to": "to_b", "toField": "x"}], "hydrate": False},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+
+        # Deleting a referenced child reads back as missing + referenced_by
+        r_del = client.delete(f"{base}/cc", headers=write_hdr)
+        self.assertEqual(r_del.status_code, 200, r_del.text)
+        self.assertEqual(set(r_del.json()["referenced_by"]) , {"bb", "dd"})
+        self.assertEqual(client.get(f"{base}/bb", headers=read_hdr).json()["nested_maps"]["cc"]["status"], "missing")
+        h = client.get(f"{base}/aa/hierarchy", headers=read_hdr).json()
+        self.assertEqual(h["tree"]["children"][0]["children"][0]["status"], "missing")
+
+    def test_nested_nodemap_group_and_scopes(self) -> None:
+        client, read_hdr, write_hdr = self._nested_client()
+        base = "/api/v1/nodemap/canvases"
+        r = client.post(base, headers=write_hdr, json={
+            "id": "big", "name": "Big", "hydrate": False,
+            "nodes": [{"id": f"n{i}", "type": "note", "data": {"text": str(i)}} for i in range(1, 5)],
+            "edges": [{"id": "e12", "from": "n1", "to": "n2"}, {"id": "e23", "from": "n2", "to": "n3"},
+                      {"id": "e34", "from": "n3", "to": "n4"}],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        r = client.post(f"{base}/big/group", headers=write_hdr,
+                        json={"node_ids": ["n2", "n3"], "new_canvas_id": "inner", "name": "Inner", "node": {"id": "grp"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        g = r.json()
+        self.assertEqual(g["node_id"], "grp")
+        self.assertEqual(g["target_id"], "inner")
+        self.assertEqual(sorted(g["moved_node_ids"]), ["n2", "n3"])
+        self.assertEqual(g["moved_edge_ids"], ["e23"])
+        self.assertEqual(sorted(g["rewired_edge_ids"]), ["e12", "e34"])
+        self.assertEqual(g["child"]["node_count"], 2)
+        parent = client.get(f"{base}/big", headers=read_hdr).json()
+        edges = {e["id"]: (e["from"], e["to"]) for e in parent["canvas"]["edges"]}
+        self.assertEqual(edges, {"e12": ("n1", "grp"), "e34": ("grp", "n4")})
+        self.assertEqual(parent["nested_maps"]["inner"]["counts"]["nodes"], 2)
+        # Validation
+        self.assertEqual(client.post(f"{base}/big/group", headers=write_hdr, json={"node_ids": []}).status_code, 422)
+        self.assertEqual(client.post(f"{base}/big/group", headers=write_hdr, json={"node_ids": ["zzz"]}).status_code, 422)
+        self.assertEqual(client.post(f"{base}/big/group", headers=write_hdr, json={"node_ids": ["n1"], "bogus": 1}).status_code, 422)
+        # Reader gets 403 on the new write routes; hierarchy stays readable
+        self.assertEqual(client.post(f"{base}/big/nested", headers=read_hdr, json={"target_id": "inner"}).status_code, 403)
+        self.assertEqual(client.post(f"{base}/big/group", headers=read_hdr, json={"node_ids": ["n1"]}).status_code, 403)
+        self.assertEqual(client.get(f"{base}/big/hierarchy", headers=read_hdr).status_code, 200)
+
     def test_p1_kapi_mail_kconfig_history_pahole_and_maintainers(self) -> None:
         # 1. KAPI endpoints (summary, syscalls, exports, params, tracepoints, modules, devices)
         with patch("webapp.backend.services.kapi_service.summary", return_value={

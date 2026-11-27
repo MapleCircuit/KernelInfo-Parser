@@ -658,6 +658,95 @@ class TestMcpTools(_McpFixture):
         self.assertFalse(r_del["isError"], r_del)
         self.assertTrue(r_del["structuredContent"]["deleted"])
 
+    def test_nested_nodemap_tools_scopes_and_compact_projection(self) -> None:
+        cfg = core_config.get_config()
+        cfg["api"]["allow_writes"] = True
+        cfg["api"]["nodemap_canvas_dir"] = str(Path(self._tmp.name) / "canvases")
+        cfg["api"]["keys"] = {
+            "reader": {"key": "mcp-read-token", "scopes": ["read"]},
+            "writer": {"key": "mcp-write-token", "scopes": ["read", "nodemap:write"]},
+        }
+        client = TestClient(create_app())
+
+        def call(token: str, name: str, arguments: dict) -> dict:
+            r = client.post(
+                mcp.MCP_PATH,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["result"]
+
+        def tools(token: str) -> dict:
+            r = client.post(
+                mcp.MCP_PATH,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            return {t["name"]: t for t in r.json()["result"]["tools"]}
+
+        read_tools, write_tools = tools("mcp-read-token"), tools("mcp-write-token")
+        self.assertIn("get_nodemap_hierarchy", read_tools)
+        self.assertTrue(read_tools["get_nodemap_hierarchy"]["annotations"]["readOnlyHint"])
+        for name in ("attach_nested_nodemap", "group_nodemap_nodes"):
+            self.assertNotIn(name, read_tools)
+            self.assertFalse(write_tools[name]["annotations"]["readOnlyHint"])
+            self.assertFalse(write_tools[name]["annotations"]["destructiveHint"])
+        self.assertIn("insertable_into", read_tools["list_nodemap_canvases"]["inputSchema"]["properties"])
+        self.assertEqual(write_tools["group_nodemap_nodes"]["inputSchema"]["properties"]["node_ids"]["minItems"], 1)
+        self.assertIn("canvasId", json.dumps(write_tools["create_nodemap_canvas"]["inputSchema"]))
+
+        denied = call("mcp-read-token", "attach_nested_nodemap", {"canvas_id": "p", "target_id": "c"})
+        self.assertToolError(denied, 403)
+
+        for cid, nodes in (("kid", [{"id": "n1", "type": "note", "data": {"text": "k"}}]), ("par", [])):
+            res = call("mcp-write-token", "create_nodemap_canvas", {"id": cid, "name": cid, "nodes": nodes})
+            self.assertFalse(res["isError"], res)
+
+        att = call("mcp-write-token", "attach_nested_nodemap", {"canvas_id": "par", "target_id": "kid", "node": {"id": "sub"}})
+        att_body = self.assertToolOk(att)
+        self.assertEqual(att_body["node_id"], "sub")
+        card = att_body["parent"]["nested_maps"]["kid"]
+        self.assertEqual(card["status"], "ok")
+        self.assertEqual(card["counts"]["nodes"], 1)
+        self.assertEqual(set(card["preview"]), {"w", "h", "boxes", "segments", "truncated"})
+        self.assertEqual(card["preview"]["boxes"], 1)
+
+        got = self.assertToolOk(call("mcp-write-token", "get_nodemap_canvas", {"canvas_id": "par"}))
+        self.assertEqual(got["canvas"]["nodes"][0]["data"]["canvasId"], "kid")
+        self.assertNotIn("nodes", got["nested_maps"]["kid"]["preview"])
+        verbose = self.assertToolOk(call("mcp-write-token", "get_nodemap_canvas", {"canvas_id": "par", "verbose": True}))
+        self.assertIn("nodes", verbose["nested_maps"]["kid"]["preview"])
+
+        hier = self.assertToolOk(call("mcp-read-token", "get_nodemap_hierarchy", {"canvas_id": "par", "depth": 3}))
+        self.assertEqual(hier["tree"]["children"][0]["canvas_id"], "kid")
+        self.assertToolError(call("mcp-read-token", "get_nodemap_hierarchy", {"canvas_id": "par", "depth": 99}), 422)
+
+        # Cycle -> tool error; strict validation rejects ports on nested nodes
+        self.assertToolError(call("mcp-write-token", "attach_nested_nodemap", {"canvas_id": "kid", "target_id": "par"}), 422)
+        err = call(
+            "mcp-write-token",
+            "preview_nodemap_canvas",
+            {
+                "nodes": [{"id": "a", "type": "nodemap", "data": {"canvasId": "kid"}}, {"id": "b", "type": "note"}],
+                "edges": [{"from": "b", "to": "a", "toField": "x"}],
+            },
+        )
+        self.assertToolError(err, 422)
+
+        # Group tool
+        call("mcp-write-token", "mutate_nodemap_canvas", {
+            "canvas_id": "kid",
+            "ops": [{"op": "add_nodes", "nodes": [{"id": "n2", "type": "note", "data": {"text": "2"}}]}],
+        })
+        grp = self.assertToolOk(call("mcp-write-token", "group_nodemap_nodes", {
+            "canvas_id": "kid", "node_ids": ["n1", "n2"], "new_canvas_id": "inner",
+        }))
+        self.assertEqual(grp["target_id"], "inner")
+        self.assertEqual(sorted(grp["moved_node_ids"]), ["n1", "n2"])
+        self.assertEqual(grp["parent"]["nested_maps"]["inner"]["preview"]["boxes"], 2)
+        self.assertToolError(call("mcp-write-token", "group_nodemap_nodes", {"canvas_id": "kid", "node_ids": []}), 422)
+
     def test_p1_p2_mcp_tools_readonly_posts_and_p3_exclusion(self) -> None:
         # 1. Read-only POST MCP tools remain visible in tools/list and callable when allow_writes=False
         tools = {t["name"]: t for t in self.rpc("tools/list", {}).json()["result"]["tools"]}

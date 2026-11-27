@@ -410,5 +410,261 @@ class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
                 self.assertEqual(len(r_get.json()["canvas"]["nodes"]), 1)
 
 
+class NestedNodeMapTests(unittest.TestCase):
+    """Nested NodeMap references (`nodemap` nodes): cycles, previews, missing targets, hierarchy, attach, group
+    (`webapp/backend/services/nodemap_nesting.py`, webapp/API_ENDPOINTS.md section 4.14)."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from webapp.backend.services.nodemap_canvas_service import (
+            nodemap_canvas_service,
+        )
+
+        self.svc = nodemap_canvas_service
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        p = patch("webapp.backend.services.nodemap_canvas_service.get_nodemap_canvas_dir", return_value=Path(self._tmp.name))
+        p.start()
+        self.addCleanup(p.stop)
+        app = FastAPI()
+        app.include_router(nodemap_router)
+        self.client = TestClient(app)
+
+    def _create(self, cid: str, nodes: list | None = None, edges: list | None = None) -> dict:
+        r = self.client.post(
+            "/webapi/nodemap/canvases",
+            json={"id": cid, "name": cid.upper(), "canvas": {"nodes": nodes or [], "edges": edges or []}},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    @staticmethod
+    def _ref(nid: str, target: str, **extra) -> dict:
+        return {"id": nid, "type": "nodemap", "data": {"canvasId": target}, **extra}
+
+    def _ops(self, cid: str, ops: list) -> object:
+        return self.client.post(f"/webapi/nodemap/canvases/{cid}/ops", json={"ops": ops})
+
+    def test_schema_normalizes_nodemap_nodes_and_clears_ports(self) -> None:
+        from webapp.backend.services import nodemap_canvas_schema as pcs
+
+        self.assertIn("nodemap", pcs.NODE_TYPES)
+        self.assertNotIn("nodemap", pcs.AUTOFIT_TYPES)
+        doc = pcs.normalize_canvas({
+            "schema": "kip-nodemap-canvas", "version": 1,
+            "nodes": [
+                self._ref("m1", "child-1"),
+                {"id": "m2", "type": "nodemap", "data": {"canvasId": "../etc", "nodes": [{"id": "x"}]}},
+                {"id": "s", "type": "struct", "data": {"name": "foo"}},
+            ],
+            "edges": [{"id": "e1", "from": "s", "to": "m1", "fromField": "a", "toField": "inner"}],
+        })
+        by_id = {n["id"]: n for n in doc["nodes"]}
+        self.assertEqual(by_id["m1"]["data"], {"canvasId": "child-1"})
+        self.assertEqual(by_id["m2"]["data"], {"canvasId": ""})
+        self.assertEqual(by_id["m1"]["title"], "Nested NodeMap")
+        self.assertEqual(doc["edges"][0]["fromField"], "a")
+        self.assertIsNone(doc["edges"][0]["toField"])
+
+    def test_arbitrary_depth_and_shared_child(self) -> None:
+        self._create("c", [{"id": "c1", "type": "note"}, {"id": "c2", "type": "note", "x": 400}], [{"id": "ce", "from": "c1", "to": "c2"}])
+        self._create("b", [self._ref("nb", "c"), {"id": "b1", "type": "note"}])
+        self._create("a", [self._ref("na", "b")])
+        self._create("p2", [self._ref("np2", "c")])
+        h = self.client.get("/webapi/nodemap/canvases/a/hierarchy").json()
+        self.assertEqual(h["tree"]["canvas_id"], "a")
+        lvl1 = h["tree"]["children"][0]
+        self.assertEqual((lvl1["node_id"], lvl1["canvas_id"], lvl1["status"]), ("na", "b", "ok"))
+        lvl2 = lvl1["children"][0]
+        self.assertEqual((lvl2["canvas_id"], lvl2["counts"]), ("c", {"nodes": 2, "edges": 1, "nested": 0}))
+        self.assertNotIn("nodes", lvl2)
+        hc = self.client.get("/webapi/nodemap/canvases/c/hierarchy").json()
+        self.assertEqual([p["canvas_id"] for p in hc["parents"]], ["b", "p2"])
+        self.assertEqual(hc["ancestors"], ["a", "b", "p2"])
+        self.assertEqual(hc["invalid_targets"], ["a", "b", "c", "p2"])
+        shallow = self.client.get("/webapi/nodemap/canvases/a/hierarchy?depth=1").json()
+        self.assertTrue(shallow["tree"]["children"][0]["children_truncated"])
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/a/hierarchy?depth=0").status_code, 422)
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/zz/hierarchy").status_code, 404)
+
+    def test_cycles_rejected_on_every_write(self) -> None:
+        self._create("c")
+        self._create("b", [self._ref("nb", "c")])
+        self._create("a", [self._ref("na", "b")])
+        # A -> A (create, attach, ops)
+        r = self.client.post("/webapi/nodemap/canvases", json={"id": "s", "canvas": {"nodes": [self._ref("x", "s")]}})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("s -> s", r.json()["detail"])
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/a/nested", json={"target_id": "a"}).status_code, 422)
+        # A -> B -> A
+        r = self._ops("b", [{"op": "upsert_nodes", "nodes": [self._ref("back", "a")]}])
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("b -> a -> b", r.json()["detail"])
+        # A -> B -> C -> A (replace and attach)
+        r = self.client.put("/webapi/nodemap/canvases/c", json={"canvas": {"nodes": [self._ref("loop", "a")]}})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("c -> a -> b -> c", r.json()["detail"])
+        r = self.client.post("/webapi/nodemap/canvases/c/nested", json={"target_id": "a"})
+        self.assertEqual(r.status_code, 422)
+        # Nothing was written
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/c").json()["revision"], 1)
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/b").json()["nested_refs"], ["c"])
+
+    def test_missing_target_and_port_into_nested_node_rejected(self) -> None:
+        self._create("c")
+        self._create("a", [self._ref("na", "c"), {"id": "n", "type": "note"}])
+        r = self._ops("a", [{"op": "upsert_nodes", "nodes": [self._ref("nx", "ghost")]}])
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("ghost", r.json()["detail"])
+        r = self._ops("a", [{"op": "upsert_edges", "edges": [{"from": "n", "to": "na", "toField": "inner.field"}]}])
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("as a whole", r.json()["detail"])
+        r = self._ops("a", [{"op": "upsert_edges", "edges": [{"id": "ok", "from": "n", "to": "na"}]}])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["canvas"]["edges"][0]["to"], "na")
+
+    def test_parent_read_is_lightweight_and_tolerates_missing_children(self) -> None:
+        child_nodes = [
+            {"id": f"k{i}", "type": "source", "x": i * 30, "y": i * 10, "data": {"path": "kernel/fork.c"}}
+            for i in range(260)
+        ]
+        child_edges = [{"id": f"ke{i}", "from": f"k{i}", "to": f"k{i + 1}"} for i in range(259)]
+        self._create("big", child_nodes, child_edges)
+        self._create("gone")
+        parent = self._create("p", [self._ref("n1", "big"), self._ref("n2", "big"), self._ref("n3", "gone")])
+        self.assertEqual(parent["nested_count"], 3)
+        self.assertEqual(sorted(parent["nested_maps"]), ["big", "gone"])
+        r = self.client.get("/webapi/nodemap/canvases/p").json()
+        self.assertEqual(len(r["canvas"]["nodes"]), 3)
+        card = r["nested_maps"]["big"]
+        self.assertEqual(card["status"], "ok")
+        self.assertEqual(card["name"], "BIG")
+        self.assertEqual(card["counts"], {"nodes": 260, "edges": 259, "nested": 0})
+        prev = card["preview"]
+        self.assertTrue(prev["truncated"])
+        self.assertLessEqual(len(prev["nodes"]), 200)
+        self.assertLessEqual(max(prev["w"], prev["h"]), 1000)
+        self.assertEqual(set(prev["nodes"][0]), {"x", "y", "w", "h", "type", "color"})
+        self.assertNotIn("kernel/fork.c", str(r["nested_maps"]))
+        self.assertNotIn("canvas", card)
+
+        d = self.client.delete("/webapi/nodemap/canvases/gone").json()
+        self.assertEqual(d["referenced_by"], ["p"])
+        r = self.client.get("/webapi/nodemap/canvases/p")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["nested_maps"]["gone"], {"canvas_id": "gone", "status": "missing"})
+        tree = self.client.get("/webapi/nodemap/canvases/p/hierarchy").json()["tree"]
+        self.assertEqual([c["status"] for c in tree["children"]], ["ok", "ok", "missing"])
+        # A kept dangling reference does not block editing the parent; a new missing target does
+        self.assertEqual(self._ops("p", [{"op": "upsert_nodes", "nodes": [{"id": "t", "type": "note"}]}]).status_code, 200)
+        self.assertEqual(self._ops("p", [{"op": "upsert_nodes", "nodes": [self._ref("n4", "gone-too")]}]).status_code, 422)
+
+    def test_insertable_listing_and_attach_new_or_existing(self) -> None:
+        self._create("c")
+        self._create("b", [self._ref("nb", "c")])
+        items = self.client.get("/webapi/nodemap/canvases?insertable_into=c").json()["items"]
+        self.assertEqual({i["id"]: i["insertable"] for i in items}, {"b": False, "c": False})
+        r = self.client.post("/webapi/nodemap/canvases/b/nested", json={"name": "Fresh", "new_canvas_id": "fresh", "node": {"x": 500, "y": 40}})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["created"])
+        self.assertEqual(body["target_id"], "fresh")
+        node = next(n for n in body["parent"]["canvas"]["nodes"] if n["id"] == body["node_id"])
+        self.assertEqual((node["type"], node["x"], node["title"]), ("nodemap", 500, "Fresh"))
+        self.assertEqual(body["parent"]["nested_maps"]["fresh"]["counts"], {"nodes": 0, "edges": 0, "nested": 0})
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/fresh").json()["name"], "Fresh")
+        r = self.client.post("/webapi/nodemap/canvases/fresh/nested", json={"target_id": "c", "expected_revision": 1})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["created"])
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/fresh/nested", json={"target_id": "c", "expected_revision": 1}).status_code, 409)
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/b/nested", json={"new_canvas_id": "c"}).status_code, 409)
+
+    def test_group_selection_into_nested_canvas(self) -> None:
+        self._create("c")
+        nodes = [
+            {"id": "out", "type": "note", "x": 0, "y": 0},
+            {"id": "g", "type": "group", "x": 300, "y": 300, "w": 400, "h": 300},
+            {"id": "in1", "type": "note", "x": 320, "y": 350, "groupId": "g"},
+            {"id": "in2", "type": "note", "x": 500, "y": 350},
+            self._ref("deep", "c", x=700, y=700),
+        ]
+        edges = [
+            {"id": "e_int", "from": "in1", "to": "in2", "waypoints": [{"x": 400, "y": 400}]},
+            {"id": "e_in", "from": "out", "to": "in1"},
+            {"id": "e_out", "from": "in2", "to": "out", "fromField": "x"},
+            {"id": "e_deep", "from": "in2", "to": "deep"},
+        ]
+        self._create("p", nodes, edges)
+        self.client.post("/webapi/nodemap/canvases/p/ops", json={"ops": [{"op": "upsert_tour", "tour": {"id": "t1", "steps": [{"id": "s1", "nodeIds": ["in1", "out", "in2"], "edgeIds": ["e_int", "e_in"]}]}}]})
+        r = self.client.post("/webapi/nodemap/canvases/p/group", json={"node_ids": ["g", "in2", "deep"], "name": "Inner", "new_canvas_id": "inner"})
+        self.assertEqual(r.status_code, 200, r.text)
+        g = r.json()
+        nid = g["node_id"]
+        self.assertEqual(sorted(g["moved_node_ids"]), ["deep", "g", "in1", "in2"])
+        self.assertEqual(sorted(g["moved_edge_ids"]), ["e_deep", "e_int"])
+        self.assertEqual(sorted(g["rewired_edge_ids"]), ["e_in", "e_out"])
+        self.assertEqual((g["child"]["node_count"], g["child"]["edge_count"], g["child"]["nested_count"]), (4, 2, 1))
+        parent = g["parent"]["canvas"]
+        self.assertEqual(sorted(n["id"] for n in parent["nodes"]), sorted(["out", nid]))
+        pe = {e["id"]: e for e in parent["edges"]}
+        self.assertEqual((pe["e_in"]["from"], pe["e_in"]["to"]), ("out", nid))
+        self.assertEqual((pe["e_out"]["from"], pe["e_out"]["fromField"]), (nid, None))
+        step = parent["tours"][0]["steps"][0]
+        self.assertEqual((step["nodeIds"], step["edgeIds"]), ([nid, "out"], ["e_in"]))
+        nested = next(n for n in parent["nodes"] if n["id"] == nid)
+        self.assertEqual((nested["type"], nested["data"]["canvasId"], nested["x"], nested["y"]), ("nodemap", "inner", 300, 300))
+        child = self.client.get("/webapi/nodemap/canvases/inner").json()
+        cn = {n["id"]: n for n in child["canvas"]["nodes"]}
+        self.assertEqual(cn["in1"]["groupId"], "g")
+        self.assertEqual((cn["g"]["x"], cn["g"]["y"]), (80, 80))
+        ce = {e["id"]: e for e in child["canvas"]["edges"]}
+        self.assertEqual(ce["e_int"]["waypoints"], [{"x": 180, "y": 180}])
+        self.assertEqual(child["nested_maps"]["c"]["status"], "ok")
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/p/hierarchy").json()["tree"]["children"][0]["children"][0]["canvas_id"], "c")
+        # Invalid selections
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/p/group", json={"node_ids": []}).status_code, 422)
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/p/group", json={"node_ids": ["nope"]}).status_code, 422)
+        self.assertEqual(self.client.post("/webapi/nodemap/canvases/p/group", json={"node_ids": ["out"], "expected_revision": 1}).status_code, 409)
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases").json()["total"], 3)
+
+    def test_group_rolls_back_child_when_parent_write_fails(self) -> None:
+        self._create("p", [{"id": "n1", "type": "note"}, {"id": "n2", "type": "note", "x": 300}])
+        real = self.svc._write_envelope_atomic
+
+        def flaky(path, env):
+            if env["id"] == "p":
+                raise OSError("disk full")
+            return real(path, env)
+
+        with patch.object(self.svc, "_write_envelope_atomic", side_effect=flaky), self.assertRaises(OSError):
+            self.svc.group_into_nested("p", {"node_ids": ["n1"], "new_canvas_id": "kid"})
+        self.assertEqual(self.client.get("/webapi/nodemap/canvases/kid").status_code, 404)
+        self.assertEqual(len(self.client.get("/webapi/nodemap/canvases/p").json()["canvas"]["nodes"]), 2)
+
+    def test_writes_can_be_disabled(self) -> None:
+        with patch("webapp.backend.routers.nodemap.get_config", return_value={"webapp": {"nodemap_canvas_writes": False}}):
+            r = self.client.post("/webapi/nodemap/canvases", json={"id": "x"})
+            self.assertEqual(r.status_code, 403)
+            self.assertEqual(self.client.get("/webapi/nodemap/canvases").status_code, 200)
+
+    def test_pure_helpers(self) -> None:
+        from webapp.backend.services.nodemap_nesting import (
+            ancestors_of,
+            build_static_preview,
+            find_cycle,
+        )
+
+        g = {"b": ["c"], "c": ["a"], "d": ["b"]}
+        self.assertEqual(find_cycle(g, "a", ["b"]), ["a", "b", "c", "a"])
+        self.assertEqual(find_cycle(g, "a", ["d"]), ["a", "d", "b", "c", "a"])
+        self.assertIsNone(find_cycle(g, "x", ["b", "missing"]))
+        self.assertEqual(ancestors_of(g, "a"), {"b", "c", "d"})
+        deep = {f"m{i}": [f"m{i + 1}"] for i in range(5000)}
+        self.assertIsNone(find_cycle(deep, "root", ["m0"]))
+        self.assertEqual(build_static_preview({"nodes": [], "edges": []})["nodes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

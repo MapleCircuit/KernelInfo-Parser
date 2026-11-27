@@ -1,7 +1,7 @@
 """webapp/backend/services/nodemap_canvas_schema.py - Canonical NodeMap canvas schema and normalization.
 
 Mirrors `webapp/frontend/js/views/nodemap/canvas_model.js` (`schema: "kip-nodemap-canvas"`, `version: 1`)
-across all 16 `NODE_TYPES`, `SIZE_LIMITS`, `LOCK_KINDS`, `EDGE_PRESETS`, `default_title()`, `viewport`,
+across all 17 `NODE_TYPES`, `SIZE_LIMITS`, `LOCK_KINDS`, `EDGE_PRESETS`, `default_title()`, `viewport`,
 `settings`, `layers`, `tours`, sub-canvases (`depth < 8`), dangling/self-loop edge pruning, and
 `groupId` cycle pruning.
 """
@@ -38,6 +38,7 @@ NODE_TYPES: list[str] = [
     "doc",
     "history",
     "commit",
+    "nodemap",
 ]
 
 NODE_BADGES: dict[str, str] = {
@@ -57,6 +58,7 @@ NODE_BADGES: dict[str, str] = {
     "doc": "doc",
     "history": "hist",
     "commit": "commit",
+    "nodemap": "map",
 }
 
 SIDES: list[str] = ["auto", "top", "right", "bottom", "left"]
@@ -153,6 +155,7 @@ SIZE_LIMITS: dict[str, dict[str, int]] = {
     "doc": {"w": 480, "h": 380, "minW": 260, "minH": 140, "maxW": 2000, "maxH": 2400},
     "history": {"w": 440, "h": 340, "minW": 240, "minH": 140, "maxW": 1800, "maxH": 2400},
     "commit": {"w": 460, "h": 420, "minW": 260, "minH": 140, "maxW": 1800, "maxH": 2400},
+    "nodemap": {"w": 360, "h": 260, "minW": 200, "minH": 140, "maxW": 2400, "maxH": 2400},
 }
 
 GRID_DEFAULT = 20
@@ -407,7 +410,11 @@ def normalize_embed_view_state(raw: Any) -> dict[str, Any] | None:
 
 
 def normalize_data(node_type: str, raw: Any, depth: int = 0) -> dict[str, Any]:
-    """Normalize type-specific `node.data` across all 16 NodeMap node types."""
+    """Normalize type-specific `node.data` across all 17 NodeMap node types.
+
+    A `nodemap` node references another saved canvas of the same repository by `data.canvasId`
+    (`/^[\\w-]{1,64}$/`, `""` when unset); the referenced document is never embedded.
+    """
     d = raw if _is_obj(raw) else {}
     if node_type == "struct":
         return {
@@ -559,6 +566,9 @@ def normalize_data(node_type: str, raw: Any, depth: int = 0) -> dict[str, Any]:
         if depth < MAX_SUBCANVAS_DEPTH and _is_obj(d.get("subCanvas")):
             return {"subCanvas": normalize_canvas(d["subCanvas"], depth + 1)}
         return {}
+    if node_type == "nodemap":
+        cid = d.get("canvasId")
+        return {"canvasId": cid if isinstance(cid, str) and is_valid_id(cid) else ""}
     return {}
 
 
@@ -647,6 +657,8 @@ def default_title(node_type: str, data: dict[str, Any]) -> str:
         if not ch:
             return "Commit"
         return f"{ch[:12]} {d['subject']}" if d.get("subject") else f"Commit {ch[:12]}"
+    if node_type == "nodemap":
+        return "Nested NodeMap"
     return "Node"
 
 
@@ -983,10 +995,16 @@ def normalize_canvas(raw: Any, depth: int = 0, *, strict: bool = True) -> dict[s
     raw_edges = raw.get("edges") if isinstance(raw.get("edges"), list) else []
     edges: list[dict[str, Any]] = []
     edge_ids: set[str] = set()
+    nested_ids = {n["id"] for n in nodes if n["type"] == "nodemap"}
     for e in raw_edges[:MAX_EDGES]:
         edge = normalize_edge(e, seen)
         if not edge or edge["id"] in edge_ids:
             continue
+        # A nested NodeMap node is attached as a whole: no port into its interior
+        if edge["from"] in nested_ids:
+            edge["fromField"] = None
+        if edge["to"] in nested_ids:
+            edge["toField"] = None
         edge_ids.add(edge["id"])
         edges.append(edge)
 

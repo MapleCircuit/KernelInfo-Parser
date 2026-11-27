@@ -1263,9 +1263,10 @@ class ApiClient {
   }
 
   /** `GET /webapi/nodemap/canvases`: list server-side saved NodeMap canvases for the active project (§4.14). */
-  async getNodemapCanvases({ q = "", limit = 100, offset = 0 } = {}) {
+  async getNodemapCanvases({ q = "", limit = 100, offset = 0, insertableInto = "" } = {}) {
     const params = new URLSearchParams();
     if (q) params.set("q", String(q));
+    if (insertableInto) params.set("insertable_into", String(insertableInto));
     if (limit) params.set("limit", String(limit));
     if (offset) params.set("offset", String(offset));
     const qs = params.toString();
@@ -1275,6 +1276,45 @@ class ApiClient {
   /** `GET /webapi/nodemap/canvases/{canvas_id}`: fetch a saved server-side NodeMap canvas document (§4.14). */
   async getNodemapCanvas(canvasId) {
     return this.request(`/webapi/nodemap/canvases/${encodeURIComponent(String(canvasId || "").trim())}`, { networkFirst: true });
+  }
+
+  _nodemapCanvasPath(canvasId, suffix = "") {
+    return `/webapi/nodemap/canvases/${encodeURIComponent(String(canvasId || "").trim())}${suffix}`;
+  }
+
+  /** `POST /webapi/nodemap/canvases`: save a new server canvas `{id?, name, description?, version?, canvas}` (409 when the id exists). */
+  async createNodemapCanvas(body) {
+    return this.request("/webapi/nodemap/canvases", { method: "POST", body: JSON.stringify(body || {}) });
+  }
+
+  /** `PUT /webapi/nodemap/canvases/{id}`: replace the document `{canvas, expected_revision, name?, ...}` (409 conflict, 422 cycle, 403 disabled). */
+  async updateNodemapCanvas(canvasId, body) {
+    return this.request(this._nodemapCanvasPath(canvasId), { method: "PUT", body: JSON.stringify(body || {}) });
+  }
+
+  /** `DELETE /webapi/nodemap/canvases/{id}` -> `{deleted, referenced_by}`. */
+  async deleteNodemapCanvas(canvasId) {
+    return this.request(this._nodemapCanvasPath(canvasId), { method: "DELETE" });
+  }
+
+  /** `POST /webapi/nodemap/canvases/{id}/ops` `{ops, expected_revision}`. */
+  async applyNodemapOps(canvasId, ops, expectedRevision) {
+    return this.request(this._nodemapCanvasPath(canvasId, "/ops"), { method: "POST", body: JSON.stringify({ ops, expected_revision: expectedRevision }) });
+  }
+
+  /** `GET /webapi/nodemap/canvases/{id}/hierarchy?depth=`: nested-map tree, parents, ancestors. */
+  async getNodemapHierarchy(canvasId, depth = 8) {
+    return this.request(this._nodemapCanvasPath(canvasId, `/hierarchy?depth=${encodeURIComponent(String(depth))}`), { networkFirst: true });
+  }
+
+  /** `POST /webapi/nodemap/canvases/{id}/nested`: reference an existing canvas (`target_id`) or create a new empty one. */
+  async insertNodemapNested(canvasId, body) {
+    return this.request(this._nodemapCanvasPath(canvasId, "/nested"), { method: "POST", body: JSON.stringify(body || {}) });
+  }
+
+  /** `POST /webapi/nodemap/canvases/{id}/group`: move `node_ids` into a new child canvas behind a nested node. */
+  async groupNodemapNodes(canvasId, body) {
+    return this.request(this._nodemapCanvasPath(canvasId, "/group"), { method: "POST", body: JSON.stringify(body || {}) });
   }
 
   async getCallgraph(version, functionName) {

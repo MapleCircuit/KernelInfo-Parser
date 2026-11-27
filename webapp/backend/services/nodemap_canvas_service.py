@@ -5,10 +5,13 @@ with zero SQLite dependency and no coupling between `webapp` and `api` `cache_en
 Supports optimistic concurrency (`revision` / `expected_revision` -> HTTP 409), live node hydration,
 struct `fromField`/`toField` resolution, batch declarative operations, server-side graph expansions
 (`struct_types`, `callgraph`, `callpath`, `kconfig`, `commit`, `impact_map`), deterministic layout,
-and stateless read-only preview/export.
+stateless read-only preview/export, and nested NodeMap references (`nodemap` nodes naming another saved
+canvas by `data.canvasId`): acyclic reference validation on every write, bounded static previews of the
+referenced canvases on reads (`nested_maps`), hierarchy reads, attach and group-into-nested operations.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -16,6 +19,8 @@ import re
 import tempfile
 import threading
 import time
+from collections import OrderedDict
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +51,7 @@ from webapp.backend.services.nodemap_canvas_schema import (
     create_edge,
     create_node,
     default_title,
+    display_title,
     empty_canvas,
     fit_group_to_members,
     fit_viewport,
@@ -64,9 +70,25 @@ from webapp.backend.services.nodemap_canvas_schema import (
     serialize_canvas,
     struct_item_key,
 )
+from webapp.backend.services.nodemap_nesting import (
+    HIERARCHY_DEPTH_DEFAULT,
+    HIERARCHY_DEPTH_MAX,
+    HIERARCHY_MAX_ENTRIES,
+    NESTED_NODE_TYPE,
+    ancestors_of,
+    build_static_preview,
+    canvas_counts,
+    find_cycle,
+    nested_node_frame,
+    nested_nodes,
+    nested_refs,
+    remap_tours,
+    split_for_group,
+)
 from webapp.backend.services.nodemap_service import nodemap_service
 from webapp.backend.services.symbol_service import SymbolService
 
+_INFO_CACHE_MAX = 2048
 _SAFE_SEGMENT_RE = re.compile(r"\A[\w-]{1,64}\Z", re.ASCII)
 
 _QUALIFIERS = frozenset(
@@ -195,6 +217,27 @@ class NodeMapCanvasService:
     def __init__(self) -> None:
         self._guard = threading.RLock()
         self._canvas_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._graph_locks: dict[str, threading.RLock] = {}
+        # (repo, canvas_id) -> (mtime_ns, size, info): reference index entries of the stored canvases
+        self._info_cache: OrderedDict[tuple[str, str], tuple[int, int, dict[str, Any]]] = OrderedDict()
+
+    def _graph_lock(self, repo: str) -> threading.RLock:
+        """Per-repository lock serializing reference validation with the write it guards.
+
+        Lock order: canvas locks (ascending id) before the graph lock."""
+        with self._guard:
+            lock = self._graph_locks.get(repo)
+            if lock is None:
+                lock = threading.RLock()
+                self._graph_locks[repo] = lock
+            return lock
+
+    @contextlib.contextmanager
+    def _canvas_locks_sorted(self, repo: str, ids: list[str]) -> Iterator[None]:
+        with contextlib.ExitStack() as stack:
+            for cid in sorted(set(ids)):
+                stack.enter_context(self._lock_for(repo, cid))
+            yield
 
     def _lock_for(self, repo: str, canvas_id: str) -> threading.RLock:
         key = (repo, canvas_id)
@@ -289,6 +332,8 @@ class NodeMapCanvasService:
             "node_count": len(nodes),
             "edge_count": len(edges),
             "tour_count": len(tours),
+            "nested_count": len(nested_nodes(canonical)),
+            "nested_refs": nested_refs(canonical),
             "webapp_url": webapp_canvas_url(version, canvas_id),
             "canvas": canonical,
         }
@@ -307,8 +352,146 @@ class NodeMapCanvasService:
             "node_count": int(env.get("node_count", len((env.get("canvas") or {}).get("nodes") or []))),
             "edge_count": int(env.get("edge_count", len((env.get("canvas") or {}).get("edges") or []))),
             "tour_count": int(env.get("tour_count", len((env.get("canvas") or {}).get("tours") or []))),
+            "nested_count": len(nested_nodes(env.get("canvas"))),
+            "nested_refs": nested_refs(env.get("canvas")),
             "webapp_url": env.get("webapp_url") or webapp_canvas_url(env.get("version", "v3.0"), env["id"]),
         }
+
+    # ------------------------------------------------------------------ Nested NodeMap references
+
+    def _canvas_info(self, repo: str, canvas_id: str) -> dict[str, Any] | None:
+        """Reference-index entry of a stored canvas (None when absent or unreadable), cached per file stat.
+
+        `{"id", "name", "description", "version", "revision", "updated_at", "refs", "nested": [{"node_id",
+        "canvas_id", "title"}], "counts", "preview"}` -- never the document itself."""
+        path = self._canvas_path(repo, canvas_id)
+        try:
+            st = path.stat()
+        except OSError:
+            with self._guard:
+                self._info_cache.pop((repo, canvas_id), None)
+            return None
+        key = (repo, canvas_id)
+        with self._guard:
+            hit = self._info_cache.get(key)
+            if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+                self._info_cache.move_to_end(key)
+                return hit[2]
+        env = self._read_envelope(path)
+        if env is None:
+            return None
+        canvas = env["canvas"]
+        info = {
+            "id": canvas_id,
+            "name": str(env.get("name") or "Untitled Canvas"),
+            "description": str(env.get("description") or ""),
+            "version": str(env.get("version") or "v3.0"),
+            "revision": int(env.get("revision", 1)),
+            "updated_at": int(env.get("updated_at", 0)),
+            "refs": nested_refs(canvas),
+            "nested": [
+                {"node_id": n["id"], "canvas_id": (n.get("data") or {}).get("canvasId") or "", "title": display_title(n)}
+                for n in nested_nodes(canvas)
+            ],
+            "counts": canvas_counts(canvas),
+            "preview": build_static_preview(canvas),
+        }
+        with self._guard:
+            self._info_cache[key] = (st.st_mtime_ns, st.st_size, info)
+            self._info_cache.move_to_end(key)
+            while len(self._info_cache) > _INFO_CACHE_MAX:
+                self._info_cache.popitem(last=False)
+        return info
+
+    def _drop_info(self, repo: str, canvas_id: str) -> None:
+        with self._guard:
+            self._info_cache.pop((repo, canvas_id), None)
+
+    def _stored_ids(self, repo: str) -> list[str]:
+        repo_dir = self._repo_dir(repo)
+        if not repo_dir.is_dir():
+            return []
+        return sorted(
+            fp.stem for fp in repo_dir.glob("*.json")
+            if not fp.name.startswith(".") and _SAFE_SEGMENT_RE.match(fp.stem)
+        )
+
+    def _ref_graph(self, repo: str) -> dict[str, list[str]]:
+        """Stored reference graph of a repository: canvas id -> referenced canvas ids."""
+        graph: dict[str, list[str]] = {}
+        for cid in self._stored_ids(repo):
+            info = self._canvas_info(repo, cid)
+            if info is not None:
+                graph[cid] = info["refs"]
+        return graph
+
+    def _nested_summary(self, repo: str, canvas_id: str) -> dict[str, Any]:
+        """Lightweight card of a referenced canvas: summary, counts and static preview, or `status: "missing"`."""
+        info = self._canvas_info(repo, canvas_id) if _SAFE_SEGMENT_RE.match(canvas_id or "") else None
+        if info is None:
+            return {"canvas_id": canvas_id, "status": "missing"}
+        return {
+            "canvas_id": canvas_id,
+            "status": "ok",
+            "name": info["name"],
+            "description": info["description"],
+            "version": info["version"],
+            "revision": info["revision"],
+            "updated_at": info["updated_at"],
+            "counts": dict(info["counts"]),
+            "preview": info["preview"],
+            "webapp_url": webapp_canvas_url(info["version"], canvas_id),
+        }
+
+    def nested_maps_of(self, canvas: dict[str, Any], *, repo: str | None = None) -> dict[str, dict[str, Any]]:
+        """`{canvas_id: nested summary}` for every canvas referenced by `canvas` (each target once)."""
+        active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
+        return {cid: self._nested_summary(active_repo, cid) for cid in nested_refs(canvas)}
+
+    def _validate_nesting(
+        self,
+        repo: str,
+        canvas_id: str,
+        canvas: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> None:
+        """Reject (422) a document whose new references name a missing canvas or close a reference cycle.
+
+        References kept from `previous` may point at deleted canvases (they read back as missing)."""
+        refs = nested_refs(canvas)
+        if not refs:
+            return
+        graph = self._ref_graph(repo)
+        added = set(refs) - set(nested_refs(previous))
+        missing = sorted(r for r in added if r != canvas_id and r not in graph)
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Nested NodeMap target canvas not found: {', '.join(repr(m) for m in missing)}.",
+            )
+        cycle = find_cycle(graph, canvas_id, refs)
+        if cycle:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Nested NodeMap reference cycle: {' -> '.join(cycle)}.",
+            )
+
+    def _commit(
+        self,
+        repo: str,
+        canvas_id: str,
+        path: Path,
+        env: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> None:
+        """Validate the references of `env` and write it, atomically with respect to other writes of `repo`."""
+        with self._graph_lock(repo):
+            self._validate_nesting(repo, canvas_id, env["canvas"], previous)
+            self._write_envelope_atomic(path, env)
+            self._drop_info(repo, canvas_id)
+
+    def _with_nested(self, repo: str, record: dict[str, Any]) -> dict[str, Any]:
+        return {**record, "nested_maps": self.nested_maps_of(record.get("canvas") or {}, repo=repo)}
 
     # ------------------------------------------------------------------ Hydration & Field Resolution
 
@@ -551,6 +734,12 @@ class NodeMapCanvasService:
                         candidate["toSide"] = candidate.pop("to_side")
                     src_node = nodes_by_id.get(str(candidate.get("from") or ""))
                     dst_node = nodes_by_id.get(str(candidate.get("to") or ""))
+                    for end, ref in (("fromField", src_node), ("toField", dst_node)):
+                        if candidate.get(end) and ref is not None and ref.get("type") == NESTED_NODE_TYPE:
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"Edges attach to nested NodeMap node '{ref['id']}' as a whole: '{end}' is not allowed.",
+                            )
                     if candidate.get("fromField"):
                         candidate["fromField"] = self._resolve_struct_field_key(
                             src_node, str(candidate["fromField"]), default_version, scache
@@ -1650,9 +1839,16 @@ class NodeMapCanvasService:
         q: str | None = "",
         limit: int = 50,
         offset: int = 0,
+        insertable_into: str | None = None,
     ) -> dict[str, Any]:
+        """Saved canvas summaries, newest first. With `insertable_into` (a canvas id) each item also carries
+        `insertable`: false for that canvas and its ancestors, whose reference would close a cycle."""
         active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
         repo_dir = self._repo_dir(active_repo)
+        blocked: set[str] | None = None
+        if insertable_into:
+            host = validate_safe_segment(insertable_into, "insertable_into")
+            blocked = {host, *ancestors_of(self._ref_graph(active_repo), host)}
         items: list[dict[str, Any]] = []
         needle = str(q or "").strip().lower()
         if repo_dir.is_dir():
@@ -1667,6 +1863,8 @@ class NodeMapCanvasService:
                     hay = f"{summary['id']} {summary['name']} {summary['description']}".lower()
                     if needle not in hay:
                         continue
+                if blocked is not None:
+                    summary["insertable"] = summary["id"] not in blocked
                 items.append(summary)
         items.sort(key=lambda r: (-int(r.get("updated_at") or 0), str(r.get("name") or "")))
         total = len(items)
@@ -1690,10 +1888,11 @@ class NodeMapCanvasService:
             env = self._read_envelope(path)
             if env is None:
                 raise HTTPException(status_code=404, detail=f"NodeMap canvas '{safe_id}' not found.")
-            return {
+            record = {
                 **self._summary_of(env),
                 "canvas": serialize_canvas(env["canvas"]),
             }
+        return self._with_nested(active_repo, record)
 
     def export_saved_canvas(
         self,
@@ -1764,8 +1963,8 @@ class NodeMapCanvasService:
                 created_by=created_by,
                 canvas=built_canvas,
             )
-            self._write_envelope_atomic(path, env)
-            return env
+            self._commit(active_repo, cid, path, env, None)
+            return self._with_nested(active_repo, env)
 
     def replace_canvas(
         self,
@@ -1826,8 +2025,8 @@ class NodeMapCanvasService:
                 created_by=created_by,
                 canvas=canvas,
             )
-            self._write_envelope_atomic(path, env)
-            return env
+            self._commit(active_repo, safe_id, path, env, (existing or {}).get("canvas"))
+            return self._with_nested(active_repo, env)
 
     def delete_canvas(self, canvas_id: str, *, repo: str | None = None) -> dict[str, Any]:
         active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
@@ -1837,8 +2036,11 @@ class NodeMapCanvasService:
             path = self._canvas_path(active_repo, safe_id)
             if not path.is_file():
                 raise HTTPException(status_code=404, detail=f"NodeMap canvas '{safe_id}' not found.")
-            path.unlink()
-            return {"repo": active_repo, "id": safe_id, "deleted": True}
+            with self._graph_lock(active_repo):
+                path.unlink()
+                self._drop_info(active_repo, safe_id)
+                referenced_by = sorted(c for c, refs in self._ref_graph(active_repo).items() if safe_id in refs)
+            return {"repo": active_repo, "id": safe_id, "deleted": True, "referenced_by": referenced_by}
 
     def mutate_canvas(
         self,
@@ -1920,8 +2122,8 @@ class NodeMapCanvasService:
                 created_by=str(existing.get("created_by") or "api"),
                 canvas=canvas,
             )
-            self._write_envelope_atomic(path, env)
-            return env
+            self._commit(active_repo, safe_id, path, env, existing["canvas"])
+            return self._with_nested(active_repo, env)
 
     def expand_canvas(
         self,
@@ -1969,9 +2171,9 @@ class NodeMapCanvasService:
                 created_by=str(existing.get("created_by") or "api"),
                 canvas=canvas,
             )
-            self._write_envelope_atomic(path, env)
+            self._commit(active_repo, safe_id, path, env, existing["canvas"])
             return {
-                **env,
+                **self._with_nested(active_repo, env),
                 "added_node_ids": [n["id"] for n in env["canvas"]["nodes"] if n["id"] not in before_nids],
                 "added_edge_ids": [e["id"] for e in env["canvas"]["edges"] if e["id"] not in before_eids],
             }
@@ -2022,8 +2224,316 @@ class NodeMapCanvasService:
                 created_by=str(existing.get("created_by") or "api"),
                 canvas=canvas,
             )
-            self._write_envelope_atomic(path, env)
-            return env
+            self._commit(active_repo, safe_id, path, env, existing["canvas"])
+            return self._with_nested(active_repo, env)
+
+    def canvas_hierarchy(
+        self,
+        canvas_id: str,
+        *,
+        depth: int = HIERARCHY_DEPTH_DEFAULT,
+        repo: str | None = None,
+    ) -> dict[str, Any]:
+        """Reference tree below a canvas, its direct parents and every ancestor, without node/edge payloads.
+
+        The tree descends `depth` levels (`1..HIERARCHY_DEPTH_MAX`) and holds at most
+        `HIERARCHY_MAX_ENTRIES` entries; a reused target appears under each parent referencing it.
+        `invalid_targets` lists the canvases that cannot be inserted into this one (itself and its ancestors).
+        """
+        active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
+        safe_id = validate_safe_segment(canvas_id, "canvas_id")
+        if not 1 <= int(depth) <= HIERARCHY_DEPTH_MAX:
+            raise HTTPException(status_code=400, detail=f"depth must be between 1 and {HIERARCHY_DEPTH_MAX}.")
+        root_info = self._canvas_info(active_repo, safe_id)
+        if root_info is None:
+            raise HTTPException(status_code=404, detail=f"NodeMap canvas '{safe_id}' not found.")
+        graph = self._ref_graph(active_repo)
+        budget = {"left": HIERARCHY_MAX_ENTRIES, "truncated": False}
+
+        def entry(cid: str, levels: int, path: tuple[str, ...]) -> dict[str, Any]:
+            budget["left"] -= 1
+            info = self._canvas_info(active_repo, cid) if _SAFE_SEGMENT_RE.match(cid or "") else None
+            if info is None:
+                return {"canvas_id": cid, "status": "missing", "children": []}
+            out: dict[str, Any] = {
+                "canvas_id": cid,
+                "status": "cycle" if cid in path else "ok",
+                "name": info["name"],
+                "version": info["version"],
+                "revision": info["revision"],
+                "counts": dict(info["counts"]),
+                "children": [],
+            }
+            if cid in path:
+                return out
+            kids = [k for k in info["nested"] if k["canvas_id"]]
+            if levels <= 0:
+                out["children_truncated"] = bool(kids)
+                return out
+            for k in kids:
+                if budget["left"] <= 0:
+                    budget["truncated"] = True
+                    out["children_truncated"] = True
+                    break
+                child = entry(k["canvas_id"], levels - 1, (*path, cid))
+                out["children"].append({"node_id": k["node_id"], "title": k["title"], **child})
+            return out
+
+        tree = entry(safe_id, int(depth), ())
+        parents = []
+        for cid in sorted(c for c, refs in graph.items() if safe_id in refs and c != safe_id):
+            pinfo = self._canvas_info(active_repo, cid)
+            if pinfo is not None:
+                parents.append({
+                    "canvas_id": cid,
+                    "name": pinfo["name"],
+                    "node_ids": [k["node_id"] for k in pinfo["nested"] if k["canvas_id"] == safe_id],
+                })
+        ancestors = sorted(ancestors_of(graph, safe_id))
+        return {
+            "repo": active_repo,
+            "id": safe_id,
+            "name": root_info["name"],
+            "depth": int(depth),
+            "tree": tree,
+            "parents": parents,
+            "ancestors": ancestors,
+            "invalid_targets": sorted({safe_id, *ancestors}),
+            "entries": HIERARCHY_MAX_ENTRIES - budget["left"],
+            "truncated": budget["truncated"],
+        }
+
+    def _locked_parent(self, repo: str, canvas_id: str, payload: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+        """(path, envelope) of an existing canvas whose revision matches `payload["expected_revision"]` (404 / 409)."""
+        path = self._canvas_path(repo, canvas_id)
+        existing = self._read_envelope(path)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"NodeMap canvas '{canvas_id}' not found.")
+        cur_rev = int(existing.get("revision", 1))
+        expected_rev = payload.get("expected_revision")
+        if expected_rev is not None and int(expected_rev) != cur_rev:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Revision conflict on canvas '{canvas_id}': expected {expected_rev}, current is {cur_rev}.",
+            )
+        return path, existing
+
+    def _new_child_envelope(
+        self,
+        repo: str,
+        child_id: str,
+        spec: dict[str, Any],
+        parent: dict[str, Any],
+        canvas: dict[str, Any],
+        created_by: str,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        ver = safe_rev(str(spec.get("version") or parent.get("version") or "v3.0").strip() or "v3.0", "version")
+        return self._build_envelope(
+            canvas_id=child_id,
+            repo=repo,
+            name=str(spec.get("name") or "Nested NodeMap").strip()[:256] or "Nested NodeMap",
+            description=str(spec.get("description") or "").strip()[:2000],
+            version=ver,
+            revision=1,
+            created_at=now_ms,
+            updated_at=now_ms,
+            created_by=created_by,
+            canvas=canvas,
+        )
+
+    def _write_parent_and_child(
+        self,
+        repo: str,
+        parent_id: str,
+        parent_path: Path,
+        parent_env: dict[str, Any],
+        previous: dict[str, Any],
+        child: tuple[str, Path, dict[str, Any]] | None,
+    ) -> None:
+        """Write a new child canvas then its parent under the graph lock; the child is removed if the parent fails."""
+        with self._graph_lock(repo):
+            if child is not None:
+                cid, cpath, cenv = child
+                self._commit(repo, cid, cpath, cenv, None)
+            try:
+                self._commit(repo, parent_id, parent_path, parent_env, previous)
+            except BaseException:
+                if child is not None:
+                    with contextlib.suppress(OSError):
+                        child[1].unlink()
+                    self._drop_info(repo, child[0])
+                raise
+
+    def _child_id(self, repo: str, payload: dict[str, Any]) -> tuple[str, Path]:
+        raw = payload.get("new_canvas_id")
+        cid = validate_safe_segment(str(raw), "new_canvas_id") if raw else new_id("nm")
+        path = self._canvas_path(repo, cid)
+        if path.exists():
+            raise HTTPException(status_code=409, detail=f"NodeMap canvas '{cid}' already exists.")
+        return cid, path
+
+    def attach_nested(
+        self,
+        canvas_id: str,
+        payload: dict[str, Any],
+        *,
+        repo: str | None = None,
+        created_by: str = "api",
+    ) -> dict[str, Any]:
+        """Add a `nodemap` node to a canvas referencing `target_id`, or a new empty canvas when it is omitted.
+
+        `payload`: `target_id`, `new_canvas_id`, `name`, `description`, `version` (new child), `node`
+        (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`),
+        `expected_revision` (parent). Missing targets and cycles are 422; the write is atomic.
+        """
+        active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
+        safe_id = validate_safe_segment(canvas_id, "canvas_id")
+        target_raw = payload.get("target_id")
+        target = validate_safe_segment(str(target_raw), "target_id") if target_raw else None
+        child_id, child_path = (target, self._canvas_path(active_repo, target)) if target else self._child_id(active_repo, payload)
+        with self._canvas_locks_sorted(active_repo, [safe_id, child_id]), self._graph_lock(active_repo):
+            path, existing = self._locked_parent(active_repo, safe_id, payload)
+            child: tuple[str, Path, dict[str, Any]] | None = None
+            if target is None:
+                if child_path.exists():
+                    raise HTTPException(status_code=409, detail=f"NodeMap canvas '{child_id}' already exists.")
+                child_env = self._new_child_envelope(active_repo, child_id, payload, existing, empty_canvas(), created_by)
+                child = (child_id, child_path, child_env)
+                title = child_env["name"]
+            else:
+                tinfo = self._canvas_info(active_repo, target)
+                title = tinfo["name"] if tinfo else ""
+            spec = payload.get("node") if isinstance(payload.get("node"), dict) else {}
+            node_raw = {k: spec[k] for k in ("id", "x", "y", "w", "h", "customTitle", "color", "bgColor", "groupId", "layerId") if k in spec}
+            node = normalize_node({
+                **node_raw,
+                "type": NESTED_NODE_TYPE,
+                "id": node_raw.get("id") if is_valid_id(node_raw.get("id")) else new_id("n"),
+                "title": title,
+                "version": existing.get("version") or "v3.0",
+                "repo": active_repo,
+                "data": {"canvasId": child_id},
+            })
+            assert node is not None
+            canvas = copy.deepcopy(existing["canvas"])
+            if any(n["id"] == node["id"] for n in canvas["nodes"]):
+                raise HTTPException(status_code=409, detail=f"Node '{node['id']}' already exists on canvas '{safe_id}'.")
+            canvas["nodes"].append(node)
+            canvas = normalize_canvas(canvas, strict=False) or canvas
+            now_ms = int(time.time() * 1000)
+            env = self._build_envelope(
+                canvas_id=safe_id,
+                repo=active_repo,
+                name=str(existing.get("name") or "Untitled Canvas"),
+                description=str(existing.get("description") or ""),
+                version=str(existing.get("version") or "v3.0"),
+                revision=int(existing.get("revision", 1)) + 1,
+                created_at=int(existing.get("created_at") or now_ms),
+                updated_at=now_ms,
+                created_by=str(existing.get("created_by") or "api"),
+                canvas=canvas,
+            )
+            self._write_parent_and_child(active_repo, safe_id, path, env, existing["canvas"], child)
+            return {
+                "repo": active_repo,
+                "id": safe_id,
+                "node_id": node["id"],
+                "target_id": child_id,
+                "created": child is not None,
+                "parent": self._with_nested(active_repo, env),
+            }
+
+    def group_into_nested(
+        self,
+        canvas_id: str,
+        payload: dict[str, Any],
+        *,
+        repo: str | None = None,
+        created_by: str = "api",
+    ) -> dict[str, Any]:
+        """Move `payload["node_ids"]` (plus descendants of selected groups) into a new child canvas.
+
+        The child receives the moved nodes and the edges between them; the parent gets a `nodemap` node
+        at the selection's place, and each edge crossing the selection boundary is rewired to that node.
+        Tour steps targeting moved nodes target the nested node. `new_canvas_id`, `name`, `description`,
+        `version`, `node` (`id`, `customTitle`, `color`, `bgColor`, `layerId`) and `expected_revision` are
+        optional. Both canvases are written atomically (422 for an empty or unknown selection).
+        """
+        active_repo = validate_safe_segment(repo or get_active_repo_name(), "repo")
+        safe_id = validate_safe_segment(canvas_id, "canvas_id")
+        raw_ids = payload.get("node_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise HTTPException(status_code=422, detail="node_ids must be a non-empty list of node ids.")
+        child_id, child_path = self._child_id(active_repo, payload)
+        with self._canvas_locks_sorted(active_repo, [safe_id, child_id]), self._graph_lock(active_repo):
+            path, existing = self._locked_parent(active_repo, safe_id, payload)
+            if child_path.exists():
+                raise HTTPException(status_code=409, detail=f"NodeMap canvas '{child_id}' already exists.")
+            canvas = existing["canvas"]
+            known = {n["id"] for n in canvas["nodes"]}
+            unknown = sorted({str(x) for x in raw_ids} - known)
+            if unknown:
+                raise HTTPException(status_code=422, detail=f"Unknown node ids on canvas '{safe_id}': {', '.join(unknown[:20])}.")
+            spec = payload.get("node") if isinstance(payload.get("node"), dict) else {}
+            nid = spec.get("id") if is_valid_id(spec.get("id")) and spec.get("id") not in known else new_id("n")
+            split = split_for_group(canvas, [str(x) for x in raw_ids], nid)
+
+            child_canvas = normalize_canvas({
+                **empty_canvas(),
+                "nodes": split["child_nodes"],
+                "edges": split["child_edges"],
+                "settings": copy.deepcopy(canvas.get("settings") or {}),
+                "viewport": fit_viewport(bounds_of(split["child_nodes"])),
+            }) or empty_canvas()
+            child_env = self._new_child_envelope(active_repo, child_id, payload, existing, child_canvas, created_by)
+
+            frame = nested_node_frame(split["bounds"])
+            node = normalize_node({
+                **{k: spec[k] for k in ("customTitle", "color", "bgColor", "layerId") if k in spec},
+                **frame,
+                "id": nid,
+                "type": NESTED_NODE_TYPE,
+                "title": child_env["name"],
+                "groupId": split["group_id"],
+                "version": existing.get("version") or "v3.0",
+                "repo": active_repo,
+                "data": {"canvasId": child_id},
+            })
+            assert node is not None
+            moved = set(split["moved_ids"])
+            parent_edges = split["parent_edges"]
+            parent_canvas = normalize_canvas({
+                **canvas,
+                "nodes": [*split["parent_nodes"], node],
+                "edges": parent_edges,
+                "tours": remap_tours(canvas.get("tours") or [], moved, nid, {e["id"] for e in parent_edges}),
+            }) or empty_canvas()
+            now_ms = int(time.time() * 1000)
+            env = self._build_envelope(
+                canvas_id=safe_id,
+                repo=active_repo,
+                name=str(existing.get("name") or "Untitled Canvas"),
+                description=str(existing.get("description") or ""),
+                version=str(existing.get("version") or "v3.0"),
+                revision=int(existing.get("revision", 1)) + 1,
+                created_at=int(existing.get("created_at") or now_ms),
+                updated_at=now_ms,
+                created_by=str(existing.get("created_by") or "api"),
+                canvas=parent_canvas,
+            )
+            self._write_parent_and_child(active_repo, safe_id, path, env, canvas, (child_id, child_path, child_env))
+            return {
+                "repo": active_repo,
+                "id": safe_id,
+                "node_id": nid,
+                "target_id": child_id,
+                "moved_node_ids": split["moved_ids"],
+                "moved_edge_ids": [e["id"] for e in split["child_edges"]],
+                "rewired_edge_ids": split["rewired_edge_ids"],
+                "child": self._summary_of(child_env),
+                "parent": self._with_nested(active_repo, env),
+            }
 
 
 nodemap_canvas_service = NodeMapCanvasService()
