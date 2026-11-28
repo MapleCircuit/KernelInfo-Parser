@@ -542,7 +542,7 @@ class TestAiOAuthServer(unittest.TestCase):
         )
         self.assertEqual(r_rt_after_replay.status_code, 400)
 
-        # 10. Issued read-only access token works on GET /api/v1/capabilities and returns 403 with insufficient_scope on write route
+        # 10. Issued read-only access token works on GET /api/v1/capabilities; no canvas write route exists
         r_cap = client.get("/api/v1/capabilities", headers={"Authorization": f"Bearer {access_token}"})
         self.assertEqual(r_cap.status_code, 200)
 
@@ -551,9 +551,7 @@ class TestAiOAuthServer(unittest.TestCase):
             json={"name": "Denied"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
-        self.assertEqual(r_write.status_code, 403)
-        self.assertIn('error="insufficient_scope"', r_write.headers.get("WWW-Authenticate", ""))
-        self.assertIn('scope="nodemap:write"', r_write.headers.get("WWW-Authenticate", ""))
+        self.assertIn(r_write.status_code, (404, 405))
 
     # ------------------------------------------------------------------ 5. Lockout on Consent Brute-Force
 

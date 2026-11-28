@@ -825,6 +825,9 @@ export async function runTourFrameExport(ctrl, rawOpts = null, deps = {}) {
   try {
     await fontsReady();
     if (signal.aborted) throw new DOMException("Export cancelled", "AbortError");
+    // high-quality nested pictures rendered once here; every frame embeds the same cached snapshot
+    if (ctrl.hasHighQualityNested?.()) await Promise.resolve(ctrl.prepareNestedSnapshots?.()).catch(() => 0);
+    if (signal.aborted) throw new DOMException("Export cancelled", "AbortError");
 
     // Pre-rasterize live DOM nodes (tab, man, doc) once at the maximum frame scale
     const visSlice = ctrl.canvas ? visibleCanvasSlice(ctrl.canvas) : null;

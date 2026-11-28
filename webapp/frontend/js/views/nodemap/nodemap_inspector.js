@@ -266,6 +266,14 @@ export function renderInspector(ctrl) {
       html += `<div class="nm-insp-actions"><button type="button" class="nodemap-btn" data-insp="commit-spawn-diff" ${d.commitHash ? "" : "disabled"} title="Add (or connect) this commit's diff node">± Open Diff Node</button></div>`;
     } else if (n.type === "note") {
       html += check("d-markdown", d.markdown, "Render Markdown");
+    } else if (n.type === "nodemap") {
+      // High-quality picture of the child (`nested_snapshot.js`): opt-in, unavailable without a stored target
+      const target = typeof d.canvasId === "string" ? d.canvasId : "";
+      const usable = Boolean(target) && ctrl.nestedStatus?.[target] !== "missing";
+      const hqTitle = usable
+        ? "Show a rendered picture of the nested NodeMap (also used by SVG / PNG / tour exports); off keeps the fast schematic preview"
+        : "Choose an existing NodeMap first: the picture needs a target stored in this browser";
+      html += `<label class="inspector-field nm-insp-check" title="${escapeHtml(hqTitle)}"><input type="checkbox" data-insp="d-highQualityPreview" ${d.highQualityPreview === true ? "checked" : ""}${usable ? "" : ' disabled aria-disabled="true"'}/> <span>High quality preview</span></label>`;
     } else if (n.type === "group") {
       const members = M.groupDescendants(ctrl.canvas.nodes, n.id).length;
       html += `<div class="inspector-field"><span class="inspector-label">Members</span><span class="inspector-val">${members} (drag nodes in or out of the frame)</span></div>`;

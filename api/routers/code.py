@@ -13,7 +13,7 @@ from api.config import (
     resolve_default_version,
     resolve_version,
 )
-from api.security import get_active_api_scopes, has_write_scope
+from api.security import get_active_api_scopes
 from api.routers.common import (
     DEFAULT_DEFINITION_ARCH,
     _ENDPOINT_CATALOG,
@@ -69,7 +69,7 @@ def get_capabilities(
     active_repo = get_active_repo_name()
     exposed = visible_tools()
     active_scopes = sorted(get_active_api_scopes())
-    read_only = not has_write_scope("nodemap:write")
+    read_only = True  # no endpoint or MCP tool persists server state (canvas authoring is stateless)
     repos = [
         {
             "repo": p["repo"],

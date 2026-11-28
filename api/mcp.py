@@ -65,11 +65,19 @@ SERVER_INSTRUCTIONS = (
 _PARAM_DOCS: dict[str, str] = {
     "repo": "Repository name (see list_repos).",
     "version": "Git revision (default: active latest).",
-    "path": "Repository-relative path.",
     "limit": "Max items to return.",
     "offset": "Pagination offset.",
     "arch": "Target architecture.",
     "q": "Search query.",
+    "depth": "Maximum nesting depth of the returned hierarchy tree (1..32, default 8).",
+    "canvas": "Canvas document in the portable inline format (`nodes`, `edges`, `tours`, ...; nested nodes carry `data.canvas`). Stateless: nothing is saved on the server; import the returned canvas JSON in the webapp NodeMap (Import JSON).",
+    "child": "Inline child canvas to nest (mutually exclusive with `server_canvas_id`; omit both for a new empty child).",
+    "server_canvas_id": "Pre-existing server canvas id copied read-only as the inline child.",
+    "canvas_id": "Pre-existing server canvas id (read-only).",
+    "path": "Repository-relative path.",
+    "node_ids": "Ids of the canvas nodes to move into the new inline nested node.",
+    "node": "Placement/styling of the nested NodeMap node (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`).",
+    "include_preview": "Keep computed `data.preview` geometry on nested nodes (default false; `data.summary` is always present).",
 }
 
 # Duplicate REST convenience aliases omitted from MCP inputSchema (preserved on REST /api/v1/*).
@@ -84,9 +92,6 @@ _MCP_OMITTED_PARAMS: dict[str, frozenset[str]] = {
     "match_patch_maintainers": frozenset({"patch", "touched_files"}),
     "get_maintainer_person": frozenset({"email"}),
     "preview_nodemap_canvas": frozenset({"expand", "layout"}),
-    "create_nodemap_canvas": frozenset({"expand", "layout"}),
-    "replace_nodemap_canvas": frozenset({"layout"}),
-    "mutate_nodemap_canvas": frozenset({"upsert_tour", "layout"}),
 }
 
 # Canonical parameters that are optional on REST only because aliases exist, required on MCP.
@@ -119,9 +124,9 @@ _ESSENTIAL_MAIL_HEADERS: frozenset[str] = frozenset({
 
 _NODEMAP_STRICT_TOOLS: frozenset[str] = frozenset({
     "preview_nodemap_canvas",
-    "create_nodemap_canvas",
-    "replace_nodemap_canvas",
-    "mutate_nodemap_canvas",
+    "nest_nodemap_canvas",
+    "group_nodemap_canvas",
+    "inspect_nodemap_hierarchy",
 })
 
 _EMPTY_NODE_UI_KEYS: frozenset[str] = frozenset({
@@ -250,6 +255,11 @@ def _mcp_extra_fields(tool_name: str) -> dict[str, Any]:
             bool,
             Field(default=False, description="Include all fields without compact projection."),
         )
+    elif tool_name == "get_nodemap_canvas":
+        extras["verbose"] = (
+            bool,
+            Field(default=False, description="Include empty/default UI-state keys on nodes and edges."),
+        )
     elif tool_name in ("get_kconfig_symbol", "get_nodemap_struct", "get_struct_layout", "get_tree"):
         extras["verbose"] = (
             bool,
@@ -308,7 +318,7 @@ def _annotations_for_route(http_method: str, required_scope: str | None, tool_na
     if required_scope is None:
         return dict(TOOL_ANNOTATIONS)
     is_delete = http_method == "DELETE"
-    is_idempotent = http_method in ("PUT", "DELETE") or tool_name == "layout_nodemap_canvas"
+    is_idempotent = http_method in ("PUT", "DELETE")
     return {
         "readOnlyHint": False,
         "destructiveHint": is_delete,
@@ -523,8 +533,10 @@ def _validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
-def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
-    """Strip empty/default UI-state keys from NodeMap nodes/edges (and nested subCanvases)."""
+def _compact_nodemap_canvas(canvas: dict[str, Any], keep_preview: bool = False) -> dict[str, Any]:
+    """Strip empty/default UI-state keys from NodeMap nodes/edges, recursing into nested `data.canvas` / `subCanvas`.
+
+    Computed `data.preview` geometry is dropped unless `keep_preview`."""
     out = copy.deepcopy(canvas)
     nodes = out.get("nodes")
     if isinstance(nodes, list):
@@ -545,8 +557,11 @@ def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
                     for k, v in data.items()
                     if not (k in _EMPTY_DATA_UI_KEYS and (v in ("", [], {})))
                 }
-                if isinstance(cdata.get("subCanvas"), dict):
-                    cdata["subCanvas"] = _compact_nodemap_canvas(cdata["subCanvas"])
+                if not keep_preview:
+                    cdata.pop("preview", None)
+                for sub_key in ("subCanvas", "canvas"):
+                    if isinstance(cdata.get(sub_key), dict):
+                        cdata[sub_key] = _compact_nodemap_canvas(cdata[sub_key], keep_preview)
                 cnode["data"] = cdata
             cleaned_nodes.append(cnode)
         out["nodes"] = cleaned_nodes
@@ -614,7 +629,16 @@ def _project_mcp_result(
         if not include_canvas:
             out.pop("canvas", None)
         elif not verbose and isinstance(out.get("canvas"), dict):
-            out["canvas"] = _compact_nodemap_canvas(out["canvas"])
+            out["canvas"] = _compact_nodemap_canvas(out["canvas"], bool(input_args.get("include_preview")))
+        return out
+
+    if name in ("nest_nodemap_canvas", "group_nodemap_canvas"):
+        return result  # the complete importable canvas is the deliverable; never compacted
+
+    if name == "get_nodemap_canvas":
+        out = dict(result)
+        if not verbose and isinstance(out.get("canvas"), dict):
+            out["canvas"] = _compact_nodemap_canvas(out["canvas"], bool(input_args.get("include_preview")))
         return out
 
     if verbose:

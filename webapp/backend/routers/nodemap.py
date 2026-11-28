@@ -1,4 +1,8 @@
-"""webapp/backend/routers/nodemap.py - NodeMap struct layout and source slice endpoints (webapp/API_ENDPOINTS.md section 4.14)."""
+"""webapp/backend/routers/nodemap.py - NodeMap struct layout, source slice and read-only server canvas endpoints (webapp/API_ENDPOINTS.md section 4.14).
+
+User canvases live in the browser; the webapp never writes a canvas. Pre-existing server canvases (JSON files
+of `nodemap_canvas_service`, never the database) are listed and read as self-contained inline documents.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,6 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from webapp.backend.config import require_feature
 from webapp.backend.services.nodemap_canvas_service import nodemap_canvas_service
+from webapp.backend.services.nodemap_nesting import (
+    HIERARCHY_DEPTH_DEFAULT,
+    HIERARCHY_DEPTH_MAX,
+)
 from webapp.backend.services.nodemap_service import nodemap_service
 
 router = APIRouter(prefix="/webapi/nodemap", tags=["nodemap"], dependencies=[Depends(require_feature("nodemap"))])
@@ -18,14 +26,23 @@ def list_canvases(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    """List server-side saved NodeMap canvases for the active repository."""
+    """List the pre-existing server-side canvases of the active repository (read-only)."""
     return nodemap_canvas_service.list_canvases(q=q, limit=limit, offset=offset)
 
 
 @router.get("/canvases/{canvas_id}")
 def get_canvas(canvas_id: str) -> dict[str, Any]:
-    """Load a server-side saved NodeMap canvas document by ID."""
+    """A pre-existing server-side canvas as a self-contained inline document (loaded into the browser as a local copy)."""
     return nodemap_canvas_service.get_canvas(canvas_id)
+
+
+@router.get("/canvases/{canvas_id}/hierarchy")
+def get_canvas_hierarchy(
+    canvas_id: str,
+    depth: int = Query(HIERARCHY_DEPTH_DEFAULT, ge=1, le=HIERARCHY_DEPTH_MAX),
+) -> dict[str, Any]:
+    """Nested reference tree, parents and ancestors of a server-side canvas (no node payloads)."""
+    return nodemap_canvas_service.canvas_hierarchy(canvas_id, depth=depth)
 
 
 @router.get("/{version_name}/struct/{name}")

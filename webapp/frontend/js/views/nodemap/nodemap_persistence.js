@@ -16,6 +16,8 @@ import { PNG_DEFAULT_SCALE, pngSize, svgSize } from "./nodemap_export.js";
 import { LIVE_NODE_TYPES, browserPngEnv, liveNodeRasters } from "./nodemap_png.js";
 import { canvasToDot, canvasToInteractiveHtml, canvasToMermaid } from "./nodemap_export_formats.js";
 import { collectReferencedTabIds, pruneOrphanedTabCanvases } from "./nodemap_library.js";
+import { exportDocument, probeStatuses, saveChildLevel } from "./nodemap_nested.js";
+import { importDocument, storeOf } from "./nested_store.js";
 
 const SAVE_DELAY_MS = 300;
 const PASTE_STEP = 24;
@@ -51,6 +53,7 @@ export async function loadFromIndexedDB(ctrl) {
       ctrl.applyTransform();
       ctrl.renderBreadcrumbs();
       ctrl.commit({ save: incoming.length > 0, absorb: true });
+      probeStatuses(ctrl);
     }
   } catch {
     // Keep localStorage/empty canvas on IDB errors
@@ -66,6 +69,11 @@ export function flushSave(ctrl) {
   if (!ctrl.saveTimer || !ctrl.canvas) return;
   clearTimeout(ctrl.saveTimer);
   ctrl.saveTimer = null;
+  // A drilled-down nested NodeMap is a child record, never the tab's own canvas
+  if (ctrl.nav?.stack?.length) {
+    saveChildLevel(ctrl);
+    return;
+  }
   const doc = ctrl.rootCanvas || ctrl.canvas;
   if (hasIndexedDbBackend(ctrl)) {
     M.saveCanvasAsync(
@@ -357,19 +365,39 @@ export function download(name, blob) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
-export function exportJSON(ctrl) {
-  ctrl.download("nodemap_canvas.json", new Blob([JSON.stringify(M.serializeCanvas(ctrl.canvas), null, 2)], { type: "application/json" }));
-  toast.success("Exported the canvas as JSON");
+/** Canvas JSON with every nested NodeMap re-inlined from browser storage (self-contained, re-importable). */
+export async function exportJSON(ctrl) {
+  const { canvas, warnings } = await exportDocument(ctrl);
+  ctrl.download("nodemap_canvas.json", new Blob([JSON.stringify(canvas, null, 2)], { type: "application/json" }));
+  if (warnings.length) toast.warning(`Exported the canvas as JSON: ${warnings.length} nested NodeMap${warnings.length === 1 ? "" : "s"} could not be inlined (missing or circular) and ${warnings.length === 1 ? "was" : "were"} left unset`);
+  else toast.success("Exported the canvas as JSON");
+  return { canvas, warnings };
 }
 
+/**
+ * SVG image of the canvas (downloaded; returns the SVG). With high-quality nested nodes on the canvas their
+ * pictures are made current first and the call returns a Promise of the SVG.
+ */
 export function exportSVG(ctrl, { transparent = false } = {}) {
-  const svg = ctrl.canvasSvg({ transparent });
-  ctrl.download("nodemap_canvas.svg", new Blob([svg], { type: "image/svg+xml" }));
-  toast.success("Exported SVG image");
-  return svg;
+  const run = () => {
+    const svg = ctrl.canvasSvg({ transparent });
+    ctrl.download("nodemap_canvas.svg", new Blob([svg], { type: "image/svg+xml" }));
+    toast.success("Exported SVG image");
+    return svg;
+  };
+  if (!ctrl.hasHighQualityNested?.()) return run();
+  return Promise.resolve(ctrl.prepareNestedSnapshots?.()).catch(() => 0).then(run);
 }
 
+/** Interactive HTML page of the canvas; like `exportSVG`, a Promise when high-quality pictures are prepared first. */
 export function exportInteractiveHTML(ctrl, { title = "KernelInfo NodeMap", transparent = false } = {}) {
+  if (ctrl.hasHighQualityNested?.()) {
+    return Promise.resolve(ctrl.prepareNestedSnapshots?.()).catch(() => 0).then(() => interactiveHtml(ctrl, { title, transparent }));
+  }
+  return interactiveHtml(ctrl, { title, transparent });
+}
+
+function interactiveHtml(ctrl, { title, transparent }) {
   const svg = ctrl.canvasSvg({ transparent, foreign: true });
   const html = canvasToInteractiveHtml(ctrl.canvas, svg, {
     title,
@@ -406,6 +434,8 @@ export function exportDot(ctrl, { direction = "LR" } = {}) {
  * the browser still refuses is rendered again with placeholder cards and a warning.
  */
 export async function exportPNG(ctrl, { transparent = false, scale = PNG_DEFAULT_SCALE, env = null } = {}) {
+  // high-quality nested pictures current before the first render (each is embedded as vector SVG)
+  if (ctrl.hasHighQualityNested?.()) await Promise.resolve(ctrl.prepareNestedSnapshots?.()).catch(() => 0);
   const { w, h } = svgSize(ctrl.canvasSvg({ transparent, foreign: false }));
   const first = pngSize(w, h, scale);
   let rasters = null;
@@ -520,7 +550,7 @@ export function importJSON(ctrl, file) {
     if (ctrl._disposeGen !== gen) return;
     toast.error(`Import failed: ${reader.error?.message || "could not read file"}`);
   };
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
     if (ctrl._disposeGen !== gen) return;
     let parsed = null;
     try {
@@ -529,7 +559,9 @@ export function importJSON(ctrl, file) {
       toast.error(`Import failed: ${err.message}`);
       return;
     }
-    const canvas = M.normalizeCanvas(parsed);
+    // inline nested canvases are unpacked into browser storage (`nested_store.js`)
+    const canvas = await importDocument(storeOf(ctrl), parsed, { repo: ctrl.repo || "" });
+    if (ctrl._disposeGen !== gen) return;
     if (!canvas) {
       toast.error(`Import failed: not a NodeMap canvas (schema "${M.CANVAS_SCHEMA}" version ${M.CANVAS_VERSION})`);
       return;

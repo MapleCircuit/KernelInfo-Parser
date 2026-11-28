@@ -604,3 +604,27 @@ test("interaction lock blocks canvas gestures during active export and allows Es
   onKeyDown(h.c, { key: "Escape", target: { tagName: "DIV", closest: () => null }, preventDefault() {} });
   assert.equal(aborted, true);
 });
+
+test("runTourFrameExport: a high-quality nested picture is rendered once and reused by every frame", async () => {
+  const S = await import("../js/views/nodemap/nested_store.js");
+  const Nested = await import("../js/views/nodemap/nodemap_nested.js");
+  const store = { userDb: null, storage: globalThis.localStorage };
+  const child = M.normalizeCanvas({ ...M.emptyCanvas(), nodes: [M.createNode("note", { id: "k1", x: 0, y: 0, data: { text: "nested picture text" } })] });
+  assert.equal(await S.saveChild(store, "tourkid", child, { name: "Kid" }), true);
+  const h = makeRunHarness({ transparent: true, hideHud: true, pickerSupported: true });
+  h.c.canvas.nodes.push(M.createNode("nodemap", { id: "nm1", x: 700, y: 50, w: 420, h: 320, data: { canvasId: "tourkid", highQualityPreview: true } }));
+  h.c.rootCanvas = h.c.canvas;
+  let renders = 0;
+  h.c.snapshotRenderFn = (ctrl, d) => (renders++, Nested.renderChildSnapshot(ctrl, d));
+  h.c.snapshotCacheOpts = { urls: { create: () => "blob:tour-snap", revoke() {} }, defer: async () => {} };
+  const svgs = [];
+  const load = h.deps.loadSvgImage;
+  h.deps.loadSvgImage = async (svg, ...rest) => (svgs.push(svg), load(svg, ...rest));
+  const res = await E.startTourFrameExport(h.c, h.deps);
+  assert.equal(res.written, 13);
+  assert.equal(renders, 1, "the child canvas is rendered once for the whole sequence");
+  assert.equal(svgs.length, 13);
+  assert.ok(svgs.every((s) => s.includes("nested picture text") && /id="nq0-/.test(s)), "every frame embeds the cached picture with scoped ids");
+  assert.ok(svgs.every((s) => !/blob:|nmsnapq7/.test(s)), "frames stay self-contained");
+  Nested.disposeSnapshots(h.c);
+});

@@ -332,6 +332,7 @@ class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
     def test_python_schema_matches_frontend_canvas_model_js(self) -> None:
         import re
         from pathlib import Path
+
         from webapp.backend.services import nodemap_canvas_schema as pcs
 
         js_path = (
@@ -345,12 +346,12 @@ class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
         )
         js_src = js_path.read_text(encoding="utf-8")
 
-        m_types = re.search(r"export const NODE_TYPES\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.S)
+        m_types = re.search(r"export const NODE_TYPES\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.DOTALL)
         self.assertIsNotNone(m_types)
         js_node_types = tuple(re.findall(r'"([^"]+)"', m_types.group(1)))
         self.assertEqual(tuple(pcs.NODE_TYPES), js_node_types)
 
-        m_locks = re.search(r"export const LOCK_KINDS\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.S)
+        m_locks = re.search(r"export const LOCK_KINDS\s*=\s*(?:Object\.freeze\()?\[(.*?)\](?:\))?;", js_src, re.DOTALL)
         self.assertIsNotNone(m_locks)
         js_lock_kinds = tuple(re.findall(r'"([a-z0-9_-]+)"', m_locks.group(1)))
         for lk in pcs.LOCK_KINDS:
@@ -382,23 +383,24 @@ class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
         self.assertEqual([e["id"] for e in doc["edges"]], ["e_ok"])
 
     def test_webapi_nodemap_canvases_endpoints(self) -> None:
+        import json
         import tempfile
         from pathlib import Path
-        from webapp.backend.services.nodemap_canvas_service import nodemap_canvas_service
 
         app = FastAPI()
         app.include_router(nodemap_router)
         client = TestClient(app)
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("webapp.backend.services.nodemap_canvas_service.get_nodemap_canvas_dir", return_value=Path(tmp)):
-                nodemap_canvas_service.create_canvas(
-                    canvas_id="demo-map",
-                    name="Demo Canvas",
-                    description="Saved for UI test",
-                    version="v3.0",
-                    canvas={"nodes": [{"id": "n1", "type": "note", "title": "Note", "data": {"text": "hi"}}], "edges": []},
-                )
+            repo_dir = Path(tmp) / "linux"
+            repo_dir.mkdir()
+            (repo_dir / "demo-map.json").write_text(json.dumps({
+                "id": "demo-map", "name": "Demo Canvas", "description": "Pre-existing", "version": "v3.0",
+                "canvas": {"schema": "kip-nodemap-canvas", "version": 1,
+                           "nodes": [{"id": "n1", "type": "note", "title": "Note", "data": {"text": "hi"}}], "edges": []},
+            }))
+            with patch("webapp.backend.services.nodemap_canvas_service.get_nodemap_canvas_dir", return_value=Path(tmp)), \
+                    patch("webapp.backend.services.nodemap_canvas_service.get_active_repo_name", return_value="linux"):
                 r_list = client.get("/webapi/nodemap/canvases")
                 self.assertEqual(r_list.status_code, 200)
                 self.assertEqual(r_list.json()["total"], 1)
@@ -408,7 +410,358 @@ class NodeMapCanvasSchemaAndWebapiTests(unittest.TestCase):
                 self.assertEqual(r_get.status_code, 200)
                 self.assertEqual(r_get.json()["name"], "Demo Canvas")
                 self.assertEqual(len(r_get.json()["canvas"]["nodes"]), 1)
+                self.assertEqual(r_get.json()["warnings"], [])
+                self.assertEqual(client.get("/webapi/nodemap/canvases/nope").status_code, 404)
 
+
+def _cv(nodes: list | None = None, edges: list | None = None, tours: list | None = None) -> dict:
+    return {"schema": "kip-nodemap-canvas", "version": 1, "nodes": nodes or [], "edges": edges or [], "tours": tours or []}
+
+
+def _note(nid: str, x: int = 0, **extra) -> dict:
+    return {"id": nid, "type": "note", "x": x, "y": 0, "data": {"text": nid}, **extra}
+
+
+def _nest(nid: str, canvas: dict, **extra) -> dict:
+    return {"id": nid, "type": "nodemap", "data": {"canvas": canvas}, **extra}
+
+
+def _ref(nid: str, target: str, **extra) -> dict:
+    return {"id": nid, "type": "nodemap", "data": {"canvasId": target}, **extra}
+
+
+def _chain() -> dict:
+    """A -> B -> C inline tree: A{a1, nb}, B{b1, nc}, C{c1} with one edge per level onto the nested node."""
+    c = _cv([_note("c1")])
+    b = _cv([_note("b1"), _nest("nc", c, title="C")], [{"id": "eb", "from": "b1", "to": "nc"}])
+    return _cv([_note("a1"), _nest("nb", b, title="B")], [{"id": "ea", "from": "a1", "to": "nb", "toField": "x"}])
+
+
+def _deep(levels: int) -> dict:
+    cur = _cv([_note("leaf")])
+    for i in range(levels):
+        cur = _cv([_nest(f"n{i}", cur)])
+    return cur
+
+
+class NestedNodeMapTests(unittest.TestCase):
+    """Nested NodeMaps (`nodemap` nodes): inline `data.canvas` trees, stateless nest/group/hierarchy, read-only
+    server canvases and the absence of every canvas write (`webapp/backend/services/nodemap_nesting.py`,
+    webapp/API_ENDPOINTS.md section 4.14)."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from webapp.backend.services.nodemap_canvas_service import (
+            nodemap_canvas_service,
+        )
+
+        self.svc = nodemap_canvas_service
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.repo_dir = self.base / "linux"
+        self.repo_dir.mkdir()
+        for target, value in (("get_nodemap_canvas_dir", self.base), ("get_active_repo_name", "linux")):
+            p = patch(f"webapp.backend.services.nodemap_canvas_service.{target}", return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        app = FastAPI()
+        app.include_router(nodemap_router)
+        self.client = TestClient(app)
+
+    def _store(self, cid: str, nodes: list | None = None, edges: list | None = None) -> None:
+        """Place a pre-existing canvas file on disk (the only way a server canvas comes to exist)."""
+        import json
+
+        (self.repo_dir / f"{cid}.json").write_text(
+            json.dumps({"id": cid, "name": cid.upper(), "version": "v3.0", "canvas": _cv(nodes, edges)}),
+            encoding="utf-8",
+        )
+
+    def _disk(self) -> list[tuple[str, int, int]]:
+        return sorted((str(p.relative_to(self.base)), p.stat().st_size, p.stat().st_mtime_ns) for p in self.base.rglob("*"))
+
+    def _http_error(self, fn, *args, **kwargs) -> int:
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as cm:
+            fn(*args, **kwargs)
+        return cm.exception.status_code
+
+    def test_schema_normalizes_inline_and_reference_nodes(self) -> None:
+        from webapp.backend.services import nodemap_canvas_schema as pcs
+
+        self.assertIn("nodemap", pcs.NODE_TYPES)
+        self.assertNotIn("nodemap", pcs.AUTOFIT_TYPES)
+        doc = pcs.normalize_canvas(_cv(
+            [
+                _ref("m1", "child-1"),
+                {"id": "m2", "type": "nodemap", "data": {"canvasId": "../etc", "nodes": [{"id": "x"}]}},
+                {"id": "m3", "type": "nodemap", "data": {
+                    "canvas": {"nodes": [_note("i1")]}, "canvasId": "ignored",
+                    "summary": {"nodes": 99}, "preview": {"w": 1}}},
+                {"id": "s", "type": "struct", "data": {"name": "foo"}},
+            ],
+            [{"id": "e1", "from": "s", "to": "m1", "fromField": "a", "toField": "inner"}],
+        ))
+        by_id = {n["id"]: n for n in doc["nodes"]}
+        self.assertEqual(by_id["m1"]["data"], {"canvasId": "child-1"})
+        self.assertEqual(by_id["m2"]["data"], {"canvasId": ""})
+        self.assertEqual(list(by_id["m3"]["data"]), ["canvas"])
+        self.assertEqual(by_id["m3"]["data"]["canvas"]["schema"], "kip-nodemap-canvas")
+        self.assertEqual([n["id"] for n in by_id["m3"]["data"]["canvas"]["nodes"]], ["i1"])
+        self.assertEqual(by_id["m1"]["title"], "Nested NodeMap")
+        self.assertEqual(doc["edges"][0]["fromField"], "a")
+        self.assertIsNone(doc["edges"][0]["toField"])
+        # The inline embedding budget is shared with Sub-Maps: level 9 is cut to an unset node
+        cut = pcs.normalize_canvas(_deep(9))
+        from webapp.backend.services.nodemap_nesting import tree_stats
+        self.assertEqual(tree_stats(cut)["nested_depth"], 8)
+
+    def test_no_canvas_write_routes_or_service_writes(self) -> None:
+        import inspect
+        import re
+
+        from webapp.backend.services import nodemap_canvas_service as mod
+
+        self._store("p", [_note("p1")])
+        before = self._disk()
+        body = {"id": "x", "canvas": _cv([_note("n")]), "ops": [], "node_ids": ["p1"], "target_id": "p"}
+        for method, url in (
+            ("post", "/webapi/nodemap/canvases"),
+            ("put", "/webapi/nodemap/canvases/p"),
+            ("patch", "/webapi/nodemap/canvases/p"),
+            ("delete", "/webapi/nodemap/canvases/p"),
+            ("post", "/webapi/nodemap/canvases/p/ops"),
+            ("post", "/webapi/nodemap/canvases/p/nested"),
+            ("post", "/webapi/nodemap/canvases/p/group"),
+        ):
+            kw = {} if method == "delete" else {"json": body}
+            r = getattr(self.client, method)(url, **kw)
+            self.assertIn(r.status_code, (404, 405), f"{method.upper()} {url} -> {r.status_code}")
+        self.assertEqual(self._disk(), before)
+        for gone in ("create_canvas", "replace_canvas", "delete_canvas", "mutate_canvas", "expand_canvas",
+                     "layout_canvas", "attach_nested", "group_into_nested"):
+            self.assertFalse(hasattr(self.svc, gone), gone)
+        src = inspect.getsource(mod)
+        for primitive in ("write_text", "write_bytes", "os.replace", ".unlink(", "mkstemp", "json.dump(", ".mkdir(", "rmtree"):
+            self.assertNotIn(primitive, src, primitive)
+        self.assertIsNone(re.search(r"open\([^)]*['\"][wax+]", src))
+
+    def test_server_reference_chain_reads_inline(self) -> None:
+        self._store("p", [_note("p1"), _ref("rq", "q", title="Q"), _ref("rx", "gone")], [{"id": "e", "from": "p1", "to": "rq"}])
+        self._store("q", [_note("q1"), _ref("rr", "r")])
+        self._store("r", [_note("r1"), _ref("back", "p")])
+        before = self._disk()
+        r = self.client.get("/webapi/nodemap/canvases/p")
+        self.assertEqual(r.status_code, 200, r.text)
+        rec = r.json()
+        self.assertNotIn("nested_maps", rec)
+        by_id = {n["id"]: n for n in rec["canvas"]["nodes"]}
+        q = by_id["rq"]["data"]
+        self.assertNotIn("canvasId", q)
+        self.assertEqual(q["summary"], {"title": "Q", "nodes": 2, "edges": 0, "nested": 1, "depth": 1})
+        self.assertNotIn("preview", q)
+        r_inline = {n["id"]: n for n in q["canvas"]["nodes"]}["rr"]["data"]["canvas"]
+        self.assertEqual({n["id"]: n for n in r_inline["nodes"]}["back"]["data"], {})
+        self.assertEqual(by_id["rx"]["data"], {})
+        self.assertEqual(
+            sorted((w["code"], w["canvas_id"], tuple(w["path"])) for w in rec["warnings"]),
+            [("missing_reference", "gone", ("p",)), ("reference_cycle", "p", ("p", "q", "r"))],
+        )
+        with_preview = self.svc.get_canvas("p", include_preview=True)
+        self.assertIn("preview", {n["id"]: n for n in with_preview["canvas"]["nodes"]}["rq"]["data"])
+        h = self.client.get("/webapi/nodemap/canvases/p/hierarchy", params={"depth": 3}).json()
+        self.assertNotIn("invalid_targets", h)
+        self.assertEqual(h["tree"]["children"][0]["canvas_id"], "q")
+        self.assertEqual(h["ancestors"], ["q", "r"])
+        listed = self.client.get("/webapi/nodemap/canvases", params={"insertable_into": "p"}).json()
+        self.assertEqual(listed["total"], 3)
+        self.assertNotIn("insertable", listed["items"][0])
+        self.assertEqual(self._disk(), before)
+
+    def test_preview_inline_chain_annotations_and_bounds(self) -> None:
+        out = self.svc.preview_canvas({"canvas": _chain(), "hydrate": False, "auto_layout": None})
+        self.assertEqual((out["nested_count"], out["nested_depth"], out["total_node_count"]), (2, 2, 5))
+        nb = {n["id"]: n for n in out["canvas"]["nodes"]}["nb"]
+        self.assertEqual(nb["data"]["summary"], {"title": "B", "nodes": 2, "edges": 1, "nested": 1, "depth": 1})
+        self.assertNotIn("preview", nb["data"])
+        self.assertIsNone(out["canvas"]["edges"][0]["toField"])
+        nc = {n["id"]: n for n in nb["data"]["canvas"]["nodes"]}["nc"]
+        self.assertEqual(nc["data"]["summary"]["depth"], 0)
+        # Round trip: the returned canvas is importable input again; summaries are recomputed
+        again = self.svc.preview_canvas({"canvas": out["canvas"], "hydrate": False, "auto_layout": None, "include_preview": True})
+        nb2 = {n["id"]: n for n in again["canvas"]["nodes"]}["nb"]
+        self.assertEqual(nb2["data"]["summary"], nb["data"]["summary"])
+        self.assertEqual(len(nb2["data"]["preview"]["nodes"]), 2)
+        # Layout runs at every level
+        laid = self.svc.preview_canvas({"canvas": _chain(), "hydrate": False, "auto_layout": "dag"})
+        self.assertEqual(laid["nested_depth"], 2)
+        # Unresolved references are kept and reported
+        warn = self.svc.preview_canvas({"canvas": _cv([_ref("r", "local-x")]), "hydrate": False})["warnings"]
+        self.assertEqual([w["code"] for w in warn], ["unresolved_reference"])
+
+    def test_inline_validation_rejects_internal_edges_depth_cycles_and_size(self) -> None:
+        from webapp.backend.services import nodemap_nesting as nn
+
+        internal = _chain()
+        internal["edges"].append({"id": "bad", "from": "a1", "to": "c1"})
+        self.assertEqual(self._http_error(self.svc.preview_canvas, {"canvas": internal, "hydrate": False}), 422)
+        self.assertEqual(self._http_error(self.svc.preview_canvas, {"canvas": _chain(), "hydrate": False,
+                                                                     "edges": [{"id": "x", "from": "b1", "to": "a1"}]}), 422)
+        self.assertEqual(self._http_error(self.svc.preview_canvas, {"canvas": _deep(9), "hydrate": False}), 422)
+        self.svc.preview_canvas({"canvas": _deep(8), "hydrate": False, "auto_layout": None})
+        loop = _cv()
+        loop["nodes"].append(_nest("self", loop))
+        self.assertEqual(self._http_error(self.svc.preview_canvas, {"canvas": loop, "hydrate": False}), 422)
+        errors, _ = nn.inline_problems(_cv([_nest("a", _cv([_note(f"x{i}") for i in range(30)]))]), max_total_nodes=20)
+        self.assertEqual([e["code"] for e in errors], ["nested_too_large"])
+        errors, _ = nn.inline_problems(internal)
+        self.assertEqual(errors[0]["code"], "internal_edge_target")
+        self.assertEqual((errors[0]["edge_id"], errors[0]["node_id"]), ("bad", "c1"))
+
+    def test_nest_new_inline_and_server_children(self) -> None:
+        self._store("q", [_note("q1"), _ref("rr", "r")])
+        self._store("r", [_note("r1")])
+        before = self._disk()
+        out = self.svc.nest_canvas({"canvas": _chain(), "path": ["nb", "nc"], "child": _cv([_note("d1")]),
+                                    "name": "D", "node": {"id": "nd", "x": 40, "y": 50}})
+        self.assertEqual((out["node_id"], out["path"], out["nested_depth"], out["total_node_count"]), ("nd", ["nb", "nc"], 3, 7))
+        from webapp.backend.services.nodemap_nesting import canvas_at_path
+
+        level_c = canvas_at_path(out["canvas"], ["nb", "nc"])
+        nd = {n["id"]: n for n in level_c["nodes"]}["nd"]
+        self.assertEqual((nd["x"], nd["y"], nd["title"]), (40, 50, "D"))
+        self.assertEqual([n["id"] for n in nd["data"]["canvas"]["nodes"]], ["d1"])
+        empty = self.svc.nest_canvas({"canvas": _cv([_note("a")])})
+        self.assertEqual(empty["nested_count"], 1)
+        self.assertEqual({n["id"]: n for n in empty["canvas"]["nodes"]}[empty["node_id"]]["data"]["summary"]["nodes"], 0)
+        copied = self.svc.nest_canvas({"canvas": _cv(), "server_canvas_id": "q"})
+        node = copied["canvas"]["nodes"][0]
+        self.assertEqual(node["title"], "Q")
+        self.assertEqual(copied["nested_depth"], 2)
+        self.assertEqual(copied["total_node_count"], 1 + 2 + 1)
+        for bad in (
+            {"canvas": _cv(), "child": _cv(), "server_canvas_id": "q"},
+            {"canvas": _cv(), "path": ["missing"]},
+            {"canvas": _cv([_note("a")]), "node": {"id": "a"}},
+            {"canvas": "nope"},
+            {"canvas": _deep(8), "path": [f"n{i}" for i in range(7, -1, -1)]},
+        ):
+            self.assertEqual(self._http_error(self.svc.nest_canvas, bad), 422, bad)
+        self.assertEqual(self._http_error(self.svc.nest_canvas, {"canvas": _cv(), "server_canvas_id": "gone"}), 404)
+        self.assertEqual(self._disk(), before)
+
+    def test_group_selection_into_inline_child(self) -> None:
+        canvas = _cv(
+            [{"id": "g", "type": "group", "x": 0, "y": 0, "w": 900, "h": 500},
+             _note("a", 100, groupId="g"), _note("b", 400, groupId="g"), _note("c", 700)],
+            [{"id": "e1", "from": "a", "to": "b"}, {"id": "e2", "from": "b", "to": "c", "fromField": "f",
+                                                     "waypoints": [{"x": 1, "y": 2}]}],
+            [{"id": "t", "title": "T", "steps": [{"id": "s1", "nodeIds": ["a", "b", "c"], "edgeIds": ["e1", "e2"]}]}],
+        )
+        out = self.svc.group_canvas({"canvas": canvas, "node_ids": ["a", "b"], "name": "AB", "node": {"id": "nm"}})
+        self.assertEqual((out["node_id"], out["moved_node_ids"], out["moved_edge_ids"], out["rewired_edge_ids"]),
+                         ("nm", ["a", "b"], ["e1"], ["e2"]))
+        by_id = {n["id"]: n for n in out["canvas"]["nodes"]}
+        self.assertEqual(sorted(by_id), ["c", "g", "nm"])
+        nm = by_id["nm"]
+        self.assertEqual((nm["title"], nm["groupId"]), ("AB", "g"))
+        child = nm["data"]["canvas"]
+        self.assertEqual(sorted(n["id"] for n in child["nodes"]), ["a", "b"])
+        self.assertTrue(all(n["groupId"] is None for n in child["nodes"]))
+        self.assertEqual([e["id"] for e in child["edges"]], ["e1"])
+        e2 = out["canvas"]["edges"][0]
+        self.assertEqual((e2["from"], e2["to"], e2["fromField"], e2["waypoints"]), ("nm", "c", None, []))
+        step = out["canvas"]["tours"][0]["steps"][0]
+        self.assertEqual((step["nodeIds"], step["edgeIds"]), (["nm", "c"], ["e2"]))
+        nested = self.svc.group_canvas({"canvas": _chain(), "path": ["nb"], "node_ids": ["b1", "nc"]})
+        self.assertEqual((nested["nested_depth"], nested["moved_edge_ids"]), (3, ["eb"]))
+        for bad in ({"canvas": canvas, "node_ids": []}, {"canvas": canvas, "node_ids": ["zz"]},
+                    {"canvas": canvas, "node_ids": "a"}, {"canvas": canvas, "node_ids": ["a"], "path": ["c"]}):
+            self.assertEqual(self._http_error(self.svc.group_canvas, bad), 422, bad)
+
+    def test_inline_hierarchy(self) -> None:
+        h = self.svc.inline_hierarchy({"canvas": _chain(), "depth": 1})
+        self.assertEqual((h["source"], h["nested_depth"], h["total_node_count"]), ({"kind": "inline"}, 2, 5))
+        self.assertEqual(h["tree"]["counts"], {"nodes": 2, "edges": 1, "nested": 1})
+        child = h["tree"]["children"][0]
+        self.assertEqual((child["node_id"], child["title"], child["depth"], child["children"]), ("nb", "B", 1, []))
+        self.assertTrue(child["children_truncated"])
+        full = self.svc.inline_hierarchy({"canvas": _chain()})
+        self.assertEqual(full["tree"]["children"][0]["children"][0]["node_id"], "nc")
+        self._store("p", [_ref("rq", "q")])
+        self._store("q", [_note("q1")])
+        srv = self.svc.inline_hierarchy({"canvas_id": "p"})
+        self.assertEqual((srv["source"]["kind"], srv["nested_depth"]), ("server", 1))
+        for bad in ({}, {"canvas": _cv(), "canvas_id": "p"}, {"canvas": _cv(), "depth": 0}, {"canvas": _cv(), "depth": True}):
+            self.assertEqual(self._http_error(self.svc.inline_hierarchy, bad), 422, bad)
+
+    def test_high_quality_preview_flag_survives_normalization_inlining_and_validation(self) -> None:
+        """`data.highQualityPreview` is a boolean display option: kept only when true, carried through
+        reference inlining, accepted by strict validation as a bool only; never a picture payload."""
+        from api.routers.nodemap import validate_nodemap_payload_strict
+        from webapp.backend.services import nodemap_canvas_schema as pcs
+        from webapp.backend.services.nodemap_nesting import inline_references
+
+        doc = pcs.normalize_canvas(_cv([
+            {"id": "r", "type": "nodemap", "data": {"canvasId": "kid", "highQualityPreview": True, "png": "data:image/png;base64,AA"}},
+            {"id": "i", "type": "nodemap", "data": {"canvas": _cv([_note("x")]), "highQualityPreview": True}},
+            {"id": "f", "type": "nodemap", "data": {"canvasId": "kid", "highQualityPreview": "yes"}},
+            _ref("p", "kid"),
+        ]))
+        by_id = {n["id"]: n for n in doc["nodes"]}
+        self.assertEqual(by_id["r"]["data"], {"canvasId": "kid", "highQualityPreview": True})
+        self.assertIs(by_id["i"]["data"]["highQualityPreview"], True)
+        self.assertEqual(by_id["f"]["data"], {"canvasId": "kid"})
+        self.assertEqual(by_id["p"]["data"], {"canvasId": "kid"})
+        kid = pcs.normalize_canvas(_cv([_note("k1")]))
+        host = pcs.normalize_canvas(_cv([
+            {"id": "r", "type": "nodemap", "data": {"canvasId": "kid", "highQualityPreview": True}},
+            {"id": "m", "type": "nodemap", "data": {"canvasId": "gone", "highQualityPreview": True}},
+        ]))
+        warn = inline_references(host, lambda cid: kid if cid == "kid" else None)
+        self.assertEqual([w["code"] for w in warn], ["missing_reference"])
+        inlined = {n["id"]: n["data"] for n in host["nodes"]}
+        self.assertEqual(set(inlined["r"]), {"canvas", "highQualityPreview"})
+        self.assertEqual(inlined["m"], {"highQualityPreview": True})
+        self.assertNotIn("data:image", str(host))
+        ok = validate_nodemap_payload_strict({"nodes": [{"id": "n", "type": "nodemap", "data": {"canvasId": "kid", "highQualityPreview": False}}]})
+        self.assertEqual(ok, [])
+        bad = validate_nodemap_payload_strict({"nodes": [{"id": "n", "type": "nodemap", "data": {"canvasId": "kid", "highQualityPreview": "on"}}]})
+        self.assertEqual([e["type"] for e in bad], ["bool_type"])
+        extra = validate_nodemap_payload_strict({"nodes": [{"id": "n", "type": "nodemap", "data": {"canvasId": "kid", "snapshot": "data:image/svg+xml,x"}}]})
+        self.assertEqual([e["type"] for e in extra], ["extra_forbidden"])
+        # the typed request model (REST / MCP bodies) accepts the flag as a boolean only
+        from pydantic import ValidationError
+
+        from api.routers.nodemap import NodemapNodeDataInput
+
+        self.assertIs(NodemapNodeDataInput(canvasId="kid", highQualityPreview=True).highQualityPreview, True)
+        with self.assertRaises(ValidationError):
+            NodemapNodeDataInput(canvasId="kid", highQualityPreview="on")
+        with self.assertRaises(ValidationError):
+            NodemapNodeDataInput(canvasId="kid", snapshot="data:image/svg+xml,x")
+
+    def test_pure_helpers(self) -> None:
+        from webapp.backend.services.nodemap_canvas_schema import normalize_canvas
+        from webapp.backend.services.nodemap_nesting import (
+            ancestors_of,
+            build_static_preview,
+            inline_references,
+            tree_stats,
+        )
+
+        g = {"b": ["c"], "c": ["a"], "d": ["b"]}
+        self.assertEqual(ancestors_of(g, "a"), {"b", "c", "d"})
+        self.assertEqual(build_static_preview({"nodes": [], "edges": []})["nodes"], [])
+        big = normalize_canvas(_cv([_note(f"x{i}") for i in range(30)]))
+        host = normalize_canvas(_cv([_ref("r1", "big"), _ref("r2", "big")]))
+        warn = inline_references(host, lambda cid: big, max_total_nodes=50)
+        self.assertEqual([w["code"] for w in warn], ["nested_too_large"])
+        self.assertEqual(tree_stats(host)["total_node_count"], 32)
 
 if __name__ == "__main__":
     unittest.main()
