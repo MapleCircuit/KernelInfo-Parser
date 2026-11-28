@@ -177,6 +177,7 @@ export function selectEdge(ctrl, id) {
 export function onPointerDown(ctrl, e) {
   if (ctrl.tourExporting) return;
   const t = e.target;
+  if (t.closest?.(".nm-breadcrumbs")) return;
   if (!t.closest(".nm-inline-edit")) ctrl.rootEl.focus({ preventScroll: true });
   const start = { x: e.clientX, y: e.clientY };
   if (e.button === 1 || (e.button === 0 && ctrl.spaceDown)) {
@@ -467,6 +468,7 @@ export function finishWire(ctrl, g, e) {
 
 export function onDblClick(ctrl, e) {
   if (ctrl.tourExporting) return;
+  if (e.target.closest?.(".nm-breadcrumbs")) return;
   if (isTyping(e.target)) return;
   const wpEl = e.target.closest?.(".nm-edge-wp[data-edge-id]");
   if (wpEl) {
@@ -476,6 +478,8 @@ export function onDblClick(ctrl, e) {
   const titleEl = e.target.closest(".nm-title");
   const nodeEl = e.target.closest(".nm-node");
   const edgeEl = e.target.closest(".nm-edge[data-edge-id]");
+  const nestedNode = nodeEl ? ctrl.byId(nodeEl.dataset.nodeId) : null;
+  if (nestedNode?.type === "nodemap" && !titleEl && !e.target.closest("button")) return ctrl.openNested(nestedNode.id);
   if (nodeEl && !ctrl.canvas.settings.editMode) {
     if ((titleEl || e.target.closest(".nm-type-note .nm-node-body")) && !ctrl.hintedEditMode) {
       ctrl.hintedEditMode = true;
@@ -599,6 +603,7 @@ export function onContextMenu(ctrl, e) {
     e.preventDefault?.();
     return;
   }
+  if (e.target.closest?.(".nm-breadcrumbs")) return;
   e.preventDefault();
   e.stopPropagation();
   const nodeEl = e.target.closest(".nm-node");
@@ -636,7 +641,16 @@ export function attachCanvasEvents(ctrl) {
     }
   }, true);
   if (ctrl.breadcrumbsEl) {
+    ctrl.breadcrumbsEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+    ctrl.breadcrumbsEl.addEventListener("dblclick", (e) => e.stopPropagation());
+    ctrl.breadcrumbsEl.addEventListener("contextmenu", (e) => e.stopPropagation());
     ctrl.breadcrumbsEl.addEventListener("click", (e) => {
+      if (ctrl.tourExporting) return;
+      const nested = e.target.closest("[data-nm-crumb]");
+      if (nested) {
+        ctrl.goToCrumb(parseInt(nested.dataset.nmCrumb, 10));
+        return;
+      }
       const btn = e.target.closest("[data-bc-depth]");
       if (!btn) return;
       ctrl.exitSubMapTo(parseInt(btn.dataset.bcDepth, 10));
@@ -822,7 +836,10 @@ export function onClick(ctrl, e) {
         // a frame still loading
       }
     }
-  } else if (act === "tab-freeze" && node.type === "tab") ctrl.setTabsFrozen([node.id], !node.data.frozen);
+  } else if (act === "nested-open" && node.type === "nodemap") ctrl.openNested(node.id);
+  else if (act === "nested-choose" && node.type === "nodemap") ctrl.chooseNestedTarget(node.id);
+  else if (act === "nested-remove" && node.type === "nodemap") ctrl.removeNode(node.id);
+  else if (act === "tab-freeze" && node.type === "tab") ctrl.setTabsFrozen([node.id], !node.data.frozen);
   else if (act === "tab-reset" && node.type === "tab") ctrl.resetTabNode(node.id);
   else if (act === "toggle-header") ctrl.setHeaderHidden(node.id, !node.hideHeader);
   else if (act === "open-tab") ctrl.openNodeAsTab(node.id);

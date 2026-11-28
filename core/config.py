@@ -1106,7 +1106,7 @@ def is_api_default_version_pinned() -> bool:
 
 
 def get_nodemap_canvas_dir() -> Path:
-    """Resolve persistent directory for saved NodeMap canvas JSON files (`api.nodemap_canvas_dir`).
+    """Resolve the read-only directory of pre-existing server NodeMap canvas JSON files (`api.nodemap_canvas_dir`).
 
     Shared by both `api/` and `webapp/` services outside `cache_engine`. Relative paths resolve against
     `REPO_ROOT`; an empty value defaults to `<config_dir>/nodemap-canvases` (or `<REPO_ROOT>/nodemap-canvases`).

@@ -4,21 +4,18 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from api.config import (
     get_active_repo_name,
     require_feature,
-    resolve_default_version,
     resolve_version,
 )
 from api.routers.common import (
-    DEFAULT_ARCH,
     _with_repo,
     nodemap_canvas_service,
     nodemap_service,
 )
-from api.security import get_active_api_key_id, require_write_scope
 from webapp.backend.services.nodemap_canvas_schema import (
     ARROWS,
     CURVES,
@@ -33,6 +30,11 @@ from webapp.backend.services.nodemap_canvas_schema import (
     SIDES,
     SOURCE_MODES,
     STRUCT_STYLES,
+)
+from webapp.backend.services.nodemap_nesting import (
+    HIERARCHY_DEPTH_DEFAULT,
+    HIERARCHY_DEPTH_MAX,
+    NESTED_DEPTH_MAX,
 )
 
 router = APIRouter()
@@ -57,6 +59,7 @@ _NODE_DATA_KEYS_BY_TYPE: dict[str, tuple[str, ...]] = {
     "commit": ("commitHash", "subject"),
     "note": ("text", "markdown"),
     "group": ("subCanvas",),
+    "nodemap": ("canvasId", "canvas", "summary", "preview", "highQualityPreview"),
 }
 _ALL_NODE_DATA_KEYS: frozenset[str] = frozenset(
     key for keys in _NODE_DATA_KEYS_BY_TYPE.values() for key in keys
@@ -180,6 +183,11 @@ class NodemapNodeDataInput(BaseModel):
     text: str | None = Field(default=None, max_length=20000, description="Note body text.")
     markdown: bool | None = None
     subCanvas: dict[str, Any] | None = None
+    canvasId: str | None = Field(default=None, pattern=r"^[\w-]{1,64}$", description="Nested NodeMap card: unresolved reference to a pre-existing server canvas id (kept with a warning; prefer inline `canvas`).")
+    canvas: dict[str, Any] | None = Field(default=None, description="Nested NodeMap card: inline child canvas document (recursive, max depth 8).")
+    summary: dict[str, Any] | None = Field(default=None, description="Computed output; ignored and recomputed.")
+    preview: dict[str, Any] | None = Field(default=None, description="Computed output; ignored and recomputed.")
+    highQualityPreview: StrictBool | None = Field(default=None, description="Nested NodeMap card: opt-in display flag (the web client renders a picture of the child locally); kept only when true.")
 
 
 class NodemapNodeInput(BaseModel):
@@ -190,7 +198,7 @@ class NodemapNodeInput(BaseModel):
     id: str | None = Field(default=None, pattern=r"^[\w-]{1,64}$")
     type: Literal[
         "struct", "symbol", "source", "man", "tab", "note", "group", "diff",
-        "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit",
+        "mail", "kconfig", "maintainer", "cve", "kapi", "doc", "history", "commit", "nodemap",
     ]
     title: str | None = Field(default=None, max_length=512)
     customTitle: str | None = Field(default=None, max_length=512)
@@ -305,6 +313,7 @@ def _validate_node_dict(
     errors: list[dict[str, Any]],
     *,
     is_update: bool = False,
+    depth: int = 0,
 ) -> None:
     if not isinstance(node, dict):
         errors.append(_err(loc, f"Expected node object, got {type(node).__name__}.", "dict_type"))
@@ -360,6 +369,8 @@ def _validate_node_dict(
                             "extra_forbidden",
                         )
                     )
+                elif dkey == "highQualityPreview" and not isinstance(dval, bool):
+                    errors.append(_err([*loc, "data", dkey], f"Expected boolean for data.highQualityPreview, got {type(dval).__name__}.", "bool_type"))
                 elif dkey == "kind" and node_type == "struct" and dval not in (None, "struct", "union"):
                     errors.append(_err([*loc, "data", "kind"], f"Invalid struct kind {dval!r}; expected 'struct' or 'union'."))
                 elif dkey == "style" and node_type == "struct" and dval not in (None, *STRUCT_STYLES):
@@ -376,6 +387,28 @@ def _validate_node_dict(
                         errors.append(_err([*loc, "data", "mode"], f"Invalid mode {dval!r} for '{node_type}'; expected one of: {', '.join(valid_modes)}."))
                 elif dkey == "catalog" and node_type == "kapi" and dval not in (None, *KAPI_CATALOGS):
                     errors.append(_err([*loc, "data", "catalog"], f"Invalid kapi catalog {dval!r}; expected one of: {', '.join(KAPI_CATALOGS)}."))
+        if node_type == "nodemap" and data.get("canvas") is not None:
+            _validate_inline_canvas(data["canvas"], [*loc, "data", "canvas"], errors, depth + 1)
+
+
+def _validate_inline_canvas(canvas: Any, loc: list[str | int], errors: list[dict[str, Any]], depth: int) -> None:
+    """Strictly validate an inline nested canvas (`nodes`, `edges`, `tours`, recursively), bounded by `NESTED_DEPTH_MAX`."""
+    if not isinstance(canvas, dict):
+        errors.append(_err(loc, f"Expected canvas object, got {type(canvas).__name__}.", "dict_type"))
+        return
+    if depth > NESTED_DEPTH_MAX:
+        errors.append(_err(loc, f"Nested NodeMap depth exceeds the maximum of {NESTED_DEPTH_MAX} levels."))
+        return
+    _nodemap_ports(canvas.get("nodes"), canvas.get("edges"), "edges", loc, errors)
+    for ckey, cfn in (
+        ("nodes", lambda item, iloc: _validate_node_dict(item, iloc, errors, depth=depth)),
+        ("edges", lambda item, iloc: _validate_edge_dict(item, iloc, errors)),
+        ("tours", lambda item, iloc: _validate_tour_dict(item, iloc, errors, require_id=True)),
+    ):
+        citems = canvas.get(ckey)
+        if isinstance(citems, list):
+            for idx, item in enumerate(citems):
+                cfn(item, [*loc, ckey, idx])
 
 
 def _validate_edge_dict(
@@ -474,9 +507,30 @@ def _validate_tour_dict(
                 errors.append(_err([*sloc, id_list_key], f"Tour step '{id_list_key}' must be a list of valid IDs matching /^[\\w-]{{1,64}}$/."))
 
 
+def _nodemap_ports(nodes: Any, edges: Any, loc_key: str, prefix: list[str | int], errors: list[dict[str, Any]]) -> None:
+    """Reject `fromField`/`toField` on edges whose endpoint is a `nodemap` node declared in the same payload."""
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return
+    nested = {n.get("id") for n in nodes if isinstance(n, dict) and n.get("type") == "nodemap" and n.get("id")}
+    if not nested:
+        return
+    for idx, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            continue
+        for end, port in (("from", "fromField"), ("to", "toField")):
+            if edge.get(port) and edge.get(end) in nested:
+                errors.append(_err(
+                    [*prefix, loc_key, idx, port],
+                    f"Edges attach to a nested NodeMap node as a whole; remove '{port}' (endpoint {edge.get(end)!r} is a 'nodemap' node).",
+                    "value_error",
+                ))
+
+
 def validate_nodemap_payload_strict(raw_args: dict[str, Any]) -> list[dict[str, Any]]:
     """Strict actionable validation for NodeMap MCP inputs (`nodes`, `edges`, `groups`, `tours`, `ops`, `canvas`)."""
     errors: list[dict[str, Any]] = []
+    _nodemap_ports(raw_args.get("nodes"), raw_args.get("edges"), "edges", [], errors)
+    _nodemap_ports(raw_args.get("upsert_nodes"), raw_args.get("upsert_edges"), "upsert_edges", [], errors)
     for list_key, fn in (
         ("nodes", lambda item, loc: _validate_node_dict(item, loc, errors)),
         ("upsert_nodes", lambda item, loc: _validate_node_dict(item, loc, errors)),
@@ -494,15 +548,10 @@ def validate_nodemap_payload_strict(raw_args: dict[str, Any]) -> list[dict[str, 
 
     canvas = raw_args.get("canvas")
     if isinstance(canvas, dict):
-        for ckey, cfn in (
-            ("nodes", lambda item, loc: _validate_node_dict(item, loc, errors)),
-            ("edges", lambda item, loc: _validate_edge_dict(item, loc, errors)),
-            ("tours", lambda item, loc: _validate_tour_dict(item, loc, errors, require_id=True)),
-        ):
-            citems = canvas.get(ckey)
-            if isinstance(citems, list):
-                for idx, item in enumerate(citems):
-                    cfn(item, ["canvas", ckey, idx])
+        _validate_inline_canvas(canvas, ["canvas"], errors, 0)
+    child = raw_args.get("child")
+    if isinstance(child, dict):
+        _validate_inline_canvas(child, ["child"], errors, 0)
 
     ops = raw_args.get("ops")
     if isinstance(ops, list):
@@ -571,115 +620,53 @@ class NodemapPreviewRequest(BaseModel):
     auto_layout: str | None = Field(default="dag")
     export_format: str | None = Field(default=None, pattern="^(json|mermaid|dot)$")
     direction: str = Field(default="LR", pattern="^(LR|RL|TB|TD|BT)$")
+    include_preview: bool = Field(default=False, description="Keep computed `data.preview` geometry on nested nodes.")
 
 
-class NodemapCreateRequest(BaseModel):
-    """Create and persist a new NodeMap canvas document."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str | None = Field(default=None, min_length=1, max_length=64)
-    name: str = Field(default="Untitled Canvas", min_length=1, max_length=256)
-    description: str = Field(default="", max_length=2000)
-    version: str | None = Field(default=None, max_length=256)
-    nodes: list[NodemapNodeInput] = Field(default_factory=list)
-    edges: list[NodemapEdgeInput] = Field(default_factory=list)
-    groups: list[NodemapGroupInput] = Field(default_factory=list)
-    ops: list[dict[str, Any]] = Field(default_factory=list)
-    expansions: list[dict[str, Any]] = Field(default_factory=list)
-    expand: dict[str, Any] | list[dict[str, Any]] | None = None
-    layout: dict[str, Any] | str | None = None
-    settings: dict[str, Any] | None = None
-    tours: list[NodemapTourInput] = Field(default_factory=list)
-    canvas: dict[str, Any] | None = None
-    hydrate: bool = True
-    auto_layout: str | None = Field(default="dag")
-
-
-class NodemapReplaceRequest(BaseModel):
-    """Full replacement of a saved NodeMap canvas document with optional optimistic concurrency check."""
+class NodemapNestRequest(BaseModel):
+    """Stateless: add a nested NodeMap node (inline child canvas) to an in-memory canvas. Nothing is saved on the server."""
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str | None = Field(default=None, max_length=256)
-    description: str | None = Field(default=None, max_length=2000)
+    canvas: dict[str, Any] = Field(description="Parent canvas document (inline format).")
+    child: dict[str, Any] | None = Field(default=None, description="Inline child canvas; mutually exclusive with `server_canvas_id`. Omit both for a new empty child.")
+    server_canvas_id: str | None = Field(default=None, max_length=64, description="Pre-existing server canvas copied read-only as the inline child.")
+    path: list[str] = Field(default_factory=list, description="Ids of nested nodes leading to the target level (default: root).")
+    name: str | None = Field(default=None, max_length=256, description="Title of the new child canvas.")
+    node: dict[str, Any] | None = Field(default=None, description="Placement/styling of the nested node (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`).")
     version: str | None = Field(default=None, max_length=256)
-    expected_revision: int | None = Field(default=None, ge=1)
-    nodes: list[NodemapNodeInput] = Field(default_factory=list)
-    edges: list[NodemapEdgeInput] = Field(default_factory=list)
-    groups: list[NodemapGroupInput] = Field(default_factory=list)
-    ops: list[dict[str, Any]] = Field(default_factory=list)
-    layout: dict[str, Any] | str | None = None
-    settings: dict[str, Any] | None = None
-    tours: list[NodemapTourInput] = Field(default_factory=list)
-    canvas: dict[str, Any] | None = None
-    hydrate: bool = True
-    auto_layout: str | None = None
+    include_preview: bool = Field(default=False, description="Keep computed `data.preview` geometry on nested nodes.")
 
 
-class NodemapMutateRequest(BaseModel):
-    """Atomic batch of declarative operations over a saved NodeMap canvas."""
+class NodemapGroupRequest(BaseModel):
+    """Stateless: move nodes of an in-memory canvas into a new inline nested node and rewire boundary edges. Nothing is saved on the server."""
 
     model_config = ConfigDict(extra="forbid")
 
-    ops: list[dict[str, Any]] = Field(default_factory=list)
-    upsert_nodes: list[NodemapNodeInput] | None = None
-    remove_nodes: list[str] | None = None
-    upsert_edges: list[NodemapEdgeInput] | None = None
-    remove_edges: list[str] | None = None
-    upsert_groups: list[NodemapGroupInput] | None = None
-    annotate: dict[str, Any] | None = None
-    upsert_tour: dict[str, Any] | None = None
-    upsert_tours: list[NodemapTourInput] | None = None
-    layout: dict[str, Any] | str | None = None
-    name: str | None = Field(default=None, max_length=256)
-    description: str | None = Field(default=None, max_length=2000)
+    canvas: dict[str, Any] = Field(description="Canvas document (inline format).")
+    node_ids: list[str] = Field(min_length=1, description="Ids of the nodes to move into the new nested node.")
+    path: list[str] = Field(default_factory=list, description="Ids of nested nodes leading to the target level (default: root).")
+    name: str | None = Field(default=None, max_length=256, description="Title of the new child canvas.")
+    node: dict[str, Any] | None = Field(default=None, description="Placement/styling of the nested node (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`).")
     version: str | None = Field(default=None, max_length=256)
-    expected_revision: int | None = Field(default=None, ge=1)
-    hydrate: bool = True
-    auto_layout: str | None = None
+    include_preview: bool = Field(default=False, description="Keep computed `data.preview` geometry on nested nodes.")
 
 
-class NodemapExpandRequest(BaseModel):
-    """Server-side graph expansion over a saved NodeMap canvas."""
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    mode: str = Field(pattern="^(struct_types|callgraph|callpath|kconfig|commit|impact_map)$")
-    node_id: str | None = Field(default=None, max_length=64)
-    struct: str | None = Field(default=None, max_length=256)
-    function: str | None = Field(default=None, max_length=256)
-    direction: str = Field(default="both", pattern="^(both|callers|callees|in|out)$")
-    from_func: str | None = Field(default=None, alias="from", max_length=256, description="Starting function name (callpath mode).")
-    to_func: str | None = Field(default=None, alias="to", max_length=256, description="Target function name (callpath mode).")
-    max_depth: int = Field(default=6, ge=1, le=10)
-    k: int = Field(default=5, ge=1, le=20)
-    symbol: str | None = Field(default=None, max_length=256)
-    arch: str = Field(default=DEFAULT_ARCH, max_length=64)
-    commit_hash: str | None = Field(default=None, max_length=64)
-    seed_kind: str | None = Field(default=None, max_length=64)
-    target: str | None = Field(default=None, max_length=512)
-    path: str | None = Field(default=None, max_length=512)
-    files: list[str] = Field(default_factory=list)
-    diff_text: str = Field(default="", max_length=200000)
-    title: str = Field(default="", max_length=256)
-    limit: int = Field(default=16, ge=1, le=100)
-    version: str | None = Field(default=None, max_length=256)
-    expected_revision: int | None = Field(default=None, ge=1)
-    auto_layout: str | bool | None = Field(default="dag")
-
-
-class NodemapLayoutRequest(BaseModel):
-    """Deterministic Sugiyama DAG or force-directed layout over a saved NodeMap canvas."""
+class NodemapHierarchyRequest(BaseModel):
+    """Stateless nested-hierarchy tree of an inline canvas (or a pre-existing server canvas read-only)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = Field(default="dag", pattern="^(dag|force)$")
-    group_id: str | None = Field(default=None, max_length=64)
-    node_ids: list[str] | None = None
-    fit_groups: bool = True
-    options: dict[str, Any] | None = None
-    expected_revision: int | None = Field(default=None, ge=1)
+    canvas: dict[str, Any] | None = Field(default=None, description="Inline canvas document; exactly one of `canvas` / `canvas_id`.")
+    canvas_id: str | None = Field(default=None, max_length=64, description="Pre-existing server canvas id (read-only).")
+    depth: int = Field(default=HIERARCHY_DEPTH_DEFAULT, ge=1, le=HIERARCHY_DEPTH_MAX, description="Maximum tree depth (1..32, default 8).")
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> NodemapHierarchyRequest:
+        if (self.canvas is None) == (self.canvas_id is None):
+            raise ValueError("Provide exactly one of `canvas` or `canvas_id`.")
+        return self
+
 
 
 @router.get("/nodemap/struct", dependencies=[Depends(require_feature("nodemap"))])
@@ -718,14 +705,26 @@ def list_nodemap_canvases(
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
-    """Paginated list of saved NodeMap canvases for the active repository."""
+    """Paginated read-only list of pre-existing server NodeMap canvases for the active repository."""
     return _with_repo(nodemap_canvas_service.list_canvases(q=q, limit=limit, offset=offset))
 
 
 @router.get("/nodemap/canvases/{canvas_id}", dependencies=[Depends(require_feature("nodemap"))])
-def get_nodemap_canvas(canvas_id: str) -> dict[str, Any]:
-    """Retrieve a saved NodeMap canvas document, metadata, and webapp URL."""
-    return _with_repo(nodemap_canvas_service.get_canvas(canvas_id))
+def get_nodemap_canvas(
+    canvas_id: str,
+    include_preview: Annotated[bool, Query(description="Keep computed `data.preview` geometry on nested nodes.")] = False,
+) -> dict[str, Any]:
+    """Read-only pre-existing server NodeMap canvas as a self-contained inline document (`data.canvas`), metadata, `warnings`, and webapp URL."""
+    return _with_repo(nodemap_canvas_service.get_canvas(canvas_id, include_preview=include_preview))
+
+
+@router.get("/nodemap/canvases/{canvas_id}/hierarchy", dependencies=[Depends(require_feature("nodemap"))])
+def get_nodemap_hierarchy(
+    canvas_id: str,
+    depth: Annotated[int, Query(ge=1, le=HIERARCHY_DEPTH_MAX)] = HIERARCHY_DEPTH_DEFAULT,
+) -> dict[str, Any]:
+    """Nested NodeMap reference tree, parents, and ancestors of a pre-existing server canvas (no node payloads)."""
+    return _with_repo(nodemap_canvas_service.canvas_hierarchy(canvas_id, depth=depth))
 
 
 @router.get("/nodemap/canvases/{canvas_id}/export", dependencies=[Depends(require_feature("nodemap"))])
@@ -734,13 +733,17 @@ def export_nodemap_canvas(
     format: Annotated[str, Query(pattern="^(json|mermaid|dot)$")] = "json",
     direction: Annotated[str, Query(pattern="^(LR|RL|TB|TD|BT)$")] = "LR",
 ) -> dict[str, Any]:
-    """Export a saved NodeMap canvas in `"json"`, `"mermaid"`, or `"dot"` format."""
+    """Export a pre-existing server NodeMap canvas in `"json"`, `"mermaid"`, or `"dot"` format."""
     return _with_repo(nodemap_canvas_service.export_saved_canvas(canvas_id, fmt=format, direction=direction))
 
 
 @router.post("/nodemap/preview", dependencies=[Depends(require_feature("nodemap"))])
 def preview_nodemap_canvas(payload: NodemapPreviewRequest) -> dict[str, Any]:
+<<<<<<< HEAD
     """Build a NodeMap canvas in one call (nothing saved): pass nodes by identifier, get importable `kip-nodemap-canvas` JSON and/or a mermaid/dot export. Use it whenever asked to create, draw or export a NodeMap; hydration resolves paths, astId, subjects and sizes."""
+=======
+    """Stateless NodeMap canvas builder (nothing is saved): normalize inline nested canvases recursively, hydrate, expand, lay out, and optionally export in memory; import the returned canvas JSON in the webapp NodeMap (Import JSON)."""
+>>>>>>> 1f9a73ac1e2a89cf0ec9a0011597b9f4484d4c83
     ver = resolve_version(payload.version)
     data = payload.model_dump(by_alias=True, exclude_none=True)
     if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):
@@ -750,86 +753,28 @@ def preview_nodemap_canvas(payload: NodemapPreviewRequest) -> dict[str, Any]:
     )
 
 
-@router.post(
-    "/nodemap/canvases",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def create_nodemap_canvas(payload: NodemapCreateRequest) -> dict[str, Any]:
-    """Create and persist a new NodeMap canvas document on disk."""
+@router.post("/nodemap/nest", dependencies=[Depends(require_feature("nodemap"))])
+def nest_nodemap_canvas(payload: NodemapNestRequest) -> dict[str, Any]:
+    """Stateless (nothing is saved on the server): add an inline nested NodeMap node (new empty, supplied `child`, or copied `server_canvas_id`) to `canvas`; import the returned canvas JSON in the webapp NodeMap (Import JSON)."""
     ver = resolve_version(payload.version)
     data = payload.model_dump(by_alias=True, exclude_none=True)
-    if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):
-        data["auto_layout"] = None
     return _with_repo(
-        nodemap_canvas_service.create_canvas(
-            data,
-            default_version=ver,
-            created_by=get_active_api_key_id() or "api",
-        )
+        nodemap_canvas_service.nest_canvas(data, default_version=ver, default_repo=get_active_repo_name())
     )
 
 
-@router.put(
-    "/nodemap/canvases/{canvas_id}",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def replace_nodemap_canvas(canvas_id: str, payload: NodemapReplaceRequest) -> dict[str, Any]:
-    """Replace a saved NodeMap canvas with optional `expected_revision` optimistic concurrency check."""
-    ver = resolve_version(payload.version) if payload.version else resolve_default_version()
-    data = payload.model_dump(by_alias=True, exclude_unset=True)
-    if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):
-        data["auto_layout"] = None
+@router.post("/nodemap/group", dependencies=[Depends(require_feature("nodemap"))])
+def group_nodemap_canvas(payload: NodemapGroupRequest) -> dict[str, Any]:
+    """Stateless (nothing is saved on the server): move `node_ids` of `canvas` into a new inline nested node; internal edges move along, boundary edges and tour steps are rewired; import the returned canvas JSON in the webapp NodeMap (Import JSON)."""
+    ver = resolve_version(payload.version)
+    data = payload.model_dump(by_alias=True, exclude_none=True)
     return _with_repo(
-        nodemap_canvas_service.replace_canvas(
-            canvas_id,
-            data,
-            default_version=ver,
-            updated_by=get_active_api_key_id() or "api",
-        )
+        nodemap_canvas_service.group_canvas(data, default_version=ver, default_repo=get_active_repo_name())
     )
 
 
-@router.delete(
-    "/nodemap/canvases/{canvas_id}",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def delete_nodemap_canvas(canvas_id: str) -> dict[str, Any]:
-    """Delete a saved NodeMap canvas JSON file."""
-    return _with_repo(nodemap_canvas_service.delete_canvas(canvas_id))
-
-
-@router.post(
-    "/nodemap/canvases/{canvas_id}/ops",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def mutate_nodemap_canvas(canvas_id: str, payload: NodemapMutateRequest) -> dict[str, Any]:
-    """Apply an atomic batch of declarative operations to a saved NodeMap canvas."""
+@router.post("/nodemap/hierarchy", dependencies=[Depends(require_feature("nodemap"))])
+def inspect_nodemap_hierarchy(payload: NodemapHierarchyRequest) -> dict[str, Any]:
+    """Stateless nested-hierarchy tree (titles, node/edge/nested counts, depth) of an inline `canvas` or a read-only server `canvas_id`; no node payloads."""
     data = payload.model_dump(by_alias=True, exclude_none=True)
-    if payload.version:
-        data["version"] = resolve_version(payload.version)
-    if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):
-        data["auto_layout"] = None
-    return _with_repo(nodemap_canvas_service.mutate_canvas(canvas_id, data))
-
-
-@router.post(
-    "/nodemap/canvases/{canvas_id}/expand",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def expand_nodemap_graph(canvas_id: str, payload: NodemapExpandRequest) -> dict[str, Any]:
-    """Expand a saved NodeMap canvas with server-side graph discovery (`struct_types`, `callgraph`, `callpath`, `kconfig`, `commit`, `impact_map`)."""
-    data = payload.model_dump(by_alias=True, exclude_none=True)
-    if payload.version:
-        data["version"] = resolve_version(payload.version)
-    if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):
-        data["auto_layout"] = None
-    return _with_repo(nodemap_canvas_service.expand_canvas(canvas_id, data))
-
-
-@router.post(
-    "/nodemap/canvases/{canvas_id}/layout",
-    dependencies=[Depends(require_feature("nodemap")), Depends(require_write_scope("nodemap:write"))],
-)
-def layout_nodemap_canvas(canvas_id: str, payload: NodemapLayoutRequest) -> dict[str, Any]:
-    """Run deterministic Sugiyama `"dag"` or `"force"` layout over a saved NodeMap canvas."""
-    return _with_repo(nodemap_canvas_service.layout_canvas(canvas_id, payload.model_dump(by_alias=True, exclude_none=True)))
+    return _with_repo(nodemap_canvas_service.inline_hierarchy(data, default_repo=get_active_repo_name()))

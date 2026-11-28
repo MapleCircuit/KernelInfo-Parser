@@ -718,7 +718,7 @@ class TestAiApiEndpoints(unittest.TestCase):
         self.assertEqual(r_nm_src.json()["repo"], "linux")
         self.assertEqual((r_nm_src.json()["start_line"], r_nm_src.json()["end_line"]), (3, 5))
 
-    def test_nodemap_canvas_authoring_expansion_layout_preview_and_export(self) -> None:
+    def test_nodemap_stateless_preview_with_ops_and_export(self) -> None:
         # 1. Stateless preview works in default read-only mode
         r_prev = self.client.post(
             "/api/v1/nodemap/preview",
@@ -758,161 +758,201 @@ class TestAiApiEndpoints(unittest.TestCase):
         self.assertEqual(edge0["fromField"], "2:a")
         self.assertEqual(edge0["lockKind"], "rcu")
 
-        # 2. Write endpoints are denied (403) when api.allow_writes is False
-        r_denied = self.client.post(
-            "/api/v1/nodemap/canvases",
-            headers=self.auth,
-            json={"id": "vfs-map", "name": "VFS Map"},
-        )
-        self.assertEqual(r_denied.status_code, 403)
+    # ------------------------------------------------------------------ stateless NodeMap (nothing is saved)
 
-        # 3. Enable allow_writes + configure a key with nodemap:write and a read-only key
+    def _canvas_client(self) -> tuple[TestClient, Path]:
+        """Client with writes fully enabled and a temp canvas dir; used to prove no route can persist canvases."""
         cfg = core_config.get_config()
+        canvas_dir = Path(self._tmp.name) / "canvases"
+        (canvas_dir / "linux").mkdir(parents=True, exist_ok=True)
         cfg["api"]["allow_writes"] = True
-        cfg["api"]["keys"] = {
-            "reader": {"key": "read-only-secret", "scopes": ["read"]},
-            "writer": {"key": "write-secret", "scopes": ["read", "nodemap:write"]},
-        }
-        client = TestClient(create_app())
-        read_hdr = {"Authorization": "Bearer read-only-secret"}
-        write_hdr = {"Authorization": "Bearer write-secret"}
+        cfg["api"]["nodemap_canvas_dir"] = str(canvas_dir)
+        cfg["api"]["keys"] = {"writer": {"key": "write-secret", "scopes": ["read", "nodemap:write"]}}
+        self.assertEqual(core_config.get_nodemap_canvas_dir(), canvas_dir)
+        return TestClient(create_app()), canvas_dir
 
-        # Reader key still gets 403 on write endpoints
+    @staticmethod
+    def _note(nid: str, text: str = "x") -> dict:
+        return {"id": nid, "type": "note", "x": 0, "y": 0, "w": 200, "h": 100, "data": {"text": text}}
+
+    @classmethod
+    def _chain(cls) -> dict:
+        """A -> B -> C inline: root holds `na` (nodemap) holding `nb` (nodemap) holding a leaf note."""
+        c = {"schema": "kip-nodemap-canvas", "version": 1, "nodes": [cls._note("leaf", "deep")], "edges": []}
+        b = {"schema": "kip-nodemap-canvas", "version": 1,
+             "nodes": [{"id": "nc", "type": "nodemap", "x": 0, "y": 0, "w": 300, "h": 200, "data": {"canvas": c}}], "edges": []}
+        return {"schema": "kip-nodemap-canvas", "version": 1,
+                "nodes": [cls._note("top"), {"id": "nb", "type": "nodemap", "x": 400, "y": 0, "w": 300, "h": 200, "data": {"canvas": b}}],
+                "edges": [{"id": "e1", "from": "top", "to": "nb"}]}
+
+    @staticmethod
+    def _tree_files(root: Path) -> list[str]:
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+    def test_nodemap_canvas_write_routes_removed_and_nothing_persisted(self) -> None:
+        client, canvas_dir = self._canvas_client()
+        hdr = {"Authorization": "Bearer write-secret"}
+        before = self._tree_files(canvas_dir)
+        base = "/api/v1/nodemap/canvases"
+        attempts = [
+            ("post", base, {"id": "m", "name": "M"}),
+            ("put", f"{base}/m", {"name": "M"}),
+            ("delete", f"{base}/m", None),
+            ("post", f"{base}/m/ops", {"ops": []}),
+            ("post", f"{base}/m/expand", {"mode": "kconfig", "symbol": "X"}),
+            ("post", f"{base}/m/layout", {"mode": "dag"}),
+            ("post", f"{base}/m/nested", {}),
+            ("post", f"{base}/m/group", {"node_ids": ["a"]}),
+        ]
+        for method, url, body in attempts:
+            kwargs = {"json": body} if body is not None else {}
+            r = getattr(client, method)(url, headers=hdr, **kwargs)
+            self.assertIn(r.status_code, (404, 405), f"{method.upper()} {url} -> {r.status_code}")
+        self.assertEqual(self._tree_files(canvas_dir), before)
+        self.assertEqual(before, [])
+        # catalog has no write-scoped entry and capabilities report read-only
+        caps = client.get("/api/v1/capabilities", headers=hdr).json()
+        self.assertTrue(caps["read_only"])
+        self.assertTrue(caps["mcp"]["read_only"])
+        self.assertFalse([e for e in caps["endpoints"] if e.get("scope")])
+        nodemap_eps = {(e["method"], e["path"]) for e in caps["endpoints"] if "/nodemap/" in e["path"]}
         self.assertEqual(
-            client.post("/api/v1/nodemap/canvases", headers=read_hdr, json={"id": "vfs-map", "name": "VFS"}).status_code,
-            403,
+            {m for m, _ in nodemap_eps if m != "GET"} , {"POST"},
         )
-
-        # Path traversal in canvas_id is rejected with 400
-        for bad_id in ("../evil", "a/b", "bad.id", ""):
-            r_bad = client.post("/api/v1/nodemap/canvases", headers=write_hdr, json={"id": bad_id, "name": "Bad"})
-            self.assertIn(r_bad.status_code, (400, 422), bad_id)
-
-        # Create a canvas with write_hdr
-        r_create = client.post(
-            "/api/v1/nodemap/canvases",
-            headers=write_hdr,
-            json={"id": "foo-map", "name": "Foo Architecture", "description": "Foo subsystem overview", "version": "v3.0"},
-        )
-        self.assertEqual(r_create.status_code, 200, r_create.text)
-        created = r_create.json()
-        self.assertEqual(created["id"], "foo-map")
-        self.assertEqual(created["revision"], 1)
-        self.assertEqual(created["created_by"], "writer")
-        self.assertEqual(created["webapp_url"], "/#v=v3.0&tab=nodemap&canvas=foo-map")
-
-        # Duplicate create without overwrite fails with 409
         self.assertEqual(
-            client.post("/api/v1/nodemap/canvases", headers=write_hdr, json={"id": "foo-map", "name": "Dup"}).status_code,
-            409,
+            sorted(p for m, p in nodemap_eps if m == "POST"),
+            ["/api/v1/nodemap/group", "/api/v1/nodemap/hierarchy", "/api/v1/nodemap/nest", "/api/v1/nodemap/preview"],
         )
 
-        # Batch ops: add_nodes, add_group, assign_group, connect, annotate, upsert_tour
-        r_ops = client.post(
-            "/api/v1/nodemap/canvases/foo-map/ops",
-            headers=write_hdr,
-            json={
-                "expected_revision": 1,
-                "ops": [
-                    {
-                        "op": "add_nodes",
-                        "hydrate": True,
-                        "nodes": [
-                            {"id": "n_foo", "type": "struct", "data": {"name": "foo", "hint": "include/linux/foo.h"}},
-                            {"id": "n_fn", "type": "source", "data": {"path": "kernel/foo.c", "symbol": "foo_helper"}},
-                        ],
-                    },
-                    {"op": "add_group", "id": "g_core", "title": "Core", "members": ["n_foo", "n_fn"], "fit_to_members": True},
-                    {"op": "connect", "id": "e_foo_fn", "from": "n_foo", "fromField": "a", "to": "n_fn", "preset": "data_flow"},
-                    {"op": "annotate", "id": "n_note", "target_id": "n_foo", "title": "Lock Note", "text": "Protected by RCU."},
-                    {
-                        "op": "upsert_tour",
-                        "tour": {
-                            "id": "t_walk",
-                            "title": "Walkthrough",
-                            "steps": [{"nodeId": "n_foo", "title": "Step 1", "caption": "Inspect struct foo"}],
-                        },
-                    },
-                ],
-            },
-        )
-        self.assertEqual(r_ops.status_code, 200, r_ops.text)
-        after_ops = r_ops.json()
-        self.assertEqual(after_ops["revision"], 2)
-        self.assertEqual(after_ops["node_count"], 4)  # n_foo, n_fn, g_core, n_note
-        self.assertEqual(after_ops["edge_count"], 2)  # e_foo_fn + note edge
-        self.assertEqual(after_ops["tour_count"], 1)
+    def test_nodemap_readonly_access_to_preexisting_server_canvases(self) -> None:
+        client, canvas_dir = self._canvas_client()
+        hdr = {"Authorization": "Bearer write-secret"}
+        def put(cid: str, nodes: list) -> None:
+            doc = {"id": cid, "name": f"Canvas {cid}", "canvas": {"schema": "kip-nodemap-canvas", "version": 1, "nodes": nodes, "edges": []}}
+            (canvas_dir / "linux" / f"{cid}.json").write_text(json.dumps(doc), encoding="utf-8")
+        put("q", [self._note("qn")])
+        put("p", [self._note("pn"), {"id": "ref_q", "type": "nodemap", "x": 0, "y": 0, "w": 300, "h": 200, "data": {"canvasId": "q"}},
+                  {"id": "ref_gone", "type": "nodemap", "x": 0, "y": 300, "w": 300, "h": 200, "data": {"canvasId": "nope"}}])
+        before = {n: (canvas_dir / n).read_text() for n in self._tree_files(canvas_dir)}
 
-        # Stale expected_revision returns 409 Conflict
-        r_conflict = client.post(
-            "/api/v1/nodemap/canvases/foo-map/ops",
-            headers=write_hdr,
-            json={"expected_revision": 1, "ops": [{"op": "remove_edges", "ids": ["e_foo_fn"]}]},
-        )
-        self.assertEqual(r_conflict.status_code, 409)
-
-        # Expand canvas (kconfig mode + callgraph mode + impact_map mode)
-        with patch("webapp.backend.services.nodemap_canvas_service._kconfig_service.get_symbol_detail", return_value={
-            "name": "FOO_BAR", "depends_on": ["BAR_DEP"], "selects": ["BAZ_SEL"],
-        }):
-            r_exp = client.post(
-                "/api/v1/nodemap/canvases/foo-map/expand",
-                headers=write_hdr,
-                json={"mode": "kconfig", "symbol": "FOO_BAR", "version": "v3.0", "auto_layout": True},
-            )
-            self.assertEqual(r_exp.status_code, 200, r_exp.text)
-            self.assertGreaterEqual(len(r_exp.json()["added_node_ids"]), 2)
-
-        with patch("webapp.backend.services.nodemap_canvas_service._callgraph_service.get_function_callgraph", return_value={
-            "version": "v3.0", "file_path": "kernel/foo.c", "line_s": 3, "line_e": 5,
-            "callers": [{"name": "main_entry", "file_path": "kernel/foo.c", "line_s": 6, "line_e": 8}],
-            "callees": [],
-        }):
-            r_exp_cg = client.post(
-                "/api/v1/nodemap/canvases/foo-map/expand",
-                headers=write_hdr,
-                json={"mode": "callgraph", "function": "foo_helper", "version": "v3.0", "auto_layout": True},
-            )
-            self.assertEqual(r_exp_cg.status_code, 200, r_exp_cg.text)
-            self.assertGreaterEqual(len(r_exp_cg.json()["added_node_ids"]), 2)
-
-        r_exp_imp = client.post(
-            "/api/v1/nodemap/canvases/foo-map/expand",
-            headers=write_hdr,
-            json={"mode": "impact_map", "seed_kind": "file", "target": "kernel/foo.c", "version": "v3.0"},
-        )
-        self.assertEqual(r_exp_imp.status_code, 200, r_exp_imp.text)
-        self.assertGreaterEqual(len(r_exp_imp.json()["added_node_ids"]), 1)
-
-        # Layout endpoint ("force" and "dag")
-        for mode in ("dag", "force"):
-            r_lay = client.post(
-                "/api/v1/nodemap/canvases/foo-map/layout",
-                headers=write_hdr,
-                json={"mode": mode, "fit_groups": True},
-            )
-            self.assertEqual(r_lay.status_code, 200, r_lay.text)
-
-        # List, Get, and Export (json, mermaid, dot) work with read-only key
-        r_list = client.get("/api/v1/nodemap/canvases?q=Foo", headers=read_hdr)
+        r_list = client.get("/api/v1/nodemap/canvases", headers=hdr)
         self.assertEqual(r_list.status_code, 200)
-        self.assertEqual(r_list.json()["total"], 1)
-        self.assertEqual(r_list.json()["items"][0]["id"], "foo-map")
+        self.assertEqual(sorted(i["id"] for i in r_list.json()["items"]), ["p", "q"])
+        self.assertNotIn("insertable", json.dumps(r_list.json()))
 
-        r_get = client.get("/api/v1/nodemap/canvases/foo-map", headers=read_hdr)
-        self.assertEqual(r_get.status_code, 200)
-        self.assertEqual(r_get.json()["id"], "foo-map")
+        r_get = client.get("/api/v1/nodemap/canvases/p", headers=hdr)
+        self.assertEqual(r_get.status_code, 200, r_get.text)
+        body = r_get.json()
+        self.assertNotIn("nested_maps", body)
+        by_id = {n["id"]: n for n in body["canvas"]["nodes"]}
+        inner = by_id["ref_q"]["data"]["canvas"]
+        self.assertEqual([n["id"] for n in inner["nodes"]], ["qn"])
+        self.assertNotIn("canvasId", by_id["ref_q"]["data"])
+        self.assertEqual(by_id["ref_q"]["data"]["summary"]["nodes"], 1)
+        self.assertNotIn("preview", by_id["ref_q"]["data"])
+        self.assertNotIn("canvas", by_id["ref_gone"]["data"])
+        self.assertTrue(any(w["code"] == "missing_reference" and w["canvas_id"] == "nope" for w in body["warnings"]))
+        r_prev = client.get("/api/v1/nodemap/canvases/p?include_preview=true", headers=hdr)
+        self.assertIn("preview", {n["id"]: n for n in r_prev.json()["canvas"]["nodes"]}["ref_q"]["data"])
 
-        for fmt, marker in (("json", '"kip-nodemap-canvas"'), ("mermaid", "flowchart"), ("dot", "digraph NodeMap")):
-            r_ex = client.get(f"/api/v1/nodemap/canvases/foo-map/export?format={fmt}", headers=read_hdr)
-            self.assertEqual(r_ex.status_code, 200)
-            self.assertIn(marker, r_ex.json()["content"])
+        r_exp = client.get("/api/v1/nodemap/canvases/p/export?format=json", headers=hdr)
+        self.assertEqual(r_exp.status_code, 200)
+        self.assertIn('"canvas"', r_exp.json()["content"])
+        r_h = client.get("/api/v1/nodemap/canvases/p/hierarchy", headers=hdr)
+        self.assertEqual(r_h.status_code, 200)
+        self.assertNotIn("invalid_targets", r_h.json())
+        self.assertEqual(client.get("/api/v1/nodemap/canvases/missing", headers=hdr).status_code, 404)
 
-        # Delete canvas
-        r_del = client.delete("/api/v1/nodemap/canvases/foo-map", headers=write_hdr)
-        self.assertEqual(r_del.status_code, 200)
-        self.assertTrue(r_del.json()["deleted"])
-        self.assertEqual(client.get("/api/v1/nodemap/canvases/foo-map", headers=read_hdr).status_code, 404)
+        r_sh = client.post("/api/v1/nodemap/hierarchy", headers=hdr, json={"canvas_id": "p"})
+        self.assertEqual(r_sh.status_code, 200, r_sh.text)
+        self.assertEqual(client.post("/api/v1/nodemap/hierarchy", headers=hdr, json={}).status_code, 422)
+        self.assertEqual(
+            client.post("/api/v1/nodemap/hierarchy", headers=hdr, json={"canvas_id": "p", "canvas": {}}).status_code, 422
+        )
+        after = {n: (canvas_dir / n).read_text() for n in self._tree_files(canvas_dir)}
+        self.assertEqual(after, before)
+
+    def test_nodemap_stateless_preview_nest_group_hierarchy(self) -> None:
+        client, canvas_dir = self._canvas_client()
+        hdr = {"Authorization": "Bearer write-secret"}
+
+        # preview: recursive normalize A->B->C, summaries always, preview geometry only on request
+        r = client.post("/api/v1/nodemap/preview", headers=hdr, json={"canvas": self._chain(), "hydrate": False})
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["nested_depth"], 2)
+        self.assertEqual(out["nested_count"], 2)
+        nb = {n["id"]: n for n in out["canvas"]["nodes"]}["nb"]["data"]
+        self.assertEqual(nb["summary"]["depth"], 1)
+        self.assertNotIn("preview", nb)
+        nc = nb["canvas"]["nodes"][0]["data"]
+        self.assertEqual(nc["canvas"]["nodes"][0]["id"], "leaf")
+        r2 = client.post("/api/v1/nodemap/preview", headers=hdr, json={"canvas": self._chain(), "hydrate": False, "include_preview": True})
+        self.assertIn("preview", {n["id"]: n for n in r2.json()["canvas"]["nodes"]}["nb"]["data"])
+
+        # nest: empty child, inline child, nested target path, server canvas copied read-only
+        root = {"schema": "kip-nodemap-canvas", "version": 1, "nodes": [self._note("a")], "edges": []}
+        r_n = client.post("/api/v1/nodemap/nest", headers=hdr, json={"canvas": root, "name": "Child B", "node": {"id": "nb"}})
+        self.assertEqual(r_n.status_code, 200, r_n.text)
+        n1 = r_n.json()
+        self.assertEqual(n1["node_id"], "nb")
+        self.assertEqual(n1["nested_count"], 1)
+        r_n2 = client.post(
+            "/api/v1/nodemap/nest", headers=hdr,
+            json={"canvas": n1["canvas"], "path": ["nb"], "child": {"schema": "kip-nodemap-canvas", "version": 1, "nodes": [self._note("z")], "edges": []}, "node": {"id": "nc"}},
+        )
+        self.assertEqual(r_n2.status_code, 200, r_n2.text)
+        n2 = r_n2.json()
+        self.assertEqual(n2["nested_depth"], 2)
+        self.assertEqual(n2["path"], ["nb"])
+        top = {n["id"]: n for n in n2["canvas"]["nodes"]}
+        self.assertEqual(top["nb"]["data"]["canvas"]["nodes"][0]["data"]["canvas"]["nodes"][0]["id"], "z")
+        # both child and server_canvas_id -> 422; unknown path -> 422; depth over 8 -> 422
+        self.assertEqual(client.post("/api/v1/nodemap/nest", headers=hdr, json={"canvas": root, "child": root, "server_canvas_id": "x"}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/nodemap/nest", headers=hdr, json={"canvas": root, "path": ["ghost"]}).status_code, 422)
+        deep = {"schema": "kip-nodemap-canvas", "version": 1, "nodes": [self._note("leaf")], "edges": []}
+        for i in range(9):
+            deep = {"schema": "kip-nodemap-canvas", "version": 1, "nodes": [{"id": f"d{i}", "type": "nodemap", "x": 0, "y": 0, "w": 300, "h": 200, "data": {"canvas": deep}}], "edges": []}
+        self.assertEqual(client.post("/api/v1/nodemap/preview", headers=hdr, json={"canvas": deep, "hydrate": False}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/nodemap/nest", headers=hdr, json={"canvas": deep}).status_code, 422)
+
+        # group: moves nodes + internal edges, rewires boundary edges, retargets tour steps
+        g_canvas = {
+            "schema": "kip-nodemap-canvas", "version": 1,
+            "nodes": [self._note("a"), self._note("b"), self._note("c")],
+            "edges": [{"id": "ab", "from": "a", "to": "b"}, {"id": "bc", "from": "b", "to": "c"}],
+            "tours": [{"id": "t1", "title": "T", "steps": [{"nodeIds": ["a"], "title": "s"}]}],
+        }
+        r_g = client.post("/api/v1/nodemap/group", headers=hdr, json={"canvas": g_canvas, "node_ids": ["a", "b"], "name": "AB", "node": {"id": "grp"}})
+        self.assertEqual(r_g.status_code, 200, r_g.text)
+        g = r_g.json()
+        self.assertEqual(sorted(g["moved_node_ids"]), ["a", "b"])
+        self.assertEqual(g["rewired_edge_ids"], ["bc"])
+        gn = {n["id"]: n for n in g["canvas"]["nodes"]}
+        self.assertEqual(sorted(gn), ["c", "grp"])
+        self.assertEqual(sorted(n["id"] for n in gn["grp"]["data"]["canvas"]["nodes"]), ["a", "b"])
+        self.assertEqual([e["id"] for e in gn["grp"]["data"]["canvas"]["edges"]], ["ab"])
+        bc = next(e for e in g["canvas"]["edges"] if e["id"] == "bc")
+        self.assertEqual((bc["from"], bc["to"]), ("grp", "c"))
+        self.assertEqual(g["canvas"]["tours"][0]["steps"][0]["nodeIds"], ["grp"])
+        self.assertEqual(client.post("/api/v1/nodemap/group", headers=hdr, json={"canvas": g_canvas, "node_ids": []}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/nodemap/group", headers=hdr, json={"canvas": g_canvas, "node_ids": ["nope"]}).status_code, 422)
+
+        # parent edge targeting a node that exists only inside a nested child -> 422
+        bad = {**g["canvas"], "edges": [*g["canvas"]["edges"], {"id": "bad", "from": "c", "to": "a"}]}
+        self.assertEqual(client.post("/api/v1/nodemap/preview", headers=hdr, json={"canvas": bad, "hydrate": False}).status_code, 422)
+
+        # inline hierarchy
+        r_h = client.post("/api/v1/nodemap/hierarchy", headers=hdr, json={"canvas": self._chain(), "depth": 8})
+        self.assertEqual(r_h.status_code, 200, r_h.text)
+        h = r_h.json()
+        self.assertEqual(h["nested_depth"], 2)
+        self.assertEqual(h["tree"]["children"][0]["node_id"], "nb")
+        self.assertEqual(client.post("/api/v1/nodemap/hierarchy", headers=hdr, json={"canvas": self._chain(), "depth": 99}).status_code, 422)
+
+        # strictness: unknown node type inside a nested canvas is rejected via the pydantic/strict path
+        # and nothing was written
+        self.assertEqual(self._tree_files(canvas_dir), [])
 
     def test_p1_kapi_mail_kconfig_history_pahole_and_maintainers(self) -> None:
         # 1. KAPI endpoints (summary, syscalls, exports, params, tracepoints, modules, devices)

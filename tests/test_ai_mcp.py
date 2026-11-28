@@ -514,12 +514,16 @@ class TestMcpTools(_McpFixture):
         with patch("api.routers.v1.callpath_state", return_value={"state": "done", "result": {"paths": []}}):
             self.assertToolOk(self.call("get_callpath", {"from": "a", "to": "b"}))
 
-    def test_write_scoped_mcp_tools_visibility_and_execution(self) -> None:
-        # 1. Default (allow_writes=False): write tools hidden from tools/list and return 403 on tools/call
+    def test_no_write_tools_exist_even_with_writes_enabled(self) -> None:
+        removed = ('create_nodemap_canvas', 'replace_nodemap_canvas', 'delete_nodemap_canvas', 'mutate_nodemap_canvas', 'expand_nodemap_graph', 'layout_nodemap_canvas', 'attach_nested_nodemap', 'group_nodemap_nodes')
+        # 1. Default: removed canvas-write tools are absent; calling one is an unknown-tool protocol error
         default_names = {t["name"] for t in self.rpc("tools/list", {}).json()["result"]["tools"]}
         self.assertIn("preview_nodemap_canvas", default_names)
-        self.assertNotIn("create_nodemap_canvas", default_names)
-        self.assertToolError(self.call("create_nodemap_canvas", {"id": "mcp-map", "name": "MCP Map"}), 403)
+        for name in removed:
+            self.assertNotIn(name, default_names)
+            self.assertNotIn(name, mcp.TOOLS)
+            r = self.rpc("tools/call", {"name": name, "arguments": {}})
+            self.assertEqual(r.json()["error"]["code"], mcp.INVALID_PARAMS)
 
         # 2. Stateless preview works via MCP in read-only mode (compact export omits canvas + export_content)
         prev = self.assertToolOk(
@@ -579,7 +583,7 @@ class TestMcpTools(_McpFixture):
         self.assertIn("locks", prev_v["canvas"]["nodes"][0])
         self.assertIn("collapsed", prev_v["canvas"]["nodes"][0]["data"])
 
-        # 3. Enable allow_writes with a scoped key -> write tools appear in tools/list and execute via tools/call
+        # 3. Writes enabled + nodemap:write scope: still no extra tools, nothing requires a write scope
         cfg = core_config.get_config()
         cfg["api"]["allow_writes"] = True
         cfg["api"]["keys"] = {
@@ -595,74 +599,146 @@ class TestMcpTools(_McpFixture):
                 headers={"Authorization": f"Bearer {token}"},
             ).json()
 
-        read_tools = {t["name"] for t in rpc_with("mcp-read-token", "tools/list")["result"]["tools"]}
+        read_tools = {t["name"]: t for t in rpc_with("mcp-read-token", "tools/list")["result"]["tools"]}
         write_tools = {t["name"]: t for t in rpc_with("mcp-write-token", "tools/list")["result"]["tools"]}
-        self.assertNotIn("create_nodemap_canvas", read_tools)
-        self.assertIn("create_nodemap_canvas", write_tools)
-        self.assertFalse(write_tools["create_nodemap_canvas"]["annotations"]["readOnlyHint"])
-        self.assertTrue(write_tools["delete_nodemap_canvas"]["annotations"]["destructiveHint"])
-        self.assertTrue(write_tools["replace_nodemap_canvas"]["annotations"]["idempotentHint"])
+        self.assertEqual(set(read_tools), set(write_tools))
+        self.assertEqual(set(read_tools), set(mcp.TOOLS))
+        self.assertFalse([n for n, t in mcp.TOOLS.items() if t.required_scope])
+        for name, tool in write_tools.items():
+            self.assertTrue(tool["annotations"]["readOnlyHint"], name)
+            self.assertFalse(tool["annotations"]["destructiveHint"], name)
+        for name in removed:
+            self.assertNotIn(name, write_tools)
+            r = rpc_with("mcp-write-token", "tools/call", {"name": name, "arguments": {}})
+            self.assertEqual(r["error"]["code"], mcp.INVALID_PARAMS)
+        for name in ("preview_nodemap_canvas", "nest_nodemap_canvas", "group_nodemap_canvas", "inspect_nodemap_hierarchy",
+                     "get_nodemap_canvas", "get_nodemap_hierarchy", "export_nodemap_canvas", "list_nodemap_canvases"):
+            self.assertIn(name, read_tools)
+        for name in ("nest_nodemap_canvas", "group_nodemap_canvas", "preview_nodemap_canvas"):
+            self.assertIn("nothing is saved", mcp.TOOLS[name].description.lower())
+        self.assertNotIn("insertable_into", read_tools["list_nodemap_canvases"]["inputSchema"]["properties"])
 
-        # Reader token gets 403 on write tool call and accurate read_only capabilities
-        ro_caps = rpc_with("mcp-read-token", "tools/call", {"name": "get_capabilities", "arguments": {}})["result"]["structuredContent"]
-        self.assertTrue(ro_caps["read_only"])
-        self.assertEqual(ro_caps["scopes"], ["read"])
-        self.assertEqual(ro_caps["mcp"]["tools"], len(read_tools))
+        for token in ("mcp-read-token", "mcp-write-token"):
+            caps = rpc_with(token, "tools/call", {"name": "get_capabilities", "arguments": {}})["result"]["structuredContent"]
+            self.assertTrue(caps["read_only"])
+            self.assertTrue(caps["mcp"]["read_only"])
+            self.assertEqual(caps["mcp"]["tools"], len(mcp.TOOLS))
 
-        rw_caps = rpc_with("mcp-write-token", "tools/call", {"name": "get_capabilities", "arguments": {}})["result"]["structuredContent"]
-        self.assertFalse(rw_caps["read_only"])
-        self.assertEqual(rw_caps["scopes"], ["nodemap:write", "read"])
-        self.assertEqual(rw_caps["mcp"]["tools"], len(mcp.TOOLS))
+    def test_nested_nodemap_stateless_tools_readonly_server_canvases_and_projection(self) -> None:
+        canvas_dir = Path(self._tmp.name) / "canvases"
+        (canvas_dir / "linux").mkdir(parents=True)
+        cfg = core_config.get_config()
+        cfg["api"]["allow_writes"] = True
+        cfg["api"]["nodemap_canvas_dir"] = str(canvas_dir)
+        cfg["api"]["keys"] = {"writer": {"key": "mcp-write-token", "scopes": ["read", "nodemap:write"]}}
+        client = TestClient(create_app())
 
-        r_denied = rpc_with(
-            "mcp-read-token",
-            "tools/call",
-            {"name": "create_nodemap_canvas", "arguments": {"id": "mcp-map", "name": "MCP Map"}},
-        )["result"]
-        self.assertTrue(r_denied["isError"])
-        self.assertEqual(r_denied["structuredContent"]["error"]["status"], 403)
+        def call(name: str, arguments: dict) -> dict:
+            r = client.post(
+                mcp.MCP_PATH,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}},
+                headers={"Authorization": "Bearer mcp-write-token"},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["result"]
 
-        # Writer token creates, mutates, lays out, and deletes canvas via MCP
-        r_created = rpc_with(
-            "mcp-write-token",
-            "tools/call",
-            {"name": "create_nodemap_canvas", "arguments": {"id": "mcp-map", "name": "MCP Map", "version": "v3.0"}},
-        )["result"]
-        self.assertFalse(r_created["isError"], r_created)
-        self.assertEqual(r_created["structuredContent"]["id"], "mcp-map")
+        def note(nid: str) -> dict:
+            return {"id": nid, "type": "note", "x": 0, "y": 0, "w": 200, "h": 100, "data": {"text": nid}}
 
-        r_mut = rpc_with(
-            "mcp-write-token",
-            "tools/call",
-            {
-                "name": "mutate_nodemap_canvas",
-                "arguments": {
-                    "canvas_id": "mcp-map",
-                    "expected_revision": 1,
-                    "ops": [
-                        {
-                            "op": "add_nodes",
-                            "nodes": [{"id": "n1", "type": "note", "title": "Hello", "data": {"text": "World"}}],
-                        }
-                    ],
-                },
-            },
-        )["result"]
-        self.assertFalse(r_mut["isError"], r_mut)
-        self.assertEqual(r_mut["structuredContent"]["node_count"], 1)
+        def doc(nodes: list, edges: list | None = None) -> dict:
+            return {"schema": "kip-nodemap-canvas", "version": 1, "nodes": nodes, "edges": edges or []}
 
-        r_del = rpc_with(
-            "mcp-write-token",
-            "tools/call",
-            {"name": "delete_nodemap_canvas", "arguments": {"canvas_id": "mcp-map"}},
-        )["result"]
-        self.assertFalse(r_del["isError"], r_del)
-        self.assertTrue(r_del["structuredContent"]["deleted"])
+        def files() -> list:
+            return sorted(p.name for p in canvas_dir.rglob("*") if p.is_file())
+
+        tools = mcp.TOOLS
+        self.assertEqual(tools["group_nodemap_canvas"].input_schema["properties"]["node_ids"]["minItems"], 1)
+        self.assertEqual(tools["nest_nodemap_canvas"].input_schema["required"], ["canvas"])
+        for name in ("nest_nodemap_canvas", "group_nodemap_canvas"):
+            self.assertIn("Import JSON", tools[name].description)
+            self.assertIn("include_preview", tools[name].input_schema["properties"])
+
+        # nest: result carries the complete importable canvas (not compacted); nothing saved
+        nested = self.assertToolOk(call("nest_nodemap_canvas", {"canvas": doc([note("a")]), "name": "Kid", "node": {"id": "sub"}}))
+        self.assertEqual(nested["node_id"], "sub")
+        sub = {n["id"]: n for n in nested["canvas"]["nodes"]}["sub"]["data"]
+        self.assertEqual(sub["summary"]["nodes"], 0)
+        self.assertIn("canvas", sub)
+        self.assertNotIn("preview", sub)
+        second = self.assertToolOk(call("nest_nodemap_canvas", {
+            "canvas": nested["canvas"], "path": ["sub"], "child": doc([note("leaf")]), "node": {"id": "sub2"},
+        }))
+        self.assertEqual(second["nested_depth"], 2)
+        with_prev = self.assertToolOk(call("nest_nodemap_canvas", {"canvas": doc([note("a")]), "node": {"id": "s"}, "include_preview": True}))
+        self.assertIn("preview", {n["id"]: n for n in with_prev["canvas"]["nodes"]}["s"]["data"])
+
+        # group
+        grouped = self.assertToolOk(call("group_nodemap_canvas", {
+            "canvas": doc([note("a"), note("b"), note("c")], [{"id": "ab", "from": "a", "to": "b"}, {"id": "bc", "from": "b", "to": "c"}]),
+            "node_ids": ["a", "b"], "node": {"id": "grp"},
+        }))
+        self.assertEqual(sorted(grouped["moved_node_ids"]), ["a", "b"])
+        self.assertEqual(grouped["rewired_edge_ids"], ["bc"])
+        gnodes = {n["id"]: n for n in grouped["canvas"]["nodes"]}
+        self.assertEqual(sorted(n["id"] for n in gnodes["grp"]["data"]["canvas"]["nodes"]), ["a", "b"])
+        self.assertToolError(call("group_nodemap_canvas", {"canvas": doc([note("a")]), "node_ids": []}), 422)
+        self.assertToolError(call("group_nodemap_canvas", {"canvas": doc([note("a")]), "node_ids": ["zz"]}), 422)
+
+        # strict validation: ports on nested nodes and unknown node types inside nested canvases are rejected
+        ported = doc([note("b"), {"id": "n", "type": "nodemap", "data": {}}], [{"from": "b", "to": "n", "toField": "x"}])
+        self.assertToolError(call("preview_nodemap_canvas", {"canvas": ported}), 422)
+        bad_inner = doc([{"id": "n", "type": "nodemap", "data": {"canvas": doc([{"id": "q", "type": "bogus"}])}}])
+        self.assertToolError(call("preview_nodemap_canvas", {"canvas": bad_inner}), 422)
+        self.assertToolError(call("nest_nodemap_canvas", {"canvas": bad_inner}), 422)
+
+        # preview: nested summaries kept, preview geometry only with include_preview (also in compact output)
+        chain = doc([{"id": "n1", "type": "nodemap", "x": 0, "y": 0, "w": 300, "h": 200, "data": {"canvas": doc([note("x")])}}])
+        prev = self.assertToolOk(call("preview_nodemap_canvas", {"canvas": chain, "hydrate": False}))
+        pdata = prev["canvas"]["nodes"][0]["data"]
+        self.assertEqual(pdata["canvas"]["nodes"][0]["id"], "x")
+        self.assertEqual(pdata["summary"]["nodes"], 1)
+        self.assertNotIn("preview", pdata)
+        prev2 = self.assertToolOk(call("preview_nodemap_canvas", {"canvas": chain, "hydrate": False, "include_preview": True}))
+        self.assertIn("preview", prev2["canvas"]["nodes"][0]["data"])
+
+        # inline hierarchy
+        hier = self.assertToolOk(call("inspect_nodemap_hierarchy", {"canvas": chain}))
+        self.assertEqual(hier["nested_depth"], 1)
+        self.assertToolError(call("inspect_nodemap_hierarchy", {"depth": 3}), 422)
+        self.assertToolError(call("inspect_nodemap_hierarchy", {"canvas": chain, "depth": 99}), 422)
+        self.assertEqual(files(), [])
+
+        # read-only access to pre-existing on-disk canvases (reference-style chain p -> q, plus a missing ref)
+        (canvas_dir / "linux" / "q.json").write_text(json.dumps({"id": "q", "name": "Q", "canvas": doc([note("qn")])}), encoding="utf-8")
+        p_nodes = [
+            note("pn"),
+            {"id": "rq", "type": "nodemap", "x": 0, "y": 300, "w": 300, "h": 200, "data": {"canvasId": "q"}},
+            {"id": "rg", "type": "nodemap", "x": 0, "y": 600, "w": 300, "h": 200, "data": {"canvasId": "gone"}},
+        ]
+        (canvas_dir / "linux" / "p.json").write_text(json.dumps({"id": "p", "name": "P", "canvas": doc(p_nodes)}), encoding="utf-8")
+        snapshot = {f.name: f.read_text() for f in (canvas_dir / "linux").iterdir()}
+        listed = self.assertToolOk(call("list_nodemap_canvases", {}))
+        self.assertEqual(sorted(i["id"] for i in listed["items"]), ["p", "q"])
+        got = self.assertToolOk(call("get_nodemap_canvas", {"canvas_id": "p"}))
+        gdata = {n["id"]: n for n in got["canvas"]["nodes"]}
+        self.assertEqual(gdata["rq"]["data"]["canvas"]["nodes"][0]["id"], "qn")
+        self.assertNotIn("preview", gdata["rq"]["data"])
+        self.assertNotIn("canvasId", gdata["rq"]["data"])
+        self.assertTrue(any(w["code"] == "missing_reference" for w in got["warnings"]))
+        self.assertNotIn("nested_maps", got)
+        got_p = self.assertToolOk(call("get_nodemap_canvas", {"canvas_id": "p", "include_preview": True}))
+        self.assertIn("preview", {n["id"]: n for n in got_p["canvas"]["nodes"]}["rq"]["data"])
+        hier_saved = self.assertToolOk(call("get_nodemap_hierarchy", {"canvas_id": "p", "depth": 3}))
+        self.assertNotIn("invalid_targets", hier_saved)
+        self.assertToolError(call("get_nodemap_hierarchy", {"canvas_id": "p", "depth": 99}), 422)
+        exported = self.assertToolOk(call("export_nodemap_canvas", {"canvas_id": "p"}))
+        self.assertIn("content", exported)
+        self.assertEqual({f.name: f.read_text() for f in (canvas_dir / "linux").iterdir()}, snapshot)
 
     def test_p1_p2_mcp_tools_readonly_posts_and_p3_exclusion(self) -> None:
         # 1. Read-only POST MCP tools remain visible in tools/list and callable when allow_writes=False
         tools = {t["name"]: t for t in self.rpc("tools/list", {}).json()["result"]["tools"]}
-        for ro_post_tool in ("preview_nodemap_canvas", "match_patch_maintainers", "check_watched_changes"):
+        for ro_post_tool in ("preview_nodemap_canvas", "nest_nodemap_canvas", "group_nodemap_canvas", "inspect_nodemap_hierarchy", "match_patch_maintainers", "check_watched_changes"):
             self.assertIn(ro_post_tool, tools)
             self.assertTrue(tools[ro_post_tool]["annotations"]["readOnlyHint"])
             self.assertFalse(tools[ro_post_tool]["annotations"]["destructiveHint"])
@@ -1133,53 +1209,35 @@ class TestMcpTools(_McpFixture):
                     ttl=3600,
                 )
 
-                # Read-only OAuth token hides write tools in tools/list and rejects write tools/call with 403
-                r_ro_list = self.client.post(
-                    mcp.MCP_PATH,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-                    headers={"Authorization": f"Bearer {ro_token}"},
-                )
-                self.assertEqual(r_ro_list.status_code, 200)
-                ro_names = {t["name"] for t in r_ro_list.json()["result"]["tools"]}
-                self.assertNotIn("create_nodemap_canvas", ro_names)
+                # No tool requires a write scope: both tokens see the identical read-only tool set
+                def names_for(token: str, msg_id: int) -> set[str]:
+                    r = self.client.post(
+                        mcp.MCP_PATH,
+                        json={"jsonrpc": "2.0", "id": msg_id, "method": "tools/list"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    return {t["name"] for t in r.json()["result"]["tools"]}
+
+                ro_names, rw_names = names_for(ro_token, 1), names_for(rw_token, 3)
+                self.assertEqual(ro_names, rw_names)
                 self.assertIn("preview_nodemap_canvas", ro_names)
+                self.assertIn("nest_nodemap_canvas", ro_names)
+                self.assertNotIn("create_nodemap_canvas", rw_names)
 
-                r_ro_call = self.client.post(
-                    mcp.MCP_PATH,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "tools/call",
-                        "params": {"name": "create_nodemap_canvas", "arguments": {"name": "Blocked"}},
-                    },
-                    headers={"Authorization": f"Bearer {ro_token}"},
-                )
-                self.assertEqual(r_ro_call.status_code, 200)
-                self.assertToolError(r_ro_call.json()["result"], 403)
-
-                # Write-scoped OAuth token sees and executes create_nodemap_canvas
-                r_rw_list = self.client.post(
-                    mcp.MCP_PATH,
-                    json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
-                    headers={"Authorization": f"Bearer {rw_token}"},
-                )
-                self.assertEqual(r_rw_list.status_code, 200)
-                rw_names = {t["name"] for t in r_rw_list.json()["result"]["tools"]}
-                self.assertIn("create_nodemap_canvas", rw_names)
-
-                r_rw_call = self.client.post(
-                    mcp.MCP_PATH,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 4,
-                        "method": "tools/call",
-                        "params": {"name": "create_nodemap_canvas", "arguments": {"name": "OAuth Canvas"}},
-                    },
-                    headers={"Authorization": f"Bearer {rw_token}"},
-                )
-                self.assertEqual(r_rw_call.status_code, 200)
-                created = self.assertToolOk(r_rw_call.json()["result"])
-                self.assertEqual(created["name"], "OAuth Canvas")
+                for token, msg_id in ((ro_token, 2), (rw_token, 4)):
+                    r_call = self.client.post(
+                        mcp.MCP_PATH,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "method": "tools/call",
+                            "params": {"name": "create_nodemap_canvas", "arguments": {"name": "Blocked"}},
+                        },
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    self.assertEqual(r_call.status_code, 200)
+                    self.assertEqual(r_call.json()["error"]["code"], mcp.INVALID_PARAMS)
             core_config.reset_config()
             core_config.init_config(self.cfg_path)
 
@@ -1412,7 +1470,10 @@ class TestMcpStdio(unittest.TestCase):
             mcp_stdio.serve([b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'], out, allow_writes=True)
             frame = json.loads(out.getvalue().decode("utf-8").strip())
             names = {t["name"] for t in frame["result"]["tools"]}
-            self.assertIn("create_nodemap_canvas", names)
+            # --allow-writes exposes no extra tools: no tool is write-scoped any more
+            self.assertNotIn("create_nodemap_canvas", names)
+            self.assertIn("nest_nodemap_canvas", names)
+            self.assertEqual(names, set(mcp.TOOLS))
             # Cleanly restored on exit
             self.assertFalse(get_api_server_config()["allow_writes"])
 

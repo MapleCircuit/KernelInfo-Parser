@@ -1665,3 +1665,35 @@
 }
 
 
+
+/* ---- Nested NodeMap nodes (§5.3.9): static card, never child DOM ---- */
+.nm-bc-current { color: var(--text-primary); font-weight: 600; font-size: var(--fs-11, 11px); padding: 1px 4px; }
+.nm-bc-sep { color: var(--text-muted); font-size: var(--fs-11, 11px); }
+.nm-nested { display: flex; flex-direction: column; gap: calc(4px * var(--ui-layout-scale, 1)); height: 100%; padding: calc(6px * var(--ui-layout-scale, 1)); box-sizing: border-box; font-size: var(--fs-12, 12px); }
+.nm-nested-name { display: flex; align-items: baseline; gap: calc(6px * var(--ui-layout-scale, 1)); }
+.nm-nested-title { font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm-nested-ver, .nm-nested-counts { color: var(--text-muted); font-size: var(--fs-11, 11px); }
+.nm-nested-desc { color: var(--text-secondary); font-size: var(--fs-11, 11px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm-nested-preview { position: relative; flex: 1 1 auto; min-height: 0; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-primary); overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.nm-nested-svg { width: 100%; height: 100%; display: block; }
+.nm-nested-svg line { stroke-width: 4; }
+/* High quality preview: the child's rendered picture (`nested_snapshot.js`), static and non-interactive */
+.nm-nested-img { width: 100%; height: 100%; display: block; object-fit: contain; pointer-events: none; user-select: none; }
+.nm-nested-preview.nm-nested-pending .nm-nested-svg { opacity: 0.55; transition: opacity 0.2s ease; }
+.nm-nested-empty { color: var(--text-muted); font-size: var(--fs-11, 11px); }
+.nm-nested-trunc { position: absolute; right: calc(6px * var(--ui-layout-scale, 1)); bottom: 0; color: var(--text-muted); }
+.nm-nested-foot { display: flex; align-items: center; justify-content: space-between; gap: calc(6px * var(--ui-layout-scale, 1)); }
+.nm-nested-unset, .nm-nested-broken { align-items: center; justify-content: center; text-align: center; }
+.nm-nested-broken { color: var(--accent-red); border: 1px dashed var(--accent-red); border-radius: var(--radius-sm); }
+.nm-nested-warn { font-size: var(--fs-16, 16px); }
+.nm-nested-actions { display: flex; gap: calc(6px * var(--ui-layout-scale, 1)); }
+.nm-type-nodemap .nm-nested-preview, .nm-type-nodemap .nm-nested-foot { user-select: none; }
+.nm-nested-search { width: 100%; box-sizing: border-box; margin-bottom: calc(8px * var(--ui-layout-scale, 1)); }
+.nm-nested-list { display: flex; flex-direction: column; gap: calc(4px * var(--ui-layout-scale, 1)); max-height: 50vh; overflow: auto; }
+.nm-nested-pick { display: flex; flex-wrap: wrap; gap: calc(2px * var(--ui-layout-scale, 1)) calc(10px * var(--ui-layout-scale, 1)); text-align: left; padding: calc(6px * var(--ui-layout-scale, 1)) calc(8px * var(--ui-layout-scale, 1)); border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer; }
+.nm-nested-pick:hover:not(:disabled) { background: var(--bg-hover); }
+.nm-nested-pick.nm-disabled, .nm-nested-pick:disabled { opacity: 0.55; cursor: not-allowed; }
+.nm-pick-name { font-weight: 600; }
+.nm-pick-meta, .nm-pick-desc { color: var(--text-muted); font-size: var(--fs-11, 11px); }
+.nm-pick-desc { flex-basis: 100%; }
+.nm-pick-hint { color: var(--accent-red); font-size: var(--fs-11, 11px); }

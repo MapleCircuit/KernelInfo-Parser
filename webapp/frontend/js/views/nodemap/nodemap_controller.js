@@ -58,6 +58,8 @@ import {
 } from "./nodemap_persistence.js";
 import { layoutGraphJob } from "./nodemap_worker.js";
 import { renderStructBody } from "./struct_view.js";
+import { crumbsHtml, nestedBodyHtml } from "./nested_nodes.js";
+import * as Nested from "./nodemap_nested.js";
 import {
   flushPendingHellos, frameDisposed, frameMounted, keepLiveOnRestore, onTabFrameMessage, reconcileFrozenTabs, resetDirtyFrozenTabs, resetTabNode,
   setTabsFrozen, tabKeyData,
@@ -108,6 +110,7 @@ export class NodeMapController {
     this.canvas = null;
     this.rootCanvas = null;
     this.subMapPath = [];
+    Nested.initNested(this);
     this.selected = new Set();
     this.selectedEdge = null;
     this.active = null;
@@ -263,8 +266,17 @@ export class NodeMapController {
     };
     return Promise.resolve(loadFromIndexedDB(this)).finally(done);
   }
-  scheduleSave() { return scheduleSave(this); }
-  flushSave() { return flushSave(this); }
+  scheduleSave() { scheduleSave(this); }
+  flushSave() { flushSave(this); }
+  nestedCard(node) { return Nested.nestedCard(this, node); }
+  openNested(nodeId) { return Nested.openNested(this, nodeId); }
+  goToCrumb(depth) { return Nested.goToCrumb(this, depth); }
+  chooseNestedTarget(nodeId) { return Nested.chooseNestedTarget(this, nodeId); }
+  insertExistingNodemap(at = null) { return Nested.insertExistingNodemap(this, at); }
+  createNestedNodemap(at = null) { return Nested.createNestedNodemap(this, at); }
+  groupSelectionIntoNested() { return Nested.groupSelectionIntoNested(this); }
+  hasHighQualityNested() { return Nested.hasHighQualityNested(this); }
+  prepareNestedSnapshots() { return Nested.prepareSnapshots(this); }
   embedKey(sessionId) { return embedKey(this, sessionId); }
   syncFollowChannel() { return syncFollowChannel(this); }
   closeFollowChannel() { return closeFollowChannel(this); }
@@ -330,6 +342,7 @@ export class NodeMapController {
     this.searchBar?.dispose?.();
     this.tourPlayer?.dispose?.();
     this.workerPool?.dispose?.();
+    Nested.disposeSnapshots(this);
     clearAlignmentGuides(this);
     this.guideEl?.remove?.();
     this.guideEl = null;
@@ -389,7 +402,10 @@ export class NodeMapController {
       this.renderWires();
     });
     this.unsubs.push(typeof offScale === "function" ? offScale : () => { });
-    const onTheme = () => this.renderWires();
+    const onTheme = () => {
+      this.renderWires();
+      Nested.onNestedThemeChanged(this);
+    };
     window.addEventListener("kip:theme-changed", onTheme);
     this.unsubs.push(() => window.removeEventListener("kip:theme-changed", onTheme));
     for (const ev of ["kconfig:engine:changed", "kconfig:assignments:updated"]) {
@@ -623,6 +639,7 @@ export class NodeMapController {
     }
     if (node.type === "mail") return String(this.mailEpoch || 0);
     if (node.type === "tab") return this.embedKey(M.embedSessionOf(this.canvas, node).id);
+    if (node.type === "nodemap") return Nested.nestedBodyKey(this, node);
     return "";
   }
 
@@ -646,6 +663,7 @@ export class NodeMapController {
         this.canvas = imported;
         added.push(...this.canvas.nodes);
         seeded = true;
+        Nested.unpackInPlace(this);
       }
     } else if (Array.isArray(tab.initialNodes)) {
       seeded = true;
@@ -956,6 +974,10 @@ export class NodeMapController {
     const status = (msg, err = false) => `<div class="nm-status${err ? " nm-error" : ""}">${escapeHtml(msg)}</div>`;
     if (node.type === "group") {
       body.innerHTML = "";
+    } else if (node.type === "nodemap") {
+      const snapshot = Nested.nestedSnapshot(this, node);
+      body.innerHTML = nestedBodyHtml(node, Nested.nestedCard(this, node), snapshot);
+      if (!snapshot) Nested.scheduleSnapshot(this, node);
     } else if (node.type === "note") {
       const empty = this.canvas.settings.editMode ? "Double-click to write a note" : "Empty note (Edit Mode edits it)";
       let html = node.data.markdown ? renderNoteMarkdown(node.data.text) : `<pre class="nm-note-plain">${escapeHtml(node.data.text || empty)}</pre>`;
@@ -2110,15 +2132,17 @@ export class NodeMapController {
 
   renderBreadcrumbs() {
     if (!this.breadcrumbsEl || !this.rootCanvas) return;
+    const nestedHtml = crumbsHtml(this.nav?.root, this.nav?.stack);
     if (!this.subMapPath.length) {
-      this.breadcrumbsEl.hidden = true;
-      this.breadcrumbsEl.innerHTML = "";
+      this.breadcrumbsEl.hidden = !nestedHtml;
+      if (this.breadcrumbsEl.innerHTML !== nestedHtml) this.breadcrumbsEl.innerHTML = nestedHtml;
       return;
     }
     const { trail } = M.resolveSubMapAtPath(this.rootCanvas, this.subMapPath);
-    const parts = ['<button type="button" class="nm-bc-btn" data-bc-depth="0">Root</button>'];
+    const parts = nestedHtml ? [nestedHtml, '<span class="nm-bc-sep">›</span>', '<button type="button" class="nm-bc-btn" data-bc-depth="0">Map</button>'] : ['<button type="button" class="nm-bc-btn" data-bc-depth="0">Root</button>'];
     trail.forEach((t, i) => parts.push(`<span class="nm-bc-sep">/</span><button type="button" class="nm-bc-btn" data-bc-depth="${i + 1}">${escapeHtml(t.title)}</button>`));
-    this.breadcrumbsEl.innerHTML = parts.join("");
+    const html = parts.join("");
+    if (this.breadcrumbsEl.innerHTML !== html) this.breadcrumbsEl.innerHTML = html;
     this.breadcrumbsEl.hidden = false;
   }
 
@@ -2270,48 +2294,18 @@ export class NodeMapController {
     this.rootEl?.querySelector?.("[data-tb='snap']")?.setAttribute?.("aria-pressed", String(canvas.settings.snap));
     this.commit({ save: true, record });
     if (fit && canvas.nodes.length) this.fitView(false);
+    Nested.probeStatuses(this);
     return true;
   }
 
-  async loadServerCanvas(canvasId, { tourId = "" } = {}) {
-    const cid = String(canvasId || "").trim();
-    if (!cid) return false;
-    this._loadedServerCanvasId = cid;
-    this._storeLoading = true;
-    try {
-      const client = this.api || api;
-      const res = await client.getNodemapCanvas(cid);
-      if (this._loadedServerCanvasId !== cid) return false;
-      const doc = res?.canvas;
-      if (!doc || typeof doc !== "object") {
-        toast.error?.(`Canvas "${cid}" is empty or invalid`);
-        return false;
-      }
-      const ok = this.loadCanvasDocument(doc, { record: false, fit: true });
-      if (ok && res?.name && this.tab) {
-        this.tab.title = String(res.name);
-        state.updateTabState?.(this.tab.id, { title: this.tab.title });
-      }
-      const targetTour = String(tourId || this.tab?.tourId || "").trim();
-      if (ok && targetTour && Array.isArray(this.canvas?.tours) && this.canvas.tours.some((t) => t.id === targetTour)) {
-        this.tourPlayer?.start?.(targetTour);
-      }
-      return ok;
-    } catch (err) {
-      if (this._loadedServerCanvasId === cid) {
-        this._loadedServerCanvasId = "";
-      }
-      toast.error?.(`Failed to load canvas "${cid}": ${err?.message || err}`);
-      return false;
-    } finally {
-      this._storeLoading = false;
-      flushPendingHellos(this);
-    }
-  }
+  /** Read-only server canvas -> local copy in this tab (`nodemap_nested.js: loadServerCanvas`). */
+  loadServerCanvas(canvasId, opts = {}) { return Nested.loadServerCanvas(this, canvasId, opts); }
 
   svgOptions({ foreign = true } = {}) {
     return {
       editMode: Boolean(this.canvas.settings.editMode),
+      nested: (n) => Nested.nestedCard(this, n),
+      nestedSnapshot: (n) => Nested.nestedSnapshot(this, n),
       content: (n) => this.modelOf(n),
       structOpts: (n) => this.structOpts(n),
       rowHeights: (n) => this.structRowHeights(n),

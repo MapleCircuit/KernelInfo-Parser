@@ -14,6 +14,8 @@ import { headMetaOf, sourceLineSegments } from "./node_content.js";
 import { commitRowKey, diffRows, kconfigValue, mailBadges, mailLineClass, mailRowKey, maintainerLines, releaseRowKey, statusClass, valueClass } from "./domain_nodes.js";
 import { collectExpandableTypes, countDirectives, esc as escHtml, paholeRows, structRows } from "./struct_view.js";
 import { evalCssColor, formatCssColor, mixCssColors, svgPaint } from "../../utils/css_color.js";
+import { nestedCountsText, nestedExportLines, nestedLabel, nestedState } from "./nested_nodes.js";
+import { embedSnapshotSvg } from "./nested_snapshot.js";
 
 export const EXPORT_METRICS = {
   PAD: 40,
@@ -336,7 +338,9 @@ function shadowFilter(value, id) {
  * `foreign(node)` (DOM snapshot `{html}` of tab / man / doc), `editMode`, `structOpts(node)`,
  * `rowHeights(node)` (measured struct rows), `kconfigValues(node)`, `onCanvas(node)` (Set of Kconfig
  * symbols already on the canvas), `scroll(node)` (`{top, boxes}` live scroll offsets), `fonts`
- * (`{sans, mono}` font stacks), `transparent`, `pixelScale`.
+ * (`{sans, mono}` font stacks), `transparent`, `pixelScale`, `nestedSnapshot(node)` (the cached high-quality
+ * picture of a `nodemap` node with `data.highQualityPreview`, `nested_snapshot.js`; embedded as a nested
+ * `<svg>` with scoped ids), `idPrefix` (prefix of every generated id: a document rendered for embedding).
  */
 export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
   const prevMeasure = MEASURE;
@@ -351,9 +355,15 @@ export function canvasToSvg(canvas, resolve = (c) => c, opts = {}) {
 function buildSvg(canvas, resolve, opts) {
   const visCanvas = visibleCanvasSlice(canvas);
   const content = typeof opts.content === "function" ? opts.content : () => null;
+  const nestedCardOf = typeof opts.nested === "function" ? opts.nested : () => null;
   const foreignOf = typeof opts.foreign === "function" ? opts.foreign : () => null;
   // per-node rasters of live DOM bodies (PNG export, `nodemap_png.js`): `{ href: data:image/png…, w, h }`
   const rasterOf = typeof opts.rasters === "function" ? opts.rasters : () => null;
+  // high-quality nested pictures (`nested_snapshot.js`); a snapshot render passes none, so the nested
+  // nodes of a pictured child stay schematic cards (one level, no cascade)
+  const snapshotOf = typeof opts.nestedSnapshot === "function" ? opts.nestedSnapshot : () => null;
+  const idp = /^[A-Za-z_][\w-]{0,63}$/.test(String(opts.idPrefix || "")) ? String(opts.idPrefix) : "";
+  let embedN = 0;
   const editMode = Boolean(opts.editMode);
   const structOptsOf = typeof opts.structOpts === "function" ? opts.structOpts : () => ({ editMode });
   const rowHeightsOf = typeof opts.rowHeights === "function" ? opts.rowHeights : () => null;
@@ -410,12 +420,12 @@ function buildSvg(canvas, resolve, opts) {
   let defs = "";
   let clipN = 0;
   const clip = (x, y, w, h, rx = 0) => {
-    const id = `nmclip${clipN++}`;
+    const id = `${idp}nmclip${clipN++}`;
     defs += `<clipPath id="${id}"><rect x="${r1(x)}" y="${r1(y)}" width="${r1(Math.max(0, w))}" height="${r1(Math.max(0, h))}"${rx ? ` rx="${rx}"` : ""}/></clipPath>`;
     return id;
   };
   const clipRound = (w, h) => clip(0, 0, w, h, 6);
-  const shadowId = "nmshadow";
+  const shadowId = `${idp}nmshadow`;
   const shadowDef = shadowFilter(R("var(--shadow-sm)"), shadowId);
   let shadowUsed = false;
 
@@ -1447,6 +1457,38 @@ function buildSvg(canvas, resolve, opts) {
     return s;
   };
 
+  /**
+   * A nested NodeMap node is a titled box with its name and counts (the schematic preview is a live-view
+   * feature); with `highQualityPreview` and a cached snapshot, the child picture sits between the name and
+   * the counts like on the live card.
+   */
+  const nodemapBody = (n, box, top) => {
+    const card = nestedCardOf(n);
+    const snap = n.data?.highQualityPreview === true && nestedState(n, card) === "ok" ? snapshotOf(n) : null;
+    if (snap?.svg && !snap.empty) {
+      const label = wrapW(nestedLabel(n, card), box.w - 16, 12, false, 400)[0] || "";
+      const py = top + 26;
+      const ph = box.h - py - 24;
+      if (ph >= 24) {
+        const pic = embedSnapshotSvg(snap, { x: 8, y: py, w: Math.max(1, box.w - 16), h: ph }, `${idp}nq${embedN++}-`);
+        if (pic) {
+          used = Math.max(used, box.h);
+          return txt(8, top + 18, esc(label), { fill: C.text, size: 12 }) + pic + txt(8, box.h - 8, esc(nestedCountsText(card.counts)), { fill: C.faint, size: 11 });
+        }
+      }
+    }
+    let s = "";
+    let y = top + 6;
+    for (const line of nestedExportLines(n, card)) {
+      for (const l of wrapW(line, box.w - 16, 12, false, 400)) {
+        s += txt(8, y + 12, esc(l), { fill: C.text, size: 12 });
+        y += 16.2;
+      }
+    }
+    used = Math.max(used, y);
+    return s;
+  };
+
   const commitBody = (n, box, top) => {
     const model = content(n);
     if (!model?.hash) return txt(10, top + 16, esc(n.data.commitHash ? `Commit ${n.data.commitHash.slice(0, 12)}` : "Commit"), { fill: C.faint });
@@ -1648,6 +1690,7 @@ function buildSvg(canvas, resolve, opts) {
     else if (n.type === "doc") body = docBody(n, box, top);
     else if (n.type === "history") body = historyBody(n, box, top, ctx);
     else if (n.type === "commit") body = commitBody(n, box, top);
+    else if (n.type === "nodemap") body = nodemapBody(n, box, top);
     if (n.autoFit && used > top && used < box.h) box = { ...box, h: Math.ceil(used) };
     // a scrolled body shows the same window as the live node (clamped to its content)
     const sc = selfScroll ? 0 : Math.min(ctx.sc, Math.max(0, used - box.h));
@@ -1785,12 +1828,12 @@ function buildSvg(canvas, resolve, opts) {
   const vbAttr = hasVb ? `${+vx.toFixed(4)} ${+vy.toFixed(4)} ${+vw.toFixed(4)} ${+vh.toFixed(4)}` : `${vx} ${vy} ${vw} ${vh}`;
   // Snap grid (Inspector → Canvas → Snap): the live canvas draws border-color dots every `grid` units
   const grid = !opts.transparent && visCanvas.settings?.snap && Number(visCanvas.settings?.grid) >= 4 ? Number(visCanvas.settings.grid) : 0;
-  if (grid) defs += `<pattern id="nmgrid" x="0" y="0" width="${grid}" height="${grid}" patternUnits="userSpaceOnUse"><circle cx="${grid / 2}" cy="${grid / 2}" r="1"${F(C.border)}/></pattern>`;
+  if (grid) defs += `<pattern id="${idp}nmgrid" x="0" y="0" width="${grid}" height="${grid}" patternUnits="userSpaceOnUse"><circle cx="${grid / 2}" cy="${grid / 2}" r="1"${F(C.border)}/></pattern>`;
   if (shadowUsed) defs += shadowDef;
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pw}" height="${ph}" viewBox="${vbAttr}"${hasVb ? ' preserveAspectRatio="xMidYMid meet"' : ""}>\n`;
   if (defs) s += `<defs>${defs}</defs>\n`;
   if (!opts.transparent) s += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}"${F(C.bg)}/>\n`;
-  if (grid) s += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" fill="url(#nmgrid)"/>\n`;
+  if (grid) s += `<rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" fill="url(#${idp}nmgrid)"/>\n`;
   /* ui-scale-exempt-end */
   s += groupsSvg + edgesSvg + nodesSvg;
   return `${s}</svg>`;
