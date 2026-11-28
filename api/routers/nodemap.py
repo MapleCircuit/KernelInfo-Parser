@@ -739,11 +739,7 @@ def export_nodemap_canvas(
 
 @router.post("/nodemap/preview", dependencies=[Depends(require_feature("nodemap"))])
 def preview_nodemap_canvas(payload: NodemapPreviewRequest) -> dict[str, Any]:
-<<<<<<< HEAD
-    """Build a NodeMap canvas in one call (nothing saved): pass nodes by identifier, get importable `kip-nodemap-canvas` JSON and/or a mermaid/dot export. Use it whenever asked to create, draw or export a NodeMap; hydration resolves paths, astId, subjects and sizes."""
-=======
-    """Stateless NodeMap canvas builder (nothing is saved): normalize inline nested canvases recursively, hydrate, expand, lay out, and optionally export in memory; import the returned canvas JSON in the webapp NodeMap (Import JSON)."""
->>>>>>> 1f9a73ac1e2a89cf0ec9a0011597b9f4484d4c83
+    """Build a NodeMap canvas in one call (nothing is saved): pass nodes by identifier (inline nested canvases are normalized recursively), get importable `kip-nodemap-canvas` JSON and/or a mermaid/dot export. Use it whenever asked to create, draw or export a NodeMap; hydration resolves paths, astId, subjects and sizes."""
     ver = resolve_version(payload.version)
     data = payload.model_dump(by_alias=True, exclude_none=True)
     if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):

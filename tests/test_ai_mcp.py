@@ -1057,9 +1057,10 @@ class TestMcpTools(_McpFixture):
 
         tools = self.rpc("tools/list", {}).json()["result"]["tools"]
         by_name = {t["name"]: t for t in tools}
-        # Token budget of the advertised catalog (83,769 B / 9,381 B before the slimming pass)
-        self.assertLess(size({"tools": tools}), 74_000)
-        self.assertLess(size(by_name["preview_nodemap_canvas"]), 7_000)
+        # Token budget of the advertised catalog (83,769 B / 9,381 B before the slimming pass; the nested
+        # NodeMap tools `nest_` / `group_` / `inspect_nodemap_hierarchy` and `get_nodemap_hierarchy` add ~5.5 KB)
+        self.assertLess(size({"tools": tools}), 80_000)
+        self.assertLess(size(by_name["preview_nodemap_canvas"]), 8_000)
         # `repo` is documented once in the server instructions, not on every tool
         self.assertEqual(by_name["get_file_slice"]["inputSchema"]["properties"]["repo"],
                          {"type": "string", "minLength": 1, "maxLength": 128})

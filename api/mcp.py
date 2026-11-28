@@ -70,26 +70,16 @@ SERVER_INSTRUCTIONS = (
 
 # Fallback docs only for names that are ambiguous on their own (`limit`, `offset`, `q`, `arch` are not).
 _PARAM_DOCS: dict[str, str] = {
-<<<<<<< HEAD
     "version": "Git revision.",
     "path": "Repository-relative path.",
-=======
-    "repo": "Repository name (see list_repos).",
-    "version": "Git revision (default: active latest).",
-    "limit": "Max items to return.",
-    "offset": "Pagination offset.",
-    "arch": "Target architecture.",
-    "q": "Search query.",
     "depth": "Maximum nesting depth of the returned hierarchy tree (1..32, default 8).",
     "canvas": "Canvas document in the portable inline format (`nodes`, `edges`, `tours`, ...; nested nodes carry `data.canvas`). Stateless: nothing is saved on the server; import the returned canvas JSON in the webapp NodeMap (Import JSON).",
     "child": "Inline child canvas to nest (mutually exclusive with `server_canvas_id`; omit both for a new empty child).",
     "server_canvas_id": "Pre-existing server canvas id copied read-only as the inline child.",
     "canvas_id": "Pre-existing server canvas id (read-only).",
-    "path": "Repository-relative path.",
     "node_ids": "Ids of the canvas nodes to move into the new inline nested node.",
     "node": "Placement/styling of the nested NodeMap node (`id`, `x`, `y`, `w`, `h`, `customTitle`, `color`, `bgColor`, `groupId`, `layerId`).",
     "include_preview": "Keep computed `data.preview` geometry on nested nodes (default false; `data.summary` is always present).",
->>>>>>> 1f9a73ac1e2a89cf0ec9a0011597b9f4484d4c83
 }
 
 # Duplicate REST convenience aliases omitted from MCP inputSchema (preserved on REST /api/v1/*).
@@ -628,7 +618,6 @@ def _validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
-<<<<<<< HEAD
 def _is_empty(value: Any) -> bool:
     return value is None or (isinstance(value, (str, list, dict)) and not value)
 
@@ -647,14 +636,16 @@ def _default_node_title(node: dict[str, Any]) -> str | None:
         return None
 
 
-def _compact_node_data(node_type: Any, data: dict[str, Any]) -> dict[str, Any]:
+def _compact_node_data(node_type: Any, data: dict[str, Any], keep_preview: bool) -> dict[str, Any]:
     keep_empty = _DATA_NONEMPTY_DEFAULT_KEYS.get(str(node_type), frozenset())
     value_defaults = _DATA_VALUE_DEFAULTS.get(str(node_type), {})
     out: dict[str, Any] = {}
     for key, value in data.items():
-        if key == "subCanvas" and isinstance(value, dict):
-            out[key] = _compact_nodemap_canvas(value)
+        if key in ("subCanvas", "canvas") and isinstance(value, dict):
+            out[key] = _compact_nodemap_canvas(value, keep_preview)
             continue
+        if key == "preview" and not keep_preview:
+            continue  # computed nested-node geometry, recomputed by the webapp
         if key in value_defaults and _same(value, value_defaults[key]):
             continue
         if key == "mode" and node_type == "diff" and value == ("commit" if data.get("commitHash") else "file"):
@@ -669,7 +660,7 @@ def _compact_node_data(node_type: Any, data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _compact_nodemap_node(node: dict[str, Any]) -> dict[str, Any]:
+def _compact_nodemap_node(node: dict[str, Any], keep_preview: bool) -> dict[str, Any]:
     out = {
         k: v
         for k, v in node.items()
@@ -691,7 +682,7 @@ def _compact_nodemap_node(node: dict[str, Any]) -> dict[str, Any]:
         out.pop("baseH", None)
     data = out.get("data")
     if isinstance(data, dict):
-        cdata = _compact_node_data(node.get("type"), data)
+        cdata = _compact_node_data(node.get("type"), data, keep_preview)
         if cdata:
             out["data"] = cdata
         else:
@@ -707,49 +698,17 @@ def _compact_nodemap_edge(edge: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
-    """Drop NodeMap node/edge keys equal to the webapp importer defaults (nested subCanvases included).
+def _compact_nodemap_canvas(canvas: dict[str, Any], keep_preview: bool = False) -> dict[str, Any]:
+    """Drop NodeMap node/edge keys equal to the webapp importer defaults, recursing into nested
+    `data.canvas` / `subCanvas`.
 
-    The result re-imports into exactly the same normalized canvas (`kip-nodemap-canvas` v1).
+    The result re-imports into exactly the same normalized canvas (`kip-nodemap-canvas` v1). Computed
+    `data.preview` geometry on nested nodes is dropped unless `keep_preview`.
     """
     out = dict(canvas)
     nodes = out.get("nodes")
     if isinstance(nodes, list):
-        out["nodes"] = [_compact_nodemap_node(n) if isinstance(n, dict) else n for n in nodes]
-=======
-def _compact_nodemap_canvas(canvas: dict[str, Any], keep_preview: bool = False) -> dict[str, Any]:
-    """Strip empty/default UI-state keys from NodeMap nodes/edges, recursing into nested `data.canvas` / `subCanvas`.
-
-    Computed `data.preview` geometry is dropped unless `keep_preview`."""
-    out = copy.deepcopy(canvas)
-    nodes = out.get("nodes")
-    if isinstance(nodes, list):
-        cleaned_nodes: list[Any] = []
-        for node in nodes:
-            if not isinstance(node, dict):
-                cleaned_nodes.append(node)
-                continue
-            cnode = {
-                k: v
-                for k, v in node.items()
-                if not (k in _EMPTY_NODE_UI_KEYS and (v in ("", [], {}, False, None)))
-            }
-            data = cnode.get("data")
-            if isinstance(data, dict):
-                cdata = {
-                    k: v
-                    for k, v in data.items()
-                    if not (k in _EMPTY_DATA_UI_KEYS and (v in ("", [], {})))
-                }
-                if not keep_preview:
-                    cdata.pop("preview", None)
-                for sub_key in ("subCanvas", "canvas"):
-                    if isinstance(cdata.get(sub_key), dict):
-                        cdata[sub_key] = _compact_nodemap_canvas(cdata[sub_key], keep_preview)
-                cnode["data"] = cdata
-            cleaned_nodes.append(cnode)
-        out["nodes"] = cleaned_nodes
->>>>>>> 1f9a73ac1e2a89cf0ec9a0011597b9f4484d4c83
+        out["nodes"] = [_compact_nodemap_node(n, keep_preview) if isinstance(n, dict) else n for n in nodes]
     edges = out.get("edges")
     if isinstance(edges, list):
         out["edges"] = [_compact_nodemap_edge(e) if isinstance(e, dict) else e for e in edges]
@@ -804,18 +763,16 @@ def _project_mcp_result(
         include_canvas = proj_opts.get("include_canvas")
         if include_canvas is None:
             include_canvas = not bool(input_args.get("export_format"))
-        compact = None if verbose or not isinstance(out.get("canvas"), dict) else _compact_nodemap_canvas(out["canvas"])
+        compact = None
+        if not verbose and isinstance(out.get("canvas"), dict):
+            compact = _compact_nodemap_canvas(out["canvas"], bool(input_args.get("include_preview")))
         if compact is not None and out.get("export_format") == "json":
             # Same document as the indented REST export, minified and compacted (still webapp-importable).
             out["export"] = json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
         if not include_canvas:
             out.pop("canvas", None)
-<<<<<<< HEAD
         elif compact is not None:
             out["canvas"] = compact
-=======
-        elif not verbose and isinstance(out.get("canvas"), dict):
-            out["canvas"] = _compact_nodemap_canvas(out["canvas"], bool(input_args.get("include_preview")))
         return out
 
     if name in ("nest_nodemap_canvas", "group_nodemap_canvas"):
@@ -825,7 +782,6 @@ def _project_mcp_result(
         out = dict(result)
         if not verbose and isinstance(out.get("canvas"), dict):
             out["canvas"] = _compact_nodemap_canvas(out["canvas"], bool(input_args.get("include_preview")))
->>>>>>> 1f9a73ac1e2a89cf0ec9a0011597b9f4484d4c83
         return out
 
     if verbose:
