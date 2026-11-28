@@ -180,6 +180,18 @@ class TestDistributedParsing(unittest.TestCase):
         self.assertEqual(db.count_rows("m_ast_container"), 0, "its children go with it")
         self.assertEqual(db.count_rows("m_file_name"), 1, "Git registries are preserved")
 
+    def test_range_rollback_with_no_ranges_resets_reparsed_blobs(self):
+        """A distributed run records no watermarks: its re-parsed blobs alone still roll back (not a purge)."""
+        db = MockDB(use_global=False)
+        db.insert_rows("m_file_blob", ["blob_id", "blob_hash", "ftype"], [(7, b"\x07" * 20, 0)])
+        db.insert_rows("m_bridge_tag", ["blob_id", "tag_id", "line_s", "line_e", "char_s", "char_e"], [(7, 3, 1, 2, 0, 0)])
+        ingest_state.begin(db, 1, 30, TABLES, distributed=True)
+        self.assertEqual(db.count_rows("m_ingest_watermark"), 0, "leased ids, not watermarks, identify a distributed run")
+        ingest_state.record_blobs(db, 30, [7])
+        self.assertTrue(ingest_state.rollback_version(db, 1, 30, TABLES))
+        self.assertEqual(db.count_rows("m_bridge_tag"), 0, "the re-parsed blob reads as unparsed again")
+        self.assertEqual(db.count_rows("m_file_blob"), 1)
+
     def test_unlock_dependent_tasks_base_ref(self):
         """Verify unlock_dependent_tasks updates tasks matching base_ref_name and sets base_commit_id."""
         db = DistDB().add_tasks(
@@ -274,7 +286,7 @@ class TestDistributedParsing(unittest.TestCase):
 
             # Verify ingest_state.begin called with base_commit_id and worker_id
             mock_begin.assert_called_once_with(
-                mock_db, 1, 777, TABLES, base_commit_id=555, worker_id="worker-node-1"
+                mock_db, 1, 777, TABLES, base_commit_id=555, worker_id="worker-node-1", distributed=True
             )
 
             # Verify heartbeat daemon updated
@@ -2251,3 +2263,146 @@ class TestDistributedConcurrencyResilience(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _row(table, **values):
+    """A full row of `table` in column order: the given values, zero / empty defaults for the rest."""
+    out = []
+    for name, spec in table.init_columns:
+        if name in values:
+            out.append(values[name])
+        elif spec.is_binary:
+            out.append(b"\x00" * int(spec.length or 1))
+        elif spec.is_integer:
+            out.append(0)
+        else:
+            out.append("")
+    return tuple(out)
+
+
+class TestInterleavedRangeRollback(unittest.TestCase):
+    """Two workers interleave their leased ids; rolling back one never touches the other's rows.
+
+    Worker A (version commit 110) created MAINTAINERS blob 10 with section 1000 (members, patterns), tags 100-101
+    and AST nodes 500-503. Worker B (commit 300) parsed blob 20 meanwhile and reused A's committed tag 100 and AST
+    node 500 by content (its section 2000 names AST 500). A is interrupted and rolled back by its ranges.
+    """
+
+    A_HEAD = 110
+
+    def _seed(self):
+        from core import DBLayout as D
+
+        db = MockDB(use_global=False)
+
+        def put(table, *rows):
+            db.insert_rows(table.table_name, [c for c, _ in table.init_columns], [_row(table, **r) for r in rows])
+
+        put(D.m_file_blob, {"blob_id": 5, "blob_hash": b"\x05" * 20}, {"blob_id": 10, "blob_hash": b"\x10" * 20},
+            {"blob_id": 20, "blob_hash": b"\x20" * 20})
+        put(D.m_ast, {"ast_id": 7, "name": "EXT2 FILE SYSTEM"}, {"ast_id": 500, "name": "a_adopted"},
+            {"ast_id": 501, "name": "a_own"}, {"ast_id": 502, "name": "a_adopted_child"}, {"ast_id": 503, "name": "a_own_child"},
+            {"ast_id": 2500, "name": "b"})
+        put(D.m_ast_container, {"ast_id": 500, "priority": 0, "ref_ast_id": 502}, {"ast_id": 501, "priority": 0, "ref_ast_id": 503})
+        put(D.m_ast_hash, {"hash": b"\x01" * 16, "ast_id": 500}, {"hash": b"\x02" * 16, "ast_id": 501})
+        put(D.m_tag, {"tag_id": 50, "hash": b"\x50" * 32, "ast_id": 7}, {"tag_id": 100, "hash": b"\x64" * 32, "ast_id": 500},
+            {"tag_id": 101, "hash": b"\x65" * 32, "ast_id": 501}, {"tag_id": 200, "hash": b"\xc8" * 32, "ast_id": 2500})
+        put(D.m_tag_def, {"tag_id": 100, "def_idx": 0, "name": "x"}, {"tag_id": 101, "def_idx": 0, "name": "y"})
+        put(D.m_bridge_tag, {"blob_id": 10, "tag_id": 50}, {"blob_id": 10, "tag_id": 100}, {"blob_id": 10, "tag_id": 101},
+            {"blob_id": 20, "tag_id": 100}, {"blob_id": 20, "tag_id": 200})
+        put(D.m_bridge_commit_tag, {"commit_id": 95, "blob_id": 10, "tag_id": 101}, {"commit_id": 300, "blob_id": 20, "tag_id": 100})
+        put(D.m_maintainer_person, {"person_id": 1, "name": "Jan Kara", "email": "jack@suse.cz"})
+        put(D.m_maintainer_section, {"sec_id": 1000, "blob_id": 10, "name": "EXT2 FILE SYSTEM", "ast_id": 7},
+            {"sec_id": 2000, "blob_id": 20, "name": "B SECTION", "ast_id": 500})
+        put(D.m_maintainer_member, {"sec_id": 1000, "person_id": 1, "role_type": 1}, {"sec_id": 2000, "person_id": 1, "role_type": 1})
+        put(D.m_maintainer_pattern, {"sec_id": 1000, "pat_type": 1, "pattern": "fs/ext2/"},
+            {"sec_id": 2000, "pat_type": 1, "pattern": "fs/b/"})
+        put(D.m_maintainer_file, {"sec_id": 1000, "fnid": 3}, {"sec_id": 2000, "fnid": 4})
+        db.insert_rows("m_ingest_id_range", ["commit_id", "marked_table_id", "start_id", "end_id"], [
+            (self.A_HEAD, D.m_file_blob.table_id, 10, 19),
+            (self.A_HEAD, D.m_ast.table_id, 500, 599),
+            (self.A_HEAD, D.m_tag.table_id, 100, 199),
+            (self.A_HEAD, D.m_maintainer_section.table_id, 1000, 1099),
+            (self.A_HEAD, D.m_commit.table_id, 90, 99),
+        ])
+        ingest_state.set_status(db, 1, self.A_HEAD, ingest_state.INGEST_PARSING, worker_id="A")
+        ingest_state.set_status(db, 1, 300, ingest_state.INGEST_PARSING, worker_id="B")
+        return db
+
+    @staticmethod
+    def _ids(db, table, *cols):
+        rows = db.select_rows(table, list(cols), as_dict=False)
+        return sorted(tuple(r) if len(cols) > 1 else r[0] for r in rows)
+
+    def test_rollback_keeps_peer_children_and_resets_own_blob(self):
+        db = self._seed()
+        self.assertTrue(ingest_state.rollback_version(db, 1, self.A_HEAD, TABLES))
+
+        # A's own blob reads as unparsed (Step 4.5 reuses tagged blobs only), so its retry parses it again
+        self.assertEqual(db.count_rows("m_bridge_tag", {"blob_id": 10}), 0)
+        self.assertEqual(db.count_rows("m_maintainer_section", {"blob_id": 10}), 0)
+        self.assertIn(10, self._ids(db, "m_file_blob", "blob_id"), "the blob row stays for peers' checkpoints")
+        # B's section, members, patterns and files are intact
+        self.assertEqual(self._ids(db, "m_maintainer_section", "sec_id"), [2000])
+        self.assertEqual(self._ids(db, "m_maintainer_member", "sec_id"), [2000])
+        self.assertEqual(self._ids(db, "m_maintainer_pattern", "sec_id"), [2000])
+        self.assertEqual(self._ids(db, "m_maintainer_file", "sec_id"), [2000])
+        # B's blob keeps every tag bridge, including the one to A's adopted tag (and that tag's own rows)
+        self.assertEqual(self._ids(db, "m_bridge_tag", "blob_id", "tag_id"), [(20, 100), (20, 200)])
+        self.assertEqual(self._ids(db, "m_tag", "tag_id"), [50, 100, 200])
+        self.assertEqual(self._ids(db, "m_tag_def", "tag_id"), [100])
+        self.assertEqual(self._ids(db, "m_bridge_commit_tag", "commit_id", "tag_id"), [(300, 100)])
+        # AST nodes: the adopted node keeps its subtree; A's unadopted nodes go with their composition rows
+        self.assertEqual(self._ids(db, "m_ast", "ast_id"), [7, 500, 502, 2500])
+        self.assertEqual(self._ids(db, "m_ast_container", "ast_id", "ref_ast_id"), [(500, 502)])
+        self.assertEqual(self._ids(db, "m_ast_hash", "ast_id"), [500])
+        # No child row anywhere names a missing parent
+        secs, tags, asts = (set(self._ids(db, t, c)) for t, c in
+                            (("m_maintainer_section", "sec_id"), ("m_tag", "tag_id"), ("m_ast", "ast_id")))
+        for table in ("m_maintainer_member", "m_maintainer_pattern", "m_maintainer_file"):
+            self.assertLessEqual(set(self._ids(db, table, "sec_id")), secs, table)
+        for table in ("m_bridge_tag", "m_tag_def", "m_bridge_commit_tag"):
+            self.assertLessEqual(set(self._ids(db, table, "tag_id")), tags, table)
+        self.assertLessEqual(set(self._ids(db, "m_tag", "ast_id")) | set(self._ids(db, "m_ast_container", "ref_ast_id")), asts)
+        # A's bookkeeping is spent; B's run is untouched
+        self.assertEqual(db.count_rows("m_ingest_id_range"), 0)
+        self.assertIsNone(ingest_state.get_status(db, 1, self.A_HEAD))
+        self.assertEqual(ingest_state.get_status(db, 1, 300), ingest_state.INGEST_PARSING)
+
+    def test_retry_begin_keeps_the_earlier_attempts_ranges(self):
+        """A retry that starts without a rollback (a lost lease, a preserved in-progress run) keeps the ranges, so
+        the next rollback still finds the first attempt's rows instead of leaving them half-written forever."""
+        db = self._seed()
+        ingest_state.begin(db, 1, self.A_HEAD, TABLES, distributed=True)
+        self.assertEqual(len(ingest_state.fetch_id_ranges(db, self.A_HEAD)), 5)
+        self.assertTrue(ingest_state.rollback_version(db, 1, self.A_HEAD, TABLES))
+        self.assertEqual(self._ids(db, "m_maintainer_section", "sec_id"), [2000])
+        self.assertEqual(self._ids(db, "m_maintainer_member", "sec_id"), [2000])
+
+    def test_single_writer_retry_after_a_distributed_attempt_rolls_back_both(self):
+        """The serial retry's rows above its watermarks go, and so do the distributed attempt's leased rows below them."""
+        from core import DBLayout as D
+
+        db = self._seed()
+        ingest_state.begin(db, 1, self.A_HEAD, TABLES)  # single writer: watermarks at the current maxima
+        db.insert_rows("m_tag", [c for c, _ in D.m_tag.init_columns], [_row(D.m_tag, tag_id=9000, hash=b"\x90" * 32, ast_id=7)])
+        self.assertTrue(ingest_state.rollback_version(db, 1, self.A_HEAD, TABLES))
+        self.assertEqual(self._ids(db, "m_tag", "tag_id"), [50, 100, 200], "the retry's tag and the leased unadopted one go")
+        self.assertEqual(self._ids(db, "m_maintainer_section", "sec_id"), [2000])
+        self.assertEqual((db.count_rows("m_ingest_id_range"), db.count_rows("m_ingest_watermark")), (0, 0))
+
+    def test_child_roles(self):
+        from core import DBLayout as D
+
+        role = ingest_state.child_role
+        self.assertEqual(role(D.m_maintainer_member, "sec_id", "m_maintainer_section"), ingest_state.OWNED)
+        self.assertEqual(role(D.m_maintainer_member, "person_id", "m_maintainer_person"), ingest_state.REF)
+        self.assertEqual(role(D.m_bridge_tag, "tag_id", "m_tag"), ingest_state.REF)
+        self.assertEqual(role(D.m_tag_def, "tag_id", "m_tag"), ingest_state.OWNED)
+        self.assertEqual(role(D.m_moved_tag, "e_tag_id", "m_tag"), ingest_state.OWNED)
+        self.assertEqual(role(D.m_ast_container, "ast_id", "m_ast"), ingest_state.OWNED)
+        self.assertEqual(role(D.m_ast_container, "ref_ast_id", "m_ast"), ingest_state.EDGE)
+        self.assertEqual(role(D.m_ast_hash, "ast_id", "m_ast"), ingest_state.OWNED)
+        self.assertEqual(role(D.m_tag, "ast_id", "m_ast"), ingest_state.REF)
+        self.assertEqual(role(D.m_maintainer_section, "ast_id", "m_ast"), ingest_state.REF)
+        self.assertEqual(role(D.m_release_person, "segment_id", "m_release_segment"), ingest_state.OWNED)

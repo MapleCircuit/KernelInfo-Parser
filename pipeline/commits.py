@@ -23,6 +23,7 @@ from core.DBLayout import (
     m_bridge_commit_tag,
     m_file_blob,
 )
+from parser.git_ast.git_commit_parser import commit_fold_columns
 from pipeline.blob_reuse import _SQL_IN_CHUNK, _person_key
 from pipeline.changesets import file_fnid_cache, get_fnid_for_path
 from pipeline.git_commit_worker import _collect_git_commit_result
@@ -162,7 +163,8 @@ def processing_git_commits(version: str) -> None:
                                     commit.committer_email or commit.author_email)),
             )
             committer_pid = committer_res[0] if committer_res else author_pid
-            # Insert commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)
+            # Insert commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message,
+            # subject_key, backport)
             commit_res = G.TE.set(
                 m_commit.table_id,
                 (
@@ -175,6 +177,7 @@ def processing_git_commits(version: str) -> None:
                     commit.committer_date,
                     commit.subject[:500],
                     commit.message,
+                    *commit_fold_columns(commit.subject, commit.message),
                 ),
             )
             commit_id = commit_res[0]

@@ -4,8 +4,12 @@ A version (the head commit of a tag/branch) is ingested in one `main.update()` r
 - `m_ingest_state(network_id, commit_id, status, updated_at)`: INGEST_PARSING when it starts,
   INGEST_DONE once its last rows are committed. The webapp lists only finished versions.
 - `m_ingest_watermark(commit_id, marked_table_id, max_id)`: the highest id of every id-allocating table
-  when the run started. Ids are allocated increasingly by a single writer, so every row above a
+  when a single-writer run started. Ids are allocated increasingly by that one writer, so every row above a
   watermark was created by this run.
+- `m_ingest_id_range(commit_id, marked_table_id, start_id, end_id)`: the id blocks a distributed run leased
+  (`reserve_id_block`). Peers lease ids above any watermark, so a distributed run records no watermarks and is
+  rolled back by its ranges (`rollback_id_ranges()`): blobs it created or re-parsed are reset to unparsed and
+  its leased rows go unless a row of another run references them.
 - `m_ingest_blob(commit_id, blob_id)`: blobs that already existed but are parsed by this run (blobs
   of intermediate commits that were never parsed); their derived rows may be partial too.
 
@@ -36,7 +40,8 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from db_engine import DBError, DeadlockError
-from db_engine.spec import Join, NotExists, Select, Value, Where, between, gt, in_select, is_null, le
+from db_engine.errors import MissingTableError
+from db_engine.spec import AnyOf, Join, NotExists, Select, Value, Where, between, gt, in_select, is_null, le, lt, ne
 
 logger = logging.getLogger(__name__)
 
@@ -354,8 +359,14 @@ def begin(
     tables: Sequence[Any],
     base_commit_id: int = 0,
     worker_id: str = "",
+    distributed: bool = False,
 ) -> dict[str, int]:
-    """Mark a version as being parsed and record the watermarks of its run. Returns the marks."""
+    """Mark a version as being parsed and record the watermarks of its run. Returns the marks.
+
+    The id ranges (`m_ingest_id_range`) and re-parsed blobs (`m_ingest_blob`) an earlier attempt of the same
+    commit recorded stay: rows nobody rolled back are still this commit's rows, and the next rollback (or the
+    finished status) consumes them. A `distributed` run records no watermarks: peers lease ids above any mark,
+    so only its leased ranges identify its rows (`rollback_id_ranges()`)."""
     marks: dict[str, int] = {}
     if not commit_id:
         logger.warning("Not watermarking a run for commit_id 0 (the ref has no resolved head commit).")
@@ -363,7 +374,10 @@ def begin(
 
     def _op() -> dict[str, int]:
         local_marks: dict[str, int] = {}
-        _delete_marks(db, commit_id)
+        if db.row_exists("m_ingest_watermark", {"commit_id": commit_id}):
+            db.delete_rows("m_ingest_watermark", {"commit_id": commit_id})
+        if distributed:
+            return local_marks
         rows = []
         for t, col in marked_tables(tables):
             local_marks[t.table_name] = int(db.max_value(t.table_name, col, default=0) or 0)
@@ -406,6 +420,147 @@ def record_blobs(db: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
     _run_tx_with_retry(db, _op)
 
 
+# Registry rows a range rollback keeps although the run leased their ids: peers reuse them by content the
+# moment they are committed (paths, blobs, people, commits). A kept blob of the run is reset to unparsed instead.
+_RANGE_REGISTRY = ("m_file_name", "m_file_blob", "m_maintainer_person", "m_commit")
+OWNED, EDGE, REF = "owned", "edge", "ref"
+
+
+def child_role(child: Any, column: str, parent: str) -> str:
+    """How rows of `child` refer to `parent` through `column`, as a range rollback treats them.
+
+    - `owned`: the row is part of the parent row (its AST children, tag definitions, section members and
+      patterns): it goes with the parent and never keeps it alive. A link table without an id of its own whose
+      first key column is the reference, or whose every reference names the parent, is owned.
+    - `edge`: the parent's own composition rows pointing at another row of the same table
+      (`m_ast_container.ref_ast_id`): a kept parent keeps the row it points at.
+    - `ref`: any other reference (a peer blob's tag bridge, a section naming an AST, a tag naming an AST):
+      a surviving referencing row keeps the parent row (the parent was adopted).
+    """
+    if id_column(child):
+        return REF
+    primary = tuple(child.init_primary or ())
+    fks = _foreign(child)
+    if primary and primary[0] == column:
+        return OWNED
+    lead = next((p for c, p, _ in fks if primary and c == primary[0]), None)
+    if lead == parent:
+        return OWNED if column in primary else EDGE
+    if fks and all(p == parent for _, p, _ in fks):
+        return OWNED
+    return REF
+
+
+def _merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Leased blocks as few disjoint intervals (adjacent and overlapping blocks merged)."""
+    out: list[list[int]] = []
+    for lo, hi in sorted(ranges):
+        if out and lo <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return [(lo, hi) for lo, hi in out]
+
+
+def _leads_index(table: Any, column: str) -> bool:
+    """Whether a key or index of `table` starts with `column` (a range read of it does not scan the table)."""
+    keys = [tuple(table.init_primary or ()), *(tuple(k) for k in (getattr(table, "unique_keys", None) or ()))]
+    keys += [tuple(cols) for _name, cols in (getattr(table, "indexes", None) or ())]
+    return any(k and k[0] == column for k in keys)
+
+
+def _blob_derived(table: Any) -> bool:
+    return table.table_name not in _COMMIT_SCOPED and any(p == "m_file_blob" for _, p, _ in _foreign(table))
+
+
+def _in_ranges(column: str, ranges: Sequence[tuple[int, int]]) -> Any:
+    terms = [{column: between(lo, hi)} for lo, hi in ranges]
+    return terms[0] if len(terms) == 1 else AnyOf(*terms)
+
+
+def _outside_ranges(column: str, ranges: Sequence[tuple[int, int]]) -> list[Any]:
+    return [AnyOf({column: lt(lo)}, {column: gt(hi)}) for lo, hi in ranges]
+
+
+def _id_chunks(column: str, ids: Sequence[int]) -> list[Any]:
+    """Where terms covering exactly `ids` (sorted): contiguous runs as BETWEEN, else IN chunks, whichever is fewer."""
+    if not ids:
+        return []
+    spans: list[list[int]] = [[ids[0], ids[0]]]
+    for i in ids[1:]:
+        if i == spans[-1][1] + 1:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    if len(spans) <= len(ids) // _IN_CHUNK + 1:
+        return [{column: between(lo, hi)} for lo, hi in spans]
+    return [{column: list(ids[i:i + _IN_CHUNK])} for i in range(0, len(ids), _IN_CHUNK)]
+
+
+def _safe_delete(db: Any, table: str, where: Any) -> int:
+    """Delete rows; a table the database does not have has none (any other error propagates: the rollback is
+    run again rather than reporting success with rows left behind)."""
+    try:
+        return int(db.delete_rows(table, where) or 0)
+    except MissingTableError:
+        return 0
+
+
+def _run_blob_ids(db: Any, commit_id: int, blob_ranges: Sequence[tuple[int, int]]) -> list[int]:
+    """Blobs a run created (its leased m_file_blob ids) or re-parsed (`m_ingest_blob`)."""
+    ids = {int(r[0]) for r in db.select_rows("m_ingest_blob", ["blob_id"], {"commit_id": commit_id}, as_dict=False)}
+    if blob_ranges:
+        ids.update(int(b) for b in db.select_values("m_file_blob", "blob_id", [_in_ranges("blob_id", blob_ranges)]))
+    ids.discard(0)
+    return sorted(ids)
+
+
+def _checks_adoption(child: Any, column: str, role: str) -> bool:
+    """Whether `child.column` is read for adoption. A blob-derived reference without an index on it (symbol rows
+    naming a tag) is not: the same blob's indexed `m_bridge_tag` row records that reference too."""
+    return role == EDGE or not _blob_derived(child) or _leads_index(child, column)
+
+
+def _adopted_ids(
+    db: Any,
+    ranges: Sequence[tuple[int, int]],
+    roles: Sequence[tuple[Any, str, str]],
+    run_commits: tuple[int, Sequence[tuple[int, int]]],
+) -> set[int]:
+    """Ids in `ranges` (of the table whose children `roles` lists) that a row outside the run references (directly, or through a kept row's
+    composition edges): those rows stay. Rows of the run's own commits never adopt."""
+    head, commit_ranges = run_commits
+    adopted: set[int] = set()
+    edges: dict[int, list[int]] = {}
+    for child, col, role in roles:
+        if role == OWNED or not _checks_adoption(child, col, role):
+            continue
+        where: list[Any] = [_in_ranges(col, ranges)]
+        if role == EDGE:
+            owner = next(iter(child.init_primary))
+            # Composition rows of nodes outside the ranges adopt what they point at
+            adopted.update(int(v) for v in db.select_values(
+                child.table_name, col, [*where, *_outside_ranges(owner, ranges)], distinct=True))
+            for o, r in db.select_rows(child.table_name, [owner, col], [*where, _in_ranges(owner, ranges)], as_dict=False):
+                edges.setdefault(int(o), []).append(int(r))
+            continue
+        for fk_col, parent, _ in _foreign(child):
+            if parent == "m_commit":
+                where.append({fk_col: ne(head)})
+                where.extend(_outside_ranges(fk_col, commit_ranges))
+        try:
+            adopted.update(int(v) for v in db.select_values(child.table_name, col, where, distinct=True))
+        except MissingTableError:
+            continue
+    stack = list(adopted)
+    while stack:
+        for nxt in edges.get(stack.pop(), ()):
+            if nxt not in adopted:
+                adopted.add(nxt)
+                stack.append(nxt)
+    return adopted
+
+
 def rollback_id_ranges(
     db: Any,
     commit_id: int,
@@ -413,15 +568,26 @@ def rollback_id_ranges(
     id_ranges: list[tuple[int, int, int]],
     network_id: int | None = None,
 ) -> int:
-    """Range-isolated rollback for an interrupted run that leased discrete ID blocks.
+    """Range-isolated rollback for an interrupted run that leased discrete ID blocks (distributed mode).
 
-    Preserves universal Git registry entries (m_file_name, m_file_blob, m_maintainer_person, m_commit)
-    and removes only the version-scoped and ID-range-allocated rows of this commit_id. Every delete is
-    idempotent and atomic on its own: an interrupted rollback is simply run again.
+    Peers write between and into the same tables concurrently and reuse committed content rows (tags, AST
+    nodes, sections) by content, so the rollback removes what only this run owns and never a row another
+    worker's rows depend on:
+
+    1. the version-scoped rows of `commit_id`;
+    2. every blob the run created (its leased `m_file_blob` ids) or re-parsed (`m_ingest_blob`) is reset to
+       unparsed: all rows parsing it produced (`blob_rows_plan()`: tags bridges, sections with their members,
+       patterns and files, symbols, credits...) go, the `m_file_blob` row stays (peers' checkpoints may name
+       it). Step 4.5 reuses tagged blobs only, so the next run holding the blob parses it again;
+    3. the leased rows of every other id table, referencing tables first, except the ones a surviving row
+       outside the run references (`_adopted_ids()`, roles in `child_role()`); a deleted row takes its owned
+       rows and the run's own references (rows of the run's commits) with it.
+
+    Registry rows (`_RANGE_REGISTRY`) stay. Every delete is idempotent: an interrupted rollback is run again.
     """
     total = 0
     by_id = {t.table_id: t for t in tables}
-    children = _children(tables)
+    by_name = {t.table_name: t for t in tables}
     started = time.perf_counter()
 
     # 1. Version-scoped rows
@@ -431,58 +597,45 @@ def rollback_id_ranges(
         "m_bridge_commit_person",
         "m_commit_email",
     ):
-        try:
-            total += int(db.delete_rows(vtable, {"commit_id": commit_id}) or 0)
-        except DBError:
-            pass
+        total += _safe_delete(db, vtable, {"commit_id": commit_id})
 
-    # 2. Ingest blob derived rows
-    blob_rows = db.select_rows("m_ingest_blob", ["blob_id"], {"commit_id": commit_id}, as_dict=False)
-    blob_ids = [int(r[0]) for r in blob_rows]
-    for i in range(0, len(blob_ids), _IN_CHUNK):
-        chunk = blob_ids[i : i + _IN_CHUNK]
-        for t, col in blob_derived_tables(tables):
-            pk = id_column(t)
-            if pk:
-                for child, child_col in children.get(t.table_name, ()):
-                    total += _delete_in_parent_rows(child.table_name, child_col, t.table_name, pk, col, chunk).run(db)
-            total += _delete_in(t.table_name, col, chunk).run(db)
-
-    # 3. Leased ID range deletes
+    ranges: dict[str, list[tuple[int, int]]] = {}
     for tid, start_id, end_id in id_ranges:
         tbl = by_id.get(tid)
-        if tbl is None or tbl.table_name in _STATIC_TABLES or tbl.table_name in (
-            "m_file_name",
-            "m_file_blob",
-            "m_maintainer_person",
-            "m_commit",
-        ):
-            continue
-        if getattr(tbl, "db_assigned_ids", False):
+        if tbl is None or tbl.table_name in _STATIC_TABLES or getattr(tbl, "db_assigned_ids", False):
             # AUTO_INCREMENT ids are not leased: a range recorded for such a table holds other runs' rows
             continue
-        pk = id_column(tbl)
-        if not pk:
-            continue
+        if id_column(tbl) and start_id <= end_id:
+            ranges.setdefault(tbl.table_name, []).append((int(start_id), int(end_id)))
+    ranges = {name: _merge_ranges(r) for name, r in ranges.items()}
 
-        # Special AST handling for children
-        if tbl.table_name == "m_ast":
-            for ast_child in ("m_ast_container", "m_ast_include", "m_ast_attribute"):
-                total += int(db.delete_rows(ast_child, {"ast_id": between(start_id, end_id)}) or 0)
-            try:
-                total += int(db.delete_rows("m_ast_hash", {"ast_id": between(start_id, end_id)}) or 0)
-            except DBError:
-                pass
+    # 2. Blobs the run created or re-parsed: reset to unparsed
+    blob_ids = _run_blob_ids(db, commit_id, ranges.get("m_file_blob", ()))
+    for step in blob_rows_plan(tables, blob_ids):
+        total += step.run(db)
 
-        for child, child_col in children.get(tbl.table_name, ()):
-            if child.table_name in by_id and id_column(child):
-                continue  # Child will have its own range if marked
-            try:
-                total += int(db.delete_rows(child.table_name, {child_col: between(start_id, end_id)}) or 0)
-            except DBError:
-                pass
-
-        total += int(db.delete_rows(tbl.table_name, {pk: between(start_id, end_id)}) or 0)
+    # 3. Leased rows nobody outside the run references, referencing tables first
+    run_commits = (int(commit_id), tuple(ranges.get("m_commit", ())))
+    children = _children(tables)
+    ranged = [(by_name[name], id_column(by_name[name])) for name in ranges if name not in _RANGE_REGISTRY]
+    for tbl, pk in _child_first_order(ranged):
+        t_ranges = ranges[tbl.table_name]
+        roles = [(c, col, child_role(c, col, tbl.table_name)) for c, col in children.get(tbl.table_name, ())]
+        adopted = _adopted_ids(db, t_ranges, roles, run_commits)
+        existing = sorted(int(v) for v in db.select_values(tbl.table_name, pk, [_in_ranges(pk, t_ranges)]))
+        doomed = [i for i in existing if i not in adopted]
+        for child, col, role in roles:  # owned rows, and the run's own references (others adopted the id)
+            if role == REF and _blob_derived(child):
+                continue  # the run's blob-derived rows went with the blob reset; any other one adopted the id
+            for term in _id_chunks(col, doomed):
+                total += _safe_delete(db, child.table_name, term)
+        for term in _id_chunks(pk, doomed):
+            total += _safe_delete(db, tbl.table_name, term)
+        if adopted & set(existing):
+            logger.info(
+                f"Rollback of commit_id {commit_id}: kept {len(adopted & set(existing))} {tbl.table_name} row(s) "
+                "that rows of other runs reference."
+            )
 
     # 4. Clean up state and marks
     state_where = {"network_id": network_id, "commit_id": commit_id} if network_id is not None else {"commit_id": commit_id}
@@ -490,7 +643,7 @@ def rollback_id_ranges(
     discard_marks(db, commit_id)
     logger.info(
         f"Rolled back interrupted run of commit_id {commit_id} using leased ID ranges: "
-        f"{total} rows removed in {time.perf_counter() - started:.1f}s."
+        f"{total} rows removed ({len(blob_ids)} blob(s) reset to unparsed) in {time.perf_counter() - started:.1f}s."
     )
     return total
 
@@ -500,11 +653,12 @@ def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[
     watermarks (it predates them, or a later version finished on top of them and the caller has to fall
     back to a version-scoped purge); raises RecoveryError when older rows reference rows of the run."""
     id_ranges = fetch_id_ranges(db, commit_id)
-    if id_ranges:
-        rollback_id_ranges(db, commit_id, tables, id_ranges, network_id=network_id)
-        return True
     marks = _fetch_marks(db, commit_id, tables)
     if not marks:
+        if id_ranges or db.row_exists("m_ingest_blob", {"commit_id": commit_id}):
+            # A distributed run (no watermarks): its leased ranges and re-parsed blobs identify its rows
+            rollback_id_ranges(db, commit_id, tables, id_ranges, network_id=network_id)
+            return True
         return False
     newer = _completed_after(db, marks)
     if newer is not None:
@@ -514,6 +668,9 @@ def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[
             "belong to this run alone. Discarding them instead of deleting a finished version; only "
             "the version-scoped rows of the interrupted run are purged."
         )
+        if id_ranges:  # an earlier distributed attempt's leased rows still identify themselves
+            rollback_id_ranges(db, commit_id, tables, id_ranges, network_id=network_id)
+            return True
         discard_marks(db, commit_id)
         return False
     for desc, select in precheck_queries(tables, marks):
@@ -548,6 +705,9 @@ def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[
             f"  [{step}/{len(plan)}] {d.table} ({d.condition}): {removed} rows "
             f"in {time.perf_counter() - step_started:.1f}s (total {total})"
         )
+    if id_ranges:
+        # A single-writer attempt after a distributed one: the earlier attempt's leased rows lie below the marks
+        total += rollback_id_ranges(db, commit_id, tables, id_ranges, network_id=network_id)
     discard_marks(db, commit_id)
     logger.info(
         f"Rolled back the interrupted run of commit_id {commit_id}: {total} rows removed "

@@ -9,7 +9,6 @@ each call, and handlers execute in-process (no loopback HTTP). See `api/API.md` 
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import time
@@ -59,17 +58,20 @@ SERVER_INSTRUCTIONS = (
     "Indexed kernel repository analysis: source, ASTs, symbols, call graphs, git history, Kconfig, "
     "Kernel API, LKML, maintainers, docs, man pages, CVEs, and NodeMap canvases. Call `get_capabilities` "
     "first for repos, features, and limits. Optional `repo` overrides the active repository; `version` "
-    "defaults to the latest indexed mainline release."
+    "defaults to the latest indexed mainline release.\n"
+    "NodeMap: when asked to build, draw, create or export a NodeMap/diagram, call `preview_nodemap_canvas` "
+    "directly (it returns the webapp-importable `kip-nodemap-canvas` JSON) instead of drawing ASCII. With "
+    "`hydrate=true` (default) pass identifiers only: struct `name` (+`path`), symbol `name` (+`path`, "
+    "`kind`), commit `commitHash`, mail `mid` or `tid`; paths, `astId`, subjects and card sizes are resolved "
+    "server-side, so do not pre-fetch struct layouts or symbol definitions. Keep `verbose=false` (compact, "
+    "still importable); set `export_format` (`mermaid`/`dot`/`json`) plus `include_canvas=true` to get the "
+    "export and the canvas JSON in one call."
 )
 
+# Fallback docs only for names that are ambiguous on their own (`limit`, `offset`, `q`, `arch` are not).
 _PARAM_DOCS: dict[str, str] = {
-    "repo": "Repository name (see list_repos).",
-    "version": "Git revision (default: active latest).",
+    "version": "Git revision.",
     "path": "Repository-relative path.",
-    "limit": "Max items to return.",
-    "offset": "Pagination offset.",
-    "arch": "Target architecture.",
-    "q": "Search query.",
 }
 
 # Duplicate REST convenience aliases omitted from MCP inputSchema (preserved on REST /api/v1/*).
@@ -124,7 +126,12 @@ _NODEMAP_STRICT_TOOLS: frozenset[str] = frozenset({
     "mutate_nodemap_canvas",
 })
 
+# `verbose=false` NodeMap compaction: a key is dropped only when the webapp importer
+# (`webapp/frontend/js/views/nodemap/canvas_model.js` `normalizeNode` / `normalizeData` / `normalizeEdge`)
+# restores the identical value for a missing key, so a compact canvas imports unchanged.
 _EMPTY_NODE_UI_KEYS: frozenset[str] = frozenset({
+    "version",
+    "repo",
     "color",
     "bgColor",
     "customTitle",
@@ -134,16 +141,37 @@ _EMPTY_NODE_UI_KEYS: frozenset[str] = frozenset({
     "autoFit",
     "groupId",
 })
-_EMPTY_DATA_UI_KEYS: frozenset[str] = frozenset({
-    "collapsed",
-    "hiddenItems",
-    "fieldLocks",
-    "openMids",
-    "fullMids",
-    "pinnedBodies",
-    "typeOverrides",
-    "collapsedGuards",
-})
+# Data keys whose importer default is `false` / `true` (every other data key defaults to "", null, {} or []).
+_DATA_FALSE_DEFAULT_KEYS: frozenset[str] = frozenset({"expanded", "single", "frozen", "disableKconfigEngine"})
+_DATA_TRUE_DEFAULT_KEYS: frozenset[str] = frozenset({"showTypes", "showGuards", "markdown"})
+# Data keys whose importer default is a non-empty value, per node type.
+_DATA_VALUE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "struct": {"kind": "struct", "style": "list"},
+    "symbol": {"kind": "symbol"},
+    "source": {"mode": "file", "context": 0},
+    "kconfig": {"arch": "x86_64"},
+    "kapi": {"catalog": "summary", "arch": "x86_64"},
+    "doc": {"mode": "auto"},
+    "history": {"mode": "symbol", "line": 1},
+}
+# Data keys whose importer default is NOT "" / null / {} / [] (an empty value there must stay).
+_DATA_NONEMPTY_DEFAULT_KEYS: dict[str, frozenset[str]] = {
+    "kconfig": frozenset({"arch"}),
+    "kapi": frozenset({"arch", "catalog"}),
+    "history": frozenset({"line", "mode"}),
+    "struct": frozenset({"kind", "style"}),
+    "symbol": frozenset({"kind"}),
+    "source": frozenset({"mode", "context"}),
+    "doc": frozenset({"mode"}),
+    "diff": frozenset({"mode"}),
+}
+_EDGE_DEFAULTS: dict[str, Any] = {
+    "fromSide": "auto",
+    "toSide": "auto",
+    "arrow": "forward",
+    "style": "solid",
+    "curve": "bezier",
+}
 _EMPTY_EDGE_UI_KEYS: frozenset[str] = frozenset({
     "color",
     "waypoints",
@@ -152,6 +180,7 @@ _EMPTY_EDGE_UI_KEYS: frozenset[str] = frozenset({
     "fromField",
     "toField",
     "callSite",
+    "label",
 })
 
 
@@ -304,6 +333,57 @@ def _clean_property(prop: dict[str, Any], defs: dict[str, Any] | None = None) ->
     return out
 
 
+# One per-type key map on `nodes[].data` replaces the per-field descriptions of the flat data schema.
+_NODEMAP_DATA_DOC = (
+    "Keys per node type (hydrate fills the rest): struct name [path, kind struct|union]; symbol name "
+    "[path, kind symbol|func|macro]; source path [mode file|range|symbol, start, end, symbol]; commit "
+    "commitHash; diff commitHash, or path+versionA+versionB; mail mid or tid; kconfig symbol (no CONFIG_) "
+    "[arch]; maintainer query|secId|path; cve cveId|filePath; kapi catalog, query|symbol; doc path; history "
+    "path+line or name; man name, section; note text; tab tabType, hash. Other keys are webapp UI state."
+)
+
+_NESTED_SCHEMA_KEYS: frozenset[str] = frozenset({
+    "type", "enum", "description", "items", "properties", "required", "additionalProperties",
+})
+
+
+def _slim_nested_schema(prop: dict[str, Any]) -> None:
+    """Strip value constraints and free-form map schemas below a top-level property (in place).
+
+    Nested NodeMap objects keep their structure (`properties`, `required`, `enum`, `additionalProperties:
+    false`) so clients still see every allowed key; length/range/pattern limits stay enforced by the
+    pydantic model server-side and only cost tokens in the catalog.
+    """
+
+    def slim_object(obj: dict[str, Any]) -> None:
+        props = obj.get("properties")
+        if isinstance(props, dict):
+            for key, sub in list(props.items()):
+                if isinstance(sub, dict):
+                    props[key] = slim_value(sub)
+        if isinstance(obj.get("additionalProperties"), dict):
+            obj.pop("additionalProperties")
+
+    def slim_value(node: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in node.items() if k in _NESTED_SCHEMA_KEYS}
+        if isinstance(out.get("properties"), dict):
+            out.pop("description", None)  # the model docstring ("NodeMap canvas edge specification.")
+        if out.get("type") == "object" and "properties" not in out:
+            out.pop("additionalProperties", None)
+        if isinstance(out.get("items"), dict):
+            out["items"] = slim_value(out["items"])
+        if isinstance(out.get("properties"), dict):
+            slim_object(out)
+        return out
+
+    items = prop.get("items")
+    if isinstance(items, dict) and isinstance(items.get("properties"), dict):
+        items.pop("description", None)
+        slim_object(items)
+    elif isinstance(prop.get("properties"), dict):
+        slim_object(prop)
+
+
 def _annotations_for_route(http_method: str, required_scope: str | None, tool_name: str) -> dict[str, bool]:
     if required_scope is None:
         return dict(TOOL_ANNOTATIONS)
@@ -389,21 +469,26 @@ def _build_tool(route: APIRoute, catalog: dict[tuple[str, str], dict[str, Any]],
     defs = raw.get("$defs") if isinstance(raw.get("$defs"), dict) else {}
     properties = {key: _clean_property(value, defs) for key, value in (raw.get("properties") or {}).items()}
     for key, prop in properties.items():
+        if prop.get("default") == "" and prop.get("type") == "string":
+            prop.pop("default")  # an empty-string default is the same as omitting the optional key
         existing = prop.get("description")
         if not existing:
             doc = _PARAM_DOCS.get(key, "")
             if key in list_params:
-                doc = f"{doc} Accepts a string or list of strings.".strip()
+                doc = f"{doc} String or list.".strip()
             if doc:
                 prop["description"] = doc
         elif key in list_params and "string" not in existing.lower():
-            prop["description"] = f"{existing} Accepts a string or list of strings."
-    properties["repo"] = {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": MAX_REPO_NAME_LENGTH,
-        "description": _PARAM_DOCS["repo"],
-    }
+            prop["description"] = f"{existing} String or list."
+    for prop in properties.values():
+        _slim_nested_schema(prop)
+    node_data = ((properties.get("nodes") or {}).get("items") or {}).get("properties", {}).get("data")
+    if name in _NODEMAP_STRICT_TOOLS and isinstance(node_data, dict) and isinstance(node_data.get("properties"), dict):
+        node_data["description"] = _NODEMAP_DATA_DOC
+        for sub in node_data["properties"].values():
+            sub.pop("description", None)
+    # Described once in SERVER_INSTRUCTIONS instead of on every tool.
+    properties["repo"] = {"type": "string", "minLength": 1, "maxLength": MAX_REPO_NAME_LENGTH}
     schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
     if raw.get("required"):
         schema["required"] = [r for r in raw["required"] if r != "repo"]
@@ -523,45 +608,98 @@ def _validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
+def _is_empty(value: Any) -> bool:
+    return value is None or (isinstance(value, (str, list, dict)) and not value)
+
+
+def _same(value: Any, default: Any) -> bool:
+    return type(value) is type(default) and value == default
+
+
+def _default_node_title(node: dict[str, Any]) -> str | None:
+    from webapp.backend.services.nodemap_canvas_schema import default_title
+
+    data = node.get("data")
+    try:
+        return default_title(node.get("type"), data if isinstance(data, dict) else {})
+    except Exception:  # noqa: BLE001 - a payload default_title cannot read keeps its title
+        return None
+
+
+def _compact_node_data(node_type: Any, data: dict[str, Any]) -> dict[str, Any]:
+    keep_empty = _DATA_NONEMPTY_DEFAULT_KEYS.get(str(node_type), frozenset())
+    value_defaults = _DATA_VALUE_DEFAULTS.get(str(node_type), {})
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "subCanvas" and isinstance(value, dict):
+            out[key] = _compact_nodemap_canvas(value)
+            continue
+        if key in value_defaults and _same(value, value_defaults[key]):
+            continue
+        if key == "mode" and node_type == "diff" and value == ("commit" if data.get("commitHash") else "file"):
+            continue
+        if key in _DATA_FALSE_DEFAULT_KEYS and value is False:
+            continue
+        if key in _DATA_TRUE_DEFAULT_KEYS and value is True:
+            continue
+        if key not in keep_empty and _is_empty(value):
+            continue
+        out[key] = value
+    return out
+
+
+def _compact_nodemap_node(node: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        k: v
+        for k, v in node.items()
+        if not (k in _EMPTY_NODE_UI_KEYS and (v is False or _is_empty(v)))
+    }
+    # `customTitle` is the rename lock (while empty the webapp re-derives `title` from the data), so a set one
+    # always stays, as does `title` beside it; a `title` equal to the importer's `defaultTitle()` is dropped.
+    if "title" in out and not out.get("customTitle") and out["title"] == _default_node_title(node):
+        out.pop("title")
+    auto_fit = node.get("autoFit") is True
+    scale = node.get("scale")
+    unit_scale = scale is None or (isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale == 1)
+    if "scale" in out and unit_scale:
+        out.pop("scale")
+    # The importer resets baseW/baseH to w/h unless autoFit; an autoFit node keeps them (a missing base is
+    # clamped to the per-type size limits, which content-sized nodes may exceed).
+    if not auto_fit:
+        out.pop("baseW", None)
+        out.pop("baseH", None)
+    data = out.get("data")
+    if isinstance(data, dict):
+        cdata = _compact_node_data(node.get("type"), data)
+        if cdata:
+            out["data"] = cdata
+        else:
+            out.pop("data")
+    return out
+
+
+def _compact_nodemap_edge(edge: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in edge.items()
+        if not (k in _EMPTY_EDGE_UI_KEYS and _is_empty(v)) and not (k in _EDGE_DEFAULTS and v == _EDGE_DEFAULTS[k])
+    }
+
+
 def _compact_nodemap_canvas(canvas: dict[str, Any]) -> dict[str, Any]:
-    """Strip empty/default UI-state keys from NodeMap nodes/edges (and nested subCanvases)."""
-    out = copy.deepcopy(canvas)
+    """Drop NodeMap node/edge keys equal to the webapp importer defaults (nested subCanvases included).
+
+    The result re-imports into exactly the same normalized canvas (`kip-nodemap-canvas` v1).
+    """
+    out = dict(canvas)
     nodes = out.get("nodes")
     if isinstance(nodes, list):
-        cleaned_nodes: list[Any] = []
-        for node in nodes:
-            if not isinstance(node, dict):
-                cleaned_nodes.append(node)
-                continue
-            cnode = {
-                k: v
-                for k, v in node.items()
-                if not (k in _EMPTY_NODE_UI_KEYS and (v in ("", [], {}, False, None)))
-            }
-            data = cnode.get("data")
-            if isinstance(data, dict):
-                cdata = {
-                    k: v
-                    for k, v in data.items()
-                    if not (k in _EMPTY_DATA_UI_KEYS and (v in ("", [], {})))
-                }
-                if isinstance(cdata.get("subCanvas"), dict):
-                    cdata["subCanvas"] = _compact_nodemap_canvas(cdata["subCanvas"])
-                cnode["data"] = cdata
-            cleaned_nodes.append(cnode)
-        out["nodes"] = cleaned_nodes
+        out["nodes"] = [_compact_nodemap_node(n) if isinstance(n, dict) else n for n in nodes]
     edges = out.get("edges")
     if isinstance(edges, list):
-        out["edges"] = [
-            {
-                k: v
-                for k, v in edge.items()
-                if not (k in _EMPTY_EDGE_UI_KEYS and (v in ("", [], {}, None)))
-            }
-            if isinstance(edge, dict)
-            else edge
-            for edge in edges
-        ]
+        out["edges"] = [_compact_nodemap_edge(e) if isinstance(e, dict) else e for e in edges]
+    if out.get("tours") == []:
+        out.pop("tours")
     return out
 
 
@@ -611,10 +749,14 @@ def _project_mcp_result(
         include_canvas = proj_opts.get("include_canvas")
         if include_canvas is None:
             include_canvas = not bool(input_args.get("export_format"))
+        compact = None if verbose or not isinstance(out.get("canvas"), dict) else _compact_nodemap_canvas(out["canvas"])
+        if compact is not None and out.get("export_format") == "json":
+            # Same document as the indented REST export, minified and compacted (still webapp-importable).
+            out["export"] = json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
         if not include_canvas:
             out.pop("canvas", None)
-        elif not verbose and isinstance(out.get("canvas"), dict):
-            out["canvas"] = _compact_nodemap_canvas(out["canvas"])
+        elif compact is not None:
+            out["canvas"] = compact
         return out
 
     if verbose:

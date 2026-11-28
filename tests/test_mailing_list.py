@@ -964,6 +964,288 @@ class TestXapianSerialization(unittest.TestCase):
                 st.close()
 
 
+class TestRankedSearch(unittest.TestCase):
+    """Plain-text search ranks Subject matches ahead of newer body-only traffic and returns each article once."""
+
+    # (mid, num, subject, body, date): newest first by date; "t@x" is indexed in two shards (a cross-post)
+    DOCS = (
+        ("r1@x", 1, "Re: [PATCH] mm: unrelated", "quoting ext2: mark as deprecated", 500),
+        ("r2@x", 2, "[GIT PULL] vfs", "ext2 mark as deprecated", 400),
+        ("rep@x", 3, "Re: [PATCH] ext2: mark as deprecated", "", 200),
+        ("t@x", 4, "[PATCH] ext2: mark as deprecated", "", 100),
+        ("t@x", 4, "[PATCH] ext2: mark as deprecated", "", 100),
+        ("old@x", 5, "ext2: mark as deprecated and more", "", 50),
+    )
+
+    def _store(self, docs=None):
+        from parser.mailing_list import ml_store
+        docs = self.DOCS if docs is None else docs
+
+        class Q:
+            def __init__(self, pred):
+                self.pred = pred
+
+        class FakeQP:
+            def parse_query(self, text, flags=None):
+                if text.startswith("s:"):
+                    words = [w[2:].lower() for w in text.split()]
+                    return Q(lambda d: all(w in ml_store._WORD_RE.findall(d[2].lower()) for w in words))
+                words = ml_store._WORD_RE.findall(text.lower())
+                return Q(lambda d: all(w in ml_store._WORD_RE.findall((d[2] + " " + d[3]).lower()) for w in words))
+
+        class Term:
+            def __init__(self, t):
+                self.term = t.encode()
+
+        class Doc:
+            def __init__(self, mid):
+                self.mid = mid
+
+            def termlist(self):
+                return [Term("XSUBJ"), Term(f"Q{self.mid}")]
+
+        class Match:
+            def __init__(self, mid):
+                self.document = Doc(mid)
+
+        class MSet(list):
+            total = 0
+
+            def get_matches_estimated(self):
+                return self.total
+
+        class FakeEnquire:
+            def __init__(self, db):
+                self.q = None
+
+            def set_query(self, q):
+                self.q = q
+
+            def set_weighting_scheme(self, w):
+                pass
+
+            def set_sort_by_value(self, slot, reverse):
+                pass
+
+            def set_sort_by_relevance_then_value(self, slot, reverse):
+                pass
+
+            def get_mset(self, start, limit, check=0):
+                hits = sorted((d for d in docs if self.q.pred(d)), key=lambda d: -d[4])
+                out = MSet(Match(d[0]) for d in hits[start:start + limit])
+                out.total = len(hits)
+                return out
+
+        class FakeQuery:
+            OP_AND_NOT = "and_not"
+
+            def __new__(cls, op, a, b):
+                return Q(lambda d: a.pred(d) and not b.pred(d))
+
+        class FakeXapian:
+            Enquire = FakeEnquire
+            Query = FakeQuery
+            DatabaseModifiedError = RuntimeError
+
+            @staticmethod
+            def BoolWeight():
+                return None
+
+            @staticmethod
+            def BM25Weight():
+                return None
+
+        store = object.__new__(PublicInboxLocalStore)
+        store._qp_lock = threading.Lock()
+        store.xap_db = object()
+        store.qp = FakeQP()
+        store.shard_errors = []
+        by_mid = {d[0]: d for d in docs}
+        store.get_by_mid = lambda mid: SmsgRecord(num=by_mid[mid][1], tid=1, subject=by_mid[mid][2],
+                                                  ds=by_mid[mid][4], mids=[mid])
+        orig = (ml_store.xapian, ml_store.HAS_XAPIAN)
+        ml_store.xapian, ml_store.HAS_XAPIAN = FakeXapian, True
+        self.addCleanup(lambda: setattr(ml_store, "xapian", orig[0]) or setattr(ml_store, "HAS_XAPIAN", orig[1]))
+        return store
+
+    def test_subject_matches_rank_first_and_hits_are_unique(self):
+        store = self._store()
+        out = store.search_emails(query="ext2: mark as deprecated", limit=10)
+        subjects = [r["subject"] for r in out["results"]]
+        nums = [r["num"] for r in out["results"]]
+        self.assertEqual(len(nums), len(set(nums)), "a cross-posted message must appear once")
+        self.assertEqual(subjects[:2], ["Re: [PATCH] ext2: mark as deprecated", "[PATCH] ext2: mark as deprecated"])
+        self.assertEqual(subjects[2], "ext2: mark as deprecated and more")
+        self.assertEqual(set(subjects[3:]), {"Re: [PATCH] mm: unrelated", "[GIT PULL] vfs"})
+
+    def test_paging_crosses_the_subject_tier_without_overlap(self):
+        store = self._store()
+        first = store.search_emails(query="ext2 mark deprecated", limit=2, offset=0)["results"]
+        second = store.search_emails(query="ext2 mark deprecated", limit=2, offset=2)["results"]
+        third = store.search_emails(query="ext2 mark deprecated", limit=2, offset=4)["results"]
+        nums = [r["num"] for r in first + second + third]
+        self.assertEqual(nums[:2], [3, 4])  # subject tier first
+        self.assertEqual(nums[-2:], [1, 2])  # then the body-only matches, newest first
+        # A cross-posted article appears exactly once across every page
+        self.assertEqual(len(nums), len(set(nums)))
+        self.assertEqual(set(nums), {1, 2, 3, 4, 5})
+
+    def _walk(self, store, query, limit, filter_type="all"):
+        """All pages at a limit: (concatenated nums, per-page (len, has_more))."""
+        nums, pages, offset = [], [], 0
+        while True:
+            out = store.search_emails(query=query, limit=limit, offset=offset, filter_type=filter_type)
+            got = [r["num"] for r in out["results"]]
+            pages.append((len(got), out["has_more"]))
+            nums += got
+            self.assertGreaterEqual(out["total"], offset + len(got) + (1 if out["has_more"] else 0))
+            if not out["has_more"]:
+                return nums, pages
+            offset += limit
+            self.assertLess(len(pages), 50, "paging did not terminate")
+
+    def test_every_limit_walks_the_same_deduped_sequence(self):
+        store = self._store()
+        full, _ = self._walk(store, "ext2 mark deprecated", 100)
+        self.assertEqual(full, [3, 4, 5, 1, 2])
+        for limit in (1, 2, 3, 4):
+            nums, pages = self._walk(store, "ext2 mark deprecated", limit)
+            self.assertEqual(nums, full, f"limit={limit}")
+            for n, more in pages[:-1]:
+                self.assertEqual((n, more), (limit, True))
+            self.assertFalse(pages[-1][1])
+            self.assertTrue(0 < pages[-1][0] <= limit)
+
+    def test_duplicates_across_page_boundary_and_tier_boundary(self):
+        # "x@x" is a Tier 1 doc (subject hit) and also a Tier 2 doc (body-only copy, newer);
+        # "d@x" is cross-posted straight across a page boundary.
+        docs = (
+            ("x@x", 10, "ext2 mark deprecated", "", 90),
+            ("d@x", 11, "[PATCH] ext2 mark deprecated", "", 80),
+            ("d@x", 11, "[PATCH] ext2 mark deprecated", "", 80),
+            ("b@x", 12, "mm: other", "ext2 mark deprecated", 700),
+            ("x@x", 10, "ext2 mark deprecated", "", 90),
+            ("c@x", 13, "mm: more", "ext2 mark deprecated", 600),
+        )
+        store = self._store(docs)
+        full, _ = self._walk(store, "ext2 mark deprecated", 100)
+        self.assertEqual(sorted(full), [10, 11, 12, 13])
+        self.assertEqual(len(full), 4)
+        for limit in (1, 2, 3):
+            nums, pages = self._walk(store, "ext2 mark deprecated", limit)
+            self.assertEqual(nums, full)
+            self.assertEqual([n for n, _ in pages[:-1]], [limit] * (len(pages) - 1))
+
+    def test_untiered_syntax_query_pages_without_repeats(self):
+        docs = tuple(
+            (f"m{i}@x", i, f"ext2 note {i}", "", 1000 - i) for i in range(1, 7)
+        ) + (("m2@x", 2, "ext2 note 2", "", 998), ("m3@x", 3, "ext2 note 3", "", 997))
+        store = self._store(docs)
+        q = "s:ext2"
+        full, _ = self._walk(store, q, 100)
+        self.assertEqual(full, [1, 2, 3, 4, 5, 6])
+        for limit in (1, 2, 4):
+            nums, pages = self._walk(store, q, limit)
+            self.assertEqual(nums, full)
+            self.assertTrue(all(n == limit for n, _ in pages[:-1]))
+        self.assertFalse(store.search_emails(query=q, limit=6)["has_more"])
+        self.assertTrue(store.search_emails(query=q, limit=5)["has_more"])
+
+    def test_filter_type_pages_apply_filter_before_counting(self):
+        docs = tuple(
+            (f"p{i}@x", i, ("[PATCH] ext2 fix %d" if i % 3 == 0 else "ext2 chatter %d") % i, "", 1000 - i)
+            for i in range(1, 16)
+        ) + (("p3@x", 3, "[PATCH] ext2 fix 3", "", 997),)
+        store = self._store(docs)
+        expected = [3, 6, 9, 12, 15]
+        for limit in (1, 2, 3):
+            nums, pages = self._walk(store, "ext2", limit, filter_type="patch")
+            self.assertEqual(nums, expected, f"limit={limit}")
+            self.assertTrue(all(n == limit for n, _ in pages[:-1]))
+
+    def _capped(self, cap, count=40):
+        from parser.mailing_list import ml_store
+        docs = tuple((f"c{i}@x", i, f"ext2 thing {i}", "", 5000 - i) for i in range(1, count + 1))
+        store = self._store(docs)
+        orig = ml_store.MAX_SEARCH_SCAN
+        ml_store.MAX_SEARCH_SCAN = cap
+        self.addCleanup(lambda: setattr(ml_store, "MAX_SEARCH_SCAN", orig))
+        return store
+
+    def test_page_straddling_the_cap_continues_natively(self):
+        store = self._capped(10)
+        out = store.search_emails(query="ext2", limit=4, offset=8)
+        self.assertEqual([r["num"] for r in out["results"]], [9, 10, 11, 12])
+        self.assertTrue(out["has_more"])
+        self.assertTrue(out["scan_capped"])
+
+    def test_offset_beyond_the_cap_stays_reachable(self):
+        store = self._capped(10)
+        out = store.search_emails(query="ext2", limit=4, offset=20)
+        self.assertEqual([r["num"] for r in out["results"]], [21, 22, 23, 24])
+        self.assertTrue(out["has_more"])
+        self.assertTrue(out["scan_capped"])
+        last = store.search_emails(query="ext2", limit=4, offset=36)
+        self.assertEqual([r["num"] for r in last["results"]], [37, 38, 39, 40])
+        self.assertFalse(last["has_more"])
+        past = store.search_emails(query="ext2", limit=4, offset=60)
+        self.assertEqual(past["results"], [])
+        self.assertFalse(past["has_more"])
+        self.assertFalse(past.get("scan_capped", False))
+
+    def test_cap_ending_exactly_at_the_results_is_not_flagged(self):
+        store = self._capped(10, count=10)
+        out = store.search_emails(query="ext2", limit=4, offset=8)
+        self.assertEqual([r["num"] for r in out["results"]], [9, 10])
+        self.assertFalse(out["has_more"])
+        self.assertNotIn("scan_capped", out)
+
+    def test_unresolved_message_id_keeps_positions_stable(self):
+        store = self._store()
+        orig = store.get_by_mid
+        store.get_by_mid = lambda mid: None if mid == "rep@x" else orig(mid)
+        full = [r["num"] for r in store.search_emails(query="ext2 mark deprecated", limit=100)["results"]]
+        self.assertEqual(full, [4, 5, 1, 2])  # rep@x (num 3) is gone but nothing shifts
+        pages = [
+            [r["num"] for r in store.search_emails(query="ext2 mark deprecated", limit=2, offset=o)["results"]]
+            for o in (0, 2, 4)
+        ]
+        self.assertEqual(pages, [[4], [5, 1], [2]])
+
+    def test_total_is_identical_on_every_page(self):
+        store = self._store()
+        totals = {store.search_emails(query="ext2 mark deprecated", limit=2, offset=o)["total"] for o in (0, 2, 4)}
+        self.assertEqual(len(totals), 1)
+
+    def test_skipped_prefix_is_not_resolved(self):
+        store = self._store()
+        calls = []
+        orig = store.get_by_mid
+        store.get_by_mid = lambda mid: calls.append(mid) or orig(mid)
+        store.search_emails(query="ext2 mark deprecated", limit=2, offset=2)
+        self.assertEqual(len(calls), 3)  # page of 2 + 1 probe, nothing of the prefix
+
+    def test_query_syntax_runs_untiered(self):
+        store = self._store()
+        self.assertIsNone(store.subject_tier_query("s:ext2 deprecated"))
+        self.assertIsNone(store.subject_tier_query('"mark as deprecated"'))
+        self.assertIsNone(store.subject_tier_query("ext2 OR ext3"))
+        self.assertIsNotNone(store.subject_tier_query("ext2: drain in-flight DIO"))
+
+    def test_subject_match_tier(self):
+        from parser.mailing_list.ml_store import subject_match_tier
+        self.assertEqual(subject_match_tier("ext2: mark as deprecated", "Re: [PATCH v2 1/3] ext2: mark as deprecated"), 0)
+        self.assertEqual(subject_match_tier("Remove ext3 filesystem driver", "[PATCH] fs: Remove ext3 filesystem driver"), 1)
+        self.assertEqual(subject_match_tier("ext2: drain in-flight DIO", "DIO: drain ext2 in-flight"), 2)
+        self.assertEqual(subject_match_tier("ext2 deprecated", "mm: something"), 3)
+
+    def test_service_page_drops_repeated_articles(self):
+        from webapp.backend.services.mailing_list_service import _dedupe_search_results
+        page = {"results": [{"num": 1, "message_id": "a"}, {"num": 1, "message_id": "a"}, {"num": 2, "message_id": "b"},
+                            {"num": 3, "message_id": "b"}]}
+        self.assertEqual([r["num"] for r in _dedupe_search_results(page)["results"]], [1, 2])
+
+
 class TestBlobQueryConstruction(unittest.TestCase):
     """A blob term must never reach Xapian as a bare prefix.
 

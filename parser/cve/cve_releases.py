@@ -814,6 +814,8 @@ def build_lookup_data(
             if tag is None:
                 continue
             sha = _hex(ch_raw)
+            if int(chain_raw) not in (DB_CHAIN_MAINLINE, DB_CHAIN_STABLE):
+                continue  # a linux-next snapshot (chain 3) is no release
             entry = sha_tags.setdefault(sha, {"mainline": None, "stable": None})
             entry["mainline" if int(chain_raw) == DB_CHAIN_MAINLINE else "stable"] = tag
 

@@ -423,6 +423,8 @@ def _index_job_key() -> str:
 # m_release_segment.chain / m_commit_release.chain (parser/git_ast/release_stats.py)
 DB_CHAIN_MAINLINE = 1
 DB_CHAIN_STABLE = 2
+DB_CHAIN_NEXT = 3
+_DB_CHAIN_FIELD = {DB_CHAIN_MAINLINE: "mainline", DB_CHAIN_STABLE: "stable"}
 _DB_COVERAGE: RepoScopedCache = RepoScopedCache(maxsize=4)
 _DB_COVERAGE_TTL = 60.0  # a "not covered" answer is checked again after this (release statistics run at parser start)
 
@@ -484,8 +486,11 @@ def db_lookup(shas: list[str]) -> dict[str, dict[str, str | None]]:
                     tag = _text(r["tag"])
                     if tags.get(tag) != _hex(r["tag_hash"]):
                         continue
+                    field = _DB_CHAIN_FIELD.get(int(r["chain"]))
+                    if field is None:  # a linux-next snapshot is no release (first_stable / first_mainline)
+                        continue
                     hit = out.setdefault(_hex(r["commit_hash"]), {"mainline": None, "stable": None})
-                    hit["mainline" if int(r["chain"]) == DB_CHAIN_MAINLINE else "stable"] = tag
+                    hit[field] = tag
     except Exception as exc:  # noqa: BLE001 - an older database: nothing from it
         logger.debug("m_commit_release lookup failed: %s", exc)
         return {}

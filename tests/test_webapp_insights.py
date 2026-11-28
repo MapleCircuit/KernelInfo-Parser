@@ -1359,6 +1359,7 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
         import json
         from unittest import mock
 
+        from parser.git_ast import release_stats
         from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
         from parser.maintainer_ast.maintainer_parser import MaintainerParser
         from tests.db_fixtures import make_db, patch_reader
@@ -1379,8 +1380,8 @@ class TestSubsystemHealthDeltasAndFixes(unittest.TestCase):
             "m_release_segment",
             ["segment_id", "repo_id", "tag", "tag_hash", "chain", "base_tag", "base_hash", "commits", "merges", "diff_base_tag", "files_changed", "lines_added", "lines_removed", "format"],
             [
-                (1, 1, "v1.1", bytes.fromhex(h1), 1, "v1.0", b"\x00" * 20, 2, 0, "v1.0", 1, 1, 0, 2),
-                (2, 1, "v1.2", bytes.fromhex(h2), 1, "v1.1", bytes.fromhex(h1), 1, 0, "v1.1", 1, 1, 0, 2),
+                (1, 1, "v1.1", bytes.fromhex(h1), 1, "v1.0", b"\x00" * 20, 2, 0, "v1.0", 1, 1, 0, release_stats.FORMAT),
+                (2, 1, "v1.2", bytes.fromhex(h2), 1, "v1.1", bytes.fromhex(h1), 1, 0, "v1.1", 1, 1, 0, release_stats.FORMAT),
             ],
         )
         foo_v1 = secs_v1[0]

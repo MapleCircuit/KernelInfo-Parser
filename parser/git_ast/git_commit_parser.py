@@ -6,6 +6,7 @@ and correlates code occurrence tags (m_tag) to commit revisions.
 """
 import re
 import bisect
+import hashlib
 import subprocess
 import logging
 from pathlib import Path
@@ -50,6 +51,39 @@ def iter_trailers(message: str) -> Iterator[tuple[str, str, str]]:
         prefix, name, email_angle, email_bare = match.groups()
         email = (email_angle or email_bare or "").strip()
         yield prefix, (name or "").strip() or email, email
+
+
+_SUBJECT_SPACE_RE = re.compile(r"\s+")
+SUBJECT_KEY_LEN = 8
+EMPTY_SUBJECT_KEY = b"\x00" * SUBJECT_KEY_LEN
+
+
+def normalize_subject(subject: str | None) -> str:
+    """A commit subject as the backport fold compares it: whitespace runs collapsed, stripped, lower-cased."""
+    return _SUBJECT_SPACE_RE.sub(" ", subject or "").strip().lower()
+
+
+def subject_key(subject: str | None) -> bytes:
+    """`m_commit.subject_key`: first `SUBJECT_KEY_LEN` bytes of the SHA-256 of `normalize_subject()`;
+    `EMPTY_SUBJECT_KEY` for an empty subject (such rows never fold)."""
+    norm = normalize_subject(subject)
+    if not norm:
+        return EMPTY_SUBJECT_KEY
+    return hashlib.sha256(norm.encode("utf-8", "surrogatepass")).digest()[:SUBJECT_KEY_LEN]
+
+
+def is_backport(message: str | None) -> bool:
+    """`m_commit.backport`: the message names the upstream commit it backports (`commit <sha> upstream.`,
+    `[ Upstream commit <sha> ]`, `(cherry picked from commit <sha>)`; `commit_relations.UPSTREAM_RES`)."""
+    from parser.git_ast.commit_relations import UPSTREAM_RES
+
+    text = message or ""
+    return any(rx.search(text) for rx in UPSTREAM_RES)
+
+
+def commit_fold_columns(subject: str | None, message: str | None) -> tuple[bytes, int]:
+    """(`subject_key`, `backport`) of an `m_commit` row."""
+    return subject_key(subject), int(is_backport(message))
 
 
 # Regexes to extract Fixes: tags and revert references

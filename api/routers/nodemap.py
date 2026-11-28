@@ -42,7 +42,7 @@ _NODE_DATA_KEYS_BY_TYPE: dict[str, tuple[str, ...]] = {
         "name", "kind", "path", "hint", "line", "showTypes", "showGuards", "typeOverrides",
         "collapsed", "style", "collapsedGuards", "hiddenItems", "fieldLocks", "disableKconfigEngine",
     ),
-    "symbol": ("name", "kind", "astId", "expanded", "constituents"),
+    "symbol": ("name", "kind", "path", "astId", "expanded", "constituents"),
     "source": ("path", "mode", "start", "end", "symbol", "symbolKind", "context"),
     "man": ("repo", "version", "path", "name", "section", "mode"),
     "tab": ("tabType", "hash", "embedSessionId", "frozen", "viewState"),
@@ -127,7 +127,7 @@ class NodemapNodeDataInput(BaseModel):
 
     name: str | None = Field(default=None, max_length=256, description="Struct, symbol, man-page, or history target name.")
     kind: str | None = Field(default=None, max_length=32, description="Kind ('struct'|'union' for struct; 'symbol'|'func'|'macro' for symbol).")
-    path: str | None = Field(default=None, max_length=1024, description="Repository-relative file path (source/struct/man/diff/doc/history/maintainer).")
+    path: str | None = Field(default=None, max_length=1024, description="Repository-relative file path (source/struct/symbol definition/man/diff/doc/history/maintainer).")
     hint: str | None = Field(default=None, max_length=1024, description="Header path hint for struct disambiguation.")
     line: int | None = Field(default=None, ge=1, description="1-based source line number.")
     showTypes: bool | None = None
@@ -740,7 +740,7 @@ def export_nodemap_canvas(
 
 @router.post("/nodemap/preview", dependencies=[Depends(require_feature("nodemap"))])
 def preview_nodemap_canvas(payload: NodemapPreviewRequest) -> dict[str, Any]:
-    """Stateless read-only NodeMap canvas builder: normalize, hydrate, expand, lay out, and optionally export in memory."""
+    """Build a NodeMap canvas in one call (nothing saved): pass nodes by identifier, get importable `kip-nodemap-canvas` JSON and/or a mermaid/dot export. Use it whenever asked to create, draw or export a NodeMap; hydration resolves paths, astId, subjects and sizes."""
     ver = resolve_version(payload.version)
     data = payload.model_dump(by_alias=True, exclude_none=True)
     if str(data.get("auto_layout") or "").strip().lower() in ("none", "false", "0", ""):

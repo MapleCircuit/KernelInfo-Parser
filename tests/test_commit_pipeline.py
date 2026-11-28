@@ -17,6 +17,7 @@ import signal
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import main
 import pipeline.source_order
@@ -453,6 +454,36 @@ class TestRetriedCommit(_EngineCase):
         self.te._committed_nodup_keys[m_file_name.table_id][key] = 99
         self.te.commit_all()
         self.assertEqual(self.te.queued_set[m_file_name.table_id], {})
+
+
+class TestCommitFoldColumns(unittest.TestCase):
+    """Step 1 writes the backport-fold metadata (`m_commit.subject_key` / `backport`) with every commit row."""
+
+    def test_dag_ingest_stores_subject_key_and_backport_flag(self) -> None:
+        import main
+        import pipeline.git_ingest
+        from parser.git_ast.git_commit_parser import subject_key
+        from tests.test_pipeline_steps import _commit
+
+        MockDB.reset()
+        try:
+            up, bp, plain = "1" * 40, "2" * 40, "3" * 40
+            mainline = _commit(up, "A", "a@x", [])
+            mainline.subject, mainline.message = "ext2: drain DIO", "ext2: drain DIO\n\nSigned-off-by: A <a@x>"
+            backport = _commit(bp, "A", "a@x", [up])
+            backport.subject = "ext2:  Drain DIO"
+            backport.message = f"ext2:  Drain DIO\n\ncommit {up} upstream.\n"
+            other = _commit(plain, "A", "a@x", [bp])
+            other.subject, other.message = "", ""
+            with MockDB() as db, mock.patch.object(main.MF, "repo_dir", None, create=True):
+                ids = pipeline.git_ingest._ingest_commit_range(db, [other, backport, mainline], network_id=1)
+                rows = {int(r[0]): (bytes(r[1]), int(r[2])) for r in db.select_rows(
+                    "m_commit", ["commit_id", "subject_key", "backport"], {"commit_id": list(ids.values())}, as_dict=False)}
+        finally:
+            MockDB.reset()
+        self.assertEqual(rows[ids[up]], (subject_key("ext2: drain DIO"), 0))
+        self.assertEqual(rows[ids[bp]], (subject_key("ext2: drain DIO"), 1), "same normalized subject, upstream reference")
+        self.assertEqual(rows[ids[plain]], (b"\x00" * 8, 0), "an empty subject never folds")
 
 
 class TestStageCounts(unittest.TestCase):

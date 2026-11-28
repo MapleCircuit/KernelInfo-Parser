@@ -49,6 +49,25 @@ def normalize_series_subject(subject: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _dedupe_search_results(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the first hit of each article (`num`, else `message_id`) in a search page."""
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload
+    seen: set[Any] = set()
+    unique: list[Any] = []
+    for row in results:
+        if isinstance(row, dict):
+            keys = [k for k in (("num", row.get("num")), ("mid", row.get("message_id"))) if k[1]]
+            if any(k in seen for k in keys):
+                continue
+            seen.update(keys)
+        unique.append(row)
+    if len(unique) == len(results):
+        return payload
+    return {**payload, "results": unique}
+
+
 def _drop_future_dated(payload: dict[str, Any]) -> dict[str, Any]:
     """Remove results whose Date: header lies in the future from a browse listing.
 
@@ -511,13 +530,19 @@ class MailingListService:
         page: int = 1,
         limit: int = 50,
         filter_type: str = "all",
+        offset: int | None = None,
     ) -> dict[str, Any]:
-        """Search mailing list messages by query and filter with pagination."""
+        """Search mailing list messages by query and filter with pagination.
+
+        `offset` (a raw result position, any value) overrides the page-derived
+        `(page - 1) * limit`; the archive returns positions `[offset, offset + limit)`
+        of one Message-ID-unique sequence, so any offset is a valid page start.
+        """
         clean_q = (query or "").strip()
         p = max(1, page)
         lim = max(1, min(100, limit))
-        offset = (p - 1) * lim
-        cache_key = f"{clean_q}:{p}:{lim}:{filter_type}"
+        offset = (p - 1) * lim if offset is None else max(0, int(offset))
+        cache_key = f"{clean_q}:{offset}:{lim}:{filter_type}"
 
         with self._lock:
             cached = self._live_get(self._search_cache, cache_key)
@@ -560,6 +585,7 @@ class MailingListService:
                 }
             if not clean_q:
                 search_data = _drop_future_dated(search_data)
+            search_data = _dedupe_search_results(search_data)
             result: dict[str, Any] = {
                 "available": True,
                 "page": p,

@@ -121,5 +121,96 @@ class TestQueryRepository(unittest.TestCase):
         self.assertEqual(items[0]["files_count"], 1)
 
 
+class TestBackportFoldSQL(unittest.TestCase):
+    """Text search folds stable backports into the mainline row in SQL (`list_network_commits(collapse_backports=True)`),
+    over the ingest-time `m_commit.subject_key` / `backport` columns, at any offset."""
+
+    MAIN, BP1, BP2 = 5, 700, 800  # one change: mainline 5 and two stable backports
+    ONLY1, ONLY2 = 900, 950       # a change only stable backports carry (its mainline is not indexed)
+
+    @staticmethod
+    def _rows():
+        from parser.git_ast.git_commit_parser import commit_fold_columns
+
+        def row(cid, subject, message=""):
+            key, bp = commit_fold_columns(subject, message)
+            return (cid, 1, cid.to_bytes(20, "big"), 1, cid, 1, cid, subject, message, key, bp)
+
+        rows = [row(i, f"ext2: filler {i}") for i in range(1, 651) if i not in (5, 10, 20)]
+        rows += [
+            row(5, "ext2: drain in-flight DIO"),
+            row(700, "ext2:  Drain in-flight DIO", f"commit {'5' * 40} upstream."),
+            row(800, "ext2: drain in-flight DIO", f"[ Upstream commit {'5' * 40} ]"),
+            # distinct mainline commits sharing a generic subject: never folded
+            row(10, "ext2: fix typo"), row(20, "ext2: fix typo"),
+            row(900, "ext2: stable only", "(cherry picked from commit abcdef1)"),
+            row(950, "ext2: stable only", "commit abcdef1 upstream."),
+        ]
+        return rows
+
+    def _db(self, kind):
+        from core.DBLayout import m_commit, m_commit_file, m_maintainer_person
+        from tests.db_fixtures import make_db
+
+        return make_db(kind, tables=[m_commit, m_maintainer_person, m_commit_file], rows={
+            "m_maintainer_person": (["person_id", "name", "email"], [(1, "Ann", "ann@x.org")]),
+            "m_commit": ([c for c, _ in m_commit.init_columns], self._rows()),
+        })
+
+    def _walk(self, db, limit, collapse=True):
+        out, offset = [], 0
+        while True:
+            page = db.list_network_commits(1, text="ext2", limit=limit + 1, offset=offset, collapse_backports=collapse)
+            out.extend(page[:limit])
+            if len(page) <= limit:
+                return out
+            offset += limit
+
+    def test_fold_is_exact_at_every_offset(self) -> None:
+        for kind in ("mock", "sqlite"):
+            with self.subTest(kind=kind), self._db(kind).reader() as db:
+                every = self._walk(db, 50, collapse=False)
+                self.assertEqual(len(every), 650 - 3 + 7, "backports=include lists every copy")
+                self.assertTrue(all("backport_count" not in r for r in every))
+                hidden = {self.BP1, self.BP2, self.ONLY2}
+                expected = [r["commit_id"] for r in every if r["commit_id"] not in hidden]
+                for limit in (50, 37, 200):
+                    folded = self._walk(db, limit)
+                    self.assertEqual([r["commit_id"] for r in folded], expected, f"limit {limit}")
+                by_id = {r["commit_id"]: r for r in self._walk(db, 50)}
+                # The mainline row sits past offset 500 and still carries its backports (newest first)
+                self.assertGreater(expected.index(self.MAIN), 500)
+                self.assertEqual(by_id[self.MAIN]["backport_count"], 2)
+                self.assertEqual(by_id[self.MAIN]["backport_hashes"],
+                                 [self.BP2.to_bytes(20, "big").hex(), self.BP1.to_bytes(20, "big").hex()])
+                self.assertEqual(by_id[self.ONLY1]["backport_count"], 1, "no mainline: the oldest backport stands in")
+                self.assertNotIn("backport_count", by_id[10])
+                self.assertNotIn("backport_count", by_id[20])
+                self.assertNotIn("subject_key", by_id[10])
+                deep = db.list_network_commits(1, text="ext2", limit=5, offset=expected.index(self.MAIN) - 2,
+                                               collapse_backports=True)
+                self.assertEqual([r["commit_id"] for r in deep], expected[expected.index(self.MAIN) - 2:][:5])
+
+    def test_router_pages_the_folded_listing(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from api.routers import common as api_common
+        from api.routers import history
+
+        calls = []
+
+        def fake(ver, page=1, limit=50, query="", *, offset=None, collapse_backports=False):
+            calls.append((offset, limit, collapse_backports))
+            return {"version": ver, "commits": [{"commit_hash": f"{i:040x}", "subject": "s"} for i in range(limit)]}
+
+        app = FastAPI()
+        app.include_router(history.router)
+        with patch.object(api_common._git_service, "get_commits", side_effect=fake):
+            body = TestClient(app).get("/commits?q=ext2&limit=20&offset=740").json()
+        self.assertEqual(calls, [(740, 21, True)], "the folded page is read at its exact offset")
+        self.assertEqual((len(body["commits"]), body["truncated"], body["offset"]), (20, True, 740))
+
+
 if __name__ == "__main__":
     unittest.main()

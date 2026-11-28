@@ -932,7 +932,7 @@ def processing_unified_preparse(
                         "sha": sha,
                         "base_sha": tag_shas[base] if base else None,
                         "diff_base_sha": tag_shas[diff_base] if diff_base else None,
-                        "chain": release_stats.CHAIN_MAINLINE if rng["kind"] == "mainline" else release_stats.CHAIN_STABLE,
+                        "chain": release_stats.chain_of(rng["kind"]),
                     }
 
             if not (need_sub or need_st or need_pulls or need_api or need_seg):

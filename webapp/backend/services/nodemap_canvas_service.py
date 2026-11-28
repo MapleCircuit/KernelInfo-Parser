@@ -318,7 +318,13 @@ class NodeMapCanvasService:
         default_version: str,
         default_repo: str,
         struct_cache: dict[tuple[str, str, str], dict[str, Any] | None],
+        raw: dict[str, Any] | None = None,
     ) -> None:
+        """Fill what the card would otherwise fetch (paths, astId, subjects, sizes) into a normalized node.
+
+        `raw` is the caller's node before normalization: request-only hints the canvas schema does not store
+        (a symbol's definition `data.path`) are read from it.
+        """
         ntype = node.get("type")
         data = node.get("data")
         if not isinstance(data, dict):
@@ -386,15 +392,56 @@ class NodeMapCanvasService:
                     hydrated_meta["line_count"] = len(lines)
 
         elif ntype == "symbol" and data.get("name"):
+            raw_data = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else {}
+            def_path = str(data.get("path") or raw_data.get("path") or "").strip().lstrip("/")
             try:
-                sym_res = _symbol_service.get_symbol_detail(ver, str(data["name"]).strip())
+                sym_res = _symbol_service.get_symbol_detail(
+                    ver, str(data["name"]).strip(), from_file=def_path or None
+                )
             except Exception:  # noqa: BLE001
                 sym_res = None
             if isinstance(sym_res, dict):
                 defn = sym_res.get("definition") if isinstance(sym_res.get("definition"), dict) else sym_res
+                if def_path:
+                    # A caller-named definition file selects that definition among the ranked ones.
+                    for cand in sym_res.get("definitions") or ():
+                        if isinstance(cand, dict) and cand.get("file") == def_path:
+                            defn = cand
+                            break
                 tname = str(defn.get("type_name") or "").lower()
-                if data.get("kind") in ("", "symbol") and "func" in tname:
+                if data.get("kind") in (None, "", "symbol") and "func" in tname:
                     data["kind"] = "func"
+                ast_id = defn.get("ast_id")
+                if not isinstance(data.get("astId"), int) and isinstance(ast_id, int) and ast_id > 0:
+                    data["astId"] = ast_id
+                if defn.get("file"):
+                    hydrated_meta["definition_file"] = defn["file"]
+
+        elif ntype == "mail" and (data.get("mid") or data.get("tid")) and not data.get("subject"):
+            from webapp.backend.services.mailing_list_service import (
+                mailing_list_service,
+            )
+
+            mid = str(data.get("mid") or "").strip().strip("<>")
+            tid = data.get("tid") if isinstance(data.get("tid"), int) and not isinstance(data.get("tid"), bool) else 0
+            m_res: dict[str, Any] | None = None
+            try:
+                if mid:
+                    m_res = mailing_list_service.get_message(mid)
+                if (not isinstance(m_res, dict) or not m_res.get("subject")) and (tid > 0 or mid):
+                    m_res = mailing_list_service.get_thread(tid, mid_hint=mid)
+            except Exception:  # noqa: BLE001
+                m_res = None
+            if isinstance(m_res, dict):
+                subject = m_res.get("subject")
+                msgs = m_res.get("messages")
+                if not subject and isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+                    subject = msgs[0].get("subject")
+                if subject:
+                    data["subject"] = str(subject).strip()[:512]
+                res_tid = m_res.get("tid")
+                if tid <= 0 and isinstance(res_tid, int) and not isinstance(res_tid, bool) and res_tid > 0:
+                    data["tid"] = res_tid
 
         elif ntype == "commit" and data.get("commitHash") and not data.get("subject"):
             try:
@@ -495,7 +542,7 @@ class NodeMapCanvasService:
                         norm = normalize_node(merged)
                         if norm:
                             if hydrate:
-                                self._hydrate_node(norm, default_version, default_repo, scache)
+                                self._hydrate_node(norm, default_version, default_repo, scache, raw=merged)
                             canvas["nodes"][idx] = norm
                             by_id[nid] = (idx, norm)
                     elif op_name not in ("update_nodes", "update_node"):
@@ -504,12 +551,12 @@ class NodeMapCanvasService:
                             if norm["id"] in by_id:
                                 idx, _ = by_id[norm["id"]]
                                 if hydrate:
-                                    self._hydrate_node(norm, default_version, default_repo, scache)
+                                    self._hydrate_node(norm, default_version, default_repo, scache, raw=item)
                                 canvas["nodes"][idx] = norm
                                 by_id[norm["id"]] = (idx, norm)
                             else:
                                 if hydrate:
-                                    self._hydrate_node(norm, default_version, default_repo, scache)
+                                    self._hydrate_node(norm, default_version, default_repo, scache, raw=item)
                                 idx = len(canvas["nodes"])
                                 canvas["nodes"].append(norm)
                                 by_id[norm["id"]] = (idx, norm)

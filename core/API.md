@@ -14,35 +14,35 @@ agents.
   - 2.1. `MasterFile` (`mf`) [L252-L322]
 - 3. Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L323-L555]
   - 3.1. `GreatProcessor` (`gp`) [L325-L555]
-- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L556-L757]
+- 4. Relational Database Schema Registry (`core/DBLayout.py`) [L556-L761]
   - Relational Table Families (`core/DBLayout.py`) [L568-L640]
-  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L641-L730]
-  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L731-L757]
-- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L758-L954]
-  - 5.1. Data Sanitization Helpers [L760-L766]
-  - 5.2. `Table` Class Interface [L767-L800]
-  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L801-L907]
-  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L908-L930]
-  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L931-L954]
-- 6. End-to-End Inter-Module Execution Lifecycle [L955-L1102]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1103-L1539]
-  - 7.1. Unified Configuration Hierarchy [L1105-L1238]
-  - 7.1.1. Repository Auto-Detection & Selection [L1239-L1304]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1305-L1374]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1375-L1424]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1425-L1539]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1540-L1810]
-  - 8.1. High-Level Architecture [L1542-L1585]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1586-L1611]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1612-L1810]
-- 9. CVE List Ingestion (`parser/cve/`) [L1811-L1867]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1868-L1935]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1936-L2070]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1944-L1975]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1976-L2020]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L2021-L2053]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2054-L2070]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2071-L2118]
+  - 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`) [L641-L734]
+  - 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`) [L735-L761]
+- 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L762-L958]
+  - 5.1. Data Sanitization Helpers [L764-L770]
+  - 5.2. `Table` Class Interface [L771-L804]
+  - 5.3. `ChangeSet` (`CS`) Class & Context Routing [L805-L911]
+  - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L912-L934]
+  - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L935-L958]
+- 6. End-to-End Inter-Module Execution Lifecycle [L959-L1106]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1107-L1543]
+  - 7.1. Unified Configuration Hierarchy [L1109-L1242]
+  - 7.1.1. Repository Auto-Detection & Selection [L1243-L1308]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1309-L1378]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1379-L1428]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1429-L1543]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1544-L1820]
+  - 8.1. High-Level Architecture [L1546-L1589]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1590-L1615]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1616-L1820]
+- 9. CVE List Ingestion (`parser/cve/`) [L1821-L1877]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1878-L1947]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1948-L2097]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1956-L1987]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1988-L2032]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L2033-L2080]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2081-L2097]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2098-L2145]
 <!-- toc:end -->
 
 ---
@@ -569,7 +569,7 @@ For authoritative table definitions, primary keys, indexes, and the full relatio
 - **Projects & File Blobs** (Tables 0–4): `m_project`, `m_file_name`, `m_file_blob`, `m_bridge_checkpoint`, `m_blob_transition`.
 - **AST Nodes & Spatial Mapping** (Tables 5–14, 34): `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`, `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_ast_hash`, `m_ast_attribute`.
 - **Maintainers & CREDITS** (Tables 15–20): `m_maintainer_person`, `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry`. `m_maintainer_section` records subsystem metadata: `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id, patchwork, bug_url, chat_channel, profile_doc)`.
-- **Git Commit DAG & Lineage** (Tables 21–25, 30–33, 43, 60, 63–64): `m_commit`, `m_bridge_commit_person`, `m_commit_file`, `m_bridge_commit_tag`, `m_moved_tag`, `m_git_network`, `m_repository`, `m_git_ref`, `m_commit_parent`, `m_commit_email`, `m_commit_release`, `m_commit_relation`, `m_commit_link`.
+- **Git Commit DAG & Lineage** (Tables 21–25, 30–33, 43, 60, 63–64): `m_commit`, `m_bridge_commit_person`, `m_commit_file`, `m_bridge_commit_tag`, `m_moved_tag`, `m_git_network`, `m_repository`, `m_git_ref`, `m_commit_parent`, `m_commit_email`, `m_commit_release`, `m_commit_relation`, `m_commit_link`. Every `m_commit` row carries its backport-fold metadata from ingestion (Step 1 `_ingest_commit_range()` and Step 6.5 `processing_git_commits()`, pure `commit_fold_columns()` of `parser/git_ast/git_commit_parser.py`): `subject_key` (8-byte digest of the normalized subject) and `backport` (the message names its upstream commit), indexed by `commit_subject_idx (network_id, subject_key, backport, commit_id)` for the SQL fold of the commit search (`list_network_commits(collapse_backports=True)`, `db_engine/DB_API.md` §2.12).
 - **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61, 70–71): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`, `m_kapi_catalog`, `m_kapi_release_summary`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`. Tables 70–71 store materialized per-revision Kernel API catalogs (`(commit_id, arch, kind)` -> zlib JSON BLOB + summary) and per-release cross-kind summaries (`(commit_id, arch)` -> per-kind counts and subsystem breakdowns).
 - **Ingestion State, Watermarks, Checkpoints & Distributed Coordination** (Tables 29, 35, 40–41, 47, 55–58, 75–77): `m_db_instance`, `m_ingest_state`, `m_ingest_watermark`, `m_ingest_blob`, `m_checkpoint_base`, `m_table_sequence`, `m_ingest_id_range`, `m_parse_node`, `m_parse_task`, `distributed_tasks`, `distributed_worker_capabilities`, `distributed_worker_step_caps`. Table 58 `m_parse_task` holds legacy secondary work items (`(network_id, ref_name)` unique key). Table 75 `distributed_tasks` stores prioritized coordination queue items (`pending`, `claimed`, `completed`, `failed`, priorities 10/8/5/3/1, `heartbeat_ts`, `available_ts` retry backoff, `required_capability` of auxiliary step/repo tasks, unique key `(network_id, repo_name, task_type, ref_name)`). Table 76 `distributed_worker_capabilities` stores per-node repository, track, and ordinal boundary capabilities keyed by `(worker_id, network_id, repo_name, track_name)`. Table 77 `distributed_worker_step_caps` stores the independent steps (§11.4) a node runs per repository, keyed by `(worker_id, network_id, repo_name, capability)`.
 - **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59, 66–67, 72–74): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`, `m_release_pull`, `m_release_section_health`, `insights_subsystem_version_delta`, `insights_subsystem_author_delta`, `insights_stable_version_delta`. Tables 72–74 store incremental, disjoint release deltas keyed by `(version_tag, subsystem_name)` (and `author_identity_id`) and indexed by `(series_track, series_ord)` for O(1)-slice aggregation across tag windows.
@@ -649,8 +649,12 @@ therefore bracketed:
   id-allocating table (`marked_tables()`: single INT primary key that is not a foreign key, outside the static
   registries `m_type_descriptor`, `m_project`, `m_git_network`, `m_repository`, `m_git_ref`). Ids are
   allocated increasingly by a single writer, so every row above a watermark belongs to the run *while that run
-  is the newest one*. A ref whose head commit could not be resolved (`commit_id` 0, the `m_git_ref` sentinel)
-  is never watermarked and gets no state row.
+  is the newest one*. A distributed run (`G.distributed`, `begin(..., distributed=True)`) records no
+  watermarks: peers lease ids above any mark, so its leased `m_ingest_id_range` blocks alone identify its rows
+  (§11.3). `begin()` keeps the id ranges and `m_ingest_blob` rows an earlier attempt of the same commit
+  recorded (a retry that starts without a rollback still rolls the first attempt back later). A ref whose head
+  commit could not be resolved (`commit_id` 0, the `m_git_ref` sentinel) is never watermarked and gets no
+  state row.
 - **Step 4.5** (`_record_reparsed_blobs()`): blobs that already exist but are parsed now (they are not reused)
   go to `m_ingest_blob` before any of their rows are written.
 - **Step 4.6** (`pipeline/compile_envs.py` `prepare_compile_env()`): the version's compilation environment
@@ -1786,12 +1790,18 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
     the reference host), so every result set is bounded by construction — one unbounded fetch was enough to
     grow the daemon to 14.7GB and have the kernel OOM-kill it alongside its neighbours:
     - `search_emails`: `limit` and `offset` are clamped (`MAX_SEARCH_LIMIT = 200`, `MAX_SEARCH_OFFSET =
-      5_000_000`) and the offset is pushed **into** the data source — `search_xapian_page()` passes it to
-      `Enquire.get_mset(offset, limit)`, the chronological browse uses SQL `LIMIT ? OFFSET ?`, and
-      `search_over_subjects()` streams its bounded scan (`MAX_SEARCH_SCAN = 20_000`) while retaining only the
-      requested page. Fetching `limit + offset` records and slicing cost 3.1GB and 43s at offset 2M; the same
-      page now costs 33MB and 0.16s. `total` is Xapian's `get_matches_estimated()` where available, and the
-      response carries `has_more`.
+      5_000_000`); the chronological browse uses SQL `LIMIT ? OFFSET ?` and `search_over_subjects()` streams its
+      bounded scan (`MAX_SEARCH_SCAN = 20_000`) while retaining only the requested page. A Xapian query runs
+      through `search_xapian_unique()`: one deterministic sequence (a plain-text query as two tiers, Subject
+      holding every word then the rest via `OP_AND_NOT`, each by BM25 relevance, newest first, then docid; a
+      Xapian-syntax query newest first) deduplicated by the documents' `Q` (Message-ID) terms, so a cross-posted
+      article takes one position across all pages and tiers without any new value slot. The walk reads
+      Message-ID terms only for skipped positions and resolves records only for the page; it covers at most
+      `MAX_SEARCH_SCAN` documents (`MAX_FILTERED_SEARCH_SCAN = 2_000` with a filter), past which the page is read
+      at Xapian's native document offset (`get_mset(offset, limit)` mapped from the walk's last position,
+      approximate uniqueness, `scan_capped`). Fetching `limit + offset` records and slicing costs 3.1GB and 43s at
+      offset 2M; the bounded walk and the native offset keep a deep page at tens of MB. `total` is the sum of the
+      tiers' `get_matches_estimated()`, and the response carries an exact `has_more`.
     - `get_thread_by_tid(tid, limit, offset)` is capped at `MAX_THREAD_MESSAGES = 1000` (the reference
       archive's largest thread holds 12,342 messages, each with a compressed overview blob).
       `get_thread_messages()` pages over it and reports the thread's real size from the indexed
@@ -1891,7 +1901,9 @@ history with Git.
   repository has any such tag, else every `<prefix>X.Y[.Z][-rcN]` tag (`man-pages-6.9`, `foo-1.2.3`), each
   prefix a family of its own chains (`parser/git_ast/GIT_API.md` §7). `release_ranges()` gives each tag its
   **segment** — from the previous tag of its chain: the previous mainline tag of its family (release
-  candidates included) for a mainline tag, `previous_in()` for a stable update
+  candidates included) for a mainline tag, `previous_in()` for a stable update, the previous linux-next
+  snapshot for a `next-YYYYMMDD` tag — and its **chain** (`release_stats.chain_of()`: 1 mainline, 2 stable,
+  3 linux-next; readers report chains 1 and 2 only, so a snapshot is never a `first_stable` / first release)
   — and its **diff range** from `previous_in()`, the range a release report covers: a final release's whole
   cycle from the previous release, otherwise the segment itself. A chain's segments are disjoint and add up to
   any range on it (`v3.0..v3.1` = `v3.0..v3.1-rc1` + … + `v3.1-rc8..v3.1`), so a release's commits, merges and
@@ -2019,9 +2031,24 @@ strict local capability matching, and singleton PID lock exclusivity.
     `base_commit_id` or `base_ref_name` joined to `m_git_ref`, plus active runs in `m_ingest_state`.
 
 ### 11.3. Surgical Range-Isolated Crash Recovery
-- If any node (Master or Worker) crashes mid-version, `core/ingest_state.py:rollback_version()` uses
-  `fetch_id_ranges()` to execute range-bounded deletes (`DELETE FROM table WHERE pk BETWEEN start_id AND
-  end_id`) along with version-scoped rows and derived blob rows.
+- If any node (Master or Worker) crashes mid-version, `core/ingest_state.py:rollback_version()` runs
+  `rollback_id_ranges()` over the run's `fetch_id_ranges()` (also when a distributed run leased nothing but
+  recorded re-parsed blobs). Peers commit into the same tables meanwhile and reuse committed content rows by
+  content (a tag, an AST node, a section's name AST), so the rollback removes only what the run alone owns:
+  1. the version-scoped rows of the head commit;
+  2. **blob reset**: every blob the run created (its leased `m_file_blob` ids) or re-parsed (`m_ingest_blob`)
+     loses every row parsing it produced (`blob_rows_plan()`: tag bridges, sections with their members,
+     patterns and files, symbol rows, credits); the `m_file_blob` row stays (peers' checkpoints may name it).
+     Step 4.5 reuses tagged blobs only, so the next run holding the blob parses it again: a blob is never left
+     partly tagged and reused as parsed;
+  3. **adoption-aware range deletes**: the leased rows of every other id table, referencing tables first,
+     except the ids a surviving row outside the run references. `child_role()` classifies each foreign key:
+     `owned` rows are part of their parent and go with it (`m_ast_container.ast_id`, `m_ast_hash`, `m_tag_def`,
+     `m_moved_tag`, `m_maintainer_member.sec_id`, `m_maintainer_pattern`, `m_maintainer_file`,
+     `m_arch_layout_entry`, release segment children); `edge` rows (`m_ast_container.ref_ast_id`) make a kept
+     node keep the nodes it points at; any other (`ref`) row adopts what it references (`m_bridge_tag.tag_id`
+     of a peer blob, `m_tag.ast_id`, `m_maintainer_section.ast_id`, `m_bridge_commit_tag` of another commit),
+     while references from the run's own commits (head and leased `m_commit` ids) go with the rows they name.
 - Universal Git registry entries (`m_file_name`, `m_file_blob`, `m_maintainer_person`, `m_commit`) are
   preserved, ensuring concurrent peer nodes sharing paths, authors, or commits are never broken.
 - **Worker Crash Rollback Sequencing & Lease Validation**:

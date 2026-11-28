@@ -1,6 +1,7 @@
 """api/routers/history.py - Commits, blame, file history, symbol history, and line-range history endpoints."""
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,7 +22,11 @@ from api.routers.common import (
     _with_repo,
 )
 from webapp.backend.security.git import safe_rev, validate_pathspecs
+from webapp.backend.services.mailing_list_service import LORE_BASE_URL
 from webapp.backend.services.history_service import history_service
+
+_COMMIT_WINDOW = 500
+_HEX_QUERY = re.compile(r"[0-9a-f]{4,40}")
 
 router = APIRouter()
 
@@ -48,6 +53,13 @@ def query_commits(
     section: Annotated[str, Query(max_length=128)] = "",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    backports: Annotated[
+        str,
+        Query(
+            pattern="^(collapse|include)$",
+            description="Text search: 'collapse' (default) folds same-subject stable backports into the mainline row (backport_count, backport_hashes); 'include' lists every copy.",
+        ),
+    ] = "collapse",
 ) -> dict[str, Any]:
     """Commit search and structured git log query."""
     ver = resolve_version(version) if version else ""
@@ -143,7 +155,24 @@ def query_commits(
             "commits": page,
         }
 
-    if offset + limit + 1 <= 500:
+    q_clean = q.strip()
+    if backports == "collapse" and q_clean and not _HEX_QUERY.fullmatch(q_clean.lower()):
+        # The fold runs in SQL over ingest-time metadata (m_commit.subject_key / backport): exact at any offset
+        res = _git_service.get_commits(ver, limit=limit + 1, query=q, offset=offset, collapse_backports=True)
+        commits = list(res.get("commits") or [])
+        page = commits[:limit]
+        truncated = len(commits) > limit
+        return {
+            "repo": get_active_repo_name(),
+            "version": res.get("version", ver),
+            "total": offset + len(page) + (1 if truncated else 0),
+            "limit": limit,
+            "offset": offset,
+            "truncated": truncated,
+            "commits": page,
+        }
+
+    if offset + limit + 1 <= _COMMIT_WINDOW:
         res = _git_service.get_commits(ver, page=1, limit=offset + limit + 1, query=q)
         commits = res.get("commits") or []
         page, total, truncated = paginate_items(commits, limit, offset)
@@ -222,9 +251,33 @@ def get_commit_diff(
 
 @router.get("/commits/{commit_hash}/relations", dependencies=[Depends(require_feature("commits"))])
 def get_commit_relations(commit_hash: str) -> Any:
-    """Fixes, fixed-by, reverts, reverted-by, upstream/backports, stable Cc, mail links, and CVEs of a commit."""
+    """Fixes, fixed-by, reverts, reverted-by, upstream/backports, stable Cc, release badges, CVEs, and matched mail (`linked_emails`, as in get_commit) of a commit."""
     safe_rev(commit_hash, "commit")
-    return _with_repo(_v1()._relations_one(commit_hash))
+    body = _v1()._relations_one(commit_hash)
+    if isinstance(body, dict) and body.get("commit"):
+        body["linked_emails"] = _relations_linked_emails(str(body["commit"]), body.get("links") or [])
+    return _with_repo(body)
+
+
+def _relations_linked_emails(sha: str, links: list[Any]) -> list[dict[str, Any]]:
+    """`get_commit`'s `linked_emails` (every match tier); the `Link:` / `Message-Id:` trailers when none is stored."""
+    try:
+        linked = _git_service.get_commit_linked_emails(sha)
+    except Exception:  # noqa: BLE001 - optional mailing-list metadata
+        linked = []
+    known = {e.get("message_id") for e in linked}
+    for raw in links:
+        mid = str(raw or "").strip().strip("<>")
+        if mid and mid not in known:
+            known.add(mid)
+            linked.append({
+                "message_id": mid,
+                "thread_id": None,
+                "match_tier": 1,
+                "match_tier_name": "Authoritative Link / Message-ID",
+                "lore_url": f"{LORE_BASE_URL}{mid}/",
+            })
+    return linked
 
 
 @router.get("/commits/{commit_hash}/released", dependencies=[Depends(require_feature("commits"))])

@@ -43,9 +43,36 @@ FUTURE_DATE_SKEW_SECONDS = 3600
 MAX_THREAD_MESSAGES = 1000      # messages unpacked for a single thread
 MAX_SEARCH_LIMIT = 200          # page size accepted from a caller
 MAX_SEARCH_OFFSET = 5_000_000   # how deep paging may go before it is clamped
-MAX_SEARCH_SCAN = 20_000        # rows scanned by the non-Xapian substring fallback
+MAX_SEARCH_SCAN = 20_000        # rows scanned by the non-Xapian substring fallback; Xapian docs walked per request
+MAX_FILTERED_SEARCH_SCAN = 2_000  # Xapian docs walked per request when a filter_type needs each record resolved
+_XAPIAN_CHUNK_MAX = 500         # docs fetched per Xapian get_mset call during a de-duplicating scan
+# Plain-text search detection: words for the Subject tier, and Xapian operator syntax that opts out of it.
+_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+_QUERY_SYNTAX_RE = re.compile(r"(?:^|\s)(?:AND|OR|NOT|XOR|NEAR|ADJ)(?:\s|$)|\.\.|[()]")
 MAX_RAW_EMAIL_BYTES = 32 << 20  # single blob read from `git cat-file --batch`
 SQLITE_CACHE_KIB = 8_000        # page cache per connection (thread-local handles)
+
+
+_REPLY_TAG_RE = re.compile(r"^\s*(?:(?:re|fwd?|aw)\s*:\s*|\[[^\]]*\]\s*)+", re.IGNORECASE)
+
+
+def subject_match_tier(query: str, subject: str) -> int:
+    """Rank of a Subject against a plain-text query: 0 exact, 1 phrase contained, 2 all words, 3 other.
+
+    `Re:` / `Fwd:` and bracketed `[PATCH v2 1/3]` tags are ignored and case and runs of
+    non-word characters do not matter, so `[PATCH] ext2: mark as deprecated` is an exact
+    match for `ext2: mark as deprecated`.
+    """
+    q_words = _WORD_RE.findall((query or "").lower())
+    if not q_words:
+        return 3
+    s_words = _WORD_RE.findall(_REPLY_TAG_RE.sub("", subject or "").lower())
+    if s_words == q_words:
+        return 0
+    n = len(q_words)
+    if any(s_words[i : i + n] == q_words for i in range(len(s_words) - n + 1)):
+        return 1
+    return 2 if set(q_words) <= set(s_words) else 3
 
 
 class PublicInboxLocalStore:
@@ -437,12 +464,15 @@ class PublicInboxLocalStore:
         return self.search_xapian_page(query, limit=limit)[0]
 
     def search_xapian_page(
-        self, query: Any, limit: int = 50, offset: int = 0
+        self, query: Any, limit: int = 50, offset: int = 0, *, ranked: bool = False, check_at_least: int = 0
     ) -> tuple[list[SmsgRecord], int]:
         """Fetch one page of Xapian matches plus the estimated total match count.
 
         The offset is applied by Xapian, so a deep page costs what the first one does
-        instead of materializing every record skipped along the way.
+        instead of materializing every record skipped along the way. `ranked` orders by
+        BM25 relevance with newest-first as the tie-break (default: newest first only);
+        `check_at_least` makes the match count exact up to that many matches. A
+        Message-ID indexed in several shards (cross-posts) is returned once.
         """
         if self.xap_db is None or not HAS_XAPIAN or xapian is None or query is None:
             return [], 0
@@ -454,11 +484,18 @@ class PublicInboxLocalStore:
                 with self._qp_lock:
                     enquire = xapian.Enquire(self.xap_db)
                     enquire.set_query(query)
-                    enquire.set_weighting_scheme(xapian.BoolWeight())
-                    enquire.set_sort_by_value(0, True)
+                    if ranked:
+                        enquire.set_weighting_scheme(xapian.BM25Weight())
+                        enquire.set_sort_by_relevance_then_value(0, True)
+                    else:
+                        enquire.set_weighting_scheme(xapian.BoolWeight())
+                        enquire.set_sort_by_value(0, True)
                     # Xapian applies the offset itself, so a deep page costs the same
                     # as the first one instead of materializing everything skipped.
-                    mset = enquire.get_mset(max(0, offset), max(1, limit))
+                    if check_at_least > 0:
+                        mset = enquire.get_mset(max(0, offset), max(1, limit), int(check_at_least))
+                    else:
+                        mset = enquire.get_mset(max(0, offset), max(1, limit))
                     estimated = mset.get_matches_estimated()
 
                     for match in mset:
@@ -477,11 +514,216 @@ class PublicInboxLocalStore:
                     raise
 
         results: list[SmsgRecord] = []
+        seen: set[str] = set()
         for mid in mids:
+            if mid in seen:
+                continue
+            seen.add(mid)
             rec = self.get_by_mid(mid)
             if rec:
                 results.append(rec)
         return results, estimated
+
+    def subject_tier_query(self, query_string: str) -> Any:
+        """Xapian query requiring every word of a plain-text search in the Subject (or None).
+
+        Only plain text qualifies: a query using a search prefix (`s:`, `f:`, `m:`, ...),
+        quotes or boolean operators is the caller's own Xapian syntax and is run as given.
+        """
+        text = (query_string or "").strip()
+        if not text or '"' in text or _QUERY_SYNTAX_RE.search(text):
+            return None
+        prefixes = {*self.BOOLEAN_PREFIXES, *self.PROB_PREFIXES}
+        if any(re.search(rf"(?<![\w]){re.escape(p)}:\S", text) for p in prefixes):
+            return None
+        words = _WORD_RE.findall(text)
+        if not words:
+            return None
+        return self.parse_query(" ".join(f"s:{w}" for w in words))
+
+    def _mset_mids(
+        self, query: Any, ranked: bool, start: int, size: int
+    ) -> tuple[list[str | None], int]:
+        """One mset slice as per-document Message-IDs (cheap termlist `Q` walk) plus the match estimate."""
+        for attempt in range(2):
+            mids: list[str | None] = []
+            try:
+                with self._qp_lock:
+                    enquire = xapian.Enquire(self.xap_db)
+                    enquire.set_query(query)
+                    if ranked:
+                        enquire.set_weighting_scheme(xapian.BM25Weight())
+                        enquire.set_sort_by_relevance_then_value(0, True)
+                    else:
+                        enquire.set_weighting_scheme(xapian.BoolWeight())
+                        enquire.set_sort_by_value(0, True)
+                    mset = enquire.get_mset(max(0, start), max(1, size))
+                    estimated = mset.get_matches_estimated()
+                    for match in mset:
+                        found: str | None = None
+                        for term_item in match.document.termlist():
+                            t = term_item.term.decode("utf-8", errors="replace")
+                            if t.startswith("Q"):
+                                found = t[1:]
+                                break
+                        mids.append(found)
+                return mids, estimated
+            except getattr(xapian, "DatabaseModifiedError", Exception):
+                if attempt == 0:
+                    with self._qp_lock:
+                        self.xap_db.reopen()
+                else:
+                    raise
+        return [], 0
+
+    @staticmethod
+    def _filter_accepts(filter_type: str, subject: str) -> bool:
+        """True when a subject passes the `filter_type` (all / patch / cover / pull)."""
+        low = subject.lower()
+        if filter_type == "patch":
+            return bool(re.search(r"\[[^\]]*\bpatch\b", low))
+        if filter_type == "cover":
+            return bool(re.search(r"\[[^\]]*\b0+/\d+[^\]]*\]", low))
+        if filter_type == "pull":
+            return bool(re.search(r"\[[^\]]*\bgit pull\b", low))
+        return True
+
+    def search_xapian_unique(
+        self, query_string: str, limit: int, offset: int, filter_type: str = "all"
+    ) -> dict[str, Any]:
+        """Page of one Message-ID-unique, deterministic Xapian result sequence.
+
+        The sequence is the de-duplicated concatenation of the tiers: for plain text,
+        tier 1 (Subject holds every word, BM25 then newest first) and tier 2 (every other
+        match, same order); for a query in Xapian syntax, a single newest-first tier. A
+        Message-ID indexed as several documents (cross-posts) occupies one position, at
+        its first appearance, and a Message-ID emitted by tier 1 is skipped in tier 2.
+        Ties break by Xapian docid, so repeated requests walk the same sequence.
+
+        Exact zone: the page is positions `[offset, offset + limit)` of that sequence,
+        found by one walk from the top. Skipped documents cost only a termlist `Q` read;
+        only the returned page is resolved through `get_by_mid` (with a `filter_type`
+        every candidate is resolved to test its subject and counts only if it passes).
+        One extra unique item is probed to decide `has_more`. A position is counted when
+        its Message-ID is first seen, in the skipped prefix and the page alike, so an
+        unresolvable Message-ID occupies its position (the page may be one short) and
+        page boundaries never move. The walk covers at most `MAX_SEARCH_SCAN` documents
+        (`MAX_FILTERED_SEARCH_SCAN` with a filter).
+
+        Approximate zone: when the window lies beyond that cap, the walk stops at
+        document `s` of tier `t` with `u` unique positions counted. Position `p >= u`
+        maps to Xapian document offset `s + (p - u)` in tier `t` (the tail is assumed
+        duplicate-free; a later tier uses the offset left after subtracting the earlier
+        tiers' estimated sizes). That window is fetched natively, in chunks bounded by
+        `2 * 500` documents, de-duplicated against the Message-IDs seen and within the
+        fetched chunks only, and `scan_capped` is true. `has_more` is true when a
+        unique item exists past the page, or when the last native chunk was full and
+        the page is non-empty. A cap that lands exactly at the end of the results is
+        not flagged. `has_more` is never true for an empty page.
+
+        Returns `records`, `has_more`, `estimated` (sum of every tier's Xapian match
+        estimate, stable across pages), `tiered` and `scan_capped`.
+        """
+        out: dict[str, Any] = {"records": [], "has_more": False, "estimated": 0, "tiered": False, "scan_capped": False}
+        full = self.parse_query(query_string)
+        if full is None or xapian is None:
+            return out
+        subject_q = self.subject_tier_query(query_string)
+        if subject_q is None:
+            tiers: list[tuple[Any, bool]] = [(full, False)]
+        else:
+            tiers = [
+                (subject_q, True),
+                (xapian.Query(xapian.Query.OP_AND_NOT, full, subject_q), True),
+            ]
+            out["tiered"] = True
+        filtered = filter_type != "all"
+        cap = MAX_FILTERED_SEARCH_SCAN if filtered else MAX_SEARCH_SCAN
+        want = limit + 1  # one probe past the page
+        est = [self._mset_mids(q, r, 0, 1)[1] for q, r in tiers]
+        out["estimated"] = sum(est)
+        seen: set[str] = set()
+        records: list[SmsgRecord] = []
+        st = {"position": 0, "taken": 0}  # positions counted; page items (incl. probe) taken
+
+        def consume(mid: str, exact: bool) -> bool:
+            """Count one unique Message-ID; True once the page and its probe are complete."""
+            if exact and not filtered and st["position"] < offset:
+                st["position"] += 1
+                return False
+            rec = self.get_by_mid(mid)
+            if filtered and (rec is None or not self._filter_accepts(filter_type, rec.subject)):
+                return False
+            st["position"] += 1
+            if exact and st["position"] <= offset:
+                return False
+            st["taken"] += 1
+            if rec is not None and st["taken"] <= limit:
+                records.append(rec)
+            return st["taken"] >= want
+
+        scanned = 0
+        done = False
+        capped_at: tuple[int, int] | None = None
+        for ti, (query, ranked) in enumerate(tiers):
+            start = 0
+            while not done and capped_at is None:
+                if filtered:
+                    size = min(_XAPIAN_CHUNK_MAX, max(16, want * 4))
+                else:
+                    size = min(_XAPIAN_CHUNK_MAX, max(16, offset + want - st["position"]))
+                size = min(size, cap - scanned)
+                if size <= 0:
+                    capped_at = (ti, start)
+                    break
+                mids, _est = self._mset_mids(query, ranked, start, size)
+                if not mids:
+                    break
+                start += len(mids)
+                scanned += len(mids)
+                for mid in mids:
+                    if mid is None or mid in seen:
+                        continue
+                    seen.add(mid)
+                    if consume(mid, True):
+                        done = True
+                        break
+                if len(mids) < size:
+                    break
+
+        more_native = False
+        if capped_at is not None and not done:
+            ti, start = capped_at
+            native = start + max(0, offset - st["position"])
+            chunk = min(_XAPIAN_CHUNK_MAX, max(16, want * 4))
+            fetched = 0
+            while ti < len(tiers) and not done and fetched < 2 * _XAPIAN_CHUNK_MAX:
+                query, ranked = tiers[ti]
+                mids, _est = self._mset_mids(query, ranked, native, chunk)
+                if not mids:
+                    native = max(0, native - est[ti]) if native > 0 else 0
+                    ti += 1
+                    more_native = False
+                    continue
+                out["scan_capped"] = True
+                fetched += len(mids)
+                native += len(mids)
+                for mid in mids:
+                    if mid is None or mid in seen:
+                        continue
+                    seen.add(mid)
+                    if consume(mid, False):
+                        done = True
+                        break
+                more_native = len(mids) >= chunk
+                if not more_native:
+                    ti += 1
+                    native = 0
+
+        has_more = st["taken"] > limit or (out["scan_capped"] and more_native and bool(records))
+        out["records"] = records
+        out["has_more"] = bool(has_more and out["records"])
+        return out
 
     @staticmethod
     def _read_cat_payload(proc: Any, size: int, keep: int) -> bytes:
@@ -768,22 +1010,23 @@ class PublicInboxLocalStore:
         # a 22M-message archive, which is what exhausted the host's RAM.
         limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
         offset = max(0, min(int(offset), MAX_SEARCH_OFFSET))
-        # `filter_type` is applied after fetching, so over-fetch a little to keep a
-        # filtered page full, bounded so the over-fetch cannot itself grow unbounded.
-        fetch = limit if filter_type == "all" else min(limit * 4, MAX_SEARCH_LIMIT * 4)
         matched_records: list[SmsgRecord] = []
         estimated_total = 0
+        has_more = False
+        scan_capped = False
 
-        # 1. Try Xapian search if available and query is present
+        # 1. Xapian: one Message-ID-unique, deterministic sequence; the page is a slice of it
+        # (filter_type applied inside the walk, before counting).
         xapian_used = False
         xapian_error: str | None = None
         shard_errors = list(getattr(self, "shard_errors", ()))
         if clean_q and self.xap_db is not None and HAS_XAPIAN and self.qp is not None and xapian is not None:
             try:
-                x_query = self.parse_query(clean_q)
-                matched_records, estimated_total = self.search_xapian_page(
-                    x_query, limit=fetch, offset=offset
-                )
+                found = self.search_xapian_unique(clean_q, limit, offset, filter_type)
+                matched_records = found["records"]
+                estimated_total = int(found["estimated"])
+                has_more = bool(found["has_more"])
+                scan_capped = bool(found["scan_capped"])
                 xapian_used = True
             except Exception as exc:
                 xapian_error = str(exc)
@@ -791,8 +1034,9 @@ class PublicInboxLocalStore:
         elif clean_q and shard_errors and not self.xap_db:
             xapian_error = "; ".join(shard_errors)
 
-        # 2. Fallback to over.sqlite3 substring search only when Xapian was not used
-        if not xapian_used and not matched_records:
+        # 2. Fallback to over.sqlite3 substring search / browse listing when Xapian was not used
+        if not xapian_used:
+            fetch = limit + 1 if filter_type == "all" else min(limit * 4, MAX_SEARCH_LIMIT * 4)
             if clean_q:
                 matched_records = self.search_over_subjects(
                     clean_q, limit=fetch, scan_limit=MAX_SEARCH_SCAN, offset=offset
@@ -810,28 +1054,14 @@ class PublicInboxLocalStore:
                     order_by=["-ds"], limit=fetch, offset=offset,
                 )
                 matched_records = [self._unpack_row(r) for r in rows]
+            raw_count = len(matched_records)
+            matched_records = [r for r in matched_records if self._filter_accepts(filter_type, r.subject)]
+            has_more = len(matched_records) > limit or raw_count >= fetch
+            matched_records = matched_records[:limit]
 
-        # 3. Apply filter_type: all, patch, cover, pull
-        filtered: list[SmsgRecord] = []
-        for r in matched_records:
-            subj_lower = r.subject.lower()
-            if filter_type == "patch":
-                if not re.search(r"\[[^\]]*\bpatch\b", subj_lower):
-                    continue
-            elif filter_type == "cover":
-                if not re.search(r"\[[^\]]*\b0+/\d+[^\]]*\]", subj_lower):
-                    continue
-            elif filter_type == "pull":
-                if not re.search(r"\[[^\]]*\bgit pull\b", subj_lower):
-                    continue
-            filtered.append(r)
-
-        # The fetch above already starts at `offset`, so the page is just the head of
-        # what came back. `total` is Xapian's estimate when available, and otherwise a
-        # lower bound that lets a caller know whether another page exists.
-        page = filtered[:limit]
-        has_more = len(filtered) > limit or len(matched_records) >= fetch
-        total = estimated_total or (offset + len(page) + (1 if has_more else 0))
+        # `total` is Xapian's estimate when available, never below what the pages already show.
+        page = matched_records
+        total = max(estimated_total, offset + len(page) + (1 if has_more else 0))
 
         results: list[dict[str, Any]] = []
         for r in page:
@@ -874,6 +1104,8 @@ class PublicInboxLocalStore:
             "has_more": has_more,
             "results": results,
         }
+        if scan_capped:
+            out_payload["scan_capped"] = True
         if xapian_error or shard_errors:
             out_payload["degraded"] = True
             out_payload["error"] = (

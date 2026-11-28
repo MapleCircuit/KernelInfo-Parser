@@ -21,7 +21,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
                  └── m_git_ref (ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)
 
 2. Git Commit DAG, Delta Snapshot & Checkpoint Layer:
-   m_commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)
+   m_commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message,
+             subject_key, backport)
      ├── m_commit_parent (commit_id, parent_commit_id, parent_idx)
      ├── m_commit_file (commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)
      ├── m_bridge_checkpoint (commit_id, fnid, blob_id)
@@ -647,6 +648,10 @@ m_credits_entry = Table(
 
 # -----------------------------------------------------------------------------
 # 21. m_commit (table_id=21): Git Commit Metadata & Topology Node
+#     subject_key / backport are written with the row (pure extractors in parser/git_ast/git_commit_parser.py):
+#     subject_key is the 8-byte digest of the normalized subject (zero for an empty subject), backport is 1
+#     when the message names the upstream commit it backports. The commit search folds a backport into the
+#     same-subject mainline row in SQL (`list_network_commits(collapse_backports=True)`).
 # -----------------------------------------------------------------------------
 m_commit = Table(
     table_id=21,
@@ -661,17 +666,20 @@ m_commit = Table(
         ("committer_date", INT(unsigned=True)),
         ("subject", VARCHAR(500, bin_collation=True)),
         ("message", MEDIUMTEXT()),
+        ("subject_key", BIN(8, default=b"\x00" * 8)),
+        ("backport", TINYINT(unsigned=True, default=0)),
     ),
     primary=("commit_id",),
     foreign=(
         ("author_id", "m_maintainer_person", "person_id"),
         ("committer_id", "m_maintainer_person", "person_id"),
     ),
-    initial_insert=((0, 0, b"\x00" * 20, 0, 0, 0, 0, "", ""),),
+    initial_insert=((0, 0, b"\x00" * 20, 0, 0, 0, 0, "", "", b"\x00" * 8, 0),),
     no_duplicate=False,
     te_cached=False,
     unique_keys=(("network_id", "commit_hash"),),
-    indexes=(("commit_author_idx", ("author_id",)),),
+    # The backport fold probes a subject group: same network and subject_key, mainline rows first
+    indexes=(("commit_author_idx", ("author_id",)), ("commit_subject_idx", ("network_id", "subject_key", "backport", "commit_id"))),
     hashing_table=False,
 )
 
@@ -1490,7 +1498,8 @@ m_cve_commit = Table(
 # 52. m_release_segment (table_id=52): A Release Tag and the History Range Ending at It
 #     Written by the release statistics step (parser/git_ast/release_stats.py, core/API.md section 10)
 #     for every release tag of the repository, ingested or not. chain 1 = mainline (releases and
-#     release candidates), 2 = stable updates. base_tag..tag is the segment: the previous tag of the
+#     release candidates), 2 = stable updates, 3 = linux-next snapshots (`next-YYYYMMDD`, never
+#     reported as a release). base_tag..tag is the segment: the previous tag of the
 #     same chain, so a chain's segments are disjoint and add up to any range of it; commits / merges
 #     count it. diff_base_tag..tag is the range a release report covers (a release: its whole cycle
 #     from the previous release; otherwise the segment), and files_changed / lines_added /

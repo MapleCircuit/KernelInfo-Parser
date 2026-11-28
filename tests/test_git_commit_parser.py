@@ -543,6 +543,33 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         self.assertEqual(commits3[0].files, [("M", "foo/a b/bar.c")])
         self.assertIn("foo/a b/bar.c", hunks_map)
 
+class TestCommitFoldExtractors(unittest.TestCase):
+    """Pure ingest-time extractors of `m_commit.subject_key` / `backport` (parser/git_ast/git_commit_parser.py)."""
+
+    def test_subject_key_normalizes_whitespace_and_case(self) -> None:
+        from parser.git_ast.git_commit_parser import (
+            EMPTY_SUBJECT_KEY,
+            SUBJECT_KEY_LEN,
+            subject_key,
+        )
+
+        self.assertEqual(subject_key("ext2: Drain  in-flight DIO "), subject_key("ext2: drain in-flight dio"))
+        self.assertNotEqual(subject_key("ext2: a"), subject_key("ext2: b"))
+        self.assertEqual(len(subject_key("x")), SUBJECT_KEY_LEN)
+        self.assertEqual(subject_key("   "), EMPTY_SUBJECT_KEY)
+        self.assertEqual(subject_key(None), EMPTY_SUBJECT_KEY)
+
+    def test_is_backport_recognizes_the_upstream_reference_styles(self) -> None:
+        from parser.git_ast.git_commit_parser import commit_fold_columns, is_backport
+
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        for message in (f"s\n\ncommit {sha} upstream.\n", f"s\n\n[ Upstream commit {sha} ]\n",
+                        f"s\n\n(cherry picked from commit {sha[:12]})\n"):
+            self.assertTrue(is_backport(message), message)
+        for message in ("", "fix typo", f"s\n\nFixes: {sha[:12]} (\"x\")", f"see commit {sha} upstream in the text"):
+            self.assertFalse(is_backport(message), message)
+        self.assertEqual(commit_fold_columns("Fix typo", "Fix typo")[1], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -212,7 +212,7 @@ class TestIngestStateDatabase(unittest.TestCase):
         I.begin(db, 1, 10, TABLES)
         db.add("m_ingest_blob", 10, 3)
         I.begin(db, 1, 10, TABLES)
-        self.assertEqual(db.count_rows("m_ingest_blob"), 0)
+        self.assertEqual(db.count_rows("m_ingest_blob"), 1, "the earlier attempt's re-parsed blobs stay to be rolled back")
         self.assertEqual(db.count_rows("m_ingest_watermark"), len(I.marked_tables(TABLES)))
 
     def test_done_clears_the_bookkeeping(self) -> None:
@@ -266,10 +266,14 @@ class TestIngestStateDatabase(unittest.TestCase):
 
     def test_rollback_by_leased_id_ranges(self) -> None:
         db = seeded()
-        db.add("m_ingest_id_range", 10, BY_NAME["m_ast"].table_id, 11, 20)
+        # A distributed run leases every id it creates: its blob 11, tag 11 and AST node 11
+        for name in ("m_ast", "m_tag", "m_file_blob"):
+            db.add("m_ingest_id_range", 10, BY_NAME[name].table_id, 11, 20)
         db.add("m_ingest_blob", 10, 3)
         self.assertTrue(I.rollback_version(db, 1, 10, TABLES))
         self.assertEqual({r["ast_id"] for r in db.table_rows("m_ast")}, {1}, "the leased range goes")
+        self.assertEqual({r["tag_id"] for r in db.table_rows("m_tag")}, {1})
+        self.assertEqual({r["blob_id"] for r in db.table_rows("m_bridge_tag")}, {1}, "the run's blobs read as unparsed")
         self.assertEqual({r["ast_id"] for r in db.table_rows("m_ast_container")}, {1})
         self.assertEqual(db.table_rows("m_ast_hash"), [])
         self.assertEqual([r["commit_id"] for r in db.table_rows("m_bridge_checkpoint")], [5])

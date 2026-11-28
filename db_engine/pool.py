@@ -718,6 +718,7 @@ class ReadAPI(Protocol):
         newest_first: bool = True,
         limit: int = 50,
         offset: int = 0,
+        collapse_backports: bool = False,
     ) -> list[dict]: ...
 
     def maintainer_sections(

@@ -232,6 +232,32 @@ class TestMailingListService(unittest.TestCase):
         self.assertEqual(res_cached["total"], 12)
         self.assertEqual(mock_client.search_emails.call_count, 1)
 
+    def test_search_raw_offset_pages_pass_through_and_cache_separately(self) -> None:
+        seq = [{"num": n, "message_id": f"s{n}@k.org", "subject": f"Fix {n}"} for n in range(1, 8)]
+        mock_client = MagicMock()
+        mock_client.search_emails.side_effect = lambda query="", limit=50, offset=0, filter_type="all": {
+            "total": len(seq),
+            "has_more": offset + limit < len(seq),
+            "results": seq[offset:offset + limit],
+        }
+        self.service._client = mock_client
+
+        walked, offset = [], 0
+        while True:
+            res = self.service.search(query="fix", limit=3, offset=offset)
+            walked += [r["num"] for r in res["results"]]
+            if not res["has_more"]:
+                break
+            offset += 3
+        self.assertEqual(walked, [1, 2, 3, 4, 5, 6, 7])
+        # An offset that is not a page multiple reaches the client verbatim and is cached on its own
+        mid = self.service.search(query="fix", limit=3, offset=2)
+        self.assertEqual([r["num"] for r in mid["results"]], [3, 4, 5])
+        self.assertEqual(mock_client.search_emails.call_args.kwargs["offset"], 2)
+        calls = mock_client.search_emails.call_count
+        self.service.search(query="fix", limit=3, offset=2)
+        self.assertEqual(mock_client.search_emails.call_count, calls)
+
     @staticmethod
     def _dated_rows() -> dict[str, object]:
         """One past-dated and one future-dated search row, as the archive returns them."""

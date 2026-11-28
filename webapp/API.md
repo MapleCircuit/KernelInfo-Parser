@@ -18,7 +18,7 @@ ES-Module IDE frontend.
   - 2.4. Sliding-Window Rate Limiting [L275-L286]
   - 2.5. Strict Read-Only Database & Parser-First Feature Invariant [L287-L329]
   - 2.6. Frontend & Service Architectural Invariants [L330-L382]
-- 2B. Backend Domain & Infrastructure Services [L383-L1072]
+- 2B. Backend Domain & Infrastructure Services [L383-L1073]
   - 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`) [L385-L467]
   - 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`) [L468-L500]
   - 2.9. Git-Native Database Architecture & Commit Hash Formatting [L501-L530]
@@ -29,20 +29,20 @@ ES-Module IDE frontend.
   - 2.14. Disk Cache of Derived Data (`webapp/backend/services/disk_cache.py`) [L737-L765]
   - 2.15. Background Jobs and 202 Responses (`webapp/backend/services/jobs.py`, `webapp/frontend/js/utils/job_poll.js`) [L766-L796]
   - 2.16. Commit Relations (`webapp/backend/services/commit_relations.py`) [L797-L849]
-  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L850-L903]
-  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L904-L921]
-  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L922-L977]
-  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L978-L1025]
-  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L1026-L1072]
-- 3. Database Schema & Underlying Tables [L1073-L1087]
-- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1088-L1093]
-- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1094-L1099]
-- 6. Using the Services from Python [L1100-L1117]
-- 7. Configuration & Execution [L1118-L1208]
-  - 7.1. Configuration Precedence & Resolution [L1120-L1170]
-  - 7.2. Starting the Server [L1171-L1208]
-- 8. Error Handling, Status Codes & Resilience [L1209-L1245]
-  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1227-L1245]
+  - 2.17. Release Index (`webapp/backend/services/release_service.py`) [L850-L904]
+  - 2.18. Running Repository Scripts (`webapp/backend/services/checkpatch_service.py`) [L905-L922]
+  - 2.19. Source Index (`webapp/backend/services/source_index.py`, `parser/source_facts.py`) [L923-L978]
+  - 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`) [L979-L1026]
+  - 2.21. Local Scope Resolution (`webapp/backend/services/scope_service.py`) [L1027-L1073]
+- 3. Database Schema & Underlying Tables [L1074-L1088]
+- 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`) [L1089-L1094]
+- 5. Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`) [L1095-L1100]
+- 6. Using the Services from Python [L1101-L1118]
+- 7. Configuration & Execution [L1119-L1209]
+  - 7.1. Configuration Precedence & Resolution [L1121-L1171]
+  - 7.2. Starting the Server [L1172-L1209]
+- 8. Error Handling, Status Codes & Resilience [L1210-L1246]
+  - 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`) [L1228-L1246]
 <!-- toc:end -->
 
 ---
@@ -881,7 +881,8 @@ Shared answers about releases, from Git:
 - **First containing tag** (`first_containing(sha)`): `git describe --contains` costs ~14 s per commit on a
   clone without a commit-graph, so (without database coverage) an index maps every commit to the first
   mainline tag introducing it (one `git rev-list <tag> ^<previous>` per consecutive pair of the mainline
-  chain) and to the first stable tag of its series. It lives in the cache engine
+  chain) and to the first stable tag of its series (`next-YYYYMMDD` snapshots are on neither chain: the
+  SQLite index skips them and `db_lookup()` ignores `m_commit_release` chain 3). It lives in the cache engine
   (cache_engine space `release-index`, `<repository>-v<format>`; stores `tags`, `first_tag`), built by a background job (5,761 ranges in ~125 s, 66 MB)
   and extended incrementally when tags are fetched (0.2 s when nothing is new). A lookup takes a few
   milliseconds. The answer is `{first_tag, first_release (the release a candidate leads to, once tagged),

@@ -507,6 +507,44 @@ class TestAiApiEndpoints(unittest.TestCase):
             cfg["repositories"][0]["features"] = {"man": False}
             self.assertEqual(self.client.get("/api/v1/man?name=read", headers=self.auth).status_code, 403)
 
+    def test_commit_search_backports_and_relations_mail_parity(self) -> None:
+        from api.routers import common as api_common
+
+        main, bp1, bp2, other = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+        every_row = [
+            {"commit_hash": bp2, "subject": "ext2: mark as deprecated"},
+            {"commit_hash": bp1, "subject": "ext2: mark as deprecated"},
+            {"commit_hash": other, "subject": "ext2: other"},
+            {"commit_hash": main, "subject": "ext2: mark as deprecated"},
+        ]
+        folded = [{**every_row[3], "backport_count": 2, "backport_hashes": [bp2, bp1]}, every_row[2]]
+
+        def listing(ver, page=1, limit=50, query="", *, offset=None, collapse_backports=False):
+            # the SQL fold (list_network_commits) is the service's job; the router passes the flag and the offset
+            rows = folded if collapse_backports else every_row
+            start = 0 if offset is None else offset
+            return {"version": "v3.0", "commits": rows[start:start + limit]}
+
+        with patch.object(api_common._git_service, "get_commits", side_effect=listing):
+            body = self.client.get("/api/v1/commits?q=ext2", headers=self.auth).json()
+            self.assertEqual([c["commit_hash"] for c in body["commits"]], [main, other])
+            self.assertEqual(body["commits"][0]["backport_count"], 2)
+            self.assertEqual(body["total"], 2)
+            every = self.client.get("/api/v1/commits?q=ext2&backports=include", headers=self.auth).json()
+            self.assertEqual(len(every["commits"]), 4)
+            self.assertNotIn("backport_count", every["commits"][0])
+        self.assertEqual(self.client.get("/api/v1/commits?q=x&backports=bogus", headers=self.auth).status_code, 422)
+
+        stored = [{"message_id": "blob@x", "thread_id": 5, "relation_type": 1, "match_tier": 3,
+                   "match_tier_name": "Blob Hash Match", "lore_url": "https://lore/blob@x/"}]
+        with patch("api.routers.v1._relations_one", return_value={"commit": main, "links": ["<link@x>", "blob@x"]}), \
+                patch.object(api_common._git_service, "get_commit_linked_emails", return_value=list(stored)) as linked:
+            rel = self.client.get(f"/api/v1/commits/{main}/relations", headers=self.auth).json()
+        linked.assert_called_once_with(main)
+        self.assertEqual([e["message_id"] for e in rel["linked_emails"]], ["blob@x", "link@x"])
+        self.assertEqual(rel["linked_emails"][0]["match_tier"], 3)
+        self.assertEqual(rel["linked_emails"][1]["match_tier"], 1)
+
     def test_pagination_offsets_commits_and_man_path_validation(self) -> None:
         # 1. Non-multiple offset in /api/v1/commits and exact-multiple truncated=False
         r_exact_mult = self.client.get("/api/v1/commits?limit=1&offset=0", headers=self.auth)

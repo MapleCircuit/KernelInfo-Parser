@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -966,6 +967,131 @@ class TestMcpTools(_McpFixture):
                 200,
             )
         self.assertToolError(self.call("compare_struct_layout", {"struct": "foo", "a": "v3.0", "b": "master"}), 422)
+
+    def test_server_instructions_and_catalog_size_budget(self) -> None:
+        res = self.rpc("initialize", {"protocolVersion": mcp.SUPPORTED_PROTOCOL_VERSIONS[0], "capabilities": {},
+                                      "clientInfo": {"name": "t", "version": "1"}}).json()["result"]
+        instructions = res["instructions"]
+        for needle in ("get_capabilities", "preview_nodemap_canvas", "hydrate", "verbose=false", "include_canvas",
+                       "export_format"):
+            self.assertIn(needle, instructions)
+
+        def size(obj) -> int:
+            return len(json.dumps(obj, separators=(",", ":")).encode())
+
+        tools = self.rpc("tools/list", {}).json()["result"]["tools"]
+        by_name = {t["name"]: t for t in tools}
+        # Token budget of the advertised catalog (83,769 B / 9,381 B before the slimming pass)
+        self.assertLess(size({"tools": tools}), 74_000)
+        self.assertLess(size(by_name["preview_nodemap_canvas"]), 7_000)
+        # `repo` is documented once in the server instructions, not on every tool
+        self.assertEqual(by_name["get_file_slice"]["inputSchema"]["properties"]["repo"],
+                         {"type": "string", "minLength": 1, "maxLength": 128})
+        data = by_name["preview_nodemap_canvas"]["inputSchema"]["properties"]["nodes"]["items"]["properties"]["data"]
+        self.assertIn("symbol name [path", data["description"])
+        self.assertIn("path", data["properties"])
+        for prop in data["properties"].values():
+            self.assertNotIn("maxLength", prop)
+            self.assertNotIn("description", prop)
+        self.assertIn("NodeMap", by_name["preview_nodemap_canvas"]["description"])
+
+    def test_preview_nodemap_canvas_hydrates_symbol_path_and_mail_subject(self) -> None:
+        from webapp.backend.services import nodemap_canvas_service as ncs
+
+        detail = {
+            "definition": {"ast_id": 11, "file": "fs/ext2/super.c", "type_name": "function"},
+            "definitions": [
+                {"ast_id": 11, "file": "fs/ext2/super.c", "type_name": "function"},
+                {"ast_id": 22, "file": "fs/ext3/super.c", "type_name": "function"},
+            ],
+        }
+        message = {"available": True, "subject": "[PATCH] ext2: mark as deprecated", "tid": 42}
+        with patch.object(ncs._symbol_service, "get_symbol_detail", return_value=detail) as sym, patch(
+            "webapp.backend.services.mailing_list_service.mailing_list_service.get_message", return_value=message
+        ), patch("webapp.backend.services.mailing_list_service.mailing_list_service.get_thread",
+                 return_value={"available": True, "tid": 7, "messages": [{"subject": "Remove ext3 filesystem driver"}]}):
+            out = self.assertToolOk(self.call("preview_nodemap_canvas", {
+                "nodes": [
+                    {"id": "s1", "type": "symbol", "data": {"name": "ext3_fill_super", "path": "fs/ext3/super.c"}},
+                    {"id": "m1", "type": "mail", "data": {"mid": "<x@y>"}},
+                    {"id": "m2", "type": "mail", "data": {"tid": 7}},
+                ],
+                "verbose": True,
+            }))
+            self.assertIn("fs/ext3/super.c", [c.kwargs.get("from_file") for c in sym.call_args_list])
+        nodes = {n["id"]: n for n in out["canvas"]["nodes"]}
+        self.assertEqual(nodes["s1"]["data"]["astId"], 22)  # the named definition file wins
+        self.assertEqual(nodes["s1"]["data"]["kind"], "func")
+        self.assertNotIn("path", nodes["s1"]["data"])  # consumed by hydration, not a stored card field
+        self.assertEqual(nodes["m1"]["data"]["subject"], "[PATCH] ext2: mark as deprecated")
+        self.assertEqual(nodes["m1"]["data"]["tid"], 42)
+        self.assertEqual(nodes["m1"]["title"], "[PATCH] ext2: mark as deprecated")
+        self.assertEqual(nodes["m2"]["data"]["subject"], "Remove ext3 filesystem driver")
+
+    def test_preview_nodemap_canvas_compact_output_reimports_identically(self) -> None:
+        nodes = [
+            {"id": "s1", "type": "struct", "data": {"name": "inode", "path": "include/linux/fs.h"}},
+            {"id": "y1", "type": "symbol", "data": {"name": "ext2_fill_super", "kind": "func"}},
+            {"id": "m1", "type": "mail", "data": {"mid": "abc@x", "subject": "ext2: mark as deprecated"}},
+            {"id": "c1", "type": "commit", "data": {"commitHash": "abcdef123456"}},
+            {"id": "src", "type": "source", "data": {"path": "fs/ext2/super.c", "mode": "range", "start": 10, "end": 20}},
+            {"id": "k1", "type": "kconfig", "data": {"symbol": "EXT2_FS"}},
+            {"id": "n1", "type": "note", "customTitle": "Hello", "title": "Hello", "data": {"text": "hi"}},
+            {"id": "d1", "type": "diff", "data": {"commitHash": "abcdef123456"}},
+            {"id": "h1", "type": "history", "data": {"path": "fs/ext2/super.c"}},
+            {"id": "kp", "type": "kapi", "data": {}},
+            {"id": "dc", "type": "doc", "data": {"path": "Documentation/filesystems/ext2.rst"}},
+            {"id": "mt", "type": "maintainer", "data": {"query": "EXT2"}},
+            {"id": "cv", "type": "cve", "data": {"cveId": "CVE-2024-1"}},
+            {"id": "af", "type": "note", "autoFit": True, "scale": 1.5, "w": 300, "h": 200, "data": {"text": "x"}},
+            {"id": "big", "type": "struct", "autoFit": True, "baseW": 2000, "baseH": 1500, "w": 2000, "h": 1500,
+             "data": {"name": "task_struct"}},
+            {"id": "g1", "type": "group", "title": "G"},
+        ]
+        edges = [
+            {"id": "e1", "from": "s1", "to": "y1"},
+            {"id": "e2", "from": "y1", "to": "m1", "label": "x", "style": "dashed"},
+            {"id": "e3", "from": "m1", "to": "c1", "arrow": "both", "curve": "straight", "fromSide": "left"},
+        ]
+        args = {"nodes": nodes, "edges": edges, "hydrate": False}
+        full = self.assertToolOk(self.call("preview_nodemap_canvas", {**args, "verbose": True}))["canvas"]
+        compact = self.assertToolOk(self.call("preview_nodemap_canvas", args))["canvas"]
+        full_b = len(json.dumps(full, separators=(",", ":")))
+        compact_b = len(json.dumps(compact, separators=(",", ":")))
+        self.assertLess(compact_b, full_b * 0.45)
+        by_id = {n["id"]: n for n in compact["nodes"]}
+        self.assertEqual(by_id["n1"]["customTitle"], "Hello")  # the rename lock stays
+        self.assertNotIn("scale", by_id["s1"])
+        self.assertNotIn("baseW", by_id["s1"])
+        self.assertEqual(by_id["af"]["scale"], 1.5)  # an autoFit node keeps its base size
+        self.assertIn("baseW", by_id["af"])
+        self.assertEqual({k for k in compact["edges"][0]}, {"id", "from", "to"})
+        self.assertEqual(compact["edges"][2]["fromSide"], "left")
+
+        # JSON export in the same call: minified and compacted, still the importable document
+        exp = self.assertToolOk(self.call("preview_nodemap_canvas", {**args, "export_format": "json"}))
+        self.assertNotIn("canvas", exp)
+        self.assertEqual(json.loads(exp["export"]), compact)
+        both = self.assertToolOk(self.call("preview_nodemap_canvas", {**args, "export_format": "mermaid", "include_canvas": True}))
+        self.assertIn("canvas", both)
+        self.assertTrue(both["export"].startswith(("flowchart", "graph")))
+
+        # Round trip through the webapp importer itself: identical normalized canvases
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node not installed")
+        model = Path(__file__).resolve().parent.parent / "webapp/frontend/js/views/nodemap/canvas_model.js"
+        script = (
+            "const fs = await import('node:fs'); const assert = (await import('node:assert/strict')).default;"
+            f"const {{ normalizeCanvas }} = await import({json.dumps(model.as_uri())});"
+            "const { full, compact } = JSON.parse(fs.readFileSync(0, 'utf8'));"
+            "const a = normalizeCanvas(full), b = normalizeCanvas(compact);"
+            "assert.ok(a && b); assert.deepEqual(b, a); console.log('ok', a.nodes.length);"
+        )
+        proc = subprocess.run([node_bin, "--input-type=module", "-e", script], input=json.dumps({"full": full, "compact": compact}),
+                              capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn(f"ok {len(nodes)}", proc.stdout)
 
     def test_mcp_http_with_oauth_access_token_and_scope_visibility(self) -> None:
         from api.oauth import oauth_manager

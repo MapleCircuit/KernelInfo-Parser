@@ -15,11 +15,15 @@ from db_engine.spec import (
     Agg,
     AnyOf,
     Case,
+    Col,
+    Const,
     Exists,
     Join,
     Length,
     Order,
     Pred,
+    Select,
+    exists_select,
     ge,
     gt,
     ieq,
@@ -27,7 +31,12 @@ from db_engine.spec import (
     like,
     lt,
     ne,
+    sub,
 )
+
+# `m_commit.subject_key` of an empty subject (`parser/git_ast/git_commit_parser.py` EMPTY_SUBJECT_KEY): never folds
+_EMPTY_SUBJECT_KEY = b"\x00" * 8
+BACKPORT_HASH_CAP = 10
 
 
 def _text(value: Any) -> Any:
@@ -187,23 +196,52 @@ class ReadIntents:
         newest_first: bool = True,
         limit: int = 50,
         offset: int = 0,
+        collapse_backports: bool = False,
     ) -> list[dict]:
         """Commits of a git network (`commit_id, commit_hash, author_date, subject, author_id, author_name,
-        author_email, files_count`) matching a hash prefix, subject / author text, date and id bounds."""
+        author_email, files_count`) matching a hash prefix, subject / author text, date and id bounds.
+
+        `collapse_backports` folds stable backports in SQL, so `offset` / `limit` page the folded list: a row whose
+        message names its upstream commit (`m_commit.backport`) is left out when another matching row has the
+        same `subject_key` and is a mainline commit or an older backport. The group's representative (its oldest
+        matching mainline row, else its oldest backport) gains `backport_count` and up to `BACKPORT_HASH_CAP`
+        `backport_hashes` (newest first). Mainline rows sharing a subject all stay, and a group without a backport
+        is unchanged."""
         from db_engine.spec import hash_prefix as hash_prefix_cond
 
-        where: list[Any] = [{"c.commit_id": gt(0), "c.network_id": int(network_id)}]
-        if hash_prefix:
-            where.append({"c.commit_hash": hash_prefix_cond(hash_prefix)})
         q_text = (text or "").strip()
-        if q_text:
-            where.append(AnyOf({"c.subject": like(q_text, ci=True)}, {"p.name": like(q_text, ci=True)}))
-        if authored_before is not None:
-            where.append({"c.author_date": lt(authored_before)})
-        if id_min is not None:
-            where.append({"c.commit_id": gt(id_min) if id_min_exclusive else ge(id_min)})
-        if id_max is not None:
-            where.append({"c.commit_id": le(id_max)})
+
+        def _filters(a: str, p: str) -> list[Any]:
+            where: list[Any] = [{f"{a}.commit_id": gt(0), f"{a}.network_id": int(network_id)}]
+            if hash_prefix:
+                where.append({f"{a}.commit_hash": hash_prefix_cond(hash_prefix)})
+            if q_text:
+                where.append(AnyOf({f"{a}.subject": like(q_text, ci=True)}, {f"{p}.name": like(q_text, ci=True)}))
+            if authored_before is not None:
+                where.append({f"{a}.author_date": lt(authored_before)})
+            if id_min is not None:
+                where.append({f"{a}.commit_id": gt(id_min) if id_min_exclusive else ge(id_min)})
+            if id_max is not None:
+                where.append({f"{a}.commit_id": le(id_max)})
+            return where
+
+        def _person(a: str, p: str) -> list[Join]:
+            return [Join(("m_maintainer_person", p), {f"{p}.person_id": f"{a}.author_id"})]
+
+        where = _filters("c", "p")
+        if collapse_backports:
+            preferred = Select(
+                ("m_commit", "s"),
+                [Const(1)],
+                [
+                    *_filters("s", "sp"),
+                    {"s.subject_key": Col("c.subject_key")},
+                    # a mainline row, or an older backport (`c.commit_id - s.commit_id > 0`; never the row itself)
+                    AnyOf({"s.backport": 0}, Pred(sub("c.commit_id", "s.commit_id"), gt(0))),
+                ],
+                joins=_person("s", "sp") if q_text else (),
+            )
+            where.append(AnyOf({"c.backport": 0}, {"c.subject_key": _EMPTY_SUBJECT_KEY}, exists_select(preferred, negate=True)))
 
         req_limit = int(limit)
         req_offset = int(offset)
@@ -214,19 +252,22 @@ class ReadIntents:
             sql_limit = req_limit
             sql_offset = req_offset
 
+        columns = {
+            "commit_id": "c.commit_id",
+            "commit_hash": "c.commit_hash",
+            "author_date": "c.author_date",
+            "subject": "c.subject",
+            "author_id": "p.person_id",
+            "author_name": "p.name",
+            "author_email": "p.email",
+        }
+        if collapse_backports:
+            columns.update({"subject_key": "c.subject_key", "backport": "c.backport"})
         rows = self.select_rows(  # type: ignore[attr-defined]
             ("m_commit", "c"),
-            {
-                "commit_id": "c.commit_id",
-                "commit_hash": "c.commit_hash",
-                "author_date": "c.author_date",
-                "subject": "c.subject",
-                "author_id": "p.person_id",
-                "author_name": "p.name",
-                "author_email": "p.email",
-            },
+            columns,
             where,
-            joins=[Join(("m_maintainer_person", "p"), {"p.person_id": "c.author_id"})],
+            joins=_person("c", "p"),
             order_by=["-c.commit_id" if newest_first else "c.commit_id"],
             limit=sql_limit,
             offset=sql_offset,
@@ -263,7 +304,52 @@ class ReadIntents:
             if isinstance(r.get("commit_hash"), (bytearray, memoryview)):
                 r["commit_hash"] = bytes(r["commit_hash"])
             r["files_count"] = counts.get(int(r["commit_id"]), 0)
+        if collapse_backports and rows:
+            self._attach_backports(rows, _filters, _person if q_text else None)
         return rows
+
+    def _attach_backports(self, rows: list[dict], filters: Any, person: Any) -> None:
+        """`backport_count` / `backport_hashes` of the folded groups' representatives among `rows` (see
+        `list_network_commits(collapse_backports=True)`); drops the `subject_key` / `backport` helper columns."""
+        keys = {bytes(r["subject_key"]) for r in rows if r.get("subject_key") and bytes(r["subject_key"]) != _EMPTY_SUBJECT_KEY}
+        for r in rows:
+            r.pop("subject_key", None)
+            r.pop("backport", None)
+        if not keys:
+            return
+        joins = person("s", "sp") if person else ()
+        backports: dict[bytes, list[tuple[int, bytes]]] = {}
+        for b in self.select_rows(  # type: ignore[attr-defined]
+            ("m_commit", "s"),
+            {"commit_id": "s.commit_id", "commit_hash": "s.commit_hash", "subject_key": "s.subject_key"},
+            [*filters("s", "sp"), {"s.subject_key": sorted(keys), "s.backport": 1}],
+            joins=joins,
+            order_by=["-s.commit_id"],
+            as_dict=True,
+        ):
+            backports.setdefault(bytes(b["subject_key"]), []).append((int(b["commit_id"]), bytes(b["commit_hash"])))
+        if not backports:
+            return
+        mainline: dict[bytes, int] = {}
+        for m in self.aggregate(  # type: ignore[attr-defined]
+            ("m_commit", "s"),
+            {"first": Agg("MIN", "s.commit_id")},
+            [*filters("s", "sp"), {"s.subject_key": sorted(backports), "s.backport": 0}],
+            joins=joins,
+            group_by=["s.subject_key"],
+            as_dict=True,
+        ):
+            mainline[bytes(m["subject_key"])] = int(m["first"])
+        rep = {k: mainline.get(k, min(cid for cid, _h in members)) for k, members in backports.items()}
+        by_id = {int(r["commit_id"]): r for r in rows}
+        for key, members in backports.items():
+            row = by_id.get(rep[key])
+            if row is None:
+                continue
+            others = [h for cid, h in members if cid != rep[key]]
+            if others:
+                row["backport_count"] = len(others)
+                row["backport_hashes"] = [h.hex() for h in others[:BACKPORT_HASH_CAP]]
 
     # ---- maintainers ---------------------------------------------------------------------------------------------
     _SECTION_COLUMNS = ("sec_id", "name", "status", "scm_tree", "web_page", "mailing_list", "ast_id")

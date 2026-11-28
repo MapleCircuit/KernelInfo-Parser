@@ -135,7 +135,7 @@ class TestCommitRangeIngestion(unittest.TestCase):
             _commit(c1, "A Dev", "a@x", [], [("A Dev", "a@x")]),
         ]
         with MockDB() as db:
-            db.insert(m_commit, (100, 1, bytes.fromhex(outside), 1, 0, 1, 0, "outside", ""))
+            db.insert(m_commit, (100, 1, bytes.fromhex(outside), 1, 0, 1, 0, "outside", "", b"\0" * 8, 0))
             ids = pipeline.git_ingest._ingest_commit_range(db, commits, network_id=1)
             self.assertEqual(ids[outside], 100)
             self.assertLess(ids[c1], ids[c2])
@@ -1023,11 +1023,12 @@ class TestUnifiedPreparseCLIAndOrchestration(unittest.TestCase):
         db.insert_rows("m_maintainer_person", ["person_id", "name", "email"], [(1, "Alice", "alice@example.com")])
         db.insert_rows(
             "m_commit",
-            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
+            ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message",
+             "subject_key", "backport"],
             [
-                (10, 1, bytes.fromhex(sha30), 1, 1, 1, 1, "v3.0", "v3.0"),
-                (11, 1, bytes.fromhex(sha301), 1, 2, 1, 2, "v3.0.1", "v3.0.1"),
-                (12, 1, bytes.fromhex(sha31), 1, 3, 1, 3, "v3.1", "v3.1"),
+                (10, 1, bytes.fromhex(sha30), 1, 1, 1, 1, "v3.0", "v3.0", b"\1" * 8, 0),
+                (11, 1, bytes.fromhex(sha301), 1, 2, 1, 2, "v3.0.1", "v3.0.1", b"\2" * 8, 0),
+                (12, 1, bytes.fromhex(sha31), 1, 3, 1, 3, "v3.1", "v3.1", b"\3" * 8, 0),
             ],
         )
         db.insert_rows(

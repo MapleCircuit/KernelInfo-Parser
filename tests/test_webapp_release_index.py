@@ -294,6 +294,28 @@ class TestDatabaseMembership(TestIndexesOnRepository):
         self.assertEqual(badges[self.fix]["first_release"], "v1.1")
         self.assertFalse(badges[self.revert]["released"])
 
+    def test_linux_next_tags_are_never_first_stable(self) -> None:
+        from parser.git_ast import release_stats
+        self.assertEqual(release_stats.chain_of("next"), release_stats.CHAIN_NEXT)
+        self.assertEqual(release_stats.chain_of("stable"), release_stats.CHAIN_STABLE)
+        self.run_git("tag", "next-20260925", self.revert)
+        rs._TAGS_CACHE.clear()
+        try:
+            release_stats.ingest(self.engine, self.repo, repo_id=1, workers=2)
+            chains = {r["tag"]: int(r["chain"]) for r in self.engine.select_rows("m_release_segment", ["tag", "chain"], {}, as_dict=True)}
+            self.assertEqual(chains["next-20260925"], release_stats.CHAIN_NEXT)
+            rs._TAGS_CACHE.clear()
+            rs._DB_COVERAGE.clear()
+            hit = rs.db_lookup([self.revert, self.fix])
+            self.assertNotIn(self.revert, hit)   # only a linux-next snapshot holds it: no release at all
+            self.assertNotEqual((hit.get(self.fix) or {}).get("stable"), "next-20260925")
+            for sha in (self.revert, self.fix, self.backport):
+                info = rs.first_containing(sha)
+                self.assertFalse(str(info.get("first_stable") or "").startswith("next-"), info)
+        finally:
+            self.run_git("tag", "-d", "next-20260925")
+            rs._TAGS_CACHE.clear()
+
     def test_moved_tag_and_new_tags_fall_back(self) -> None:
         self.run_git("tag", "v1.2-rc1", self.revert)     # fetched since the last parse
         rs._TAGS_CACHE.clear()

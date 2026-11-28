@@ -56,13 +56,21 @@ logger = logging.getLogger(__name__)
 
 # Bump when the stored rows change meaning: every segment is summarized again.
 # 2: m_commit_release rows (every commit of the segment), one git log with merges.
-FORMAT = 2
+# 3: linux-next snapshots on chain 3 (CHAIN_NEXT), never chain 2.
+FORMAT = 3
 MW_FORMAT = 5
 HEALTH_FORMAT = 3
 EMPTY_PULL_IDX = 65535
 WORKERS = 4
 CHAIN_MAINLINE = 1
 CHAIN_STABLE = 2
+CHAIN_NEXT = 3  # linux-next snapshots (`next-YYYYMMDD`): neither a mainline nor a stable release
+
+
+def chain_of(kind: str) -> int:
+    """m_release_segment / m_commit_release chain of a `release_ranges()` kind."""
+    return {"mainline": CHAIN_MAINLINE, "next": CHAIN_NEXT}.get(kind, CHAIN_STABLE)
+
 NAME_MAX = 128  # m_maintainer_person.name / email
 _NO_HASH = b"\x00" * 20
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -170,7 +178,7 @@ def plan(tags: dict[str, str], stored: dict[str, tuple]) -> list[dict[str, Any]]
         if stored.get(tag) != want:
             todo.append({**r, "sha": tags[tag], "base_sha": tags[base] if base else None,
                          "diff_base_sha": tags[diff_base] if diff_base else None,
-                         "chain": CHAIN_MAINLINE if r["kind"] == "mainline" else CHAIN_STABLE})
+                         "chain": chain_of(r["kind"])})
     return todo
 
 

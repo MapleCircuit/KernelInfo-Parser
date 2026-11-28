@@ -27,12 +27,15 @@ def search_mail(
     """Search LKML archive messages across subjects, authors, and patch metadata."""
     eff_page = page if page is not None else ((offset // limit) + 1)
     eff_offset = (eff_page - 1) * limit if page is not None else offset
-    rel_off = eff_offset - (eff_page - 1) * limit
-    res = mailing_list_service.search(query=q, page=eff_page, limit=limit, filter_type=filter)
+    # The offset is a position in one Message-ID-unique sequence: the store pages it, no re-slicing here
+    res = mailing_list_service.search(query=q, page=eff_page, limit=limit, filter_type=filter, offset=eff_offset)
     raw_results = list(res.get("results") if "results" in res else (res.get("messages") or []))
-    sliced = raw_results[rel_off : rel_off + limit] if rel_off > 0 else raw_results[:limit]
-    total = int(res["total"]) if res.get("total") is not None else len(raw_results)
-    truncated = bool(res.get("has_more") or (eff_offset + len(sliced) < total))
+    sliced = raw_results[:limit]
+    total = int(res["total"]) if res.get("total") is not None else eff_offset + len(raw_results)
+    if "has_more" in res:
+        truncated = bool(res["has_more"])
+    else:
+        truncated = eff_offset + len(sliced) < total
     return {
         "repo": get_active_repo_name(),
         **res,

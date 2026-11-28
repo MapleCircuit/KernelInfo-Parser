@@ -29,6 +29,7 @@ from core.DBLayout import (
     m_git_ref,
     m_bridge_commit_person,
 )
+from parser.git_ast.git_commit_parser import EMPTY_SUBJECT_KEY, commit_fold_columns
 from pipeline.blob_reuse import _person_key
 from pipeline.changesets import file_fid_cache, file_fnid_cache
 from pipeline.commits import commit_relation_rows
@@ -179,6 +180,7 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
                 int(commit.committer_date or 0),
                 (commit.subject or "")[:500],
                 commit.message or "",
+                *commit_fold_columns(commit.subject, commit.message),
             ))
             for p_idx, p_hash in enumerate(commit.parents or ()):
                 p_cid = commit_ids.get(p_hash)
@@ -269,7 +271,7 @@ def ingest_git_dag(
     already_ingested = False
     with G.DB() as db:
         ref_row = db.select(m_git_ref, (None, repo_id, None, version_or_ref, None, None, None, None))
-        commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None))
+        commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None, None, None))
         head_commit_id = commit_row[0] if commit_row else None
         ref_moved = bool(ref_row and ref_row[4] != head_commit_id)
         known_cid = head_commit_id if (ref_moved or not ref_row) else ref_row[4]
@@ -328,7 +330,7 @@ def ingest_git_dag(
 
     if head_commit_id is None:
         with G.DB() as db:
-            commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None))
+            commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None, None, None))
             if commit_row:
                 head_commit_id = commit_row[0]
             else:
@@ -340,7 +342,7 @@ def ingest_git_dag(
                     head_commit_id,
                     network_id,
                     head_commit_bytes,
-                    1, 0, 1, 0, f"Commit {version_or_ref}", "",
+                    1, 0, 1, 0, f"Commit {version_or_ref}", "", EMPTY_SUBJECT_KEY, 0,
                 ))
 
     # Register in m_git_ref
@@ -370,7 +372,8 @@ def ingest_git_dag(
                 else:
                     raise e_ins
         if not already_ingested and db is not None:
-            # From here on every row the run writes lies above these watermarks (see core/ingest_state.py)
+            # From here on every row the run writes lies above these watermarks, or in its leased id ranges when
+            # distributed (see core/ingest_state.py)
             ingest_state.begin(
                 db,
                 network_id,
@@ -378,6 +381,7 @@ def ingest_git_dag(
                 TABLES,
                 base_commit_id=base_vid,
                 worker_id=getattr(G, "node_id", "") or "",
+                distributed=bool(getattr(G, "distributed", False)),
             )
         if getattr(G, "distributed", False) and getattr(G, "node_id", None):
             if heartbeat_daemon := getattr(G, "heartbeat_daemon", None):

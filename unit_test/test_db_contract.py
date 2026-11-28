@@ -650,10 +650,11 @@ class PipelineContractMixin(_BackendCase):
         db.insert_rows("m_maintainer_member", ["sec_id", "person_id", "role_type", "priority"], [(1, 1, 1, 0), (1, 3, 2, 0), (2, 1, 2, 0)])
         db.insert_rows("m_credits_entry", ["credit_id", "blob_id", "person_id", "web_page", "pgp_key", "description", "snail_mail", "ast_id"],
                        [(7, 1, 3, "", "", "", "", 0)])
-        db.insert_rows("m_commit", ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message"],
-                       [(1, 1, bytes.fromhex("ab" * 20), 1, 100, 1, 100, "net: fix 100% leak", ""),
-                        (2, 1, bytes.fromhex("ac" * 20), 3, 200, 3, 200, "fs: other", ""),
-                        (3, 2, bytes.fromhex("ad" * 20), 3, 300, 3, 300, "elsewhere", "")])
+        db.insert_rows("m_commit", ["commit_id", "network_id", "commit_hash", "author_id", "author_date", "committer_id", "committer_date", "subject", "message",
+                                    "subject_key", "backport"],
+                       [(1, 1, bytes.fromhex("ab" * 20), 1, 100, 1, 100, "net: fix 100% leak", "", b"k1" * 4, 0),
+                        (2, 1, bytes.fromhex("ac" * 20), 3, 200, 3, 200, "fs: other", "", b"k2" * 4, 0),
+                        (3, 2, bytes.fromhex("ad" * 20), 3, 300, 3, 300, "elsewhere", "", b"k1" * 4, 1)])
         db.insert_rows("m_commit_file", ["commit_id", "fnid", "blob_id", "old_fnid", "old_blob_id", "change_type"], [(1, 1, 1, 0, 0, "M"), (1, 2, 2, 0, 0, "A")])
         return [t.table_name for t in extra]
 
@@ -693,6 +694,38 @@ class PipelineContractMixin(_BackendCase):
                 self.assertEqual(r.find_maintainer_person("<BOB@y.org>", "bob@y.org", "bob@y.org", "")["person_id"], 3, "named person first")
                 self.assertEqual(r.find_maintainer_person("x", "x", "", "ann dev")["person_id"], 1)
                 self.assertIsNone(r.find_maintainer_person("nobody", "nobody", "", ""))
+        finally:
+            self.db.drop_tables(names, ignore_fk=True)
+
+    def test_list_network_commits_folds_backports_in_sql(self) -> None:
+        """`collapse_backports` folds same-subject_key backports into the mainline row with the same SQL on every backend."""
+        from parser.git_ast.git_commit_parser import commit_fold_columns
+
+        names = self._webapp_fixture()
+        up = "ab" * 20
+        rows = []
+        for cid, subject, message in ((10, "ext2: drain DIO", ""), (20, "ext2: Drain  DIO", f"commit {up} upstream."),
+                                      (30, "ext2: drain DIO", f"[ Upstream commit {up} ]"), (40, "ext2: fix typo", ""),
+                                      (50, "ext2: fix typo", ""), (60, "ext2: stable only", "(cherry picked from commit abcdef1)"),
+                                      (70, "ext2: stable only", "commit abcdef1 upstream."), (80, "", "commit abcdef1 upstream.")):
+            rows.append((cid, 1, cid.to_bytes(20, "big"), 1, cid, 1, cid, subject, message, *commit_fold_columns(subject, message)))
+        self.db.insert_rows("m_commit", [c for c, _ in D.m_commit.init_columns], rows)
+        try:
+            with self.db.reader() as r:
+                every = [c["commit_id"] for c in r.list_network_commits(1, text="ext2", limit=50)]
+                self.assertEqual(every, [70, 60, 50, 40, 30, 20, 10])
+                folded = r.list_network_commits(1, text="ext2", limit=50, collapse_backports=True)
+                self.assertEqual([c["commit_id"] for c in folded], [60, 50, 40, 10])
+                by_id = {c["commit_id"]: c for c in folded}
+                self.assertEqual((by_id[10]["backport_count"], by_id[10]["backport_hashes"]),
+                                 (2, [(30).to_bytes(20, "big").hex(), (20).to_bytes(20, "big").hex()]))
+                self.assertEqual(by_id[60]["backport_count"], 1)
+                self.assertNotIn("backport_count", by_id[40])
+                # Paging the folded list: the offset counts folded rows (no window)
+                self.assertEqual([c["commit_id"] for c in r.list_network_commits(1, text="ext2", limit=2, offset=2,
+                                                                                 collapse_backports=True)], [40, 10])
+                # An empty subject never folds; without a text filter every row still takes part
+                self.assertIn(80, [c["commit_id"] for c in r.list_network_commits(1, collapse_backports=True)])
         finally:
             self.db.drop_tables(names, ignore_fk=True)
 

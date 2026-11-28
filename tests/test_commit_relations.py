@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import backfills
+from parser.git_ast.git_commit_parser import commit_fold_columns
 from core import ingest_state as I
 from core import DBLayout as D
 from core.DBLayout import TABLES
@@ -150,12 +151,13 @@ class Store:
         self.db = self.engine
         self.engine.create_table([D.m_maintainer_person, D.m_release_segment, D.m_release_person, D.m_person_first_release,
                                   D.m_commit_release, D.m_ingest_state, D.m_commit, D.m_commit_relation, D.m_commit_link])
-        self.engine.insert_rows("m_commit", self.COMMIT_COLUMNS, [(0, 0, b"\0" * 20, 0, 0, 0, 0, "", "")], on_conflict="ignore")
+        self.engine.insert_rows("m_commit", self.COMMIT_COLUMNS, [(0, 0, b"\0" * 20, 0, 0, 0, 0, "", "", b"\0" * 8, 0)], on_conflict="ignore")
         out = git(repo, "log", "--all", "--topo-order", "--reverse", "--format=%x1e%H%x1f%at%x1f%s%x1f%B")
         for i, rec in enumerate(r for r in out.split("\x1e") if r.strip()):
             sha, at, subject, body = rec.split("\x1f", 3)
             self.engine.insert_rows("m_commit", self.COMMIT_COLUMNS,
-                                    [(i + 1, 1, bytes.fromhex(sha), 1, int(at), 1, int(at), subject, body.rstrip("\n"))])
+                                    [(i + 1, 1, bytes.fromhex(sha), 1, int(at), 1, int(at), subject, body.rstrip("\n"),
+                                      *commit_fold_columns(subject, body))])
         if with_relations:
             self.summary = backfills.backfill_commit_relations(self.engine, str(repo))
         from parser.git_ast import release_stats

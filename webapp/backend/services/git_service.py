@@ -210,6 +210,7 @@ def _commit_entry(r: dict[str, Any]) -> dict[str, Any]:
         "author_name": safe_decode(r["author_name"]),
         "author_email": safe_decode(r["author_email"]),
         "files_count": int(r.get("files_count", 0)),
+        **{k: r[k] for k in ("backport_count", "backport_hashes") if k in r},
     }
 
 
@@ -277,6 +278,45 @@ def merge_contributors(trailers: list[dict[str, Any]]) -> list[dict[str, Any]]:
             contributors_map[key]["roles"].append(t["role_name"])
             contributors_map[key]["role_types"].append(t["role_type"])
     return list(contributors_map.values())
+
+
+_EMAIL_TIER_NAMES = {
+    1: "Authoritative Link / Message-ID",
+    2: "Exact Patch-ID",
+    3: "Blob Hash Match",
+    4: "Maintainer / Bot Reference",
+    5: "Metadata Match",
+    6: "Pull Request Match",
+}
+
+
+def commit_linked_emails(reader: Any, cid: int) -> list[dict[str, Any]]:
+    """Mailing-list messages matched to an ingested commit (`m_commit_email`, every match tier)."""
+    linked_emails: list[dict[str, Any]] = []
+    try:
+        for erow in reader.select_rows(
+            "m_commit_email",
+            ["message_id", "thread_id", "relation_type", "match_tier", "patch_version", "patch_idx", "patch_total"],
+            {"commit_id": cid},
+            order_by=["relation_type", "patch_idx"],
+            as_dict=True,
+        ):
+            tier = erow["match_tier"]
+            mid = safe_decode(erow["message_id"]).strip("<> ")
+            linked_emails.append({
+                "message_id": mid,
+                "thread_id": erow["thread_id"],
+                "relation_type": erow["relation_type"],
+                "match_tier": tier,
+                "match_tier_name": _EMAIL_TIER_NAMES.get(tier, "Matched"),
+                "patch_version": erow["patch_version"],
+                "patch_idx": erow["patch_idx"],
+                "patch_total": erow["patch_total"],
+                "lore_url": f"{LORE_BASE_URL}{mid}/",
+            })
+    except Exception as exc:  # noqa: BLE001 - optional mailing-list metadata
+        logger.debug("Failed to query m_commit_email for commit %d: %s", cid, exc)
+    return linked_emails
 
 
 class GitService:
@@ -580,11 +620,25 @@ class GitService:
             "formatted_patch": formatted,
         }
 
-    def get_commits(self, version_name: str = "", page: int = 1, limit: int = 50, query: str = "") -> dict[str, Any]:
-        """Search the indexed commits of the request's repository (its Git network), newest first."""
+    def get_commits(
+        self,
+        version_name: str = "",
+        page: int = 1,
+        limit: int = 50,
+        query: str = "",
+        *,
+        offset: int | None = None,
+        collapse_backports: bool = False,
+    ) -> dict[str, Any]:
+        """Search the indexed commits of the request's repository (its Git network), newest first.
+
+        `offset` (else `(page - 1) * limit`) is bound straight into SQL. `collapse_backports` folds same-subject
+        stable backports of a text search into their mainline row in SQL (`list_network_commits`): the page is
+        a slice of the folded list at any offset, and a folded row carries `backport_count` / `backport_hashes`."""
         # limit and the page's offset are bound straight into SQL LIMIT/OFFSET
         limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
-        off = max(0, min((max(1, int(page)) - 1) * limit, MAX_COMMIT_OFFSET))
+        start = (max(1, int(page)) - 1) * limit if offset is None else int(offset)
+        off = max(0, min(start, MAX_COMMIT_OFFSET))
         now_ts = int(time.time())
         v_clean = (version_name or "").strip()
         with get_reader() as reader:
@@ -645,7 +699,9 @@ class GitService:
                 # Case 2: Text search by commit subject or author name
                 commits = [
                     _commit_entry(r)
-                    for r in reader.list_network_commits(network_id, text=q_clean, limit=limit, offset=off)
+                    for r in reader.list_network_commits(
+                        network_id, text=q_clean, limit=limit, offset=off, collapse_backports=collapse_backports
+                    )
                 ]
             else:
                 # Case 3: Empty query -> latest indexed commits (primary key walk, excluding future commits)
@@ -710,6 +766,21 @@ class GitService:
                 sha = str(c.get("commit_hash") or "").lower()
                 if sha in resolved:
                     c["files_count"] = resolved[sha]
+
+    def get_commit_linked_emails(self, commit_hash: str) -> list[dict[str, Any]]:
+        """`linked_emails` of `get_commit_detail()` alone (full SHA of an ingested commit; else `[]`)."""
+        clean = str(commit_hash or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", clean):
+            return []
+        with get_reader() as reader:
+            cond: dict[str, Any] = {"commit_hash": hash_prefix(clean)}
+            network_id = get_active_network_id(reader)
+            if network_id is not None:
+                cond["network_id"] = network_id
+            row = reader.select_one("m_commit", ["commit_id"], cond, as_dict=True)
+            if not row:
+                return []
+            return commit_linked_emails(reader, row["commit_id"])
 
     def get_commit_detail(self, commit_id: int | str) -> dict[str, Any]:
         """Retrieve full commit metadata, modified files, and trailers."""
@@ -818,39 +889,7 @@ class GitService:
             contributors = merge_contributors(trailers)
 
             # Linked mailing list emails from m_commit_email
-            tier_names = {
-                1: "Authoritative Link / Message-ID",
-                2: "Exact Patch-ID",
-                3: "Blob Hash Match",
-                4: "Maintainer / Bot Reference",
-                5: "Metadata Match",
-                6: "Pull Request Match",
-            }
-            linked_emails: list[dict[str, Any]] = []
-            try:
-                for erow in reader.select_rows(
-                    "m_commit_email",
-                    ["message_id", "thread_id", "relation_type", "match_tier", "patch_version", "patch_idx", "patch_total"],
-                    {"commit_id": cid},
-                    order_by=["relation_type", "patch_idx"],
-                    as_dict=True,
-                ):
-                    rel_type = erow["relation_type"]
-                    tier = erow["match_tier"]
-                    mid = safe_decode(erow["message_id"]).strip("<> ")
-                    linked_emails.append({
-                        "message_id": mid,
-                        "thread_id": erow["thread_id"],
-                        "relation_type": rel_type,
-                        "match_tier": tier,
-                        "match_tier_name": tier_names.get(tier, "Matched"),
-                        "patch_version": erow["patch_version"],
-                        "patch_idx": erow["patch_idx"],
-                        "patch_total": erow["patch_total"],
-                        "lore_url": f"{LORE_BASE_URL}{mid}/",
-                    })
-            except Exception as exc:  # noqa: BLE001 - optional mailing-list metadata
-                logger.debug("Failed to query m_commit_email for commit %d: %s", cid, exc)
+            linked_emails = commit_linked_emails(reader, cid)
 
             # LKML thread URL on the self-hosted public-inbox mirror
             subj = safe_decode(c_row["subject"])
