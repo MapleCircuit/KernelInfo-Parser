@@ -172,6 +172,8 @@ export const ZOOM_MIN = 0.15;
 export const ZOOM_MAX = 3;
 
 const ID_RE = /^[\w-]{1,64}$/;
+/** Inline embedding depth budget shared by Sub-Map `subCanvas` and nested `data.canvas` (Python `MAX_SUBCANVAS_DEPTH`). */
+export const MAX_SUBCANVAS_DEPTH = 8;
 let idCounter = 0;
 
 /** A fresh id with a type prefix (`n-…` nodes, `e-…` edges). */
@@ -391,13 +393,60 @@ export function normalizeData(type, raw, depth = 0) {
     case "note":
       return { text: str(d.text, "", 20000), markdown: d.markdown !== false };
     case "group":
-      return depth < 8 && isObj(d.subCanvas) ? { subCanvas: normalizeCanvas(d.subCanvas, depth + 1) } : {};
-    case "nodemap":
-      // Reference to another saved (server) canvas by id; its document is never embedded
-      return { canvasId: typeof d.canvasId === "string" && ID_RE.test(d.canvasId) ? d.canvasId : "" };
+      return depth < MAX_SUBCANVAS_DEPTH && isObj(d.subCanvas) ? { subCanvas: normalizeCanvas(d.subCanvas, depth + 1) } : {};
+    case "nodemap": {
+      // `highQualityPreview` (opt-in, kept only when true): the card shows a rendered picture of the child
+      // (`nested_snapshot.js`); the picture itself is never part of the node data
+      const hq = d.highQualityPreview === true ? { highQualityPreview: true } : {};
+      // Portable form: the child canvas inline in `data.canvas` (shares the Sub-Map depth budget)
+      if (isObj(d.canvas)) {
+        if (depth >= MAX_SUBCANVAS_DEPTH) return { canvasId: "", ...hq };
+        return { canvas: normalizeCanvas(d.canvas, depth + 1) || emptyCanvas(), ...hq };
+      }
+      // Working form: a browser-local child id plus the cached `summary` / `preview` of its content
+      const canvasId = typeof d.canvasId === "string" && ID_RE.test(d.canvasId) ? d.canvasId : "";
+      const out = { canvasId, ...hq };
+      if (canvasId) {
+        const summary = normalizeNestedSummary(d.summary);
+        const preview = normalizeNestedPreview(d.preview);
+        if (summary) out.summary = summary;
+        if (preview) out.preview = preview;
+      }
+      return out;
+    }
     default:
       return {};
   }
+}
+
+const NESTED_PREVIEW_NODES = 200;
+const NESTED_PREVIEW_EDGES = 400;
+const intIn = (v, lo, hi, d = 0) => Math.min(hi, Math.max(lo, Math.round(num(v, d))));
+
+/** Sanitized cached card summary `{title, nodes, edges, nested, depth}` of a nested child, or null. */
+export function normalizeNestedSummary(raw) {
+  if (!isObj(raw)) return null;
+  return {
+    title: str(raw.title, "", 256),
+    nodes: intIn(raw.nodes, 0, 1e6),
+    edges: intIn(raw.edges, 0, 1e6),
+    nested: intIn(raw.nested, 0, 1e6),
+    depth: intIn(raw.depth, 0, 64),
+  };
+}
+
+/** Sanitized, bounded static preview geometry of a nested child (`build_static_preview` shape), or null. */
+export function normalizeNestedPreview(raw) {
+  if (!isObj(raw)) return null;
+  const nodes = (Array.isArray(raw.nodes) ? raw.nodes : []).filter(isObj).slice(0, NESTED_PREVIEW_NODES).map((n) => ({
+    x: intIn(n.x, -1e5, 1e5), y: intIn(n.y, -1e5, 1e5), w: intIn(n.w, 0, 1e5), h: intIn(n.h, 0, 1e5),
+    type: str(n.type, "", 32), color: str(n.color, "", 64),
+  }));
+  const edges = (Array.isArray(raw.edges) ? raw.edges : []).filter(isObj).slice(0, NESTED_PREVIEW_EDGES).map((e) => ({
+    x1: intIn(e.x1, -1e5, 1e5), y1: intIn(e.y1, -1e5, 1e5), x2: intIn(e.x2, -1e5, 1e5), y2: intIn(e.y2, -1e5, 1e5),
+    color: str(e.color, "", 64), style: ["solid", "dashed", "dotted"].includes(e.style) ? e.style : "solid",
+  }));
+  return { w: intIn(raw.w, 0, 1e5), h: intIn(raw.h, 0, 1e5), nodes, edges, truncated: Boolean(raw.truncated) };
 }
 
 /** Default title of a node from its payload (shown unless `customTitle` is set). */

@@ -412,8 +412,11 @@ def normalize_embed_view_state(raw: Any) -> dict[str, Any] | None:
 def normalize_data(node_type: str, raw: Any, depth: int = 0) -> dict[str, Any]:
     """Normalize type-specific `node.data` across all 17 NodeMap node types.
 
-    A `nodemap` node references another saved canvas of the same repository by `data.canvasId`
-    (`/^[\\w-]{1,64}$/`, `""` when unset); the referenced document is never embedded.
+    A `nodemap` node embeds its child canvas inline in `data.canvas` (normalized recursively, sharing the
+    embedding depth budget `MAX_SUBCANVAS_DEPTH`). Without an inline canvas it keeps a reference id
+    `data.canvasId` (`/^[\\w-]{1,64}$/`, `""` when unset): a pre-existing server document's reference or
+    a browser-local working id. Computed `summary` / `preview` metadata is never kept (see
+    `nodemap_nesting.annotate_nested`).
     """
     d = raw if _is_obj(raw) else {}
     if node_type == "struct":
@@ -567,8 +570,15 @@ def normalize_data(node_type: str, raw: Any, depth: int = 0) -> dict[str, Any]:
             return {"subCanvas": normalize_canvas(d["subCanvas"], depth + 1)}
         return {}
     if node_type == "nodemap":
+        # `highQualityPreview` (opt-in display flag, kept only when true): the browser renders the child's
+        # picture locally; no picture data is ever part of the payload
+        hq = {"highQualityPreview": True} if d.get("highQualityPreview") is True else {}
+        if _is_obj(d.get("canvas")):
+            if depth < MAX_SUBCANVAS_DEPTH:
+                return {"canvas": normalize_canvas(d["canvas"], depth + 1, strict=False) or empty_canvas(), **hq}
+            return {"canvasId": "", **hq}
         cid = d.get("canvasId")
-        return {"canvasId": cid if isinstance(cid, str) and is_valid_id(cid) else ""}
+        return {"canvasId": cid if isinstance(cid, str) and is_valid_id(cid) else "", **hq}
     return {}
 
 

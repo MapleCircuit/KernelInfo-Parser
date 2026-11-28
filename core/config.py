@@ -153,9 +153,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # is taken only from `ref` ("latest-release" or a release tag), never from a caller's revision;
         # `sandbox` optionally names a wrapper command (e.g. "bwrap") the run goes through.
         "tools": {"checkpatch": {"enabled": False, "ref": "latest-release"}, "sandbox": ""},
-        # Saved NodeMap canvas writes of the webapp (webapp/API_ENDPOINTS.md section 4.14): POST/PUT/DELETE of
-        # `/webapi/nodemap/canvases*` (JSON files under `nodemap_canvas_dir`, never the database); false -> 403
-        "nodemap_canvas_writes": True,
         # Source index (webapp/API.md section 2.19): the facts of ingested blobs come from the database (written by
         # the parser, Step 6.9); these low-priority processes only extract blobs it lacks (revisions the parser never
         # ingested), into a SQLite store capped at max_mb (least recently used blobs dropped past it). Assembled
@@ -1109,7 +1106,7 @@ def is_api_default_version_pinned() -> bool:
 
 
 def get_nodemap_canvas_dir() -> Path:
-    """Resolve persistent directory for saved NodeMap canvas JSON files (`api.nodemap_canvas_dir`).
+    """Resolve the read-only directory of pre-existing server NodeMap canvas JSON files (`api.nodemap_canvas_dir`).
 
     Shared by both `api/` and `webapp/` services outside `cache_engine`. Relative paths resolve against
     `REPO_ROOT`; an empty value defaults to `<config_dir>/nodemap-canvases` (or `<REPO_ROOT>/nodemap-canvases`).

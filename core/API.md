@@ -25,24 +25,24 @@ agents.
   - 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`) [L908-L930]
   - 5.5. Test Runner CLI (`python3 main.py -u`, `unit_test/runner.py`) [L931-L954]
 - 6. End-to-End Inter-Module Execution Lifecycle [L955-L1102]
-- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1103-L1540]
-  - 7.1. Unified Configuration Hierarchy [L1105-L1239]
-  - 7.1.1. Repository Auto-Detection & Selection [L1240-L1305]
-  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1306-L1375]
-  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1376-L1425]
-  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1426-L1540]
-- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1541-L1811]
-  - 8.1. High-Level Architecture [L1543-L1586]
-  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1587-L1612]
-  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1613-L1811]
-- 9. CVE List Ingestion (`parser/cve/`) [L1812-L1868]
-- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1869-L1936]
-- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1937-L2071]
-  - 11.1. Operational Modes, DB Queue & Singleton Security [L1945-L1976]
-  - 11.2. Concurrency Guarantees & ID Block Leasing [L1977-L2021]
-  - 11.3. Surgical Range-Isolated Crash Recovery [L2022-L2054]
-  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2055-L2071]
-- 12. Backfills of Derived Tables (`core/backfills.py`) [L2072-L2119]
+- 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`) [L1103-L1539]
+  - 7.1. Unified Configuration Hierarchy [L1105-L1238]
+  - 7.1.1. Repository Auto-Detection & Selection [L1239-L1304]
+  - 7.2. SSH Tunnel Manager (`SSHTunnelManager`) [L1305-L1374]
+  - 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`) [L1375-L1424]
+  - 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety [L1425-L1539]
+- 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`) [L1540-L1810]
+  - 8.1. High-Level Architecture [L1542-L1585]
+  - 8.2. Relational Schema Mapping (Table 43: `m_commit_email`) [L1586-L1611]
+  - 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`) [L1612-L1810]
+- 9. CVE List Ingestion (`parser/cve/`) [L1811-L1867]
+- 10. Release Statistics (`parser/git_ast/release_stats.py`) [L1868-L1935]
+- 11. Distributed Multi-Computer Parsing (`core/distributed.py`) [L1936-L2070]
+  - 11.1. Operational Modes, DB Queue & Singleton Security [L1944-L1975]
+  - 11.2. Concurrency Guarantees & ID Block Leasing [L1976-L2020]
+  - 11.3. Surgical Range-Isolated Crash Recovery [L2021-L2053]
+  - 11.4. Independent Steps as Auxiliary Tasks (`pipeline/step_tasks.py`) [L2054-L2070]
+- 12. Backfills of Derived Tables (`core/backfills.py`) [L2071-L2118]
 <!-- toc:end -->
 
 ---
@@ -1147,9 +1147,8 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `revisions` default `8`: the source index's extraction processes for blobs the database lacks, their store
     cap, and how many assembled revisions stay on disk, `webapp/API.md` §2.19) and `tools`
     (`checkpatch.enabled` default `false`, `checkpatch.ref` default `"latest-release"`, `sandbox` default
-    `""`: running the repository's `scripts/checkpatch.pl`, off by default) and `nodemap_canvas_writes` (default
-    `true`: the saved NodeMap canvas write routes of `webapp/API_ENDPOINTS.md` §4.14, 403 when `false`); see
-    `webapp/API.md` §2.14–§2.15, §2.18 and §7.1.
+    `""`: running the repository's `scripts/checkpatch.pl`, off by default); see `webapp/API.md` §2.14–§2.15,
+    §2.18 and §7.1.
   - `"api"`: standalone authenticated AI API service (`api/API.md` §2): `host` (default `"127.0.0.1"`), `port`
     (default `8001`), `reload` (default `false`), `default_version`, `keys` (list of strings or `{name: key}`;
     empty fails closed), `rate_limit` (`max_requests`, `window_seconds`), `auth_lockout` (`max_failures`,

@@ -177,6 +177,7 @@ export function selectEdge(ctrl, id) {
 export function onPointerDown(ctrl, e) {
   if (ctrl.tourExporting) return;
   const t = e.target;
+  if (t.closest?.(".nm-breadcrumbs")) return;
   if (!t.closest(".nm-inline-edit")) ctrl.rootEl.focus({ preventScroll: true });
   const start = { x: e.clientX, y: e.clientY };
   if (e.button === 1 || (e.button === 0 && ctrl.spaceDown)) {
@@ -467,6 +468,7 @@ export function finishWire(ctrl, g, e) {
 
 export function onDblClick(ctrl, e) {
   if (ctrl.tourExporting) return;
+  if (e.target.closest?.(".nm-breadcrumbs")) return;
   if (isTyping(e.target)) return;
   const wpEl = e.target.closest?.(".nm-edge-wp[data-edge-id]");
   if (wpEl) {
@@ -601,6 +603,7 @@ export function onContextMenu(ctrl, e) {
     e.preventDefault?.();
     return;
   }
+  if (e.target.closest?.(".nm-breadcrumbs")) return;
   e.preventDefault();
   e.stopPropagation();
   const nodeEl = e.target.closest(".nm-node");
@@ -638,7 +641,11 @@ export function attachCanvasEvents(ctrl) {
     }
   }, true);
   if (ctrl.breadcrumbsEl) {
+    ctrl.breadcrumbsEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+    ctrl.breadcrumbsEl.addEventListener("dblclick", (e) => e.stopPropagation());
+    ctrl.breadcrumbsEl.addEventListener("contextmenu", (e) => e.stopPropagation());
     ctrl.breadcrumbsEl.addEventListener("click", (e) => {
+      if (ctrl.tourExporting) return;
       const nested = e.target.closest("[data-nm-crumb]");
       if (nested) {
         ctrl.goToCrumb(parseInt(nested.dataset.nmCrumb, 10));

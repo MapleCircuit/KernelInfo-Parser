@@ -80,6 +80,7 @@ function summaryFromRecord(rec, fallbackKey = "") {
     updated_at: Number(rec?.updated_at) || 0,
     nodeCount,
     edgeCount,
+    nested: rec?.nested === true,
   };
 }
 
@@ -87,7 +88,7 @@ function summaryFromRecord(rec, fallbackKey = "") {
 
 export async function saveNamedCanvas(
   userDb,
-  { key = "", name = "Untitled Map", repo = "", canvas = null, created_at = null } = {},
+  { key = "", name = "Untitled Map", repo = "", canvas = null, created_at = null, nested = false } = {},
   fallbackStorage = globalThis.localStorage,
 ) {
   const cleanKey = String(key || "").trim();
@@ -125,6 +126,7 @@ export async function saveNamedCanvas(
     updated_at: updatedAt,
     nodeCount,
     edgeCount,
+    nested: nested === true,
     data,
   };
 
@@ -136,6 +138,7 @@ export async function saveNamedCanvas(
     updated_at: updatedAt,
     nodeCount,
     edgeCount,
+    nested: nested === true,
     canvas: normalizedCanvas,
   };
 
@@ -162,10 +165,12 @@ export async function saveNamedCanvas(
 
 export async function listNamedCanvases(
   userDb,
-  { repo = null } = {},
+  { repo = null, nested = false } = {},
   fallbackStorage = globalThis.localStorage,
 ) {
   const byKey = new Map();
+  // `nested`: false = library maps only (default), true = nested children only, "all" = both
+  const matchesNested = (r) => nested === "all" || (r?.nested === true) === (nested === true);
   const matchesRepo = (r) => repo === null || repo === undefined || String(r?.repo || "") === String(repo);
 
   if (userDb && typeof userDb.userList === "function") {
@@ -174,7 +179,7 @@ export async function listNamedCanvases(
       for (const raw of Array.isArray(idbList) ? idbList : []) {
         if (!isObj(raw) || !raw.key) continue;
         if (raw.kind && raw.kind !== NAMED_CANVAS_KIND) continue;
-        if (!matchesRepo(raw)) continue;
+        if (!matchesRepo(raw) || !matchesNested(raw)) continue;
         const item = summaryFromRecord(raw, raw.key);
         const prev = byKey.get(item.key);
         if (!prev || item.updated_at > prev.updated_at) byKey.set(item.key, item);
@@ -195,7 +200,7 @@ export async function listNamedCanvases(
       }
       if (!isObj(parsed)) continue;
       if (parsed.kind && parsed.kind !== NAMED_CANVAS_KIND) continue;
-      if (!matchesRepo(parsed)) continue;
+      if (!matchesRepo(parsed) || !matchesNested(parsed)) continue;
       const item = summaryFromRecord(parsed, k);
       const prev = byKey.get(item.key);
       if (!prev || item.updated_at > prev.updated_at) byKey.set(item.key, item);
@@ -254,6 +259,7 @@ export async function loadNamedCanvas(userDb, key, fallbackStorage = globalThis.
     created_at: Number(chosen?.created_at) || 0,
     updated_at: Number(chosen?.updated_at) || 0,
     canvas,
+    nested: chosen?.nested === true,
     backend,
   };
 }
@@ -274,6 +280,7 @@ export async function renameNamedCanvas(userDb, key, newName, fallbackStorage = 
       repo: existing.repo,
       canvas: existing.canvas,
       created_at: existing.created_at,
+      nested: existing.nested,
     },
     fallbackStorage,
   );

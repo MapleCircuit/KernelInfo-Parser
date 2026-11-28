@@ -1269,7 +1269,7 @@ class ContextMenu {
       if (typeCount) items.push({ label: `Expand Types (${typeCount})`, icon: "⇶", onClick: () => controller.expandStructTypes(node.id) });
       if (node.type === "nodemap") {
         const target = d.canvasId || "";
-        const status = controller.nestedMaps?.[target]?.status;
+        const status = controller.nestedCard?.(node)?.status;
         items.push({ label: "Open NodeMap", icon: "↘", disabled: !target || !status || status === "missing", onClick: () => controller.openNested?.(node.id) });
         items.push({ label: "Choose Another NodeMap…", icon: "🗺", onClick: () => controller.chooseNestedTarget?.(node.id) });
       }

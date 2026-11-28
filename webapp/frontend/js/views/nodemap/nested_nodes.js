@@ -1,11 +1,14 @@
 /**
  * nested_nodes.js - Pure helpers of nested NodeMap nodes (`webapp/API_FRONTEND.md` §5.3.9).
  *
- * A `nodemap` node references another saved server canvas by `data.canvasId`. The reference is never
- * expanded: the node body is a static card (name, counts, SVG preview) built from the `nested_maps`
- * card the server sends with every canvas read. DOM-free; every interpolated string is escaped.
+ * A `nodemap` node references a browser-local child canvas by `data.canvasId`. The reference is never
+ * expanded: the node body is a static card (name, counts, SVG preview) built from the node's cached
+ * `data.summary` / `data.preview` (`nested_store.js: cardOf`); with `data.highQualityPreview` the preview is
+ * the child's rendered picture (`nested_snapshot.js`) as an `<img>` once it is ready. DOM-free; every
+ * interpolated string is escaped.
  */
 import { accentVar } from "./canvas_model.js";
+import { isSnapshotUrl } from "./nested_snapshot.js";
 
 const ID_RE = /^[\w-]{1,64}$/;
 
@@ -23,7 +26,7 @@ export function nestedTargetId(node) {
 
 /**
  * Display state of a nested node: `unset` (no target chosen), `missing` (deleted target or no card for
- * it), `ok`. `card` is `nested_maps[canvasId]`.
+ * it), `ok`. `card` is `nested_store.js: cardOf`.
  */
 export function nestedState(node, card) {
   if (!nestedTargetId(node)) return "unset";
@@ -57,6 +60,11 @@ export function nestedPreviewSvg(preview) {
   return `<svg class="nm-nested-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false"><g class="nm-nested-edges" stroke-width="4" fill="none">${lines.join("")}</g><g class="nm-nested-rects" fill-opacity="0.55">${rects.join("")}</g></svg>`;
 }
 
+/** Whether a nested node asks for the high-quality picture of its child (opt-in, off by default). */
+export function wantsHighQuality(node) {
+  return node?.data?.highQualityPreview === true;
+}
+
 /** Label of a nested node: the target name when known, else the node title. */
 export function nestedLabel(node, card) {
   if (card && card.status !== "missing" && card.name) return String(card.name);
@@ -66,22 +74,26 @@ export function nestedLabel(node, card) {
 /**
  * Body HTML of a nested node (no child DOM, no editors): static preview, counts, "Open"/"Remove" actions.
  * `data-act` buttons are routed by `nodemap_gestures.js` onClick (`nested-open`, `nested-remove`,
- * `nested-choose`).
+ * `nested-choose`). `snapshot` is the node's cached high-quality picture (`nested_snapshot.js` entry) or
+ * `null`: a high-quality node shows the schematic preview (marked pending) until it is ready.
  */
-export function nestedBodyHtml(node, card) {
+export function nestedBodyHtml(node, card, snapshot = null) {
   const state = nestedState(node, card);
   const target = nestedTargetId(node);
   if (state === "unset") {
     return `<div class="nm-nested nm-nested-unset"><div class="nm-nested-msg">No NodeMap chosen</div><div class="nm-nested-actions"><button type="button" class="nodemap-btn" data-act="nested-choose">Choose NodeMap…</button><button type="button" class="nodemap-btn nm-danger" data-act="nested-remove">Remove</button></div></div>`;
   }
   if (state === "missing") {
-    return `<div class="nm-nested nm-nested-broken" role="alert"><div class="nm-nested-msg"><span class="nm-nested-warn" aria-hidden="true">⚠</span> Broken reference: NodeMap <code>${esc(target)}</code> no longer exists</div><div class="nm-nested-actions"><button type="button" class="nodemap-btn" data-act="nested-choose">Choose another…</button><button type="button" class="nodemap-btn nm-danger" data-act="nested-remove">Remove</button></div></div>`;
+    return `<div class="nm-nested nm-nested-broken" role="alert"><div class="nm-nested-msg"><span class="nm-nested-warn" aria-hidden="true">⚠</span> Broken reference: NodeMap <code>${esc(target)}</code> is not stored in this browser</div><div class="nm-nested-actions"><button type="button" class="nodemap-btn" data-act="nested-choose">Choose another…</button><button type="button" class="nodemap-btn nm-danger" data-act="nested-remove">Remove</button></div></div>`;
   }
-  const svg = nestedPreviewSvg(card.preview);
-  const trunc = card.preview?.truncated ? '<span class="nm-nested-trunc" title="The preview shows a part of the map">…</span>' : "";
+  const hq = wantsHighQuality(node);
+  const pic = hq && snapshot && !snapshot.empty && isSnapshotUrl(snapshot.url) ? snapshot.url : "";
+  const svg = pic ? `<img class="nm-nested-img" src="${esc(pic)}" alt="" draggable="false" decoding="async"/>` : nestedPreviewSvg(card.preview);
+  const trunc = !pic && card.preview?.truncated ? '<span class="nm-nested-trunc" title="The preview shows a part of the map">…</span>' : "";
+  const pcls = pic ? " nm-nested-hq" : hq && !snapshot ? " nm-nested-pending" : "";
   const desc = card.description ? `<div class="nm-nested-desc">${esc(card.description)}</div>` : "";
   const ver = card.version ? `<span class="nm-nested-ver">${esc(card.version)}</span>` : "";
-  return `<div class="nm-nested"><div class="nm-nested-name"><span class="nm-nested-title">${esc(nestedLabel(node, card))}</span>${ver}</div>${desc}<div class="nm-nested-preview">${svg || '<div class="nm-nested-empty">Empty NodeMap</div>'}${trunc}</div><div class="nm-nested-foot"><span class="nm-nested-counts">${esc(nestedCountsText(card.counts))}</span><button type="button" class="nodemap-btn" data-act="nested-open" title="Open this NodeMap for editing">Open</button></div></div>`;
+  return `<div class="nm-nested"><div class="nm-nested-name"><span class="nm-nested-title">${esc(nestedLabel(node, card))}</span>${ver}</div>${desc}<div class="nm-nested-preview${pcls}">${svg || '<div class="nm-nested-empty">Empty NodeMap</div>'}${trunc}</div><div class="nm-nested-foot"><span class="nm-nested-counts">${esc(nestedCountsText(card.counts))}</span><button type="button" class="nodemap-btn" data-act="nested-open" title="Open this NodeMap for editing">Open</button></div></div>`;
 }
 
 /** Plain-text label lines of a nested node for exports (`[title, counts]`). */
@@ -101,8 +113,7 @@ export function crumb(canvasId, name, nodeId = "") {
 }
 
 /**
- * The stack after entering `entry`. Entering a canvas already on the stack (a cycle cannot occur on the
- * server; a stale stack can) truncates back to it instead of growing.
+ * The stack after entering `entry`. Entering a canvas already on the stack (a stale stack can) truncates back to it instead of growing.
  */
 export function pushCrumb(stack, entry) {
   const list = Array.isArray(stack) ? stack : [];
@@ -137,17 +148,21 @@ export function crumbsHtml(root, stack) {
 
 // ---------------------------------------------------------------- insert picker
 
-/** Picker rows of `GET /canvases?insertable_into=`: `insertable === false` rows are disabled with a hint. */
-export function pickerRows(items, { currentId = "" } = {}) {
+/**
+ * Picker rows of the local canvases: `items` are named-library summaries `{id, name, nodeCount, edgeCount,
+ * nested}`; ids in `blocked` (the open canvas, its ancestors and every canvas containing them) are
+ * disabled with a cycle hint.
+ */
+export function pickerRows(items, { currentId = "", blocked = new Set() } = {}) {
   return (Array.isArray(items) ? items : [])
     .filter((c) => c && c.id && c.id !== currentId)
     .map((c) => {
-      const insertable = c.insertable !== false;
+      const insertable = !blocked.has(String(c.id));
       return {
         id: String(c.id),
         name: String(c.name || c.id),
-        description: String(c.description || ""),
-        counts: `${num(c.node_count)} nodes · ${num(c.edge_count)} edges`,
+        description: c.nested ? "Nested NodeMap" : "",
+        counts: `${num(c.nodeCount ?? c.node_count)} nodes · ${num(c.edgeCount ?? c.edge_count)} edges`,
         insertable,
         hint: insertable ? "" : "would create a cycle",
       };
@@ -156,15 +171,6 @@ export function pickerRows(items, { currentId = "" } = {}) {
 
 /** HTML of the picker list (rows are `<button data-pick>`; disabled rows carry the cycle hint). */
 export function pickerHtml(rows) {
-  if (!rows.length) return '<div class="nm-status">No saved NodeMaps found</div>';
+  if (!rows.length) return '<div class="nm-status">No NodeMaps found</div>';
   return rows.map((r) => `<button type="button" class="nm-nested-pick${r.insertable ? "" : " nm-disabled"}" data-pick="${esc(r.id)}"${r.insertable ? "" : ' disabled aria-disabled="true"'}><span class="nm-pick-name">${esc(r.name)}</span><span class="nm-pick-meta">${esc(r.counts)}</span>${r.description ? `<span class="nm-pick-desc">${esc(r.description)}</span>` : ""}${r.hint ? `<span class="nm-pick-hint">${esc(r.hint)}</span>` : ""}</button>`).join("");
-}
-
-/** Message of a failed server write (409 conflict, 403 disabled, 422 cycle/missing, else generic). */
-export function writeErrorKind(err) {
-  const status = Number(err?.status ?? err?.statusCode ?? 0) || Number(/\b(40[39]|422)\b/.exec(String(err?.message || ""))?.[1] || 0);
-  if (status === 409) return "conflict";
-  if (status === 403) return "forbidden";
-  if (status === 422) return "invalid";
-  return "error";
 }

@@ -22,6 +22,7 @@ import {
   renameNamedCanvas, saveNamedCanvas,
 } from "./nodemap_library.js";
 import { generateImpactMap } from "./impact_map.js";
+import { importDocument } from "./nested_store.js";
 import { pickButtonHtml, wireFormPickers } from "./nodemap_pickers.js";
 import { sessionManager } from "../../session_manager.js";
 
@@ -364,7 +365,7 @@ export function openImageExport(ctrl, kind) {
     modal.close();
     // async (live tab iframes are loaded and rasterized first): a failure is reported, never unhandled
     if (png) Promise.resolve(ctrl.exportPNG(opts)).catch((err) => toast.error(`PNG export failed${err?.message ? `: ${err.message}` : ""}`));
-    else ctrl.exportSVG(opts);
+    else Promise.resolve(ctrl.exportSVG(opts)).catch((err) => toast.error(`SVG export failed${err?.message ? `: ${err.message}` : ""}`));
   };
   q("form")?.addEventListener?.("submit", (e) => {
     e.preventDefault();
@@ -393,7 +394,7 @@ export function openFormatExportModal(ctrl, format) {
       const title = form?.querySelector("[name='title']")?.value || "KernelInfo NodeMap";
       const transparent = Boolean(form?.querySelector("[name='transparent']")?.checked);
       modal.close();
-      ctrl.exportInteractiveHTML({ title, transparent });
+      Promise.resolve(ctrl.exportInteractiveHTML({ title, transparent })).catch((err) => toast.error(`HTML export failed${err?.message ? `: ${err.message}` : ""}`));
     };
     modal.body.querySelector("form")?.addEventListener?.("submit", (e) => {
       e.preventDefault();
@@ -577,7 +578,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
 
     const serverHtml = serverCanvases.length ? `
       <div class="nm-lib-section">
-        <div class="nm-hint" style="margin: 10px 0 6px; font-weight: 600;">Server / AI Canvases (${serverCanvases.length})</div>
+        <div class="nm-hint" style="margin: 10px 0 6px; font-weight: 600;">Server / AI Canvases (${serverCanvases.length}, read-only)</div>
         <div class="nm-lib-list">
           ${serverCanvases.map((rec) => `
             <div class="nm-lib-card" data-server-id="${escapeHtml(rec.id)}">
@@ -586,7 +587,7 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
                 <span class="nm-hint">${escapeHtml(rec.id)} · ${rec.node_count ?? 0} nodes · ${rec.edge_count ?? 0} edges${rec.updated_at ? ` · ${escapeHtml(new Date(rec.updated_at).toLocaleDateString())}` : ""}</span>
               </div>
               <div class="nm-lib-acts">
-                <button type="button" class="code-btn primary" data-lib-act="server-open" data-cid="${escapeHtml(rec.id)}">Open in Tab</button>
+                <button type="button" class="code-btn primary" data-lib-act="server-open" data-cid="${escapeHtml(rec.id)}">Open Local Copy in Tab</button>
                 <button type="button" class="code-btn" data-lib-act="server-copy" data-cid="${escapeHtml(rec.id)}">Save Copy to Browser Library</button>
               </div>
             </div>`).join("")}
@@ -700,16 +701,12 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
           const cid = String(b.dataset.cid || "").trim();
           if (!cid) return;
           if (typeof ctrl.loadServerCanvas === "function") {
-            if (ctrl.tab) {
-              ctrl.tab.canvasId = cid;
-              state.updateTabState?.(ctrl.tab.id, { canvasId: cid });
-            }
             const ok = await ctrl.loadServerCanvas(cid);
             if (!modal.body?.isConnected) return;
             if (ok) {
               modal.close();
               urlSync?.syncToUrl?.();
-              toast.success(`Opened server canvas "${cid}"`);
+              toast.success(`Opened a local copy of server canvas "${cid}"`);
             }
           } else {
             state.openTab?.({ type: "nodemap", title: cid, version: ctrl.currentVersion || "v3.0", canvasId: cid, forceNew: true });
@@ -723,7 +720,10 @@ export function openLibraryDialog(ctrl, initialTab = "library") {
             if (!modal.body?.isConnected) return;
             if (loaded?.canvas) {
               const name = String(loaded.name || cid).trim();
-              await saveNamedCanvas(ctrl.userDb, { name, repo: ctrl.repo, canvas: loaded.canvas }, globalThis.localStorage);
+              // nested canvases arrive inline: unpack them into browser storage first
+              const local = await importDocument({ userDb: ctrl.userDb, storage: globalThis.localStorage }, loaded.canvas, { repo: ctrl.repo || "" });
+              if (!local) throw new Error("not a NodeMap canvas");
+              await saveNamedCanvas(ctrl.userDb, { name, repo: ctrl.repo, canvas: local }, globalThis.localStorage);
               if (!modal.body?.isConnected) return;
               toast.success(`Copied "${name}" to Browser Library`);
               refresh();
